@@ -2,6 +2,7 @@
 pub mod app_state;
 pub mod config;
 pub mod events;
+pub mod model_client;
 
 use tauri::{
     menu::{Menu, MenuItem},
