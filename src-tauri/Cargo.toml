@@ -1,0 +1,24 @@
+[package]
+name = "shaniu"
+version = "0.1.0"
+description = "SHANIU - Windows 桌面 Agent Harness 客户端"
+edition = "2021"
+
+[lib]
+name = "shaniu_lib"
+crate-type = ["staticlib", "cdylib", "rlib"]
+
+[build-dependencies]
+tauri-build = { version = "2", features = [] }
+
+[dependencies]
+# 版本锁定见 docs/01-架构需求文档.md §6（Tauri 2.12.5）
+tauri = { version = "=2.12.5", features = [] }
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+toml = "1.2"
+
+[profile.release]
+codegen-units = 1
+lto = true
+strip = true
