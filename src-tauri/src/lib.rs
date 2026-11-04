@@ -4,6 +4,7 @@ pub mod app_state;
 pub mod config;
 pub mod events;
 pub mod model_client;
+pub mod permission;
 pub mod tool_router;
 pub mod tools;
 
@@ -50,6 +51,7 @@ fn send_task(app: tauri::AppHandle, task: String) -> Result<(), String> {
     let agent = agent_loop::AgentLoop::from_config(
         backend,
         Arc::new(router),
+        state.broker.clone(),
         &cfg,
         state.workspace_root(),
     );
@@ -67,6 +69,19 @@ fn send_task(app: tauri::AppHandle, task: String) -> Result<(), String> {
 #[tauri::command]
 fn cancel_task(app: tauri::AppHandle) -> Result<(), String> {
     let _ = app.state::<AppState>().cancel_active();
+    Ok(())
+}
+
+/// 审批回执（approval card → broker）。
+#[tauri::command]
+fn approve(app: tauri::AppHandle, request_id: String, decision: String) -> Result<(), String> {
+    let decision = match decision.as_str() {
+        "allow" => events::ApprovalDecision::Allow,
+        "allow_always" => events::ApprovalDecision::AllowAlways,
+        "deny" => events::ApprovalDecision::Deny,
+        other => return Err(format!("未知裁决: {other}")),
+    };
+    app.state::<AppState>().broker.resolve(&request_id, decision);
     Ok(())
 }
 
@@ -152,6 +167,7 @@ pub fn run() {
             dev_ping,
             send_task,
             cancel_task,
+            approve,
             store_api_key,
             has_api_key,
             get_settings,

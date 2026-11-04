@@ -2,11 +2,12 @@
 
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicU32, Ordering};
-use std::sync::{Mutex, RwLock};
+use std::sync::{Arc, Mutex, RwLock};
 
 use tokio_util::sync::CancellationToken;
 
 use crate::config::{new_session_id, AppConfig};
+use crate::permission::ApprovalBroker;
 
 pub struct AppState {
     config: RwLock<AppConfig>,
@@ -14,6 +15,8 @@ pub struct AppState {
     session_seq: AtomicU32,
     /// 当前活动任务的取消令牌（None = 空闲）。
     active_task: Mutex<Option<CancellationToken>>,
+    /// 审批 broker（approve 命令回执入口）。
+    pub broker: Arc<ApprovalBroker>,
 }
 
 impl AppState {
@@ -23,6 +26,7 @@ impl AppState {
             config_path: RwLock::new(config_path),
             session_seq: AtomicU32::new(1),
             active_task: Mutex::new(None),
+            broker: Arc::new(ApprovalBroker::new()),
         }
     }
 

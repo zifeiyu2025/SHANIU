@@ -21,6 +21,7 @@ use crate::events::EventMsg;
 use crate::model_client::{
     self, provider::ProviderConfig, HistoryItem, ModelStreamEvent, ResponseItem, Role, Usage,
 };
+use crate::permission::{policy, ApprovalBroker};
 use crate::tool_router::{ToolContext, ToolRouter};
 
 pub use budget::TurnBudget;
@@ -66,22 +67,30 @@ impl ModelBackend for ResponsesBackend {
 pub struct AgentLoop {
     pub backend: Arc<dyn ModelBackend>,
     pub router: Arc<ToolRouter>,
+    pub broker: Arc<ApprovalBroker>,
     pub workspace_root: PathBuf,
     pub max_turns: u32,
+    pub policy: policy::SessionPolicy,
 }
 
 impl AgentLoop {
     pub fn from_config(
         backend: Arc<dyn ModelBackend>,
         router: Arc<ToolRouter>,
+        broker: Arc<ApprovalBroker>,
         cfg: &AppConfig,
         workspace_root: PathBuf,
     ) -> Self {
         Self {
             backend,
             router,
+            broker,
             workspace_root,
             max_turns: TurnBudget::from_config(cfg).max_turns,
+            policy: policy::SessionPolicy {
+                approval: cfg.approval.mode,
+                sandbox: cfg.sandbox.mode,
+            },
         }
     }
 
@@ -190,19 +199,72 @@ impl AgentLoop {
                 });
             }
             for (name, arguments, call_id) in &calls {
+                // 未知工具 = 协议违规：不经门禁直接拒绝回填（模型自我纠正），不打扰人工
+                if self.router.get(name).is_none() {
+                    emit(&sink, EventMsg::ToolCallBegin {
+                        call_id: call_id.clone(),
+                        tool: name.clone(),
+                        args: serde_json::from_str(arguments)
+                            .unwrap_or(serde_json::Value::String(arguments.clone())),
+                    });
+                    emit(&sink, EventMsg::ToolCallEnd {
+                        call_id: call_id.clone(),
+                        exit_code: None,
+                        error: Some(format!("未知工具: {name}")),
+                    });
+                    history.push(HistoryItem::FunctionCallOutput {
+                        call_id: call_id.clone(),
+                        output: format!("未知工具: {name}"),
+                    });
+                    continue;
+                }
+
                 emit(&sink, EventMsg::ToolCallBegin {
                     call_id: call_id.clone(),
                     tool: name.clone(),
                     args: serde_json::from_str(arguments)
                         .unwrap_or(serde_json::Value::String(arguments.clone())),
                 });
+
+                // 审批门禁（ADR-003）：裁决 → 询问回执 → 放行/拒绝
+                let args_val =
+                    serde_json::from_str(arguments).unwrap_or(serde_json::Value::String(arguments.clone()));
+                match self
+                    .broker
+                    .gate(name, &args_val, call_id, self.policy, &sink, &cancel)
+                    .await
+                {
+                    crate::permission::GateOutcome::Allowed => {}
+                    crate::permission::GateOutcome::Denied => {
+                        emit(&sink, EventMsg::ToolCallEnd {
+                            call_id: call_id.clone(),
+                            exit_code: None,
+                            error: Some("用户拒绝".into()),
+                        });
+                        history.push(HistoryItem::FunctionCallOutput {
+                            call_id: call_id.clone(),
+                            output: "用户拒绝了该工具调用".into(),
+                        });
+                        continue;
+                    }
+                    crate::permission::GateOutcome::Cancelled => {
+                        emit(&sink, EventMsg::ToolCallEnd {
+                            call_id: call_id.clone(),
+                            exit_code: None,
+                            error: Some("已取消".into()),
+                        });
+                        reason = TurnEndReasonLocal::Cancelled;
+                        break 'outer;
+                    }
+                }
+
                 let tool_ctx = ToolContext::new(
                     self.workspace_root.clone(),
                     cancel.clone(),
                     call_id.clone(),
                     sink.clone(),
                 );
-                let result = self.router.execute(name, parse_args(arguments), &tool_ctx).await;
+                let result = self.router.execute(name, args_val, &tool_ctx).await;
                 let output_text = match &result {
                     Ok(out) => {
                         emit(&sink, EventMsg::ToolCallEnd {
@@ -248,10 +310,6 @@ impl AgentLoop {
         });
         TurnSummary { turns: last_turn, reason: reason.into() }
     }
-}
-
-fn parse_args(arguments: &str) -> serde_json::Value {
-    serde_json::from_str(arguments).unwrap_or(serde_json::Value::String(arguments.to_string()))
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -338,8 +396,9 @@ mod tests {
 
     impl Default for EchoTool {
         fn default() -> Self {
+            // 命名 read_file → 风险 read → 门禁自动放行（回显工具用于循环测试）
             Self {
-                spec: ToolSpec::new("echo", "回显", serde_json::json!({"type":"object"})),
+                spec: ToolSpec::new("read_file", "回显", serde_json::json!({"type":"object"})),
             }
         }
     }
@@ -356,17 +415,28 @@ mod tests {
 
     fn make_loop(
         turns: Vec<Vec<ModelStreamEvent>>,
-    ) -> (AgentLoop, Arc<Mutex<Vec<EventMsg>>>, CancellationToken) {
+    ) -> (
+        AgentLoop,
+        Arc<Mutex<Vec<EventMsg>>>,
+        CancellationToken,
+        Arc<ApprovalBroker>,
+    ) {
         let mut router = ToolRouter::new();
         router.register(Arc::new(EchoTool::default()));
         let (_sink, store) = CapturingSink::new();
+        let broker = Arc::new(ApprovalBroker::new());
         let agent = AgentLoop {
             backend: Arc::new(ScriptedBackend::new(turns)),
             router: Arc::new(router),
+            broker: broker.clone(),
             workspace_root: std::env::temp_dir(),
             max_turns: 3,
+            policy: policy::SessionPolicy {
+                approval: crate::config::ApprovalMode::Ask,
+                sandbox: crate::config::SandboxMode::WorkspaceWrite,
+            },
         };
-        (agent, store, CancellationToken::new())
+        (agent, store, CancellationToken::new(), broker)
     }
 
     fn usage_ev() -> ModelStreamEvent {
@@ -375,7 +445,7 @@ mod tests {
 
     fn fn_call_ev() -> ModelStreamEvent {
         ModelStreamEvent::OutputItem(ResponseItem::FunctionCall {
-            name: "echo".into(),
+            name: "read_file".into(),
             arguments: r#"{"x":1}"#.into(),
             call_id: "c1".into(),
         })
@@ -385,10 +455,12 @@ mod tests {
 
     #[tokio::test]
     async fn single_turn_completion_emits_expected_events() {
-        let (agent, store, cancel) = make_loop(vec![vec![
-            ModelStreamEvent::OutputTextDelta { delta: "你好".into() },
-            usage_ev(),
-        ]]);
+        let (agent, store, cancel, _broker) = make_loop(vec![
+            vec![
+                ModelStreamEvent::OutputTextDelta { delta: "你好".into() },
+                usage_ev(),
+            ],
+        ]);
         let summary = agent.run_task("任务", Arc::new(CapturingSink(store.clone())), cancel).await;
         assert_eq!(summary.reason, TurnEndReason::Completed);
         let events = store.lock().unwrap();
@@ -404,7 +476,7 @@ mod tests {
 
     #[tokio::test]
     async fn tool_call_cycle_then_complete() {
-        let (agent, store, cancel) = make_loop(vec![
+        let (agent, store, cancel, _broker) = make_loop(vec![
             vec![fn_call_ev(), usage_ev()],
             vec![ModelStreamEvent::OutputTextDelta { delta: "完成".into() }, usage_ev()],
         ]);
@@ -414,7 +486,7 @@ mod tests {
         let events = store.lock().unwrap();
         assert!(events.iter().any(|e| matches!(
             e,
-            EventMsg::ToolCallBegin { call_id, tool, .. } if call_id == "c1" && tool == "echo"
+            EventMsg::ToolCallBegin { call_id, tool, .. } if call_id == "c1" && tool == "read_file"
         )));
         assert!(events.iter().any(|e| matches!(
             e,
@@ -424,7 +496,7 @@ mod tests {
 
     #[tokio::test]
     async fn budget_exhausted_when_tools_keep_coming() {
-        let (agent, store, cancel) = make_loop(vec![
+        let (agent, store, cancel, _broker) = make_loop(vec![
             vec![fn_call_ev(), usage_ev()],
             vec![fn_call_ev(), usage_ev()],
             vec![fn_call_ev(), usage_ev()],
@@ -440,7 +512,7 @@ mod tests {
     #[tokio::test]
     async fn cancelled_token_yields_cancelled_completion() {
         // 空脚本 = 挂起的事件流：预取消后 select! 只有取消分支就绪（确定性）
-        let (agent, store, cancel) = make_loop(vec![vec![]]);
+        let (agent, store, cancel, _broker) = make_loop(vec![vec![]]);
         cancel.cancel();
         let summary = agent.run_task("任务", Arc::new(CapturingSink(store.clone())), cancel).await;
         assert_eq!(summary.reason, TurnEndReason::Cancelled);
@@ -452,7 +524,7 @@ mod tests {
 
     #[tokio::test]
     async fn model_failure_maps_to_failed() {
-        let (agent, store, cancel) = make_loop(vec![vec![ModelStreamEvent::Failed { message: "boom".into() }]]);
+        let (agent, store, cancel, _broker) = make_loop(vec![vec![ModelStreamEvent::Failed { message: "boom".into() }]]);
         let summary = agent.run_task("任务", Arc::new(CapturingSink(store.clone())), cancel).await;
         assert_eq!(summary.reason, TurnEndReason::Failed);
         assert!(store.lock().unwrap().iter().any(|e| matches!(
@@ -463,7 +535,7 @@ mod tests {
 
     #[tokio::test]
     async fn unknown_tool_error_backfills_and_continues() {
-        let (agent, store, cancel) = make_loop(vec![
+        let (agent, store, cancel, _broker) = make_loop(vec![
             vec![ModelStreamEvent::OutputItem(ResponseItem::FunctionCall {
                 name: "no_such_tool".into(),
                 arguments: "{}".into(),
@@ -478,5 +550,83 @@ mod tests {
             e,
             EventMsg::ToolCallEnd { call_id, error: Some(msg), .. } if call_id == "c9" && msg.contains("未知工具")
         )));
+    }
+
+    #[tokio::test]
+    async fn destructive_tool_requires_approval_and_deny_blocks_execution() {
+        // wipe_disk 是注册过的假想破坏性工具（未知工具名走路由拒绝路径，见另一用例）
+        let (agent, store, cancel, broker) = make_loop_with_destructive(vec![
+            vec![ModelStreamEvent::OutputItem(ResponseItem::FunctionCall {
+                name: "wipe_disk".into(),
+                arguments: "{}".into(),
+                call_id: "c7".into(),
+            }), usage_ev()],
+            vec![ModelStreamEvent::OutputTextDelta { delta: "已纠正".into() }, usage_ev()],
+        ]);
+        let sink = Arc::new(CapturingSink(store.clone()));
+        let run = tokio::spawn(async move { agent.run_task("任务", sink, cancel).await });
+        // 等待审批请求出现后回执「拒绝」
+        for _ in 0..300 {
+            if broker.has_pending("appr-c7") {
+                assert!(broker.resolve("appr-c7", crate::events::ApprovalDecision::Deny));
+                break;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+        }
+        let summary = run.await.unwrap();
+        assert_eq!(summary.reason, TurnEndReason::Completed);
+        let events = store.lock().unwrap();
+        assert!(events.iter().any(|e| matches!(
+            e,
+            EventMsg::ExecApprovalRequest { request_id, risk: crate::events::RiskLevel::Destructive, .. }
+                if request_id == "appr-c7"
+        )));
+        assert!(events.iter().any(|e| matches!(
+            e,
+            EventMsg::ToolCallEnd { call_id, error: Some(msg), .. }
+                if call_id == "c7" && msg.contains("用户拒绝")
+        )));
+    }
+
+    fn make_loop_with_destructive(
+        turns: Vec<Vec<ModelStreamEvent>>,
+    ) -> (
+        AgentLoop,
+        Arc<Mutex<Vec<EventMsg>>>,
+        CancellationToken,
+        Arc<ApprovalBroker>,
+    ) {
+        struct WipeTool {
+            spec: ToolSpec,
+        }
+        impl Default for WipeTool {
+            fn default() -> Self {
+                Self {
+                    spec: ToolSpec::new("wipe_disk", "破坏性", serde_json::json!({"type":"object"})),
+                }
+            }
+        }
+        #[async_trait::async_trait]
+        impl ToolExecutor for WipeTool {
+            fn spec(&self) -> &ToolSpec {
+                &self.spec
+            }
+            async fn execute(&self, _a: Value, _c: &ToolContext) -> Result<ToolOutput, ToolError> {
+                Ok(ToolOutput::ok("wiped"))
+            }
+        }
+        let (mut agent, store, cancel, broker) = make_loop(turns);
+        let mut router_raw = ToolRouter::new();
+        router_raw.register(Arc::new(WipeTool::default()));
+        // 直接补注册（保持既有 router 引用结构）
+        let router = Arc::new({
+            let mut r = ToolRouter::new();
+            r.register(Arc::new(EchoTool::default()));
+            r.register(Arc::new(WipeTool::default()));
+            r
+        });
+        agent.router = router;
+        drop(router_raw);
+        (agent, store, cancel, broker)
     }
 }

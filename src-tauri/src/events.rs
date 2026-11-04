@@ -43,6 +43,8 @@ pub enum RiskLevel {
 pub enum ApprovalDecision {
     Allow,
     Deny,
+    /// 仅 execute 级有效：本会话记住选择（ADR-003），destructive 永不记忆。
+    AllowAlways,
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]

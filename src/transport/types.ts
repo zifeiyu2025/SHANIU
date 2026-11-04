@@ -5,7 +5,7 @@
 export type TurnEndReason = 'completed' | 'cancelled' | 'failed' | 'budget_exhausted';
 export type IoChannel = 'stdout' | 'stderr';
 export type RiskLevel = 'read' | 'write_in_workspace' | 'execute' | 'destructive';
-export type ApprovalDecision = 'allow' | 'deny';
+export type ApprovalDecision = 'allow' | 'deny' | 'allow_always';
 
 export type EventMsg =
   | { type: 'turn_started'; turn: number }
