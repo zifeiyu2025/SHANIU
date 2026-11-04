@@ -22,6 +22,8 @@ export type SessionStore = SnapshotStore<SessionState> & {
   dispatch(msg: Parameters<typeof applyEvent>[1]): void;
   /** 记录用户任务节点；transport.sendTask 由视图层调用（store 不依赖 transport）。 */
   submitUserTask(task: string): void;
+  /** 新会话：清空当前会话状态。 */
+  reset(): void;
 };
 
 export function createSessionStore(): SessionStore {
@@ -43,6 +45,15 @@ export function createSessionStore(): SessionStore {
     submitUserTask(task) {
       store.update((state) => {
         state.nodes.push(newUserMessageNode(task));
+      });
+    },
+    reset() {
+      store.setState({
+        status: 'idle',
+        currentTurn: 0,
+        lastTurnEnd: null,
+        nodes: [],
+        usage: null,
       });
     },
   };

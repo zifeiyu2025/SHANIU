@@ -1,12 +1,19 @@
 @import "tailwindcss";
 
-/* 主题令牌（ADR-006 / docs §8 styles）：颜色 / 圆角 */
+/*
+ * 主题令牌（复刻 deepseek-harness 桌面端暗色视觉，docs §8 styles）
+ */
 @theme {
-  --color-surface: #0d1017;
-  --color-surface-raised: #161b26;
-  --color-border-subtle: #232a38;
-  --color-accent: #5b8cff;
-  --color-accent-strong: #3f6fe8;
+  --color-sidebar: #0d0d0e;
+  --color-surface: #1a1a1a;
+  --color-raised: #262626;
+  --color-hover: #2a2a2a;
+  --color-border: #2e2e2e;
+  --color-text: #ececec;
+  --color-secondary: #8a8a8a;
+  --color-weak: #6f6f6f;
+  --color-accent: #5b6eae;
+  --color-accent-hover: #6d80c2;
 }
 
 html,
@@ -18,11 +25,24 @@ body,
 body {
   margin: 0;
   background-color: var(--color-surface);
-  color: var(--color-zinc-100, #f4f4f5);
-  font-family:
-    "Segoe UI",
-    "Microsoft YaHei",
-    system-ui,
-    sans-serif;
+  color: var(--color-text);
+  font-family: "Segoe UI", "Microsoft YaHei", system-ui, sans-serif;
   -webkit-font-smoothing: antialiased;
+  overflow: hidden; /* 无边框窗口内禁止整页滚动 */
+}
+
+/* 细滚动条（复刻 dsh） */
+*::-webkit-scrollbar {
+  width: 8px;
+  height: 8px;
+}
+*::-webkit-scrollbar-thumb {
+  background: #2e2e2e;
+  border-radius: 4px;
+}
+*::-webkit-scrollbar-thumb:hover {
+  background: #3a3a3a;
+}
+*::-webkit-scrollbar-track {
+  background: transparent;
 }

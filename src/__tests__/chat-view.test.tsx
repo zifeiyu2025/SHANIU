@@ -21,7 +21,9 @@ describe('ChatView', () => {
     expect(screen.getByText('正在读取')).toBeTruthy();
     expect(screen.getByTestId('streaming-cursor')).toBeTruthy();
     expect(screen.getByRole('button', { name: '停止' })).toBeTruthy();
-    expect((screen.getByPlaceholderText('描述任务…') as HTMLTextAreaElement).disabled).toBe(true);
+    expect(
+      (screen.getByPlaceholderText(/描述你想要构建的内容/) as HTMLTextAreaElement).disabled,
+    ).toBe(true);
     expect(screen.getByTestId('turn-status').textContent).toContain('运行中');
   });
 
@@ -41,13 +43,16 @@ describe('ChatView', () => {
     expect(screen.getByText('完整回复')).toBeTruthy();
     expect(screen.queryByTestId('streaming-cursor')).toBeNull();
     expect(screen.getByRole('button', { name: '发送' })).toBeTruthy();
-    expect((screen.getByPlaceholderText('描述任务…') as HTMLTextAreaElement).disabled).toBe(false);
+    expect(
+      (screen.getByPlaceholderText(/描述你想要构建的内容/) as HTMLTextAreaElement).disabled,
+    ).toBe(false);
     expect(screen.getByTestId('token-usage').textContent).toContain('↑10');
   });
 
-  it('空态提示', () => {
+  it('空态：欢迎区 + 输入卡片居中', () => {
     const store = createSessionStore();
     render(<ChatView store={store} transport={createMockTransport()} />);
-    expect(screen.getByTestId('empty-hint')).toBeTruthy();
+    expect(screen.getByTestId('empty-hero')).toBeTruthy();
+    expect(screen.getByPlaceholderText(/描述你想要构建的内容/)).toBeTruthy();
   });
 });
