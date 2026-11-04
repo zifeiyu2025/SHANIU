@@ -133,7 +133,8 @@ impl ToolRouter {
 // ============================== 工作区路径边界（共享助手） ==============================
 
 /// 解析工作区内路径：绝对路径与相对路径统一，canonicalize 后校验不越界。
-/// 这是 M1 的逻辑边界；M2 sandbox 模块落地后由 deny-ACE 接管强制力（ADR-002）。
+/// 要求目标**已存在**（读类工具用）。这是 M1 的逻辑边界；M2 sandbox 模块落地后
+/// 由 deny-ACE 接管强制力（ADR-002）。
 pub fn resolve_in_workspace(workspace_root: &Path, path: &str) -> Result<PathBuf, ToolError> {
     if path.trim().is_empty() {
         return Err(ToolError::InvalidArgs("路径为空".into()));
@@ -150,6 +151,54 @@ pub fn resolve_in_workspace(workspace_root: &Path, path: &str) -> Result<PathBuf
         return Err(ToolError::Execution(format!("路径越界（工作区之外）: {path}")));
     }
     Ok(canonical)
+}
+
+/// 写类操作的工作区路径校验：允许目标**尚不存在**（如 Add File）。
+/// 规则：拒绝包含 `..` 组件；对最深存在的祖先做 canonicalize 并校验不越界，
+/// 尾部组件原样拼接（不存在 `..` 故不可能向上逃逸）。
+pub fn resolve_for_write(workspace_root: &Path, path: &str) -> Result<PathBuf, ToolError> {
+    if path.trim().is_empty() {
+        return Err(ToolError::InvalidArgs("路径为空".into()));
+    }
+    let raw = PathBuf::from(path);
+    let joined = if raw.is_absolute() { raw } else { workspace_root.join(raw) };
+    if joined
+        .components()
+        .any(|c| matches!(c, std::path::Component::ParentDir))
+    {
+        return Err(ToolError::Execution(format!(
+            "路径越界（包含 ..）: {path}"
+        )));
+    }
+    // 自底向上找最深存在祖先
+    let mut tail: Vec<std::ffi::OsString> = Vec::new();
+    let mut probe = joined.clone();
+    while !probe.exists() {
+        match probe.parent() {
+            Some(parent) if parent != probe => {
+                tail.push(probe.file_name().map(|n| n.to_os_string()).unwrap_or_default());
+                probe = parent.to_path_buf();
+            }
+            _ => return Err(ToolError::InvalidArgs(format!("路径无法定位: {path}"))),
+        }
+    }
+    let canonical_base = probe
+        .canonicalize()
+        .map_err(|e| ToolError::Execution(format!("工作区根目录不可用: {e}")))?;
+    let root = workspace_root
+        .canonicalize()
+        .map_err(|e| ToolError::Execution(format!("工作区根目录不可用: {e}")))?;
+    if !canonical_base.starts_with(&root) {
+        return Err(ToolError::Execution(format!("路径越界（工作区之外）: {path}")));
+    }
+    let mut result = canonical_base;
+    for name in tail.iter().rev() {
+        result.push(name);
+    }
+    if !result.starts_with(&root) {
+        return Err(ToolError::Execution(format!("路径越界（工作区之外）: {path}")));
+    }
+    Ok(result)
 }
 
 #[cfg(test)]
@@ -250,6 +299,19 @@ mod tests {
         let ws = temp_workspace();
         // ".." 真实存在（temp 父目录）：canonicalize 成功后触发越界判定
         let err = resolve_in_workspace(&ws, "..").unwrap_err();
+        assert!(matches!(err, ToolError::Execution(_)));
+        std::fs::remove_dir_all(&ws).ok();
+    }
+
+    #[test]
+    fn write_resolver_allows_missing_targets_but_rejects_escape() {
+        let ws = temp_workspace();
+        // 允许尚不存在的目标（Add File 场景），含多级新目录
+        let ok = resolve_for_write(&ws, "new/deep/file.txt").unwrap();
+        assert!(ok.starts_with(ws.canonicalize().unwrap().as_path()));
+        assert_eq!(ok.file_name().unwrap(), "file.txt");
+        // 含 .. 的路径直接越界拒绝
+        let err = resolve_for_write(&ws, "../evil.txt").unwrap_err();
         assert!(matches!(err, ToolError::Execution(_)));
         std::fs::remove_dir_all(&ws).ok();
     }

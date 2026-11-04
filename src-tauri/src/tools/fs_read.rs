@@ -280,7 +280,7 @@ impl ToolExecutor for Search {
     }
 }
 
-/// 注册全部只读工具。
+/// 注册全部只读工具（保留独立入口；全量注册用 tools::register_builtin）。
 pub fn register_all(router: &mut crate::tool_router::ToolRouter) {
     router.register(std::sync::Arc::new(ReadFile::new()));
     router.register(std::sync::Arc::new(ListDir::new()));
