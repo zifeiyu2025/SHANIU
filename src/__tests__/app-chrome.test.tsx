@@ -21,19 +21,22 @@ describe('App 窗口 chrome', () => {
     expect(screen.queryByTestId('tool-panel')).toBeNull();
   });
 
-  it('标题栏按钮折叠/展开左侧栏', () => {
+  it('侧栏折叠/展开（折叠钮在侧栏行，折叠后为 56px 轨）', () => {
     render(<App transport={createMockTransport()} />);
-    expect(screen.getByText('SHANIU')).toBeTruthy();
+    // 展开态：侧栏行 + hero chip 两处「默认工作区」
+    expect(screen.getAllByText('默认工作区').length).toBe(2);
+    expect(screen.getByRole('button', { name: '折叠侧栏' })).toBeTruthy();
 
     act(() => {
       fireEvent.click(screen.getByRole('button', { name: '折叠侧栏' }));
     });
-    expect(screen.queryByText('SHANIU')).toBeNull();
+    expect(screen.getAllByText('默认工作区').length).toBe(1); // 仅剩 hero chip
+    expect(screen.getByRole('button', { name: '展开侧栏' })).toBeTruthy();
 
     act(() => {
       fireEvent.click(screen.getByRole('button', { name: '展开侧栏' }));
     });
-    expect(screen.getByText('SHANIU')).toBeTruthy();
+    expect(screen.getAllByText('默认工作区').length).toBe(2);
   });
 
   it('浏览器模式（非 Tauri）不渲染窗口控制按钮', () => {

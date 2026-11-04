@@ -30,3 +30,4 @@ pub fn run() {
         .run(tauri::generate_context!())
         .expect("SHANIU 启动失败");
 }
+

@@ -2,7 +2,7 @@ import { useState } from 'react';
 import { useStoreSelector } from '../../store/engine';
 import type { SessionStore } from '../../store/session-store';
 import type { Transport } from '../../transport/types';
-import { ArrowUpIcon, ChevronDownIcon, PlusIcon, ShieldIcon, StopIcon } from '../icons';
+import { ArrowUpIcon, ChevronDownIcon, PlusIcon, StopIcon, WarningIcon } from '../icons';
 
 /**
  * 输入卡（复刻 dsh InputBar）：
@@ -67,11 +67,11 @@ export function Composer({
           </button>
           <button
             type="button"
-            title="沙箱策略（M2 接入，当前默认只读）"
+            title="权限预设（M2 接入沙箱策略裁决）"
             className="flex h-7 items-center gap-1 rounded-sm px-2 text-[13px] font-medium leading-5 text-secondary transition-colors duration-100 hover:bg-hover"
           >
-            <ShieldIcon className="h-3.5 w-3.5" />
-            只读沙箱
+            <WarningIcon className="h-3.5 w-3.5" />
+            完全权限
             <ChevronDownIcon className="h-3 w-3 text-caption" />
           </button>
         </div>
@@ -93,11 +93,19 @@ export function Composer({
           {usage && (
             <span
               data-testid="token-usage"
-              className="rounded-sm px-2 py-px text-[12px] leading-[18px] tabular-nums text-tertiary"
+              className="rounded-sm bg-accent/15 px-2 py-px text-[12px] leading-[18px] font-medium tabular-nums text-accent"
             >
               ↑{usage.inputTokens} ↓{usage.outputTokens}
             </span>
           )}
+          <button
+            type="button"
+            title="推理力度（M1 接入）"
+            className="flex h-7 items-center gap-1 rounded-sm px-2 text-[13px] leading-5 text-secondary transition-colors duration-100 hover:bg-hover"
+          >
+            High
+            <ChevronDownIcon className="h-3 w-3 text-caption" />
+          </button>
           {running ? (
             <button
               type="button"

@@ -149,6 +149,16 @@ export function ShieldIcon({ className }: IconProps) {
   );
 }
 
+export function WarningIcon({ className }: IconProps) {
+  return (
+    <svg {...base(className)}>
+      <circle cx="12" cy="12" r="8.5" />
+      <line x1="12" y1="7.6" x2="12" y2="12.8" />
+      <circle cx="12" cy="15.9" r="0.9" fill="currentColor" stroke="none" />
+    </svg>
+  );
+}
+
 export function ArrowUpIcon({ className }: IconProps) {
   return (
     <svg {...base(className)}>

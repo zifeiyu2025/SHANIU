@@ -14,12 +14,12 @@ export function EmptyHero() {
   );
 }
 
-/** 工作区/沙箱选择 chip 行（复刻 dsh 工作区选择行：h28、r8、13/20 wt500、folder16+chevron12）。 */
+/** 工作区/模式选择 chip 行（复刻 dsh 图4：默认工作区 + 标准模式，h28、r8、13/20 wt500）。 */
 export function SelectorChips() {
   return (
     <div className="flex items-center gap-2">
       <Chip icon={<FolderIcon className="h-4 w-4" />} label="默认工作区" milestone="M1 接入" />
-      <Chip icon={<ShieldIcon className="h-3.5 w-3.5" />} label="只读沙箱" milestone="M2 接入" />
+      <Chip icon={<ShieldIcon className="h-3.5 w-3.5" />} label="标准模式" milestone="M1 接入" />
     </div>
   );
 }

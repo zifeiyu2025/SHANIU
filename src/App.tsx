@@ -42,7 +42,7 @@ export function App({ transport }: { transport: Transport }) {
         {sidebarCollapsed ? (
           <SidebarRail onExpand={() => setSidebarCollapsed(false)} />
         ) : (
-          <Sidebar store={store} onNewSession={() => store.reset()} onCollapse={() => setSidebarCollapsed(true)} />
+          <Sidebar onNewSession={() => store.reset()} onCollapse={() => setSidebarCollapsed(true)} />
         )}
         <main className="min-w-0 flex-1 overflow-hidden rounded-tl-[16px] bg-canvas">
           <ChatView store={store} transport={transport} />

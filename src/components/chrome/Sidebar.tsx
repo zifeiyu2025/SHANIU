@@ -1,7 +1,5 @@
 import type { ComponentType, ReactNode } from 'react';
-import type { SessionStore } from '../../store/session-store';
 import {
-  BrandMark,
   DotsIcon,
   FolderIcon,
   GearIcon,
@@ -20,31 +18,24 @@ const MENU_ROWS: Array<{ icon: ComponentType<{ className?: string }>; label: str
   { icon: DotsIcon, label: '更多', milestone: '二期接入' },
 ];
 
-/** 左侧栏·展开态（复刻 dsh SidebarRoot：280px、pad 6 8、logo 行 60px、行 32px）。 */
+/** 左侧栏·展开态（复刻 dsh SidebarRoot 几何：280px、行 32px；品牌区/用户区按需求移除）。 */
 export function Sidebar({
   onNewSession,
   onCollapse,
 }: {
-  store: SessionStore;
   onNewSession: () => void;
   onCollapse: () => void;
 }) {
   return (
     <aside className="flex w-[280px] shrink-0 flex-col bg-sidebar pb-2 text-primary">
-      {/* 品牌行 h60（logoRow，SidebarRoot.module.css:231-242） */}
-      <div className="flex h-[60px] shrink-0 items-center gap-[5px] pl-2">
-        <BrandMark className="h-6 w-6" />
-        <span className="text-[18px] font-semibold leading-6 tracking-[0.04em]">SHANIU</span>
-        <span className="ml-0.5 flex h-[10px] items-center rounded-[2px] px-[3px] pb-px font-mono text-[8px] font-medium leading-[10px] text-secondary ring-[0.5px] ring-line2">
-          HARNESS
-        </span>
-        <div className="flex-1" />
+      {/* 折叠钮行（dsh 折叠钮位于 logo 行右侧；品牌区按需求移除） */}
+      <div className="flex h-10 shrink-0 items-center justify-end pr-1">
         <button
           type="button"
           aria-label="折叠侧栏"
           title="折叠侧栏"
           onClick={onCollapse}
-          className="mr-1 flex h-7 w-7 items-center justify-center rounded-sm text-secondary transition-colors duration-100 hover:bg-hover hover:text-primary"
+          className="flex h-7 w-7 items-center justify-center rounded-sm text-secondary transition-colors duration-100 hover:bg-hover hover:text-primary"
         >
           <PanelLeftIcon className="h-4 w-4" />
         </button>
@@ -90,19 +81,11 @@ export function Sidebar({
           <div className="pointer-events-none sticky bottom-0 -mb-1 h-6 bg-gradient-to-t from-sidebar to-transparent" />
         </div>
       </div>
-
-      {/* 底部用户区（footArea，:781-807） */}
-      <div className="mt-1 flex h-9 shrink-0 items-center gap-2 px-1">
-        <span className="flex h-7 w-7 items-center justify-center rounded-full bg-accent/30 text-[12px] font-medium">
-          本
-        </span>
-        <span className="text-[13px] leading-5 text-secondary">本地用户</span>
-      </div>
     </aside>
   );
 }
 
-/** 左侧栏·折叠轨（rail 56px：36×36 静息 logo、hover 换面板图标，:337-394）。 */
+/** 左侧栏·折叠轨（rail 56px：36×36 展开钮，:337-394）。 */
 export function SidebarRail({ onExpand }: { onExpand: () => void }) {
   return (
     <aside className="flex w-14 shrink-0 flex-col items-center bg-sidebar pt-[18px]">
@@ -111,10 +94,9 @@ export function SidebarRail({ onExpand }: { onExpand: () => void }) {
         aria-label="展开侧栏"
         title="展开侧栏"
         onClick={onExpand}
-        className="group flex h-9 w-9 items-center justify-center rounded-md text-primary transition-colors duration-100 hover:bg-hover"
+        className="flex h-9 w-9 items-center justify-center rounded-md text-primary transition-colors duration-100 hover:bg-hover"
       >
-        <BrandMark className="h-5 w-5 group-hover:hidden" />
-        <PanelLeftIcon className="hidden h-5 w-5 group-hover:block" />
+        <PanelLeftIcon className="h-5 w-5" />
       </button>
     </aside>
   );
