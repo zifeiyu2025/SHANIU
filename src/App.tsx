@@ -1,5 +1,6 @@
 import { useEffect, useState } from 'react';
 import { ChatView } from './components/chat/ChatView';
+import { EdgeResizeLayer } from './components/chrome/EdgeResizeLayer';
 import { Sidebar, SidebarRail } from './components/chrome/Sidebar';
 import { TitleBar } from './components/chrome/TitleBar';
 import { ToolPanel } from './components/chrome/ToolPanel';
@@ -49,6 +50,7 @@ export function App({ transport }: { transport: Transport }) {
         </main>
         {rightOpen && <ToolPanel onClose={() => setRightOpen(false)} />}
       </div>
+      <EdgeResizeLayer />
     </div>
   );
 }
