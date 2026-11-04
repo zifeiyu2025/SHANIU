@@ -93,3 +93,15 @@ pub fn emit_pong(app: &tauri::AppHandle, nonce: &str) -> Result<(), String> {
     )
     .map_err(|e| format!("pong 广播失败: {e}"))
 }
+
+/// 测试支撑：丢弃全部事件（工具/循环单测的 sink 注入件）。
+#[cfg(test)]
+#[derive(Debug, Default)]
+pub struct NullEventSink;
+
+#[cfg(test)]
+impl EventSink for NullEventSink {
+    fn emit(&self, _msg: &EventMsg) -> Result<(), String> {
+        Ok(())
+    }
+}

@@ -21,6 +21,15 @@ toml = "1.2"
 reqwest = { version = "0.12", features = ["stream", "json"] }
 eventsource-stream = "0.2"
 futures = "0.3"
+# M1 工具系统（§6 声明，按需引入策略）：异步 trait 对象化 / 取消令牌（ADR-001）/
+# gitignore 感知文件遍历（ripgrep 引擎）/ 错误定义 / 正则
+async-trait = "0.1"
+tokio-util = "0.7"
+ignore = "0.4"
+thiserror = "2"
+regex = "1"
+# 异步运行时（tauri 内含；此处直连以获得 #[tokio::test]、进程/超时等能力）
+tokio = { version = "1", features = ["macros", "rt", "process", "io-util", "time"] }
 # DPAPI（config.rs 密钥存取，§6 已确认方案）：微软官方 Win32 绑定，最小 feature 面
 windows = { version = "0.62", features = [
     "Win32_Foundation",

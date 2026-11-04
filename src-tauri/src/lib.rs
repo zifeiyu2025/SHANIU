@@ -3,6 +3,8 @@ pub mod app_state;
 pub mod config;
 pub mod events;
 pub mod model_client;
+pub mod tool_router;
+pub mod tools;
 
 use tauri::{
     menu::{Menu, MenuItem},
