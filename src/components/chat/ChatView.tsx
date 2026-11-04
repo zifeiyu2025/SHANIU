@@ -1,3 +1,4 @@
+import type { ReactNode } from 'react';
 import { useStoreSelector } from '../../store/engine';
 import type { SessionStore } from '../../store/session-store';
 import type { Transport } from '../../transport/types';
@@ -14,7 +15,15 @@ const CONTENT_WIDTH = 'w-[clamp(680px,64%,920px)]';
  * 有消息时内容列 clamp(680,64%,920) 居中 + composer sticky 沉底（顶部 36px 渐隐遮罩）。
  * 空态欢迎区（标题/徽章/工作区 chips）已按需求移除，后续参考 dsh HeroShell 补齐。
  */
-export function ChatView({ store, transport }: { store: SessionStore; transport: Transport }) {
+export function ChatView({
+  store,
+  transport,
+  headerAction,
+}: {
+  store: SessionStore;
+  transport: Transport;
+  headerAction?: ReactNode;
+}) {
   const nodes = useStoreSelector(store, (s) => s.nodes);
   const status = useStoreSelector(store, (s) => s.status);
   const running = status === 'running';
@@ -22,13 +31,14 @@ export function ChatView({ store, transport }: { store: SessionStore; transport:
 
   return (
     <div className="flex h-full min-h-0 flex-col">
-      <header className="flex h-[76px] shrink-0 items-end border-b-[0.5px] border-line3 px-5 pb-2">
+      <header className="flex h-[76px] shrink-0 items-end justify-between border-b-[0.5px] border-line3 px-5 pb-2">
         <button
           type="button"
           className="max-w-[220px] truncate rounded-md px-2 py-1 text-[14px] leading-5 font-medium text-primary transition-colors duration-100 hover:bg-hover"
         >
           新会话
         </button>
+        {headerAction}
       </header>
 
       {empty ? (

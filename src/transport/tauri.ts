@@ -1,6 +1,6 @@
 import { invoke } from '@tauri-apps/api/core';
 import { listen, type UnlistenFn } from '@tauri-apps/api/event';
-import type { EventMsg, Transport } from './types';
+import type { EventMsg, Settings, Transport } from './types';
 
 // 通道名与 src-tauri/src/events.rs 保持一致。
 const EVENT_CHANNEL = 'shaniu://event';
@@ -46,6 +46,19 @@ export function createTauriTransport(): Transport {
 
     async cancel() {
       await invoke('cancel_task');
+    },
+
+    async getSettings() {
+      return invoke<Settings>('get_settings');
+    },
+
+    async saveSettings(input) {
+      await invoke('save_settings', {
+        baseUrl: input.baseUrl,
+        model: input.model,
+        workspaceRoot: input.workspaceRoot,
+        apiKey: input.apiKey?.trim() ? input.apiKey.trim() : null,
+      });
     },
 
     async approve() {

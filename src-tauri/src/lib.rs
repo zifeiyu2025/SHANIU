@@ -84,31 +84,45 @@ fn has_api_key(app: tauri::AppHandle, provider: String) -> Result<bool, String> 
     config::SecretStore::new(&state.config_root()).load_key(&provider).map(|k| k.is_some())
 }
 
-/// 保存模型端点配置（provider 固定 openai-responses；base_url/model/轮数）。
+/// 读取设置（非敏感字段 + Key 是否已配置）。
 #[tauri::command]
-fn set_model_config(
+fn get_settings(app: tauri::AppHandle) -> Result<serde_json::Value, String> {
+    let state = app.state::<AppState>();
+    let cfg = state.config();
+    let has_key = config::SecretStore::new(&state.config_root())
+        .load_key("openai-responses")
+        .map(|k| k.is_some())?;
+    Ok(serde_json::json!({
+        "baseUrl": cfg.model.base_url,
+        "model": cfg.model.model,
+        "maxTurns": cfg.model.max_turns,
+        "workspaceRoot": state.workspace_root().to_string_lossy(),
+        "hasApiKey": has_key,
+    }))
+}
+
+/// 保存设置：模型端点/工作区入 config.toml，API Key（可选填）DPAPI 加密落盘。
+#[tauri::command]
+fn save_settings(
     app: tauri::AppHandle,
     base_url: String,
     model: String,
-    max_turns: Option<u32>,
+    workspace_root: String,
+    api_key: Option<String>,
 ) -> Result<(), String> {
     let state = app.state::<AppState>();
     let mut cfg: AppConfig = state.config();
     cfg.model.base_url = base_url.trim_end_matches('/').to_string();
     cfg.model.model = model;
-    if let Some(t) = max_turns {
-        cfg.model.max_turns = t.clamp(1, 100);
+    cfg.workspace.root = workspace_root;
+    state.update_config(cfg)?;
+    if let Some(key) = api_key {
+        let key = key.trim().to_string();
+        if !key.is_empty() {
+            config::SecretStore::new(&state.config_root()).store_key("openai-responses", &key)?;
+        }
     }
-    state.update_config(cfg)
-}
-
-/// 保存工作区根目录。
-#[tauri::command]
-fn set_workspace_root(app: tauri::AppHandle, root: String) -> Result<(), String> {
-    let state = app.state::<AppState>();
-    let mut cfg = state.config();
-    cfg.workspace.root = root;
-    state.update_config(cfg)
+    Ok(())
 }
 
 /// 从托盘恢复主窗口：取消最小化 + 显示 + 聚焦。
@@ -140,8 +154,8 @@ pub fn run() {
             cancel_task,
             store_api_key,
             has_api_key,
-            set_model_config,
-            set_workspace_root
+            get_settings,
+            save_settings
         ])
         .on_window_event(|window, event| {
             // 关闭 = 隐藏到系统托盘（不退出）；真正退出只走托盘菜单「退出」

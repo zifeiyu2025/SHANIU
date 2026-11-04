@@ -1,4 +1,4 @@
-import type { EventMsg, Transport } from './types';
+import type { EventMsg, Settings, Transport } from './types';
 
 const delay = (ms: number) => new Promise<void>((resolve) => setTimeout(resolve, ms));
 
@@ -12,6 +12,12 @@ const MOCK_REPLY = [
 export function createMockTransport(): Transport {
   const listeners = new Set<(msg: EventMsg) => void>();
   let cancelRequested = false;
+  const settings: Settings = {
+    baseUrl: '',
+    model: '',
+    workspaceRoot: '',
+    hasApiKey: false,
+  };
 
   function emit(msg: EventMsg): void {
     for (const listener of [...listeners]) listener(msg);
@@ -43,6 +49,19 @@ export function createMockTransport(): Transport {
 
     async cancel() {
       cancelRequested = true;
+    },
+
+    async getSettings() {
+      await delay(10);
+      return { ...settings };
+    },
+
+    async saveSettings(input) {
+      await delay(10);
+      settings.baseUrl = input.baseUrl;
+      settings.model = input.model;
+      settings.workspaceRoot = input.workspaceRoot;
+      if (input.apiKey?.trim()) settings.hasApiKey = true;
     },
 
     async approve() {

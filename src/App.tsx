@@ -4,6 +4,8 @@ import { EdgeResizeLayer } from './components/chrome/EdgeResizeLayer';
 import { Sidebar, SidebarRail } from './components/chrome/Sidebar';
 import { TitleBar } from './components/chrome/TitleBar';
 import { ToolPanel } from './components/chrome/ToolPanel';
+import { SettingsDialog } from './components/settings/SettingsDialog';
+import { GearIcon } from './components/icons';
 import { createSessionStore, type SessionStore } from './store/session-store';
 import type { Transport } from './transport/types';
 
@@ -18,6 +20,7 @@ export function App({ transport }: { transport: Transport }) {
   const [link, setLink] = useState<LinkState>('pending');
   const [sidebarCollapsed, setSidebarCollapsed] = useState(false);
   const [rightOpen, setRightOpen] = useState(false);
+  const [settingsOpen, setSettingsOpen] = useState(false);
 
   useEffect(() => {
     let alive = true;
@@ -46,10 +49,27 @@ export function App({ transport }: { transport: Transport }) {
           <Sidebar onCollapse={() => setSidebarCollapsed(true)} />
         )}
         <main className="min-w-0 flex-1 overflow-hidden rounded-tl-[16px] bg-canvas">
-          <ChatView store={store} transport={transport} />
+          <ChatView
+            store={store}
+            transport={transport}
+            headerAction={
+              <button
+                type="button"
+                aria-label="打开设置"
+                title="设置"
+                onClick={() => setSettingsOpen(true)}
+                className="flex h-8 w-8 items-center justify-center rounded-sm text-tertiary transition-colors duration-100 hover:bg-hover hover:text-primary"
+              >
+                <GearIcon className="h-4 w-4" />
+              </button>
+            }
+          />
         </main>
         {rightOpen && <ToolPanel onClose={() => setRightOpen(false)} />}
       </div>
+      {settingsOpen && (
+        <SettingsDialog transport={transport} onClose={() => setSettingsOpen(false)} />
+      )}
       <EdgeResizeLayer />
     </div>
   );
