@@ -42,6 +42,15 @@ pub fn run() {
     tauri::Builder::default()
         .manage(AppState::new(app_config, config_path))
         .invoke_handler(tauri::generate_handler![dev_ping])
+        .on_window_event(|window, event| {
+            // 关闭 = 隐藏到系统托盘（不退出）；真正退出只走托盘菜单「退出」
+            if let tauri::WindowEvent::CloseRequested { api, .. } = event {
+                if window.label() == "main" {
+                    api.prevent_close();
+                    let _ = window.hide();
+                }
+            }
+        })
         .setup(|app| {
             // 系统托盘：菜单 = 显示 / 退出；左键单击图标 = 显示主窗口
             let show = MenuItem::with_id(app, "show", "显示", true, None::<&str>)?;
