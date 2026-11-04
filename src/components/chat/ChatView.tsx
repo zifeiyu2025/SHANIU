@@ -4,6 +4,7 @@ import type { SessionStore } from '../../store/session-store';
 import type { Transport } from '../../transport/types';
 import type { ConversationNode } from '../../nodes/types';
 import { StreamingText } from '../markdown/StreamingText';
+import { ApprovalCard } from '../approval/ApprovalCard';
 import { Composer } from './Composer';
 
 /** 会话内容列宽（dsh ConversationRoot.module.css:468-471）。 */
@@ -51,7 +52,7 @@ export function ChatView({
         <div className="min-h-0 flex-1 overflow-y-auto">
           <div className={`mx-auto mt-4 flex flex-col ${CONTENT_WIDTH} max-w-full px-4`}>
             {nodes.map((node) => (
-              <NodeItem key={node.id} node={node} />
+              <NodeItem key={node.id} node={node} transport={transport} />
             ))}
           </div>
           {/* 沉底输入卡：sticky + 卡片上方 36px 渐隐（ConversationRoot.module.css:447-550） */}
@@ -67,7 +68,7 @@ export function ChatView({
   );
 }
 
-function NodeItem({ node }: { node: ConversationNode }) {
+function NodeItem({ node, transport }: { node: ConversationNode; transport: Transport }) {
   switch (node.kind) {
     case 'user_message':
       // 右对齐气泡：bg specific-bubble、r20、pad 10 16、max-w 70.2%（MessageItem/UserMessageBubble）
@@ -92,6 +93,12 @@ function NodeItem({ node }: { node: ConversationNode }) {
           className="mt-3 rounded-md border-[0.5px] border-danger/40 bg-danger/10 px-3 py-2 text-[13px] text-danger"
         >
           {node.message}
+        </div>
+      );
+    case 'approval':
+      return (
+        <div className="mt-3">
+          <ApprovalCard node={node} transport={transport} />
         </div>
       );
   }

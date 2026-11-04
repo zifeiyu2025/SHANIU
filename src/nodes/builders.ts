@@ -1,4 +1,11 @@
-import type { AgentMessageNode, ConversationNode, ErrorNode, UserMessageNode } from './types';
+import type {
+  AgentMessageNode,
+  ApprovalNode,
+  ConversationNode,
+  ErrorNode,
+  RiskLevel,
+  UserMessageNode,
+} from './types';
 
 let seq = 0;
 
@@ -19,8 +26,19 @@ export function newErrorNode(message: string): ErrorNode {
   return { kind: 'error', id: nextId('error'), message };
 }
 
+export function newApprovalNode(
+  requestId: string,
+  tool: string,
+  args: unknown,
+  risk: RiskLevel,
+): ApprovalNode {
+  return { kind: 'approval', id: nextId('approval'), requestId, tool, args, risk, status: 'pending' };
+}
+
 export function isConversationNode(value: unknown): value is ConversationNode {
   if (typeof value !== 'object' || value === null) return false;
   const kind = (value as { kind?: unknown }).kind;
-  return kind === 'user_message' || kind === 'agent_message' || kind === 'error';
+  return (
+    kind === 'user_message' || kind === 'agent_message' || kind === 'error' || kind === 'approval'
+  );
 }

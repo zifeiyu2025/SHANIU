@@ -5,10 +5,11 @@ import { applyTurnEvent } from './turn';
 import { applyAgentMessageDelta } from './agent-message';
 import { applyTokenUsage } from './usage';
 import { applyError } from './error';
+import { applyApprovalEvent } from './approval';
 
 /**
  * EventMsg → store 归约器入口。
- * 未列出的 M1+ 事件（tool_call_* / exec_approval_* / plan_delta / turn_diff）与
+ * 未列出的 M1+ 事件（tool_call_* / plan_delta / turn_diff）与
  * 未知事件类型一律忽略：旧前端必须能容忍新协议事件（前向兼容，见 docs §5 FF-2）。
  */
 export function applyEvent(state: Draft<SessionState>, msg: EventMsg): void {
@@ -22,6 +23,9 @@ export function applyEvent(state: Draft<SessionState>, msg: EventMsg): void {
       return applyTokenUsage(state, msg);
     case 'error':
       return applyError(state, msg);
+    case 'exec_approval_request':
+    case 'exec_approval_resolved':
+      return applyApprovalEvent(state, msg);
     default:
       break;
   }

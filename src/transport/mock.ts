@@ -65,7 +65,8 @@ export function createMockTransport(): Transport {
     },
 
     async approve() {
-      throw new Error('M0 mock：审批通道在 M2 里程碑（permission broker）接入');
+      // mock 模式无后端 broker：静默忽略（审批卡状态由后端事件驱动，mock 不发）
+      await delay(10);
     },
 
     onEvent(handler) {

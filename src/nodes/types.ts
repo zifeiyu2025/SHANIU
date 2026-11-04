@@ -1,5 +1,8 @@
 // conversation-nodes 模式（ADR-006）：会话流统一建模为 node 序列。
-// M0 仅含消息类节点；tool_call / approval / diff / plan 节点随对应里程碑加入。
+// M2 增加 approval 节点；diff / plan 节点随对应里程碑加入。
+
+export type RiskLevel = 'read' | 'write_in_workspace' | 'execute' | 'destructive';
+export type ApprovalNodeStatus = 'pending' | 'allowed' | 'denied';
 
 export interface UserMessageNode {
   kind: 'user_message';
@@ -21,4 +24,14 @@ export interface ErrorNode {
   message: string;
 }
 
-export type ConversationNode = UserMessageNode | AgentMessageNode | ErrorNode;
+export interface ApprovalNode {
+  kind: 'approval';
+  id: string;
+  requestId: string;
+  tool: string;
+  args: unknown;
+  risk: RiskLevel;
+  status: ApprovalNodeStatus;
+}
+
+export type ConversationNode = UserMessageNode | AgentMessageNode | ErrorNode | ApprovalNode;

@@ -65,10 +65,6 @@ describe('reducers', () => {
   it('M1+ 事件与未知事件类型被忽略（前向兼容）', () => {
     let state = reduce(initialState(), { type: 'turn_started', turn: 1 });
     state = reduce(state, { type: 'tool_call_begin', call_id: 'c1', tool: 'unified_exec', args: {} });
-    state = reduce(
-      state,
-      { type: 'exec_approval_request', request_id: 'r1', tool: 't', args: {}, risk: 'execute' } as EventMsg,
-    );
     // 运行时收到未知 type 字符串也不得抛错
     state = reduce(state, { type: 'future_event', payload: 1 } as unknown as EventMsg);
     expect(state.nodes).toEqual([]);
