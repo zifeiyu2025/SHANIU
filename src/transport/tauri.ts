@@ -40,13 +40,12 @@ export function createTauriTransport(): Transport {
       });
     },
 
-    async sendTask() {
-      // M1 里程碑接入 agent_loop 后替换为 invoke('send_task', { task })
-      throw new Error('M0：真实任务提交在 M1 里程碑（agent_loop）接入');
+    async sendTask(task) {
+      await invoke('send_task', { task });
     },
 
     async cancel() {
-      // M1 里程碑接入 CancellationToken 传播后替换为 invoke('cancel')
+      await invoke('cancel_task');
     },
 
     async approve() {

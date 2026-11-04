@@ -324,8 +324,11 @@ mod tests {
             _tools: &[ToolDeclaration],
         ) -> Result<ModelStream, String> {
             let mut q = self.0.lock().unwrap();
-            let script = q.pop_front().ok_or("脚本耗尽")?;
-            Ok(Box::pin(futures::stream::iter(script)))
+            match q.pop_front() {
+                Some(script) if !script.is_empty() => Ok(Box::pin(futures::stream::iter(script))),
+                // 空脚本 = 永不产出的事件流（取消/超时类确定性测试用）
+                _ => Ok(Box::pin(futures::stream::pending())),
+            }
         }
     }
 
@@ -436,7 +439,8 @@ mod tests {
 
     #[tokio::test]
     async fn cancelled_token_yields_cancelled_completion() {
-        let (agent, store, cancel) = make_loop(vec![vec![ModelStreamEvent::OutputTextDelta { delta: "x".into() }]]);
+        // 空脚本 = 挂起的事件流：预取消后 select! 只有取消分支就绪（确定性）
+        let (agent, store, cancel) = make_loop(vec![vec![]]);
         cancel.cancel();
         let summary = agent.run_task("任务", Arc::new(CapturingSink(store.clone())), cancel).await;
         assert_eq!(summary.reason, TurnEndReason::Cancelled);

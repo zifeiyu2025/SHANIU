@@ -24,6 +24,7 @@ pub struct AppConfig {
     pub model: ModelConfig,
     pub sandbox: SandboxConfig,
     pub approval: ApprovalConfig,
+    pub workspace: WorkspaceConfig,
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
@@ -78,6 +79,14 @@ pub enum ApprovalMode {
     Ask,
     /// 只读自动放行，其余仍询问（M2 起 broker 裁决）。
     AutoReadOnly,
+}
+
+/// 工作区配置（docs §9.1：Agent 操作的项目目录，用户指定）。
+#[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
+#[serde(default)]
+pub struct WorkspaceConfig {
+    /// 工作区根目录；空 = 用户主目录（%USERPROFILE%）。
+    pub root: String,
 }
 
 /// 解析出的数据目录（§9.3：解析结果写入日志第一行）。
