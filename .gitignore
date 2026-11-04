@@ -36,3 +36,6 @@ pnpm-debug.log*
 *.pem
 *.key
 测试API.txt
+
+# 一次性原型/脚本（AGENTS §7：不并入主代码路径）
+scratch/
