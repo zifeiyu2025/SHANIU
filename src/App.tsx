@@ -34,6 +34,7 @@ export function App({ transport }: { transport: Transport }) {
         onToggleCollapse={() => setSidebarCollapsed((c) => !c)}
         rightOpen={rightOpen}
         onToggleRight={() => setRightOpen((o) => !o)}
+        link={link}
       />
       <div className="flex min-h-0 flex-1">
         {!sidebarCollapsed && (
@@ -44,10 +45,6 @@ export function App({ transport }: { transport: Transport }) {
         </main>
         {rightOpen && <ToolPanel onClose={() => setRightOpen(false)} />}
       </div>
-      {/* 连接状态以无侵入方式呈现（M0 验收观察点） */}
-      <span data-testid="link-state" className="sr-only">
-        {link === 'ok' ? 'IPC 已连通' : link === 'fail' ? 'IPC 未连通' : '连接中'}
-      </span>
     </div>
   );
 }

@@ -4,7 +4,7 @@ import { CloseIcon, MaximizeIcon, MinusIcon, PanelLeftIcon, PanelRightIcon } fro
 const isTauri = typeof window !== 'undefined' && '__TAURI_INTERNALS__' in window;
 
 /**
- * 无边框窗口自定义标题栏（复刻 dsh）：左侧折叠侧栏；右侧工具面板开关 +
+ * 无边框窗口自定义标题栏（复刻 dsh）：左侧折叠侧栏 + IPC 状态点；右侧工具面板开关 +
  * 自绘窗口控制按钮；整条可拖拽（data-tauri-drag-region，仅 Tauri 环境生效）。
  */
 export function TitleBar({
@@ -12,14 +12,16 @@ export function TitleBar({
   onToggleCollapse,
   rightOpen,
   onToggleRight,
+  link,
 }: {
   collapsed: boolean;
   onToggleCollapse: () => void;
   rightOpen: boolean;
   onToggleRight: () => void;
+  link: 'pending' | 'ok' | 'fail';
 }) {
   const win = isTauri ? getCurrentWindow() : null;
-
+  const linkTitle = link === 'ok' ? 'IPC 已连通' : link === 'fail' ? 'IPC 未连通' : 'IPC 连接中';
   return (
     <div
       data-tauri-drag-region
@@ -35,6 +37,14 @@ export function TitleBar({
         >
           <PanelLeftIcon className="h-[18px] w-[18px]" />
         </button>
+        <span
+          data-testid="link-state"
+          title={linkTitle}
+          aria-label={linkTitle}
+          className={`ml-1 h-2 w-2 rounded-full ${
+            link === 'ok' ? 'bg-emerald-500' : link === 'fail' ? 'bg-red-500' : 'bg-zinc-600'
+          }`}
+        />
       </div>
 
       <div className="flex items-center">
