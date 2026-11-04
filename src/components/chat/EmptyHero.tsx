@@ -1,5 +1,5 @@
 import type { ReactNode } from 'react';
-import { BrandMark, ChevronDownIcon, FolderIcon, ShieldIcon } from '../icons';
+import { BrandMark, ChevronDownIcon, FolderIcon } from '../icons';
 
 /** 空态标题行（复刻 dsh HeroShell：34px 品牌 + 26/32 wt500 + mono 预览徽章，:29-76）。 */
 export function EmptyHero() {
@@ -14,12 +14,11 @@ export function EmptyHero() {
   );
 }
 
-/** 工作区/模式选择 chip 行（复刻 dsh 图4：默认工作区 + 标准模式，h28、r8、13/20 wt500）。 */
+/** 工作区选择 chip 行（对齐 dsh：h28、r8、13/20 wt500、folder16+chevron12）。 */
 export function SelectorChips() {
   return (
     <div className="flex items-center gap-2">
       <Chip icon={<FolderIcon className="h-4 w-4" />} label="默认工作区" milestone="M1 接入" />
-      <Chip icon={<ShieldIcon className="h-3.5 w-3.5" />} label="标准模式" milestone="M1 接入" />
     </div>
   );
 }
