@@ -4,15 +4,15 @@ import type { Transport } from '../../transport/types';
 import type { ConversationNode } from '../../nodes/types';
 import { StreamingText } from '../markdown/StreamingText';
 import { Composer } from './Composer';
-import { EmptyHero, SelectorChips } from './EmptyHero';
 
 /** 会话内容列宽（dsh ConversationRoot.module.css:468-471）。 */
 const CONTENT_WIDTH = 'w-[clamp(680px,64%,920px)]';
 
 /**
  * 会话主区（复刻 dsh ConversationRoot）：
- * header 76px（0.5px l3 底边、面包屑 crumb）；空态垂直居中（栈 gap12、pb32 上浮）；
+ * header 76px（0.5px l3 底边、面包屑 crumb）；空态输入卡垂直居中（32px 上浮）；
  * 有消息时内容列 clamp(680,64%,920) 居中 + composer sticky 沉底（顶部 36px 渐隐遮罩）。
+ * 空态欢迎区（标题/徽章/工作区 chips）已按需求移除，后续参考 dsh HeroShell 补齐。
  */
 export function ChatView({ store, transport }: { store: SessionStore; transport: Transport }) {
   const nodes = useStoreSelector(store, (s) => s.nodes);
@@ -32,13 +32,9 @@ export function ChatView({ store, transport }: { store: SessionStore; transport:
       </header>
 
       {empty ? (
-        <div className="flex min-h-0 flex-1 items-center justify-center">
-          <div className={`flex flex-col items-center gap-3 ${CONTENT_WIDTH} max-w-full pb-8 px-4`}>
-            <EmptyHero />
-            <SelectorChips />
-            <div className="mt-0.5 w-full">
-              <Composer store={store} transport={transport} disabled={running} running={running} hero />
-            </div>
+        <div className="flex min-h-0 flex-1 items-center justify-center px-4">
+          <div className={`w-full ${CONTENT_WIDTH} max-w-full pb-8`}>
+            <Composer store={store} transport={transport} disabled={running} running={running} hero />
           </div>
         </div>
       ) : (

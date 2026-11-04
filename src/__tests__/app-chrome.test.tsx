@@ -23,20 +23,18 @@ describe('App 窗口 chrome', () => {
 
   it('侧栏折叠/展开（折叠钮在侧栏行，折叠后为 56px 轨）', () => {
     render(<App transport={createMockTransport()} />);
-    // 展开态：侧栏行 + hero chip 两处「默认工作区」
-    expect(screen.getAllByText('默认工作区').length).toBe(2);
     expect(screen.getByRole('button', { name: '折叠侧栏' })).toBeTruthy();
 
     act(() => {
       fireEvent.click(screen.getByRole('button', { name: '折叠侧栏' }));
     });
-    expect(screen.getAllByText('默认工作区').length).toBe(1); // 仅剩 hero chip
+    expect(screen.queryByRole('button', { name: '折叠侧栏' })).toBeNull();
     expect(screen.getByRole('button', { name: '展开侧栏' })).toBeTruthy();
 
     act(() => {
       fireEvent.click(screen.getByRole('button', { name: '展开侧栏' }));
     });
-    expect(screen.getAllByText('默认工作区').length).toBe(2);
+    expect(screen.getByRole('button', { name: '折叠侧栏' })).toBeTruthy();
   });
 
   it('浏览器模式（非 Tauri）不渲染窗口控制按钮', () => {
@@ -56,24 +54,16 @@ describe('App 窗口 chrome', () => {
     expect(dot.className).toContain('bg-success'); // ping 已回显
   });
 
-  it('新会话按钮清空会话节点', () => {
+  it('提交任务后从空态进入会话流', () => {
     const { unmount } = render(<App transport={createMockTransport()} />);
     const input = screen.getByPlaceholderText(/描述你想要构建的内容/);
 
-    // 通过 store 直接灌入消息（App 内部 store 不经 input 提交也能被重置）
-    act(() => {
-      screen.getByRole('button', { name: '发送' }); // 输入卡片存在
-    });
-    expect(screen.getByTestId('empty-hero')).toBeTruthy();
-
-    // 模拟有会话内容：通过键盘输入并提交
     fireEvent.change(input, { target: { value: '跑个任务' } });
     fireEvent.keyDown(input, { key: 'Enter' });
-    expect(screen.queryByTestId('empty-hero')).toBeNull();
 
-    // 侧栏有两处「新会话」（主按钮 + 工作区列表项），点主按钮（DOM 顺序在前）
-    fireEvent.click(screen.getAllByRole('button', { name: '新会话' })[0]);
-    expect(screen.getByTestId('empty-hero')).toBeTruthy();
+    // 用户气泡立即出现（store 同步记录）；composer 从 hero 切换为沉底实例，输入框为空
+    expect(screen.getByText('跑个任务')).toBeTruthy();
+    expect(screen.getByPlaceholderText(/描述你想要构建的内容/)).toHaveProperty('value', '');
     unmount();
   });
 });

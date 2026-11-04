@@ -49,10 +49,9 @@ describe('ChatView', () => {
     expect(screen.getByTestId('token-usage').textContent).toContain('↑10');
   });
 
-  it('空态：欢迎区 + 输入卡片居中', () => {
+  it('空态：输入卡片居中', () => {
     const store = createSessionStore();
     render(<ChatView store={store} transport={createMockTransport()} />);
-    expect(screen.getByTestId('empty-hero')).toBeTruthy();
     expect(screen.getByPlaceholderText(/描述你想要构建的内容/)).toBeTruthy();
   });
 });
