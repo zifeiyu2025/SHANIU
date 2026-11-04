@@ -12,8 +12,8 @@ crate-type = ["staticlib", "cdylib", "rlib"]
 tauri-build = { version = "2", features = [] }
 
 [dependencies]
-# 版本锁定见 docs/01-架构需求文档.md §6（Tauri 2.12.5）
-tauri = { version = "=2.12.5", features = [] }
+# 版本锁定见 docs/01-架构需求文档.md §6（Tauri 2.12.5）；tray-icon 为系统托盘所需 feature
+tauri = { version = "=2.12.5", features = ["tray-icon"] }
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 toml = "1.2"
