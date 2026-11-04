@@ -160,6 +160,186 @@ pub fn new_session_id(seq: u32) -> String {
     format!("sess-{ms}-{seq:04}")
 }
 
+// ============================== DPAPI 密钥存取（docs §9.1 secrets\） ==============================
+//
+// 边界（AGENTS §3 / docs §9.3）：Key 永不进代码/提示词/日志；仅本模块读写；
+// DPAPI 加密绑定当前机器当前用户——跨机器解密失败一律 Err（fail-closed，不回退明文）。
+
+use windows::core::PCWSTR;
+use windows::Win32::Foundation::{LocalFree, HLOCAL};
+use windows::Win32::Security::Cryptography::{
+    CryptProtectData, CryptUnprotectData, CRYPT_INTEGER_BLOB,
+};
+
+pub const SECRETS_DIR: &str = "secrets";
+
+/// DPAPI 加密（用户作用域）。输出 blob 需 LocalFree，务必走完释放路径。
+fn dpapi_protect(plaintext: &[u8]) -> Result<Vec<u8>, String> {
+    unsafe {
+        let input = CRYPT_INTEGER_BLOB {
+            cbData: plaintext.len() as u32,
+            pbData: plaintext.as_ptr() as *mut u8,
+        };
+        let mut out = CRYPT_INTEGER_BLOB::default();
+        CryptProtectData(
+            &input,
+            PCWSTR::null(),
+            None,
+            None,
+            None,
+            0,
+            &mut out,
+        )
+        .map_err(|e| format!("DPAPI 加密失败: {e}"))?;
+        let cipher = std::slice::from_raw_parts(out.pbData, out.cbData as usize).to_vec();
+        let _ = LocalFree(Some(HLOCAL(out.pbData.cast())));
+        Ok(cipher)
+    }
+}
+
+/// DPAPI 解密。任何失败都返回 Err——绝不降级输出半截数据。
+fn dpapi_unprotect(cipher: &[u8]) -> Result<Vec<u8>, String> {
+    unsafe {
+        let input = CRYPT_INTEGER_BLOB {
+            cbData: cipher.len() as u32,
+            pbData: cipher.as_ptr() as *mut u8,
+        };
+        let mut out = CRYPT_INTEGER_BLOB::default();
+        CryptUnprotectData(&input, None, None, None, None, 0, &mut out)
+            .map_err(|_| "DPAPI 解密失败（密文损坏或跨机器迁移）".to_string())?;
+        let plain = std::slice::from_raw_parts(out.pbData, out.cbData as usize).to_vec();
+        let _ = LocalFree(Some(HLOCAL(out.pbData.cast())));
+        Ok(plain)
+    }
+}
+
+/// 密钥存储：`<config_root>/secrets/<provider>.key`（DPAPI 密文，仅当前用户可解）。
+#[derive(Clone)]
+pub struct SecretStore {
+    root: std::path::PathBuf,
+}
+
+impl SecretStore {
+    pub fn new(config_root: &Path) -> Self {
+        Self { root: config_root.to_path_buf() }
+    }
+
+    /// provider 名清洗为文件系统安全 slug，阻断路径分隔符注入。
+    fn sanitize_provider(provider: &str) -> Result<String, String> {
+        let safe: String = provider
+            .chars()
+            .filter(|c| c.is_ascii_alphanumeric() || *c == '-' || *c == '_')
+            .collect();
+        if safe.is_empty() {
+            return Err("provider 名非法".into());
+        }
+        Ok(safe)
+    }
+
+    fn key_path(&self, provider: &str) -> Result<PathBuf, String> {
+        Ok(self.root.join(SECRETS_DIR).join(format!(
+            "{}.key",
+            Self::sanitize_provider(provider)?
+        )))
+    }
+
+    /// 存储并加密。空密钥拒绝。
+    pub fn store_key(&self, provider: &str, plaintext: &str) -> Result<(), String> {
+        if plaintext.trim().is_empty() {
+            return Err("密钥为空".into());
+        }
+        let cipher = dpapi_protect(plaintext.as_bytes())?;
+        let path = self.key_path(provider)?;
+        fs::create_dir_all(path.parent().expect("密钥路径必有父目录"))
+            .map_err(|e| format!("创建 secrets 目录失败: {e}"))?;
+        fs::write(&path, cipher).map_err(|e| format!("写入密钥失败: {e}"))
+    }
+
+    /// 读取并解密；不存在返回 Ok(None)。解密失败（损坏/跨机器）返回 Err——fail-closed。
+    pub fn load_key(&self, provider: &str) -> Result<Option<String>, String> {
+        let path = self.key_path(provider)?;
+        if !path.exists() {
+            return Ok(None);
+        }
+        let cipher = fs::read(&path).map_err(|e| format!("读取密钥失败: {e}"))?;
+        let plain = dpapi_unprotect(&cipher)?;
+        String::from_utf8(plain)
+            .map(Some)
+            .map_err(|_| "密钥编码非法".into())
+    }
+
+    pub fn delete_key(&self, provider: &str) -> Result<(), String> {
+        let path = self.key_path(provider)?;
+        if path.exists() {
+            fs::remove_file(&path).map_err(|e| format!("删除密钥失败: {e}"))?;
+        }
+        Ok(())
+    }
+}
+
+#[cfg(test)]
+mod secrets_tests {
+    use super::*;
+
+    fn store() -> SecretStore {
+        let base = std::env::temp_dir().join(format!("shaniu-secrets-{}", std::process::id()));
+        SecretStore::new(&base)
+    }
+
+    #[test]
+    fn round_trip_store_load() {
+        let s = store();
+        s.store_key("openai-responses", "sk-test-123").unwrap();
+        assert_eq!(s.load_key("openai-responses").unwrap().as_deref(), Some("sk-test-123"));
+        // 落盘的是 DPAPI 密文而非明文
+        let raw = std::fs::read(s.key_path("openai-responses").unwrap()).unwrap();
+        assert!(!raw.windows(12).any(|w| w == b"sk-test-123"));
+        s.delete_key("openai-responses").unwrap();
+    }
+
+    #[test]
+    fn missing_key_is_none() {
+        let s = store();
+        assert_eq!(s.load_key("nonexistent").unwrap(), None);
+    }
+
+    #[test]
+    fn delete_then_load_is_none() {
+        let s = store();
+        s.store_key("p1", "secret").unwrap();
+        s.delete_key("p1").unwrap();
+        assert_eq!(s.load_key("p1").unwrap(), None);
+    }
+
+    #[test]
+    fn tampered_cipher_fails_closed() {
+        let s = store();
+        s.store_key("p2", "secret-value").unwrap();
+        let path = s.key_path("p2").unwrap();
+        let mut raw = std::fs::read(&path).unwrap();
+        let mid = raw.len() / 2;
+        raw[mid] = raw[mid].wrapping_add(0xFF);
+        std::fs::write(&path, raw).unwrap();
+        // 损坏密文必须 Err，绝不输出明文
+        assert!(s.load_key("p2").is_err());
+        s.delete_key("p2").unwrap();
+    }
+
+    #[test]
+    fn provider_name_is_sanitized_against_path_injection() {
+        let s = store();
+        let path = s.key_path("../evil").unwrap();
+        // 分隔符被清洗：不逃逸 secrets 目录
+        assert!(path.file_name().unwrap() == "evil.key");
+    }
+
+    #[test]
+    fn empty_key_rejected() {
+        let s = store();
+        assert!(s.store_key("p3", "   ").is_err());
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

@@ -17,6 +17,15 @@ tauri = { version = "=2.12.5", features = ["tray-icon"] }
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 toml = "1.2"
+# M1 模型客户端（§6 已确认）：HTTP/SSE 与流处理
+reqwest = { version = "0.12", features = ["stream", "json"] }
+eventsource-stream = "0.2"
+futures = "0.3"
+# DPAPI（config.rs 密钥存取，§6 已确认方案）：微软官方 Win32 绑定，最小 feature 面
+windows = { version = "0.62", features = [
+    "Win32_Foundation",
+    "Win32_Security_Cryptography",
+] }
 
 [profile.release]
 codegen-units = 1
