@@ -1,4 +1,5 @@
 // pub 供集成测试（src-tauri/tests/）作为契约面使用
+pub mod agent_loop;
 pub mod app_state;
 pub mod config;
 pub mod events;
