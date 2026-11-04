@@ -35,3 +35,4 @@ pnpm-debug.log*
 .env.*
 *.pem
 *.key
+测试API.txt
