@@ -1,19 +1,125 @@
 @import "tailwindcss";
 
-/*
- * 主题令牌（复刻 deepseek-harness 桌面端暗色视觉，docs §8 styles）
- */
-@theme {
-  --color-sidebar: #0d0d0e;
-  --color-surface: #1a1a1a;
-  --color-raised: #262626;
-  --color-hover: #2a2a2a;
-  --color-border: #2e2e2e;
-  --color-text: #ececec;
-  --color-secondary: #8a8a8a;
-  --color-weak: #6f6f6f;
-  --color-accent: #5b6eae;
-  --color-accent-hover: #6d80c2;
+/* ============================================================
+   SHANIU 设计令牌 —— 全量复刻 deepseek-harness（dsh）桌面端
+   来源：packages/client/ui-theme/src/styles/design-platform.css、
+        base.css、gradient-shadow-text.css、scrollbar.css、focus.css
+   分层：--dsw-*（dsh 原值）→ @theme inline 映射为 Tailwind 工具类。
+   :root = 暗色（默认，对齐 dsh data-ds-dark-theme）；亮色随 M4 设置接入。
+   ============================================================ */
+
+:root {
+  color-scheme: dark;
+
+  /* —— 静态色板（亮暗同值） —— */
+  --dsw-deepseek-400: rgb(122 170 255);
+  --dsw-deepseek-500: rgb(65 118 230);
+  --dsw-neutral-600: rgb(84 85 87);
+  --dsw-neutral-700: rgb(60 60 61);
+  --dsw-bluish-50: rgb(249 250 251);
+  --dsw-bluish-300: rgb(207 211 214);
+  --dsw-bluish-400: rgb(173 178 184);
+  --dsw-bluish-600: rgb(129 133 140);
+  --dsw-bluish-750: rgb(67 69 74);
+  --dsw-bluish-800: rgb(53 54 56);
+  --dsw-bluish-850: rgb(44 44 46);
+  --dsw-bluish-875: rgb(35 35 36);
+  --dsw-bluish-900: rgb(27 27 28);
+  --dsw-bluish-950: rgb(21 21 23);
+  --dsw-red-400: rgb(242 90 90);
+  --dsw-green-500: rgb(34 197 94);
+
+  /* —— 语义别名（暗色） —— */
+  --dsw-bg-base: var(--dsw-bluish-950);
+  --dsw-bg-layer-1: var(--dsw-bluish-875);
+  --dsw-bg-layer-2: var(--dsw-bluish-850);
+  --dsw-bg-layer-3: var(--dsw-bluish-800);
+  --dsw-sidebar-fill: var(--dsw-bluish-900);
+  --dsw-label-primary: var(--dsw-bluish-50);
+  --dsw-label-secondary: var(--dsw-bluish-300);
+  --dsw-label-tertiary: var(--dsw-bluish-400);
+  --dsw-label-caption: var(--dsw-bluish-600);
+  --dsw-label-dimmed: var(--dsw-bluish-750);
+  --dsw-border-l1: rgb(255 255 255 / 0.06);
+  --dsw-border-l2: rgb(255 255 255 / 0.12);
+  --dsw-border-l3: rgb(255 255 255 / 0.16);
+  --dsw-border-l4: rgb(255 255 255 / 0.2);
+  --dsw-interactive-hover: rgb(255 255 255 / 0.08);
+  --dsw-interactive-active: rgb(255 255 255 / 0.14);
+  --dsw-business-primary: var(--dsw-deepseek-400);
+  --dsw-button-info-hover: var(--dsw-deepseek-500);
+  --dsw-button-elevated: var(--dsw-bluish-750);
+  --dsw-button-elevated-hover: var(--dsw-bluish-800);
+  --dsw-selector: var(--dsw-bluish-800);
+  --dsw-hover-solid: var(--dsw-bluish-800);
+  --dsw-menu-surface: rgb(48 49 54 / 0.64);
+  --dsw-scrollbar-thumb: var(--dsw-neutral-700);
+  --dsw-scrollbar-thumb-hover: var(--dsw-neutral-600);
+  --dsw-placeholder: #81858c;
+  --dsw-keycap: rgb(101 103 107);
+  --dsw-close-hover: #e81123;
+
+  /* —— elevation（描边 0.5px 画进 shadow，gradient-shadow-text.css:31-40） —— */
+  --dsw-elevation-soft:
+    0 0 0 0.5px var(--dsw-border-l2), 0 4px 16px rgb(0 0 0 / 0.03),
+    0 0 24px rgb(0 0 0 / 0.03);
+  --dsw-elevation-panel:
+    0 0 0 0.5px var(--dsw-border-l4), 0 3px 8px rgb(0 0 0 / 0.03),
+    0 0 16px rgb(0 0 0 / 0.02);
+  --dsw-elevation-prominent:
+    0 0 0 0.5px var(--dsw-border-l1), 0 3px 8px rgb(0 0 0 / 0.04),
+    0 0 20px rgb(0 0 0 / 0.05);
+
+  --ds-ease: cubic-bezier(0.4, 0, 0.2, 1);
+}
+
+@theme inline {
+  /* 颜色：bg-base→canvas、layer-1/2/3、label-*→text、border-l*→line、hover→bg-hover */
+  --color-canvas: var(--dsw-bg-base);
+  --color-sidebar: var(--dsw-sidebar-fill);
+  --color-layer1: var(--dsw-bg-layer-1);
+  --color-layer2: var(--dsw-bg-layer-2);
+  --color-layer3: var(--dsw-bg-layer-3);
+  --color-hover: var(--dsw-interactive-hover);
+  --color-active: var(--dsw-interactive-active);
+  --color-primary: var(--dsw-label-primary);
+  --color-secondary: var(--dsw-label-secondary);
+  --color-tertiary: var(--dsw-label-tertiary);
+  --color-caption: var(--dsw-label-caption);
+  --color-dimmed: var(--dsw-label-dimmed);
+  --color-accent: var(--dsw-business-primary);
+  --color-accent-strong: var(--dsw-button-info-hover);
+  --color-danger: var(--dsw-red-400);
+  --color-success: var(--dsw-green-500);
+  --color-menu: var(--dsw-menu-surface);
+  --color-selector: var(--dsw-selector);
+  --color-btn-elevated: var(--dsw-button-elevated);
+  --color-btn-elevated-hover: var(--dsw-button-elevated-hover);
+  --color-line1: var(--dsw-border-l1);
+  --color-line2: var(--dsw-border-l2);
+  --color-line3: var(--dsw-border-l3);
+  --color-line4: var(--dsw-border-l4);
+
+  /* 圆角体系（base.css:18-23）：chip 8 / 行卡 12 / 代码菜单 16 / 气泡 20 / composer 28 */
+  --radius-xs: 4px;
+  --radius-sm: 8px;
+  --radius-md: 12px;
+  --radius-lg: 16px;
+  --radius-xl: 20px;
+  --radius-panel: 28px;
+
+  --shadow-soft: var(--dsw-elevation-soft);
+  --shadow-panel: var(--dsw-elevation-panel);
+  --shadow-prominent: var(--dsw-elevation-prominent);
+
+  /* 字体（base.css:7-12） */
+  --font-sans:
+    -apple-system, BlinkMacSystemFont, "Segoe UI", "PingFang SC",
+    "Hiragino Sans GB", "Microsoft YaHei", "Helvetica Neue", Helvetica, Arial,
+    sans-serif;
+  --font-mono:
+    "SF Mono", "JetBrains Mono", "Fira Code", Consolas, "Liberation Mono",
+    Menlo, Courier, "PingFang SC", "Microsoft YaHei";
 }
 
 html,
@@ -24,25 +130,41 @@ body,
 
 body {
   margin: 0;
-  background-color: var(--color-surface);
-  color: var(--color-text);
-  font-family: "Segoe UI", "Microsoft YaHei", system-ui, sans-serif;
-  -webkit-font-smoothing: antialiased;
   overflow: hidden; /* 无边框窗口内禁止整页滚动 */
+  background-color: var(--dsw-bg-base);
+  color: var(--dsw-label-primary);
+  font-family: var(--font-sans);
+  font-size: 14px;
+  line-height: 22px;
+  -webkit-font-smoothing: antialiased;
 }
 
-/* 细滚动条（复刻 dsh） */
+::selection {
+  background: rgb(122 170 255 / 0.3);
+}
+
+/* 滚动条：5px、圆角 999、track 透明（scrollbar.css:25,67-97） */
 *::-webkit-scrollbar {
-  width: 8px;
-  height: 8px;
+  width: 5px;
+  height: 5px;
 }
 *::-webkit-scrollbar-thumb {
-  background: #2e2e2e;
-  border-radius: 4px;
+  background-color: var(--dsw-scrollbar-thumb);
+  border-radius: 999px;
 }
 *::-webkit-scrollbar-thumb:hover {
-  background: #3a3a3a;
+  background-color: var(--dsw-scrollbar-thumb-hover);
 }
 *::-webkit-scrollbar-track {
   background: transparent;
+}
+
+/* focus ring 2px 蓝（focus.css:3）；交互过渡 100ms（base.css:14-17） */
+:focus-visible {
+  outline: 2px solid var(--dsw-business-primary);
+  outline-offset: -1px;
+}
+
+button {
+  cursor: pointer;
 }

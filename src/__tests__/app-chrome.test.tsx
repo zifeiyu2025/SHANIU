@@ -46,11 +46,11 @@ describe('App 窗口 chrome', () => {
   it('IPC 握手成功后标题栏状态点变绿', async () => {
     render(<App transport={createMockTransport()} />);
     const dot = screen.getByTestId('link-state');
-    expect(dot.className).toContain('bg-zinc-600'); // 连接中
+    expect(dot.className).toContain('bg-dimmed'); // 连接中
     await act(async () => {
       await new Promise((r) => setTimeout(r, 80));
     });
-    expect(dot.className).toContain('bg-emerald-500'); // ping 已回显
+    expect(dot.className).toContain('bg-success'); // ping 已回显
   });
 
   it('新会话按钮清空会话节点', () => {

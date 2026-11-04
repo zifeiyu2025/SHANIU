@@ -4,11 +4,15 @@ import type { Transport } from '../../transport/types';
 import type { ConversationNode } from '../../nodes/types';
 import { StreamingText } from '../markdown/StreamingText';
 import { Composer } from './Composer';
-import { EmptyHero } from './EmptyHero';
+import { EmptyHero, SelectorChips } from './EmptyHero';
+
+/** 会话内容列宽（dsh ConversationRoot.module.css:468-471）。 */
+const CONTENT_WIDTH = 'w-[clamp(680px,64%,920px)]';
 
 /**
- * 会话主区（复刻 dsh）：空态时欢迎语 + 输入卡片垂直居中；
- * 有消息时消息流滚动 + 输入卡片沉底。
+ * 会话主区（复刻 dsh ConversationRoot）：
+ * header 76px（0.5px l3 底边、面包屑 crumb）；空态垂直居中（栈 gap12、pb32 上浮）；
+ * 有消息时内容列 clamp(680,64%,920) 居中 + composer sticky 沉底（顶部 36px 渐隐遮罩）。
  */
 export function ChatView({ store, transport }: { store: SessionStore; transport: Transport }) {
   const nodes = useStoreSelector(store, (s) => s.nodes);
@@ -18,24 +22,38 @@ export function ChatView({ store, transport }: { store: SessionStore; transport:
 
   return (
     <div className="flex h-full min-h-0 flex-col">
-      <main className="min-h-0 flex-1 overflow-y-auto px-4 py-6">
-        {empty ? (
-          <div className="mx-auto flex h-full max-w-2xl flex-col items-center justify-center gap-10 pb-10">
+      <header className="flex h-[76px] shrink-0 items-end border-b-[0.5px] border-line3 px-5 pb-2">
+        <button
+          type="button"
+          className="max-w-[220px] truncate rounded-md px-2 py-1 text-[14px] leading-5 font-medium text-primary transition-colors duration-100 hover:bg-hover"
+        >
+          新会话
+        </button>
+      </header>
+
+      {empty ? (
+        <div className="flex min-h-0 flex-1 items-center justify-center">
+          <div className={`flex flex-col items-center gap-3 ${CONTENT_WIDTH} max-w-full pb-8 px-4`}>
             <EmptyHero />
-            <Composer store={store} transport={transport} disabled={running} running={running} />
+            <SelectorChips />
+            <div className="mt-0.5 w-full">
+              <Composer store={store} transport={transport} disabled={running} running={running} hero />
+            </div>
           </div>
-        ) : (
-          <div className="mx-auto flex max-w-3xl flex-col gap-5 pb-4">
+        </div>
+      ) : (
+        <div className="min-h-0 flex-1 overflow-y-auto">
+          <div className={`mx-auto mt-4 flex flex-col ${CONTENT_WIDTH} max-w-full px-4`}>
             {nodes.map((node) => (
               <NodeItem key={node.id} node={node} />
             ))}
           </div>
-        )}
-      </main>
-      {!empty && (
-        <div className="px-4 pb-4">
-          <div className="mx-auto max-w-2xl">
-            <Composer store={store} transport={transport} disabled={running} running={running} />
+          {/* 沉底输入卡：sticky + 卡片上方 36px 渐隐（ConversationRoot.module.css:447-550） */}
+          <div className="sticky bottom-0 px-4 pb-4">
+            <div className="pointer-events-none absolute bottom-full left-0 right-0 h-9 bg-gradient-to-t from-canvas to-transparent" />
+            <div className={`mx-auto ${CONTENT_WIDTH} max-w-full`}>
+              <Composer store={store} transport={transport} disabled={running} running={running} />
+            </div>
           </div>
         </div>
       )}
@@ -46,14 +64,18 @@ export function ChatView({ store, transport }: { store: SessionStore; transport:
 function NodeItem({ node }: { node: ConversationNode }) {
   switch (node.kind) {
     case 'user_message':
+      // 右对齐气泡：bg specific-bubble、r20、pad 10 16、max-w 70.2%（MessageItem/UserMessageBubble）
       return (
-        <div className="max-w-[80%] self-end rounded-2xl bg-hover px-4 py-2.5">
-          <p className="whitespace-pre-wrap text-[14px] leading-6 text-text">{node.text}</p>
+        <div className="mt-3 flex justify-end">
+          <div className="max-w-[70.2%] rounded-xl bg-layer2 px-4 py-2.5 text-[14px] leading-[22px] whitespace-pre-wrap text-primary">
+            {node.text}
+          </div>
         </div>
       );
     case 'agent_message':
+      // 平铺无气泡：正文 14/24、块间 16（AssistantMarkdown.module.css:9-21）
       return (
-        <div className="text-[15px] text-text">
+        <div className="mt-3 text-[14px] leading-6 text-primary">
           <StreamingText text={node.text} streaming={node.streaming} />
         </div>
       );
@@ -61,7 +83,7 @@ function NodeItem({ node }: { node: ConversationNode }) {
       return (
         <div
           role="alert"
-          className="rounded-xl border border-red-900/70 bg-red-950/40 px-4 py-3 text-sm text-red-300"
+          className="mt-3 rounded-md border-[0.5px] border-danger/40 bg-danger/10 px-3 py-2 text-[13px] text-danger"
         >
           {node.message}
         </div>

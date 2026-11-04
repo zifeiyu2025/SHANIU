@@ -1,56 +1,73 @@
-import type { ReactNode } from 'react';
+import type { ComponentType, ReactNode } from 'react';
 import type { SessionStore } from '../../store/session-store';
 import {
   BrandMark,
   DotsIcon,
   FolderIcon,
   GearIcon,
+  PanelLeftIcon,
   PlusIcon,
   PuzzleIcon,
   SearchIcon,
 } from '../icons';
 
-/** 左侧栏（复刻 dsh）：品牌行 / 新会话 / 菜单 / 工作区分组 / 底部用户。 */
-export function Sidebar({ store, onNewSession }: { store: SessionStore; onNewSession: () => void }) {
-  const nodeCount = 0; // 占位：M3 会话列表接入后替换为真实会话列表
-  void nodeCount;
-  void store;
+const ICON_BTN_28 =
+  'flex h-7 w-7 items-center justify-center rounded-sm text-tertiary transition-colors duration-100 hover:bg-hover hover:text-secondary';
 
+const MENU_ROWS: Array<{ icon: ComponentType<{ className?: string }>; label: string; milestone: string }> = [
+  { icon: GearIcon, label: '设置', milestone: 'M4 接入' },
+  { icon: PuzzleIcon, label: '插件', milestone: '二期接入' },
+  { icon: DotsIcon, label: '更多', milestone: '二期接入' },
+];
+
+/** 左侧栏·展开态（复刻 dsh SidebarRoot：280px、pad 6 8、logo 行 60px、行 32px）。 */
+export function Sidebar({
+  onNewSession,
+  onCollapse,
+}: {
+  store: SessionStore;
+  onNewSession: () => void;
+  onCollapse: () => void;
+}) {
   return (
-    <aside className="flex w-[280px] shrink-0 flex-col bg-sidebar text-[13px]">
-      {/* 品牌行 */}
-      <div className="flex items-center gap-2 px-4 pt-3 pb-2">
-        <BrandMark className="h-6 w-6 text-text" />
-        <span className="text-[15px] font-semibold tracking-wide text-white">SHANIU</span>
-        <span className="rounded-full border border-secondary/70 px-1.5 py-px text-[9px] tracking-widest text-secondary">
+    <aside className="flex w-[280px] shrink-0 flex-col bg-sidebar pb-2 text-primary">
+      {/* 品牌行 h60（logoRow，SidebarRoot.module.css:231-242） */}
+      <div className="flex h-[60px] shrink-0 items-center gap-[5px] pl-2">
+        <BrandMark className="h-6 w-6" />
+        <span className="text-[18px] font-semibold leading-6 tracking-[0.04em]">SHANIU</span>
+        <span className="ml-0.5 flex h-[10px] items-center rounded-[2px] px-[3px] pb-px font-mono text-[8px] font-medium leading-[10px] text-secondary ring-[0.5px] ring-line2">
           HARNESS
         </span>
-      </div>
-
-      {/* 新会话 */}
-      <div className="px-3 pt-1">
+        <div className="flex-1" />
         <button
           type="button"
-          onClick={onNewSession}
-          className="flex h-10 w-full items-center justify-center gap-2 rounded-[10px] bg-hover text-text transition-colors hover:bg-raised"
+          aria-label="折叠侧栏"
+          title="折叠侧栏"
+          onClick={onCollapse}
+          className="mr-1 flex h-7 w-7 items-center justify-center rounded-sm text-secondary transition-colors duration-100 hover:bg-hover hover:text-primary"
         >
-          <PlusIcon className="h-4 w-4" />
-          新会话
+          <PanelLeftIcon className="h-4 w-4" />
         </button>
       </div>
 
-      {/* 菜单（M1+ 接入对应功能，当前仅占位） */}
-      <nav className="mt-3 flex flex-col gap-0.5 px-3">
-        {[
-          { icon: GearIcon, label: '设置', milestone: 'M4' },
-          { icon: PuzzleIcon, label: '插件', milestone: '二期' },
-          { icon: DotsIcon, label: '更多', milestone: '二期' },
-        ].map(({ icon: Icon, label, milestone }) => (
+      {/* 新会话：h38、r12、0.5px 边框、elevated 填充（:420-531） */}
+      <button
+        type="button"
+        onClick={onNewSession}
+        className="mx-1 flex h-[38px] shrink-0 items-center justify-center gap-2 rounded-md border-[0.5px] border-line3 bg-btn-elevated text-[14px] font-medium leading-[22px] transition-colors duration-100 hover:bg-btn-elevated-hover"
+      >
+        <PlusIcon className="h-3.5 w-3.5" />
+        新会话
+      </button>
+
+      {/* 菜单行：min-h 32、pad 5 9、r12、label-primary（:685-724） */}
+      <nav className="mt-2 flex shrink-0 flex-col">
+        {MENU_ROWS.map(({ icon: Icon, label, milestone }) => (
           <button
             key={label}
             type="button"
-            title={`${milestone}接入`}
-            className="flex h-9 items-center gap-2.5 rounded-lg px-2.5 text-secondary hover:bg-hover hover:text-text"
+            title={milestone}
+            className="flex min-h-8 items-center gap-1.5 rounded-md px-[9px] py-[5px] text-left text-[14px] leading-[22px] transition-colors duration-100 hover:bg-hover"
           >
             <Icon className="h-4 w-4" />
             {label}
@@ -58,49 +75,57 @@ export function Sidebar({ store, onNewSession }: { store: SessionStore; onNewSes
         ))}
       </nav>
 
-      {/* 工作区分组 */}
-      <div className="mt-5 flex min-h-0 flex-1 flex-col">
-        <div className="flex items-center justify-between px-4 pb-1">
-          <span className="text-xs text-weak">工作区</span>
-          <button
-            type="button"
-            title="搜索工作区（M3 接入）"
-            className="flex h-6 w-6 items-center justify-center rounded-md text-weak hover:bg-hover hover:text-secondary"
-          >
+      {/* 工作区分组：标题行 36px tertiary（WorkspaceBrowser.module.css:66-79） */}
+      <div className="mt-1 flex min-h-0 flex-1 flex-col">
+        <div className="flex h-9 shrink-0 items-center justify-between pl-3 pr-0.5">
+          <span className="text-tertiary">工作区</span>
+          <button type="button" title="搜索工作区（M3 接入）" className={ICON_BTN_28}>
             <SearchIcon className="h-3.5 w-3.5" />
           </button>
         </div>
-        <div className="flex-1 overflow-y-auto px-2">
-          <SidebarItem icon={<FolderIcon className="h-4 w-4" />} label="默认工作区" />
-          <SidebarItem label="新会话" selected />
+        <div className="relative min-h-0 flex-1 overflow-y-auto pr-1">
+          <SidebarRow icon={<FolderIcon className="h-4 w-4" />} label="默认工作区" />
+          <SidebarRow label="新会话" selected />
+          {/* 列表底部 24px 渐隐（:586-593） */}
+          <div className="pointer-events-none sticky bottom-0 -mb-1 h-6 bg-gradient-to-t from-sidebar to-transparent" />
         </div>
       </div>
 
-      {/* 底部用户 */}
-      <div className="flex items-center gap-2.5 px-4 py-3">
-        <span className="flex h-7 w-7 items-center justify-center rounded-full bg-accent/30 text-xs font-semibold text-text">
+      {/* 底部用户区（footArea，:781-807） */}
+      <div className="mt-1 flex h-9 shrink-0 items-center gap-2 px-1">
+        <span className="flex h-7 w-7 items-center justify-center rounded-full bg-accent/30 text-[12px] font-medium">
           本
         </span>
-        <span className="text-secondary">本地用户</span>
+        <span className="text-[13px] leading-5 text-secondary">本地用户</span>
       </div>
     </aside>
   );
 }
 
-function SidebarItem({
-  icon,
-  label,
-  selected = false,
-}: {
-  icon?: ReactNode;
-  label: string;
-  selected?: boolean;
-}) {
+/** 左侧栏·折叠轨（rail 56px：36×36 静息 logo、hover 换面板图标，:337-394）。 */
+export function SidebarRail({ onExpand }: { onExpand: () => void }) {
+  return (
+    <aside className="flex w-14 shrink-0 flex-col items-center bg-sidebar pt-[18px]">
+      <button
+        type="button"
+        aria-label="展开侧栏"
+        title="展开侧栏"
+        onClick={onExpand}
+        className="group flex h-9 w-9 items-center justify-center rounded-md text-primary transition-colors duration-100 hover:bg-hover"
+      >
+        <BrandMark className="h-5 w-5 group-hover:hidden" />
+        <PanelLeftIcon className="hidden h-5 w-5 group-hover:block" />
+      </button>
+    </aside>
+  );
+}
+
+function SidebarRow({ icon, label, selected = false }: { icon?: ReactNode; label: string; selected?: boolean }) {
   return (
     <button
       type="button"
-      className={`flex h-9 w-full items-center gap-2.5 rounded-lg px-2.5 ${
-        selected ? 'bg-raised text-white' : 'text-secondary hover:bg-hover hover:text-text'
+      className={`flex h-8 w-full items-center gap-2 rounded-md px-2 text-left text-[14px] leading-5 transition-colors duration-100 hover:bg-hover ${
+        selected ? 'bg-hover' : ''
       }`}
     >
       {icon}

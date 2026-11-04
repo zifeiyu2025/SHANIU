@@ -1,38 +1,47 @@
+import type { ReactNode } from 'react';
 import { BrandMark, ChevronDownIcon, FolderIcon, ShieldIcon } from '../icons';
 
-/** 会话空态欢迎区（复刻 dsh 空态：品牌语 + 徽章 + 工作区/沙箱选择行）。 */
+/** 空态标题行（复刻 dsh HeroShell：34px 品牌 + 26/32 wt500 + mono 预览徽章，:29-76）。 */
 export function EmptyHero() {
   return (
-    <div data-testid="empty-hero" className="flex flex-col items-center gap-7 text-center">
-      <div className="flex flex-col items-center gap-3">
-        <BrandMark className="h-10 w-10 text-text" />
-        <h1 className="flex items-center gap-2 text-[26px] font-bold leading-tight text-white">
-          把开发任务交给 Agent
-          <span className="rounded-full bg-raised px-2 py-0.5 text-[11px] font-normal text-secondary">
-            预览版
-          </span>
-        </h1>
-      </div>
-      <div className="flex items-center gap-2 text-[13px] text-secondary">
-        <button
-          type="button"
-          title="工作区选择（M1 接入）"
-          className="flex items-center gap-1.5 rounded-lg px-2.5 py-1.5 hover:bg-hover hover:text-text"
-        >
-          <FolderIcon className="h-4 w-4" />
-          默认工作区
-          <ChevronDownIcon className="h-3.5 w-3.5" />
-        </button>
-        <button
-          type="button"
-          title="沙箱策略（M2 接入，当前默认只读）"
-          className="flex items-center gap-1.5 rounded-lg px-2.5 py-1.5 hover:bg-hover hover:text-text"
-        >
-          <ShieldIcon className="h-4 w-4" />
-          只读沙箱
-          <ChevronDownIcon className="h-3.5 w-3.5" />
-        </button>
-      </div>
+    <div data-testid="empty-hero" className="flex items-center justify-center gap-2.5">
+      <BrandMark className="h-[34px] w-[34px] text-primary" />
+      <h1 className="text-[26px] font-medium leading-8 text-primary">把开发任务交给 Agent</h1>
+      <span className="mt-1 rounded-full border-[0.5px] border-accent/25 bg-accent/15 px-[7px] pt-px font-mono text-[12px] leading-[18px] font-medium text-primary">
+        预览版
+      </span>
     </div>
+  );
+}
+
+/** 工作区/沙箱选择 chip 行（复刻 dsh 工作区选择行：h28、r8、13/20 wt500、folder16+chevron12）。 */
+export function SelectorChips() {
+  return (
+    <div className="flex items-center gap-2">
+      <Chip icon={<FolderIcon className="h-4 w-4" />} label="默认工作区" milestone="M1 接入" />
+      <Chip icon={<ShieldIcon className="h-3.5 w-3.5" />} label="只读沙箱" milestone="M2 接入" />
+    </div>
+  );
+}
+
+function Chip({
+  icon,
+  label,
+  milestone,
+}: {
+  icon: ReactNode;
+  label: string;
+  milestone: string;
+}) {
+  return (
+    <button
+      type="button"
+      title={milestone}
+      className="flex h-7 items-center gap-1.5 rounded-sm px-2 text-[13px] font-medium leading-5 text-primary transition-colors duration-100 hover:bg-hover"
+    >
+      {icon}
+      {label}
+      <ChevronDownIcon className="h-3 w-3 text-caption" />
+    </button>
   );
 }

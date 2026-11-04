@@ -8,7 +8,7 @@ function base(className?: string) {
     viewBox: '0 0 24 24',
     fill: 'none',
     stroke: 'currentColor',
-    strokeWidth: 1.8,
+    strokeWidth: 1.3, // dsh 图标两档描边：regular 1px / medium 1.3px（artwork.ts:9,12）
     strokeLinecap: 'round' as const,
     strokeLinejoin: 'round' as const,
     className,
