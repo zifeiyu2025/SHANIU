@@ -156,9 +156,206 @@ pub fn build_responses_request(
     })
 }
 
+/// 构造 ChatCompletions API 请求体（stream:true；工具为 function 包装）。
+pub fn build_chat_request(
+    provider: &ProviderConfig,
+    history: &[HistoryItem],
+    tools: &[ToolDeclaration],
+) -> serde_json::Value {
+    let messages: Vec<serde_json::Value> = history
+        .iter()
+        .map(|h| match h {
+            HistoryItem::Message { role, text } => serde_json::json!({
+                "role": role,
+                "content": text,
+            }),
+            HistoryItem::FunctionCall { name, arguments, call_id } => serde_json::json!({
+                "role": "assistant",
+                "content": null,
+                "tool_calls": [{
+                    "id": call_id,
+                    "type": "function",
+                    "function": { "name": name, "arguments": arguments },
+                }],
+            }),
+            HistoryItem::FunctionCallOutput { call_id, output } => serde_json::json!({
+                "role": "tool",
+                "tool_call_id": call_id,
+                "content": output,
+            }),
+        })
+        .collect();
+    serde_json::json!({
+        "model": provider.model,
+        "messages": messages,
+        "stream": true,
+        "tools": tools.iter().map(|t| serde_json::json!({
+            "type": "function",
+            "function": {
+                "name": t.name,
+                "description": t.description,
+                "parameters": t.parameters,
+            },
+        })).collect::<Vec<_>>(),
+    })
+}
+
+// ============================== ChatCompletions 分片累积（纯状态机） ==============================
+
+/// ChatCompletions 流式状态机：增量 chunk → 模型事件。
+/// 工具调用按 index 分片到达（name 首片、arguments 逐段），finish_reason=tool_calls
+/// 时统一发已装配的 FunctionCall 输出项；文本增量直接透传。
+#[derive(Default)]
+pub struct ChatStreamAccumulator {
+    text: String,
+    tool_calls: Vec<(String, String, String)>, // (id, name, arguments)
+    finished: bool,
+}
+
+impl ChatStreamAccumulator {
+    pub fn feed(&mut self, data: &serde_json::Value) -> Vec<ModelStreamEvent> {
+        let mut events = Vec::new();
+        if let Some(choices) = data.get("choices").and_then(|c| c.as_array()) {
+            if let Some(choice) = choices.first() {
+                if let Some(delta) = choice.get("delta") {
+                    if let Some(content) = delta.get("content").and_then(|c| c.as_str()) {
+                        if !content.is_empty() {
+                            self.text.push_str(content);
+                            events.push(ModelStreamEvent::OutputTextDelta { delta: content.to_string() });
+                        }
+                    }
+                    if let Some(tool_calls) = delta.get("tool_calls").and_then(|t| t.as_array()) {
+                        for tc in tool_calls {
+                            let index = tc.get("index").and_then(|i| i.as_u64()).unwrap_or(0) as usize;
+                            while self.tool_calls.len() <= index {
+                                self.tool_calls.push((String::new(), String::new(), String::new()));
+                            }
+                            if let Some(id) = tc.get("id").and_then(|v| v.as_str()) {
+                                self.tool_calls[index].0 = id.to_string();
+                            }
+                            if let Some(f) = tc.get("function") {
+                                if let Some(name) = f.get("name").and_then(|v| v.as_str()) {
+                                    if !name.is_empty() {
+                                        self.tool_calls[index].1 = name.to_string();
+                                    }
+                                }
+                                if let Some(a) = f.get("arguments").and_then(|v| v.as_str()) {
+                                    self.tool_calls[index].2.push_str(a);
+                                }
+                            }
+                        }
+                    }
+                }
+                let finish = choice.get("finish_reason").and_then(|f| f.as_str());
+                if finish == Some("tool_calls") && !self.finished {
+                    self.finished = true;
+                    for (id, name, arguments) in self.tool_calls.drain(..) {
+                        events.push(ModelStreamEvent::OutputItem(ResponseItem::FunctionCall {
+                            name, arguments, call_id: id,
+                        }));
+                    }
+                }
+            }
+        }
+        if let Some(usage) = data.get("usage").filter(|u| u.is_object()) {
+            let usage = Usage {
+                input_tokens: usage.get("prompt_tokens").and_then(|v| v.as_u64()).unwrap_or(0) as u32,
+                cached_input_tokens: usage
+                    .pointer("/prompt_tokens_details/cached_tokens")
+                    .and_then(|v| v.as_u64())
+                    .map(|v| v as u32),
+                output_tokens: usage.get("completion_tokens").and_then(|v| v.as_u64()).unwrap_or(0) as u32,
+            };
+            events.push(ModelStreamEvent::Completed { usage });
+        }
+        events
+    }
+}
+
+/// ChatCompletions SSE 数据翻译（纯函数；[DONE] 返回空，error 追加 Failed）。
+pub fn translate_chat_data(data: &str, acc: &mut ChatStreamAccumulator) -> Vec<ModelStreamEvent> {
+    let data = data.trim();
+    if data == "[DONE]" || data.is_empty() {
+        return Vec::new();
+    }
+    let Ok(json) = serde_json::from_str::<serde_json::Value>(data) else {
+        return Vec::new();
+    };
+    let mut events = acc.feed(&json);
+    if let Some(err) = json.get("error") {
+        events.push(ModelStreamEvent::Failed {
+            message: err
+                .get("message")
+                .and_then(|v| v.as_str())
+                .unwrap_or("chat error")
+                .to_string(),
+        });
+    }
+    events
+}
+
 // ============================== 网络流（薄 IO 壳） ==============================
 
-/// 打开模型 SSE 流（Bearer 鉴权；密钥由调用方从 SecretStore 解密传入，本模块不接触存储）。
+/// 模型流别名（agent_loop 消费；Pin<Box> 保证 Unpin 语义简单）。
+pub type ModelStream = std::pin::Pin<Box<dyn Stream<Item = ModelStreamEvent> + Send>>;
+
+/// 统一入口：按协议族选择 Responses / ChatCompletions 流。
+pub async fn stream_model(
+    provider: &ProviderConfig,
+    api_key: &str,
+    history: &[HistoryItem],
+    tools: &[ToolDeclaration],
+) -> Result<ModelStream, String> {
+    if provider.is_responses() {
+        Ok(Box::pin(stream_responses(provider, api_key, history, tools).await?))
+    } else {
+        Ok(Box::pin(stream_chat(provider, api_key, history, tools).await?))
+    }
+}
+
+/// ChatCompletions 端点：base_url 已含 /chat/completions 则原样，否则拼接。
+fn chat_url(provider: &ProviderConfig) -> String {
+    if provider.base_url.ends_with("/chat/completions") {
+        provider.base_url.clone()
+    } else {
+        format!("{}/chat/completions", provider.base_url)
+    }
+}
+
+/// 打开 ChatCompletions SSE 流（累积器跨事件存活，流结束即释放）。
+pub async fn stream_chat(
+    provider: &ProviderConfig,
+    api_key: &str,
+    history: &[HistoryItem],
+    tools: &[ToolDeclaration],
+) -> Result<impl Stream<Item = ModelStreamEvent>, String> {
+    let client = reqwest::Client::new();
+    let body = build_chat_request(provider, history, tools);
+    let response = client
+        .post(chat_url(provider))
+        .bearer_auth(api_key)
+        .json(&body)
+        .send()
+        .await
+        .map_err(|e| format!("模型请求失败: {e}"))?;
+    if !response.status().is_success() {
+        let status = response.status();
+        let body_text = response.text().await.unwrap_or_default();
+        let snippet: String = body_text.chars().take(200).collect();
+        return Err(format!("模型端点返回 {status}: {snippet}"));
+    }
+    let acc = std::cell::RefCell::new(ChatStreamAccumulator::default());
+    Ok(response
+        .bytes_stream()
+        .eventsource()
+        .map(move |res| match res {
+            Ok(event) => translate_chat_data(&event.data, &mut acc.borrow_mut()),
+            Err(e) => vec![ModelStreamEvent::Failed { message: format!("SSE 流错误: {e}") }],
+        })
+        .flat_map(futures::stream::iter))
+}
+
+/// 打开 Responses API SSE 流。
 pub async fn stream_responses(
     provider: &ProviderConfig,
     api_key: &str,
@@ -296,5 +493,104 @@ mod tests {
         assert_eq!(body["input"][2]["type"], "function_call_output");
         assert_eq!(body["tools"][0]["type"], "function");
         assert_eq!(body["tools"][0]["name"], "unified_exec");
+    }
+}
+
+#[cfg(test)]
+mod chat_tests {
+    use super::*;
+
+    #[test]
+    fn chat_request_maps_history_and_function_tools() {
+        let p = ProviderConfig {
+            provider: "openai-chat".into(),
+            base_url: "https://api.longcat.chat/openai/v1".into(),
+            model: "LongCat-2.5".into(),
+        };
+        let history = vec![
+            HistoryItem::Message { role: Role::User, text: "任务".into() },
+            HistoryItem::FunctionCall { name: "t".into(), arguments: "{}".into(), call_id: "c1".into() },
+            HistoryItem::FunctionCallOutput { call_id: "c1".into(), output: "ok".into() },
+        ];
+        let tools = vec![ToolDeclaration {
+            name: "unified_exec".into(),
+            description: "d".into(),
+            parameters: serde_json::json!({"type":"object"}),
+        }];
+        let body = build_chat_request(&p, &history, &tools);
+        assert_eq!(body["model"], "LongCat-2.5");
+        assert_eq!(body["stream"], true);
+        assert_eq!(body["messages"][0]["role"], "user");
+        assert_eq!(body["messages"][1]["tool_calls"][0]["id"], "c1");
+        assert_eq!(body["messages"][2]["role"], "tool");
+        assert_eq!(body["tools"][0]["function"]["name"], "unified_exec");
+        assert!(!p.is_responses());
+    }
+
+    #[test]
+    fn chat_url_appends_or_keeps_endpoint() {
+        let p1 = ProviderConfig {
+            provider: "openai-chat".into(),
+            base_url: "https://api.longcat.chat/openai/v1".into(),
+            model: "m".into(),
+        };
+        assert_eq!(chat_url(&p1), "https://api.longcat.chat/openai/v1/chat/completions");
+        let p2 = ProviderConfig {
+            provider: "openai-chat".into(),
+            base_url: "https://api.longcat.chat/openai/v1/chat/completions".into(),
+            model: "m".into(),
+        };
+        assert_eq!(chat_url(&p2), "https://api.longcat.chat/openai/v1/chat/completions");
+    }
+
+    #[test]
+    fn chat_accumulator_assembles_tool_call_fragments() {
+        let mut acc = ChatStreamAccumulator::default();
+        // 文本增量
+        let evs = translate_chat_data(
+            r#"{"choices":[{"delta":{"content":"你"},"finish_reason":null}]}"#,
+            &mut acc,
+        );
+        assert_eq!(evs, vec![ModelStreamEvent::OutputTextDelta { delta: "你".into() }]);
+        // 工具调用分片：首片 id+name，后续 arguments 追加
+        let _ = translate_chat_data(
+            r#"{"choices":[{"delta":{"tool_calls":[{"index":0,"id":"c9","function":{"name":"apply_patch","arguments":""}}]}}]}"#,
+            &mut acc,
+        );
+        let _ = translate_chat_data(
+            r#"{"choices":[{"delta":{"tool_calls":[{"index":0,"function":{"arguments":"{\"p\":"}}]}}]}"#,
+            &mut acc,
+        );
+        let _ = translate_chat_data(
+            r#"{"choices":[{"delta":{"tool_calls":[{"index":0,"function":{"arguments":"1}"}}]}}]}"#,
+            &mut acc,
+        );
+        // finish_reason=tool_calls → 装配输出
+        let evs = translate_chat_data(
+            r#"{"choices":[{"delta":{},"finish_reason":"tool_calls"}]}"#,
+            &mut acc,
+        );
+        assert_eq!(
+            evs,
+            vec![ModelStreamEvent::OutputItem(ResponseItem::FunctionCall {
+                name: "apply_patch".into(),
+                arguments: r#"{"p":1}"#.into(),
+                call_id: "c9".into(),
+            })]
+        );
+        // usage（完成块可同带 usage）
+        let evs = translate_chat_data(
+            r#"{"choices":[],"usage":{"prompt_tokens":9,"completion_tokens":3}}"#,
+            &mut acc,
+        );
+        assert!(matches!(evs.last(), Some(ModelStreamEvent::Completed { .. })));
+    }
+
+    #[test]
+    fn chat_done_and_error_handled() {
+        let mut acc = ChatStreamAccumulator::default();
+        assert!(translate_chat_data("[DONE]", &mut acc).is_empty());
+        let evs = translate_chat_data(r#"{"error":{"message":"quota"}}"#, &mut acc);
+        assert!(matches!(evs.last(), Some(ModelStreamEvent::Failed { message }) if message == "quota"));
     }
 }

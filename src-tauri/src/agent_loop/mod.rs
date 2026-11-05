@@ -13,7 +13,7 @@ pub mod budget;
 use std::path::PathBuf;
 use std::sync::Arc;
 
-use futures::{Stream, StreamExt};
+use futures::StreamExt;
 use tokio_util::sync::CancellationToken;
 
 use crate::config::AppConfig;
@@ -28,8 +28,8 @@ pub use budget::TurnBudget;
 
 // ============================== 模型后端抽象 ==============================
 
-/// 模型流（agent_loop 只依赖此别名；Pin<Box> 保证可安全轮询）。
-pub type ModelStream = std::pin::Pin<Box<dyn Stream<Item = ModelStreamEvent> + Send>>;
+/// 模型流（转发 model_client 的别名）。
+pub use crate::model_client::ModelStream;
 
 /// 模型后端：把 (历史, 工具声明) 变成模型事件流。
 #[async_trait::async_trait]
@@ -57,7 +57,7 @@ impl ModelBackend for ResponsesBackend {
         history: &[HistoryItem],
         tools: &[ToolDeclarationShim],
     ) -> Result<ModelStream, String> {
-        let stream = model_client::stream_responses(&self.provider, &self.api_key, history, tools).await?;
+        let stream = model_client::stream_model(&self.provider, &self.api_key, history, tools).await?;
         Ok(Box::pin(stream))
     }
 }
