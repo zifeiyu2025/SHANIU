@@ -8,6 +8,7 @@ pub mod spec;
 
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 
 use async_trait::async_trait;
@@ -18,6 +19,39 @@ use crate::events::EventSink;
 use crate::model_client::ToolDeclaration;
 
 pub use spec::ToolSpec;
+
+/// 计划态共享标志。
+///
+/// 放在共享内核（与 `ToolSpec` 同层）而非 `tools/plan`：`agent_loop` 要读它做
+/// 计划态门控，若留在 `tools/*` 会逼出 `agent_loop → tools` 的反向依赖（docs §2.3）。
+#[derive(Debug, Default)]
+pub struct PlanState {
+    active: AtomicBool,
+}
+
+impl PlanState {
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    pub fn is_active(&self) -> bool {
+        self.active.load(Ordering::SeqCst)
+    }
+
+    fn set(&self, active: bool) {
+        self.active.store(active, Ordering::SeqCst);
+    }
+
+    /// 激活计划态（enter_plan_mode 调用；测试与恢复路径同样走此入口）。
+    pub fn activate(&self) {
+        self.set(true);
+    }
+
+    /// 退出计划态（exit_plan_mode 获批准后调用）。
+    pub fn deactivate(&self) {
+        self.set(false);
+    }
+}
 
 // ============================== 执行契约 ==============================
 

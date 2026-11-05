@@ -8,7 +8,7 @@ use tokio_util::sync::CancellationToken;
 
 use crate::config::{new_session_id, AppConfig};
 use crate::permission::ApprovalBroker;
-use crate::tools::plan::PlanState;
+use crate::tool_router::PlanState;
 
 pub struct AppState {
     config: RwLock<AppConfig>,

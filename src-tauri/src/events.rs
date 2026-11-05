@@ -49,6 +49,21 @@ pub enum ApprovalDecision {
     AllowAlways,
 }
 
+/// 工具调用终态（docs/04 §1.2.1）：`ToolCallEnd.result` 的取值域。
+/// 存在时是**唯一**状态判据；缺失时前端才走 `exit_code`/`error` 的两步反推回退。
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ToolCallResult {
+    /// 工具执行成功。
+    Ok,
+    /// 执行失败（含超时、非零退出、工具层错误）。
+    Error,
+    /// 用户/系统取消（CancellationToken）。
+    Cancelled,
+    /// 审批拒绝。
+    Denied,
+}
+
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(tag = "type", rename_all = "snake_case")]
 pub enum EventMsg {
@@ -57,7 +72,14 @@ pub enum EventMsg {
     AgentMessageDelta { delta: String },
     ToolCallBegin { call_id: String, tool: String, args: serde_json::Value },
     ToolCallOutputDelta { call_id: String, channel: IoChannel, delta: String },
-    ToolCallEnd { call_id: String, exit_code: Option<i32>, error: Option<String> },
+    ToolCallEnd {
+        call_id: String,
+        exit_code: Option<i32>,
+        error: Option<String>,
+        /// additive（FF-2，docs/04 §1.2.1）：`None` 时不产生该键，旧消费端无感知。
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        result: Option<ToolCallResult>,
+    },
     ExecApprovalRequest { request_id: String, tool: String, args: serde_json::Value, risk: RiskLevel },
     ExecApprovalResolved { request_id: String, decision: ApprovalDecision },
     PlanDelta { delta: String },

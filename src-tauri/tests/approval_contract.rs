@@ -16,8 +16,9 @@ use shaniu_lib::config::{ApprovalMode, SandboxMode};
 use shaniu_lib::events::{ApprovalDecision, EventMsg, EventSink, RiskLevel};
 use shaniu_lib::model_client::{HistoryItem, ModelStreamEvent, ResponseItem, ToolDeclaration};
 use shaniu_lib::permission::{policy, ApprovalBroker};
-use shaniu_lib::tool_router::{ToolContext, ToolError, ToolExecutor, ToolOutput, ToolRouter, ToolSpec};
-use shaniu_lib::tools::plan::PlanState;
+use shaniu_lib::tool_router::{
+    PlanState, ToolContext, ToolError, ToolExecutor, ToolOutput, ToolRouter, ToolSpec,
+};
 use tokio_util::sync::CancellationToken;
 
 // ============================== 测试基建 ==============================

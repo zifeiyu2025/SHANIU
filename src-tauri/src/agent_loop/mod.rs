@@ -18,13 +18,12 @@ use futures::StreamExt;
 use tokio_util::sync::CancellationToken;
 
 use crate::config::AppConfig;
-use crate::events::EventMsg;
+use crate::events::{EventMsg, ToolCallResult};
 use crate::model_client::{
     self, provider::ProviderConfig, HistoryItem, ModelStreamEvent, ResponseItem, Role, Usage,
 };
 use crate::permission::{policy, ApprovalBroker};
-use crate::tools::plan::PlanState;
-use crate::tool_router::{ToolContext, ToolRouter};
+use crate::tool_router::{PlanState, ToolContext, ToolRouter};
 
 pub use budget::TurnBudget;
 
@@ -227,6 +226,7 @@ impl AgentLoop {
                         call_id: call_id.clone(),
                         exit_code: None,
                         error: Some(format!("未知工具: {name}")),
+                        result: Some(ToolCallResult::Error),
                     });
                     history.push(HistoryItem::FunctionCallOutput {
                         call_id: call_id.clone(),
@@ -248,6 +248,7 @@ impl AgentLoop {
                         call_id: call_id.clone(),
                         exit_code: None,
                         error: Some("计划模式仅只读工具可用".into()),
+                        result: Some(ToolCallResult::Error),
                     });
                     history.push(HistoryItem::FunctionCallOutput {
                         call_id: call_id.clone(),
@@ -270,6 +271,7 @@ impl AgentLoop {
                             call_id: call_id.clone(),
                             exit_code: None,
                             error: Some("用户拒绝".into()),
+                            result: Some(ToolCallResult::Denied),
                         });
                         history.push(HistoryItem::FunctionCallOutput {
                             call_id: call_id.clone(),
@@ -282,6 +284,7 @@ impl AgentLoop {
                             call_id: call_id.clone(),
                             exit_code: None,
                             error: Some("已取消".into()),
+                            result: Some(ToolCallResult::Cancelled),
                         });
                         reason = TurnEndReasonLocal::Cancelled;
                         break 'outer;
@@ -302,6 +305,12 @@ impl AgentLoop {
                             call_id: call_id.clone(),
                             exit_code: Some(i32::from(!out.success)),
                             error: None,
+                            // 成功/失败是两回事：exit_code 只表达是否非零退出，result 才区分语义
+                            result: Some(if out.success {
+                                ToolCallResult::Ok
+                            } else {
+                                ToolCallResult::Error
+                            }),
                         });
                         out.output.clone()
                     }
@@ -310,6 +319,7 @@ impl AgentLoop {
                             call_id: call_id.clone(),
                             exit_code: None,
                             error: Some("已取消".into()),
+                            result: Some(ToolCallResult::Cancelled),
                         });
                         reason = TurnEndReasonLocal::Cancelled;
                         break 'outer;
@@ -319,6 +329,7 @@ impl AgentLoop {
                             call_id: call_id.clone(),
                             exit_code: None,
                             error: Some(e.to_string()),
+                            result: Some(ToolCallResult::Error),
                         });
                         e.to_string()
                     }
@@ -535,7 +546,85 @@ mod tests {
         )));
         assert!(events.iter().any(|e| matches!(
             e,
-            EventMsg::ToolCallEnd { call_id, exit_code: Some(0), error: None } if call_id == "c1"
+            EventMsg::ToolCallEnd { call_id, exit_code: Some(0), error: None, result: Some(ToolCallResult::Ok) } if call_id == "c1"
+        )));
+    }
+
+    /// 结果语义探针：同一个假工具按需返回失败/取消，用于钉住 emit 分支的 `result` 取值。
+    #[derive(Debug, Clone, Copy)]
+    enum ToolBehavior {
+        Fail,
+        Cancel,
+    }
+
+    fn make_loop_with_read_tool(
+        behavior: ToolBehavior,
+        turns: Vec<Vec<ModelStreamEvent>>,
+    ) -> (
+        AgentLoop,
+        Arc<Mutex<Vec<EventMsg>>>,
+        CancellationToken,
+        Arc<ApprovalBroker>,
+    ) {
+        struct BehaviorTool {
+            spec: ToolSpec,
+            behavior: ToolBehavior,
+        }
+        #[async_trait::async_trait]
+        impl ToolExecutor for BehaviorTool {
+            fn spec(&self) -> &ToolSpec {
+                &self.spec
+            }
+            async fn execute(&self, _a: Value, _c: &ToolContext) -> Result<ToolOutput, ToolError> {
+                match self.behavior {
+                    ToolBehavior::Fail => Ok(ToolOutput::fail("命令以非零状态退出")),
+                    ToolBehavior::Cancel => Err(ToolError::Cancelled),
+                }
+            }
+        }
+        // 命名 read_file → 风险 read → 门禁自动放行，避免测试里再走审批
+        let (mut agent, store, cancel, broker) = make_loop(turns);
+        let mut r = ToolRouter::new();
+        r.register(Arc::new(BehaviorTool {
+            spec: ToolSpec::new("read_file", "假读工具", serde_json::json!({"type":"object"})),
+            behavior,
+        }));
+        agent.router = Arc::new(r);
+        (agent, store, cancel, broker)
+    }
+
+    #[tokio::test]
+    async fn failed_tool_emits_result_error() {
+        let (agent, store, cancel, _broker) = make_loop_with_read_tool(
+            ToolBehavior::Fail,
+            vec![
+                vec![fn_call_ev(), usage_ev()],
+                vec![ModelStreamEvent::OutputTextDelta { delta: "继续".into() }, usage_ev()],
+            ],
+        );
+        agent.run_task("任务", Arc::new(CapturingSink(store.clone())), cancel).await;
+        let events = store.lock().unwrap();
+        // 非零退出：exit_code 是证据字段，result 才是语义判据
+        assert!(events.iter().any(|e| matches!(
+            e,
+            EventMsg::ToolCallEnd { call_id, exit_code: Some(1), result: Some(ToolCallResult::Error), .. }
+                if call_id == "c1"
+        )));
+    }
+
+    #[tokio::test]
+    async fn cancelled_tool_emits_result_cancelled() {
+        let (agent, store, cancel, _broker) = make_loop_with_read_tool(
+            ToolBehavior::Cancel,
+            vec![vec![fn_call_ev(), usage_ev()]],
+        );
+        let summary = agent.run_task("任务", Arc::new(CapturingSink(store.clone())), cancel).await;
+        assert_eq!(summary.reason, TurnEndReason::Cancelled);
+        let events = store.lock().unwrap();
+        assert!(events.iter().any(|e| matches!(
+            e,
+            EventMsg::ToolCallEnd { call_id, exit_code: None, result: Some(ToolCallResult::Cancelled), .. }
+                if call_id == "c1"
         )));
     }
 
@@ -628,7 +717,7 @@ mod tests {
         )));
         assert!(events.iter().any(|e| matches!(
             e,
-            EventMsg::ToolCallEnd { call_id, error: Some(msg), .. }
+            EventMsg::ToolCallEnd { call_id, error: Some(msg), result: Some(ToolCallResult::Denied), .. }
                 if call_id == "c7" && msg.contains("用户拒绝")
         )));
     }
@@ -825,7 +914,7 @@ mod tests {
         // 未被真正执行：没有「成功」的 ToolCallEnd
         assert!(!events.iter().any(|e| matches!(
             e,
-            EventMsg::ToolCallEnd { call_id, exit_code: Some(0), error: None } if call_id == "c5"
+            EventMsg::ToolCallEnd { call_id, exit_code: Some(0), error: None, .. } if call_id == "c5"
         )));
         // 也不应触发审批（守卫先于审批门禁）
         assert!(!events.iter().any(|e| matches!(e, EventMsg::ExecApprovalRequest { .. })));

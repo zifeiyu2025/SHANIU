@@ -5,43 +5,12 @@
 //! 只读强制为双层：①agent_loop 按白名单收窄工具声明（模型看不见写工具）；
 //! ②执行守卫拒绝非白名单调用（防御）。
 
-use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 
 use async_trait::async_trait;
 use serde_json::Value;
 
-use crate::tool_router::{ToolContext, ToolError, ToolExecutor, ToolOutput, ToolSpec};
-
-/// 计划态共享标志。
-#[derive(Debug, Default)]
-pub struct PlanState {
-    active: AtomicBool,
-}
-
-impl PlanState {
-    pub fn new() -> Self {
-        Self::default()
-    }
-
-    pub fn is_active(&self) -> bool {
-        self.active.load(Ordering::SeqCst)
-    }
-
-    fn set(&self, active: bool) {
-        self.active.store(active, Ordering::SeqCst);
-    }
-
-    /// 激活计划态（enter_plan_mode 调用；测试与恢复路径同样走此入口）。
-    pub fn activate(&self) {
-        self.set(true);
-    }
-
-    /// 退出计划态（exit_plan_mode 获批准后调用）。
-    pub fn deactivate(&self) {
-        self.set(false);
-    }
-}
+use crate::tool_router::{PlanState, ToolContext, ToolError, ToolExecutor, ToolOutput, ToolSpec};
 
 // ============================== enter_plan_mode ==============================
 
