@@ -44,12 +44,23 @@ export type EventMsg =
       output_tokens: number;
     };
 
+/**
+ * 安全面档位（SH-040），镜像 Rust 侧 `config::{SandboxMode, ApprovalMode}`。
+ * 名字用 snake_case 而不是界面上的中文/英文标签：那 serde 序列化出来的形态，
+ * 也是 config.toml 里写的形态，前端跟着它就不存在第三套名字。
+ */
+export type SandboxMode = 'read_only' | 'workspace_write' | 'danger_full_access';
+export type ApprovalMode = 'ask' | 'auto_read_only';
+
 /** 设置数据（settings dialog 的读写载荷）。 */
 export interface Settings {
   baseUrl: string;
   model: string;
   workspaceRoot: string;
   hasApiKey: boolean;
+  /** 后端总会回显这两档，所以是必填而不是可选——界面不能靠"猜当前档位"渲染。 */
+  sandboxMode: SandboxMode;
+  approvalMode: ApprovalMode;
 }
 
 export interface SettingsInput {
@@ -58,6 +69,9 @@ export interface SettingsInput {
   workspaceRoot: string;
   /** 留空 = 不改动已保存的 Key。 */
   apiKey?: string;
+  /** 省略 = 不改动该档（后端 None 分支）；界面只在用户真的动过它时传。 */
+  sandboxMode?: SandboxMode;
+  approvalMode?: ApprovalMode;
 }
 
 /** 会话摘要（SH-033），镜像 Rust 侧 `rollout::SessionSummary`（camelCase 由 serde 保证）。 */

@@ -16,6 +16,8 @@ export function stubTransport(
     model: 'M0-Mock',
     workspaceRoot: 'D:/MyWorkspace/demo',
     hasApiKey: false,
+    sandboxMode: 'read_only',
+    approvalMode: 'ask',
     ...settings,
   };
   return {

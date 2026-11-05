@@ -77,11 +77,33 @@ describe('Tauri 传输层的 command 契约', () => {
     expect(invoke).toHaveBeenCalledWith('cancel_task');
     expect(invoke).toHaveBeenCalledWith('approve', { requestId: 'r1', decision: 'allow' });
     // apiKey 必须被 trim 后才下行；留空则传 null 表示"不改动已存 Key"
+    // 两个安全档位没传时必须落 null：后端 None 分支才不动它，兜默认值就等于偷改沙箱。
     expect(invoke).toHaveBeenCalledWith('save_settings', {
       baseUrl: 'https://x/v1',
       model: 'm',
       workspaceRoot: 'D:/w',
       apiKey: 'k',
+      sandboxMode: null,
+      approvalMode: null,
+    });
+  });
+
+  it('保存安全档位时按 snake_case 的线名原样下行', async () => {
+    invoke.mockResolvedValue(undefined);
+    await transport().saveSettings({
+      baseUrl: 'https://x/v1',
+      model: 'm',
+      workspaceRoot: 'D:/w',
+      sandboxMode: 'workspace_write',
+      approvalMode: 'auto_read_only',
+    });
+    expect(invoke).toHaveBeenCalledWith('save_settings', {
+      baseUrl: 'https://x/v1',
+      model: 'm',
+      workspaceRoot: 'D:/w',
+      apiKey: null,
+      sandboxMode: 'workspace_write',
+      approvalMode: 'auto_read_only',
     });
   });
 

@@ -341,8 +341,17 @@ fn get_settings(app: tauri::AppHandle) -> Result<serde_json::Value, String> {
         "maxTurns": cfg.model.max_turns,
         "workspaceRoot": state.workspace_root().to_string_lossy(),
         "hasApiKey": has_key,
+        // 安全面两档的回显。序列化直接走 serde（枚举本身是 snake_case），
+        // 不在这里手写字符串——手写就会与 config.toml 里的写法漂移成两套名字。
+        "sandboxMode": serde_json::to_value(cfg.sandbox.mode).map_err(|e| e.to_string())?,
+        "approvalMode": serde_json::to_value(cfg.approval.mode).map_err(|e| e.to_string())?,
     }))
 }
+
+/// 报错时列给用户的合法档位名。它必须与 `config.rs` 的枚举同源——
+/// `safety_mode_names_match_enums` 用穷举后的序列化结果逐字比对，加一档忘改这里会直接红。
+const SANDBOX_MODE_NAMES: &str = "read_only / workspace_write / danger_full_access";
+const APPROVAL_MODE_NAMES: &str = "ask / auto_read_only";
 
 /// 保存设置：模型端点/工作区入 config.toml，API Key（可选填）DPAPI 加密落盘。
 #[tauri::command]
@@ -352,12 +361,26 @@ fn save_settings(
     model: String,
     workspace_root: String,
     api_key: Option<String>,
+    sandbox_mode: Option<String>,
+    approval_mode: Option<String>,
 ) -> Result<(), String> {
     let state = app.state::<AppState>();
     let mut cfg: AppConfig = state.config();
     cfg.model.base_url = base_url.trim_end_matches('/').to_string();
     cfg.model.model = model;
     cfg.workspace.root = workspace_root;
+    // 安全面两档：None = 不改，所以旧调用形态（不传这两个键）行为完全不变。
+    // 非法值必须报错而不是静默保留旧值——"点了保存却没生效、界面还显示旧档位"是安全
+    // 设置里最坏的一类失败：用户会以为自己已经收紧（或放宽）了，实际什么都没变。
+    // 解析复用 serde 而不是手写 match，这样名字永远与 config.toml 里的写法同源。
+    if let Some(mode) = sandbox_mode {
+        cfg.sandbox.mode = serde_json::from_value(serde_json::Value::String(mode))
+            .map_err(|_| format!("沙箱模式取值非法，可用：{}", SANDBOX_MODE_NAMES))?;
+    }
+    if let Some(mode) = approval_mode {
+        cfg.approval.mode = serde_json::from_value(serde_json::Value::String(mode))
+            .map_err(|_| format!("审批模式取值非法，可用：{}", APPROVAL_MODE_NAMES))?;
+    }
     state.update_config(cfg)?;
     if let Some(key) = api_key {
         let key = key.trim().to_string();
@@ -457,7 +480,8 @@ pub fn run() {
 
 #[cfg(test)]
 mod session_projection_tests {
-    use super::{project_entries, SessionEntry};
+    use super::{project_entries, SessionEntry, APPROVAL_MODE_NAMES, SANDBOX_MODE_NAMES};
+    use crate::config;
     use crate::model_client::{HistoryItem, Role};
     use crate::rollout::{ConfigSnapshot, RolloutItem};
 
@@ -566,5 +590,54 @@ mod session_projection_tests {
             SessionEntry::Message { reasoning, .. } => assert_eq!(reasoning.as_deref(), Some("思路")),
             other => panic!("期望 Message，得到 {other:?}"),
         }
+    }
+
+    /// 档位清单与枚举同源（SH-040）。
+    ///
+    /// 这里刻意用**序列化结果**而不是手写第二份字符串来比对：如果哪天给枚举加一档
+    /// 却忘了更新报错文案里的清单，用户就会照着一份不完整的清单去填，然后撞上
+    /// "取值非法"——安全设置的提示本身成了误导源。
+    #[test]
+    fn safety_mode_names_match_enums() {
+        let sandbox_all = [
+            config::SandboxMode::ReadOnly,
+            config::SandboxMode::WorkspaceWrite,
+            config::SandboxMode::DangerFullAccess,
+        ];
+        let sandbox_joined = sandbox_all
+            .iter()
+            .map(|m| serde_json::to_value(*m).unwrap().as_str().unwrap().to_string())
+            .collect::<Vec<_>>()
+            .join(" / ");
+        assert_eq!(sandbox_joined, SANDBOX_MODE_NAMES, "沙箱档位清单与枚举漂移了");
+
+        let approval_all = [config::ApprovalMode::Ask, config::ApprovalMode::AutoReadOnly];
+        let approval_joined = approval_all
+            .iter()
+            .map(|m| serde_json::to_value(*m).unwrap().as_str().unwrap().to_string())
+            .collect::<Vec<_>>()
+            .join(" / ");
+        assert_eq!(approval_joined, APPROVAL_MODE_NAMES, "审批档位清单与枚举漂移了");
+    }
+
+    /// 两个模式必须真的能 round-trip 回自身：只比对名字的话，serde 属性一改就会
+    /// 让"界面显示的值"和"存进 config.toml 的值"变成两套东西。
+    #[test]
+    fn safety_modes_round_trip_through_wire_names() {
+        for name in SANDBOX_MODE_NAMES.split(" / ") {
+            let parsed: config::SandboxMode =
+                serde_json::from_value(serde_json::Value::String(name.to_string())).unwrap();
+            assert_eq!(serde_json::to_value(parsed).unwrap().as_str().unwrap(), name);
+        }
+        for name in APPROVAL_MODE_NAMES.split(" / ") {
+            let parsed: config::ApprovalMode =
+                serde_json::from_value(serde_json::Value::String(name.to_string())).unwrap();
+            assert_eq!(serde_json::to_value(parsed).unwrap().as_str().unwrap(), name);
+        }
+        // 非法值必须解析失败——save_settings 的报错分支全靠这个前提
+        assert!(serde_json::from_value::<config::SandboxMode>(
+            serde_json::Value::String("full_access".into())
+        )
+        .is_err());
     }
 }

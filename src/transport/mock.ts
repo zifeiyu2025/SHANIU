@@ -100,6 +100,9 @@ export function createMockTransport(): Transport {
     model: 'M0-Mock',
     workspaceRoot: 'D:/MyWorkspace/demo',
     hasApiKey: false,
+    // 与 Rust 侧 Default 同源：沙箱默认只读、审批默认逐次询问（ADR-002 fail-closed）。
+    sandboxMode: 'read_only',
+    approvalMode: 'ask',
   };
 
   function emit(msg: EventMsg): void {
@@ -281,6 +284,9 @@ export function createMockTransport(): Transport {
       settings.model = input.model;
       settings.workspaceRoot = input.workspaceRoot;
       if (input.apiKey?.trim()) settings.hasApiKey = true;
+      // 与后端同一条规则：没传就不动该档，绝不兜默认值。
+      if (input.sandboxMode !== undefined) settings.sandboxMode = input.sandboxMode;
+      if (input.approvalMode !== undefined) settings.approvalMode = input.approvalMode;
     },
 
     async approve(requestId, decision) {

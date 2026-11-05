@@ -78,6 +78,10 @@ export function createTauriTransport(): Transport {
         model: input.model,
         workspaceRoot: input.workspaceRoot,
         apiKey: input.apiKey?.trim() ? input.apiKey.trim() : null,
+        // 省略即 null：后端 None 分支不动该档。不能在这里兜一个默认档位——
+        // 用户没碰沙箱开关时，保存别的字段绝不该顺手把沙箱模式改掉。
+        sandboxMode: input.sandboxMode ?? null,
+        approvalMode: input.approvalMode ?? null,
       });
     },
 
