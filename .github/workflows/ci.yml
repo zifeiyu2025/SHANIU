@@ -1,0 +1,83 @@
+name: CI
+
+# 已知 FF 缺口（勿把"CI 全绿"读成 docs/01 §5 七条不变量全部成立）：
+#   FF-3 沙箱越界写入探针 src-tauri/tests/sandbox_probe.rs::sandbox_denies_write_outside_workspace
+#        仍为 #[ignore]（技术不可达，待 SH-022）——本流水线不验证它；
+#   FF-4 sandbox_failclosed.rs、FF-5 latency_budget.rs 尚未存在，无对应用例；
+#   FF-6 审批不可绕过、FF-2 事件 schema 快照、FF-7 前端块冻结由 cargo test / vitest 覆盖。
+
+on:
+  push:
+  pull_request:
+
+jobs:
+  gate:
+    # 必须 Windows runner：沙箱实现（受限令牌 / Job Object / deny-ACE）与沙箱探针测试是
+    # Win32 专属，Linux runner 连编译都过不去，更谈不上验证 docs/01 §5 的隔离不变量。
+    runs-on: windows-latest
+    # Windows 冷编译实测 10~15 分钟，给足余量但避免 runner 卡死长期占用
+    timeout-minutes: 30
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: '22'
+
+      # 不传 version：package.json 的 packageManager 是 pnpm 版本的唯一事实源，
+      # 两处各写一份将来只改一处会硬失败
+      - uses: pnpm/action-setup@v4
+
+      # 必须显式 pin 版本：AGENTS §6 钉死 Rust 1.99.1，@stable 一旦上游发新 lint，
+      # 零代码改动的 PR 也会被 `-D warnings` 判红。
+      # 该 action 没有 v1 之类的语义化版本标签，ref 本身就是工具链版本。
+      - uses: dtolnay/rust-toolchain@1.99.1
+        with:
+          components: clippy
+
+      # 放在最前面：纯文本扫描、无编译依赖、秒级完成，契约违规能最快失败并给出人话报错
+      - name: 依赖方向检查（FF-1，阈值 0）
+        shell: pwsh
+        run: |
+          # GHA 的 pwsh 步骤自带 $ErrorActionPreference='stop'：脚本语法错误时 `& script`
+          # 抛的是终止性错误，会直接中断步骤并返回 1，走不到下面的结束标记判断——
+          # 必须用 try/catch 兜住，否则"脚本坏了"会被读成"代码有违规"
+          try {
+            $out = (& ./scripts/check-deps.ps1 *>&1 | Out-String -Width 400)
+            $code = $LASTEXITCODE
+          }
+          catch {
+            $out = "[ci] check-deps 调用抛错（脚本自身错误，不是代码违规）：$($_.Exception.Message)"
+            $code = 3
+          }
+          $out | Write-Host
+          # 再兜一层：脚本没跑到结束标记（例如被中途终止）同样视为脚本故障
+          if (-not ($out -match '\[check-deps\] (依赖方向检查通过|失败)')) {
+            Write-Host '[ci] check-deps 未正常跑完（脚本自身错误，不是代码违规）'
+            exit 3
+          }
+          exit $code
+
+      - name: clippy（告警即失败）
+        working-directory: src-tauri
+        run: cargo clippy --all-targets -- -D warnings
+
+      - name: 后端测试
+        working-directory: src-tauri
+        run: cargo test
+
+      # pnpm 在上一步 action 里才装好，此处不能依赖 setup-node 的 pnpm 缓存探测
+      - name: 安装前端依赖
+        run: pnpm install --frozen-lockfile
+
+      - name: 前端类型检查
+        run: pnpm typecheck
+
+      - name: 前端测试
+        run: pnpm test
+
+      # typecheck/test 抓不到 Tailwind/vite 构建期问题，而 tauri.conf.json 的 frontendDist
+      # 指向 dist：构建链断裂不该等到打包阶段才暴露
+      - name: 前端构建
+        run: pnpm build
