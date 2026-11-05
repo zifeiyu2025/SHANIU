@@ -331,7 +331,7 @@ mod tests {
         let sink = SINK
             .get_or_init(|| Arc::new(crate::events::NullEventSink) as Arc<dyn crate::events::EventSink>)
             .clone();
-        ToolContext::new(ws, tokio_util::sync::CancellationToken::new(), "call-patch", sink)
+        ToolContext::new(ws, tokio_util::sync::CancellationToken::new(), "call-patch", sink, crate::config::SandboxMode::WorkspaceWrite)
     }
 
     fn workspace() -> std::path::PathBuf {

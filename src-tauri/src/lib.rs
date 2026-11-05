@@ -4,6 +4,7 @@ pub mod app_state;
 pub mod config;
 pub mod events;
 pub mod model_client;
+pub mod sandbox;
 pub mod permission;
 pub mod tool_router;
 pub mod tools;

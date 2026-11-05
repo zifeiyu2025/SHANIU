@@ -7,7 +7,9 @@
 //! - 超时/失败以 `ToolOutput::fail` 回填（模型可自我纠正），取消以 `ToolError::Cancelled`；
 //! - 输出总量超限时截断并标注。
 
-use std::process::Stdio;
+use std::io;
+use std::os::windows::process::ExitStatusExt;
+use std::process::{ExitStatus, Stdio};
 use std::time::Duration;
 
 use async_trait::async_trait;
@@ -16,6 +18,7 @@ use tokio::io::{AsyncBufReadExt, BufReader};
 use tokio::sync::mpsc;
 
 use crate::events::EventMsg;
+use crate::sandbox;
 use crate::tool_router::{
     resolve_in_workspace, ToolContext, ToolError, ToolExecutor, ToolOutput, ToolSpec,
 };
@@ -75,8 +78,8 @@ impl UnifiedExec {
 /// 逐行读取子进程管道送入通道；EOF（管道关闭）后任务自然结束。
 fn spawn_reader(
     pipe: Box<dyn tokio::io::AsyncRead + Unpin + Send>,
-    channel: IoChannel,
-    tx: mpsc::Sender<(IoChannel, String)>,
+    channel: u8,
+    tx: mpsc::Sender<sandbox::ExecLine>,
 ) -> tokio::task::JoinHandle<()> {
     tokio::spawn(async move {
         let mut reader = BufReader::new(pipe);
@@ -122,27 +125,41 @@ impl ToolExecutor for UnifiedExec {
             .unwrap_or(DEFAULT_TIMEOUT_MS)
             .clamp(100, MAX_TIMEOUT_MS);
 
-        // Windows：cmd /C 承载命令行；CREATE_NO_WINDOW 防止控制台弹窗
-        let mut cmd = tokio::process::Command::new("cmd");
-        cmd.args(["/C", command])
-            .current_dir(&cwd)
-            .stdout(Stdio::piped())
-            .stderr(Stdio::piped())
-            .stdin(Stdio::null());
-        #[cfg(windows)]
-        cmd.creation_flags(0x0800_0000); // CREATE_NO_WINDOW，防控制台弹窗
-        let mut child = cmd
-            .spawn()
-            .map_err(|e| ToolError::Execution(format!("命令启动失败: {e}")))?;
+        // stdio 行通道（Plain=tokio 读任务 / Restricted=std 读线程，统一回传）
+        let (tx, mut rx) = mpsc::channel::<sandbox::ExecLine>(256);
 
-        // 读取任务：stdout/stderr 逐行送入通道（装箱统一读取类型）
-        let (tx, mut rx) = mpsc::channel::<(IoChannel, String)>(256);
-        if let Some(pipe) = child.stdout.take() {
-            spawn_reader(Box::new(pipe), IoChannel::Stdout, tx.clone());
-        }
-        if let Some(pipe) = child.stderr.take() {
-            spawn_reader(Box::new(pipe), IoChannel::Stderr, tx.clone());
-        }
+        // 按沙箱策略启动（fail-closed：沙箱准备失败 → Execution，执行数为 0）
+        let mut waiter = match sandbox::prepare_spawn(
+            ctx.sandbox,
+            "cmd",
+            &["/C", command],
+            &cwd,
+            tx.clone(),
+        ) {
+            Ok(sandbox::PreparedSpawn::Plain(mut cmd)) => {
+                cmd.stdout(Stdio::piped())
+                    .stderr(Stdio::piped())
+                    .stdin(Stdio::null());
+                #[cfg(windows)]
+                cmd.creation_flags(0x0800_0000); // CREATE_NO_WINDOW，防控制台弹窗
+                let mut child = cmd
+                    .spawn()
+                    .map_err(|e| ToolError::Execution(format!("命令启动失败: {e}")))?;
+                if let Some(pipe) = child.stdout.take() {
+                    spawn_reader(Box::new(pipe), 0, tx.clone());
+                }
+                if let Some(pipe) = child.stderr.take() {
+                    spawn_reader(Box::new(pipe), 1, tx.clone());
+                }
+                Waiter::Tokio(Box::new(child))
+            }
+            Ok(sandbox::PreparedSpawn::Restricted(child)) => {
+                // 受限子进程已启动（读线程已在 windows_impl 内接 tx）；
+                // wait/kill 经 RestrictedChild 纯 Win32 封装，Job 守卫随结构存活
+                Waiter::Restricted(Box::new(child))
+            }
+            Err(e) => return Err(ToolError::Execution(e.to_string())),
+        };
         drop(tx);
 
         let mut collected: Vec<String> = Vec::new();
@@ -152,17 +169,17 @@ impl ToolExecutor for UnifiedExec {
         let result = loop {
             tokio::select! {
                 _ = ctx.cancel.cancelled() => {
-                    let _ = child.kill().await;
+                    waiter.kill();
                     return Err(ToolError::Cancelled);
                 }
                 _ = tokio::time::sleep(Duration::from_millis(timeout_ms)) => {
-                    let _ = child.kill().await;
+                    waiter.kill();
                     break Ok(ToolOutput::fail(format!(
                         "命令超时（{timeout_ms}ms）被终止。已捕获输出：\n{}",
                         collected.join("\n")
                     )));
                 }
-                status = child.wait() => {
+                status = waiter.status() => {
                     let status = status.map_err(|e| ToolError::Execution(format!("等待进程失败: {e}")))?;
                     // 排干管道余量（读取任务在 EOF 后结束）；排干限时防孤儿进程挂住
                     let drain_deadline = tokio::time::sleep(Duration::from_secs(1));
@@ -172,6 +189,7 @@ impl ToolExecutor for UnifiedExec {
                             _ = &mut drain_deadline => break,
                             item = rx.recv() => match item {
                                 Some((channel, line)) => {
+                                    let channel = to_io_channel(channel);
                                     if collected_bytes < MAX_COLLECTED_BYTES {
                                         self.emit_delta(ctx, channel, &line);
                                         collected_bytes += line.len() + 1;
@@ -197,6 +215,7 @@ impl ToolExecutor for UnifiedExec {
                     };
                 }
                 Some((channel, line)) = rx.recv() => {
+                    let channel = to_io_channel(channel);
                     if collected_bytes < MAX_COLLECTED_BYTES {
                         self.emit_delta(ctx, channel, &line);
                         collected_bytes += line.len() + 1;
@@ -211,19 +230,51 @@ impl ToolExecutor for UnifiedExec {
     }
 }
 
+fn to_io_channel(code: u8) -> IoChannel {
+    if code == 0 { IoChannel::Stdout } else { IoChannel::Stderr }
+}
+
+/// 子进程等待/终止的统一抽象（Plain=tokio Child / Restricted=spawn_blocking + Job）。
+enum Waiter {
+    Tokio(Box<tokio::process::Child>),
+    Restricted(Box<sandbox::windows_impl::RestrictedChild>),
+}
+
+impl Waiter {
+    async fn status(&mut self) -> io::Result<ExitStatus> {
+        match self {
+            Waiter::Tokio(child) => child.wait().await,
+            Waiter::Restricted(child) => {
+                // 约定：退出码 i32（Windows exit code u32 的有符号视图）
+                let code = child.wait().await?;
+                Ok(ExitStatus::from_raw(code as u32))
+            }
+        }
+    }
+
+    fn kill(&mut self) {
+        match self {
+            Waiter::Tokio(child) => {
+                let _ = child.start_kill();
+            }
+            Waiter::Restricted(child) => child.kill(),
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
     use crate::tool_router::ToolRouter;
     use std::path::Path;
     use std::sync::Arc;
-
+    
     fn ctx(ws: &Path) -> ToolContext {
         static SINK: std::sync::OnceLock<Arc<dyn crate::events::EventSink>> = std::sync::OnceLock::new();
         let sink = SINK
             .get_or_init(|| Arc::new(crate::events::NullEventSink) as Arc<dyn crate::events::EventSink>)
             .clone();
-        ToolContext::new(ws, tokio_util::sync::CancellationToken::new(), "call-exec", sink)
+        ToolContext::new(ws, tokio_util::sync::CancellationToken::new(), "call-exec", sink, crate::config::SandboxMode::WorkspaceWrite)
     }
 
     fn workspace() -> std::path::PathBuf {

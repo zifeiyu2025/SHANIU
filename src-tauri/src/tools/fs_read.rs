@@ -307,7 +307,7 @@ mod tests {
     fn ctx(ws: &Path) -> ToolContext {
         static SINK: std::sync::OnceLock<Arc<dyn crate::events::EventSink>> = std::sync::OnceLock::new();
         let sink = SINK.get_or_init(|| Arc::new(crate::events::NullEventSink) as Arc<dyn crate::events::EventSink>).clone();
-        ToolContext::new(ws, tokio_util::sync::CancellationToken::new(), "call", sink)
+        ToolContext::new(ws, tokio_util::sync::CancellationToken::new(), "call", sink, crate::config::SandboxMode::WorkspaceWrite)
     }
 
     #[tokio::test]

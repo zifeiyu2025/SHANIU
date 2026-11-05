@@ -263,6 +263,7 @@ impl AgentLoop {
                     cancel.clone(),
                     call_id.clone(),
                     sink.clone(),
+                    self.policy.sandbox,
                 );
                 let result = self.router.execute(name, args_val, &tool_ctx).await;
                 let output_text = match &result {

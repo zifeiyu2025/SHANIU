@@ -48,7 +48,7 @@ impl ToolOutput {
     }
 }
 
-/// 工具执行上下文：工作区边界、取消令牌、流式输出通道。
+/// 工具执行上下文：工作区边界、取消令牌、流式输出通道、沙箱策略。
 pub struct ToolContext {
     /// 工作区根目录（沙箱 workspace-write 的作用域，docs §9.3）。
     pub workspace_root: PathBuf,
@@ -56,6 +56,8 @@ pub struct ToolContext {
     /// 本次调用的 call_id（unified_exec 等流式工具经 sink 发 ToolCallOutputDelta）。
     pub call_id: String,
     pub sink: Arc<dyn EventSink>,
+    /// 沙箱策略（unified_exec 启动子进程时生效）。
+    pub sandbox: crate::config::SandboxMode,
 }
 
 impl ToolContext {
@@ -64,12 +66,14 @@ impl ToolContext {
         cancel: CancellationToken,
         call_id: impl Into<String>,
         sink: Arc<dyn EventSink>,
+        sandbox: crate::config::SandboxMode,
     ) -> Self {
         Self {
             workspace_root: workspace_root.into(),
             cancel,
             call_id: call_id.into(),
             sink,
+            sandbox,
         }
     }
 }
@@ -212,7 +216,7 @@ mod tests {
             Arc::new(crate::events::NullEventSink)
         })
         .clone();
-        ToolContext::new(workspace_root, CancellationToken::new(), "call-test", sink)
+        ToolContext::new(workspace_root, CancellationToken::new(), "call-test", sink, crate::config::SandboxMode::WorkspaceWrite)
     }
 
     fn router_with_noop() -> ToolRouter {

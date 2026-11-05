@@ -31,9 +31,14 @@ regex = "1"
 # 异步运行时（tauri 内含；此处直连以获得 #[tokio::test]、进程/超时等能力）
 tokio = { version = "1", features = ["macros", "rt", "process", "io-util", "time"] }
 # DPAPI（config.rs 密钥存取，§6 已确认方案）：微软官方 Win32 绑定，最小 feature 面
+# M2-c 沙箱：RestrictedToken（Security）+ JobObject + 进程创建（Threading）
 windows = { version = "0.62", features = [
     "Win32_Foundation",
     "Win32_Security_Cryptography",
+    "Win32_Security",
+    "Win32_System_JobObjects",
+    "Win32_System_Pipes",
+    "Win32_System_Threading",
 ] }
 
 [profile.release]
