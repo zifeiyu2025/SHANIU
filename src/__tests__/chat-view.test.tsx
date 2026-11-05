@@ -46,7 +46,8 @@ describe('ChatView', () => {
     expect(
       (screen.getByPlaceholderText(/描述你想要构建的内容/) as HTMLTextAreaElement).disabled,
     ).toBe(false);
-    expect(screen.getByTestId('token-usage').textContent).toContain('↑10');
+    // dsh StatsPills：紧凑总量（10 输入 + 5 输出 = 15）
+    expect(screen.getByTestId('token-usage').textContent).toContain('15');
   });
 
   it('空态：输入卡片居中', () => {

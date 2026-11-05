@@ -2,7 +2,8 @@ import { useState } from 'react';
 import { useStoreSelector } from '../../store/engine';
 import type { SessionStore } from '../../store/session-store';
 import type { Transport } from '../../transport/types';
-import { ArrowUpIcon, ChevronDownIcon, PlusIcon, StopIcon, WarningIcon } from '../icons';
+import { formatTokens } from '../../utils/token-format';
+import { ArrowUpIcon, ChevronDownIcon, DatabaseIcon, PlusIcon, StopIcon, WarningIcon } from '../icons';
 
 /**
  * 输入卡（复刻 dsh InputBar）：
@@ -90,12 +91,15 @@ export function Composer({
             M0-Mock
             <ChevronDownIcon className="h-3 w-3 text-caption" />
           </button>
-          {usage && (
+          {/* 用量胶囊（对齐 dsh StatsPills：透明底、数据库图标、紧凑总量、tertiary） */}
+          {usage && usage.inputTokens + usage.outputTokens > 0 && (
             <span
               data-testid="token-usage"
-              className="rounded-sm bg-accent/15 px-2 py-px text-[12px] leading-[18px] font-medium tabular-nums text-accent"
+              className="inline-flex items-center gap-1.5 rounded-sm px-2 py-px text-[12px] leading-5 tabular-nums text-tertiary"
+              title={`输入 ${usage.inputTokens} / 输出 ${usage.outputTokens} tokens`}
             >
-              ↑{usage.inputTokens} ↓{usage.outputTokens}
+              <DatabaseIcon className="h-3.5 w-3.5" />
+              {formatTokens(usage.inputTokens + usage.outputTokens)}
             </span>
           )}
           <button

@@ -149,6 +149,17 @@ export function ShieldIcon({ className }: IconProps) {
   );
 }
 
+/** 数据库图标（对齐 dsh IconDatabaseOutlineRegular，用量胶囊用）。 */
+export function DatabaseIcon({ className }: IconProps) {
+  return (
+    <svg {...base(className)}>
+      <ellipse cx="12" cy="6" rx="7" ry="2.8" />
+      <path d="M5 6v12c0 1.55 3.13 2.8 7 2.8s7-1.25 7-2.8V6" />
+      <path d="M5 12c0 1.55 3.13 2.8 7 2.8s7-1.25 7-2.8" />
+    </svg>
+  );
+}
+
 export function WarningIcon({ className }: IconProps) {
   return (
     <svg {...base(className)}>
