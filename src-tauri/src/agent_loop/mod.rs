@@ -80,6 +80,39 @@ pub struct AgentLoop {
     pub workspace_root: PathBuf,
     pub max_turns: u32,
     pub policy: policy::SessionPolicy,
+    /// 会话档案写入器（SH-030）。None = 本次运行不落盘（测试与无目录启动用）。
+    pub rollout: Option<Arc<crate::rollout::RolloutWriter>>,
+    /// 落盘失败只播报一次：磁盘满时每条历史都报一遍会把事件流刷满，却没有任何新信息。
+    /// 与其余字段一样公开——`AgentLoop` 是纯数据结构，测试与装配层都按字面量构造它。
+    pub rollout_broke: std::sync::atomic::AtomicBool,
+}
+
+impl AgentLoop {
+    /// 把 `history` 里尚未落盘的尾部条目补写进档案。
+    ///
+    /// 失败不中断本轮执行——工具与模型都不依赖档案；但必须**播报**：
+    /// 静默降级会让用户以为"会话有存档、可以 resume"，而实际没有。
+    fn flush_history(
+        &self,
+        sink: &Arc<dyn crate::events::EventSink>,
+        history: &[HistoryItem],
+        recorded: &mut usize,
+    ) {
+        let Some(writer) = &self.rollout else { *recorded = history.len(); return };
+        for item in &history[*recorded..] {
+            let entry = crate::rollout::RolloutItem::ResponseItem { item: item.clone() };
+            if let Err(e) = writer.append(&entry) {
+                if !self.rollout_broke.swap(true, std::sync::atomic::Ordering::Relaxed) {
+                    let _ = sink.emit(&EventMsg::Error {
+                        message: format!("会话档案写入失败（后续不再重复播报）：{e}"),
+                    });
+                }
+                // 失败后不再重试剩余条目：同一块盘继续试只会刷更多错误
+                break;
+            }
+        }
+        *recorded = history.len();
+    }
 }
 
 impl AgentLoop {
@@ -90,6 +123,7 @@ impl AgentLoop {
         plan_state: Arc<PlanState>,
         cfg: &AppConfig,
         workspace_root: PathBuf,
+        rollout: Option<Arc<crate::rollout::RolloutWriter>>,
     ) -> Self {
         Self {
             backend,
@@ -102,6 +136,8 @@ impl AgentLoop {
                 approval: cfg.approval.mode,
                 sandbox: cfg.sandbox.mode,
             },
+            rollout,
+            rollout_broke: std::sync::atomic::AtomicBool::new(false),
         }
     }
 
@@ -114,6 +150,8 @@ impl AgentLoop {
         cancel: CancellationToken,
     ) -> TurnSummary {
         let mut history = vec![HistoryItem::Message { role: Role::User, text: task.to_string(), reasoning: None }];
+        // 已落盘的历史条数（SH-030）：每轮结束时补写尾部，崩溃只丢当前轮
+        let mut recorded = 0usize;
         let mut reason = TurnEndReasonLocal::Completed;
         let mut last_turn = 0u32;
         let emit = |sink: &Arc<dyn crate::events::EventSink>, msg: EventMsg| {
@@ -353,7 +391,12 @@ impl AgentLoop {
                     output: output_text,
                 });
             }
+            // 轮末落盘：崩溃只丢当前轮，之前各轮的档案已经 flush 到位
+            self.flush_history(&sink, &history, &mut recorded);
         }
+
+        // 覆盖所有 break 路径（取消/失败/预算耗尽）——它们都从这里收口
+        self.flush_history(&sink, &history, &mut recorded);
 
         emit(&sink, EventMsg::TurnCompleted {
             turn: last_turn,
@@ -505,6 +548,8 @@ mod tests {
                 approval: crate::config::ApprovalMode::Ask,
                 sandbox: crate::config::SandboxMode::WorkspaceWrite,
             },
+            rollout: None,
+            rollout_broke: std::sync::atomic::AtomicBool::new(false),
         };
         (agent, store, CancellationToken::new(), broker)
     }
@@ -823,6 +868,8 @@ mod tests {
                 approval: crate::config::ApprovalMode::Ask,
                 sandbox: crate::config::SandboxMode::WorkspaceWrite,
             },
+            rollout: None,
+            rollout_broke: std::sync::atomic::AtomicBool::new(false),
         };
         (agent, recorded, store)
     }

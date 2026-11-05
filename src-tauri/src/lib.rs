@@ -6,6 +6,7 @@ pub mod events;
 pub mod model_client;
 pub mod sandbox;
 pub mod permission;
+pub mod rollout;
 pub mod tool_router;
 pub mod tools;
 
@@ -49,6 +50,31 @@ fn send_task(app: tauri::AppHandle, task: String) -> Result<(), String> {
     let backend: Arc<dyn ModelBackend> = Arc::new(agent_loop::ResponsesBackend { provider, api_key });
     let mut router = tool_router::ToolRouter::new();
     tools::register_builtin(&mut router, state.plan_state.clone());
+
+    // 会话档案（SH-030）：agent_id 用会话序号，一个任务一份档案。
+    // 建档失败就直接报错给前端——静默不落盘会让用户以为"能 resume"，实际不能。
+    let agent_id = state.next_session_id();
+    let snapshot = rollout::ConfigSnapshot {
+        provider: cfg.model.provider.clone(),
+        base_url: cfg.model.base_url.clone(),
+        model: cfg.model.model.clone(),
+        sandbox: format!("{:?}", cfg.sandbox.mode),
+        approval: format!("{:?}", cfg.approval.mode),
+        workspace_root: state.workspace_root().display().to_string(),
+    };
+    let meta = rollout::RolloutItem::SessionMeta {
+        session_id: agent_id.clone(),
+        agent_id: agent_id.clone(),
+        parent_id: None,
+        created_at: std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_millis() as u64)
+            .unwrap_or_default(),
+        config_snapshot: snapshot,
+    };
+    let writer = rollout::RolloutWriter::create(&state.data_root().join(rollout::ROLLOUT_DIR), &meta)
+        .map_err(|e| format!("会话档案建档失败: {e}"))?;
+
     let agent = agent_loop::AgentLoop::from_config(
         backend,
         Arc::new(router),
@@ -56,6 +82,7 @@ fn send_task(app: tauri::AppHandle, task: String) -> Result<(), String> {
         state.plan_state.clone(),
         &cfg,
         state.workspace_root(),
+        Some(Arc::new(writer)),
     );
     let sink: Arc<dyn events::EventSink> = Arc::new(events::TauriEventSink(app.clone()));
 
@@ -164,7 +191,7 @@ pub fn run() {
         });
 
     tauri::Builder::default()
-        .manage(AppState::new(app_config, config_path))
+        .manage(AppState::new(app_config, config_path, dirs.data_root.clone()))
         .invoke_handler(tauri::generate_handler![
             dev_ping,
             send_task,

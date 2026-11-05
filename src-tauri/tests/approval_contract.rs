@@ -109,6 +109,8 @@ fn harness(tool_name: &str) -> Harness {
             approval: ApprovalMode::Ask,
             sandbox: SandboxMode::WorkspaceWrite,
         },
+        rollout: None,
+        rollout_broke: std::sync::atomic::AtomicBool::new(false),
     };
     Harness { agent, hits, events, broker, cancel: CancellationToken::new() }
 }

@@ -53,9 +53,10 @@ $allow = @{
     'model_client' = @()
     'events'       = @()
     'config'       = @()
+    'rollout'      = @('model_client')                                            # E21
 }
-# rollout 刻意不登记（模块未落地，登记空集等于猜它将来的依赖）；它一出现就会被 fail-closed
-# 拦下，强制当事人先去 §2.3.1 登记。E06（agent_loop → rollout）是另一回事，仍保留在上表。
+# rollout 已落地（SH-030）：它只借用 model_client 的 HistoryItem 作为条目载荷，
+# 不反向依赖循环或工具层——档案是被读写的对象，不是参与者。
 # 组合根 / 装配层：只做接线，允许依赖任意模块，不参与分层判定（§2.3.3）。
 # 豁免判据按**模块身份**，不按名字：
 #   - lib / main 是 crate 根 / bin 根，Rust 里只能是文件 → 按顶层文件精确路径豁免；

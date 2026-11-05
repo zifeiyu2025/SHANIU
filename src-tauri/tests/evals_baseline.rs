@@ -235,6 +235,33 @@ async fn run_one(task: &Task, fixture: &BTreeMap<String, String>, backend: Arc<R
         agg: Mutex::new(Agg::default()),
         broker: broker.clone(),
     });
+    // 顺带验证持久化链路（SH-030）：真实端点跑完一轮，档案必须落盘且能原样读回。
+    // 放在评估里做是因为它跑的是生产同一套 AgentLoop 装配——单测造得出历史，造不出真实时序。
+    let rollout_dir = repo_root().join("target").join("evals-rollouts");
+    std::fs::create_dir_all(&rollout_dir).unwrap();
+    std::fs::remove_file(rollout_dir.join(format!("{}.jsonl", task.id))).ok();
+    let writer = Arc::new(
+        shaniu_lib::rollout::RolloutWriter::create(
+            &rollout_dir,
+            &shaniu_lib::rollout::RolloutItem::SessionMeta {
+                session_id: task.id.clone(),
+                agent_id: task.id.clone(),
+                parent_id: None,
+                created_at: std::time::SystemTime::now()
+                    .duration_since(std::time::UNIX_EPOCH)
+                    .map(|d| d.as_millis() as u64)
+                    .unwrap_or_default(),
+                config_snapshot: shaniu_lib::rollout::ConfigSnapshot {
+                    model: "evals".into(),
+                    sandbox: "WorkspaceWrite".into(),
+                    approval: "AutoReadOnly".into(),
+                    workspace_root: ws.display().to_string(),
+                    ..Default::default()
+                },
+            },
+        )
+        .expect("评估档案应可创建（同名旧档已先删除）"),
+    );
     let agent = AgentLoop {
         backend,
         router: Arc::new(router),
@@ -246,6 +273,8 @@ async fn run_one(task: &Task, fixture: &BTreeMap<String, String>, backend: Arc<R
             approval: ApprovalMode::AutoReadOnly,
             sandbox: SandboxMode::WorkspaceWrite,
         },
+        rollout: Some(writer),
+        rollout_broke: std::sync::atomic::AtomicBool::new(false),
     };
 
     let started = Instant::now();
@@ -281,6 +310,17 @@ async fn run_one(task: &Task, fixture: &BTreeMap<String, String>, backend: Arc<R
         unresolved: agg.unresolved,
         ms,
     };
+    // 档案契约（SH-030 的真机一侧）：真实端点跑完必须留下可读回的档案。
+    // 断言放在这里而不是另开单测——单测造得出历史，造不出真实端点的时序与取消路径。
+    let archive = shaniu_lib::rollout::read(&rollout_dir.join(format!("{}.jsonl", task.id)))
+        .unwrap_or_else(|e| panic!("任务 {} 的档案读回失败：{e}", task.id));
+    assert!(
+        archive.items.len() >= 2,
+        "档案至少要有用户任务与一条助手输出，实际 {} 条：{:?}",
+        archive.items.len(),
+        archive.items
+    );
+    assert_eq!(archive.torn_tail_lines, 0, "正常收口不该有半截写残留");
     std::fs::remove_dir_all(&ws).ok();
     out
 }

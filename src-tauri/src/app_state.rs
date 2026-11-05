@@ -13,6 +13,10 @@ use crate::tool_router::PlanState;
 pub struct AppState {
     config: RwLock<AppConfig>,
     config_path: RwLock<PathBuf>,
+    /// 数据根目录（§9.3）：会话档案 rollout 与日志写在这里。
+    /// 与 config_root 分开——安装模式下前者是 %LOCALAPPDATA%\SHANIU、后者是 %APPDATA%\SHANIU，
+    /// 从 config_path 反推会把档案写错地方。
+    data_root: PathBuf,
     session_seq: AtomicU32,
     /// 当前活动任务的取消令牌（None = 空闲）。
     active_task: Mutex<Option<CancellationToken>>,
@@ -23,10 +27,11 @@ pub struct AppState {
 }
 
 impl AppState {
-    pub fn new(config: AppConfig, config_path: PathBuf) -> Self {
+    pub fn new(config: AppConfig, config_path: PathBuf, data_root: PathBuf) -> Self {
         Self {
             config: RwLock::new(config),
             config_path: RwLock::new(config_path),
+            data_root,
             session_seq: AtomicU32::new(1),
             active_task: Mutex::new(None),
             broker: Arc::new(ApprovalBroker::new()),
@@ -44,11 +49,15 @@ impl AppState {
     }
 
     /// 配置根目录（config.toml 与 secrets\ 的父目录）。
-    pub fn config_root(&self) -> PathBuf {
-        self.config_path()
+    pub fn config_root(&self) -> PathBuf {        self.config_path()
             .parent()
             .map(PathBuf::from)
             .unwrap_or_else(std::env::temp_dir)
+    }
+
+    /// 数据根目录（rollout 档案与日志；§9.3 安装模式 = %LOCALAPPDATA%\SHANIU）。
+    pub fn data_root(&self) -> PathBuf {
+        self.data_root.clone()
     }
 
     /// 工作区根目录：配置优先，空则回落用户主目录（docs §9.1）。
@@ -120,6 +129,7 @@ mod tests {
         AppState::new(
             AppConfig::default(),
             std::env::temp_dir().join(format!("shaniu-state-{}-{n}.toml", std::process::id())),
+            std::env::temp_dir().join(format!("shaniu-state-data-{}-{n}", std::process::id())),
         )
     }
 

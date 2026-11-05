@@ -46,7 +46,8 @@ pub enum ModelStreamEvent {
 }
 
 /// 会话历史项（agent_loop 持有并回填；只描述模型需要看见的内容）。
-#[derive(Debug, Clone, PartialEq, Serialize)]
+/// Deserialize 是 rollout 持久化读回所需（SH-030）：档案必须能还原成同一份历史。
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(tag = "type", rename_all = "snake_case")]
 pub enum HistoryItem {
     Message {
@@ -68,7 +69,7 @@ pub enum HistoryItem {
     FunctionCallOutput { call_id: String, output: String },
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum Role {
     User,

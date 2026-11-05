@@ -115,6 +115,8 @@ async fn measure_once(first_byte: Duration) -> (Duration, Duration) {
             approval: ApprovalMode::Ask,
             sandbox: SandboxMode::WorkspaceWrite,
         },
+        rollout: None,
+        rollout_broke: std::sync::atomic::AtomicBool::new(false),
     };
     let started = Instant::now();
     let _ = agent
@@ -229,6 +231,8 @@ async fn first_delta_latency_within_budget_on_real_endpoint() {
                 approval: ApprovalMode::Ask,
                 sandbox: SandboxMode::ReadOnly,
             },
+            rollout: None,
+            rollout_broke: std::sync::atomic::AtomicBool::new(false),
         };
         let started = Instant::now();
         let _ = agent
