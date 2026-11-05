@@ -6,10 +6,11 @@ import { applyAgentMessageDelta } from './agent-message';
 import { applyTokenUsage } from './usage';
 import { applyError } from './error';
 import { applyApprovalEvent } from './approval';
+import { applyToolCallEvent } from './tool-call';
 
 /**
  * EventMsg → store 归约器入口。
- * 未列出的 M1+ 事件（tool_call_* / plan_delta / turn_diff）与
+ * 未列出的 plan_delta / turn_diff（后续里程碑）与
  * 未知事件类型一律忽略：旧前端必须能容忍新协议事件（前向兼容，见 docs §5 FF-2）。
  */
 export function applyEvent(state: Draft<SessionState>, msg: EventMsg): void {
@@ -19,6 +20,10 @@ export function applyEvent(state: Draft<SessionState>, msg: EventMsg): void {
       return applyTurnEvent(state, msg);
     case 'agent_message_delta':
       return applyAgentMessageDelta(state, msg);
+    case 'tool_call_begin':
+    case 'tool_call_output_delta':
+    case 'tool_call_end':
+      return applyToolCallEvent(state, msg);
     case 'token_usage':
       return applyTokenUsage(state, msg);
     case 'error':

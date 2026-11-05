@@ -12,6 +12,7 @@ const MOCK_REPLY = [
 export function createMockTransport(): Transport {
   const listeners = new Set<(msg: EventMsg) => void>();
   let cancelRequested = false;
+  let callSeq = 0;
   const settings: Settings = {
     baseUrl: '',
     model: '',
@@ -21,6 +22,52 @@ export function createMockTransport(): Transport {
 
   function emit(msg: EventMsg): void {
     for (const listener of [...listeners]) listener(msg);
+  }
+
+  async function streamChunks(chunks: string[]): Promise<void> {
+    for (const chunk of chunks) {
+      if (cancelRequested) return;
+      emit({ type: 'agent_message_delta', delta: chunk });
+      await delay(30);
+    }
+  }
+
+  /** 演示用工具调用：让 dev 模式直接看到 ToolCallCard 的「执行中 → 完成」全过程。 */
+  async function emitToolCallDemo(): Promise<void> {
+    // 每次调用都用新 callId：复用固定值会让第二轮任务沿用首轮卡片，
+    // 既让 dev 模式看不到新卡，也复现不出"跨轮复用 call_id"这条边界
+    callSeq += 1;
+    const callId = `mock-call-${callSeq}`;
+    const stdout = ['$ git status --short\n', ' M src/components/blocks/ToolCallCard.tsx\n'];
+    const stderr = ['warning: in the working copy of LF will be replaced by CRLF\n'];
+    emit({
+      type: 'tool_call_begin',
+      call_id: callId,
+      tool: 'unified_exec',
+      args: { command: 'git status --short' },
+    });
+    await delay(60);
+    for (const delta of stdout) {
+      if (cancelRequested) break;
+      emit({ type: 'tool_call_output_delta', call_id: callId, channel: 'stdout', delta });
+      await delay(80);
+    }
+    for (const delta of stderr) {
+      if (cancelRequested) break;
+      emit({ type: 'tool_call_output_delta', call_id: callId, channel: 'stderr', delta });
+      await delay(80);
+    }
+    // 与真实后端一致（agent_loop/mod.rs）：取消时同样补 end，只是 exit_code 缺失、error 带取消说明。
+    // 第三轮刻意不发 result，模拟旧版后端事件：让 dev 模式能同时看到"带 result 的卡"和
+    // "走回退反推的卡"，否则 FF-2 兼容路径永远只有测试知道、没人真见过。
+    const legacyShape = callSeq === 3;
+    emit({
+      type: 'tool_call_end',
+      call_id: callId,
+      exit_code: cancelRequested ? null : 0,
+      error: cancelRequested ? '已取消' : null,
+      ...(legacyShape ? {} : { result: cancelRequested ? ('cancelled' as const) : ('ok' as const) }),
+    });
   }
 
   return {
@@ -34,11 +81,10 @@ export function createMockTransport(): Transport {
       emit({ type: 'turn_started', turn: 1 });
       const reply = `任务：${task}\n\n${MOCK_REPLY}`;
       const chunks = reply.match(/[\s\S]{1,8}/g) ?? [];
-      for (const chunk of chunks) {
-        if (cancelRequested) break;
-        emit({ type: 'agent_message_delta', delta: chunk });
-        await delay(30);
-      }
+      const half = Math.ceil(chunks.length / 2);
+      await streamChunks(chunks.slice(0, half));
+      if (!cancelRequested) await emitToolCallDemo();
+      await streamChunks(chunks.slice(half));
       emit({ type: 'token_usage', turn: 1, input_tokens: 96, cached_input_tokens: null, output_tokens: 64 });
       emit({
         type: 'turn_completed',

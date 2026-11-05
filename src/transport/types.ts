@@ -4,8 +4,10 @@
 
 export type TurnEndReason = 'completed' | 'cancelled' | 'failed' | 'budget_exhausted';
 export type IoChannel = 'stdout' | 'stderr';
-export type RiskLevel = 'read' | 'write_in_workspace' | 'execute' | 'destructive';
+export type RiskLevel = 'read' | 'write_in_workspace' | 'execute' | 'destructive' | 'plan_review';
 export type ApprovalDecision = 'allow' | 'deny' | 'allow_always';
+/** 工具调用终态（docs/04 §1.2.1）：存在时为唯一状态判据，缺失时前端走两步反推回退。 */
+export type ToolCallResult = 'ok' | 'error' | 'cancelled' | 'denied';
 
 export type EventMsg =
   | { type: 'turn_started'; turn: number }
@@ -13,7 +15,14 @@ export type EventMsg =
   | { type: 'agent_message_delta'; delta: string }
   | { type: 'tool_call_begin'; call_id: string; tool: string; args: unknown }
   | { type: 'tool_call_output_delta'; call_id: string; channel: IoChannel; delta: string }
-  | { type: 'tool_call_end'; call_id: string; exit_code: number | null; error: string | null }
+  | {
+      type: 'tool_call_end';
+      call_id: string;
+      exit_code: number | null;
+      error: string | null;
+      /** additive（FF-2）：后端 `None` 时不产生该键，故"缺失"与"显式 null"都表示未提供。 */
+      result?: ToolCallResult | null;
+    }
   | {
       type: 'exec_approval_request';
       request_id: string;

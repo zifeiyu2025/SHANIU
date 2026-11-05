@@ -62,9 +62,9 @@ describe('reducers', () => {
     expect(state.nodes[0]).toMatchObject({ kind: 'error', message: 'boom' });
   });
 
-  it('M1+ 事件与未知事件类型被忽略（前向兼容）', () => {
+  it('未实现事件（plan_delta 等）与未知事件类型被忽略（前向兼容）', () => {
     let state = reduce(initialState(), { type: 'turn_started', turn: 1 });
-    state = reduce(state, { type: 'tool_call_begin', call_id: 'c1', tool: 'unified_exec', args: {} });
+    state = reduce(state, { type: 'plan_delta', delta: '计划片段' });
     // 运行时收到未知 type 字符串也不得抛错
     state = reduce(state, { type: 'future_event', payload: 1 } as unknown as EventMsg);
     expect(state.nodes).toEqual([]);

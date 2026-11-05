@@ -5,6 +5,7 @@ import type { Transport } from '../../transport/types';
 import type { ConversationNode } from '../../nodes/types';
 import { StreamingText } from '../markdown/StreamingText';
 import { ApprovalCard } from '../approval/ApprovalCard';
+import { ToolCallCard } from '../blocks/ToolCallCard';
 import { Composer } from './Composer';
 
 /** 会话内容列宽（dsh ConversationRoot.module.css:468-471）。 */
@@ -99,6 +100,12 @@ function NodeItem({ node, transport }: { node: ConversationNode; transport: Tran
       return (
         <div className="mt-3">
           <ApprovalCard node={node} transport={transport} />
+        </div>
+      );
+    case 'tool_call':
+      return (
+        <div className="mt-3">
+          <ToolCallCard node={node} />
         </div>
       );
   }
