@@ -18,43 +18,52 @@ export interface SessionState {
 }
 
 export type SessionStore = SnapshotStore<SessionState> & {
-  /** 应用一条后端事件（EventMsg → store 归约）。 */
+  /**
+   * 应用一条后端事件（EventMsg → store 归约）。
+   * 会话窗口关闭期间的事件属于上一会话的在途残留，直接丢弃（见 createSessionStore）。
+   */
   dispatch(msg: Parameters<typeof applyEvent>[1]): void;
-  /** 记录用户任务节点；transport.sendTask 由视图层调用（store 不依赖 transport）。 */
+  /** 记录用户任务节点并开启当前会话窗口；transport.sendTask 由视图层调用（store 不依赖 transport）。 */
   submitUserTask(task: string): void;
-  /** 新会话：清空当前会话状态。 */
+  /** 新会话：清空当前会话状态并关闭窗口，直到下一次 submitUserTask。 */
   reset(): void;
 };
 
-export function createSessionStore(): SessionStore {
-  const store = createSnapshotStore<SessionState>({
+function emptySession(): SessionState {
+  return {
     status: 'idle',
     currentTurn: 0,
     lastTurnEnd: null,
     nodes: [],
     usage: null,
-  });
+  };
+}
+
+export function createSessionStore(): SessionStore {
+  const store = createSnapshotStore<SessionState>(emptySession());
+  // 会话窗口：初建即开，reset() 关闭，submitUserTask() 为重开的信号。
+  // EventMsg 不带会话标识，跨会话唯一的判别依据是「这一轮是不是本会话用户提交的」：
+  // 点新会话时旧轮可能仍在流式产出（真实 IPC 里连 cancel 回执都还没到），
+  // 不过滤就会把旧轮的增量/工具卡/用量/轮次终态灌进刚清空的新会话（SH-081）。
+  let windowOpen = true;
   return {
     getState: store.getState,
     setState: store.setState,
     subscribe: store.subscribe,
     update: store.update,
     dispatch(msg) {
+      if (!windowOpen) return;
       store.update((state) => applyEvent(state, msg));
     },
     submitUserTask(task) {
+      windowOpen = true;
       store.update((state) => {
         state.nodes.push(newUserMessageNode(task));
       });
     },
     reset() {
-      store.setState({
-        status: 'idle',
-        currentTurn: 0,
-        lastTurnEnd: null,
-        nodes: [],
-        usage: null,
-      });
+      windowOpen = false;
+      store.setState(emptySession());
     },
   };
 }

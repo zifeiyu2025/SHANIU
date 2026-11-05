@@ -1,5 +1,5 @@
-import { describe, expect, it } from 'vitest';
-import { act, fireEvent, render, screen, within } from '@testing-library/react';
+import { describe, expect, it, vi } from 'vitest';
+import { act, fireEvent, render, screen, waitFor, within } from '@testing-library/react';
 import { App } from '../App';
 import { createMockTransport } from '../transport/mock';
 
@@ -65,5 +65,56 @@ describe('App 窗口 chrome', () => {
     expect(screen.getByText('跑个任务')).toBeTruthy();
     expect(screen.getByPlaceholderText(/描述你想要构建的内容/)).toHaveProperty('value', '');
     unmount();
+  });
+
+  // SH-081：事件订阅挂在 App 层，不随「新会话」重建——旧轮的在途事件会灌进刚清空的新会话。
+  // 用真实计时器 + waitFor 跑 mock 全轮，比假定时器更贴近真机时序，也不受慢速 runner 牵连。
+  it('流式中点新会话：旧轮在途事件不污染新会话', async () => {
+    const wait = (ms: number) => new Promise((r) => setTimeout(r, ms));
+    const transport = createMockTransport();
+    const cancel = vi.spyOn(transport, 'cancel');
+    render(<App transport={transport} />);
+
+    const input = screen.getByPlaceholderText(/描述你想要构建的内容/);
+    act(() => {
+      fireEvent.change(input, { target: { value: '旧任务' } });
+      fireEvent.keyDown(input, { key: 'Enter' });
+    });
+
+    expect(screen.getByTestId('turn-status').textContent).toContain('运行中');
+    // 旧轮确实跑到了会话里（污染前提成立）：等到工具卡出现再动手
+    await waitFor(
+      () => expect(screen.queryAllByTestId(/^tool-call-/).length).toBeGreaterThan(0),
+      { timeout: 5000 },
+    );
+    expect(screen.getByText('旧任务')).toBeTruthy();
+
+    act(() => {
+      fireEvent.click(screen.getByRole('button', { name: '新会话' }));
+    });
+    expect(cancel).toHaveBeenCalledTimes(1); // 旧轮在源头被请求中断
+    expect(screen.getByTestId('greeting')).toBeTruthy(); // 已回到空态
+
+    await act(async () => {
+      await wait(2000);
+    }); // 放足时间让旧轮把剩余增量/工具卡/用量/轮次终态全部发完
+
+    expect(screen.queryByText('旧任务')).toBeNull();
+    expect(screen.getByTestId('greeting')).toBeTruthy(); // 欢迎语只在 nodes 为空时渲染
+    expect(screen.queryAllByTestId(/^tool-call-/)).toHaveLength(0);
+    expect(screen.queryByTestId('token-usage')).toBeNull();
+    expect(screen.queryByTestId('turn-status')).toBeNull();
+
+    // 新会话未被门禁锁死：提交新任务后事件流恢复
+    const nextInput = screen.getByPlaceholderText(/描述你想要构建的内容/);
+    act(() => {
+      fireEvent.change(nextInput, { target: { value: '新任务' } });
+      fireEvent.keyDown(nextInput, { key: 'Enter' });
+    });
+    await waitFor(() => expect(screen.getByTestId('streaming-cursor')).toBeTruthy(), {
+      timeout: 5000,
+    });
+    expect(screen.getByText('新任务')).toBeTruthy();
+    expect(screen.getByTestId('turn-status').textContent).toContain('运行中');
   });
 });

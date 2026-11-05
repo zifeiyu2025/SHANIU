@@ -41,6 +41,9 @@ export function ChatView({
         <button
           type="button"
           onClick={() => {
+            // 新会话即放弃当前轮：先请中断（源头止损，别让它继续跑完烧 token），
+            // 再 reset() 关闭事件窗口丢弃在途残留（SH-081）。cancel 失败不影响清会话。
+            if (running) void transport.cancel();
             store.reset();
             setGreetingEpoch((n) => n + 1);
           }}
