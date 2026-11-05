@@ -71,9 +71,10 @@ export function ChatView({
   }, []);
 
   // Esc = 停止生成（dsh apply.ts:292-299 `response.stop` 绑 Escape）。分层规则照抄
-  // dsh 的 keymap：浮层先吃 Esc——设置卡开着时 Esc 是关卡，不能顺手把任务也取消了。
+  // dsh 的 keymap：浮层先吃 Esc——设置卡开着时 Esc 是关卡，不能顺手把任务也取消了；
+  // 挂起审批时 Esc 归审批卡（拒绝），这里让位，否则一次按键同时拒绝审批并掐掉整轮。
   useEffect(() => {
-    if (!running) return;
+    if (!running || blocked) return;
     const onKey = (e: KeyboardEvent) => {
       if (e.key !== 'Escape') return;
       if (document.querySelector('[role="dialog"]')) return;
@@ -82,7 +83,7 @@ export function ChatView({
     };
     window.addEventListener('keydown', onKey);
     return () => window.removeEventListener('keydown', onKey);
-  }, [running, transport]);
+  }, [running, blocked, transport]);
 
   // 待发队列收口：只在「一轮刚跑完」这个跃变上放队首，不在挂载/空闲时凭空开火
   // （dsh 的 inbox 语义就是 next-turn）。sending 还挂着时不清标记，等 IPC 回执到了再放，

@@ -85,6 +85,29 @@ export function createMockTransport(): Transport {
     });
   }
 
+  // dev-only 审批场景：request 发出后这条任务就挂在门上，直到裁决或取消把它解开。
+  let settleApproval: (() => void) | null = null;
+  let approvalSeq = 0;
+
+  async function emitApprovalDemo(): Promise<void> {
+    approvalSeq += 1;
+    emit({
+      type: 'exec_approval_request',
+      request_id: `mock-appr-${approvalSeq}`,
+      tool: 'unified_exec',
+      args: { command: 'rm -rf ./dist' },
+      risk: 'execute',
+    });
+    await new Promise<void>((resolve) => {
+      settleApproval = () => resolve();
+    });
+  }
+
+  function releaseApproval(): void {
+    settleApproval?.();
+    settleApproval = null;
+  }
+
   return {
     async ping(nonce) {
       await delay(30);
@@ -99,6 +122,9 @@ export function createMockTransport(): Transport {
       const half = Math.ceil(chunks.length / 2);
       await streamReasoning();
       await streamChunks(chunks.slice(0, half));
+      // dev-only 审批场景：任务文本含「审批」才挂起一张审批卡。
+      // 不发审批事件的 mock 让审批卡只活在单元测试里，键盘裁决与截图验收都无从下手。
+      if (task.includes('审批')) await emitApprovalDemo();
       if (!cancelRequested) await emitToolCallDemo();
       await streamChunks(chunks.slice(half));
       emit({ type: 'token_usage', turn: 1, input_tokens: 96, cached_input_tokens: null, output_tokens: 64 });
@@ -111,6 +137,8 @@ export function createMockTransport(): Transport {
 
     async cancel() {
       cancelRequested = true;
+      // 取消要能解开卡在审批门上的 await，否则 dev 里那条任务永远悬着
+      releaseApproval();
     },
 
     async getSettings() {
@@ -126,9 +154,12 @@ export function createMockTransport(): Transport {
       if (input.apiKey?.trim()) settings.hasApiKey = true;
     },
 
-    async approve() {
-      // mock 模式无后端 broker：静默忽略（审批卡状态由后端事件驱动，mock 不发）
+    async approve(requestId, decision) {
       await delay(10);
+      // 审批卡的状态是后端事件驱动的：mock 也得把 resolved 回执发回去，
+      // 否则卡片永远停在 pending，dev 里看不到裁决后的形态。
+      emit({ type: 'exec_approval_resolved', request_id: requestId, decision });
+      releaseApproval();
     },
 
     onEvent(handler) {

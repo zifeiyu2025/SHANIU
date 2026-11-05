@@ -253,6 +253,27 @@ describe('ChatView', () => {
     expect(spy).not.toHaveBeenCalled();
   });
 
+  it('挂起审批时 Esc 归审批卡，不会同时掐掉整轮', () => {
+    const store = createSessionStore();
+    const { transport, cancel } = spyTransport();
+    render(<ChatView store={store} transport={transport} />);
+
+    act(() => {
+      store.submitUserTask('跑个命令');
+      store.dispatch({ type: 'turn_started', turn: 1 });
+      store.dispatch({
+        type: 'exec_approval_request',
+        request_id: 'appr-1',
+        tool: 'unified_exec',
+        args: { command: 'rm -rf /tmp/x' },
+        risk: 'execute',
+      });
+    });
+
+    fireEvent.keyDown(window, { key: 'Escape' });
+    expect(cancel).not.toHaveBeenCalled(); // 会话区让位（dsh 的 pending interaction 仲裁）
+  });
+
   it('Esc = 停止生成；浮层开着时 Esc 归浮层，不顺手取消任务', () => {
     const store = createSessionStore();
     const { transport, cancel } = spyTransport();
