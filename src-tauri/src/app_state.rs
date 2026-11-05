@@ -8,6 +8,7 @@ use tokio_util::sync::CancellationToken;
 
 use crate::config::{new_session_id, AppConfig};
 use crate::permission::ApprovalBroker;
+use crate::tools::plan::PlanState;
 
 pub struct AppState {
     config: RwLock<AppConfig>,
@@ -17,6 +18,8 @@ pub struct AppState {
     active_task: Mutex<Option<CancellationToken>>,
     /// 审批 broker（approve 命令回执入口）。
     pub broker: Arc<ApprovalBroker>,
+    /// 计划态标志（Plan Mode，跨任务保留：同一会话内后续任务仍在计划态时继续只读）。
+    pub plan_state: Arc<PlanState>,
 }
 
 impl AppState {
@@ -27,6 +30,7 @@ impl AppState {
             session_seq: AtomicU32::new(1),
             active_task: Mutex::new(None),
             broker: Arc::new(ApprovalBroker::new()),
+            plan_state: Arc::new(PlanState::new()),
         }
     }
 

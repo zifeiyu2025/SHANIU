@@ -6,17 +6,19 @@
 
 pub mod apply_patch;
 pub mod fs_read;
+pub mod plan;
 pub mod unified_exec;
 
 use std::sync::Arc;
 
 use crate::tool_router::ToolRouter;
 
-/// 注册 M1 全部内置工具。
-pub fn register_builtin(router: &mut ToolRouter) {
+/// 注册全部内置工具（Plan Mode 工具对共享 PlanState）。
+pub fn register_builtin(router: &mut ToolRouter, plan_state: Arc<plan::PlanState>) {
     router.register(Arc::new(fs_read::ReadFile::new()));
     router.register(Arc::new(fs_read::ListDir::new()));
     router.register(Arc::new(fs_read::Search::new()));
     router.register(Arc::new(unified_exec::UnifiedExec::new()));
     router.register(Arc::new(apply_patch::ApplyPatch::new()));
+    plan::register(router, plan_state);
 }

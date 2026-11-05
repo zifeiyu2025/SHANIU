@@ -31,6 +31,9 @@ pub fn risk_of(tool_name: &str) -> RiskLevel {
         "read_file" | "list_dir" | "search" => RiskLevel::Read,
         "apply_patch" => RiskLevel::WriteInWorkspace,
         "unified_exec" => RiskLevel::Execute,
+        // Plan Mode：进入免确认（read 档）；退出必须用户评审（ADR-003）
+        "enter_plan_mode" => RiskLevel::Read,
+        "exit_plan_mode" => RiskLevel::PlanReview,
         _ => RiskLevel::Destructive,
     }
 }
@@ -54,8 +57,17 @@ pub fn decide(
             _ if remembered_execute => Decision::Allow,
             _ => Decision::Prompt,
         },
-        RiskLevel::Destructive => Decision::Prompt,
+        RiskLevel::Destructive | RiskLevel::PlanReview => Decision::Prompt,
     }
+}
+
+/// Plan Mode 白名单：计划态下仅只读工具 + 退出评审可用（ADR-003 只读计划态）。
+/// `enter_plan_mode` 虽为 read 档，但属模式控制而非数据读取，已在计划态时不再放行（幂等进入由工具自身容错）。
+pub fn plan_mode_allows(tool_name: &str) -> bool {
+    if tool_name == "enter_plan_mode" {
+        return false;
+    }
+    matches!(risk_of(tool_name), RiskLevel::Read) || tool_name == "exit_plan_mode"
 }
 
 #[cfg(test)]
@@ -100,5 +112,25 @@ mod tests {
     #[test]
     fn unknown_tool_is_destructive_by_default() {
         assert_eq!(risk_of("no_such_tool"), RiskLevel::Destructive);
+    }
+
+    #[test]
+    fn plan_review_is_always_prompted() {
+        for sandbox in [SandboxMode::ReadOnly, SandboxMode::WorkspaceWrite, SandboxMode::DangerFullAccess] {
+            assert_eq!(decide(RiskLevel::PlanReview, ApprovalMode::Ask, sandbox, true), Decision::Prompt);
+        }
+        assert_eq!(risk_of("exit_plan_mode"), RiskLevel::PlanReview);
+        assert_eq!(risk_of("enter_plan_mode"), RiskLevel::Read);
+    }
+
+    #[test]
+    fn plan_mode_whitelist_only_read_and_exit() {
+        assert!(plan_mode_allows("read_file"));
+        assert!(plan_mode_allows("list_dir"));
+        assert!(plan_mode_allows("search"));
+        assert!(plan_mode_allows("exit_plan_mode"));
+        assert!(!plan_mode_allows("apply_patch"));
+        assert!(!plan_mode_allows("unified_exec"));
+        assert!(!plan_mode_allows("enter_plan_mode"));
     }
 }

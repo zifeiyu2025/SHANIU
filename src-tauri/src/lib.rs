@@ -48,11 +48,12 @@ fn send_task(app: tauri::AppHandle, task: String) -> Result<(), String> {
 
     let backend: Arc<dyn ModelBackend> = Arc::new(agent_loop::ResponsesBackend { provider, api_key });
     let mut router = tool_router::ToolRouter::new();
-    tools::register_builtin(&mut router);
+    tools::register_builtin(&mut router, state.plan_state.clone());
     let agent = agent_loop::AgentLoop::from_config(
         backend,
         Arc::new(router),
         state.broker.clone(),
+        state.plan_state.clone(),
         &cfg,
         state.workspace_root(),
     );

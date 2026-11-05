@@ -22,6 +22,7 @@ use crate::model_client::{
     self, provider::ProviderConfig, HistoryItem, ModelStreamEvent, ResponseItem, Role, Usage,
 };
 use crate::permission::{policy, ApprovalBroker};
+use crate::tools::plan::PlanState;
 use crate::tool_router::{ToolContext, ToolRouter};
 
 pub use budget::TurnBudget;
@@ -68,6 +69,7 @@ pub struct AgentLoop {
     pub backend: Arc<dyn ModelBackend>,
     pub router: Arc<ToolRouter>,
     pub broker: Arc<ApprovalBroker>,
+    pub plan_state: Arc<PlanState>,
     pub workspace_root: PathBuf,
     pub max_turns: u32,
     pub policy: policy::SessionPolicy,
@@ -78,6 +80,7 @@ impl AgentLoop {
         backend: Arc<dyn ModelBackend>,
         router: Arc<ToolRouter>,
         broker: Arc<ApprovalBroker>,
+        plan_state: Arc<PlanState>,
         cfg: &AppConfig,
         workspace_root: PathBuf,
     ) -> Self {
@@ -85,6 +88,7 @@ impl AgentLoop {
             backend,
             router,
             broker,
+            plan_state,
             workspace_root,
             max_turns: TurnBudget::from_config(cfg).max_turns,
             policy: policy::SessionPolicy {
@@ -114,11 +118,9 @@ impl AgentLoop {
             emit(&sink, EventMsg::TurnStarted { turn });
 
             // 1) 采样（流式）：取消 → drop 流 = 断开连接
-            let mut stream = match self
-                .backend
-                .stream(&history, &self.router.declarations())
-                .await
-            {
+            // 计划态下只向模型声明只读工具 + exit_plan_mode（ADR-003 双层防御第一层）
+            let declarations = declarations_for(&self.router, self.plan_state.is_active());
+            let mut stream = match self.backend.stream(&history, &declarations).await {
                 Ok(s) => s,
                 Err(e) => {
                     emit(&sink, EventMsg::Error { message: e });
@@ -226,6 +228,20 @@ impl AgentLoop {
                         .unwrap_or(serde_json::Value::String(arguments.clone())),
                 });
 
+                // 计划态执行守卫（双层防御；声明已收窄，此处兜底）
+                if self.plan_state.is_active() && !policy::plan_mode_allows(name) {
+                    emit(&sink, EventMsg::ToolCallEnd {
+                        call_id: call_id.clone(),
+                        exit_code: None,
+                        error: Some("计划模式仅只读工具可用".into()),
+                    });
+                    history.push(HistoryItem::FunctionCallOutput {
+                        call_id: call_id.clone(),
+                        output: "计划模式仅只读工具可用；请先调用 exit_plan_mode 提交计划".into(),
+                    });
+                    continue;
+                }
+
                 // 审批门禁（ADR-003）：裁决 → 询问回执 → 放行/拒绝
                 let args_val =
                     serde_json::from_str(arguments).unwrap_or(serde_json::Value::String(arguments.clone()));
@@ -311,6 +327,18 @@ impl AgentLoop {
         });
         TurnSummary { turns: last_turn, reason: reason.into() }
     }
+}
+
+/// 本轮向模型声明的工具集合（ADR-003 计划态只读的第一层防御）：
+/// 计划态下仅保留只读工具与 `exit_plan_mode`，写入/执行工具对模型不可见。
+fn declarations_for(router: &ToolRouter, plan_active: bool) -> Vec<crate::model_client::ToolDeclaration> {
+    let all = router.declarations();
+    if !plan_active {
+        return all;
+    }
+    all.into_iter()
+        .filter(|d| policy::plan_mode_allows(&d.name))
+        .collect()
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -430,6 +458,7 @@ mod tests {
             backend: Arc::new(ScriptedBackend::new(turns)),
             router: Arc::new(router),
             broker: broker.clone(),
+            plan_state: Arc::new(PlanState::new()),
             workspace_root: std::env::temp_dir(),
             max_turns: 3,
             policy: policy::SessionPolicy {
@@ -629,5 +658,82 @@ mod tests {
         agent.router = router;
         drop(router_raw);
         (agent, store, cancel, broker)
+    }
+
+    // ---- Plan Mode（ADR-003 只读计划态）----
+
+    #[test]
+    fn plan_mode_declarations_hide_write_and_execute_tools() {
+        let mut router = ToolRouter::new();
+        crate::tools::register_builtin(&mut router, Arc::new(PlanState::new()));
+
+        let names = |plan: bool| -> Vec<String> {
+            declarations_for(&router, plan).into_iter().map(|d| d.name).collect()
+        };
+        let planned = names(true);
+        assert!(planned.contains(&"read_file".to_string()));
+        assert!(planned.contains(&"list_dir".to_string()));
+        assert!(planned.contains(&"search".to_string()));
+        assert!(planned.contains(&"exit_plan_mode".to_string()));
+        assert!(!planned.contains(&"apply_patch".to_string()), "计划态不得向模型声明写入工具");
+        assert!(!planned.contains(&"unified_exec".to_string()), "计划态不得向模型声明命令执行工具");
+        assert!(!planned.contains(&"enter_plan_mode".to_string()), "已在计划态，无需重复进入");
+
+        let full = names(false);
+        assert!(full.contains(&"apply_patch".to_string()));
+        assert!(full.contains(&"unified_exec".to_string()));
+    }
+
+    #[tokio::test]
+    async fn plan_mode_guard_blocks_write_tool_even_if_called() {
+        struct PatchEcho {
+            spec: ToolSpec,
+        }
+        #[async_trait::async_trait]
+        impl ToolExecutor for PatchEcho {
+            fn spec(&self) -> &ToolSpec {
+                &self.spec
+            }
+            async fn execute(&self, _a: Value, _c: &ToolContext) -> Result<ToolOutput, ToolError> {
+                Ok(ToolOutput::ok("patched"))
+            }
+        }
+        let (mut agent, store, cancel, _broker) = make_loop(vec![
+            vec![ModelStreamEvent::OutputItem(ResponseItem::FunctionCall {
+                name: "apply_patch".into(),
+                arguments: r#"{"patch":"*** Begin Patch"}"#.into(),
+                call_id: "c5".into(),
+            }), usage_ev()],
+            vec![ModelStreamEvent::OutputTextDelta { delta: "改为只读调研".into() }, usage_ev()],
+        ]);
+        // 只注册写入工具（read_file 回显 + apply_patch），并置为计划态
+        let mut router = ToolRouter::new();
+        router.register(Arc::new(EchoTool::default()));
+        router.register(Arc::new(PatchEcho {
+            spec: ToolSpec::new("apply_patch", "写入", serde_json::json!({"type":"object"})),
+        }));
+        agent.router = Arc::new(router);
+        let plan_state = Arc::new(PlanState::new());
+        plan_state.activate();
+        agent.plan_state = plan_state;
+
+        let summary = agent.run_task("任务", Arc::new(CapturingSink(store.clone())), cancel).await;
+        assert_eq!(summary.reason, TurnEndReason::Completed);
+        let events = store.lock().unwrap();
+        assert!(
+            events.iter().any(|e| matches!(
+                e,
+                EventMsg::ToolCallEnd { call_id, error: Some(msg), .. }
+                    if call_id == "c5" && msg.contains("计划模式")
+            )),
+            "计划态下写入工具必须被执行守卫拒绝"
+        );
+        // 未被真正执行：没有「成功」的 ToolCallEnd
+        assert!(!events.iter().any(|e| matches!(
+            e,
+            EventMsg::ToolCallEnd { call_id, exit_code: Some(0), error: None } if call_id == "c5"
+        )));
+        // 也不应触发审批（守卫先于审批门禁）
+        assert!(!events.iter().any(|e| matches!(e, EventMsg::ExecApprovalRequest { .. })));
     }
 }

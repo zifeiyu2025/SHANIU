@@ -36,6 +36,8 @@ pub enum RiskLevel {
     WriteInWorkspace,
     Execute,
     Destructive,
+    /// 计划评审（Plan Mode 退出确认，ADR-003）。
+    PlanReview,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]

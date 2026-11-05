@@ -7,7 +7,17 @@ const RISK_LABEL: Record<RiskLevel, string> = {
   write_in_workspace: '工作区写入',
   execute: '命令执行',
   destructive: '破坏性',
+  plan_review: '计划评审',
 };
+
+/** 计划评审节点取计划正文（exit_plan_mode 的 plan 参数），否则回退原始参数。 */
+function planTextOf(args: unknown): string {
+  if (args && typeof args === 'object' && 'plan' in args) {
+    const plan = (args as { plan?: unknown }).plan;
+    if (typeof plan === 'string') return plan;
+  }
+  return typeof args === 'string' ? args : JSON.stringify(args, null, 2);
+}
 
 /**
  * 审批卡（ADR-003）：展示工具/参数/风险等级；默认焦点在「拒绝」（审批疲劳缓解）；
@@ -23,6 +33,7 @@ export function ApprovalCard({
   const denyRef = useRef<HTMLButtonElement>(null);
   const decided = node.status !== 'pending';
   const [error, setError] = useState<string | null>(null);
+  const isPlanReview = node.risk === 'plan_review';
 
   useEffect(() => {
     if (!decided) denyRef.current?.focus();
@@ -48,11 +59,27 @@ export function ApprovalCard({
         >
           {RISK_LABEL[node.risk]}
         </span>
-        <span className="font-medium text-primary">{node.tool}</span>
+        <span className="font-medium text-primary">
+          {isPlanReview ? '实施计划待批准' : node.tool}
+        </span>
       </div>
-      <pre className="mt-2 max-h-40 overflow-auto whitespace-pre-wrap text-[12px] leading-[18px] text-secondary">
-        {typeof node.args === 'string' ? node.args : JSON.stringify(node.args, null, 2)}
-      </pre>
+      {isPlanReview ? (
+        <>
+          <p className="mt-2 text-[12px] text-tertiary">
+            批准后计划保存到工作区 <code className="text-secondary">.shaniu/plan.md</code>，并恢复写入与命令执行能力。
+          </p>
+          <pre
+            data-testid={`plan-${node.requestId}`}
+            className="mt-2 max-h-72 overflow-auto whitespace-pre-wrap rounded-md border border-line2 bg-surface px-3 py-2 text-[12px] leading-[19px] text-secondary"
+          >
+            {planTextOf(node.args)}
+          </pre>
+        </>
+      ) : (
+        <pre className="mt-2 max-h-40 overflow-auto whitespace-pre-wrap text-[12px] leading-[18px] text-secondary">
+          {typeof node.args === 'string' ? node.args : JSON.stringify(node.args, null, 2)}
+        </pre>
+      )}
       {error && (
         <p role="alert" className="mt-2 text-[12px] text-danger">
           {error}
@@ -60,7 +87,7 @@ export function ApprovalCard({
       )}
       {decided ? (
         <p className="mt-2 text-[13px] text-tertiary">
-          {node.status === 'allowed' ? '已允许' : '已拒绝'}
+          {node.status === 'allowed' ? (isPlanReview ? '计划已批准' : '已允许') : '已拒绝'}
         </p>
       ) : (
         <div className="mt-3 flex items-center gap-2">
@@ -70,14 +97,14 @@ export function ApprovalCard({
             ref={denyRef}
             className="h-8 rounded-md border border-line2 px-4 text-[13px] text-secondary transition-colors duration-100 hover:border-danger hover:text-danger"
           >
-            拒绝
+            {isPlanReview ? '拒绝修改' : '拒绝'}
           </button>
           <button
             type="button"
             onClick={() => decide('allow')}
             className="h-8 rounded-md bg-accent px-4 text-[13px] text-white transition-colors duration-100 hover:bg-accent-strong"
           >
-            允许
+            {isPlanReview ? '批准计划' : '允许'}
           </button>
           {node.risk === 'execute' && (
             <button

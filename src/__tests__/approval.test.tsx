@@ -89,4 +89,41 @@ describe('ApprovalCard', () => {
     expect(screen.queryByRole('button', { name: '允许' })).toBeNull();
     await waitFor(() => expect(transport.approve).not.toHaveBeenCalled());
   });
+
+  it('plan_review 展示计划正文与「批准计划/拒绝修改」，不提供本会话记住', () => {
+    const { transport } = makeTransport();
+    const node = {
+      ...baseNode,
+      requestId: 'appr-plan',
+      tool: 'exit_plan_mode',
+      risk: 'plan_review' as const,
+      args: { plan: '## 步骤\n1. 读代码\n2. 改文件' },
+    };
+    render(<ApprovalCard node={node} transport={transport} />);
+    expect(screen.getByText('计划评审')).toBeTruthy();
+    expect(screen.getByText('实施计划待批准')).toBeTruthy();
+    expect(screen.getByTestId('plan-appr-plan').textContent).toContain('改文件');
+    expect(screen.queryByRole('button', { name: '本会话记住' })).toBeNull();
+    fireEvent.click(screen.getByRole('button', { name: '批准计划' }));
+    expect(transport.approve).toHaveBeenCalledWith('appr-plan', 'allow');
+  });
+
+  it('plan_review 已批准显示「计划已批准」', () => {
+    const { transport } = makeTransport();
+    render(
+      <ApprovalCard
+        node={{
+          ...baseNode,
+          requestId: 'appr-plan',
+          tool: 'exit_plan_mode',
+          risk: 'plan_review' as const,
+          args: { plan: '## 步骤' },
+          status: 'allowed' as const,
+        }}
+        transport={transport}
+      />,
+    );
+    expect(screen.getByText('计划已批准')).toBeTruthy();
+    expect(screen.queryByRole('button', { name: '批准计划' })).toBeNull();
+  });
 });
