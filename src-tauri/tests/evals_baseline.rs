@@ -119,6 +119,20 @@ struct Agg {
     /// 错误原文（最多留 3 条，每条截 200 字符）：只给"失败"二字的话，
     /// 报告就退化成一个无法归因的数字，基线也就白跑了。
     errors: Vec<String>,
+    /// 工具调用轨迹（begin → end 配对，上限 10 条）：SH-085 这类"跑完但没产出"
+    /// 的失败，只有看到模型实际发了什么才有归因，否则只能猜提示词。
+    trace: Vec<String>,
+}
+
+/// 参数摘要：够认出模型发了什么，又不至于把报告撑爆。
+fn args_summary(args: &serde_json::Value) -> String {
+    let text = args.to_string();
+    let text = text.chars().take(90).collect::<String>();
+    if text.chars().count() < args.to_string().chars().count() {
+        format!("{text}…")
+    } else {
+        text
+    }
 }
 
 /// 生产语义的"总是允许"用户：请求一到就地代答。代答失败数一并记录——
@@ -140,7 +154,35 @@ impl EventSink for EvalSink {
                 agg.input_tokens += u64::from(*input_tokens);
                 agg.output_tokens += u64::from(*output_tokens);
             }
-            EventMsg::ToolCallBegin { .. } => agg.tool_calls += 1,
+            EventMsg::ToolCallBegin { tool, args, .. } => {
+                agg.tool_calls += 1;
+                if agg.trace.len() < 10 {
+                    agg.trace.push(format!("{tool} {}", args_summary(args)));
+                }
+            }
+            EventMsg::ToolCallEnd { result, error, .. } => {
+                if let Some(last) = agg.trace.last_mut() {
+                    let outcome = match (result, error) {
+                        (Some(r), None) => format!("→ {r:?}"),
+                        (Some(r), Some(e)) => {
+                            format!("→ {r:?} {}", e.chars().take(80).collect::<String>())
+                        }
+                        (None, Some(e)) => format!("→ 无终态 {e}"),
+                        (None, None) => "→ 无终态信息".to_string(),
+                    };
+                    last.push_str(&outcome);
+                }
+            }
+            EventMsg::ToolCallOutputDelta { delta, .. } => {
+                // 输出正文是归因的关键：只看命令会误判成"模型没写文件"，
+                // 实际可能是它看到的 cwd/结果与预期不符。每条轨迹限 240 字符。
+                if let Some(last) = agg.trace.last_mut() {
+                    if last.matches("｜输出=").count() < 1 {
+                        let head: String = delta.chars().take(240).collect();
+                        last.push_str(&format!("｜输出={head:?}"));
+                    }
+                }
+            }
             EventMsg::Error { message } => {
                 let trimmed: String = message.chars().take(200).collect();
                 if agg.errors.len() < 3 {
@@ -166,6 +208,7 @@ impl EventSink for EvalSink {
 struct Outcome {
     success: bool,
     detail: String,
+    trace: Vec<String>,
     turns: u32,
     input_tokens: u64,
     output_tokens: u64,
@@ -229,6 +272,7 @@ async fn run_one(task: &Task, fixture: &BTreeMap<String, String>, backend: Arc<R
     let out = Outcome {
         success: verdict.is_ok(),
         detail,
+        trace: agg.trace.clone(),
         turns,
         input_tokens: agg.input_tokens,
         output_tokens: agg.output_tokens,
@@ -259,10 +303,22 @@ async fn evals_baseline_v0() {
     let raw = std::fs::read_to_string(repo_root().join("evals").join("tasks.json"))
         .expect("evals/tasks.json 必须存在");
     let spec: TasksFile = serde_json::from_str(&raw).expect("evals/tasks.json 解析失败");
+    // 单任务调试用（SHANIU_EVAL_ONLY=create-note）：全量一轮要几分钟与真实额度，
+    // 归因时只需要重跑失败那一个
+    let only = std::env::var("SHANIU_EVAL_ONLY").unwrap_or_default();
+    let selected: Vec<&Task> = spec
+        .tasks
+        .iter()
+        .filter(|t| only.is_empty() || t.id == only)
+        .collect();
+    if selected.is_empty() {
+        panic!("SHANIU_EVAL_ONLY={only} 在 tasks.json 里没有对应任务 id");
+    }
 
     let mut rows = Vec::new();
     let mut passed = 0usize;
-    for task in &spec.tasks {
+    let count = selected.len();
+    for task in selected {
         let out = run_one(task, &spec.fixture, backend.clone()).await;
         if out.success {
             passed += 1;
@@ -279,12 +335,19 @@ async fn evals_baseline_v0() {
             out.ms,
             out.detail,
         );
+        if !out.success {
+            // 失败必带轨迹：没有"模型实际发了什么"，归因只能靠猜
+            for line in &out.trace {
+                println!("    · {line}");
+            }
+        }
         rows.push(json!({
             "id": task.id,
             "title": task.title,
             "success": out.success,
             "turns": out.turns,
             "tool_calls": out.tool_calls,
+            "trace": out.trace,
             "input_tokens": out.input_tokens,
             "output_tokens": out.output_tokens,
             "approvals": out.approvals,
@@ -294,7 +357,7 @@ async fn evals_baseline_v0() {
         }));
     }
 
-    let n = spec.tasks.len() as f64;
+    let n = count as f64;
     let sum_turns: u32 = rows.iter().filter_map(|r| r["turns"].as_u64()).map(|t| t as u32).sum();
     let sum_tokens: u64 = rows
         .iter()
@@ -308,7 +371,7 @@ async fn evals_baseline_v0() {
         "model": provider.model,
         "max_turns_per_task": MAX_TURNS_PER_TASK,
         "summary": {
-            "n": spec.tasks.len(),
+            "n": count,
             "passed": passed,
             "success_rate": passed as f64 / n,
             "avg_turns": f64::from(sum_turns) / n,
@@ -316,16 +379,19 @@ async fn evals_baseline_v0() {
         },
         "tasks": rows,
     });
-    let out_path = repo_root().join("evals").join("latest.json");
-    std::fs::write(&out_path, serde_json::to_string_pretty(&report).unwrap()).unwrap();
     println!(
-        "[evals] 基线报告已写入 {}：成功率={}/{}，平均轮数={:.2}，平均 token={:.0}",
-        out_path.display(),
-        passed,
-        spec.tasks.len(),
+        "[evals] 本轮成功率={passed}/{count}，平均轮数={:.2}，平均 token={:.0}",
         f64::from(sum_turns) / n,
         sum_tokens as f64 / n,
     );
+    if only.is_empty() {
+        let out_path = repo_root().join("evals").join("latest.json");
+        std::fs::write(&out_path, serde_json::to_string_pretty(&report).unwrap()).unwrap();
+        println!("[evals] 基线报告已写入 {}", out_path.display());
+    } else {
+        // 单任务调试绝不能覆写 latest.json：否则一次调试跑就把基线门禁的参照物换掉
+        println!("[evals] 调试模式（SHANIU_EVAL_ONLY={only}）：不写 latest.json，不影响门禁");
+    }
 
     // 运行器自身的底线：全 0 分通常是环境坏了（端点/密钥/沙箱），不是"模型笨"，
     // 必须让跑的人立刻分辨这两种情况，否则基线报告会被当成可信数据用。
