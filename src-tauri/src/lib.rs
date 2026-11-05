@@ -35,6 +35,87 @@ fn send_task(app: tauri::AppHandle, task: String) -> Result<(), String> {
     if task.trim().is_empty() {
         return Err("任务为空".into());
     }
+    let (agent, cancel) = build_agent(&state)?;
+    let sink: Arc<dyn events::EventSink> = Arc::new(events::TauriEventSink(app.clone()));
+    tauri::async_runtime::spawn(async move {
+        let _ = agent.run_task(&task, sink, cancel).await;
+        app.state::<AppState>().end_task();
+    });
+    Ok(())
+}
+
+/// 重启后恢复会话并续跑新任务（SH-031）。
+///
+/// 恢复的三条硬要求都在这里成立：档案按 agent_id 定位、续跑**追加**到同一份档案
+/// （`open_existing`，不重新建档）、已落盘条数作为写入起点（`persisted`，避免把旧历史重写一遍）。
+/// 历史合法性由 `rollout::resume` 的重放规则保证；这里不再"修"历史——
+/// 静默补配对会掩盖档案损坏，而档案损坏必须由上层显式处理。
+#[tauri::command]
+fn resume_session(app: tauri::AppHandle, agent_id: String, task: String) -> Result<(), String> {
+    let state = app.state::<AppState>();
+    if task.trim().is_empty() {
+        return Err("任务为空".into());
+    }
+    let path = state
+        .data_root()
+        .join(rollout::ROLLOUT_DIR)
+        .join(format!("{agent_id}.jsonl"));
+    let resumed = rollout::resume::resume(&path).map_err(|e| format!("恢复会话失败: {e}"))?;
+    let persisted = resumed.history.len();
+    let mut history = resumed.history;
+    history.push(model_client::HistoryItem::Message {
+        role: model_client::Role::User,
+        text: task.clone(),
+        reasoning: None,
+    });
+
+    let writer = rollout::RolloutWriter::open_existing(&resumed.path)
+        .map_err(|e| format!("档案续写打不开: {e}"))?;
+    let (agent, cancel) = build_agent_with(&state, Some(Arc::new(writer)))?;
+    let sink: Arc<dyn events::EventSink> = Arc::new(events::TauriEventSink(app.clone()));
+    tauri::async_runtime::spawn(async move {
+        let _ = agent.run_with_history(history, persisted, sink, cancel).await;
+        app.state::<AppState>().end_task();
+    });
+    Ok(())
+}
+
+/// 组装一次任务所需的 AgentLoop + 取消令牌（新会话：现场建档）。
+/// 建档失败就直接报错给前端——静默不落盘会让用户以为"能 resume"，实际不能。
+fn build_agent(state: &AppState) -> Result<(agent_loop::AgentLoop, tokio_util::sync::CancellationToken), String> {
+    let writer = new_session_writer(state)?;
+    build_agent_with(state, Some(writer))
+}
+
+fn new_session_writer(state: &AppState) -> Result<Arc<rollout::RolloutWriter>, String> {
+    let cfg = state.config();
+    let agent_id = state.next_session_id();
+    let meta = rollout::RolloutItem::SessionMeta {
+        session_id: agent_id.clone(),
+        agent_id: agent_id.clone(),
+        parent_id: None,
+        created_at: std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_millis() as u64)
+            .unwrap_or_default(),
+        config_snapshot: rollout::ConfigSnapshot {
+            provider: cfg.model.provider.clone(),
+            base_url: cfg.model.base_url.clone(),
+            model: cfg.model.model.clone(),
+            sandbox: format!("{:?}", cfg.sandbox.mode),
+            approval: format!("{:?}", cfg.approval.mode),
+            workspace_root: state.workspace_root().display().to_string(),
+        },
+    };
+    rollout::RolloutWriter::create(&state.data_root().join(rollout::ROLLOUT_DIR), &meta)
+        .map(Arc::new)
+        .map_err(|e| format!("会话档案建档失败: {e}"))
+}
+
+fn build_agent_with(
+    state: &AppState,
+    writer: Option<Arc<rollout::RolloutWriter>>,
+) -> Result<(agent_loop::AgentLoop, tokio_util::sync::CancellationToken), String> {
     let cfg = state.config();
     let provider = model_client::provider::ProviderConfig::from_model_config(&cfg.model);
     let secret = config::SecretStore::new(&state.config_root());
@@ -50,31 +131,6 @@ fn send_task(app: tauri::AppHandle, task: String) -> Result<(), String> {
     let backend: Arc<dyn ModelBackend> = Arc::new(agent_loop::ResponsesBackend { provider, api_key });
     let mut router = tool_router::ToolRouter::new();
     tools::register_builtin(&mut router, state.plan_state.clone());
-
-    // 会话档案（SH-030）：agent_id 用会话序号，一个任务一份档案。
-    // 建档失败就直接报错给前端——静默不落盘会让用户以为"能 resume"，实际不能。
-    let agent_id = state.next_session_id();
-    let snapshot = rollout::ConfigSnapshot {
-        provider: cfg.model.provider.clone(),
-        base_url: cfg.model.base_url.clone(),
-        model: cfg.model.model.clone(),
-        sandbox: format!("{:?}", cfg.sandbox.mode),
-        approval: format!("{:?}", cfg.approval.mode),
-        workspace_root: state.workspace_root().display().to_string(),
-    };
-    let meta = rollout::RolloutItem::SessionMeta {
-        session_id: agent_id.clone(),
-        agent_id: agent_id.clone(),
-        parent_id: None,
-        created_at: std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)
-            .map(|d| d.as_millis() as u64)
-            .unwrap_or_default(),
-        config_snapshot: snapshot,
-    };
-    let writer = rollout::RolloutWriter::create(&state.data_root().join(rollout::ROLLOUT_DIR), &meta)
-        .map_err(|e| format!("会话档案建档失败: {e}"))?;
-
     let agent = agent_loop::AgentLoop::from_config(
         backend,
         Arc::new(router),
@@ -82,16 +138,9 @@ fn send_task(app: tauri::AppHandle, task: String) -> Result<(), String> {
         state.plan_state.clone(),
         &cfg,
         state.workspace_root(),
-        Some(Arc::new(writer)),
+        writer,
     );
-    let sink: Arc<dyn events::EventSink> = Arc::new(events::TauriEventSink(app.clone()));
-
-    tauri::async_runtime::spawn(async move {
-        let _ = agent.run_task(&task, sink, cancel).await;
-        // 任务收口：释放活动任务槽位（无论成败）
-        app.state::<AppState>().end_task();
-    });
-    Ok(())
+    Ok((agent, cancel))
 }
 
 /// 取消当前任务。
@@ -195,6 +244,7 @@ pub fn run() {
         .invoke_handler(tauri::generate_handler![
             dev_ping,
             send_task,
+            resume_session,
             cancel_task,
             approve,
             store_api_key,

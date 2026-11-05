@@ -149,9 +149,29 @@ impl AgentLoop {
         sink: Arc<dyn crate::events::EventSink>,
         cancel: CancellationToken,
     ) -> TurnSummary {
-        let mut history = vec![HistoryItem::Message { role: Role::User, text: task.to_string(), reasoning: None }];
-        // 已落盘的历史条数（SH-030）：每轮结束时补写尾部，崩溃只丢当前轮
-        let mut recorded = 0usize;
+        let history = vec![HistoryItem::Message { role: Role::User, text: task.to_string(), reasoning: None }];
+        self.run_with_history(history, 0, sink, cancel).await
+    }
+
+    /// 从既有历史续跑（SH-031 resume/fork）。
+    ///
+    /// `persisted` = 该历史里**已经落盘**的条数（resume 传 `resumed.history.len()`，
+    /// 新会话传 0）。传错就会把整段旧历史再写一遍，档案里出现重复条目——这是
+    /// 只有读的时候才会发现的错，所以做成显式参数而不是猜。
+    ///
+    /// 历史合法性由调用方负责：`rollout::resume` 重放出来的历史已按配对规则截断，
+    /// 这里刻意不再"修"历史——静默补配对会掩盖档案损坏，而档案损坏必须由上层显式处理。
+    pub async fn run_with_history(
+        &self,
+        mut history: Vec<HistoryItem>,
+        persisted: usize,
+        sink: Arc<dyn crate::events::EventSink>,
+        cancel: CancellationToken,
+    ) -> TurnSummary {
+        // 已落盘的历史条数（SH-030）：每轮结束时补写尾部，崩溃只丢当前轮。
+        // 续跑时从调用方给的起点开始，避免把旧历史再写一遍；上限锁死在历史长度，
+        // 传大了也不会越过档案真实拥有的条目数。
+        let mut recorded = persisted.min(history.len());
         let mut reason = TurnEndReasonLocal::Completed;
         let mut last_turn = 0u32;
         let emit = |sink: &Arc<dyn crate::events::EventSink>, msg: EventMsg| {

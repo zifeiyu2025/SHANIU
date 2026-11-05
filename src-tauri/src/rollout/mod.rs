@@ -13,6 +13,8 @@
 //! 边界（AGENTS §3）：rollout 含用户代码与对话，属敏感数据。本模块**不**写入任何密钥；
 //! `config_snapshot` 只存端点/模型/模式等非凭据字段，`base_url` 允许入库但禁止含 query 凭据。
 
+pub mod resume;
+
 use std::fs::{File, OpenOptions};
 use std::io::{BufRead, BufReader, Write};
 use std::path::{Path, PathBuf};
@@ -110,6 +112,30 @@ impl RolloutWriter {
         let writer = Self { path, file: Mutex::new(file) };
         writer.append(meta)?;
         Ok(writer)
+    }
+
+    /// 以追加方式重新打开已有档案（resume 用，SH-031）。
+    ///
+    /// 校验首行确实是 `session_meta` 才允许续写：往一个没有建档的文件里追加，
+    /// 产出的是一份 resume 时才发现读不了的档案，错误被推迟到最难定位的时刻。
+    pub fn open_existing(path: &Path) -> Result<Self, RolloutError> {
+        let head = File::open(path)
+            .map_err(|e| RolloutError::Io(format!("{path:?}: {e}")))?;
+        let first_line = BufReader::new(head)
+            .lines()
+            .next()
+            .ok_or_else(|| RolloutError::NoSessionMeta(format!("{}", path.display())))?
+            .map_err(|e| RolloutError::Io(format!("{}", e)))?;
+        let first: RolloutItem = serde_json::from_str(&first_line)
+            .map_err(|e| RolloutError::Corrupted { line: 1, message: e.to_string() })?;
+        if !matches!(first, RolloutItem::SessionMeta { .. }) {
+            return Err(RolloutError::NoSessionMeta(format!("{}", path.display())));
+        }
+        let file = OpenOptions::new()
+            .append(true)
+            .open(path)
+            .map_err(|e| RolloutError::Io(format!("{path:?}: {e}")))?;
+        Ok(Self { path: path.to_path_buf(), file: Mutex::new(file) })
     }
 
     pub fn path(&self) -> &Path {
