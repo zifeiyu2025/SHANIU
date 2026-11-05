@@ -143,7 +143,7 @@ function NodeItem({ node, transport }: { node: ConversationNode; transport: Tran
         <div className="mt-3 flex justify-end">
           <div
             data-testid="user-bubble"
-            className="max-w-[70.2%] rounded-xl bg-layer2 px-4 py-2.5 text-[14px] leading-[22px] whitespace-pre-wrap text-primary"
+            className="max-w-[70.2%] rounded-xl bg-bubble px-4 py-2.5 text-[14px] leading-[22px] whitespace-pre-wrap text-primary"
           >
             {node.text}
           </div>

@@ -1,9 +1,18 @@
 import { useEffect, useState, type ReactNode } from 'react';
 import type { Transport } from '../../transport/types';
+import {
+  THEME_LABELS,
+  THEME_PREFERENCES,
+  applyPreference,
+  readPreference,
+  writePreference,
+  type ThemePreference,
+} from '../../theme';
 
 /**
- * 设置对话框（M1 最小集）：API Key（DPAPI 加密存储，留空不覆盖）/ 端点 / 模型 / 工作区。
- * 视觉对齐 dsh 菜单卡：r16、elevation-prominent、遮罩 rgba(0,0,0,.5)。
+ * 设置对话框（M1 最小集）：外观 / API Key（DPAPI 加密存储，留空不覆盖）/ 端点 / 模型 / 工作区。
+ * 视觉对齐 dsh 菜单卡：r16、elevation-panel 描边、遮罩用 mask 令牌（dsh bg-mask-1 亮档 .24）。
+ * 外观三档是纯前端显示偏好，保存即生效，不参与后端读写命令。
  */
 export function SettingsDialog({
   transport,
@@ -13,6 +22,7 @@ export function SettingsDialog({
   onClose: () => void;
 }) {
   const [baseUrl, setBaseUrl] = useState('');
+  const [theme, setTheme] = useState<ThemePreference>(() => readPreference());
   const [model, setModel] = useState('');
   const [workspaceRoot, setWorkspaceRoot] = useState('');
   const [apiKey, setApiKey] = useState('');
@@ -55,10 +65,10 @@ export function SettingsDialog({
 
   return (
     <div
-      className="fixed inset-0 z-40 flex items-center justify-center bg-black/50"
+      className="fixed inset-0 z-40 flex items-center justify-center bg-mask"
       data-testid="settings-dialog"
     >
-      <div className="w-[460px] rounded-lg bg-layer2 p-5 shadow-prominent">
+      <div className="w-[460px] rounded-lg bg-layer1 p-5 shadow-panel">
         <h2 className="mb-4 text-[16px] font-medium leading-6 text-primary">设置</h2>
 
         {error && (
@@ -68,6 +78,33 @@ export function SettingsDialog({
         )}
 
         <div className="flex flex-col gap-3 text-[14px] leading-[22px]">
+          {/* 外观三档（SH-041）：纯显示偏好，存 localStorage，不参与后端读写命令。
+              不用 Field——label 只能关联单个控件，包住 radiogroup 会污染第一个 radio 的名字。 */}
+          <div className="flex flex-col gap-1.5">
+            <span className="text-[13px] text-secondary">外观</span>
+            <div role="radiogroup" aria-label="外观" className="flex gap-1" data-testid="settings-theme">
+              {THEME_PREFERENCES.map((option) => (
+                <button
+                  key={option}
+                  type="button"
+                  role="radio"
+                  aria-checked={theme === option}
+                  onClick={() => {
+                    writePreference(option);
+                    applyPreference(option);
+                    setTheme(option);
+                  }}
+                  className={`h-8 rounded-sm px-3 text-[13px] leading-5 transition-colors duration-100 ${
+                    theme === option
+                      ? 'bg-selector text-primary'
+                      : 'text-secondary hover:bg-hover hover:text-primary'
+                  }`}
+                >
+                  {THEME_LABELS[option]}
+                </button>
+              ))}
+            </div>
+          </div>
           <Field label={`API Key${hasApiKey ? '（已保存，留空不覆盖）' : ''}`}>
             <input
               type="password"

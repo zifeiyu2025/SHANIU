@@ -75,4 +75,26 @@ describe('SettingsDialog', () => {
     await waitFor(() => expect(screen.getByRole('alert')).toBeTruthy());
     expect(onClose).not.toHaveBeenCalled();
   });
+
+  it('外观三档：名字不被 label 污染，点击即落属性并持久化', async () => {
+    const { transport } = fakeTransport();
+    render(<SettingsDialog transport={transport} onClose={() => {}} />);
+    await waitFor(() => expect(screen.getByTestId('settings-theme')).toBeTruthy());
+
+    // 每个 radio 的可访问名必须就是自己的档位文案；被外层 label 污染时这里会红。
+    expect(screen.getAllByRole('radio').map((el) => el.textContent)).toEqual(['浅色', '深色', '跟随系统']);
+    expect(screen.getByRole('radio', { name: '浅色' })).toBeTruthy();
+
+    fireEvent.click(screen.getByRole('radio', { name: '深色' }));
+    expect(document.body.hasAttribute('data-ds-dark-theme')).toBe(true);
+    expect(window.localStorage.getItem('shaniu.theme')).toBe('dark');
+    expect(screen.getByRole('radio', { name: '深色' }).getAttribute('aria-checked')).toBe('true');
+
+    fireEvent.click(screen.getByRole('radio', { name: '浅色' }));
+    expect(document.body.hasAttribute('data-ds-dark-theme')).toBe(false);
+    expect(window.localStorage.getItem('shaniu.theme')).toBe('light');
+
+    document.body.removeAttribute('data-ds-dark-theme');
+    window.localStorage.removeItem('shaniu.theme');
+  });
 });

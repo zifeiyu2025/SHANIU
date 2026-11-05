@@ -39,7 +39,7 @@ export function Composer({
   }
 
   return (
-    <div className="w-full rounded-panel bg-layer2 shadow-soft">
+    <div className="w-full rounded-panel bg-input-major shadow-soft">
       <textarea
         rows={hero ? 2 : 1}
         value={text}
