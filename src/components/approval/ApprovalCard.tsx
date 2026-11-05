@@ -1,4 +1,4 @@
-import { useEffect, useRef } from 'react';
+import { useEffect, useRef, useState } from 'react';
 import type { ApprovalNode, RiskLevel } from '../../nodes/types';
 import type { Transport } from '../../transport/types';
 
@@ -22,13 +22,14 @@ export function ApprovalCard({
 }) {
   const denyRef = useRef<HTMLButtonElement>(null);
   const decided = node.status !== 'pending';
+  const [error, setError] = useState<string | null>(null);
 
   useEffect(() => {
     if (!decided) denyRef.current?.focus();
   }, [decided]);
 
   function decide(decision: 'allow' | 'allow_always' | 'deny') {
-    void transport.approve(node.requestId, decision);
+    transport.approve(node.requestId, decision).catch((e: unknown) => setError(String(e)));
   }
 
   return (
@@ -52,6 +53,11 @@ export function ApprovalCard({
       <pre className="mt-2 max-h-40 overflow-auto whitespace-pre-wrap text-[12px] leading-[18px] text-secondary">
         {typeof node.args === 'string' ? node.args : JSON.stringify(node.args, null, 2)}
       </pre>
+      {error && (
+        <p role="alert" className="mt-2 text-[12px] text-danger">
+          {error}
+        </p>
+      )}
       {decided ? (
         <p className="mt-2 text-[13px] text-tertiary">
           {node.status === 'allowed' ? '已允许' : '已拒绝'}

@@ -1,6 +1,6 @@
 import { invoke } from '@tauri-apps/api/core';
 import { listen, type UnlistenFn } from '@tauri-apps/api/event';
-import type { EventMsg, Settings, Transport } from './types';
+import type { ApprovalDecision, EventMsg, Settings, Transport } from './types';
 
 // 通道名与 src-tauri/src/events.rs 保持一致。
 const EVENT_CHANNEL = 'shaniu://event';
@@ -61,9 +61,8 @@ export function createTauriTransport(): Transport {
       });
     },
 
-    async approve() {
-      // M2 里程碑接入 permission broker 后替换为 invoke('approve', { requestId, decision })
-      throw new Error('M0：审批通道在 M2 里程碑（permission broker）接入');
+    async approve(requestId: string, decision: ApprovalDecision) {
+      await invoke('approve', { requestId, decision });
     },
 
     onEvent(handler) {
