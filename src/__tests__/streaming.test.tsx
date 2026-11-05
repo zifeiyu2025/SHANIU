@@ -7,21 +7,28 @@ describe('StreamingText 冻结块', () => {
   it('追加流式内容时已完成块不重渲染', () => {
     const renders: string[] = [];
     const onBlockRender = (text: string) => renders.push(text);
+    const count = (block: string) => renders.filter((t) => t === block).length;
 
     const view = render(
       <StreamingText text={'第一段'} streaming onBlockRender={onBlockRender} />,
     );
+    // 尾部安全边界要留两块（dsh UNSTABLE_TAIL_BLOCKS），所以第三块出现时第一块才定稿。
     view.rerender(
-      <StreamingText text={'第一段\n\n第二段流式'} streaming onBlockRender={onBlockRender} />,
+      <StreamingText text={'第一段\n\n第二段\n\n第三段流'} streaming onBlockRender={onBlockRender} />,
+    );
+    const afterFreeze = count('第一段');
+    view.rerender(
+      <StreamingText text={'第一段\n\n第二段\n\n第三段流式'} streaming onBlockRender={onBlockRender} />,
     );
     view.rerender(
-      <StreamingText text={'第一段\n\n第二段流式中'} streaming onBlockRender={onBlockRender} />,
+      <StreamingText text={'第一段\n\n第二段\n\n第三段流式中'} streaming onBlockRender={onBlockRender} />,
     );
 
-    // 冻结块只在挂载时渲染一次
-    expect(renders.filter((t) => t === '第一段')).toHaveLength(1);
+    // 定稿之后每帧增量必须为 0：缓存的是 element 引用，React 直接跳过整棵子树。
+    expect(count('第一段')).toBe(afterFreeze);
     // 活动块随 delta 更新
-    expect(renders.filter((t) => t.startsWith('第二段')).length).toBeGreaterThanOrEqual(2);
+    expect(count('第三段流式')).toBeGreaterThanOrEqual(1);
+    expect(count('第三段流式中')).toBe(1);
   });
 
   it('完成态：末块冻结、光标消失、全文可见', () => {

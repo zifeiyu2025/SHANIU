@@ -2,10 +2,29 @@ import type { EventMsg, Settings, Transport } from './types';
 
 const delay = (ms: number) => new Promise<void>((resolve) => setTimeout(resolve, ms));
 
+/**
+ * mock 回复刻意带 Markdown 结构（标题/列表/代码块/行内码/强调）。
+ * 理由同 mock 必须发审批事件：渲染层的效果只有真机看得见，纯文本的 mock 会让
+ * 「Markdown 到底渲染成什么样」永远停在单元测试里。
+ */
 const MOCK_REPLY = [
-  '收到任务。这是 M0 骨架的 mock 会话：真实模型接入在 M1 里程碑（model_client）。',
-  '当前已打通：事件协议 EventMsg、快照存储、流式渲染（已完成块冻结）与中断按钮。',
-  '试试在流式输出过程中点击「停止」，事件流会以 cancelled 结束。',
+  '收到任务。这是 **M0 骨架** 的 mock 会话：真实模型接入在 M1 里程碑（`model_client`）。',
+  [
+    '## 当前已打通',
+    '',
+    '- 事件协议 `EventMsg` 与快照存储',
+    '- 流式渲染（已完成块冻结）',
+    '- 中断按钮，接 `CancellationToken`',
+  ].join('\n'),
+  [
+    '命令输出走独立通道：',
+    '',
+    '```ts',
+    'const handle = await exec({ command: "git status --short" });',
+    'for (const line of handle.stdout) render(line);',
+    '```',
+  ].join('\n'),
+  '试试在流式输出过程中点击「停止」，事件流会以 `cancelled` 结束。',
 ].join('\n\n');
 
 /** Vite 独立开发用的 mock 传输层：不经 Tauri IPC，本地驱动一轮完整 mock 事件流。 */
