@@ -8,5 +8,6 @@ if (el === null) throw new Error('missing #root');
 
 bootShaniu(el).catch((reason: unknown) => {
   console.error(reason);
-  el.textContent = `启动失败：${reason instanceof Error ? reason.message : String(reason)}`;
+  const detail = reason instanceof Error ? `${reason.message}\n${reason.stack ?? ''}` : String(reason);
+  el.textContent = `启动失败：${detail}`;
 });

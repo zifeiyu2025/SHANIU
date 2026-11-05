@@ -12,12 +12,66 @@ import type { HostObservable } from '@deepseek-ai/dsh-client-ui-slots'
 import type { SessionId } from '@deepseek-ai/dsh-session/types'
 import type { TypertResourceKind } from '@deepseek-ai/dsh-typert-protocol'
 
-/** `remote` 服务最小面：事件订阅全部落空（返回解绑函数），调用一律报"未接线"。 */
-export function stubRemote() {
-  return {
+/** 一个未接线的 remote 命名空间面：任何方法调用都显式抛错，属性探测返回抛错函数。 */
+export function stubRemoteNamespace(name: string): unknown {
+  const thrower = () => {
+    throw new Error(`stub(remote.${name}): 该命令面未接线，见 transport/stubs.ts 清单`)
+  }
+  return new Proxy({}, {
+    get(_t, prop) {
+      if (typeof prop === 'symbol') return undefined
+      return thrower
+    },
+  })
+}
+
+/** batch-1/2 组装面涉及的 remote 命名空间（dotted inject + 属性访问两用）。 */
+export const REMOTE_NAMESPACES = [
+  'session', 'commands', 'toolResults', 'userQuestions', 'workspace', 'workspaceFiles',
+  'directoryPicker', 'job', 'terminal', 'settings', 'subagents', 'modelSelection',
+] as const
+
+/**
+ * `remote` 服务 stub：$on/$emit/$call 事件与调用面 + 命名空间子对象。
+ * SH-017（工具/终端/diff 接线）与 SH-008（mock 事件源）核销。
+ */
+export function stubRemote(): unknown {
+  const base = {
     $on: () => () => {},
     $emit: () => false,
     $call: () => Promise.reject(new Error('stub(remote): SH-017 接线前不可用')),
+    // 流：永不产帧（无后端即无数据，UI 停在连接/加载态，不伪造成功）。
+    // 注意：new Promise<T>() 泛型形式会被当前 vite 转换管线破坏（v8.3.5 oxc 打印 bug），
+    // 必须用类型注解形式声明。
+    $stream: () => {
+      const pending: Promise<IteratorResult<never>> = new Promise(() => {})
+      return {
+        [Symbol.asyncIterator]: () => ({
+          next: () => pending,
+          return: async () => ({ done: true as const, value: undefined as never }),
+        }),
+      }
+    },
+    $mount: async () => {
+      throw new Error('stub(remote).$mount: 由适配层取代，见 transport/shims')
+    },
+  } as Record<string | symbol, unknown>
+  return new Proxy(base, {
+    get(target, prop) {
+      if (prop in target) return target[prop]
+      if (typeof prop === 'symbol') return undefined
+      if ((REMOTE_NAMESPACES as readonly string[]).includes(prop)) {
+        return stubRemoteNamespace(prop)
+      }
+      return stubRemoteNamespace(String(prop))
+    },
+  })
+}
+
+/** 批量注册 `remote.<ns>` 点分服务（cordis inject 的 'remote.session' 等按服务名解析）。 */
+export function installRemoteNamespaceStubs(ctx: Context): void {
+  for (const ns of REMOTE_NAMESPACES) {
+    ctx.reflect.provide(`remote.${ns}`, stubRemoteNamespace(ns))
   }
 }
 

@@ -9,7 +9,7 @@ export type {
   ModelSelection, ModelCatalog, ModelReasoningEffort, ModelProviderGroup,
 } from '@deepseek-ai/dsh-api-session-controller/types'
 export type { SettingsPathOpView, SettingsNamespaceView } from '@deepseek-ai/dsh-settings/types'
-export type { DirectoryListing, DirectoryEntry } from '@deepseek-ai/dsh-host-directory-picker'
+export type { DirectoryListing, DirectoryEntry } from '@deepseek-ai/dsh-host-directory-picker/types'
 export type { SessionId } from '@deepseek-ai/dsh-session/types'
 
 /** cordis 动态插件面（二期 runner），当前仅作类型占位。 */
