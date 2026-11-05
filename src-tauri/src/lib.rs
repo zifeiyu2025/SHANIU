@@ -28,34 +28,47 @@ fn dev_ping(app: tauri::AppHandle, nonce: String) -> Result<(), String> {
     events::emit_pong(&app, &nonce)
 }
 
-/// 提交任务：组装后端 → 启动 agent_loop 任务（事件经 TauriEventSink 广播）。
+/// 提交任务，并返回**本次使用的 agent_id**。
+///
+/// `agent_id` 为 None = 新会话（现场建档）；为 Some = 续写那份档案（SH-033 的
+/// 「打开历史会话后继续输入」）。返回值是必需的而不是顺手加的：新会话的 id
+/// 只有后端知道（`next_session_id` 在这里生成），前端拿不到它就无从决定
+/// 下一次提交该续写谁——会话列表也就永远点不回自己刚建的那条。
 #[tauri::command]
-fn send_task(app: tauri::AppHandle, task: String) -> Result<(), String> {
-    let state = app.state::<AppState>();
+fn send_task(app: tauri::AppHandle, task: String, agent_id: Option<String>) -> Result<String, String> {
     if task.trim().is_empty() {
         return Err("任务为空".into());
     }
-    let (agent, cancel) = build_agent(&state)?;
-    let sink: Arc<dyn events::EventSink> = Arc::new(events::TauriEventSink(app.clone()));
-    tauri::async_runtime::spawn(async move {
-        let _ = agent.run_task(&task, sink, cancel).await;
-        app.state::<AppState>().end_task();
-    });
-    Ok(())
+    let state = app.state::<AppState>();
+    match agent_id.filter(|id| !id.trim().is_empty()) {
+        Some(id) => {
+            continue_session(&app, &state, id.clone(), &task)?;
+            Ok(id)
+        }
+        None => {
+            let (agent, cancel, new_id) = build_new_session(&state)?;
+            let sink: Arc<dyn events::EventSink> = Arc::new(events::TauriEventSink(app.clone()));
+            tauri::async_runtime::spawn(async move {
+                let _ = agent.run_task(&task, sink, cancel).await;
+                app.state::<AppState>().end_task();
+            });
+            Ok(new_id)
+        }
+    }
 }
 
-/// 重启后恢复会话并续跑新任务（SH-031）。
+/// 续写一份既有档案——`resume_session` 与 `send_task(Some(id))` 的共用主体。
 ///
 /// 恢复的三条硬要求都在这里成立：档案按 agent_id 定位、续跑**追加**到同一份档案
-/// （`open_existing`，不重新建档）、已落盘条数作为写入起点（`persisted`，避免把旧历史重写一遍）。
-/// 历史合法性由 `rollout::resume` 的重放规则保证；这里不再"修"历史——
+/// （`open_existing`，不重新建档）、已落盘条数作为写入起点（`persisted`，避免把旧历史
+/// 重写一遍）。历史合法性由 `rollout::resume` 的重放规则保证；这里不再"修"历史——
 /// 静默补配对会掩盖档案损坏，而档案损坏必须由上层显式处理。
-#[tauri::command]
-fn resume_session(app: tauri::AppHandle, agent_id: String, task: String) -> Result<(), String> {
-    let state = app.state::<AppState>();
-    if task.trim().is_empty() {
-        return Err("任务为空".into());
-    }
+fn continue_session(
+    app: &tauri::AppHandle,
+    state: &AppState,
+    agent_id: String,
+    task: &str,
+) -> Result<(), String> {
     let path = state
         .data_root()
         .join(rollout::ROLLOUT_DIR)
@@ -65,29 +78,165 @@ fn resume_session(app: tauri::AppHandle, agent_id: String, task: String) -> Resu
     let mut history = resumed.history;
     history.push(model_client::HistoryItem::Message {
         role: model_client::Role::User,
-        text: task.clone(),
+        text: task.to_string(),
         reasoning: None,
     });
 
     let writer = rollout::RolloutWriter::open_existing(&resumed.path)
         .map_err(|e| format!("档案续写打不开: {e}"))?;
-    let (agent, cancel) = build_agent_with(&state, Some(Arc::new(writer)))?;
+    let (agent, cancel) = build_agent_with(state, Some(Arc::new(writer)))?;
     let sink: Arc<dyn events::EventSink> = Arc::new(events::TauriEventSink(app.clone()));
+    // spawn 的 future 必须是 'static：借用的 app 只能换成 owned 句柄再 move 进去。
+    let app_handle = app.clone();
     tauri::async_runtime::spawn(async move {
         let _ = agent.run_with_history(history, persisted, sink, cancel).await;
-        app.state::<AppState>().end_task();
+        app_handle.state::<AppState>().end_task();
     });
     Ok(())
 }
 
-/// 组装一次任务所需的 AgentLoop + 取消令牌（新会话：现场建档）。
-/// 建档失败就直接报错给前端——静默不落盘会让用户以为"能 resume"，实际不能。
-fn build_agent(state: &AppState) -> Result<(agent_loop::AgentLoop, tokio_util::sync::CancellationToken), String> {
-    let writer = new_session_writer(state)?;
-    build_agent_with(state, Some(writer))
+/// 重启后恢复会话并续跑新任务（SH-031）。
+#[tauri::command]
+fn resume_session(app: tauri::AppHandle, agent_id: String, task: String) -> Result<(), String> {
+    if task.trim().is_empty() {
+        return Err("任务为空".into());
+    }
+    let state = app.state::<AppState>();
+    continue_session(&app, &state, agent_id, &task)
 }
 
-fn new_session_writer(state: &AppState) -> Result<Arc<rollout::RolloutWriter>, String> {
+/// 会话列表（SH-033）：档案目录里的摘要，按更新时间倒序。
+///
+/// 返回空列表而不是错误：档案目录不存在是**首次运行的正常状态**，
+/// 把它当错误会让前端在干净安装上必须写一条特判分支，而那条分支什么也修不了。
+#[tauri::command]
+fn list_sessions(app: tauri::AppHandle) -> Vec<rollout::SessionSummary> {
+    let state = app.state::<AppState>();
+    rollout::list(&state.data_root().join(rollout::ROLLOUT_DIR))
+}
+
+/// 打开一个会话所需的历史条目。
+///
+/// **为什么不复用事件流重放**：`EventMsg` 里没有用户消息事件——用户消息历来是前端
+/// `submitUserTask` 本地生成的。若为了重放新增一个事件变体，就得动受保护的 `events/`
+/// 并牵动 FF-2（EventMsg tag ↔ types.ts 的机械绑定）。而重放的语义本来就是
+/// 「一次性数据加载」而不是「流」，用 command 返回值更贴切，且对协议零侵入。
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize)]
+#[serde(tag = "kind", rename_all = "snake_case")]
+pub enum SessionEntry {
+    Message {
+        role: String,
+        text: String,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        reasoning: Option<String>,
+    },
+    ToolCall {
+        call_id: String,
+        tool: String,
+        arguments: String,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        output: Option<String>,
+    },
+}
+
+/// 档案历史 → 展示条目。
+///
+/// 工具输出在档案里排在**同轮全部调用之后**（"先全部 call、再全部 output"，SH-031 的
+/// `nearest_safe_cut` 正是靠这个形状才敢只在配对边界截断）。展示要按调用顺序把输出带上，
+/// 所以先建一遍 `call_id → output` 索引，再按原序输出，`FunctionCallOutput` 本身不再成条。
+fn project_entries(items: &[rollout::RolloutItem]) -> Vec<SessionEntry> {
+    let mut outputs: std::collections::HashMap<String, String> = std::collections::HashMap::new();
+    for item in items {
+        if let rollout::RolloutItem::ResponseItem {
+            item: model_client::HistoryItem::FunctionCallOutput { call_id, output },
+        } = item
+        {
+            outputs.insert(call_id.clone(), output.clone());
+        }
+    }
+
+    let mut out = Vec::with_capacity(items.len());
+    for item in items {
+        match item {
+            rollout::RolloutItem::ResponseItem {
+                item: model_client::HistoryItem::Message { role, text, reasoning },
+            } => out.push(SessionEntry::Message {
+                role: match role {
+                    model_client::Role::User => "user",
+                    model_client::Role::Assistant => "assistant",
+                    model_client::Role::System => "system",
+                }
+                .to_string(),
+                text: text.clone(),
+                reasoning: reasoning.clone(),
+            }),
+            rollout::RolloutItem::ResponseItem {
+                item: model_client::HistoryItem::FunctionCall { name, arguments, call_id },
+            } => out.push(SessionEntry::ToolCall {
+                call_id: call_id.clone(),
+                tool: name.clone(),
+                arguments: arguments.clone(),
+                output: outputs.get(call_id).cloned(),
+            }),
+            // 已并进对应的 ToolCall，不单独成条。
+            rollout::RolloutItem::ResponseItem {
+                item: model_client::HistoryItem::FunctionCallOutput { .. },
+            } => {}
+            // 压缩锚点在 resume 时的语义就是"用 summary 取代那段区间"，
+            // 展示也必须一致，否则用户会看到区间原文而模型看到的是摘要——两份真相。
+            rollout::RolloutItem::Compacted { summary, .. } => out.push(SessionEntry::Message {
+                role: "assistant".to_string(),
+                text: summary.clone(),
+                reasoning: None,
+            }),
+            // 首行 meta 不是历史；子代理引用要等 SH-056 的泳道 UI 才有展示形态。
+            rollout::RolloutItem::SessionMeta { .. } | rollout::RolloutItem::SubagentRef { .. } => {}
+        }
+    }
+    out
+}
+
+/// 读回一个会话的历史条目，供前端渲染（SH-033 的"打开会话"）。
+///
+/// 走 `rollout::read` 的严格口径：档案中间坏行必须报错，绝不能给前端一份"看起来完整、
+/// 实际缺尾"的历史——那正是 SH-030 设计选择 2 要防的事。
+#[tauri::command]
+fn load_session(app: tauri::AppHandle, agent_id: String) -> Result<Vec<SessionEntry>, String> {
+    let state = app.state::<AppState>();
+    let path = state
+        .data_root()
+        .join(rollout::ROLLOUT_DIR)
+        .join(format!("{agent_id}.jsonl"));
+    let archive = rollout::read(&path).map_err(|e| format!("档案读不回: {e}"))?;
+    Ok(project_entries(&archive.items))
+}
+
+/// 从既有会话分支出一个新档案，返回新 agent_id（SH-033 的 fork 入口）。
+///
+/// 截断点由 `nearest_safe_cut` 兜底：前端要 N 条，实际可能给得更少（从中间切会留下
+/// 有 call 无 output 的尾巴，续跑第一次请求就 400，见 SH-082）。父档案只读。
+#[tauri::command]
+fn fork_session(app: tauri::AppHandle, agent_id: String, keep_items: usize) -> Result<String, String> {
+    let state = app.state::<AppState>();
+    let dir = state.data_root().join(rollout::ROLLOUT_DIR);
+    let src = dir.join(format!("{agent_id}.jsonl"));
+    let new_id = state.next_session_id();
+    let forked = rollout::resume::fork(&src, &dir, &new_id, keep_items)
+        .map_err(|e| format!("分支失败: {e}"))?;
+    Ok(forked.new_agent_id)
+}
+
+/// 组装一次新会话所需的 AgentLoop + 取消令牌 + 它的 agent_id（现场建档）。
+/// 建档失败就直接报错给前端——静默不落盘会让用户以为"能 resume"，实际不能。
+fn build_new_session(
+    state: &AppState,
+) -> Result<(agent_loop::AgentLoop, tokio_util::sync::CancellationToken, String), String> {
+    let (writer, agent_id) = new_session_writer(state)?;
+    let (agent, cancel) = build_agent_with(state, Some(writer))?;
+    Ok((agent, cancel, agent_id))
+}
+
+fn new_session_writer(state: &AppState) -> Result<(Arc<rollout::RolloutWriter>, String), String> {
     let cfg = state.config();
     let agent_id = state.next_session_id();
     let meta = rollout::RolloutItem::SessionMeta {
@@ -107,9 +256,10 @@ fn new_session_writer(state: &AppState) -> Result<Arc<rollout::RolloutWriter>, S
             workspace_root: state.workspace_root().display().to_string(),
         },
     };
-    rollout::RolloutWriter::create(&state.data_root().join(rollout::ROLLOUT_DIR), &meta)
+    let writer = rollout::RolloutWriter::create(&state.data_root().join(rollout::ROLLOUT_DIR), &meta)
         .map(Arc::new)
-        .map_err(|e| format!("会话档案建档失败: {e}"))
+        .map_err(|e| format!("会话档案建档失败: {e}"))?;
+    Ok((writer, agent_id))
 }
 
 fn build_agent_with(
@@ -254,6 +404,9 @@ pub fn run() {
             dev_ping,
             send_task,
             resume_session,
+            list_sessions,
+            load_session,
+            fork_session,
             cancel_task,
             approve,
             store_api_key,
@@ -300,4 +453,118 @@ pub fn run() {
         })
         .run(tauri::generate_context!())
         .expect("SHANIU 启动失败");
+}
+
+#[cfg(test)]
+mod session_projection_tests {
+    use super::{project_entries, SessionEntry};
+    use crate::model_client::{HistoryItem, Role};
+    use crate::rollout::{ConfigSnapshot, RolloutItem};
+
+    fn msg(role: Role, text: &str) -> RolloutItem {
+        RolloutItem::ResponseItem {
+            item: HistoryItem::Message { role, text: text.into(), reasoning: None },
+        }
+    }
+
+    fn call(name: &str, args: &str, id: &str) -> RolloutItem {
+        RolloutItem::ResponseItem {
+            item: HistoryItem::FunctionCall { name: name.into(), arguments: args.into(), call_id: id.into() },
+        }
+    }
+
+    fn out(id: &str, output: &str) -> RolloutItem {
+        RolloutItem::ResponseItem {
+            item: HistoryItem::FunctionCallOutput { call_id: id.into(), output: output.into() },
+        }
+    }
+
+    #[test]
+    fn tool_output_merges_into_its_call_instead_of_standing_alone() {
+        // 档案形状是"先全部 call、再全部 output"，投影必须按调用顺序把输出带上
+        let items = vec![
+            msg(Role::User, "跑一下"),
+            call("unified_exec", "{\"command\":\"ls\"}", "c1"),
+            call("read_file", "{\"path\":\"a.txt\"}", "c2"),
+            out("c2", "文件内容"),
+            out("c1", "a.txt\nb.txt"),
+        ];
+        let entries = project_entries(&items);
+        assert_eq!(entries.len(), 3, "两条调用 + 一条用户消息，输出不单独成条");
+        match &entries[1] {
+            SessionEntry::ToolCall { call_id, tool, output, .. } => {
+                assert_eq!(call_id, "c1");
+                assert_eq!(tool, "unified_exec");
+                assert_eq!(output.as_deref(), Some("a.txt\nb.txt"), "输出按 call_id 配对，不是按到达顺序");
+            }
+            other => panic!("期望 ToolCall，得到 {other:?}"),
+        }
+        match &entries[2] {
+            SessionEntry::ToolCall { call_id, output, .. } => {
+                assert_eq!(call_id, "c2");
+                assert_eq!(output.as_deref(), Some("文件内容"));
+            }
+            other => panic!("期望 ToolCall，得到 {other:?}"),
+        }
+    }
+
+    #[test]
+    fn unpaired_call_keeps_output_none() {
+        // 取消或审批拒绝的轮次：有 call 无 output，投影不能凭空补一个成功输出
+        let items = vec![call("unified_exec", "{}", "c1")];
+        match &project_entries(&items)[0] {
+            SessionEntry::ToolCall { output, .. } => assert_eq!(output, &None),
+            other => panic!("期望 ToolCall，得到 {other:?}"),
+        }
+    }
+
+    #[test]
+    fn compaction_anchor_projects_as_assistant_summary() {
+        // resume 时锚点的语义就是"摘要取代区间"，展示必须一致，
+        // 否则用户看到区间原文而模型看到的是摘要——两份真相。
+        let items = vec![
+            msg(Role::User, "早期任务"),
+            RolloutItem::Compacted { range_start: 0, range_end: 3, summary: "已压缩的上下文".into() },
+        ];
+        let entries = project_entries(&items);
+        assert_eq!(entries.len(), 2);
+        match &entries[1] {
+            SessionEntry::Message { role, text, .. } => {
+                assert_eq!(role, "assistant");
+                assert_eq!(text, "已压缩的上下文");
+            }
+            other => panic!("期望 Message，得到 {other:?}"),
+        }
+    }
+
+    #[test]
+    fn meta_and_subagent_ref_do_not_become_entries() {
+        let items = vec![
+            RolloutItem::SessionMeta {
+                session_id: "s".into(),
+                agent_id: "a".into(),
+                parent_id: None,
+                created_at: 1,
+                config_snapshot: ConfigSnapshot::default(),
+            },
+            RolloutItem::SubagentRef { child_id: "c".into(), rollout_path: "p".into() },
+            msg(Role::Assistant, "正文"),
+        ];
+        let entries = project_entries(&items);
+        assert_eq!(entries.len(), 1, "首行 meta 与子代理引用不是历史；SH-056 的泳道 UI 才有后者的展示形态");
+        assert!(matches!(&entries[0], SessionEntry::Message { role, .. } if role == "assistant"));
+    }
+
+    #[test]
+    fn reasoning_survives_projection_when_present() {
+        // SH-083 的 reasoning_content 必须能在打开会话时一起回来，
+        // 否则"重开旧会话"和"刚跑完"看到的上下文不一样。
+        let items = vec![RolloutItem::ResponseItem {
+            item: HistoryItem::Message { role: Role::Assistant, text: "答案".into(), reasoning: Some("思路".into()) },
+        }];
+        match &project_entries(&items)[0] {
+            SessionEntry::Message { reasoning, .. } => assert_eq!(reasoning.as_deref(), Some("思路")),
+            other => panic!("期望 Message，得到 {other:?}"),
+        }
+    }
 }

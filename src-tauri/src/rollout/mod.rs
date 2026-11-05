@@ -207,6 +207,109 @@ pub fn read(path: &Path) -> Result<Rollout, RolloutError> {
     Ok(Rollout { meta, items, torn_tail_lines: torn })
 }
 
+/// 会话列表的一行摘要（SH-033）。字段用 camelCase 出到前端，与 `get_settings` 同一风格。
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct SessionSummary {
+    pub agent_id: String,
+    /// 根会话为 None；fork 出来的会话带父 agent_id，列表要能显示血缘。
+    pub parent_id: Option<String>,
+    pub created_at: u64,
+    /// 档案文件的修改时间（毫秒）。列表按它倒序——比 created_at 更贴近"最近在用"。
+    pub updated_at: u64,
+    pub model: String,
+    pub workspace_root: String,
+    /// 首条用户消息压成单行并截断；没有用户消息时为空串（不编造占位标题）。
+    pub title: String,
+    /// meta 之外的条目行数，前端用来区分"空会话"。
+    pub item_count: usize,
+}
+
+/// 标题口径与前端 `ChatView::sessionTitle` 一致：空白压成单空格、按字符数取 40。
+fn summarize_title(text: &str) -> String {
+    let flat = text.split_whitespace().collect::<Vec<_>>().join(" ");
+    if flat.chars().count() > 40 {
+        format!("{}…", flat.chars().take(40).collect::<String>())
+    } else {
+        flat
+    }
+}
+
+/// 列出目录下的会话摘要，按更新时间倒序。
+///
+/// **这里的容错口径与 `read()` 刻意不同**，不是自相矛盾：`read()` 重建的是要继续跑的
+/// 历史，中间坏行必须报错，否则等于悄悄篡改上下文；而列表是**摘要视图**，某一行解析
+/// 不出来最多是标题缺一截，不影响任何后续语义。一个坏档案不该让整页列表打不开，
+/// 所以这里逐行尽力、坏文件跳过。真正打开会话时仍走 `read()`，严格性一点没丢。
+pub fn list(dir: &Path) -> Vec<SessionSummary> {
+    let Ok(entries) = std::fs::read_dir(dir) else {
+        return Vec::new();
+    };
+    let mut out: Vec<SessionSummary> = entries
+        .flatten()
+        .filter_map(|entry| {
+            let path = entry.path();
+            if path.extension().and_then(|ext| ext.to_str()) != Some("jsonl") {
+                return None;
+            }
+            summarize(&path)
+        })
+        .collect();
+    out.sort_by(|a, b| b.updated_at.cmp(&a.updated_at).then_with(|| a.agent_id.cmp(&b.agent_id)));
+    out
+}
+
+fn summarize(path: &Path) -> Option<SessionSummary> {
+    let file = File::open(path).ok()?;
+    let mut lines = BufReader::new(file).lines();
+    let first = lines.next()?.ok()?;
+    // 首行必须是 session_meta，否则这份档案不可用（与建档契约一致）。
+    let RolloutItem::SessionMeta { agent_id, parent_id, created_at, config_snapshot, .. } =
+        serde_json::from_str(&first).ok()?
+    else {
+        return None;
+    };
+
+    let mut title = String::new();
+    let mut item_count = 0usize;
+    for line in lines {
+        let Ok(line) = line else { continue };
+        if line.trim().is_empty() {
+            continue;
+        }
+        item_count += 1;
+        if !title.is_empty() {
+            continue;
+        }
+        if let Ok(RolloutItem::ResponseItem { item: HistoryItem::Message { role, text, .. } }) =
+            serde_json::from_str(&line)
+        {
+            if role == crate::model_client::Role::User {
+                title = summarize_title(&text);
+            }
+        }
+    }
+
+    let updated_at = path
+        .metadata()
+        .and_then(|m| m.modified())
+        .ok()
+        .and_then(|t| t.duration_since(std::time::UNIX_EPOCH).ok())
+        .map(|d| d.as_millis() as u64)
+        .unwrap_or(created_at);
+
+    Some(SessionSummary {
+        agent_id,
+        parent_id,
+        created_at,
+        updated_at,
+        model: config_snapshot.model,
+        workspace_root: config_snapshot.workspace_root,
+        title,
+        item_count,
+    })
+}
+
 fn ends_newline(path: &Path) -> bool {
     use std::io::{Read, Seek, SeekFrom};
     let Ok(mut f) = File::open(path) else { return true };
@@ -364,5 +467,101 @@ mod tests {
         .unwrap_err();
         assert!(matches!(err, RolloutError::NoSessionMeta(_)), "建档只接受 session_meta：{err}");
         std::fs::remove_dir_all(&dir).ok();
+    }
+
+    /// 把档案的 mtime 钉成确定值：`list` 的排序判据是更新时间，靠写入先后碰运气会让测试变脆。
+    fn set_mtime(path: &Path, millis: u64) {
+        let times = std::fs::FileTimes::new()
+            .set_modified(std::time::SystemTime::UNIX_EPOCH + std::time::Duration::from_millis(millis));
+        let file = OpenOptions::new().write(true).open(path).unwrap();
+        file.set_times(times).unwrap();
+    }
+
+    fn write_session(dir: &Path, agent: &str, first_task: &str) -> PathBuf {
+        let writer = RolloutWriter::create(dir, &meta(agent)).unwrap();
+        writer
+            .append(&RolloutItem::ResponseItem {
+                item: HistoryItem::Message { role: Role::User, text: first_task.into(), reasoning: None },
+            })
+            .unwrap();
+        writer
+            .append(&RolloutItem::ResponseItem {
+                item: HistoryItem::Message { role: Role::Assistant, text: "收到".into(), reasoning: None },
+            })
+            .unwrap();
+        writer.path().to_path_buf()
+    }
+
+    #[test]
+    fn list_summarizes_meta_and_first_user_message() {
+        let dir = temp_dir();
+        write_session(&dir, "a-1", "把  端口\n改成 9090");
+        let items = list(&dir);
+        assert_eq!(items.len(), 1, "目录里只有一个档案：{items:?}");
+        let one = &items[0];
+        assert_eq!(one.agent_id, "a-1");
+        assert_eq!(one.parent_id, None);
+        assert_eq!(one.model, "m");
+        // 标题：空白压成单空格，不是原样带换行
+        assert_eq!(one.title, "把 端口 改成 9090");
+        // item_count 不含首行 meta
+        assert_eq!(one.item_count, 2);
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn list_orders_by_updated_at_descending() {
+        let dir = temp_dir();
+        let older = write_session(&dir, "old", "早先的任务");
+        let newer = write_session(&dir, "new", "后来的任务");
+        set_mtime(&older, 1_000);
+        set_mtime(&newer, 2_000);
+        let ids: Vec<_> = list(&dir).into_iter().map(|s| s.agent_id).collect();
+        assert_eq!(ids, vec!["new".to_string(), "old".to_string()], "最近在用的排最前");
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn list_skips_file_without_session_meta_first_line() {
+        let dir = temp_dir();
+        write_session(&dir, "good", "正常的会话");
+        // 首行不是 meta 的档案：列表跳过它，而不是让整页失败
+        std::fs::write(dir.join("broken.jsonl"), "{\"type\":\"response_item\"}\n").unwrap();
+        std::fs::write(dir.join("notes.txt"), "不是档案").unwrap();
+        let ids: Vec<_> = list(&dir).into_iter().map(|s| s.agent_id).collect();
+        assert_eq!(ids, vec!["good".to_string()], "坏档案与非档案文件都不该拖垮列表");
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn list_survives_corrupt_middle_line_but_still_counts_it() {
+        let dir = temp_dir();
+        let path = write_session(&dir, "a", "第一条任务");
+        // 摘要视图容错：中间坏行不报错（read() 才严格），但行数仍计入 item_count
+        let mut raw = std::fs::read_to_string(&path).unwrap();
+        raw.push_str("this is not json\n");
+        std::fs::write(&path, raw).unwrap();
+        let one = &list(&dir)[0];
+        assert_eq!(one.title, "第一条任务", "坏行不该影响已经取到的标题");
+        assert_eq!(one.item_count, 3, "行数按物理行计，坏行留给 read() 去报错");
+        assert!(matches!(read(&path).unwrap_err(), RolloutError::Corrupted { .. }),
+            "同一份档案走 read() 必须仍然报错——两种容错口径不能混用");
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn list_title_truncates_by_chars_not_bytes() {
+        let dir = temp_dir();
+        let long = "中".repeat(60);
+        write_session(&dir, "a", &long);
+        let one = &list(&dir)[0];
+        assert_eq!(one.title.chars().count(), 41, "40 字 + 省略号，按字符数截断");
+        assert!(one.title.ends_with('…'));
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn list_of_missing_dir_is_empty_not_an_error() {
+        assert_eq!(list(Path::new("Z:\\definitely-not-here\\shaniu")), Vec::<SessionSummary>::new());
     }
 }

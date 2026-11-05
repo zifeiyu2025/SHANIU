@@ -32,6 +32,11 @@ export interface SessionState {
    * 所以这里做的是排队而不是插话——插话需要后端注入运行中的上下文，属 M5 steering 面。
    */
   queued: string[];
+  /**
+   * 当前会话的 agent_id（SH-033）。null = 还没建过档的新会话。
+   * 发送后由后端返回填进来：续写、fork、列表高亮都只认这一个值。
+   */
+  agentId: string | null;
 }
 
 export type SessionStore = SnapshotStore<SessionState> & {
@@ -52,6 +57,14 @@ export type SessionStore = SnapshotStore<SessionState> & {
   removeQueuedTask(index: number): void;
   /** 新会话：清空当前会话状态并关闭窗口，直到下一次 submitUserTask。 */
   reset(): void;
+  /** 记住本次提交实际使用的 agent_id（新会话由后端生成，前端只能从返回值拿到）。 */
+  setAgentId(agentId: string): void;
+  /**
+   * 打开一个历史会话：装入投影出的节点、认下它的 agent_id、换代次并重开事件窗口。
+   * 换代次是必需的——欢迎语的重挂载 key 与在途事件丢弃的窗口都挂在它上面（SH-080/081），
+   * 不换就会把上一个会话的残留增量灌进刚打开的这份历史。
+   */
+  openSession(agentId: string, nodes: ConversationNode[]): void;
 };
 
 function emptySession(generation: number): SessionState {
@@ -64,6 +77,7 @@ function emptySession(generation: number): SessionState {
     generation,
     sending: false,
     queued: [],
+    agentId: null,
   };
 }
 
@@ -123,6 +137,23 @@ export function createSessionStore(): SessionStore {
     reset() {
       windowOpen = false;
       store.setState(emptySession(store.getState().generation + 1));
+    },
+    setAgentId(agentId) {
+      store.update((state) => {
+        state.agentId = agentId;
+      });
+    },
+    openSession(agentId, nodes) {
+      // 从空会话起步再灌历史：status/usage/sending/queued 都必须归零，
+      // 否则上一会话的"运行中"会跟着进来，输入区被错误地锁住。
+      const next = emptySession(store.getState().generation + 1);
+      next.agentId = agentId;
+      next.nodes = nodes;
+      // 窗口保持关闭：打开会话不等于提交任务。若在这里重开，上一个会话仍在途的
+      // 增量就会灌进刚载入的历史（SH-081 那条门禁正是靠"只有 submitUserTask 才开窗"
+      // 成立的）。用户在打开的会话里输入时，submitUserTask 会照常重开窗口。
+      windowOpen = false;
+      store.setState(next);
     },
   };
 }

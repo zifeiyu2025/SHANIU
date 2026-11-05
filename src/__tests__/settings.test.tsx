@@ -2,6 +2,7 @@ import { describe, expect, it, vi } from 'vitest';
 import { fireEvent, render, screen, waitFor } from '@testing-library/react';
 import { SettingsDialog } from '../components/settings/SettingsDialog';
 import type { Transport } from '../transport/types';
+import { stubTransport } from './stub-transport';
 
 function fakeTransport(overrides?: Partial<Transport>) {
   const saveSettings = vi.fn().mockResolvedValue(undefined);
@@ -11,16 +12,7 @@ function fakeTransport(overrides?: Partial<Transport>) {
     workspaceRoot: 'D:/old',
     hasApiKey: true,
   });
-  const transport: Transport = {
-    ping: vi.fn().mockResolvedValue('n'),
-    sendTask: vi.fn().mockResolvedValue(undefined),
-    cancel: vi.fn().mockResolvedValue(undefined),
-    getSettings,
-    saveSettings,
-    approve: vi.fn().mockResolvedValue(undefined),
-    onEvent: vi.fn().mockReturnValue(() => {}),
-    ...overrides,
-  };
+  const transport = stubTransport({ getSettings, saveSettings, ...overrides });
   return { transport, saveSettings, getSettings };
 }
 

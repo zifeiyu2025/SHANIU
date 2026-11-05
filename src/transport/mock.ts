@@ -1,4 +1,4 @@
-import type { EventMsg, Settings, Transport } from './types';
+import type { EventMsg, SessionEntry, SessionSummary, Settings, Transport } from './types';
 
 const delay = (ms: number) => new Promise<void>((resolve) => setTimeout(resolve, ms));
 
@@ -31,6 +31,61 @@ const MOCK_REPLY = [
 function blockBoundary(text: string, target: number): number {
   const back = text.lastIndexOf('\n\n', target);
   return back === -1 ? target : back + 2;
+}
+
+/**
+ * mock 的会话档案：内存版，只为让 SH-033 的列表/打开/分支在 dev 模式下有真数据源。
+ *
+ * 条目形态与后端投影后的 `SessionEntry` 一致（tool_call 把 output 合并在同一条上），
+ * 所以 fork 的截断点不需要 `nearest_safe_cut` 那套回退——档案里根本不存在
+ * "有 call 无 output" 的分离尾巴。真实后端仍必须走它，两者语义在这里是等价的。
+ */
+interface MockSession {
+  id: string;
+  parentId: string | null;
+  createdAt: number;
+  updatedAt: number;
+  entries: SessionEntry[];
+}
+
+const sessions = new Map<string, MockSession>();
+let mockSeq = 0;
+let activeSession: MockSession | null = null;
+
+function nextMockId(prefix: string): string {
+  mockSeq += 1;
+  return `${prefix}-${Date.now().toString(36)}-${mockSeq}`;
+}
+
+/** 标题口径与 Rust 侧 `summarize_title` 一致：空白压成单空格、按字符取 40。 */
+function mockTitle(entries: readonly SessionEntry[]): string {
+  const first = entries.find((e) => e.kind === 'message' && e.role === 'user');
+  if (first === undefined || first.kind !== 'message') return '';
+  const flat = first.text.split(/\s+/).filter(Boolean).join(' ');
+  return flat.length > 40 ? `${flat.slice(0, 40)}…` : flat;
+}
+
+function toSummary(s: MockSession): SessionSummary {
+  return {
+    agentId: s.id,
+    parentId: s.parentId,
+    createdAt: s.createdAt,
+    updatedAt: s.updatedAt,
+    model: 'M0-Mock',
+    workspaceRoot: 'D:/MyWorkspace/demo',
+    title: mockTitle(s.entries),
+    itemCount: s.entries.length,
+  };
+}
+
+function requireSession(agentId: string): MockSession {
+  const found = sessions.get(agentId);
+  if (found === undefined) throw new Error(`会话不存在或已被清理：${agentId}`);
+  return found;
+}
+
+function touch(session: MockSession): void {
+  session.updatedAt = Date.now();
 }
 
 /** Vite 独立开发用的 mock 传输层：不经 Tauri IPC，本地驱动一轮完整 mock 事件流。 */
@@ -108,6 +163,15 @@ export function createMockTransport(): Transport {
       error: cancelRequested ? '已取消' : null,
       ...(legacyShape ? {} : { result: cancelRequested ? ('cancelled' as const) : ('ok' as const) }),
     });
+    // 同步进 mock 档案：列表与"打开会话"要能看到工具调用，否则重放路径只有单测知道。
+    // 取消时不写 output——这正是投影层判 cancelled 的依据，与后端"有 call 无 output"同形。
+    activeSession?.entries.push({
+      kind: 'tool_call',
+      call_id: callId,
+      tool: 'unified_exec',
+      arguments: JSON.stringify({ command: 'git status --short' }),
+      ...(cancelRequested ? {} : { output: stdout.join('') }),
+    });
   }
 
   // dev-only 审批场景：request 发出后这条任务就挂在门上，直到裁决或取消把它解开。
@@ -139,8 +203,18 @@ export function createMockTransport(): Transport {
       return nonce;
     },
 
-    async sendTask(task) {
+    async sendTask(task, agentId) {
       cancelRequested = false;
+      // 会话建档/续档先看 agentId：没有就是新会话，有就往那份档案上追加（SH-033）。
+      const session =
+        agentId === undefined || agentId === null
+          ? { id: nextMockId('mock'), parentId: null, createdAt: Date.now(), updatedAt: Date.now(), entries: [] as SessionEntry[] }
+          : requireSession(agentId);
+      sessions.set(session.id, session);
+      activeSession = session;
+      touch(session);
+      session.entries.push({ kind: 'message', role: 'user', text: task });
+
       emit({ type: 'turn_started', turn: 1 });
       const reply = `任务：${task}\n\n${MOCK_REPLY}`;
       // 工具调用插在**块边界**上，不是任意字符位：真实后端先把一轮的
@@ -163,6 +237,31 @@ export function createMockTransport(): Transport {
         turn: 1,
         reason: cancelRequested ? 'cancelled' : 'completed',
       });
+      session.entries.push({ kind: 'message', role: 'assistant', text: reply });
+      touch(session);
+      return session.id;
+    },
+
+    async listSessions() {
+      return [...sessions.values()].map(toSummary).sort((a, b) => b.updatedAt - a.updatedAt);
+    },
+
+    async loadSession(agentId) {
+      return requireSession(agentId).entries.map((entry) => ({ ...entry }));
+    },
+
+    async forkSession(agentId, keepItems) {
+      const src = requireSession(agentId);
+      const child: MockSession = {
+        id: nextMockId('mock-fork'),
+        parentId: src.id,
+        createdAt: Date.now(),
+        updatedAt: Date.now(),
+        // 父档案只读：这里拷的是条目本身，源会话继续追加也不会串进子档案。
+        entries: src.entries.slice(0, Math.max(0, keepItems)).map((entry) => ({ ...entry })),
+      };
+      sessions.set(child.id, child);
+      return child.id;
     },
 
     async cancel() {

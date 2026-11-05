@@ -1,6 +1,13 @@
 import { invoke } from '@tauri-apps/api/core';
 import { listen, type UnlistenFn } from '@tauri-apps/api/event';
-import type { ApprovalDecision, EventMsg, Settings, Transport } from './types';
+import type {
+  ApprovalDecision,
+  EventMsg,
+  SessionEntry,
+  SessionSummary,
+  Settings,
+  Transport,
+} from './types';
 
 // 通道名与 src-tauri/src/events.rs 保持一致。
 const EVENT_CHANNEL = 'shaniu://event';
@@ -40,12 +47,25 @@ export function createTauriTransport(): Transport {
       });
     },
 
-    async sendTask(task) {
-      await invoke('send_task', { task });
+    async sendTask(task, agentId) {
+      // agentId 为 null/undefined 时 Rust 侧收到 None = 新建会话；返回值是本次使用的 id。
+      return invoke<string>('send_task', { task, agentId: agentId ?? null });
     },
 
     async cancel() {
       await invoke('cancel_task');
+    },
+
+    async listSessions() {
+      return invoke<SessionSummary[]>('list_sessions');
+    },
+
+    async loadSession(agentId) {
+      return invoke<SessionEntry[]>('load_session', { agentId });
+    },
+
+    async forkSession(agentId, keepItems) {
+      return invoke<string>('fork_session', { agentId, keepItems });
     },
 
     async getSettings() {

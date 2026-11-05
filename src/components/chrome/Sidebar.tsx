@@ -1,13 +1,13 @@
 import { FolderIcon, GearIcon, PanelLeftIcon, PlusIcon } from '../icons';
+import { SessionList } from '../sessions/SessionList';
 import { startNewSession } from '../../utils/session-actions';
 import type { SessionStore } from '../../store/session-store';
 import type { Transport } from '../../transport/types';
 
 /**
  * 左侧栏（280px，bg=侧栏填充）。
- * 只放**当前真有数据/真行为**的入口：新建会话、工作区、设置。
- * 会话列表要等 rollout 持久化（SH-030/031/033）才有数据源，画假列表等于给 UI 埋一条
- * "看起来能用、点了没反应"的债，宁缺。
+ * 每个入口都必须真有数据/真行为：新建会话、工作区、会话列表、设置。
+ * 会话列表的数据源是 `rollout::list`（SH-033）——SH-084 当时刻意留空，等的就是它。
  */
 export function Sidebar({
   onCollapse,
@@ -72,7 +72,8 @@ export function Sidebar({
         </button>
       </div>
 
-      <div className="min-h-0 flex-1" />
+      {/* 会话列表（SH-033）：SH-084 留空是因为没有数据源，现在 `rollout::list` 给了真的源。 */}
+      <SessionList store={store} transport={transport} />
 
       <div className="shrink-0 px-2 pb-2">
         <button

@@ -2,24 +2,11 @@ import { describe, expect, it, vi } from 'vitest';
 import { fireEvent, render, screen } from '@testing-library/react';
 import { Composer } from '../components/chat/Composer';
 import { createSessionStore } from '../store/session-store';
-import type { Transport } from '../transport/types';
+import { stubTransport } from './stub-transport';
 
 function spyTransport() {
-  const sendTask = vi.fn().mockResolvedValue(undefined);
-  const transport: Transport = {
-    ping: vi.fn().mockResolvedValue('n'),
-    sendTask,
-    cancel: vi.fn().mockResolvedValue(undefined),
-    getSettings: vi.fn().mockResolvedValue({
-      baseUrl: '',
-      model: 'M0-Mock',
-      workspaceRoot: '',
-      hasApiKey: false,
-    }),
-    saveSettings: vi.fn().mockResolvedValue(undefined),
-    approve: vi.fn().mockResolvedValue(undefined),
-    onEvent: vi.fn().mockReturnValue(() => {}),
-  };
+  const sendTask = vi.fn().mockResolvedValue('stub-session');
+  const transport = stubTransport({ sendTask }, { baseUrl: '', workspaceRoot: '' });
   return { transport, sendTask };
 }
 
@@ -34,7 +21,7 @@ describe('Composer 键盘与主按钮', () => {
     fireEvent.change(input, { target: { value: '  写个测试  ' } });
     fireEvent.keyDown(input, { key: 'Enter' });
 
-    expect(sendTask).toHaveBeenCalledWith('写个测试');
+    expect(sendTask).toHaveBeenCalledWith('写个测试', null);
     expect((input as HTMLTextAreaElement).value).toBe('');
     expect(store.getState().nodes.map((n) => n.kind)).toEqual(['user_message']);
   });

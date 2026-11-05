@@ -3,26 +3,13 @@ import { act, fireEvent, render, screen } from '@testing-library/react';
 import { ChatView } from '../components/chat/ChatView';
 import { createSessionStore } from '../store/session-store';
 import { createMockTransport } from '../transport/mock';
-import type { Transport } from '../transport/types';
+import { stubTransport } from './stub-transport';
 
 /** 只记调用、不产事件的传输替身：队列/取消类用例关心的是"有没有真的发出去"。 */
 function spyTransport() {
-  const sendTask = vi.fn().mockResolvedValue(undefined);
+  const sendTask = vi.fn().mockResolvedValue('stub-session');
   const cancel = vi.fn().mockResolvedValue(undefined);
-  const transport: Transport = {
-    ping: vi.fn().mockResolvedValue('n'),
-    sendTask,
-    cancel,
-    getSettings: vi.fn().mockResolvedValue({
-      baseUrl: 'https://mock.local/v1',
-      model: 'M0-Mock',
-      workspaceRoot: 'D:/MyWorkspace/demo',
-      hasApiKey: false,
-    }),
-    saveSettings: vi.fn().mockResolvedValue(undefined),
-    approve: vi.fn().mockResolvedValue(undefined),
-    onEvent: vi.fn().mockReturnValue(() => {}),
-  };
+  const transport = stubTransport({ sendTask, cancel });
   return { transport, sendTask, cancel };
 }
 
@@ -142,7 +129,9 @@ describe('ChatView', () => {
     });
 
     expect(sendTask).toHaveBeenCalledTimes(2);
-    expect(sendTask).toHaveBeenLastCalledWith('第二条');
+    // 第二条续写的是第一条建起来的那份档案（SH-033）：agent_id 由 sendTask 返回值落进 store，
+    // 这里断言它被原样带回去，排队发送才不会悄悄变成"又新建一个会话"。
+    expect(sendTask).toHaveBeenLastCalledWith('第二条', 'stub-session');
     expect(store.getState().queued).toEqual([]);
     expect(screen.queryByTestId('queue-dock')).toBeNull(); // 队列空时整块不渲染
   });
@@ -186,7 +175,8 @@ describe('ChatView', () => {
     input.focus();
     fireEvent.change(input, { target: { value: '第一条' } });
     fireEvent.keyDown(input, { key: 'Enter' });
-    expect(sendTask).toHaveBeenCalledWith('第一条');
+    // 首条还没有档案可续，agent_id 必须是 null（后端据此新建）
+    expect(sendTask).toHaveBeenCalledWith('第一条', null);
 
     // 进入会话态后必须是同一个 DOM 节点（dsh 的 composer 常驻，只由 CSS 位移）
     expect(screen.getByPlaceholderText(/描述你想要构建的内容/)).toBe(input);

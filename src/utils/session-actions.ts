@@ -1,3 +1,4 @@
+import { nodesFromHistory } from '../nodes/from-history';
 import type { SessionStore } from '../store/session-store';
 import type { Transport } from '../transport/types';
 
@@ -30,13 +31,45 @@ export function sendTaskNow(
   transport: Transport,
   task: string,
 ): void {
+  // 续写还是新建，只认 store 里的 agentId（SH-033）：打开过的历史会话带着它的 id，
+  // 新会话是 null。后端返回本次实际使用的 id，新会话由此第一次知道自己是谁——
+  // 没有这一步，刚建的那条会话既进不了列表高亮，也续不回去。
+  const agentId = store.getState().agentId;
   store.submitUserTask(task);
   store.setSending(true);
-  transport.sendTask(task).then(
-    () => store.setSending(false),
+  transport.sendTask(task, agentId).then(
+    (id) => {
+      store.setSending(false);
+      store.setAgentId(id);
+    },
     (err: unknown) => {
       store.setSending(false);
       store.dispatch({ type: 'error', message: `任务提交失败：${String(err)}` });
     },
   );
+}
+
+/**
+ * 打开一个历史会话（SH-033）：读档案 → 投影成节点 → 认下 agent_id。
+ * 错误不在这里兜：列表组件需要区分"档案坏了"和"网络断了"，兜成一句通用提示反而没法归因。
+ */
+export async function openHistorySession(
+  store: SessionStore,
+  transport: Transport,
+  agentId: string,
+): Promise<void> {
+  const entries = await transport.loadSession(agentId);
+  store.openSession(agentId, nodesFromHistory(entries));
+}
+
+/** 从历史会话分支出新档案并立刻打开它；截断点由后端的配对安全规则兜底。 */
+export async function forkHistorySession(
+  store: SessionStore,
+  transport: Transport,
+  agentId: string,
+  keepItems: number,
+): Promise<void> {
+  const newId = await transport.forkSession(agentId, keepItems);
+  const entries = await transport.loadSession(newId);
+  store.openSession(newId, nodesFromHistory(entries));
 }
