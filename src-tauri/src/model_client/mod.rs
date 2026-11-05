@@ -138,13 +138,16 @@ fn parse_item(item: &serde_json::Value) -> Option<ResponseItem> {
 // ============================== 请求体构造（纯函数） ==============================
 
 /// 构造 Responses API 请求体（stream:true 固定；工具经 tools 数组下发）。
+/// `instructions` 为系统提示词（Responses 协议的顶层 instructions 字段）。
 pub fn build_responses_request(
     provider: &ProviderConfig,
     history: &[HistoryItem],
     tools: &[ToolDeclaration],
+    instructions: &str,
 ) -> serde_json::Value {
     serde_json::json!({
         "model": provider.model,
+        "instructions": instructions,
         "input": history,
         "stream": true,
         "tools": tools.iter().map(|t| serde_json::json!({
@@ -157,34 +160,37 @@ pub fn build_responses_request(
 }
 
 /// 构造 ChatCompletions API 请求体（stream:true；工具为 function 包装）。
+/// `instructions` 以首条 system 消息下发（不写入 history，避免每轮重复累积）。
 pub fn build_chat_request(
     provider: &ProviderConfig,
     history: &[HistoryItem],
     tools: &[ToolDeclaration],
+    instructions: &str,
 ) -> serde_json::Value {
-    let messages: Vec<serde_json::Value> = history
-        .iter()
-        .map(|h| match h {
-            HistoryItem::Message { role, text } => serde_json::json!({
-                "role": role,
-                "content": text,
-            }),
-            HistoryItem::FunctionCall { name, arguments, call_id } => serde_json::json!({
-                "role": "assistant",
-                "content": null,
-                "tool_calls": [{
-                    "id": call_id,
-                    "type": "function",
-                    "function": { "name": name, "arguments": arguments },
-                }],
-            }),
-            HistoryItem::FunctionCallOutput { call_id, output } => serde_json::json!({
-                "role": "tool",
-                "tool_call_id": call_id,
-                "content": output,
-            }),
-        })
-        .collect();
+    let mut messages: Vec<serde_json::Value> = vec![serde_json::json!({
+        "role": "system",
+        "content": instructions,
+    })];
+    messages.extend(history.iter().map(|h| match h {
+        HistoryItem::Message { role, text } => serde_json::json!({
+            "role": role,
+            "content": text,
+        }),
+        HistoryItem::FunctionCall { name, arguments, call_id } => serde_json::json!({
+            "role": "assistant",
+            "content": null,
+            "tool_calls": [{
+                "id": call_id,
+                "type": "function",
+                "function": { "name": name, "arguments": arguments },
+            }],
+        }),
+        HistoryItem::FunctionCallOutput { call_id, output } => serde_json::json!({
+            "role": "tool",
+            "tool_call_id": call_id,
+            "content": output,
+        }),
+    }));
     serde_json::json!({
         "model": provider.model,
         "messages": messages,
@@ -305,11 +311,12 @@ pub async fn stream_model(
     api_key: &str,
     history: &[HistoryItem],
     tools: &[ToolDeclaration],
+    instructions: &str,
 ) -> Result<ModelStream, String> {
     if provider.is_responses() {
-        Ok(Box::pin(stream_responses(provider, api_key, history, tools).await?))
+        Ok(Box::pin(stream_responses(provider, api_key, history, tools, instructions).await?))
     } else {
-        Ok(Box::pin(stream_chat(provider, api_key, history, tools).await?))
+        Ok(Box::pin(stream_chat(provider, api_key, history, tools, instructions).await?))
     }
 }
 
@@ -328,9 +335,10 @@ pub async fn stream_chat(
     api_key: &str,
     history: &[HistoryItem],
     tools: &[ToolDeclaration],
+    instructions: &str,
 ) -> Result<impl Stream<Item = ModelStreamEvent>, String> {
     let client = reqwest::Client::new();
-    let body = build_chat_request(provider, history, tools);
+    let body = build_chat_request(provider, history, tools, instructions);
     let response = client
         .post(chat_url(provider))
         .bearer_auth(api_key)
@@ -361,9 +369,10 @@ pub async fn stream_responses(
     api_key: &str,
     history: &[HistoryItem],
     tools: &[ToolDeclaration],
+    instructions: &str,
 ) -> Result<impl Stream<Item = ModelStreamEvent>, String> {
     let client = reqwest::Client::new();
-    let body = build_responses_request(provider, history, tools);
+    let body = build_responses_request(provider, history, tools, instructions);
     let response = client
         .post(provider.responses_url())
         .bearer_auth(api_key)
@@ -484,7 +493,7 @@ mod tests {
             description: "执行命令".into(),
             parameters: serde_json::json!({"type":"object"}),
         }];
-        let body = build_responses_request(&p, &history, &tools);
+        let body = build_responses_request(&p, &history, &tools, "SYS");
         assert_eq!(body["model"], "m1");
         assert_eq!(body["stream"], true);
         assert_eq!(body["input"][0]["type"], "message");
@@ -517,12 +526,23 @@ mod chat_tests {
             description: "d".into(),
             parameters: serde_json::json!({"type":"object"}),
         }];
-        let body = build_chat_request(&p, &history, &tools);
+        let body = build_chat_request(&p, &history, &tools, "SYS");
         assert_eq!(body["model"], "LongCat-2.5");
         assert_eq!(body["stream"], true);
-        assert_eq!(body["messages"][0]["role"], "user");
-        assert_eq!(body["messages"][1]["tool_calls"][0]["id"], "c1");
-        assert_eq!(body["messages"][2]["role"], "tool");
+        // 系统提示固定为第 0 条（docs/04 §6.1），history 顺移一位
+        assert_eq!(body["messages"][0]["role"], "system");
+        assert_eq!(body["messages"][0]["content"], "SYS");
+        assert_eq!(body["messages"][1]["role"], "user");
+        assert_eq!(body["messages"][2]["tool_calls"][0]["id"], "c1");
+        assert_eq!(body["messages"][3]["role"], "tool");
+        // 系统提示只出现一次，不随历史累积
+        let system_count = body["messages"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .filter(|m| m["role"] == "system")
+            .count();
+        assert_eq!(system_count, 1);
         assert_eq!(body["tools"][0]["function"]["name"], "unified_exec");
         assert!(!p.is_responses());
     }

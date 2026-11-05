@@ -9,6 +9,7 @@
 //! 每个任务 = 若干 turn；turn 内无工具调用即任务完成（completed）。
 
 pub mod budget;
+pub mod prompt;
 
 use std::path::PathBuf;
 use std::sync::Arc;
@@ -32,13 +33,17 @@ pub use budget::TurnBudget;
 /// 模型流（转发 model_client 的别名）。
 pub use crate::model_client::ModelStream;
 
-/// 模型后端：把 (历史, 工具声明) 变成模型事件流。
+/// 模型后端：把 (历史, 工具声明, 系统提示) 变成模型事件流。
+///
+/// `instructions` 每轮由 `prompt::system_instruction` 生成（docs/04 §6.1），
+/// 不写入 history，避免逐轮重复累积。
 #[async_trait::async_trait]
 pub trait ModelBackend: Send + Sync {
     async fn stream(
         &self,
         history: &[HistoryItem],
         tools: &[ToolDeclarationShim],
+        instructions: &str,
     ) -> Result<ModelStream, String>;
 }
 
@@ -57,8 +62,11 @@ impl ModelBackend for ResponsesBackend {
         &self,
         history: &[HistoryItem],
         tools: &[ToolDeclarationShim],
+        instructions: &str,
     ) -> Result<ModelStream, String> {
-        let stream = model_client::stream_model(&self.provider, &self.api_key, history, tools).await?;
+        let stream =
+            model_client::stream_model(&self.provider, &self.api_key, history, tools, instructions)
+                .await?;
         Ok(Box::pin(stream))
     }
 }
@@ -118,9 +126,15 @@ impl AgentLoop {
             emit(&sink, EventMsg::TurnStarted { turn });
 
             // 1) 采样（流式）：取消 → drop 流 = 断开连接
+            // 系统提示每轮重算（docs/04 §6.1 不变量③）：计划态与沙箱模式变化必须反映到模型
+            let instructions = prompt::system_instruction(
+                &self.workspace_root,
+                self.policy.sandbox,
+                self.plan_state.is_active(),
+            );
             // 计划态下只向模型声明只读工具 + exit_plan_mode（ADR-003 双层防御第一层）
             let declarations = declarations_for(&self.router, self.plan_state.is_active());
-            let mut stream = match self.backend.stream(&history, &declarations).await {
+            let mut stream = match self.backend.stream(&history, &declarations, &instructions).await {
                 Ok(s) => s,
                 Err(e) => {
                     emit(&sink, EventMsg::Error { message: e });
@@ -409,6 +423,7 @@ mod tests {
             &self,
             _history: &[HistoryItem],
             _tools: &[ToolDeclaration],
+            _instructions: &str,
         ) -> Result<ModelStream, String> {
             let mut q = self.0.lock().unwrap();
             match q.pop_front() {
@@ -658,6 +673,85 @@ mod tests {
         agent.router = router;
         drop(router_raw);
         (agent, store, cancel, broker)
+    }
+
+    // ---- 系统提示下发（docs/04 §6.1）----
+
+    /// 记录 (系统提示, 历史长度) 的后端：验证每轮下发、且不写入 history。
+    type Recorded = Arc<Mutex<Vec<(String, usize)>>>;
+
+    struct PromptRecordingBackend(Recorded);
+
+    #[async_trait::async_trait]
+    impl ModelBackend for PromptRecordingBackend {
+        async fn stream(
+            &self,
+            history: &[HistoryItem],
+            _tools: &[ToolDeclaration],
+            instructions: &str,
+        ) -> Result<ModelStream, String> {
+            self.0.lock().unwrap().push((instructions.to_string(), history.len()));
+            // 无工具调用 → 单轮即完成
+            Ok(Box::pin(futures::stream::iter(vec![ModelStreamEvent::OutputTextDelta {
+                delta: "ok".into(),
+            }])))
+        }
+    }
+
+    fn agent_with_recording(
+        workspace: PathBuf,
+        plan_active: bool,
+    ) -> (AgentLoop, Recorded, Arc<Mutex<Vec<EventMsg>>>) {
+        let recorded = Arc::new(Mutex::new(Vec::new()));
+        let backend = Arc::new(PromptRecordingBackend(recorded.clone()));
+        let (_sink, store) = CapturingSink::new();
+        let plan_state = Arc::new(PlanState::new());
+        if plan_active {
+            plan_state.activate();
+        }
+        let agent = AgentLoop {
+            backend,
+            router: Arc::new(ToolRouter::new()),
+            broker: Arc::new(ApprovalBroker::new()),
+            plan_state,
+            workspace_root: workspace,
+            max_turns: 2,
+            policy: policy::SessionPolicy {
+                approval: crate::config::ApprovalMode::Ask,
+                sandbox: crate::config::SandboxMode::WorkspaceWrite,
+            },
+        };
+        (agent, recorded, store)
+    }
+
+    #[tokio::test]
+    async fn system_instruction_sent_to_model_and_kept_out_of_history() {
+        let ws = std::env::temp_dir();
+        let (agent, recorded, store) = agent_with_recording(ws.clone(), false);
+        agent
+            .run_task("任务", Arc::new(CapturingSink(store)), CancellationToken::new())
+            .await;
+
+        let calls = recorded.lock().unwrap();
+        assert_eq!(calls.len(), 1, "单轮任务应只采样一次");
+        let (prompt, history_len) = &calls[0];
+        assert!(prompt.contains(&ws.display().to_string()), "提示须含工作区路径");
+        assert!(prompt.contains("工作区写入"), "提示须反映沙箱模式");
+        assert!(!prompt.contains("当前状态：计划模式"));
+        // 提示不写入 history：历史里只有用户这一条
+        assert_eq!(*history_len, 1, "系统提示不得混入 history");
+    }
+
+    #[tokio::test]
+    async fn system_instruction_reflects_plan_mode() {
+        let (agent, recorded, store) = agent_with_recording(std::env::temp_dir(), true);
+        agent
+            .run_task("先做计划", Arc::new(CapturingSink(store)), CancellationToken::new())
+            .await;
+        let calls = recorded.lock().unwrap();
+        let (prompt, _) = &calls[0];
+        assert!(prompt.contains("当前状态：计划模式"), "计划态必须写入提示");
+        assert!(prompt.contains("exit_plan_mode"), "计划态须指引退出路径");
     }
 
     // ---- Plan Mode（ADR-003 只读计划态）----
