@@ -3,6 +3,7 @@ import { useStoreSelector } from '../../store/engine';
 import type { SessionStore } from '../../store/session-store';
 import type { Transport } from '../../transport/types';
 import type { ConversationNode } from '../../nodes/types';
+import type { SandboxMode } from '../../transport/types';
 import { sendTaskNow } from '../../utils/session-actions';
 import { ChevronDownIcon } from '../icons';
 import { StreamingText } from '../markdown/StreamingText';
@@ -40,6 +41,8 @@ export function ChatView({
   headerAction,
   workspaceLabel,
   modelLabel,
+  sandboxMode = 'read_only',
+  onOpenSettings,
 }: {
   store: SessionStore;
   transport: Transport;
@@ -48,6 +51,10 @@ export function ChatView({
   workspaceLabel?: string;
   /** 当前模型名（来自 settings.model），mock 模式为 M0-Mock。 */
   modelLabel?: string;
+  /** 输入卡权限席位显示的真档位（SH-040）。 */
+  sandboxMode?: SandboxMode;
+  /** 权限与模型席位的落点：本仓的切换能力都在设置卡里，没有内联下拉。 */
+  onOpenSettings?: () => void;
 }) {
   const nodes = useStoreSelector(store, (s) => s.nodes);
   const status = useStoreSelector(store, (s) => s.status);
@@ -213,6 +220,9 @@ export function ChatView({
             running={running}
             blocked={blocked}
             hero={empty}
+            modelLabel={modelLabel || '未配置模型'}
+            sandboxMode={sandboxMode}
+            onOpenSettings={onOpenSettings ?? (() => {})}
           />
         </div>
       </div>

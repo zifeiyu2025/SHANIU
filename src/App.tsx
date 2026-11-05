@@ -75,6 +75,8 @@ export function App({ transport }: { transport: Transport }) {
             transport={transport}
             workspaceLabel={workspaceLabel}
             modelLabel={modelLabel}
+            sandboxMode={settings?.sandboxMode ?? 'read_only'}
+            onOpenSettings={() => setSettingsOpen(true)}
             headerAction={
               <button
                 type="button"

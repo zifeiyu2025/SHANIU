@@ -1,5 +1,6 @@
 import { useEffect, useState, type ReactNode } from 'react';
 import type { ApprovalMode, SandboxMode, Transport } from '../../transport/types';
+import { APPROVAL_OPTIONS, SANDBOX_OPTIONS } from '../../utils/safety-modes';
 import {
   THEME_LABELS,
   THEME_PREFERENCES,
@@ -8,27 +9,6 @@ import {
   writePreference,
   type ThemePreference,
 } from '../../theme';
-
-/**
- * 沙箱三档。命名策略照 codex：机器名（`danger_full_access`）留在协议与配置文件里吓人，
- * UI label 用中性词（「完全访问」），后果由副文案承担——它的实测形态就是
- * `label: "Full Access"` 配 `description: "Use with caution: …"`（approval-presets/src/lib.rs:52-53）。
- */
-const SANDBOX_OPTIONS: { value: SandboxMode; label: string; hint: string; danger?: boolean }[] = [
-  { value: 'read_only', label: '只读', hint: 'Agent 只能读工作区文件，写入与命令都要审批。' },
-  { value: 'workspace_write', label: '工作区可写', hint: '可改工作区内的文件并跑命令，越出工作区仍需审批。' },
-  {
-    value: 'danger_full_access',
-    label: '完全访问',
-    hint: '可不经审批修改本机任意文件、命令可访问网络。',
-    danger: true,
-  },
-];
-
-const APPROVAL_OPTIONS: { value: ApprovalMode; label: string; hint: string }[] = [
-  { value: 'ask', label: '逐次询问', hint: '写入与命令每次都问。' },
-  { value: 'auto_read_only', label: '只读自动放行', hint: '只读工具自动通过，其余仍逐次询问。' },
-];
 
 /**
  * 设置对话框（M1 最小集）：外观 / API Key（DPAPI 加密存储，留空不覆盖）/ 端点 / 模型 / 工作区。

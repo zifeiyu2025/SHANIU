@@ -1,7 +1,8 @@
 import { useRef, useState } from 'react';
 import { useStoreSelector } from '../../store/engine';
 import type { SessionStore } from '../../store/session-store';
-import type { Transport } from '../../transport/types';
+import type { SandboxMode, Transport } from '../../transport/types';
+import { sandboxLabel } from '../../utils/safety-modes';
 import { sendTaskNow } from '../../utils/session-actions';
 import { formatTokens } from '../../utils/token-format';
 import { ArrowUpIcon, ChevronDownIcon, DatabaseIcon, PlusIcon, QueueIcon, SpinnerIcon, StopIcon, WarningIcon } from '../icons';
@@ -25,6 +26,9 @@ export function Composer({
   running,
   blocked,
   hero = false,
+  modelLabel,
+  sandboxMode,
+  onOpenSettings,
 }: {
   store: SessionStore;
   transport: Transport;
@@ -32,6 +36,12 @@ export function Composer({
   /** 有挂起审批：dsh 的 blocked，锁输入但不锁模型席位。 */
   blocked: boolean;
   hero?: boolean;
+  /** 真实模型名（settings.model）。席位不再写死字面量——两处显示同一个后端状态时，
+   *  硬编码那份迟早与设置里的真值打脸。 */
+  modelLabel: string;
+  sandboxMode: SandboxMode;
+  /** 权限与模型席位都走"打开设置"：本仓没有内联切换能力，弹假下拉就是 SH-092 禁止的那种按钮。 */
+  onOpenSettings: () => void;
 }) {
   const [text, setText] = useState('');
   // dsh 的 IME 守卫是三重：isComposing / keyCode 229 / compositionend 后 10ms 窗口
@@ -108,11 +118,13 @@ export function Composer({
           </button>
           <button
             type="button"
-            title="权限预设（M2 接入沙箱策略裁决）"
+            onClick={onOpenSettings}
+            title={`沙箱：${sandboxLabel(sandboxMode)}（点击更改）`}
+            data-testid="composer-sandbox"
             className="flex h-7 items-center gap-1 rounded-sm px-2 text-[13px] font-medium leading-5 text-secondary transition-colors duration-100 hover:bg-hover"
           >
             <WarningIcon className="h-3.5 w-3.5" />
-            完全权限
+            {sandboxLabel(sandboxMode)}
             <ChevronDownIcon className="h-3 w-3 text-caption" />
           </button>
         </div>
@@ -125,10 +137,12 @@ export function Composer({
           )}
           <button
             type="button"
-            title="模型选择（M1 接入）"
+            onClick={onOpenSettings}
+            title={`${modelLabel}（点击更改）`}
+            data-testid="composer-model"
             className="flex h-7 items-center gap-1 rounded-sm px-2 text-[13px] leading-5 text-primary transition-colors duration-100 hover:bg-hover"
           >
-            M0-Mock
+            {modelLabel}
             <ChevronDownIcon className="h-3 w-3 text-caption" />
           </button>
           {/* 用量胶囊（对齐 dsh StatsPills：透明底、数据库图标、紧凑总量、tertiary） */}
