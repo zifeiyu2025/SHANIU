@@ -5,7 +5,7 @@ import type { SandboxMode, Transport } from '../../transport/types';
 import { sandboxLabel } from '../../utils/safety-modes';
 import { sendTaskNow } from '../../utils/session-actions';
 import { formatTokens } from '../../utils/token-format';
-import { ArrowUpIcon, ChevronDownIcon, DatabaseIcon, PlusIcon, QueueIcon, SpinnerIcon, StopIcon, WarningIcon } from '../icons';
+import { ArrowUpIcon, ChevronDownIcon, DatabaseIcon, QueueIcon, SpinnerIcon, StopIcon, WarningIcon } from '../icons';
 
 /**
  * 输入卡（复刻 dsh InputBar）：
@@ -108,14 +108,10 @@ export function Composer({
         }`}
       />
       <div className="flex items-center justify-between px-2 pb-1.5 pt-0.5">
+        {/* 附件与推理力度两个席位已删（用户确认）：一个都没有后端能力可接
+            （附件属 M1、推理力度需要模型侧参数面），留着就是 SH-092 明确禁止的
+            "点了没反应的假动作按钮"。dsh 的输入卡左侧本有 + 席位，这是有意不跟。 */}
         <div className="flex items-center gap-1">
-          <button
-            type="button"
-            title="附件（M1 接入）"
-            className="flex h-7 w-7 items-center justify-center rounded-full bg-selector text-primary transition-colors duration-100 hover:bg-hover-solid"
-          >
-            <PlusIcon className="h-4 w-4" />
-          </button>
           <button
             type="button"
             onClick={onOpenSettings}
@@ -156,14 +152,6 @@ export function Composer({
               {formatTokens(usage.inputTokens + usage.outputTokens)} tok
             </span>
           )}
-          <button
-            type="button"
-            title="推理力度（M1 接入）"
-            className="flex h-7 items-center gap-1 rounded-sm px-2 text-[13px] leading-5 text-secondary transition-colors duration-100 hover:bg-hover"
-          >
-            High
-            <ChevronDownIcon className="h-3 w-3 text-caption" />
-          </button>
           <button
             type="button"
             aria-label={primaryLabel}
