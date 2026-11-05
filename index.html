@@ -4,25 +4,6 @@
     <meta charset="UTF-8" />
     <meta name="viewport" content="width=device-width, initial-scale=1.0" />
     <title>SHANIU</title>
-    <script>
-      window.__errs = [];
-      window.addEventListener('error', function (e) {
-        window.__errs.push(String((e.error && e.error.stack) || e.message).slice(0, 300));
-      });
-      window.addEventListener('unhandledrejection', function (e) {
-        window.__errs.push('rej ' + String((e.reason && e.reason.stack) || e.reason).slice(0, 300));
-      });
-      var __origErr = console.error;
-      console.error = function () {
-        try {
-          var parts = Array.prototype.map.call(arguments, function (a) {
-            return String((a && a.stack) || a);
-          });
-          window.__errs.push(parts.join(' ').slice(0, 300));
-        } catch (e2) { /* ignore */ }
-        return __origErr.apply(console, arguments);
-      };
-    </script>
   </head>
   <body>
     <div id="root"></div>
