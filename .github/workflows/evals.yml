@@ -1,0 +1,90 @@
+name: Evals
+
+# 评估基线定时回归（docs/05 SH-028 验收项、docs/04 §6.5、AGENTS.md §5）。
+#
+# 为什么单独一条 workflow 而不是塞进 CI：
+#   - 要出网打真实端点、要花额度、单次十几分钟，PR 门禁里跑等于把交付管线绑在模型可用性上；
+#   - AGENTS §5 的判据是"指标退化 >10% 不得合并"，那是**回归门禁**，不是**构建门禁**。
+#
+# 密钥口径（用户已批准注入 LongCat）：
+#   SHANIU_EVAL_API_KEY 走仓库 Secrets，永不写进日志与提交；workflow 里只做存在性检查，
+#   缺失时**判失败**而不是跳过——"今天定时跑了但没测"比"没跑"更危险，因为它会给出绿的假象。
+#   fork 场景用 repository 判断直接退出，不去碰上游密钥。
+#
+# 触发：每日 03:10 UTC（避开 Actions 整点高峰，cron 抖动小）+ 手动 workflow_dispatch。
+
+on:
+  schedule:
+    - cron: "10 3 * * *"
+  workflow_dispatch:
+    inputs:
+      model:
+        description: 覆盖评估模型（留空用 tasks 默认 deepseek-flash）
+        required: false
+        default: ""
+
+jobs:
+  baseline:
+    # fork / 镜像仓库不跑：没有密钥，也不该消耗上游额度
+    if: github.repository == 'zifeiyu2025/SHANIU'
+    runs-on: windows-latest
+    timeout-minutes: 40
+
+    env:
+      SHANIU_TEST_PROVIDER: openai-chat
+      SHANIU_TEST_BASE_URL: https://api.longcat.chat/openai/v1
+      # 默认按用户指示打 LongCat；手动触发时可用 inputs.model 覆盖
+      SHANIU_TEST_MODEL: ${{ github.event.inputs.model || 'LongCat-2.5' }}
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: 校验评估密钥存在（缺失即失败，不给假绿）
+        env:
+          EVAL_KEY: ${{ secrets.SHANIU_EVAL_API_KEY }}
+        run: |
+          if [ -z "$EVAL_KEY" ]; then
+            echo "::error::仓库未配置 SHANIU_EVAL_API_KEY，定时评估没有真正执行。宁可红，不假绿。"
+            exit 1
+          fi
+          echo "密钥已就位（长度 ${#EVAL_KEY}，值不落日志）"
+        shell: bash
+
+      - uses: dtolnay/rust-toolchain@1.99.1
+
+      - uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: src-tauri
+
+      - name: 跑 5 任务基线（evals/tasks.json）
+        working-directory: src-tauri
+        env:
+          SHANIU_TEST_API_KEY: ${{ secrets.SHANIU_EVAL_API_KEY }}
+        run: cargo test --test evals_baseline -- --ignored --nocapture
+
+      - name: 跑 FF-5 真实端点首增量口径
+        working-directory: src-tauri
+        env:
+          SHANIU_TEST_API_KEY: ${{ secrets.SHANIU_EVAL_API_KEY }}
+        # 推理档超 3s 预算是已知事实（docs/05 SH-075 性能工单），阈值口径定下来之前
+        # 只记录不阻断：continue-on-error 让报告照常上传，红绿由上面的基线门禁决定
+        continue-on-error: true
+        run: cargo test --test latency_budget -- --ignored --nocapture
+
+      - name: 装 Node（评分脚本用）
+        uses: actions/setup-node@v4
+        with:
+          node-version: 22
+
+      # 零依赖脚本，只读两份 JSON 判退化；退化 >10% 直接让本条 workflow 变红
+      - name: 对基线判退化（success_rate 降幅 / 轮数与 token 增幅 >10% 阻断）
+        run: node evals/score.mjs
+
+      - name: 上传本轮报告
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: evals-latest
+          path: evals/latest.json
+          if-no-files-found: warn
+          retention-days: 30
