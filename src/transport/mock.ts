@@ -45,9 +45,39 @@ function mockSessionNamespace(): unknown {
     create: async () => OK({ sessionId: `mock-session-${MOCK_SESSION_ROWS.size + 1}` as SessionId }),
     fork: async () => OK({ sessionId: `mock-session-${MOCK_SESSION_ROWS.size + 1}` as SessionId }),
     search: async () => OK({ items: [], hasMore: false }),
+    selectModel: async (req: { provider: string; model: string }) =>
+      OK({ selected: { provider: req.provider, model: req.model } }),
     projections: async () => OK(null),
+    // 模型目录（composer 模型席位数据源，形状 = session-controller 的 ModelCatalog）
+    modelCatalog: async () => OK({
+      default: { provider: 'mock-provider', model: 'mock-model-a' },
+      routableProviders: ['mock-provider'],
+      groups: [{
+        id: 'mock-provider',
+        name: 'Mock Provider',
+        models: [
+          { id: 'mock-model-a', name: 'Mock Model A', description: 'mock 旗舰模型' },
+          { id: 'mock-model-b', name: 'Mock Model B', description: 'mock 轻量模型' },
+        ],
+      }],
+      failures: [],
+    }),
     control: async function* (): AsyncGenerator<unknown> {
-      yield { type: 'baseline', value: { projections: {} } }
+      // 控制基线带 per-session 投影：modelSelection（composer 模型席位的当前选择来源）
+      yield {
+        type: 'baseline',
+        value: {
+          projections: Object.fromEntries([...MOCK_SESSION_ROWS.keys()].map(id => [id, {
+            asOfSeq: 0,
+            values: {
+              modelSelection: {
+                lastUsed: null,
+                next: { provider: 'mock-provider', model: 'mock-model-a' },
+              },
+            },
+          }])),
+        },
+      }
       await new Promise<void>(() => {})
     },
     follow: async function* (): AsyncGenerator<unknown> {
@@ -57,7 +87,12 @@ function mockSessionNamespace(): unknown {
         cursor: 0,
         records: [],
         hasMore: false,
-        projections: { asOfSeq: 0, values: {} },
+        projections: {
+          asOfSeq: 0,
+          values: {
+            modelSelection: { lastUsed: null, next: { provider: 'mock-provider', model: 'mock-model-a' } },
+          },
+        },
         assistantStream: { revision: 0 },
       }
       await new Promise<void>(() => {})
