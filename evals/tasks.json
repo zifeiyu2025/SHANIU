@@ -1,0 +1,59 @@
+{
+  "version": 0,
+  "note": "评估基线 v0（docs/05 SH-028）。任务集是数据不是代码：SH-073 扩集合无需改 Rust。判据必须是机械可核验的文件断言，禁止'看一眼觉得对'。",
+  "fixture": {
+    "README.md": "# eval fixture\n\n这是 SHANIU 评估基线的临时工作区，每次任务重建。\n",
+    "config.toml": "port = 8080\nhost = \"127.0.0.1\"\n",
+    "notes.txt": "seed line\n",
+    "src/app.rs": "fn hello() {\n    println!(\"hi\");\n}\n\nfn main() {\n    hello();\n}\n",
+    "src/util.rs": "// TODO: add docs\nfn parse() {}\n"
+  },
+  "tasks": [
+    {
+      "id": "create-note",
+      "title": "新建带指定内容的文件",
+      "prompt": "在工作区新建 notes/todo.md，写一条待办事项，正文必须包含字面量 SHANIU eval。只创建这个文件，不要改动其它文件。",
+      "check": {
+        "path": "notes/todo.md",
+        "contains_all": ["SHANIU eval"]
+      }
+    },
+    {
+      "id": "read-then-summarize",
+      "title": "读文件并抽取函数名",
+      "prompt": "读取 src/app.rs，把该文件里所有 fn 函数名逐行写入 functions.txt，每行一个名字，不要写别的内容。",
+      "check": {
+        "path": "functions.txt",
+        "contains_all": ["hello", "main"]
+      }
+    },
+    {
+      "id": "edit-existing-value",
+      "title": "精确修改已有配置值",
+      "prompt": "把 config.toml 里的端口从 8080 改成 9090，其余行保持不变。改完确认文件里不再出现 8080。",
+      "check": {
+        "path": "config.toml",
+        "contains_all": ["9090"],
+        "absent_all": ["8080"]
+      }
+    },
+    {
+      "id": "run-command-capture",
+      "title": "执行命令并落盘输出",
+      "prompt": "在工作区根目录用命令列出条目（cmd 的 dir /b 即可），把命令输出原样写入 root-listing.txt。",
+      "check": {
+        "path": "root-listing.txt",
+        "contains_all": ["config.toml", "src"]
+      }
+    },
+    {
+      "id": "search-and-report",
+      "title": "跨文件搜索并汇报命中",
+      "prompt": "在工作区搜索包含 TODO 的位置，把命中的文件路径与该整行内容写入 findings.txt。",
+      "check": {
+        "path": "findings.txt",
+        "contains_all": ["util.rs", "TODO"]
+      }
+    }
+  ]
+}
