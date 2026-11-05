@@ -4,11 +4,8 @@
  * 与 stubs.ts 的区别：mock 允许"伪造成功"——按真实形状预置数据、驱动真实客户端投影
  * （workspace-controller 的 follow 流/模型机制原样运行），用于把界面各区域填充到可联调状态。
  */
-import type {
-  ISessions, SessionListState, SessionRetainInfo, SessionSummary,
-} from '@deepseek-ai/dsh-api-session-controller/client'
+import type { SessionSummary } from '@deepseek-ai/dsh-api-session-controller/client'
 import type { WorkspaceView } from '@deepseek-ai/dsh-api-workspace-controller/client'
-import { createSnapshotStore } from '@deepseek-ai/dsh-client-store'
 import type { SessionId } from '@deepseek-ai/dsh-session/types'
 
 const WORKSPACE_PATH = 'D:\\MyWorkspace\\SHANIU'
@@ -28,56 +25,85 @@ function mockSessionRow(id: string, title: string, minutesAgo: number, running =
 }
 
 /**
- * `sessions` 服务 mock：预置会话列表 + 可变更（create 即造行，全流程 mock 语义）。
- * 面形状与 stubSessions 相同的四个成员 + 其余成员经 Proxy 抛错。
+ * 预置会话行的共享可变注册表：workspace 分组（sessionIds）与 session.list RPC
+ * 消费同一份数据，保证侧栏与主区一致。
  */
-export function mockSessions(): ISessions {
-  const rows = new Map<string, SessionSummary>([
-    [SESSION_IDS[0], mockSessionRow(SESSION_IDS[0], 'SH-008 mock：读改跑联调', 42)],
-    [SESSION_IDS[1], mockSessionRow(SESSION_IDS[1], '沙箱探针测试记录', 7, true)],
-  ])
-  const list = createSnapshotStore<SessionListState>({
-    ids: [...rows.keys()] as SessionId[],
-    byId: Object.fromEntries(rows) as SessionListState['byId'],
-    phase: 'ready',
-    projectionsBySession: {},
-  })
-  const publish = (): void => {
-    list.set({
-      ids: [...rows.keys()] as SessionId[],
-      byId: Object.fromEntries(rows) as SessionListState['byId'],
-      phase: 'ready',
-      projectionsBySession: {},
-    })
-  }
-  const retention = new Map<string, ReturnType<typeof createSnapshotStore<SessionRetainInfo>>>()
-  const base = {
-    // 上游会话搜索单次上限常量（SESSION_SEARCH_RESULT_LIMIT）
-    searchResultLimit: 20,
-    list,
-    create: async (options?: { sessionId?: SessionId }) => {
-      const id = options?.sessionId ?? `mock-session-${rows.size + 1}`
-      rows.set(id, mockSessionRow(id, '新会话', 0))
-      publish()
-      return id as SessionId
+const MOCK_SESSION_ROWS = new Map<string, SessionSummary>([
+  [SESSION_IDS[0], mockSessionRow(SESSION_IDS[0], 'SH-008 mock：读改跑联调', 42)],
+  [SESSION_IDS[1], mockSessionRow(SESSION_IDS[1], '沙箱探针测试记录', 7, true)],
+])
+
+/**
+ * `remote.session` 命名空间 mock：喂真实的 session-controller 客户端运行时。
+ * 四个面 = manager 消费契约（见 api-session-controller/src/client/transport.ts）：
+ * ① list RPC（侧栏列表）② control 流（会话级控制基线）③ follow 流（journal 窗口，
+ * 空 records = 空会话原样渲染）④ page + 各 unary（prompt/cancel/rename/…）。
+ */
+function mockSessionNamespace(): unknown {
+  return {
+    list: async () => OK({ items: [...MOCK_SESSION_ROWS.values()] }),
+    create: async () => OK({ sessionId: `mock-session-${MOCK_SESSION_ROWS.size + 1}` as SessionId }),
+    fork: async () => OK({ sessionId: `mock-session-${MOCK_SESSION_ROWS.size + 1}` as SessionId }),
+    search: async () => OK({ items: [], hasMore: false }),
+    projections: async () => OK(null),
+    control: async function* (): AsyncGenerator<unknown> {
+      yield { type: 'baseline', value: { projections: {} } }
+      await new Promise<void>(() => {})
     },
-    binding: (_id: SessionId) => undefined,
-    retainInfo: (id: SessionId) => {
-      let source = retention.get(id)
-      if (source === undefined) {
-        source = createSnapshotStore<SessionRetainInfo>({ referenceCount: 0, retainedBy: {} })
-        retention.set(id, source)
+    follow: async function* (): AsyncGenerator<unknown> {
+      yield {
+        type: 'snapshot',
+        header: { version: 0, id: '' as SessionId, createdAt: Date.now(), isSeeded: false },
+        cursor: 0,
+        records: [],
+        hasMore: false,
+        projections: { asOfSeq: 0, values: {} },
+        assistantStream: { revision: 0 },
       }
-      return source
+      await new Promise<void>(() => {})
     },
+    page: async () => OK({ records: [], hasMore: false }),
+    prompt: async () => OK({}),
+    cancel: async () => OK({ accepted: false }),
+    rename: async () => OK({}),
+    attachment: async () => OK({}),
+    updateQueue: async () => OK({}),
   }
-  return new Proxy(base, {
-    get(target, prop) {
-      if (prop in target) return target[prop as keyof typeof target]
-      if (typeof prop === 'symbol') return undefined
-      throw new Error(`mock(sessions).${String(prop)}: 该成员尚未 mock，见 transport/mock.ts`)
+}
+
+/** `connection` 服务 mock：generation 恒为已连接（触发 session-controller 的 handleConnected）。 */
+export function mockConnection(): unknown {
+  return new Proxy(
+    {
+      generation: { getSnapshot: () => 1, subscribe: () => () => {} },
+      state: { getSnapshot: () => 'ready', subscribe: () => () => {} },
+      interactions: {},
+      isLoopback: true,
+    } as Record<string | symbol, unknown>,
+    {
+      get(target, prop) {
+        if (prop in target) return target[prop]
+        if (typeof prop === 'symbol') return undefined
+        throw new Error(`mock(connection).${String(prop)}: 该成员尚未 mock，见 transport/mock.ts`)
+      },
     },
-  }) as unknown as ISessions
+  )
+}
+
+/** `typert` 服务 mock：仅覆盖 contexts.registerClient 注册面（返回解绑函数）。 */
+export function mockTypert(): unknown {
+  return new Proxy(
+    {
+      contexts: { registerClient: () => () => {} },
+    } as Record<string | symbol, unknown>,
+    {
+      get(target, prop) {
+        if (prop in target) return target[prop]
+        if (typeof prop === 'symbol') return undefined
+        throw new Error(`mock(typert).${String(prop)}: 该成员尚未 mock，见 transport/mock.ts`)
+      },
+    },
+  )
 }
 
 function mockWorkspaceView(): WorkspaceView {
@@ -143,21 +169,57 @@ const MOCK_REMOTE = buildMockRemote()
 function buildMockRemote(): unknown {
   const namespaces = new Map<string, unknown>([
     ['workspace', mockWorkspaceNamespace()],
+    ['session', mockSessionNamespace()],
   ])
   const base = {
     $on: () => () => {},
     $emit: () => false,
     $call: () => Promise.reject(new Error('mock(remote).$call: 该调用尚未 mock，见 transport/mock.ts')),
     // 转发 open() 的异步可迭代：mock follow 帧经真实客户端投影机制流动。
-    // 信封形状对齐 gateway RemoteStream 的产出（{generation, value, accept}），
-    // RemoteSnapshotStream 消费时按 generation 分代并调用 accept() 做流控确认。
+    // 对齐 gateway RemoteStream 语义：
+    // - 惰性开启：open() 在首次迭代时才调用（journal 流的 initialRequest 在 open(request) 时才就位）
+    // - 信封 {generation, value, accept}：物理重启（restart）递增 generation，
+    //   消费方据此重置 opening-snapshot 期待；accept() 为流控确认
+    // - 流对象带 restart/dispose（RemoteSnapshotStream 重连/回收调用）
     $stream: (options: { open: (signal?: AbortSignal) => AsyncIterable<unknown> }) => {
-      async function* forward(): AsyncGenerator<unknown> {
-        for await (const frame of options.open()) {
-          yield { generation: 0, value: frame, accept: () => {} }
+      const state = {
+        gen: 0,
+        iter: null as AsyncIterator<unknown> | null,
+      }
+      const ensureIter = (): void => {
+        if (state.iter === null) {
+          state.iter = (options.open() as AsyncIterable<unknown>)[Symbol.asyncIterator]()
         }
       }
-      return forward()
+      const restart = (): void => {
+        state.gen += 1
+        void state.iter?.return?.(undefined)
+        state.iter = null
+      }
+      const dispose = async (): Promise<void> => {
+        await state.iter?.return?.(undefined)
+        state.iter = null
+      }
+      return {
+        [Symbol.asyncIterator]: () => ({
+          next: async () => {
+            ensureIter()
+            const result = await state.iter!.next()
+            if (result.done) return { done: true as const, value: undefined as never }
+            return {
+              done: false as const,
+              value: { generation: state.gen, value: result.value, accept: () => {} },
+            }
+          },
+          return: async () => {
+            await state.iter?.return?.(undefined)
+            state.iter = null
+            return { done: true as const, value: undefined as never }
+          },
+        }),
+        restart,
+        dispose,
+      }
     },
     $mount: async () => {
       throw new Error('mock(remote).$mount: 由适配层取代，见 transport/shims')

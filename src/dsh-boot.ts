@@ -30,6 +30,7 @@ import { apply as uiCommandsApply, inject as uiCommandsInject } from '@deepseek-
 import { apply as fileUploadApply, inject as fileUploadInject } from '@deepseek-ai/dsh-client-file-upload/client'
 import { apply as resourcesApply, inject as resourcesInject } from '@deepseek-ai/dsh-client-resources/client'
 import { apply as workspaceControllerApply, inject as workspaceControllerInject } from '@deepseek-ai/dsh-api-workspace-controller/client'
+import { apply as sessionControllerApply, inject as sessionControllerInject } from '@deepseek-ai/dsh-api-session-controller/client'
 import ShortcutsService from '@deepseek-ai/dsh-client-shortcuts/client'
 import { apply as localeApply, inject as localeInject } from '@deepseek-ai/dsh-client-locale/client'
 import {
@@ -37,7 +38,7 @@ import {
   stubConfigForms, stubRemote, stubSessions,
 } from './transport/stubs'
 import {
-  installMockRemoteNamespaces, mockRemote, mockSessions,
+  installMockRemoteNamespaces, mockConnection, mockRemote, mockTypert,
 } from './transport/mock'
 
 export interface BootHandle {
@@ -69,7 +70,10 @@ export async function bootShaniu(container: HTMLElement): Promise<BootHandle> {
   } else {
     root.provide('remote', mockRemote())
     installMockRemoteNamespaces(root)
-    root.provide('sessions', mockSessions())
+    root.provide('connection', mockConnection())
+    root.provide('typert', mockTypert())
+    // 真实 sessions 服务（ClientSessions 运行时）吃 mock 的 remote.session 面：
+    // list 拉预置行、control/follow 流空基线（会话内容原样渲染为空态）
   }
   root.provide('configForms', stubConfigForms())
   // Service 子类：构造即自注册 'remoteAccess' 并发布 useRemoteAccess 全局座席；
@@ -90,6 +94,7 @@ export async function bootShaniu(container: HTMLElement): Promise<BootHandle> {
   const features: FeaturePlugin[] = [
     { inject: resourcesInject, apply: resourcesApply },
     { inject: fileUploadInject, apply: fileUploadApply },
+    { inject: sessionControllerInject, apply: sessionControllerApply },
     { inject: uiFileDragInject, apply: uiFileDragApply },
     { inject: uiContextMenuInject, apply: uiContextMenuApply },
     { inject: uiInputTriggerInject, apply: uiInputTriggerApply },
