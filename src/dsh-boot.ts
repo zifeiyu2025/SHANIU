@@ -36,6 +36,9 @@ import {
   StubRemoteAccess, installRemoteNamespaceStubs,
   stubConfigForms, stubRemote, stubSessions,
 } from './transport/stubs'
+import {
+  installMockRemoteNamespaces, mockRemote, mockSessions,
+} from './transport/mock'
 
 export interface BootHandle {
   readonly ctx: Context
@@ -45,19 +48,33 @@ export interface BootHandle {
 /** 按依赖序安装一个 {inject, apply} 特性插件。 */
 type FeaturePlugin = { inject: readonly string[]; apply: (ctx: Context) => unknown }
 
+/** 纯浏览器开发态走 mock 数据源（SH-008 mock 联调）；Tauri 内走显式 stub 等待接线。 */
+function usingTauriBackend(): boolean {
+  return typeof window !== 'undefined' && '__TAURI_INTERNALS__' in window
+}
+
 /** 组装并挂载完整 UI；失败时把原因抛给调用方（入口页自绘错误）。 */
 export async function bootShaniu(container: HTMLElement): Promise<BootHandle> {
   const root = new Context()
+  const tauri = usingTauriBackend()
 
   // 渲染基座：SlotRegistry + slot renderer + ctx.uiRenderer.mount
   await root.plugin({ inject: [], apply: rendererApply }).await()
 
-  // 宿主侧服务 stub（M0：尚未接线的显式占位，清单见 transport/stubs.ts）
-  root.provide('remote', stubRemote())
-  installRemoteNamespaceStubs(root)
+  // 宿主侧服务：mock（浏览器联调，见 transport/mock.ts）或 stub（Tauri 内等待接线，见 transport/stubs.ts）
+  if (tauri) {
+    root.provide('remote', stubRemote())
+    installRemoteNamespaceStubs(root)
+    root.provide('sessions', stubSessions())
+  } else {
+    root.provide('remote', mockRemote())
+    installMockRemoteNamespaces(root)
+    root.provide('sessions', mockSessions())
+  }
   root.provide('configForms', stubConfigForms())
-  root.provide('sessions', stubSessions())
-  new StubRemoteAccess(root) // Service 子类：构造即自注册 'remoteAccess'
+  // Service 子类：构造即自注册 'remoteAccess' 并发布 useRemoteAccess 全局座席；
+  // mock 态授权（mock 后端语义），Tauri 态全拒（等待 SH-025 接线）
+  new StubRemoteAccess(root, !tauri)
 
   // 基础服务：locale 插件（词典注册 + slots.installLocale，渲染机合成 t 座席）
   // → shortcuts（依赖 locale）→ theme（依赖 slots/locale/remote/configForms）

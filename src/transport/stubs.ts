@@ -102,17 +102,30 @@ const REFUSED: HostObservable<boolean> = {
   subscribe: () => () => {},
 }
 
+const ALLOWED: HostObservable<boolean> = {
+  getSnapshot: () => true,
+  subscribe: () => () => {},
+}
+
 /**
- * `remoteAccess` 服务 stub：一切动作一律拒绝（SH-025 审批接线时核销）。
- * Service 子类：构造即自注册到 ctx（与上游 test-runtime 的 StaticRemoteAccess 同范式）。
+ * `remoteAccess` 服务 stub：按构造参数统一回答全部动作。
+ * Tauri 态 = 全拒（SH-025 审批接线时核销）；浏览器 mock 态 = 全许（mock 后端授权语义）。
+ * 同时发布 slots 全局 `remoteAccess` keyed hook（SidebarRoot 等 UI 的 useRemoteAccess 座席），
+ * 与上游 mountAccess 的 provideRoot 范式一致。
  */
 export class StubRemoteAccess extends Service {
-  constructor(ctx: Context) {
+  private readonly answer: HostObservable<boolean>
+
+  constructor(ctx: Context, allow: boolean) {
     super(ctx, 'remoteAccess')
+    this.answer = allow ? ALLOWED : REFUSED
+    ctx.slots.provideRoot({
+      keyedHooks: { remoteAccess: () => this.answer },
+    })
   }
 
   source(_kind: TypertResourceKind, _id: string, _action: string): HostObservable<boolean> {
-    return REFUSED
+    return this.answer
   }
 
   whenAccess(_action: string, _callback: () => unknown): () => void {
