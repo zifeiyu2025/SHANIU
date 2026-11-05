@@ -37,13 +37,16 @@ function load(name) {
 }
 
 const latest = load('latest.json');
+// 基线按**模型**分档存（evals/baseline.<model>.json）：不同模型的轮数/token 量级不可比，
+// 混在一份文件里会让"换模型"这种正常变更每次都撞退化门禁，久而久之门禁就没人信了。
+const baseName = `baseline.${latest.model}.json`;
 if (promote) {
-  writeFileSync(join(HERE, 'baseline.json'), `${JSON.stringify(latest, null, 2)}\n`);
-  console.log(`[evals] 已将 latest 升格为 baseline（模型=${latest.model} 成功率=${latest.summary.success_rate}）`);
+  writeFileSync(join(HERE, baseName), `${JSON.stringify(latest, null, 2)}\n`);
+  console.log(`[evals] 已将 latest 升格为 ${baseName}（成功率=${latest.summary.success_rate}）`);
   process.exit(0);
 }
 
-const base = load('baseline.json');
+const base = load(baseName);
 
 const fmt = (v) => (typeof v === 'number' ? (Number.isInteger(v) ? `${v}` : v.toFixed(3)) : `${v}`);
 const pct = (d) => `${d >= 0 ? '+' : ''}${(d * 100).toFixed(1)}%`;
@@ -53,10 +56,10 @@ function rel(a, b) {
   return (b - a) / a;
 }
 
-if (base.model !== latest.model || base.base_url !== latest.base_url) {
+if (base.base_url !== latest.base_url) {
   console.error(
-    `[evals] 不可比：baseline=${base.model}@${base.base_url} latest=${latest.model}@${latest.base_url}\n` +
-      '      换端点/换模型的数字不能当回归证据；要新基线就用 --promote 显式定基线。',
+    `[evals] 不可比：${baseName} 端点=${base.base_url}，本轮=${latest.base_url}\n` +
+      '      同模型换端点不能当回归证据；确属新配置就 --promote 重建该档基线。',
   );
   process.exit(1);
 }
