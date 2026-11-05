@@ -1,24 +1,12 @@
-import { StrictMode } from 'react';
-import { createRoot } from 'react-dom/client';
-import { App } from './App';
-import { createMockTransport } from './transport/mock';
-import { createTauriTransport } from './transport/tauri';
-import type { Transport } from './transport/types';
-import { initTheme } from './theme';
-import './styles/global.css';
+import { bootShaniu } from './dsh-boot';
 
-/** ADR-006：transport 注入——Tauri 环境走 IPC，纯浏览器开发走 mock。 */
-function pickTransport(): Transport {
-  return typeof window !== 'undefined' && '__TAURI_INTERNALS__' in window
-    ? createTauriTransport()
-    : createMockTransport();
-}
+// DSH 壳的基座样式（base.css：reset + boot page 变量）
+import '@deepseek-ai/dsh-client-web/base.css';
 
-// 主题必须在首次渲染前落定：晚一步就会先闪一帧另一档配色（dsh 同样把 boot-theme 放在挂载前）
-initTheme();
+const el = document.getElementById('root');
+if (el === null) throw new Error('missing #root');
 
-createRoot(document.getElementById('root')!).render(
-  <StrictMode>
-    <App transport={pickTransport()} />
-  </StrictMode>,
-);
+bootShaniu(el).catch((reason: unknown) => {
+  console.error(reason);
+  el.textContent = `启动失败：${reason instanceof Error ? reason.message : String(reason)}`;
+});
