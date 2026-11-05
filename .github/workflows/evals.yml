@@ -25,8 +25,19 @@ on:
 
 jobs:
   baseline:
-    # fork / 镜像仓库不跑：没有密钥，也不该消耗上游额度
-    if: github.repository == 'zifeiyu2025/SHANIU'
+    # fork / 镜像 / Dependabot 都不跑：Dependabot 的 PR 在同仓库里 head.repo.fork 为 false，
+    # 只看 fork 标志会漏掉它，然后密钥为空、任务自跳过并报绿（业界把它列为密钥外泄的
+    # 教科书路径，也绝不用 pull_request_target）。
+    if: >
+      github.repository == 'zifeiyu2025/SHANIU' &&
+      (github.event_name != 'pull_request' ||
+       (!github.event.pull_request.head.repo.fork &&
+        github.event.pull_request.user.login != 'dependabot[bot]'))
+    permissions:
+      contents: read
+    concurrency:
+      group: evals-${{ github.ref }}
+      cancel-in-progress: true
     runs-on: windows-latest
     timeout-minutes: 40
 
