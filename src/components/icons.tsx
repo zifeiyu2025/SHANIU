@@ -12,6 +12,8 @@ import {
   ChevronUp,
   Columns2,
   Compass,
+  Copy,
+  Check,
   Database,
   Folder,
   Globe,
@@ -62,6 +64,8 @@ export const WarningIcon = line(ShieldAlert);
 export const TrashIcon = line(Trash2);
 export const QueueIcon = line(ListOrdered);
 export const GearIcon = line(Settings);
+export const CopyIcon = line(Copy);
+export const CheckIcon = line(Check);
 
 /** 发送：dsh 的填充上箭头字形（InputBar.tsx:576，16 viewBox）。 */
 export function ArrowUpIcon({ className }: IconProps) {

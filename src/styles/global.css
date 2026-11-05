@@ -227,3 +227,54 @@ body {
 button {
   cursor: pointer;
 }
+
+/* 消息行操作条（照抄 MessageIconActions.module.css:5-60,63-94）：
+   28 高、gap 8、字形 15、tertiary 静置色。显隐只在有真正悬停能力的设备上生效——
+   用 opacity 而不是 display，位置不跳；没有 hover 能力的设备保持常显。
+   两条隐藏规则：data-actions-reveal="hover" 的行，以及"后面还有用户行"的更早用户行
+   （:has(~ …)），后者让会话里只有最后一条用户消息的操作条常显。 */
+.msg-actions {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  height: 28px;
+}
+
+.msg-action {
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  width: 28px;
+  height: 28px;
+  padding: 6px;
+  border: none;
+  border-radius: var(--dsw-radius-sm);
+  background: transparent;
+  color: var(--dsw-label-tertiary);
+  cursor: pointer;
+}
+
+.msg-action svg {
+  width: 15px;
+  height: 15px;
+}
+
+@media (hover: hover) {
+  [data-actions-reveal='hover'] .msg-actions,
+  :is([data-chat-flow-kind='user']):has(~ :is([data-chat-flow-kind='user'])) .msg-actions {
+    opacity: 0;
+    transition: opacity 80ms ease;
+  }
+
+  [data-actions-reveal='hover']:hover .msg-actions,
+  [data-actions-reveal='hover']:focus-within .msg-actions,
+  :is([data-chat-flow-kind='user']):has(~ :is([data-chat-flow-kind='user'])):hover .msg-actions,
+  :is([data-chat-flow-kind='user']):has(~ :is([data-chat-flow-kind='user'])):focus-within .msg-actions {
+    opacity: 1;
+  }
+
+  .msg-action:hover {
+    background: var(--dsw-interactive-hover);
+    color: var(--dsw-label-secondary);
+  }
+}

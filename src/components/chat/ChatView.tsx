@@ -12,6 +12,7 @@ import { ReasoningBlock } from '../blocks/ReasoningBlock';
 import { Composer } from './Composer';
 import { Greeting } from './Greeting';
 import { QueueDock } from './QueueDock';
+import { MessageActions } from '../message/MessageActions';
 
 /** 会话内容列宽（dsh ConversationRoot.module.css:468-471）。 */
 const CONTENT_WIDTH = 'w-[clamp(680px,64%,920px)]';
@@ -58,6 +59,8 @@ export function ChatView({
   const queued = useStoreSelector(store, (s) => s.queued);
   const running = status === 'running';
   const empty = nodes.length === 0;
+  // dsh 的 endsWithResponse：一轮的最后一条正文才常显操作条，更早的靠悬停
+  const tailId = [...nodes].reverse().find((n) => n.kind === 'agent_message')?.id;
   // dsh 的 blocked（InputBar.tsx:155）：挂起审批才锁输入，running 本身不锁。
   const blocked = nodes.some((n) => n.kind === 'approval' && n.status === 'pending');
   const scrollRef = useRef<HTMLDivElement>(null);
@@ -159,7 +162,12 @@ export function ChatView({
           >
             <div className={`mx-auto mt-4 flex flex-col ${CONTENT_WIDTH} max-w-full px-4 pb-6`}>
               {nodes.map((node) => (
-                <NodeItem key={node.id} node={node} transport={transport} />
+                <NodeItem
+                  key={node.id}
+                  node={node}
+                  transport={transport}
+                  reveal={node.kind === 'agent_message' && node.id === tailId}
+                />
               ))}
             </div>
           </div>
@@ -215,25 +223,47 @@ export function ChatView({
   );
 }
 
-function NodeItem({ node, transport }: { node: ConversationNode; transport: Transport }) {
+function NodeItem({
+  node,
+  transport,
+  reveal,
+}: {
+  node: ConversationNode;
+  transport: Transport;
+  /** 本轮最后一条正文（dsh 的 endsWithResponse）：操作条常显，其余靠悬停。 */
+  reveal: boolean;
+}) {
   switch (node.kind) {
     case 'user_message':
       // 右对齐气泡：bg specific-bubble、r20、pad 10 16、max-w 70.2%（MessageItem/UserMessageBubble）
+      // data-chat-flow-kind 是给 CSS 的跨行判据用的：后面还有用户行的，操作条只在悬停时出现
       return (
-        <div className="mt-3 flex justify-end">
+        <div
+          className="mt-3 flex flex-col items-end"
+          data-chat-flow-kind="user"
+          data-testid="user-row"
+        >
           <div
             data-testid="user-bubble"
             className="max-w-[70.2%] rounded-xl bg-bubble px-4 py-2.5 text-[14px] leading-[22px] whitespace-pre-wrap text-primary"
           >
             {node.text}
           </div>
+          <MessageActions text={node.text} />
         </div>
       );
     case 'agent_message':
       // 平铺无气泡：正文 14/24、块间 16（AssistantMarkdown.module.css:9-21）
+      // 流式中不给操作条：复制一条还没写完的回复不是"复制这轮回答"
       return (
-        <div className="mt-3 text-[14px] leading-6 text-primary">
+        <div
+          className="mt-3 text-[14px] leading-6 text-primary"
+          data-testid="agent-row"
+          data-chat-flow-kind="agent"
+          data-actions-reveal={reveal && !node.streaming ? 'always' : 'hover'}
+        >
           <StreamingText text={node.text} streaming={node.streaming} />
+          {!node.streaming && <MessageActions text={node.text} />}
         </div>
       );
     case 'reasoning':
