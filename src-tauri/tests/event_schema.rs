@@ -1,11 +1,13 @@
 //! 健身函数 FF-2（docs §5）：事件协议兼容契约测试。
 //!
 //! 不做整段 JSON 字面量快照（AGENTS §5 禁止），而是验证行为契约：
-//! 1) 判别标签集合与前端镜像 `src/transport/types.ts` 完全一致；
+//! 1) EventMsg tag 与前端镜像 `src/transport/types.ts` **机械绑定**（从 types.ts 声明提取
+//!    `type: '...'` 字面量集合，与 Rust 侧 tag 做双向集合相等，SH-079）；
 //! 2) 字段命名 snake_case（前端镜像依赖）；
 //! 3) 反序列化忽略未知字段（旧前端容忍新协议，前向兼容）；
 //! 4) 每个变体可无损 round-trip；
-//! 5) SH-074：枚举**变体**穷举比对（标签集合只能查事件类型漂移，查不出变体漂移）。
+//! 5) SH-074：枚举**变体**穷举比对（标签集合只能查事件类型漂移，查不出变体漂移）；
+//!    SH-079：枚举穷举升级为**双向集合相等**（TS 单方多出变体也必红）。
 
 use serde::Serialize;
 use shaniu_lib::events::{
@@ -213,16 +215,43 @@ fn ts_type_union(type_name: &str) -> String {
     rest[..end].to_string()
 }
 
+/// 提取 TS 声明体内的单引号字符串字面量集合（SH-079）。
+/// 适用前提：枚举镜像 union 形如 `export type X = 'a' | 'b';`（当前五个枚举镜像全部满足）；
+/// 若将来镜像声明带注释，会给出多余成员必红而非漏报（fail-safe 方向）。
+fn ts_union_literals(union_body: &str) -> std::collections::BTreeSet<String> {
+    let mut literals = std::collections::BTreeSet::new();
+    let mut pos = 0usize;
+    while let Some(rel_open) = union_body[pos..].find('\'') {
+        let open = pos + rel_open;
+        let Some(rel_close) = union_body[open + 1..].find('\'') else {
+            panic!("TS 声明单引号不配对（位置 {open}）：{union_body}")
+        };
+        let close = open + 1 + rel_close;
+        literals.insert(union_body[open + 1..close].to_string());
+        pos = close + 1;
+    }
+    literals
+}
+
+/// SH-079：从"单向包含"升级为**双向集合相等**——
+/// Rust 加变体前端不跟、或前端单方多出/乱改变体，两侧漂移必红。
 fn assert_union_covers<T: Serialize>(type_name: &str, variants: &[T]) {
     let union = ts_type_union(type_name);
-    for variant in variants {
-        let value = serde_json::to_value(variant).expect("序列化失败");
-        let literal = format!("'{}'", value.as_str().expect("枚举值应为字符串字面量"));
-        assert!(
-            union.contains(&literal),
-            "前端镜像 {type_name} 缺少变体 {literal}（Rust 新增变体必须同步 src/transport/types.ts）。声明：{union}"
-        );
-    }
+    let rust_set: std::collections::BTreeSet<String> = variants
+        .iter()
+        .map(|v| {
+            let value = serde_json::to_value(v).expect("序列化失败");
+            value.as_str().expect("枚举值应为字符串字面量").to_string()
+        })
+        .collect();
+    let ts_set = ts_union_literals(&union);
+    assert_eq!(
+        rust_set,
+        ts_set,
+        "前端镜像 {type_name} 与 Rust 枚举漂移（双向集合相等）：Rust-only={:?} TS-only={:?}——必须同步 src/transport/types.ts。声明：{union}",
+        rust_set.difference(&ts_set).collect::<Vec<_>>(),
+        ts_set.difference(&rust_set).collect::<Vec<_>>()
+    );
 }
 
 /// SH-074/078：FF-2 从"事件标签集合"升级为"**枚举变体穷举**"，变体清单不再硬编码——
@@ -235,4 +264,55 @@ fn every_enum_variant_is_mirrored_in_frontend_types() {
     assert_union_covers("ApprovalDecision", ApprovalDecision::all_variants());
     assert_union_covers("IoChannel", IoChannel::all_variants());
     assert_union_covers("TurnEndReason", TurnEndReason::all_variants());
+}
+
+/// SH-079：EventMsg tag 与前端镜像**机械绑定**（此前 EXPECTED_TAGS 与 types.ts 无人校验关联）。
+/// 从 types.ts 的 EventMsg 声明提取所有 `type: '...'` 字面量，与 Rust 侧 tag 做双向集合相等。
+/// EventMsg union 里只有判别字段带字符串字面量（其余字段引用枚举名，无内联字面量），
+/// 故提取出的集合恰为 tag 集合。
+#[test]
+fn event_msg_tags_are_mechanically_bound_to_frontend_mirror() {
+    let ts = include_str!("../../src/transport/types.ts");
+    let marker = "export type EventMsg ";
+    let start = ts.find(marker).expect("前端镜像缺少 EventMsg 声明");
+    let rest = &ts[start..];
+    // EventMsg 成员是对象字面量（成员内含 ';'），声明终止于下一个顶层 export，而非首个 ';'
+    let end = rest[marker.len()..]
+        .find("\nexport ")
+        .map(|i| marker.len() + i)
+        .unwrap_or(rest.len());
+    let decl = &rest[..end];
+
+    let mut ts_tags = std::collections::BTreeSet::new();
+    let mut pos = 0usize;
+    while let Some(rel) = decl[pos..].find("type:") {
+        let start = pos + rel + "type:".len();
+        let Some(qopen_rel) = decl[start..].find('\'') else { break };
+        let qopen = start + qopen_rel;
+        let Some(qclose_rel) = decl[qopen + 1..].find('\'') else {
+            panic!("EventMsg 声明内 type: 后单引号不配对（位置 {qopen}）")
+        };
+        let qclose = qopen + 1 + qclose_rel;
+        ts_tags.insert(decl[qopen + 1..qclose].to_string());
+        pos = qclose + 1;
+    }
+
+    let mut rust_tags = std::collections::BTreeSet::new();
+    for msg in all_variants() {
+        let tag = serde_json::to_value(&msg)
+            .expect("序列化失败")
+            .get("type")
+            .and_then(|t| t.as_str())
+            .expect("缺少 type 判别标签")
+            .to_string();
+        rust_tags.insert(tag);
+    }
+
+    assert_eq!(
+        rust_tags,
+        ts_tags,
+        "EventMsg 判别标签与 types.ts 声明漂移：Rust-only={:?} TS-only={:?}",
+        rust_tags.difference(&ts_tags).collect::<Vec<_>>(),
+        ts_tags.difference(&rust_tags).collect::<Vec<_>>()
+    );
 }
