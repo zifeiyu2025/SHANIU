@@ -122,6 +122,12 @@ export async function bootShaniu(container: HTMLElement): Promise<BootHandle> {
   await root.plugin({ inject: [...layoutInject], apply: layoutApply }).await()
 
   // 挂载：等价 DSH mountClient —— 等 uiRenderer 就位后 mount
+
+  // 先冲刷微任务：部分 Service 经 ctx.plugin(Class, config) 异步实例化（fiber 微任务），
+  // 同步挂载会在首次渲染时读到未就位的服务（conversation 等）并让槽位边界卡死。
+  await new Promise<void>(resolve => setTimeout(resolve, 0))
+  await Promise.resolve()
+
   const uiRenderer = root.get('uiRenderer')
   if (uiRenderer === undefined) throw new Error('dsh-boot: uiRenderer 服务未就位')
   const unmount = uiRenderer.mount(container)

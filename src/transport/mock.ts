@@ -4,23 +4,24 @@
  * 与 stubs.ts 的区别：mock 允许"伪造成功"——按真实形状预置数据、驱动真实客户端投影
  * （workspace-controller 的 follow 流/模型机制原样运行），用于把界面各区域填充到可联调状态。
  */
-import type { SessionSummary } from '@deepseek-ai/dsh-api-session-controller/client'
+import type { SessionSummary } from '@deepseek-ai/dsh-api-session-controller/types'
 import type { WorkspaceView } from '@deepseek-ai/dsh-api-workspace-controller/client'
 import type { SessionId } from '@deepseek-ai/dsh-session/types'
 
 const WORKSPACE_PATH = 'D:\\MyWorkspace\\SHANIU'
 const SESSION_IDS = ['mock-session-alpha', 'mock-session-beta']
 
-function mockSessionRow(id: string, title: string, minutesAgo: number, running = false): SessionSummary {
+function mockSessionRow(id: string, minutesAgo: number, running = false): SessionSummary {
+  // wire 形状（types.ts 的 SessionSummary，sessionId 字段）——manager.projectList 按
+  // entry.sessionId 重建 client 行；给成 client 形状（id 字段）会整行退化为 undefined key
   return {
-    id: id as SessionId,
-    title,
-    displayTitle: title,
+    agentAvailable: true,
+    sessionId: id as SessionId,
+    cwd: WORKSPACE_PATH,
     running,
-    retainedBy: {},
     blank: false,
     updatedAt: Date.now() - minutesAgo * 60_000,
-    cwd: WORKSPACE_PATH,
+    formatStatus: 'current',
   }
 }
 
@@ -29,8 +30,8 @@ function mockSessionRow(id: string, title: string, minutesAgo: number, running =
  * 消费同一份数据，保证侧栏与主区一致。
  */
 const MOCK_SESSION_ROWS = new Map<string, SessionSummary>([
-  [SESSION_IDS[0], mockSessionRow(SESSION_IDS[0], 'SH-008 mock：读改跑联调', 42)],
-  [SESSION_IDS[1], mockSessionRow(SESSION_IDS[1], '沙箱探针测试记录', 7, true)],
+  [SESSION_IDS[0], mockSessionRow(SESSION_IDS[0], 42)],
+  [SESSION_IDS[1], mockSessionRow(SESSION_IDS[1], 7, true)],
 ])
 
 /**
@@ -80,11 +81,12 @@ function mockSessionNamespace(): unknown {
       }
       await new Promise<void>(() => {})
     },
-    follow: async function* (): AsyncGenerator<unknown> {
+    follow: async function* (_request: unknown): AsyncGenerator<unknown> {
       yield {
         type: 'snapshot',
         header: { version: 0, id: '' as SessionId, createdAt: Date.now(), isSeeded: false },
-        cursor: 0,
+        // 空 journal：cursor = 会话 emptyCursor（-1），与 journal 流的空页校验一致
+        cursor: -1,
         records: [],
         hasMore: false,
         projections: {
@@ -158,7 +160,7 @@ const OK = <T>(value: T) => ({ ok: true as const, value })
 function mockWorkspaceNamespace(): unknown {
   return {
     // follow 帧形状 = api-workspace-controller 的 WorkspaceFollowFrame（baseline + 增量闭联合集）
-    follow: async function* (): AsyncGenerator<unknown> {
+    follow: async function* (_request: unknown): AsyncGenerator<unknown> {
       yield {
         type: 'baseline',
         value: { items: [mockWorkspaceView()], archivedSessionIds: [], pinnedSessionIds: [] },
