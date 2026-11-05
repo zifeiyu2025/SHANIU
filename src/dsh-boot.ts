@@ -9,9 +9,12 @@ import { Context } from '@deepseek-ai/cordis'
 import { apply as rendererApply } from '@deepseek-ai/dsh-client-ui-renderer/client'
 import { apply as themeApply, inject as themeInject } from '@deepseek-ai/dsh-client-ui-theme/client'
 import { apply as layoutApply, inject as layoutInject } from '@deepseek-ai/dsh-client-ui-layout/client'
+import { apply as uiSessionApply, inject as uiSessionInject } from '@deepseek-ai/dsh-client-ui-session/client'
 import ShortcutsService from '@deepseek-ai/dsh-client-shortcuts/client'
-import { LocaleRuntime } from '@deepseek-ai/dsh-client-locale/client'
-import { stubConfigForms, stubRemote } from './transport/stubs'
+import { apply as localeApply, inject as localeInject } from '@deepseek-ai/dsh-client-locale/client'
+import {
+  StubRemoteAccess, stubConfigForms, stubRemote, stubSessions,
+} from './transport/stubs'
 
 export interface BootHandle {
   readonly ctx: Context
@@ -28,11 +31,18 @@ export async function bootShaniu(container: HTMLElement): Promise<BootHandle> {
   // 宿主侧服务 stub（M0：尚未接线的显式占位，清单见 transport/stubs.ts）
   root.provide('remote', stubRemote())
   root.provide('configForms', stubConfigForms())
+  root.provide('sessions', stubSessions())
+  new StubRemoteAccess(root) // Service 子类：构造即自注册 'remoteAccess'
 
-  // 基础服务：locale（文案）→ shortcuts（依赖 locale）→ theme（依赖 slots/locale/remote/configForms）
-  root.provide('locale', new LocaleRuntime(root))
+  // 基础服务：locale 插件（词典注册 + slots.installLocale，渲染机合成 t 座席）
+  // → shortcuts（依赖 locale）→ theme（依赖 slots/locale/remote/configForms）
+  await root.plugin({ inject: [...localeInject], apply: localeApply }).await()
   await root.plugin(ShortcutsService).await()
   await root.plugin({ inject: [...themeInject], apply: themeApply }).await()
+
+  // session 作用域适配器：AppFrame 的 'session-maybe' 出口渲染必需（ui-session 注入
+  // sessions/slots/remote/remoteAccess 四个面，前三者已就位）
+  await root.plugin({ inject: [...uiSessionInject], apply: uiSessionApply }).await()
 
   // 布局壳：占据 root slot（sidebar/main/rightbar/shell.*）
   await root.plugin({ inject: [...layoutInject], apply: layoutApply }).await()

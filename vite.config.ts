@@ -6,6 +6,15 @@ import { dshAliases } from './src/dsh/aliases.ts';
 
 export default defineConfig({
   plugins: [react(), tailwindcss()],
+  // DSH client 面按打包期替换读取构建期环境量（scripts/types/client-build-environment
+  // 声明的最小 process 面）；SHANIU 自有品牌值，其余保持 undefined 语义
+  define: {
+    'process.env': JSON.stringify({
+      NODE_ENV: process.env.NODE_ENV ?? 'development',
+      DSH_CLIENT_TITLE: 'SHANIU',
+      DSH_CLIENT_COMMIT_HASH: '',
+    }),
+  },
   resolve: {
     alias: [
       // 传输面 shim 先于通用别名：typert 生成物（/remote）与聚合包由适配层取代；
