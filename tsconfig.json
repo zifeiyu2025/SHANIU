@@ -2007,6 +2007,15 @@
       ],
       "@deepseek-ai/dsh-api-gateway/types": [
         "./node_modules/.cache/dsh-types-client/src/dsh/packages/api/gateway/src/types.d.ts"
+      ],
+      "@deepseek-ai/dsh-client-ui-settings-general": [
+        "./node_modules/.cache/dsh-types-client/src/dsh/packages/client/ui-settings-general/src/index.d.ts"
+      ],
+      "@deepseek-ai/dsh-client-ui-settings-general/*": [
+        "./node_modules/.cache/dsh-types-client/src/dsh/packages/client/ui-settings-general/src/*"
+      ],
+      "@deepseek-ai/dsh-client-ui-settings-general/client": [
+        "./node_modules/.cache/dsh-types-client/src/dsh/packages/client/ui-settings-general/src/client/index.d.ts"
       ]
     }
   },

@@ -9,7 +9,29 @@ import type { WorkspaceView } from '@deepseek-ai/dsh-api-workspace-controller/cl
 import type { SessionId } from '@deepseek-ai/dsh-session/types'
 
 const WORKSPACE_PATH = 'D:\\MyWorkspace\\SHANIU'
+const WORKSPACE_ID = 'mock-workspace-1'
 const SESSION_IDS = ['mock-session-alpha', 'mock-session-beta']
+
+/** 工作区行内的会话集（create/attach 时推进，follow 以 upsert 帧广播）。 */
+const WORKSPACE_SESSION_IDS: string[] = [...SESSION_IDS]
+
+/** 跨调用共享的 follow 帧队列（baseline 后挂起，push 即广播）。 */
+function createFrameQueue<T>() {
+  const values: T[] = []
+  const waiters: ((value: T) => void)[] = []
+  return {
+    push(value: T): void {
+      const waiter = waiters.shift()
+      if (waiter !== undefined) waiter(value)
+      else values.push(value)
+    },
+    async next(): Promise<T> {
+      if (values.length > 0) return values.shift()!
+      return new Promise<T>(resolve => waiters.push(resolve))
+    },
+  }
+}
+const workspaceFrames = createFrameQueue<{ readonly type: 'upsert'; readonly workspace: WorkspaceView }>()
 
 function mockSessionRow(id: string, minutesAgo: number, running = false): SessionSummary {
   // wire 形状（types.ts 的 SessionSummary，sessionId 字段）——manager.projectList 按
@@ -43,7 +65,16 @@ const MOCK_SESSION_ROWS = new Map<string, SessionSummary>([
 function mockSessionNamespace(): unknown {
   return {
     list: async () => OK({ items: [...MOCK_SESSION_ROWS.values()] }),
-    create: async () => OK({ sessionId: `mock-session-${MOCK_SESSION_ROWS.size + 1}` as SessionId }),
+    create: async (payload: { workspaceId?: string; cwd?: string } = {}) => {
+      const id = `mock-session-${MOCK_SESSION_ROWS.size + 1}`
+      MOCK_SESSION_ROWS.set(id, mockSessionRow(id, 0))
+      // 新会话挂进工作区行（workspace-view.sessionIds），推 upsert 帧——
+      // 会话视图的 chip/inert 门控读取 sessionWorkspace（未挂接 = 输入框 inert）
+      WORKSPACE_SESSION_IDS.push(id)
+      workspaceFrames.push({ type: 'upsert', workspace: mockWorkspaceView() })
+      void payload
+      return OK({ sessionId: id as SessionId })
+    },
     fork: async () => OK({ sessionId: `mock-session-${MOCK_SESSION_ROWS.size + 1}` as SessionId }),
     search: async () => OK({ items: [], hasMore: false }),
     selectModel: async (req: { provider: string; model: string }) =>
@@ -108,6 +139,36 @@ function mockSessionNamespace(): unknown {
   }
 }
 
+/** `modules` 服务 mock：静态组装下无动态模块系统，仅覆盖 entries 空面（设置-常规的发布行读取）。 */
+export function mockModules(): unknown {
+  const idleState = {
+    getSnapshot: () => ({ syncing: false, failures: [] }),
+    subscribe: () => () => {},
+  }
+  const noRelease = {
+    getSnapshot: () => undefined,
+    subscribe: () => () => {},
+  }
+  return new Proxy(
+    {
+      version: 'client',
+      entries: {
+        state: idleState,
+        releaseChange: noRelease,
+        dismissRelease: () => {},
+        retry: async () => {},
+      },
+    } as Record<string | symbol, unknown>,
+    {
+      get(target, prop) {
+        if (prop in target) return target[prop]
+        if (typeof prop === 'symbol') return undefined
+        throw new Error(`mock(modules).${String(prop)}: 该成员尚未 mock，见 transport/mock.ts`)
+      },
+    },
+  )
+}
+
 /** `connection` 服务 mock：generation 恒为已连接（触发 session-controller 的 handleConnected）。 */
 export function mockConnection(): unknown {
   return new Proxy(
@@ -145,10 +206,10 @@ export function mockTypert(): unknown {
 
 function mockWorkspaceView(): WorkspaceView {
   return {
-    workspaceId: 'mock-workspace-1' as WorkspaceView['workspaceId'],
+    workspaceId: WORKSPACE_ID as WorkspaceView['workspaceId'],
     path: WORKSPACE_PATH,
     title: 'SHANIU',
-    sessionIds: SESSION_IDS as unknown as WorkspaceView['sessionIds'],
+    sessionIds: WORKSPACE_SESSION_IDS as unknown as WorkspaceView['sessionIds'],
     createdAt: new Date(Date.now() - 86_400_000).toISOString(),
     updatedAt: new Date(Date.now()).toISOString(),
   }
@@ -156,7 +217,7 @@ function mockWorkspaceView(): WorkspaceView {
 
 const OK = <T>(value: T) => ({ ok: true as const, value })
 
-/** mock 的 `remote.workspace` 命名空间：follow 基线帧 + 本地可变更方法。 */
+/** mock 的 `remote.workspace` 命名空间：follow 活流（baseline + 队列广播）+ 本地可变更方法。 */
 function mockWorkspaceNamespace(): unknown {
   return {
     // follow 帧形状 = api-workspace-controller 的 WorkspaceFollowFrame（baseline + 增量闭联合集）
@@ -165,8 +226,10 @@ function mockWorkspaceNamespace(): unknown {
         type: 'baseline',
         value: { items: [mockWorkspaceView()], archivedSessionIds: [], pinnedSessionIds: [] },
       }
-      // 保持"已连接"：无后端即无后续帧（绝不结束流）
-      await new Promise<void>(() => {})
+      // 活流：baseline 后消费帧队列（create/attach 推 upsert），无帧则挂起保持"已连接"
+      for (;;) {
+        yield await workspaceFrames.next()
+      }
     },
     create: async (input: { path: string }) => OK({
       workspace: {
@@ -178,10 +241,10 @@ function mockWorkspaceNamespace(): unknown {
     rename: async (_id: string, title: string) => OK({ workspace: { ...mockWorkspaceView(), title } }),
     initializeDefault: async () => OK({ workspace: mockWorkspaceView() }),
     delete: async () => OK({}),
-    insertBefore: async () => OK({ workspaceIds: ['mock-workspace-1'] }),
+    insertBefore: async () => OK({ workspaceIds: [WORKSPACE_ID] }),
     archiveSession: async () => OK({ archivedSessionIds: [] }),
     unarchiveSession: async () => OK({ archivedSessionIds: [] }),
-    pinSession: async () => OK({ pinnedSessionIds: [...SESSION_IDS] }),
+    pinSession: async () => OK({ pinnedSessionIds: [...WORKSPACE_SESSION_IDS] }),
     unpinSession: async () => OK({ pinnedSessionIds: [] }),
     insertSessionBefore: async () => OK({ workspace: mockWorkspaceView() }),
   }

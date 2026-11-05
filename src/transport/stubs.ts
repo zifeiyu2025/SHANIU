@@ -75,28 +75,6 @@ export function installRemoteNamespaceStubs(ctx: Context): void {
   }
 }
 
-/** `configForms` 服务最小面：所有命名空间 ready + 空值，写操作拒绝。 */
-export function stubConfigForms() {
-  const form = {
-    getSnapshot: () => ({
-      status: 'ready' as const,
-      value: undefined,
-      base: undefined,
-      user: undefined,
-      revision: undefined,
-      writable: false,
-    }),
-    subscribe: () => () => {},
-    mutate: () => Promise.resolve(false),
-    set: () => Promise.resolve(false),
-    unset: () => Promise.resolve(false),
-  }
-  return {
-    get: () => form,
-    developerTools: { enabled: { getSnapshot: () => false, subscribe: () => () => {} } },
-  }
-}
-
 const REFUSED: HostObservable<boolean> = {
   getSnapshot: () => false,
   subscribe: () => () => {},
@@ -114,10 +92,12 @@ const ALLOWED: HostObservable<boolean> = {
  * 与上游 mountAccess 的 provideRoot 范式一致。
  */
 export class StubRemoteAccess extends Service {
+  private readonly granted: boolean
   private readonly answer: HostObservable<boolean>
 
   constructor(ctx: Context, allow: boolean) {
     super(ctx, 'remoteAccess')
+    this.granted = allow
     this.answer = allow ? ALLOWED : REFUSED
     ctx.slots.provideRoot({
       keyedHooks: { remoteAccess: () => this.answer },
@@ -128,14 +108,26 @@ export class StubRemoteAccess extends Service {
     return this.answer
   }
 
-  whenAccess(_action: string, _callback: () => unknown): () => void {
-    return () => {}
+  whenAccess(_action: string, callback: () => unknown): () => void {
+    if (!this.granted) return () => {}
+    // 授权态（mock）：答案权恒真 → 回调立即挂载其 effect；返回统一卸载器
+    return this.runEffect(callback)
   }
 
   whenResourceAccess(
-    _kind: TypertResourceKind, _id: string, _action: string, _callback: () => unknown,
+    _kind: TypertResourceKind, _id: string, _action: string, callback: () => unknown,
   ): () => void {
-    return () => {}
+    return this.whenAccess('', callback)
+  }
+
+  private runEffect(callback: () => unknown): () => void {
+    const effect = callback() as unknown
+    return () => {
+      if (typeof effect === 'function') (effect as () => void)()
+      else if (effect !== undefined && Symbol.iterator in (effect as object)) {
+        for (const dispose of effect as Iterable<() => void>) dispose()
+      }
+    }
   }
 }
 

@@ -1995,6 +1995,15 @@
    "@deepseek-ai/dsh-api-gateway/types": [
     "./src/dsh/packages/api/gateway/src/types.ts"
    ],
+   "@deepseek-ai/dsh-client-ui-settings-general": [
+    "./src/dsh/packages/client/ui-settings-general/src/index.ts"
+   ],
+   "@deepseek-ai/dsh-client-ui-settings-general/*": [
+    "./src/dsh/packages/client/ui-settings-general/src/*"
+   ],
+   "@deepseek-ai/dsh-client-ui-settings-general/client": [
+    "./src/dsh/packages/client/ui-settings-general/src/client/index.ts"
+   ],
    "@deepseek-ai/dsh-api-remotes/client": [
     "./src/dsh/packages/api/remotes/src/client/index.ts"
    ],
@@ -2140,6 +2149,9 @@
     "./src/transport/shims/remote-module.ts"
    ],
    "@deepseek-ai/dsh-client-ui-settings/remote": [
+    "./src/transport/shims/remote-module.ts"
+   ],
+   "@deepseek-ai/dsh-client-ui-settings-general/remote": [
     "./src/transport/shims/remote-module.ts"
    ],
    "@deepseek-ai/dsh-client-ui-settings-plugin-inventory/remote": [
@@ -2618,6 +2630,15 @@
   "./src/dsh/vendor/cosmokit/src/time.ts",
   "./src/dsh/vendor/cosmokit/src/types.ts",
   "./src/dsh/vendor/cosmokit/src/volatile.ts",
+  "./src/dsh/vendor/loader/src/config/diff.ts",
+  "./src/dsh/vendor/loader/src/config/entry.ts",
+  "./src/dsh/vendor/loader/src/config/group.ts",
+  "./src/dsh/vendor/loader/src/config/isolate.ts",
+  "./src/dsh/vendor/loader/src/config/tree.ts",
+  "./src/dsh/vendor/loader/src/config/utils.ts",
+  "./src/dsh/vendor/loader/src/index.ts",
+  "./src/dsh/vendor/loader/src/internal.ts",
+  "./src/dsh/vendor/loader/src/resolve.ts",
   "./src/dsh/vendor/schemastery/src/index.ts"
  ]
 }

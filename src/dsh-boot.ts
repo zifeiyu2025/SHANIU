@@ -31,14 +31,16 @@ import { apply as fileUploadApply, inject as fileUploadInject } from '@deepseek-
 import { apply as resourcesApply, inject as resourcesInject } from '@deepseek-ai/dsh-client-resources/client'
 import { apply as workspaceControllerApply, inject as workspaceControllerInject } from '@deepseek-ai/dsh-api-workspace-controller/client'
 import { apply as sessionControllerApply, inject as sessionControllerInject } from '@deepseek-ai/dsh-api-session-controller/client'
+import { apply as uiSettingsApply, inject as uiSettingsInject } from '@deepseek-ai/dsh-client-ui-settings/client'
+import { apply as uiSettingsGeneralApply, inject as uiSettingsGeneralInject } from '@deepseek-ai/dsh-client-ui-settings-general/client'
 import ShortcutsService from '@deepseek-ai/dsh-client-shortcuts/client'
 import { apply as localeApply, inject as localeInject } from '@deepseek-ai/dsh-client-locale/client'
 import {
   StubRemoteAccess, installRemoteNamespaceStubs,
-  stubConfigForms, stubRemote, stubSessions,
+  stubRemote, stubSessions,
 } from './transport/stubs'
 import {
-  installMockRemoteNamespaces, mockConnection, mockRemote, mockTypert,
+  installMockRemoteNamespaces, mockConnection, mockModules, mockRemote, mockTypert,
 } from './transport/mock'
 
 export interface BootHandle {
@@ -67,15 +69,16 @@ export async function bootShaniu(container: HTMLElement): Promise<BootHandle> {
     root.provide('remote', stubRemote())
     installRemoteNamespaceStubs(root)
     root.provide('sessions', stubSessions())
+    root.provide('modules', mockModules())
   } else {
     root.provide('remote', mockRemote())
     installMockRemoteNamespaces(root)
     root.provide('connection', mockConnection())
     root.provide('typert', mockTypert())
+    root.provide('modules', mockModules())
     // 真实 sessions 服务（ClientSessions 运行时）吃 mock 的 remote.session 面：
     // list 拉预置行、control/follow 流空基线（会话内容原样渲染为空态）
   }
-  root.provide('configForms', stubConfigForms())
   // Service 子类：构造即自注册 'remoteAccess' 并发布 useRemoteAccess 全局座席；
   // mock 态授权（mock 后端语义），Tauri 态全拒（等待 SH-025 接线）
   new StubRemoteAccess(root, !tauri)
@@ -92,6 +95,8 @@ export async function bootShaniu(container: HTMLElement): Promise<BootHandle> {
   // batch-2 特性包（按依赖序；每个包的 inject 见其 apply 模块）：
   // 资源/上传/拖拽/右键菜单/输入触发/命令 → 工作区 → 会话主区 → 右栏/侧栏
   const features: FeaturePlugin[] = [
+    // ui-settings 必须最先：提供 configForms（本地 schema 表单，不依赖后端），theme 依赖它
+    { inject: uiSettingsInject, apply: uiSettingsApply },
     { inject: resourcesInject, apply: resourcesApply },
     { inject: fileUploadInject, apply: fileUploadApply },
     { inject: sessionControllerInject, apply: sessionControllerApply },
@@ -104,6 +109,7 @@ export async function bootShaniu(container: HTMLElement): Promise<BootHandle> {
     { inject: uiConversationInject, apply: uiConversationApply },
     { inject: uiSidebarRightInject, apply: uiSidebarRightApply },
     { inject: uiSidebarInject, apply: uiSidebarApply },
+    { inject: uiSettingsGeneralInject, apply: uiSettingsGeneralApply },
     { inject: uiChatInject, apply: uiChatApply },
     { inject: uiApprovalInject, apply: uiApprovalApply },
     { inject: uiToolInject, apply: uiToolApply },

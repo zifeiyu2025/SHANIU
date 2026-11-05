@@ -1995,6 +1995,15 @@
    "@deepseek-ai/dsh-api-gateway/types": [
     "./src/dsh/packages/api/gateway/src/types.ts"
    ],
+   "@deepseek-ai/dsh-client-ui-settings-general": [
+    "./src/dsh/packages/client/ui-settings-general/src/index.ts"
+   ],
+   "@deepseek-ai/dsh-client-ui-settings-general/*": [
+    "./src/dsh/packages/client/ui-settings-general/src/*"
+   ],
+   "@deepseek-ai/dsh-client-ui-settings-general/client": [
+    "./src/dsh/packages/client/ui-settings-general/src/client/index.ts"
+   ],
    "@deepseek-ai/dsh-api-remotes/client": [
     "./src/dsh/packages/api/remotes/src/client/index.ts"
    ],
@@ -2140,6 +2149,9 @@
     "./src/transport/shims/remote-module.ts"
    ],
    "@deepseek-ai/dsh-client-ui-settings/remote": [
+    "./src/transport/shims/remote-module.ts"
+   ],
+   "@deepseek-ai/dsh-client-ui-settings-general/remote": [
     "./src/transport/shims/remote-module.ts"
    ],
    "@deepseek-ai/dsh-client-ui-settings-plugin-inventory/remote": [
@@ -2692,6 +2704,13 @@
   "./src/dsh/packages/client/locale/src/locales/ru.ts",
   "./src/dsh/packages/client/locale/src/locales/settings.ts",
   "./src/dsh/packages/client/locale/src/locales/zh.ts",
+  "./src/dsh/packages/client/modules/src/client/entries.ts",
+  "./src/dsh/packages/client/modules/src/client/entry-lifecycle.ts",
+  "./src/dsh/packages/client/modules/src/client/index.ts",
+  "./src/dsh/packages/client/modules/src/client/manifest.ts",
+  "./src/dsh/packages/client/modules/src/client/notify.ts",
+  "./src/dsh/packages/client/modules/src/client/release-change.ts",
+  "./src/dsh/packages/client/modules/src/client/system.ts",
   "./src/dsh/packages/client/product-analytics/src/client/index.ts",
   "./src/dsh/packages/client/product-analytics/src/events.ts",
   "./src/dsh/packages/client/resources/src/client/contract.ts",
@@ -3224,6 +3243,33 @@
   "./src/dsh/packages/client/ui-renderer/src/client/use-sync-external-store.d.ts",
   "./src/dsh/packages/client/ui-session/src/client/index.ts",
   "./src/dsh/packages/client/ui-session/src/client/session-provider.tsx",
+  "./src/dsh/packages/client/ui-settings-general/src/client/CurrentVersionRow.module.css",
+  "./src/dsh/packages/client/ui-settings-general/src/client/CurrentVersionRow.tsx",
+  "./src/dsh/packages/client/ui-settings-general/src/client/DesktopChannelRow.module.css",
+  "./src/dsh/packages/client/ui-settings-general/src/client/DesktopChannelRow.tsx",
+  "./src/dsh/packages/client/ui-settings-general/src/client/DesktopUpdateIndicator.module.css",
+  "./src/dsh/packages/client/ui-settings-general/src/client/DesktopUpdateIndicator.tsx",
+  "./src/dsh/packages/client/ui-settings-general/src/client/DeveloperToolsRow.module.css",
+  "./src/dsh/packages/client/ui-settings-general/src/client/DeveloperToolsRow.tsx",
+  "./src/dsh/packages/client/ui-settings-general/src/client/GeneralSection.module.css",
+  "./src/dsh/packages/client/ui-settings-general/src/client/GeneralSection.tsx",
+  "./src/dsh/packages/client/ui-settings-general/src/client/HostReleasePrompt.module.css",
+  "./src/dsh/packages/client/ui-settings-general/src/client/HostReleasePrompt.tsx",
+  "./src/dsh/packages/client/ui-settings-general/src/client/SettingsDocumentAction.module.css",
+  "./src/dsh/packages/client/ui-settings-general/src/client/SettingsDocumentAction.tsx",
+  "./src/dsh/packages/client/ui-settings-general/src/client/SettingsRoot.module.css",
+  "./src/dsh/packages/client/ui-settings-general/src/client/SettingsRoot.tsx",
+  "./src/dsh/packages/client/ui-settings-general/src/client/chrome.module.css",
+  "./src/dsh/packages/client/ui-settings-general/src/client/chrome.tsx",
+  "./src/dsh/packages/client/ui-settings-general/src/client/desktop-channel-source.ts",
+  "./src/dsh/packages/client/ui-settings-general/src/client/desktop-update-source.ts",
+  "./src/dsh/packages/client/ui-settings-general/src/client/index.ts",
+  "./src/dsh/packages/client/ui-settings-general/src/client/locales.ts",
+  "./src/dsh/packages/client/ui-settings-general/src/client/settings-document-store.ts",
+  "./src/dsh/packages/client/ui-settings-general/src/client/shell-contract.ts",
+  "./src/dsh/packages/client/ui-settings-general/src/client/shell-store.ts",
+  "./src/dsh/packages/client/ui-settings-general/src/css-modules.d.ts",
+  "./src/dsh/packages/client/ui-settings-general/src/types.ts",
   "./src/dsh/packages/client/ui-settings/src/client/config-form-types.ts",
   "./src/dsh/packages/client/ui-settings/src/client/config-form.ts",
   "./src/dsh/packages/client/ui-settings/src/client/contract/slots.ts",
