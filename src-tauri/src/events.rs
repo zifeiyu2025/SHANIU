@@ -21,11 +21,32 @@ pub enum TurnEndReason {
     BudgetExhausted,
 }
 
+impl TurnEndReason {
+    /// FF-2 单一事实源（SH-078）：变体清单的唯一权威，`tests/event_schema.rs` 据此穷举比对 TS 镜像。
+    /// 无通配臂 match 保证新增变体而不更新此处时**编译失败**——模式清单与返回数组必须逐条一致。
+    pub fn all_variants() -> &'static [Self] {
+        match Self::Completed {
+            Self::Completed | Self::Cancelled | Self::Failed | Self::BudgetExhausted => {
+                &[Self::Completed, Self::Cancelled, Self::Failed, Self::BudgetExhausted]
+            }
+        }
+    }
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum IoChannel {
     Stdout,
     Stderr,
+}
+
+impl IoChannel {
+    /// FF-2 单一事实源（SH-078）：同 `TurnEndReason::all_variants` 的穷举约定。
+    pub fn all_variants() -> &'static [Self] {
+        match Self::Stdout {
+            Self::Stdout | Self::Stderr => &[Self::Stdout, Self::Stderr],
+        }
+    }
 }
 
 /// 工具风险四级（ADR-003）。
@@ -40,6 +61,21 @@ pub enum RiskLevel {
     PlanReview,
 }
 
+impl RiskLevel {
+    /// FF-2 单一事实源（SH-078）：同 `TurnEndReason::all_variants` 的穷举约定。
+    pub fn all_variants() -> &'static [Self] {
+        match Self::Read {
+            Self::Read | Self::WriteInWorkspace | Self::Execute | Self::Destructive | Self::PlanReview => &[
+                Self::Read,
+                Self::WriteInWorkspace,
+                Self::Execute,
+                Self::Destructive,
+                Self::PlanReview,
+            ],
+        }
+    }
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum ApprovalDecision {
@@ -47,6 +83,15 @@ pub enum ApprovalDecision {
     Deny,
     /// 仅 execute 级有效：本会话记住选择（ADR-003），destructive 永不记忆。
     AllowAlways,
+}
+
+impl ApprovalDecision {
+    /// FF-2 单一事实源（SH-078）：同 `TurnEndReason::all_variants` 的穷举约定。
+    pub fn all_variants() -> &'static [Self] {
+        match Self::Allow {
+            Self::Allow | Self::Deny | Self::AllowAlways => &[Self::Allow, Self::Deny, Self::AllowAlways],
+        }
+    }
 }
 
 /// 工具调用终态（docs/04 §1.2.1）：`ToolCallEnd.result` 的取值域。
@@ -62,6 +107,17 @@ pub enum ToolCallResult {
     Cancelled,
     /// 审批拒绝。
     Denied,
+}
+
+impl ToolCallResult {
+    /// FF-2 单一事实源（SH-078）：同 `TurnEndReason::all_variants` 的穷举约定。
+    pub fn all_variants() -> &'static [Self] {
+        match Self::Ok {
+            Self::Ok | Self::Error | Self::Cancelled | Self::Denied => {
+                &[Self::Ok, Self::Error, Self::Cancelled, Self::Denied]
+            }
+        }
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]

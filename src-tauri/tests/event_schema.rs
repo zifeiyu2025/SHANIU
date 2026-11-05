@@ -29,7 +29,7 @@ const EXPECTED_TAGS: [&str; 12] = [
 ];
 
 fn all_variants() -> Vec<EventMsg> {
-    vec![
+    let variants = vec![
         EventMsg::TurnStarted { turn: 1 },
         EventMsg::TurnCompleted { turn: 1, reason: TurnEndReason::Cancelled },
         EventMsg::AgentMessageDelta { delta: "你好".into() },
@@ -49,7 +49,26 @@ fn all_variants() -> Vec<EventMsg> {
         EventMsg::TurnDiff { files: vec!["a.rs".into()] },
         EventMsg::Error { message: "boom".into() },
         EventMsg::TokenUsage { turn: 1, input_tokens: 10, cached_input_tokens: Some(4), output_tokens: 20 },
-    ]
+    ];
+    // 编译期穷举证明（SH-078）：无通配臂 match，EventMsg 新增变体而不更新上面的 vec 时编译失败；
+    // vec 更新后 tag 集合随之扩大，EXPECTED_TAGS 不同步则标签集测试必红——双向闭环。
+    for msg in &variants {
+        match msg {
+            EventMsg::TurnStarted { .. }
+            | EventMsg::TurnCompleted { .. }
+            | EventMsg::AgentMessageDelta { .. }
+            | EventMsg::ToolCallBegin { .. }
+            | EventMsg::ToolCallOutputDelta { .. }
+            | EventMsg::ToolCallEnd { .. }
+            | EventMsg::ExecApprovalRequest { .. }
+            | EventMsg::ExecApprovalResolved { .. }
+            | EventMsg::PlanDelta { .. }
+            | EventMsg::TurnDiff { .. }
+            | EventMsg::Error { .. }
+            | EventMsg::TokenUsage { .. } => {}
+        }
+    }
+    variants
 }
 
 #[test]
@@ -206,41 +225,14 @@ fn assert_union_covers<T: Serialize>(type_name: &str, variants: &[T]) {
     }
 }
 
-/// SH-074：FF-2 从"事件标签集合"升级为"**枚举变体穷举**"。
-/// 任一 Rust 枚举新增变体而 TS 镜像未同步时必须失败。
+/// SH-074/078：FF-2 从"事件标签集合"升级为"**枚举变体穷举**"，变体清单不再硬编码——
+/// 由 events.rs 各枚举的 `all_variants()`（无通配臂 match，编译期穷举证明）单一供给。
+/// 任一 Rust 枚举新增变体而 TS 镜像未同步时：先编译失败逼清单同步，再断言失败指向 TS 镜像。
 #[test]
 fn every_enum_variant_is_mirrored_in_frontend_types() {
-    assert_union_covers(
-        "RiskLevel",
-        &[
-            RiskLevel::Read,
-            RiskLevel::WriteInWorkspace,
-            RiskLevel::Execute,
-            RiskLevel::Destructive,
-            RiskLevel::PlanReview,
-        ],
-    );
-    assert_union_covers(
-        "ToolCallResult",
-        &[
-            ToolCallResult::Ok,
-            ToolCallResult::Error,
-            ToolCallResult::Cancelled,
-            ToolCallResult::Denied,
-        ],
-    );
-    assert_union_covers(
-        "ApprovalDecision",
-        &[ApprovalDecision::Allow, ApprovalDecision::Deny, ApprovalDecision::AllowAlways],
-    );
-    assert_union_covers("IoChannel", &[IoChannel::Stdout, IoChannel::Stderr]);
-    assert_union_covers(
-        "TurnEndReason",
-        &[
-            TurnEndReason::Completed,
-            TurnEndReason::Cancelled,
-            TurnEndReason::Failed,
-            TurnEndReason::BudgetExhausted,
-        ],
-    );
+    assert_union_covers("RiskLevel", RiskLevel::all_variants());
+    assert_union_covers("ToolCallResult", ToolCallResult::all_variants());
+    assert_union_covers("ApprovalDecision", ApprovalDecision::all_variants());
+    assert_union_covers("IoChannel", IoChannel::all_variants());
+    assert_union_covers("TurnEndReason", TurnEndReason::all_variants());
 }
