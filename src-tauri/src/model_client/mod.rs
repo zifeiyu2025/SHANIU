@@ -167,33 +167,9 @@ pub fn build_chat_request(
     tools: &[ToolDeclaration],
     instructions: &str,
 ) -> serde_json::Value {
-    let mut messages: Vec<serde_json::Value> = vec![serde_json::json!({
-        "role": "system",
-        "content": instructions,
-    })];
-    messages.extend(history.iter().map(|h| match h {
-        HistoryItem::Message { role, text } => serde_json::json!({
-            "role": role,
-            "content": text,
-        }),
-        HistoryItem::FunctionCall { name, arguments, call_id } => serde_json::json!({
-            "role": "assistant",
-            "content": null,
-            "tool_calls": [{
-                "id": call_id,
-                "type": "function",
-                "function": { "name": name, "arguments": arguments },
-            }],
-        }),
-        HistoryItem::FunctionCallOutput { call_id, output } => serde_json::json!({
-            "role": "tool",
-            "tool_call_id": call_id,
-            "content": output,
-        }),
-    }));
     serde_json::json!({
         "model": provider.model,
-        "messages": messages,
+        "messages": chat_messages(instructions, history),
         "stream": true,
         "tools": tools.iter().map(|t| serde_json::json!({
             "type": "function",
@@ -204,6 +180,112 @@ pub fn build_chat_request(
             },
         })).collect::<Vec<_>>(),
     })
+}
+
+/// 扁平 history → ChatCompletions messages（协议硬约束的唯一落点）。
+///
+/// 三条不可协商的规则，都是真机 400 打出来的（docs/05 SH-082）：
+/// 1. 同轮的多个工具调用属于**同一条** assistant 消息的 `tool_calls` 数组；
+///    逐个拆成多条 assistant，严格端点直接报
+///    `An assistant message with 'tool_calls' must be followed by tool messages
+///     responding to each 'tool_call_id'`；
+/// 2. 该消息之后必须**紧跟**每个 `call_id` 对应的 `role=tool` 消息，顺序一致；
+/// 3. 本轮的助手文本若与工具调用同时存在，也必须并进同一条 assistant 消息
+///    （`content` + `tool_calls`），不能先出一条纯文本 assistant。
+///
+/// 取消会打断工具执行循环（agent_loop 在 `Err(Cancelled)` 分支 `break 'outer`），
+/// 于是"已声明但未执行"的调用没有输出项。这里必须给它补一条 tool 消息，否则该会话
+/// 的后续每一轮请求都会 400——历史已经不可修复，只能就地补齐。
+pub fn chat_messages(instructions: &str, history: &[HistoryItem]) -> Vec<serde_json::Value> {
+    let mut messages = vec![serde_json::json!({ "role": "system", "content": instructions })];
+    let mut i = 0;
+    while i < history.len() {
+        match &history[i] {
+            // 助手文本 + 紧随其后的同轮工具调用 → 合并成一条 assistant 消息
+            HistoryItem::Message { role, text }
+                if *role == Role::Assistant && matches!(history.get(i + 1), Some(HistoryItem::FunctionCall { .. })) =>
+            {
+                let (calls, outputs, next) = collect_call_group(history, i + 1);
+                messages.extend(assistant_group_messages(Some(text.as_str()), &calls, &outputs));
+                i = next;
+            }
+            HistoryItem::FunctionCall { .. } => {
+                let (calls, outputs, next) = collect_call_group(history, i);
+                messages.extend(assistant_group_messages(None, &calls, &outputs));
+                i = next;
+            }
+            HistoryItem::Message { role, text } => {
+                messages.push(serde_json::json!({ "role": role, "content": text }));
+                i += 1;
+            }
+            // 落单的 tool 输出：只有外部裁剪/重排历史才会出现，按 call_id 原样发出
+            HistoryItem::FunctionCallOutput { call_id, output } => {
+                messages.push(tool_message(call_id, output));
+                i += 1;
+            }
+        }
+    }
+    messages
+}
+
+/// 一次工具调用：(工具名, 参数 JSON 文本, call_id)。
+type ChatCall = (String, String, String);
+/// call_id → 该调用的输出文本。
+type ChatOutputs = std::collections::HashMap<String, String>;
+
+/// 从 `start` 起收集连续的 FunctionCall，以及紧随其后的连续 FunctionCallOutput。
+/// 返回 (调用清单, call_id → 输出, 下一段起点)。
+fn collect_call_group(history: &[HistoryItem], start: usize) -> (Vec<ChatCall>, ChatOutputs, usize) {
+    let mut calls = Vec::new();
+    let mut idx = start;
+    while let Some(HistoryItem::FunctionCall { name, arguments, call_id }) = history.get(idx) {
+        calls.push((name.clone(), arguments.clone(), call_id.clone()));
+        idx += 1;
+    }
+    let mut outputs = std::collections::HashMap::new();
+    while let Some(HistoryItem::FunctionCallOutput { call_id, output }) = history.get(idx) {
+        outputs.insert(call_id.clone(), output.clone());
+        idx += 1;
+    }
+    (calls, outputs, idx)
+}
+
+/// 取消打断工具执行循环时，"已声明未执行"的调用补位用的输出文本。
+/// 不给补位 = 该会话后续每一轮都 400，历史就此作废，比文案难看严重得多。
+const CANCELLED_CALL_NOTE: &str = "（本轮在该工具调用前被取消，未执行）";
+
+fn tool_message(call_id: &str, output: &str) -> serde_json::Value {
+    serde_json::json!({ "role": "tool", "tool_call_id": call_id, "content": output })
+}
+
+/// 一条 assistant 消息 + 其后每个 call_id 一条 tool 消息（缺失输出就地补位）。
+fn assistant_group_messages(
+    text: Option<&str>,
+    calls: &[ChatCall],
+    outputs: &ChatOutputs,
+) -> Vec<serde_json::Value> {
+    // 调用方保证 calls 非空；空清单在这里会产出非法请求，故用 debug_assert 卡住开发期误用
+    debug_assert!(!calls.is_empty());
+    let content = match text.map(str::trim) {
+        Some("") | None => serde_json::Value::Null,
+        Some(t) => serde_json::Value::String(t.to_string()),
+    };
+    let mut group = vec![serde_json::json!({
+        "role": "assistant",
+        "content": content,
+        "tool_calls": calls.iter().map(|(name, arguments, call_id)| serde_json::json!({
+            "id": call_id,
+            "type": "function",
+            "function": { "name": name, "arguments": arguments },
+        })).collect::<Vec<_>>(),
+    })];
+    group.extend(calls.iter().map(|(_, _, call_id)| {
+        tool_message(
+            call_id,
+            outputs.get(call_id).map(String::as_str).unwrap_or(CANCELLED_CALL_NOTE),
+        )
+    }));
+    group
 }
 
 // ============================== ChatCompletions 分片累积（纯状态机） ==============================
@@ -545,6 +627,101 @@ mod chat_tests {
         assert_eq!(system_count, 1);
         assert_eq!(body["tools"][0]["function"]["name"], "unified_exec");
         assert!(!p.is_responses());
+    }
+
+    /// 协议不变量（SH-082 的真机 400 对应物）：每条带 tool_calls 的 assistant 消息，
+    /// 其后必须**紧跟**等量的 role=tool 消息，且 call_id 集合一致。
+    /// 断言结构而非字面量——字面量快照挡不住"拆成两条 assistant"这种形态。
+    fn assert_tool_calls_are_answered(messages: &[serde_json::Value]) {
+        let mut i = 0;
+        while i < messages.len() {
+            let m = &messages[i];
+            let calls = m["tool_calls"].as_array();
+            let Some(calls) = calls else { i += 1; continue };
+            assert_eq!(m["role"], "assistant", "tool_calls 只能挂在 assistant 上");
+            let ids: Vec<&str> = calls.iter().map(|c| c["id"].as_str().unwrap()).collect();
+            for (n, id) in ids.iter().enumerate() {
+                let answer = messages
+                    .get(i + 1 + n)
+                    .unwrap_or_else(|| panic!("tool_call {id} 后面没有对应的 tool 消息"));
+                assert_eq!(answer["role"], "tool", "tool_call {id} 的应答位必须是 role=tool");
+                assert_eq!(answer["tool_call_id"], *id, "应答顺序必须与 tool_calls 一一对应");
+            }
+            i += 1 + ids.len();
+        }
+    }
+
+    #[test]
+    fn chat_history_merges_same_turn_multiple_calls() {
+        let p = ProviderConfig {
+            provider: "openai-chat".into(),
+            base_url: "https://x/v1".into(),
+            model: "m".into(),
+        };
+        // agent_loop 的真实产出形态：一轮里先连续 push 所有 FunctionCall，再连续 push 输出
+        let history = vec![
+            HistoryItem::Message { role: Role::User, text: "任务".into() },
+            HistoryItem::FunctionCall { name: "read_file".into(), arguments: "{}".into(), call_id: "c1".into() },
+            HistoryItem::FunctionCall { name: "list_dir".into(), arguments: "{}".into(), call_id: "c2".into() },
+            HistoryItem::FunctionCallOutput { call_id: "c1".into(), output: "o1".into() },
+            HistoryItem::FunctionCallOutput { call_id: "c2".into(), output: "o2".into() },
+            HistoryItem::Message { role: Role::Assistant, text: "完成".into() },
+        ];
+        let body = build_chat_request(&p, &history, &[], "SYS");
+        let msgs = body["messages"].as_array().unwrap();
+        // system + user + 1 条 assistant(2 calls) + 2 条 tool + 1 条 assistant = 6
+        // 旧实现会产出 8 条（两个 assistant 各带一个 call）→ 严格端点 400
+        assert_eq!(msgs.len(), 6);
+        assert_eq!(msgs[2]["tool_calls"].as_array().unwrap().len(), 2);
+        assert_eq!(msgs[3]["tool_call_id"], "c1");
+        assert_eq!(msgs[4]["tool_call_id"], "c2");
+        assert_eq!(msgs[5]["role"], "assistant");
+        assert_eq!(msgs[5]["content"], "完成");
+        assert_tool_calls_are_answered(msgs);
+    }
+
+    #[test]
+    fn chat_history_merges_assistant_text_with_same_turn_calls() {
+        let p = ProviderConfig {
+            provider: "openai-chat".into(),
+            base_url: "https://x/v1".into(),
+            model: "m".into(),
+        };
+        let history = vec![
+            HistoryItem::Message { role: Role::User, text: "任务".into() },
+            HistoryItem::Message { role: Role::Assistant, text: "我先看一眼".into() },
+            HistoryItem::FunctionCall { name: "read_file".into(), arguments: "{}".into(), call_id: "c1".into() },
+            HistoryItem::FunctionCallOutput { call_id: "c1".into(), output: "o1".into() },
+        ];
+        let body = build_chat_request(&p, &history, &[], "SYS");
+        let msgs = body["messages"].as_array().unwrap();
+        // 文本与调用合并在同一条 assistant，不再多出一条纯文本 assistant
+        assert_eq!(msgs.len(), 4);
+        assert_eq!(msgs[2]["content"], "我先看一眼");
+        assert_eq!(msgs[2]["tool_calls"].as_array().unwrap().len(), 1);
+        assert_tool_calls_are_answered(msgs);
+    }
+
+    #[test]
+    fn chat_history_backfills_missing_output_after_cancel() {
+        let p = ProviderConfig {
+            provider: "openai-chat".into(),
+            base_url: "https://x/v1".into(),
+            model: "m".into(),
+        };
+        // 取消打断工具循环：c2 已声明但从未执行，历史里没有它的输出项
+        let history = vec![
+            HistoryItem::Message { role: Role::User, text: "任务".into() },
+            HistoryItem::FunctionCall { name: "read_file".into(), arguments: "{}".into(), call_id: "c1".into() },
+            HistoryItem::FunctionCall { name: "apply_patch".into(), arguments: "{}".into(), call_id: "c2".into() },
+            HistoryItem::FunctionCallOutput { call_id: "c1".into(), output: "o1".into() },
+        ];
+        let body = build_chat_request(&p, &history, &[], "SYS");
+        let msgs = body["messages"].as_array().unwrap();
+        assert_tool_calls_are_answered(msgs);
+        assert_eq!(msgs[2]["tool_calls"].as_array().unwrap().len(), 2);
+        assert_eq!(msgs[4]["tool_call_id"], "c2");
+        assert_eq!(msgs[4]["content"], CANCELLED_CALL_NOTE);
     }
 
     #[test]
