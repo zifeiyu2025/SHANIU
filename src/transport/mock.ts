@@ -26,6 +26,19 @@ export function createMockTransport(): Transport {
     for (const listener of [...listeners]) listener(msg);
   }
 
+  /** 思考增量演示：dev 模式也要能亲眼看到折叠的"思考中"块，否则这条链路只有测试知道。 */
+  async function streamReasoning(): Promise<void> {
+    const thoughts = [
+      '先确认任务指向哪些文件，以及有没有现成的实现可以复用。',
+      '再决定用写入还是补丁，并把结果落成可核验的文件。',
+    ];
+    for (const thought of thoughts) {
+      if (cancelRequested) return;
+      emit({ type: 'reasoning_delta', delta: `${thought}\n` });
+      await delay(260);
+    }
+  }
+
   async function streamChunks(chunks: string[]): Promise<void> {
     for (const chunk of chunks) {
       if (cancelRequested) return;
@@ -84,6 +97,7 @@ export function createMockTransport(): Transport {
       const reply = `任务：${task}\n\n${MOCK_REPLY}`;
       const chunks = reply.match(/[\s\S]{1,8}/g) ?? [];
       const half = Math.ceil(chunks.length / 2);
+      await streamReasoning();
       await streamChunks(chunks.slice(0, half));
       if (!cancelRequested) await emitToolCallDemo();
       await streamChunks(chunks.slice(half));

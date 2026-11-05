@@ -13,6 +13,8 @@ export type EventMsg =
   | { type: 'turn_started'; turn: number }
   | { type: 'turn_completed'; turn: number; reason: TurnEndReason }
   | { type: 'agent_message_delta'; delta: string }
+  /** 思考模型的推理增量（additive，FF-2）：与正文分开，旧消费端按未知 type 忽略。 */
+  | { type: 'reasoning_delta'; delta: string }
   | { type: 'tool_call_begin'; call_id: string; tool: string; args: unknown }
   | { type: 'tool_call_output_delta'; call_id: string; channel: IoChannel; delta: string }
   | {

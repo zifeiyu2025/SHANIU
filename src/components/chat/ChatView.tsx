@@ -6,6 +6,7 @@ import type { ConversationNode } from '../../nodes/types';
 import { StreamingText } from '../markdown/StreamingText';
 import { ApprovalCard } from '../approval/ApprovalCard';
 import { ToolCallCard } from '../blocks/ToolCallCard';
+import { ReasoningBlock } from '../blocks/ReasoningBlock';
 import { Composer } from './Composer';
 import { Greeting } from './Greeting';
 
@@ -155,6 +156,8 @@ function NodeItem({ node, transport }: { node: ConversationNode; transport: Tran
           <StreamingText text={node.text} streaming={node.streaming} />
         </div>
       );
+    case 'reasoning':
+      return <ReasoningBlock node={node} />;
     case 'error':
       return (
         <div

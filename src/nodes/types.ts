@@ -25,6 +25,16 @@ export interface AgentMessageNode {
   streaming: boolean;
 }
 
+/** 思考模型的推理过程节点：默认折叠，不计入正文（业界同形态——codex TUI 的
+ * ReasoningSummaryCell 默认 transcript_only、ZCode 单列 reasoning_* 三段事件）。 */
+export interface ReasoningNode {
+  kind: 'reasoning';
+  id: string;
+  text: string;
+  /** 流式中为 true；正文开始或 turn 结束后冻结为 false。 */
+  streaming: boolean;
+}
+
 export interface ErrorNode {
   kind: 'error';
   id: string;
@@ -60,6 +70,7 @@ export interface ToolCallNode {
 export type ConversationNode =
   | UserMessageNode
   | AgentMessageNode
+  | ReasoningNode
   | ErrorNode
   | ApprovalNode
   | ToolCallNode;

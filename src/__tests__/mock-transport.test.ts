@@ -51,7 +51,9 @@ describe('mock transport', () => {
     transport.onEvent((msg) => events.push(msg));
 
     const running = transport.sendTask('长任务');
-    await new Promise((r) => setTimeout(r, 150)); // 等若干 delta 流出
+    // mock 现在先走思考阶段（2 段 × 260ms），要等它过去才看得到正文 delta；
+    // 本用例测的是取消语义，不是 150ms 这个具体时刻
+    await new Promise((r) => setTimeout(r, 700)); // 等若干 delta 流出
     const deltaCountBeforeCancel = events.filter((e) => e.type === 'agent_message_delta').length;
     expect(deltaCountBeforeCancel).toBeGreaterThan(0);
 

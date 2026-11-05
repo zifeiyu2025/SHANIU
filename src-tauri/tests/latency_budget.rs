@@ -2,8 +2,13 @@
 //!
 //! 计时口径（写死在这里，避免每次里程碑各量各的）：
 //! - **起点** = 调用 `AgentLoop::run_task` 的那一刻，等价于前端 `sendTask` 抵达后端、进入主循环；
-//! - **终点** = `EventSink` 收到第一条 `AgentMessageDelta` 的时刻。刻意不取 `TurnStarted`：
-//!   它不含内容，用户此刻仍看不到任何输出，拿它当"首增量"会让指标失真成纯本地握手时间；
+//! - **终点** = `EventSink` 收到**首个可展示增量**的时刻——`AgentMessageDelta` 或
+//!   `ReasoningDelta` 任一先到即算。刻意不取 `TurnStarted`（它不含内容，量出来是本地
+//!   握手时间），也刻意**不只盯正文**：推理模型正文前要先想完，LongCat-2.5 实测首正文
+//!   P95 7.1s，用旧口径这条不变量对该档位永远不成立。业界同一裁决——codex 的 TTFT 计入
+//!   `OutputTextDelta | ReasoningSummaryDelta | ReasoningContentDelta`，ZCode 同时上报
+//!   `model_first_content`（含思考/工具）与 `model_first_text`，两者各量各的、不相减。
+//!   首正文仍单独打印，作"用户多久看到答案"的参考指标，不参与门禁。
 //! - **样本** = 同一进程内连续 N 次独立任务，P95 取升序排列后第 `ceil(0.95*N)` 个（N=20 → 第 19 位）。
 //!
 //! 本机回环豁免（01 §5 括注）：默认用例用**桩后端**，不联网，量到的是 harness 自身开销
@@ -29,16 +34,31 @@ use tokio_util::sync::CancellationToken;
 const BUDGET: Duration = Duration::from_millis(3000);
 const SAMPLES: usize = 20;
 
-/// 只记录"第一条 AgentMessageDelta 的到达时刻"，其余事件忽略。
-struct FirstDeltaSink(Mutex<Option<Instant>>);
+/// 只记录两个时刻：**首个可展示增量**（正文或思考，任一先到）与**首条正文**。
+///
+/// 口径按业界成熟实现定（docs/05 SH-075 性能工单的裁决）：
+/// - codex `response_event_records_turn_ttft` 把 `OutputTextDelta | ReasoningSummaryDelta
+///   | ReasoningContentDelta` 全算作 TTFT，另设 TTFM 只在正文项记录；
+/// - ZCode 同批上报 `model_first_content`（含思考/工具）与 `model_first_text`。
+///
+/// 理由：用户点下发送后，"屏幕开始动"才是可感知的反馈；把思考态排除在外，等于要求
+/// 推理模型在正文之前不给任何反馈，那条预算对这类模型天然不可能满足（LongCat 实测 7.1s）。
+struct FirstDeltaSink {
+    first_displayable: Mutex<Option<Instant>>,
+    first_text: Mutex<Option<Instant>>,
+}
 
 impl EventSink for FirstDeltaSink {
     fn emit(&self, msg: &EventMsg) -> Result<(), String> {
-        if matches!(msg, EventMsg::AgentMessageDelta { .. }) {
-            let mut slot = self.0.lock().unwrap();
-            if slot.is_none() {
-                *slot = Some(Instant::now());
+        match msg {
+            EventMsg::AgentMessageDelta { .. } => {
+                self.first_displayable.lock().unwrap().get_or_insert_with(Instant::now);
+                self.first_text.lock().unwrap().get_or_insert_with(Instant::now);
             }
+            EventMsg::ReasoningDelta { .. } => {
+                self.first_displayable.lock().unwrap().get_or_insert_with(Instant::now);
+            }
+            _ => {}
         }
         Ok(())
     }
@@ -65,6 +85,8 @@ impl ModelBackend for StubBackend {
 
 fn script() -> Vec<ModelStreamEvent> {
     vec![
+        // 按思考模型的现实形态脚本化：先 reasoning，再正文
+        ModelStreamEvent::ReasoningDelta { delta: "先想想".into() },
         ModelStreamEvent::OutputTextDelta { delta: "首增量".into() },
         ModelStreamEvent::Completed {
             usage: Usage {
@@ -76,9 +98,12 @@ fn script() -> Vec<ModelStreamEvent> {
     ]
 }
 
-/// 单次测量：返回 run_task 入口 → 首个 AgentMessageDelta 的耗时。
-async fn measure_once(first_byte: Duration) -> Duration {
-    let sink = Arc::new(FirstDeltaSink(Mutex::new(None)));
+/// 单次测量：返回 (run_task 入口 → 首个可展示增量, → 首条正文) 两个耗时。
+async fn measure_once(first_byte: Duration) -> (Duration, Duration) {
+    let sink = Arc::new(FirstDeltaSink {
+        first_displayable: Mutex::new(None),
+        first_text: Mutex::new(None),
+    });
     let agent = AgentLoop {
         backend: Arc::new(StubBackend { first_byte, script: script() }),
         router: Arc::new(ToolRouter::new()),
@@ -95,12 +120,17 @@ async fn measure_once(first_byte: Duration) -> Duration {
     let _ = agent
         .run_task("FF-5 计时探针", sink.clone(), CancellationToken::new())
         .await;
-    let first = sink
-        .0
+    let displayable = sink
+        .first_displayable
         .lock()
         .unwrap()
-        .unwrap_or_else(|| panic!("整轮跑完仍未收到 AgentMessageDelta：计时终点缺失，FF-5 无从度量"));
-    first - started
+        .unwrap_or_else(|| panic!("整轮跑完既无正文也无思考增量：计时终点缺失，FF-5 无从度量"));
+    let text = sink
+        .first_text
+        .lock()
+        .unwrap()
+        .unwrap_or_else(|| panic!("收到思考却没收到正文：脚本或事件转发断了"));
+    (displayable - started, text - started)
 }
 
 fn p95(mut xs: Vec<Duration>) -> Duration {
@@ -109,37 +139,46 @@ fn p95(mut xs: Vec<Duration>) -> Duration {
     xs[idx]
 }
 
-async fn measure_all(first_byte: Duration, n: usize) -> Vec<Duration> {
-    let mut out = Vec::with_capacity(n);
+async fn measure_all(first_byte: Duration, n: usize) -> (Vec<Duration>, Vec<Duration>) {
+    let mut displayable = Vec::with_capacity(n);
+    let mut text = Vec::with_capacity(n);
     for _ in 0..n {
-        out.push(measure_once(first_byte).await);
+        let (d, t) = measure_once(first_byte).await;
+        displayable.push(d);
+        text.push(t);
     }
-    out
+    (displayable, text)
 }
 
 #[tokio::test]
 async fn first_delta_latency_within_budget_on_harness_path() {
-    let samples = measure_all(Duration::ZERO, SAMPLES).await;
-    let measured = p95(samples.clone());
-    let max = *samples.iter().max().unwrap();
+    let (displayable, text) = measure_all(Duration::ZERO, SAMPLES).await;
+    let measured = p95(displayable.clone());
+    let text_measured = p95(text.clone());
+    let max = *displayable.iter().max().unwrap();
     println!(
-        "[FF-5] 桩后端（回环豁免口径）N={SAMPLES} P95={measured:?} max={max:?} 预算={BUDGET:?}"
+        "[FF-5] 桩后端（回环豁免口径）N={SAMPLES} 首个可见反馈 P95={measured:?} max={max:?}；首正文 P95={text_measured:?}；预算={BUDGET:?}"
     );
     assert!(
         measured < BUDGET,
-        "提交→首增量 P95 = {measured:?}，超出 3s 预算（max={max:?}）"
+        "提交→首个可见反馈 P95 = {measured:?}，超出 3s 预算（max={max:?}）"
+    );
+    // 两个指标必须各量各的：正文一定不早于可见反馈，反过来就是终点取错了事件
+    assert!(
+        text_measured >= measured,
+        "首正文({text_measured:?}) 竟早于首个可见反馈({measured:?})——口径取反了"
     );
 }
 
 /// 计时口径本身的守卫：真实延迟必须被量到，否则上一条是在量空气。
 #[tokio::test]
 async fn latency_meter_observes_backend_first_byte() {
-    let samples = measure_all(Duration::from_millis(400), 5).await;
-    let measured = p95(samples.clone());
+    let (displayable, _text) = measure_all(Duration::from_millis(400), 5).await;
+    let measured = p95(displayable.clone());
     println!("[FF-5] 400ms 首字节桩 P95={measured:?}（应显著大于 0）");
     assert!(
         measured >= Duration::from_millis(300),
-        "计时器只量到 {measured:?}：终点取的不是首增量，或起点在 sleep 之后——FF-5 口径失效"
+        "计时器只量到 {measured:?}：终点取的不是首个可见增量，或起点在 sleep 之后——FF-5 口径失效"
     );
     assert!(measured < BUDGET, "带 400ms 延迟的 P95 = {measured:?} 仍应落在预算内");
 }
@@ -172,9 +211,13 @@ async fn first_delta_latency_within_budget_on_real_endpoint() {
         api_key,
     });
 
-    let mut samples = Vec::new();
+    let mut displayable_samples = Vec::new();
+    let mut text_samples = Vec::new();
     for _ in 0..3 {
-        let sink = Arc::new(FirstDeltaSink(Mutex::new(None)));
+        let sink = Arc::new(FirstDeltaSink {
+            first_displayable: Mutex::new(None),
+            first_text: Mutex::new(None),
+        });
         let agent = AgentLoop {
             backend: backend.clone(),
             router: Arc::new(ToolRouter::new()),
@@ -191,17 +234,30 @@ async fn first_delta_latency_within_budget_on_real_endpoint() {
         let _ = agent
             .run_task("只回复两个字", sink.clone(), CancellationToken::new())
             .await;
-        let first = sink
-            .0
+        let displayable = sink
+            .first_displayable
             .lock()
             .unwrap()
-            .unwrap_or_else(|| panic!("真实端点未产生首增量（{}）", provider.model));
-        samples.push(first - started);
+            .unwrap_or_else(|| panic!("真实端点既无正文也无思考增量（{}）", provider.model));
+        displayable_samples.push(displayable - started);
+        // 首正文允许缺失：推理模型可能整轮只想不答（本轮预算内没吐出正文）
+        let text_at: Option<Instant> = *sink.first_text.lock().unwrap();
+        if let Some(t) = text_at {
+            text_samples.push(t - started);
+        }
     }
-    let measured = p95(samples.clone());
+    let measured = p95(displayable_samples.clone());
+    let text_measured = if text_samples.is_empty() {
+        Duration::MAX
+    } else {
+        p95(text_samples.clone())
+    };
     println!(
-        "[FF-5] 真实端点 {} N=3 样本={:?} P95={measured:?}",
-        provider.model, samples
+        "[FF-5] 真实端点 {} N=3 首个可见反馈样本={:?} P95={measured:?}；首正文 P95={text_measured:?}",
+        provider.model, displayable_samples
     );
-    assert!(measured < BUDGET, "真实端点提交→首增量 P95 = {measured:?}，超出 3s 预算");
+    assert!(
+        measured < BUDGET,
+        "真实端点提交→首个可见反馈 P95 = {measured:?}，超出 3s 预算（首正文 {text_measured:?} 仅作参考，不参与门禁）"
+    );
 }

@@ -126,6 +126,11 @@ pub enum EventMsg {
     TurnStarted { turn: u32 },
     TurnCompleted { turn: u32, reason: TurnEndReason },
     AgentMessageDelta { delta: String },
+    /// additive（FF-2，docs/04 §1.2）：思考模型的推理增量。刻意**不复用**正文 delta——
+    /// 混进正文会把"想的过程"当成"答的内容"，前端也无法折叠；业界（codex
+    /// `ReasoningContentDelta`、ZCode `reasoning_delta`）一律单列事件。
+    /// 旧前端遇到未知 type 走 default 分支忽略，不破坏兼容。
+    ReasoningDelta { delta: String },
     ToolCallBegin { call_id: String, tool: String, args: serde_json::Value },
     ToolCallOutputDelta { call_id: String, channel: IoChannel, delta: String },
     ToolCallEnd {

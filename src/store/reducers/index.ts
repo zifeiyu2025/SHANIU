@@ -3,6 +3,7 @@ import type { EventMsg } from '../../transport/types';
 import type { SessionState } from '../session-store';
 import { applyTurnEvent } from './turn';
 import { applyAgentMessageDelta } from './agent-message';
+import { applyReasoningDelta } from './reasoning';
 import { applyTokenUsage } from './usage';
 import { applyError } from './error';
 import { applyApprovalEvent } from './approval';
@@ -20,6 +21,8 @@ export function applyEvent(state: Draft<SessionState>, msg: EventMsg): void {
       return applyTurnEvent(state, msg);
     case 'agent_message_delta':
       return applyAgentMessageDelta(state, msg);
+    case 'reasoning_delta':
+      return applyReasoningDelta(state, msg);
     case 'tool_call_begin':
     case 'tool_call_output_delta':
     case 'tool_call_end':

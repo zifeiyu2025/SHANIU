@@ -15,10 +15,11 @@ use shaniu_lib::events::{
 };
 
 /// 与 src/transport/types.ts 的 type 判别值逐一对应。
-const EXPECTED_TAGS: [&str; 12] = [
+const EXPECTED_TAGS: [&str; 13] = [
     "turn_started",
     "turn_completed",
     "agent_message_delta",
+    "reasoning_delta",
     "tool_call_begin",
     "tool_call_output_delta",
     "tool_call_end",
@@ -35,6 +36,7 @@ fn all_variants() -> Vec<EventMsg> {
         EventMsg::TurnStarted { turn: 1 },
         EventMsg::TurnCompleted { turn: 1, reason: TurnEndReason::Cancelled },
         EventMsg::AgentMessageDelta { delta: "你好".into() },
+        EventMsg::ReasoningDelta { delta: "先想想".into() },
         EventMsg::ToolCallBegin { call_id: "c1".into(), tool: "unified_exec".into(), args: serde_json::json!({"cmd": "ls"}) },
         EventMsg::ToolCallOutputDelta { call_id: "c1".into(), channel: IoChannel::Stdout, delta: "out".into() },
         EventMsg::ToolCallEnd { call_id: "c1".into(), exit_code: Some(0), error: None, result: None },
@@ -59,6 +61,7 @@ fn all_variants() -> Vec<EventMsg> {
             EventMsg::TurnStarted { .. }
             | EventMsg::TurnCompleted { .. }
             | EventMsg::AgentMessageDelta { .. }
+            | EventMsg::ReasoningDelta { .. }
             | EventMsg::ToolCallBegin { .. }
             | EventMsg::ToolCallOutputDelta { .. }
             | EventMsg::ToolCallEnd { .. }

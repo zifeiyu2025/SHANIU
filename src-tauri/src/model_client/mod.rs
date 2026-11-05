@@ -37,6 +37,9 @@ pub struct Usage {
 #[derive(Debug, Clone, PartialEq)]
 pub enum ModelStreamEvent {
     OutputTextDelta { delta: String },
+    /// 思考模型的推理增量（ChatCompletions 的 `delta.reasoning_content`，
+    /// 部分实现用 `delta.reasoning`）。与正文分开，绝不混入 `OutputTextDelta`。
+    ReasoningDelta { delta: String },
     OutputItem(ResponseItem),
     Completed { usage: Usage },
     Failed { message: String },
@@ -46,7 +49,21 @@ pub enum ModelStreamEvent {
 #[derive(Debug, Clone, PartialEq, Serialize)]
 #[serde(tag = "type", rename_all = "snake_case")]
 pub enum HistoryItem {
-    Message { role: Role, text: String },
+    Message {
+        role: Role,
+        text: String,
+        /// 思考模型这一轮产出的 `reasoning_content`（SH-083）。
+        ///
+        /// 为什么必须存下来并回传：thinking 档端点（DeepSeek/LongCat）要求重放的
+        /// assistant 消息带回该字段，缺了直接 400 `The reasoning_content in the thinking
+        /// mode must be passed back to the API`。同时它**不能**污染 Responses 路径的
+        /// `input` 序列化（那边没有这个字段，多余键会被拒），故 `skip_serializing_if`。
+        /// 业界同一做法：codex 把 reasoning 作为独立 `ResponseItem::Reasoning` 重放但
+        /// 排除明文 content；ZCode 把它挂在 assistant content block 上并按 provider
+        /// 兼容性决定留不留。
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        reasoning: Option<String>,
+    },
     FunctionCall { name: String, arguments: String, call_id: String },
     FunctionCallOutput { call_id: String, output: String },
 }
@@ -202,20 +219,36 @@ pub fn chat_messages(instructions: &str, history: &[HistoryItem]) -> Vec<serde_j
     while i < history.len() {
         match &history[i] {
             // 助手文本 + 紧随其后的同轮工具调用 → 合并成一条 assistant 消息
-            HistoryItem::Message { role, text }
+            HistoryItem::Message { role, text, reasoning }
                 if *role == Role::Assistant && matches!(history.get(i + 1), Some(HistoryItem::FunctionCall { .. })) =>
             {
                 let (calls, outputs, next) = collect_call_group(history, i + 1);
-                messages.extend(assistant_group_messages(Some(text.as_str()), &calls, &outputs));
+                messages.extend(assistant_group_messages(
+                    Some(text.as_str()),
+                    reasoning.as_deref(),
+                    &calls,
+                    &outputs,
+                ));
                 i = next;
             }
             HistoryItem::FunctionCall { .. } => {
                 let (calls, outputs, next) = collect_call_group(history, i);
-                messages.extend(assistant_group_messages(None, &calls, &outputs));
+                messages.extend(assistant_group_messages(None, None, &calls, &outputs));
                 i = next;
             }
-            HistoryItem::Message { role, text } => {
-                messages.push(serde_json::json!({ "role": role, "content": text }));
+            HistoryItem::Message { role, text, reasoning } => {
+                let content = if text.trim().is_empty() {
+                    serde_json::Value::Null
+                } else {
+                    serde_json::Value::String(text.clone())
+                };
+                let mut m = serde_json::json!({ "role": role, "content": content });
+                // thinking 档要求重放的 assistant 消息带回 reasoning_content（SH-083）；
+                // 没有就不产生该键，避免给不认它的端点塞陌生字段
+                if let Some(r) = reasoning.as_deref().filter(|r| !r.is_empty()) {
+                    m["reasoning_content"] = serde_json::Value::String(r.to_string());
+                }
+                messages.push(m);
                 i += 1;
             }
             // 落单的 tool 输出：只有外部裁剪/重排历史才会出现，按 call_id 原样发出
@@ -261,6 +294,7 @@ fn tool_message(call_id: &str, output: &str) -> serde_json::Value {
 /// 一条 assistant 消息 + 其后每个 call_id 一条 tool 消息（缺失输出就地补位）。
 fn assistant_group_messages(
     text: Option<&str>,
+    reasoning: Option<&str>,
     calls: &[ChatCall],
     outputs: &ChatOutputs,
 ) -> Vec<serde_json::Value> {
@@ -270,7 +304,7 @@ fn assistant_group_messages(
         Some("") | None => serde_json::Value::Null,
         Some(t) => serde_json::Value::String(t.to_string()),
     };
-    let mut group = vec![serde_json::json!({
+    let mut message = serde_json::json!({
         "role": "assistant",
         "content": content,
         "tool_calls": calls.iter().map(|(name, arguments, call_id)| serde_json::json!({
@@ -278,7 +312,11 @@ fn assistant_group_messages(
             "type": "function",
             "function": { "name": name, "arguments": arguments },
         })).collect::<Vec<_>>(),
-    })];
+    });
+    if let Some(r) = reasoning.filter(|r| !r.is_empty()) {
+        message["reasoning_content"] = serde_json::Value::String(r.to_string());
+    }
+    let mut group = vec![message];
     group.extend(calls.iter().map(|(_, _, call_id)| {
         tool_message(
             call_id,
@@ -310,6 +348,17 @@ impl ChatStreamAccumulator {
                         if !content.is_empty() {
                             self.text.push_str(content);
                             events.push(ModelStreamEvent::OutputTextDelta { delta: content.to_string() });
+                        }
+                    }
+                    // 思考增量单列事件，绝不并入正文：不同实现分别用
+                    // delta.reasoning_content（DeepSeek/LongCat）与 delta.reasoning
+                    let reasoning = delta
+                        .get("reasoning_content")
+                        .or_else(|| delta.get("reasoning"))
+                        .and_then(|r| r.as_str());
+                    if let Some(rc) = reasoning {
+                        if !rc.is_empty() {
+                            events.push(ModelStreamEvent::ReasoningDelta { delta: rc.to_string() });
                         }
                     }
                     if let Some(tool_calls) = delta.get("tool_calls").and_then(|t| t.as_array()) {
@@ -566,7 +615,7 @@ mod tests {
             model: "m1".into(),
         };
         let history = vec![
-            HistoryItem::Message { role: Role::User, text: "任务".into() },
+            HistoryItem::Message { role: Role::User, text: "任务".into(), reasoning: None },
             HistoryItem::FunctionCall { name: "t".into(), arguments: "{}".into(), call_id: "c".into() },
             HistoryItem::FunctionCallOutput { call_id: "c".into(), output: "ok".into() },
         ];
@@ -599,7 +648,7 @@ mod chat_tests {
             model: "LongCat-2.5".into(),
         };
         let history = vec![
-            HistoryItem::Message { role: Role::User, text: "任务".into() },
+            HistoryItem::Message { role: Role::User, text: "任务".into(), reasoning: None },
             HistoryItem::FunctionCall { name: "t".into(), arguments: "{}".into(), call_id: "c1".into() },
             HistoryItem::FunctionCallOutput { call_id: "c1".into(), output: "ok".into() },
         ];
@@ -660,12 +709,12 @@ mod chat_tests {
         };
         // agent_loop 的真实产出形态：一轮里先连续 push 所有 FunctionCall，再连续 push 输出
         let history = vec![
-            HistoryItem::Message { role: Role::User, text: "任务".into() },
+            HistoryItem::Message { role: Role::User, text: "任务".into(), reasoning: None },
             HistoryItem::FunctionCall { name: "read_file".into(), arguments: "{}".into(), call_id: "c1".into() },
             HistoryItem::FunctionCall { name: "list_dir".into(), arguments: "{}".into(), call_id: "c2".into() },
             HistoryItem::FunctionCallOutput { call_id: "c1".into(), output: "o1".into() },
             HistoryItem::FunctionCallOutput { call_id: "c2".into(), output: "o2".into() },
-            HistoryItem::Message { role: Role::Assistant, text: "完成".into() },
+            HistoryItem::Message { role: Role::Assistant, text: "完成".into(), reasoning: None },
         ];
         let body = build_chat_request(&p, &history, &[], "SYS");
         let msgs = body["messages"].as_array().unwrap();
@@ -688,8 +737,8 @@ mod chat_tests {
             model: "m".into(),
         };
         let history = vec![
-            HistoryItem::Message { role: Role::User, text: "任务".into() },
-            HistoryItem::Message { role: Role::Assistant, text: "我先看一眼".into() },
+            HistoryItem::Message { role: Role::User, text: "任务".into(), reasoning: None },
+            HistoryItem::Message { role: Role::Assistant, text: "我先看一眼".into(), reasoning: None },
             HistoryItem::FunctionCall { name: "read_file".into(), arguments: "{}".into(), call_id: "c1".into() },
             HistoryItem::FunctionCallOutput { call_id: "c1".into(), output: "o1".into() },
         ];
@@ -711,7 +760,7 @@ mod chat_tests {
         };
         // 取消打断工具循环：c2 已声明但从未执行，历史里没有它的输出项
         let history = vec![
-            HistoryItem::Message { role: Role::User, text: "任务".into() },
+            HistoryItem::Message { role: Role::User, text: "任务".into(), reasoning: None },
             HistoryItem::FunctionCall { name: "read_file".into(), arguments: "{}".into(), call_id: "c1".into() },
             HistoryItem::FunctionCall { name: "apply_patch".into(), arguments: "{}".into(), call_id: "c2".into() },
             HistoryItem::FunctionCallOutput { call_id: "c1".into(), output: "o1".into() },

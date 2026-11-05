@@ -13,9 +13,9 @@ export function applyTurnEvent(state: Draft<SessionState>, msg: TurnEvent): void
     case 'turn_completed':
       state.status = 'idle';
       state.lastTurnEnd = msg.reason;
-      // 冻结所有仍在流式中的节点（含 agent 消息）
+      // 冻结所有仍在流式中的节点（含 agent 消息与思考过程）
       for (const node of state.nodes) {
-        if (node.kind === 'agent_message') node.streaming = false;
+        if (node.kind === 'agent_message' || node.kind === 'reasoning') node.streaming = false;
         if (node.kind !== 'tool_call') continue;
         // 权威信息齐全（既有 result 又已离开 running）时才完全跳过轮次收敛：状态在 tool_call_end
         // 那一刻就定稿了。只判 result 不判 status 不行——万一漏写状态，跳过会让节点永久停在 running、

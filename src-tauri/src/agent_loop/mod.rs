@@ -113,7 +113,7 @@ impl AgentLoop {
         sink: Arc<dyn crate::events::EventSink>,
         cancel: CancellationToken,
     ) -> TurnSummary {
-        let mut history = vec![HistoryItem::Message { role: Role::User, text: task.to_string() }];
+        let mut history = vec![HistoryItem::Message { role: Role::User, text: task.to_string(), reasoning: None }];
         let mut reason = TurnEndReasonLocal::Completed;
         let mut last_turn = 0u32;
         let emit = |sink: &Arc<dyn crate::events::EventSink>, msg: EventMsg| {
@@ -144,6 +144,7 @@ impl AgentLoop {
 
             // 2) 消费流：转发增量、收集输出项
             let mut assistant_text = String::new();
+            let mut reasoning_text = String::new();
             let mut full_message: Option<String> = None;
             let mut calls: Vec<(String, String, String)> = Vec::new(); // (name, arguments, call_id)
             let mut usage: Option<Usage> = None;
@@ -160,6 +161,12 @@ impl AgentLoop {
                         Some(ModelStreamEvent::OutputTextDelta { delta }) => {
                             assistant_text.push_str(&delta);
                             emit(&sink, EventMsg::AgentMessageDelta { delta });
+                        }
+                        // 思考增量单独成事件：它不是答案内容，前端要能折叠显示，
+                        // FF-5 也要把它算进"首个可见反馈"（业界同一口径，见 latency_budget）
+                        Some(ModelStreamEvent::ReasoningDelta { delta }) => {
+                            reasoning_text.push_str(&delta);
+                            emit(&sink, EventMsg::ReasoningDelta { delta });
                         }
                         Some(ModelStreamEvent::OutputItem(ResponseItem::Message { role: _, text })) => {
                             full_message = Some(text);
@@ -189,8 +196,15 @@ impl AgentLoop {
 
             // 3) 助手输出入历史（完整消息优先，增量累计兜底）
             let text = full_message.unwrap_or(assistant_text);
-            if !text.trim().is_empty() {
-                history.push(HistoryItem::Message { role: Role::Assistant, text });
+            // reasoning 只要出现过就必须挂到这条 assistant 消息上回传（SH-083）：
+            // thinking 档端点缺该字段直接 400。哪怕正文为空也要留——留了才有下一轮。
+            let reasoning = if reasoning_text.trim().is_empty() {
+                None
+            } else {
+                Some(std::mem::take(&mut reasoning_text))
+            };
+            if !text.trim().is_empty() || reasoning.is_some() {
+                history.push(HistoryItem::Message { role: Role::Assistant, text, reasoning });
             }
 
             // 4) 无工具调用 → 任务完成

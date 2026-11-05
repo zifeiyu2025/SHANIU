@@ -3,6 +3,7 @@ import type {
   ApprovalNode,
   ConversationNode,
   ErrorNode,
+  ReasoningNode,
   RiskLevel,
   ToolCallNode,
   UserMessageNode,
@@ -21,6 +22,10 @@ export function newUserMessageNode(text: string): UserMessageNode {
 
 export function newAgentMessageNode(text: string, streaming: boolean): AgentMessageNode {
   return { kind: 'agent_message', id: nextId('agent'), text, streaming };
+}
+
+export function newReasoningNode(text: string, streaming: boolean): ReasoningNode {
+  return { kind: 'reasoning', id: nextId('reasoning'), text, streaming };
 }
 
 export function newErrorNode(message: string): ErrorNode {
@@ -55,6 +60,7 @@ export function isConversationNode(value: unknown): value is ConversationNode {
   return (
     kind === 'user_message' ||
     kind === 'agent_message' ||
+    kind === 'reasoning' ||
     kind === 'error' ||
     kind === 'approval' ||
     kind === 'tool_call'

@@ -12,5 +12,7 @@ export function applyAgentMessageDelta(state: Draft<SessionState>, msg: AgentMes
     last.text += msg.delta;
     return;
   }
+  // 正文开始 = 思考结束：收口末尾仍在流式的 reasoning 节点，避免两个 spinner 并转
+  if (last && last.kind === 'reasoning' && last.streaming) last.streaming = false;
   state.nodes.push(newAgentMessageNode(msg.delta, true));
 }
