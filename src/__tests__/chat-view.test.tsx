@@ -26,6 +26,15 @@ function spyTransport() {
   return { transport, sendTask, cancel };
 }
 
+/** jsdom 没有布局引擎：滚动几何只能自己定义（scrollTo 已由 test-setup 提供空实现）。 */
+function fakeScrollMetrics(
+  el: HTMLElement,
+  { scrollHeight, clientHeight }: { scrollHeight: number; clientHeight: number },
+) {
+  Object.defineProperty(el, 'scrollHeight', { configurable: true, value: scrollHeight });
+  Object.defineProperty(el, 'clientHeight', { configurable: true, value: clientHeight });
+}
+
 // AGENTS §5：UI 组件至少覆盖「流式中间态」与「完成态」两种渲染
 describe('ChatView', () => {
   afterEach(() => {
@@ -188,6 +197,60 @@ describe('ChatView', () => {
     });
     expect((input as HTMLTextAreaElement).value).toBe('还没打完的下一条');
     expect(document.activeElement).toBe(input);
+  });
+
+  it('上翻超过阈值出现「回到底部」，点击后回到贴底态', () => {
+    const store = createSessionStore();
+    const { transport } = spyTransport();
+    render(<ChatView store={store} transport={transport} />);
+    act(() => {
+      store.submitUserTask('任务');
+      store.dispatch({ type: 'turn_started', turn: 1 });
+      store.dispatch({ type: 'agent_message_delta', delta: '内容' });
+    });
+
+    const scroller = screen.getByTestId('scroll-body');
+    fakeScrollMetrics(scroller, { scrollHeight: 2000, clientHeight: 600 });
+    expect(screen.queryByTestId('to-bottom')).toBeNull(); // 贴底时不出现
+
+    scroller.scrollTop = 0; // 距底 1400px，远超 dsh 的 24px 阈值
+    fireEvent.scroll(scroller);
+    expect(screen.getByTestId('to-bottom')).toBeTruthy();
+
+    fireEvent.click(screen.getByTestId('to-bottom'));
+    expect(screen.queryByTestId('to-bottom')).toBeNull();
+  });
+
+  it('贴底时新内容跟着滚到底，上翻时不再被拽回', () => {
+    const store = createSessionStore();
+    const { transport } = spyTransport();
+    render(<ChatView store={store} transport={transport} />);
+    act(() => {
+      store.submitUserTask('任务');
+      store.dispatch({ type: 'turn_started', turn: 1 });
+    });
+
+    const scroller = screen.getByTestId('scroll-body');
+    fakeScrollMetrics(scroller, { scrollHeight: 2000, clientHeight: 600 });
+    const spy = vi.fn();
+    scroller.scrollTo = spy;
+
+    // 贴底（距底 0px）→ 新内容必须跟随
+    scroller.scrollTop = 1400;
+    fireEvent.scroll(scroller);
+    act(() => {
+      store.dispatch({ type: 'agent_message_delta', delta: '增量一' });
+    });
+    expect(spy).toHaveBeenCalled();
+
+    // 上翻 → 同样的新内容不得把用户拽回去
+    spy.mockClear();
+    scroller.scrollTop = 0;
+    fireEvent.scroll(scroller);
+    act(() => {
+      store.dispatch({ type: 'agent_message_delta', delta: '增量二' });
+    });
+    expect(spy).not.toHaveBeenCalled();
   });
 
   it('Esc = 停止生成；浮层开着时 Esc 归浮层，不顺手取消任务', () => {

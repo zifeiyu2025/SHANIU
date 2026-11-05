@@ -1,9 +1,10 @@
-import { useEffect, useRef, type ReactNode } from 'react';
+import { useCallback, useEffect, useRef, useState, type ReactNode } from 'react';
 import { useStoreSelector } from '../../store/engine';
 import type { SessionStore } from '../../store/session-store';
 import type { Transport } from '../../transport/types';
 import type { ConversationNode } from '../../nodes/types';
 import { sendTaskNow } from '../../utils/session-actions';
+import { ChevronDownIcon } from '../icons';
 import { StreamingText } from '../markdown/StreamingText';
 import { ApprovalCard } from '../approval/ApprovalCard';
 import { ToolCallCard } from '../blocks/ToolCallCard';
@@ -15,8 +16,9 @@ import { QueueDock } from './QueueDock';
 /** 会话内容列宽（dsh ConversationRoot.module.css:468-471）。 */
 const CONTENT_WIDTH = 'w-[clamp(680px,64%,920px)]';
 
-/** 距底小于这个距离就算"贴在底部"，流式时继续跟随；超过说明用户在上翻，不再打断。 */
-const PIN_TO_BOTTOM_PX = 80;
+/** 距底小于这个距离就算"贴在底部"，流式时继续跟随；超过说明用户在上翻，不再打断。
+ *  24px 是 dsh 的 FOLLOW_THRESHOLD（use-chat-reading.ts:7，实际传入 24+1）。 */
+const PIN_TO_BOTTOM_PX = 24;
 
 /** 标题取首条用户任务，按字符数截断（中文一字符一字，40 足够表意）。 */
 function sessionTitle(nodes: ConversationNode[]): string {
@@ -60,6 +62,13 @@ export function ChatView({
   const blocked = nodes.some((n) => n.kind === 'approval' && n.status === 'pending');
   const scrollRef = useRef<HTMLDivElement>(null);
   const pinned = useRef(true);
+  // ref 供跟随滚动effect读取（避免闭包读到旧值），state 供渲染「回到底部」——
+  // 同一个值写两次，React 对相同值会跳过重渲染，滚动高频时不会变成每帧一渲染。
+  const [following, setFollowing] = useState(true);
+  const pinToBottom = useCallback((next: boolean) => {
+    pinned.current = next;
+    setFollowing(next);
+  }, []);
 
   // Esc = 停止生成（dsh apply.ts:292-299 `response.stop` 绑 Escape）。分层规则照抄
   // dsh 的 keymap：浮层先吃 Esc——设置卡开着时 Esc 是关卡，不能顺手把任务也取消了。
@@ -92,9 +101,9 @@ export function ChatView({
 
   // 新会话时代次变化：回到顶部语义（重新贴底），否则旧会话的上翻位置会残留
   useEffect(() => {
-    pinned.current = true;
+    pinToBottom(true);
     scrollRef.current?.scrollTo({ top: 0 });
-  }, [generation]);
+  }, [generation, pinToBottom]);
 
   useEffect(() => {
     const el = scrollRef.current;
@@ -134,20 +143,47 @@ export function ChatView({
 
       {/* 输入区常驻（dsh 的 composer 在空态/会话态之间只由 CSS 位移，不换实例）：
           换实例会把正在输入的草稿和焦点一起丢掉——真机实测第一条发出后第二条消失过。 */}
+      {/* 消息区 + 浮动控制。relative 容器只为「回到底部」提供定位锚；
+          空态时整块不渲染（null 占位），输入卡那一路子节点位置不变，实例得以常驻。 */}
       {!empty && (
-        <div
-          ref={scrollRef}
-          onScroll={(e) => {
-            const el = e.currentTarget;
-            pinned.current = el.scrollHeight - el.scrollTop - el.clientHeight < PIN_TO_BOTTOM_PX;
-          }}
-          className="min-h-0 flex-1 overflow-y-auto"
-        >
-          <div className={`mx-auto mt-4 flex flex-col ${CONTENT_WIDTH} max-w-full px-4 pb-6`}>
-            {nodes.map((node) => (
-              <NodeItem key={node.id} node={node} transport={transport} />
-            ))}
+        <div className="relative flex min-h-0 flex-1 flex-col">
+          <div
+            ref={scrollRef}
+            data-testid="scroll-body"
+            onScroll={(e) => {
+              const el = e.currentTarget;
+              pinToBottom(el.scrollHeight - el.scrollTop - el.clientHeight < PIN_TO_BOTTOM_PX);
+            }}
+            className="min-h-0 flex-1 overflow-y-auto"
+          >
+            <div className={`mx-auto mt-4 flex flex-col ${CONTENT_WIDTH} max-w-full px-4 pb-6`}>
+              {nodes.map((node) => (
+                <NodeItem key={node.id} node={node} transport={transport} />
+              ))}
+            </div>
           </div>
+          {/* dsh ChatView.tsx:272-283 + ChatView.module.css:342-388：判据只有一个
+              !followingTail；控件 34 圆、静止时贴在输入卡上方 16px，右缘对齐内容列。 */}
+          {!following && (
+            <div className="pointer-events-none absolute inset-x-0 bottom-4 z-[8]">
+              <div className={`mx-auto flex ${CONTENT_WIDTH} max-w-full justify-end px-4`}>
+                <button
+                  type="button"
+                  aria-label="回到底部"
+                  title="回到底部"
+                  data-testid="to-bottom"
+                  onClick={() => {
+                    pinToBottom(true);
+                    const el = scrollRef.current;
+                    if (el) el.scrollTo({ top: el.scrollHeight });
+                  }}
+                  className="pointer-events-auto flex h-[34px] w-[34px] items-center justify-center rounded-full border-[0.5px] border-line3 bg-raised text-primary shadow-panel transition-colors duration-100 hover:bg-hover"
+                >
+                  <ChevronDownIcon className="h-4 w-4" />
+                </button>
+              </div>
+            </div>
+          )}
         </div>
       )}
 
