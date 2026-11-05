@@ -9,11 +9,16 @@ use std::path::Path;
 use crate::config::SandboxMode;
 
 /// 沙箱模式的中文释义（写入提示词，让模型知道自己的执行边界）。
+///
+/// 措辞必须与实现一致（ADR-002 / SH-019 结论）：workspace-write 目前是
+/// **逻辑边界**——文件工具在工具层校验路径，命令子进程经受限令牌 + Job 启动，
+/// 但尚未做文件系统级隔离，所以不能向模型宣称"工作区外写入会被拒绝"。
 fn sandbox_clause(mode: SandboxMode) -> &'static str {
     match mode {
         SandboxMode::ReadOnly => "只读：任何写入与命令执行都会被拒绝。",
         SandboxMode::WorkspaceWrite => {
-            "工作区写入：可在工作区内读写文件与执行命令；工作区外写入与网络默认被拒绝。"
+            "工作区写入：文件工具仅在当前工作区内可写，越界路径会被工具层拒绝；命令经受限令牌执行。\
+但文件系统未做强制隔离，请主动把自己限制在工作区内，不要在工作区外创建或修改文件。"
         }
         SandboxMode::DangerFullAccess => "完全访问：命令不受沙箱限制，请格外谨慎。",
     }
@@ -76,6 +81,17 @@ mod tests {
         assert!(text.contains("当前状态：计划模式"));
         assert!(text.contains("exit_plan_mode"));
         assert!(text.contains("只读"));
+    }
+
+    #[test]
+    fn workspace_write_clause_does_not_overclaim_isolation() {
+        // SH-019 实测：受限令牌不做文件系统级隔离，措辞不得宣称越界写入被拒
+        let text = system_instruction(&PathBuf::from("D:/ws"), SandboxMode::WorkspaceWrite, false);
+        assert!(
+            !text.contains("工作区外写入与网络默认被拒绝"),
+            "不得向模型宣称未实现的文件系统隔离（会诱发越界尝试）"
+        );
+        assert!(text.contains("未做强制隔离"), "必须如实告知边界性质");
     }
 
     #[test]
