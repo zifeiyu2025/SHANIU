@@ -8,10 +8,15 @@
 //! DPAPI 存取随 M2 权限模块接入（M0 无模型调用、无密钥使用场景）。
 
 use std::fs;
+use std::io;
 use std::path::{Path, PathBuf};
+use std::sync::{OnceLock, RwLock};
 use std::time::{SystemTime, UNIX_EPOCH};
 
+use regex::Regex;
 use serde::{Deserialize, Serialize};
+use tracing_appender::non_blocking::{NonBlocking, WorkerGuard};
+use tracing_subscriber::fmt::MakeWriter;
 
 pub const DATA_DIR_ENV: &str = "SHANIU_DATA_DIR";
 pub const PORTABLE_MARKER: &str = "portable.marker";
@@ -252,11 +257,12 @@ impl SecretStore {
         )))
     }
 
-    /// 存储并加密。空密钥拒绝。
+    /// 存储并加密。空密钥拒绝。明文随手登记进脱敏表（本会话刚存过的 key 同样不能出现在日志里）。
     pub fn store_key(&self, provider: &str, plaintext: &str) -> Result<(), String> {
         if plaintext.trim().is_empty() {
             return Err("密钥为空".into());
         }
+        register_secret(plaintext);
         let cipher = dpapi_protect(plaintext.as_bytes())?;
         let path = self.key_path(provider)?;
         fs::create_dir_all(path.parent().expect("密钥路径必有父目录"))
@@ -265,6 +271,7 @@ impl SecretStore {
     }
 
     /// 读取并解密；不存在返回 Ok(None)。解密失败（损坏/跨机器）返回 Err——fail-closed。
+    /// 解出的明文随手登记进脱敏表：这是唯一知道"当前密钥长什么样"的时刻。
     pub fn load_key(&self, provider: &str) -> Result<Option<String>, String> {
         let path = self.key_path(provider)?;
         if !path.exists() {
@@ -272,9 +279,9 @@ impl SecretStore {
         }
         let cipher = fs::read(&path).map_err(|e| format!("读取密钥失败: {e}"))?;
         let plain = dpapi_unprotect(&cipher)?;
-        String::from_utf8(plain)
-            .map(Some)
-            .map_err(|_| "密钥编码非法".into())
+        let key = String::from_utf8(plain).map_err(|_| "密钥编码非法".to_string())?;
+        register_secret(&key);
+        Ok(Some(key))
     }
 
     pub fn delete_key(&self, provider: &str) -> Result<(), String> {
@@ -283,6 +290,170 @@ impl SecretStore {
             fs::remove_file(&path).map_err(|e| format!("删除密钥失败: {e}"))?;
         }
         Ok(())
+    }
+}
+
+// ===== SH-042：落盘前统一脱敏（docs/01 §风险登记册 R2、§9.3 目录表 logs\ 行）=====
+// 放在本模块的理由：密钥的唯一出入口是 SecretStore，脱敏要登记"当前密钥长什么样"，
+// 两件事拆开就必然出现"存了 key 却没人登记"的缝隙。SH-042 卡面写的就是 config.rs+日志。
+
+/// 落盘脱敏标记。不回显任何密钥片段——连前缀和长度都不给。
+pub const REDACTED: &str = "[REDACTED]";
+
+/// 已知密钥原文登记表（进程级）。正则只能认"长得像 key"的串，而 DPAPI 解出的
+/// 密钥可以是任意形状，唯一可靠的办法是把原文登记下来、落盘前整串替换。
+static SECRET_REGISTRY: RwLock<Vec<String>> = RwLock::new(Vec::new());
+
+/// 登记一个密钥原文。空串与纯空白忽略：空串会匹配任何位置，等于把整篇文本都抹掉。
+pub fn register_secret(secret: &str) {
+    let s = secret.trim();
+    if s.is_empty() {
+        return;
+    }
+    let mut reg = SECRET_REGISTRY.write().unwrap_or_else(|e| e.into_inner());
+    if !reg.iter().any(|x| x == s) {
+        reg.push(s.to_string());
+    }
+}
+
+struct Pattern {
+    re: Regex,
+    /// 替换模板：无捕获组用全匹配替换；有捕获组保留键名/方案名只抹值。
+    template: &'static str,
+}
+
+fn patterns() -> &'static [Pattern] {
+    static PATTERNS: OnceLock<Vec<Pattern>> = OnceLock::new();
+    PATTERNS.get_or_init(|| {
+        vec![
+            // OpenAI 风格 key：sk- 前缀 + 至少 8 个 key 字符（未登记的陌生 key 也拦得住）
+            Pattern { re: Regex::new(r"sk-[A-Za-z0-9_-]{8,}").expect("内建正则合法"), template: REDACTED },
+            // HTTP 认证头：Bearer xxx / Basic xxx
+            Pattern {
+                re: Regex::new(r#"(?i)\b(bearer|basic)\s+[A-Za-z0-9._~+/=-]{8,}"#).expect("内建正则合法"),
+                template: "${1} [REDACTED]",
+            },
+            // 键值形态：api_key=xxx / "apiKey": "xxx" / token: xxx
+            Pattern {
+                re: Regex::new(r#"(?i)((?:api[_-]?key|secret|access[_-]?token|password)"?\s*[:=]\s*"?)[^\s",}]{6,}"#)
+                    .expect("内建正则合法"),
+                template: "${1}[REDACTED]",
+            },
+        ]
+    })
+}
+
+/// 对任意将要落盘的文本做统一脱敏：先整串替换已登记密钥，再按模式擦掉形似密钥的串。
+/// logs 与 rollouts 的所有写入都必须经过这里（docs/01 §438「落盘前统一过脱敏过滤器」）。
+pub fn redact(text: &str) -> String {
+    let mut out = text.to_string();
+    {
+        // 中毒后照常读：锁里是要保密的清单，panic 掉整个进程比少脱敏一次更糟
+        let reg = SECRET_REGISTRY.read().unwrap_or_else(|e| e.into_inner());
+        for secret in reg.iter() {
+            if out.contains(secret.as_str()) {
+                out = out.replace(secret.as_str(), REDACTED);
+            }
+        }
+    }
+    for p in patterns() {
+        out = p.re.replace_all(&out, p.template).into_owned();
+    }
+    out
+}
+
+/// 按行缓冲并脱敏的 writer：tracing 的一条事件分多次 write 到达（时间戳/级别/正文
+/// 各一次），必须攒到换行才算一行完整文本，否则密钥被写调用劈在两段里就匹配不上了。
+pub struct RedactingWriter<W: io::Write> {
+    inner: W,
+    line: Vec<u8>,
+}
+
+impl<W: io::Write> RedactingWriter<W> {
+    pub fn new(inner: W) -> Self {
+        Self { inner, line: Vec::new() }
+    }
+}
+
+impl<W: io::Write> io::Write for RedactingWriter<W> {
+    fn write(&mut self, buf: &[u8]) -> io::Result<usize> {
+        self.line.extend_from_slice(buf);
+        while let Some(pos) = self.line.iter().position(|&b| b == b'\n') {
+            let line: Vec<u8> = self.line.drain(..=pos).collect();
+            let text = String::from_utf8_lossy(&line[..line.len() - 1]);
+            self.inner.write_all(redact(&text).as_bytes())?;
+            self.inner.write_all(b"\n")?;
+        }
+        Ok(buf.len())
+    }
+
+    fn flush(&mut self) -> io::Result<()> {
+        if !self.line.is_empty() {
+            let text = String::from_utf8_lossy(&self.line);
+            self.inner.write_all(redact(&text).as_bytes())?;
+            self.line.clear();
+        }
+        self.inner.flush()
+    }
+}
+
+/// MakeWriter 适配：把 tracing 的落盘路径全部导进 RedactingWriter。
+struct RedactingMaker(NonBlocking);
+
+impl<'a> MakeWriter<'a> for RedactingMaker {
+    type Writer = RedactingWriter<<NonBlocking as MakeWriter<'a>>::Writer>;
+
+    fn make_writer(&'a self) -> Self::Writer {
+        RedactingWriter { inner: self.0.make_writer(), line: Vec::new() }
+    }
+}
+
+pub const LOG_RETENTION_DAYS: u64 = 14;
+pub const LOG_FILE_PREFIX: &str = "shaniu.log";
+
+/// 组装订阅器（与全局注册拆开：集成测试用 `with_default` 挂线程级订阅，
+/// 只有生产入口走 set_global_default——全局订阅器一个进程只能设一次）。
+pub fn build_logging(
+    data_root: &Path,
+) -> Result<(impl tracing::Subscriber + Send + Sync, WorkerGuard), String> {
+    let dir = data_root.join("logs");
+    fs::create_dir_all(&dir).map_err(|e| format!("创建日志目录失败: {e}"))?;
+    prune_expired_logs(&dir, LOG_RETENTION_DAYS);
+
+    let (non_blocking, guard) =
+        tracing_appender::non_blocking(tracing_appender::rolling::daily(&dir, LOG_FILE_PREFIX));
+    let subscriber = tracing_subscriber::fmt()
+        .with_max_level(tracing::Level::INFO)
+        .with_ansi(false)
+        .with_writer(RedactingMaker(non_blocking))
+        .finish();
+    Ok((subscriber, guard))
+}
+
+/// 初始化应用日志：`<data_root>\logs\` 按天滚动、落盘前统一脱敏、过期文件清理
+/// （docs/01 §9.3「写入前经脱敏过滤器，按天滚动，保留 14 天」）。
+/// 返回的 WorkerGuard 必须在进程生命周期内存活——non_blocking 的后台线程随 guard 关闭。
+pub fn init_logging(data_root: &Path) -> Result<WorkerGuard, String> {
+    let (subscriber, guard) = build_logging(data_root)?;
+    tracing::subscriber::set_global_default(subscriber)
+        .map_err(|e| format!("日志初始化失败: {e}"))?;
+    Ok(guard)
+}
+
+/// 删除 mtime 早于保留期的日志文件。按 mtime 而不是文件名日期判据：滚动文件名的
+/// 格式归 tracing-appender 管，mtime 与命名解耦，也省一个日期库依赖。
+/// 单个文件删不掉就留到下次启动再试，不影响应用运行。
+pub fn prune_expired_logs(dir: &Path, retain_days: u64) {
+    let cutoff = SystemTime::now() - std::time::Duration::from_secs(retain_days * 24 * 3600);
+    let Ok(entries) = fs::read_dir(dir) else { return };
+    for entry in entries.flatten() {
+        let Ok(meta) = entry.metadata() else { continue };
+        if !meta.is_file() {
+            continue;
+        }
+        if meta.modified().map(|m| m < cutoff).unwrap_or(false) {
+            let _ = fs::remove_file(entry.path());
+        }
     }
 }
 

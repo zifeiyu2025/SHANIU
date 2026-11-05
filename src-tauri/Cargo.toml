@@ -30,6 +30,17 @@ thiserror = "2"
 regex = "1"
 # 异步运行时（tauri 内含；此处直连以获得 #[tokio::test]、进程/超时等能力）
 tokio = { version = "1", features = ["macros", "rt", "process", "io-util", "time"] }
+# SH-042 日志面（docs/01 §9.3 目录表要求 logs\ 按天滚动、保留 14 天、落盘前统一脱敏）。
+# 三者同族、均 MIT：
+#   tracing            — 事件门面；reqwest/tower 这些依赖本身就在发 tracing 事件，
+#                        用 log 系就得再搭一层桥，等于自造适配。
+#   tracing-subscriber — 自定义 MakeWriter 是"落盘前唯一收口"的官方扩展点，
+#                        脱敏挂在这一层就漏不掉了（比逐处调用 redact() 可靠）。
+#   tracing-appender   — 按天滚动文件名与目录创建已由社区实现，无需手写。
+# 移除成本：三者只在 config.rs 的日志初始化处出现，换实现改一个函数。
+tracing = "0.1"
+tracing-subscriber = "0.3"
+tracing-appender = "0.2"
 # DPAPI（config.rs 密钥存取，§6 已确认方案）：微软官方 Win32 绑定，最小 feature 面
 # M2-c 沙箱：RestrictedToken（Security）+ JobObject + 进程创建（Threading）
 windows = { version = "0.62", features = [

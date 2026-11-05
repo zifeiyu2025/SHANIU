@@ -228,14 +228,23 @@ fn show_main_window(app: &tauri::AppHandle) {
 }
 
 pub fn run() {
-    // 数据目录解析结果写入启动输出第一行（docs §9.3）
+    // 数据目录解析结果写入日志第一行（docs §9.3 的「解析结果写入日志第一行」即指此条）
     let dirs = config::resolve_dirs_from_env();
-    println!("[SHANIU] config_root: {}", dirs.config_root.display());
-    println!("[SHANIU] data_root:   {}", dirs.data_root.display());
+    // 日志初始化必须早于一切 tracing:: 事件；guard 存活期 = 进程存活期
+    let _log_guard = match config::init_logging(&dirs.data_root) {
+        Ok(guard) => Some(guard),
+        Err(e) => {
+            // 日志起不来不能拦着应用启动（fail-open 但脱敏表照常工作），兜底打印说明原因
+            eprintln!("[SHANIU] 日志初始化失败（本次会话无文件日志）: {e}");
+            None
+        }
+    };
+    tracing::info!("config_root: {}", dirs.config_root.display());
+    tracing::info!("data_root:   {}", dirs.data_root.display());
 
     let (app_config, config_path) =
         AppConfig::load_or_create(&dirs.config_root).unwrap_or_else(|e| {
-            eprintln!("[SHANIU] 配置加载失败（fail-closed，使用临时默认配置）: {e}");
+            tracing::warn!("配置加载失败（fail-closed，使用临时默认配置）: {e}");
             (AppConfig::default(), dirs.config_root.join(config::CONFIG_FILE))
         });
 

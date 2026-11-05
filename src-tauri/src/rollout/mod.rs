@@ -143,8 +143,11 @@ impl RolloutWriter {
     }
 
     /// 追加一行并立即 flush（设计选择 1）。
+    /// 落盘前过脱敏过滤器（docs/01 §438）：rollout 与日志同级敏感，用户把密钥
+    /// 粘进任务文本这类情况只能在这里兜住。
     pub fn append(&self, item: &RolloutItem) -> Result<(), RolloutError> {
         let line = serde_json::to_string(item).map_err(|e| RolloutError::Io(format!("序列化失败: {e}")))?;
+        let line = crate::config::redact(&line);
         let mut file = self.file.lock().map_err(|_| RolloutError::Io("rollout 写入锁中毒".into()))?;
         file.write_all(line.as_bytes()).map_err(|e| RolloutError::Io(format!("{}", e)))?;
         file.write_all(b"\n").map_err(|e| RolloutError::Io(format!("{}", e)))?;
