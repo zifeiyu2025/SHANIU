@@ -27,6 +27,12 @@ const MOCK_REPLY = [
   '试试在流式输出过程中点击「停止」，事件流会以 `cancelled` 结束。',
 ].join('\n\n');
 
+/** 把切分点吸附到最近的块边界（空行之后）。 */
+function blockBoundary(text: string, target: number): number {
+  const back = text.lastIndexOf('\n\n', target);
+  return back === -1 ? target : back + 2;
+}
+
 /** Vite 独立开发用的 mock 传输层：不经 Tauri IPC，本地驱动一轮完整 mock 事件流。 */
 export function createMockTransport(): Transport {
   const listeners = new Set<(msg: EventMsg) => void>();
@@ -137,15 +143,20 @@ export function createMockTransport(): Transport {
       cancelRequested = false;
       emit({ type: 'turn_started', turn: 1 });
       const reply = `任务：${task}\n\n${MOCK_REPLY}`;
-      const chunks = reply.match(/[\s\S]{1,8}/g) ?? [];
-      const half = Math.ceil(chunks.length / 2);
+      // 工具调用插在**块边界**上，不是任意字符位：真实后端先把一轮的
+      // OutputTextDelta 全部流完（agent_loop/mod.rs:221）才发 ToolCallBegin
+      // （mod.rs:291、:310），所以一段 Markdown 不会被工具卡从中间劈开。
+      // 原先这里按字符数对半切，切点会落进代码围栏内部，在渲染层造出
+      // 真实场景根本不存在的破碎形态，反过来把验收引向错误的结论。
+      const cut = blockBoundary(reply, Math.ceil(reply.length / 2));
+      const toChunks = (slice: string) => slice.match(/[\s\S]{1,8}/g) ?? [];
       await streamReasoning();
-      await streamChunks(chunks.slice(0, half));
+      await streamChunks(toChunks(reply.slice(0, cut)));
       // dev-only 审批场景：任务文本含「审批」才挂起一张审批卡。
       // 不发审批事件的 mock 让审批卡只活在单元测试里，键盘裁决与截图验收都无从下手。
       if (task.includes('审批')) await emitApprovalDemo();
       if (!cancelRequested) await emitToolCallDemo();
-      await streamChunks(chunks.slice(half));
+      await streamChunks(toChunks(reply.slice(cut)));
       emit({ type: 'token_usage', turn: 1, input_tokens: 96, cached_input_tokens: null, output_tokens: 64 });
       emit({
         type: 'turn_completed',
