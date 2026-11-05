@@ -1,9 +1,10 @@
-import { useMemo } from 'react';
+import { useMemo, useState } from 'react';
 import type { ToolCallNode, ToolCallStatus } from '../../nodes/types';
 import { TerminalBlock } from './TerminalBlock';
+import { ChevronDownIcon, ChevronUpIcon } from '../icons';
 
 const STATUS_META: Record<ToolCallStatus, { label: string; tone: string; dot: string }> = {
-  running: { label: '执行中', tone: 'bg-accent/15 text-accent', dot: 'bg-accent animate-pulse' },
+  running: { label: '运行中', tone: 'bg-accent/15 text-accent', dot: 'bg-accent animate-pulse' },
   ok: { label: '完成', tone: 'bg-success/15 text-success', dot: 'bg-success' },
   error: { label: '失败', tone: 'bg-danger/15 text-danger', dot: 'bg-danger' },
   cancelled: { label: '已取消', tone: 'bg-hover text-tertiary', dot: 'bg-tertiary' },
@@ -35,6 +36,10 @@ export function ToolCallCard({ node }: { node: ToolCallNode }) {
   // 每个 output_delta 都会重渲染本卡片，而 args 引用由 immer 保持不变，memo 必命中：
   // 避免大参数（如 apply_patch 的补丁正文）被逐 delta 重复 stringify。
   const summary = useMemo(() => argsSummary(node.args), [node.args]);
+  // 两级披露（dsh ToolRow.tsx:196 useDisclosure + :471 expandOnRowClick）：
+  // 卡片默认折叠，点整行标题展开输出；没输出时不给可展开的样子（dsh 的 expandable 判据）。
+  const [open, setOpen] = useState(false);
+  const expandable = node.stdout !== '' || node.stderr !== '';
 
   return (
     <div
@@ -42,7 +47,14 @@ export function ToolCallCard({ node }: { node: ToolCallNode }) {
       data-status={status}
       className="rounded-lg border-[0.5px] border-line2 bg-layer1 px-3 py-2"
     >
-      <div className="flex items-center gap-2 text-[13px]">
+      <button
+        type="button"
+        data-testid={`${scope}-row`}
+        aria-expanded={expandable ? open : undefined}
+        disabled={!expandable}
+        onClick={() => setOpen((v) => !v)}
+        className="flex w-full items-center gap-2 text-left text-[13px] transition-colors duration-100 enabled:hover:bg-hover"
+      >
         <span
           data-testid={status === 'running' ? `${scope}-spinner` : undefined}
           aria-hidden
@@ -57,9 +69,15 @@ export function ToolCallCard({ node }: { node: ToolCallNode }) {
             {summary}
           </code>
         )}
-      </div>
+        {expandable && (
+          <span className="shrink-0 text-caption" aria-hidden>
+            {open ? <ChevronUpIcon className="h-3.5 w-3.5" /> : <ChevronDownIcon className="h-3.5 w-3.5" />}
+          </span>
+        )}
+      </button>
       {/* error 文案无条件渲染（SH-017 修过一次的坑）：只有"失败"用红色，其余状态降为中性，
-          避免灰徽标旁挂红字；`result=ok` 却带 error 文本这种矛盾数据也照原样显示，前端不"修正"状态 */}
+          避免灰徽标旁挂红字；`result=ok` 却带 error 文本这种矛盾数据也照原样显示，前端不"修正"状态。
+          它也不跟着折叠走——失败原因必须不点也能看见。 */}
       {node.error && (
         <p
           role="alert"
@@ -68,7 +86,7 @@ export function ToolCallCard({ node }: { node: ToolCallNode }) {
           {node.error}
         </p>
       )}
-      <TerminalBlock stdout={node.stdout} stderr={node.stderr} scope={scope} />
+      {open && <TerminalBlock stdout={node.stdout} stderr={node.stderr} scope={scope} />}
     </div>
   );
 }

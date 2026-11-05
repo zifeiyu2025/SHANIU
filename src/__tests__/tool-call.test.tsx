@@ -1,5 +1,5 @@
 import { describe, expect, it } from 'vitest';
-import { act, render, screen, within } from '@testing-library/react';
+import { act, fireEvent, render, screen, within } from '@testing-library/react';
 import { produce } from 'immer';
 import { applyEvent } from '../store/reducers';
 import { TerminalBlock } from '../components/blocks/TerminalBlock';
@@ -225,41 +225,58 @@ const RUNNING_NODE: ToolCallNode = {
 
 describe('TerminalBlock', () => {
   const lines = (count: number) => Array.from({ length: count }, (_, i) => `L${i + 1}`).join('\n');
+  // 折叠态是「头 pre + 折叠按钮 + 尾 pre」三段，按 pre 取行才不会被按钮文案混进来
   const renderedLines = () =>
-    (screen.getByTestId('terminal-stdout').textContent ?? '').split('\n');
+    Array.from(screen.getByTestId('terminal-stdout').querySelectorAll('pre')).flatMap((pre) =>
+      (pre.textContent ?? '').split('\n'),
+    );
 
-  it('只渲染末尾 200 行，stdout/stderr 截断提示各自独立', () => {
+  it('折叠时头尾各 8 行、中间折叠，stdout/stderr 各自独立计数', () => {
     render(<TerminalBlock stdout={lines(250)} stderr={lines(240)} />);
 
-    const stdoutNotice = screen.getByTestId('terminal-truncated-stdout');
-    const stderrNotice = screen.getByTestId('terminal-truncated-stderr');
-    expect(stdoutNotice.textContent).toContain('200');
-    expect(stderrNotice.textContent).toContain('200');
-    expect(renderedLines()).toHaveLength(200);
-    expect(renderedLines()[0]).toBe('L51');
-    expect(renderedLines()[199]).toBe('L250');
+    expect(renderedLines()).toHaveLength(16);
+    expect(renderedLines()[0]).toBe('L1');
+    expect(renderedLines()[7]).toBe('L8');
+    expect(renderedLines()[8]).toBe('L243'); // 尾部 8 行的首行
+    expect(renderedLines()[15]).toBe('L250');
+
+    const notice = screen.getByTestId('terminal-expand-stdout');
+    expect(notice.textContent).toContain('其余 234 行'); // 250 - 16
+    // 两通道各自计数：合并会把 stderr 的隐藏行数报错
+    expect(screen.getByTestId('terminal-expand-stderr').textContent).toContain('其余 224 行');
   });
 
-  // 恰好边界：证伪 off-by-one（199/200 不截断，201 才截断且首行为第 2 行）
-  it('199 行：全量渲染且无截断提示', () => {
-    render(<TerminalBlock stdout={lines(199)} stderr="" />);
-    expect(renderedLines()).toHaveLength(199);
-    expect(screen.queryByTestId('terminal-truncated-stdout')).toBeNull();
+  it('点「… 其余 N 行」展开全量，再点「收起输出」回到头尾切片', () => {
+    render(<TerminalBlock stdout={lines(250)} stderr="" />);
+    expect(renderedLines()).toHaveLength(16);
+
+    fireEvent.click(screen.getByTestId('terminal-expand-stdout'));
+    expect(renderedLines()).toHaveLength(250);
+    expect(screen.getByTestId('terminal-expand-stdout').textContent).toBe('收起输出');
+    expect(screen.getByTestId("terminal-expand-stdout").getAttribute("aria-expanded")).toBe("true");
+
+    fireEvent.click(screen.getByTestId('terminal-expand-stdout'));
+    expect(renderedLines()).toHaveLength(16);
+    expect(screen.getByTestId("terminal-expand-stdout").getAttribute("aria-expanded")).toBe("false");
   });
 
-  it('200 行（含末尾换行）：全量渲染且无截断提示', () => {
-    render(<TerminalBlock stdout={`${lines(200)}\n`} stderr="" />);
-    expect(renderedLines()).toHaveLength(200);
-    expect(screen.queryByTestId('terminal-truncated-stdout')).toBeNull();
+  // 恰好边界：证伪 off-by-one（16 行不折叠，17 行才折叠且只藏 1 行）
+  it('15 行与 16 行：全量渲染且没有折叠按钮', () => {
+    const view = render(<TerminalBlock stdout={lines(15)} stderr="" />);
+    expect(renderedLines()).toHaveLength(15);
+    expect(screen.queryByTestId('terminal-expand-stdout')).toBeNull();
+
+    view.rerender(<TerminalBlock stdout={lines(16)} stderr="" />);
+    expect(renderedLines()).toHaveLength(16);
+    expect(screen.queryByTestId('terminal-expand-stdout')).toBeNull();
   });
 
-  it('201 行（含末尾换行）：渲染末尾 200 行且给出提示', () => {
-    render(<TerminalBlock stdout={`${lines(201)}\n`} stderr="" />);
-    expect(screen.getByTestId('terminal-truncated-stdout')).toBeTruthy();
-    const rendered = renderedLines();
-    expect(rendered).toHaveLength(200);
-    expect(rendered[0]).toBe('L2');
-    expect(rendered[199]).toBe('L201');
+  it('17 行（含末尾换行）：折叠成 8+8 并只报「其余 1 行」', () => {
+    render(<TerminalBlock stdout={`${lines(17)}\n`} stderr="" />);
+    expect(renderedLines()).toHaveLength(16);
+    expect(screen.getByTestId('terminal-expand-stdout').textContent).toContain('其余 1 行');
+    // 末尾换行是终止符不是空行：折叠后最后一行仍是 L17，而不是把空行算进来
+    expect(renderedLines()[15]).toBe('L17');
   });
 
   it('空输出不渲染空壳', () => {
@@ -275,22 +292,27 @@ describe('TerminalBlock', () => {
     const rendered = renderedLines();
     expect(rendered).toHaveLength(10);
     expect(rendered[9]).toBe('L10');
-    expect(screen.queryByTestId('terminal-truncated-stdout')).toBeNull();
+    expect(screen.queryByTestId('terminal-expand-stdout')).toBeNull();
   });
 });
 
 describe('ToolCallCard', () => {
-  it('流式中间态：活动指示 + 执行中徽标 + 已有输出可见', () => {
+  it('流式中间态：活动指示 + 运行中徽标 + 输出默认折叠，点整行才展开', () => {
     render(<ToolCallCard node={RUNNING_NODE} />);
 
     expect(screen.getByTestId('tool-call-c1-spinner')).toBeTruthy();
-    expect(screen.getByText('执行中')).toBeTruthy();
+    expect(screen.getByText('运行中')).toBeTruthy();
     expect(screen.getByText(/npm run build/)).toBeTruthy();
+    // dsh ToolRow.tsx:196 useDisclosure 初值折叠：卡片不主动把输出摊在会话流里
+    expect(screen.queryByTestId('tool-call-c1-block')).toBeNull();
+
+    fireEvent.click(screen.getByTestId('tool-call-c1-row'));
+    expect(screen.getByTestId("tool-call-c1-row").getAttribute("aria-expanded")).toBe("true");
     expect(screen.getByTestId('tool-call-c1-stdout').textContent).toContain('building...');
     expect(screen.queryByTestId('tool-call-c1-stderr')).toBeNull();
   });
 
-  it('完成态：spinner 消失、stderr 走 danger 色、错误信息可见', () => {
+  it('完成态：spinner 消失、stderr 走 danger 色、错误信息不点也可见', () => {
     render(
       <ToolCallCard
         node={{
@@ -306,16 +328,23 @@ describe('ToolCallCard', () => {
 
     expect(screen.queryByTestId('tool-call-c1-spinner')).toBeNull();
     expect(screen.getByText('失败')).toBeTruthy();
+    // 失败原因在折叠之外（SH-017 的教训不能被折叠重新吞掉）
     expect(screen.getByRole('alert').textContent).toContain('非零状态退出');
+
+    fireEvent.click(screen.getByTestId('tool-call-c1-row'));
     const stderr = screen.getByTestId('tool-call-c1-stderr');
     expect(stderr.textContent).toContain('TS2304');
     expect(stderr.className).toContain('text-danger');
   });
 
-  it('无输出时不渲染终端块', () => {
+  it('无输出时不渲染终端块，整行也不给可展开的样子', () => {
     render(<ToolCallCard node={{ ...RUNNING_NODE, status: 'ok', exitCode: 0, stdout: '', stderr: '' }} />);
     expect(screen.getByText('完成')).toBeTruthy();
     expect(screen.queryByTestId('tool-call-c1-block')).toBeNull();
+    // dsh 的 expandable 判据：没内容就没有展开态，aria-expanded 都不给
+    const row = screen.getByTestId('tool-call-c1-row');
+    expect(row).toHaveProperty('disabled', true);
+    expect(row.getAttribute("aria-expanded")).toBeNull();
   });
 
   it('取消态保留 error 文案但降为中性色（真实失败原因不能被吞）', () => {
@@ -384,12 +413,16 @@ describe('ChatView 工具调用接线', () => {
     const card = screen.getByTestId('tool-call-c1');
     expect(card.getAttribute('data-status')).toBe('running');
     expect(screen.getByTestId('tool-call-c1-spinner')).toBeTruthy();
+    // 会话流里工具卡默认折叠（SH-090）：有输出也不自动摊开
+    expect(screen.queryByTestId('tool-call-c1-stdout')).toBeNull();
+    fireEvent.click(screen.getByTestId('tool-call-c1-row'));
     expect(screen.getByTestId('tool-call-c1-stdout').textContent).toContain('build ok');
 
     act(() => {
       store.dispatch({ type: 'tool_call_end', call_id: 'c1', exit_code: 0, error: null });
     });
 
+    // 展开态是卡片自己的局部状态，状态收敛不该把它关掉
     expect(screen.getByTestId('tool-call-c1').getAttribute('data-status')).toBe('ok');
     expect(screen.queryByTestId('tool-call-c1-spinner')).toBeNull();
     expect(screen.getByTestId('tool-call-c1-stdout').textContent).toContain('build ok');
@@ -408,7 +441,9 @@ describe('ChatView 工具调用接线', () => {
       store.dispatch({ type: 'tool_call_output_delta', call_id: 'call-a', channel: 'stdout', delta: 'from-a\n' });
     });
 
-    // testid 作用域化后，两个并存的调用各自只有一份 -stdout，不会多匹配
+    // 两张卡各自展开：折叠/展开互不牵连，testid 作用域化后也各自只有一份 -stdout
+    fireEvent.click(screen.getByTestId('tool-call-call-a-row'));
+    fireEvent.click(screen.getByTestId('tool-call-call-b-row'));
     expect(screen.getByTestId('tool-call-call-a-stdout').textContent).toContain('from-a');
     expect(screen.getByTestId('tool-call-call-b-stdout').textContent).toContain('from-b');
     expect(screen.getByTestId('tool-call-call-a-stdout').textContent).not.toContain('from-b');
