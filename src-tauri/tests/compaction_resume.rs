@@ -104,9 +104,14 @@ fn anchor_written_by_compaction_replays_into_a_shorter_but_complete_history() {
     std::fs::remove_dir_all(&dir).ok();
 }
 
-/// 摘要的角色必须是 assistant：塞进 system 会与 04 §6.1 不变量③（系统提示每轮重算）打架。
+/// 摘要的角色必须是 **user**：thinking 档端点要求重放的每条 assistant 消息都带
+/// `reasoning_content`（SH-083），而摘要没有那个字段。
+///
+/// 这条不是理论洁癖：把摘要写成 assistant，1500 预算的真机基线里 `search-and-report`
+/// 就以 `The reasoning_content in the thinking mode must be passed back to the API` 挂掉。
+/// 04 §6.1 不变量③ 禁的是塞进 system，user 不受那条约束。
 #[test]
-fn summary_lands_as_an_assistant_message_not_a_system_one() {
+fn summary_lands_as_a_user_message_not_an_assistant_one() {
     let dir = temp_dir("role");
     let items = vec![user_msg("任务"), big_output("c0", 40_000), big_output("c1", 40_000)];
     let writer = RolloutWriter::create(&dir, &meta("a2")).unwrap();
@@ -131,7 +136,11 @@ fn summary_lands_as_an_assistant_message_not_a_system_one() {
         .find(|item| text_of(item) == Some("摘要"))
         .expect("摘要应在历史里");
     match summary_item {
-        HistoryItem::Message { role, .. } => assert_eq!(*role, Role::Assistant),
+        HistoryItem::Message { role, .. } => assert_eq!(
+            *role,
+            Role::User,
+            "摘要以 assistant 身份进历史会让 thinking 端点直接 400（它没有 reasoning_content）"
+        ),
         other => panic!("摘要必须是 message，得到 {other:?}"),
     }
     std::fs::remove_dir_all(&dir).ok();
@@ -159,6 +168,59 @@ fn out_of_range_target_is_rejected_by_resume() {
     assert!(
         matches!(err, rollout::RolloutError::Corrupted { .. }),
         "越界要判成档案损坏，而不是悄悄跳过：{err}"
+    );
+    std::fs::remove_dir_all(&dir).ok();
+}
+
+/// 把因果链一次钉死：压缩后的历史喂进 ChatCompletions 请求构造，
+/// 每条 assistant 消息都必须带 `reasoning_content`——这正是端点 400 的那条要求。
+/// 摘要一旦写成 assistant，这条就会红，而不是等到真机基线才发现。
+#[test]
+fn compacted_history_still_satisfies_thinking_mode_reasoning_requirement() {
+    use shaniu_lib::model_client::chat_messages;
+
+    let dir = temp_dir("thinking");
+    let mut items = vec![user_msg("任务：找出配置文件里的端口")];
+    for index in 0..4 {
+        items.push(HistoryItem::Message {
+            role: Role::Assistant,
+            text: format!("第 {index} 轮结论"),
+            reasoning: Some(format!("第 {index} 轮思路")),
+        });
+        items.push(big_output(&format!("c{index}"), 30_000));
+    }
+    let writer = RolloutWriter::create(&dir, &meta("a4")).unwrap();
+    for item in &items {
+        writer.append(&RolloutItem::ResponseItem { item: item.clone() }).unwrap();
+    }
+    let path = writer.path().to_path_buf();
+    let target = compaction::plan_if_needed(0, &items, 30_000).unwrap();
+    writer
+        .append(&RolloutItem::Compacted {
+            range_start: target.range_start,
+            range_end: target.range_end,
+            summary: "交接摘要".into(),
+        })
+        .unwrap();
+    drop(writer);
+
+    let resumed = rollout::resume::resume(&path).unwrap();
+    let messages = chat_messages("系统提示", &resumed.history);
+    let offenders: Vec<_> = messages
+        .iter()
+        .filter(|m| m["role"] == "assistant" && m.get("reasoning_content").is_none())
+        .collect();
+    assert!(
+        offenders.is_empty(),
+        "压缩后仍有 {n} 条 assistant 消息缺 reasoning_content，thinking 档会直接 400：{offenders:?}",
+        n = offenders.len()
+    );
+    // 摘要必须在场，且是以 user 身份——否则等于"为了过协议把上下文丢了"
+    assert!(
+        messages
+            .iter()
+            .any(|m| m["role"] == "user" && m["content"].as_str() == Some("交接摘要")),
+        "摘要必须仍在请求里"
     );
     std::fs::remove_dir_all(&dir).ok();
 }

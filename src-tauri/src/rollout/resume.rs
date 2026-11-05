@@ -28,9 +28,16 @@ pub struct Resumed {
 /// 重放档案 → 历史。
 ///
 /// `Compacted` 锚点按记录顺序就地生效：用 `[range_start, range_end)` 换成一条摘要
-/// assistant 消息。摘要取 assistant 角色而不是 system：我们的系统提示每轮重算
-/// （04 §6.1 不变量③），把摘要塞进 system 会与那条不变量打架；而摘要本质是
-/// "模型此前说过的话的浓缩"，归 assistant 语义最正。
+/// **user** 消息。
+///
+/// 这里原本取的是 assistant，理由是"摘要是一个模型此前说过的话的浓缩，归 assistant
+/// 语义最正"。**那个选择在 thinking 档下不成立**：端点要求重放的每条 assistant 消息
+/// 都带回 `reasoning_content`（SH-083），而摘要没有这个字段，真机基线里任务因此直接
+/// 400。语义上也站得住另一种读法——摘要是交给下一个模型的**交接指令**，不是复述旧回答。
+/// codex 同此（`CompactionSummary::role()` 返回 "user"）。
+///
+/// 不变量③（04 §6.1，系统提示每轮重算）禁止的是塞进 **system**，user 不受那条约束，
+/// 所以当初那条论证真正排除的只有 system，并没有支持 assistant。
 pub fn resume(path: &Path) -> Result<Resumed, RolloutError> {
     let archive = rollout::read(path)?;
     let (session_id, agent_id, parent_id) = match &archive.meta {
@@ -61,7 +68,11 @@ pub fn resume(path: &Path) -> Result<Resumed, RolloutError> {
                     });
                 }
                 let summary_item = HistoryItem::Message {
-                    role: Role::Assistant,
+                    // 摘要取 **user** 角色，不是 assistant：thinking 档要求重放的每条
+                    // assistant 消息都带 `reasoning_content`（SH-083），摘要没有那个字段，
+                    // 以 assistant 身份进历史会被端点直接 400。04 §6.1 不变量③ 禁的是塞进
+                    // system，user 不受那条约束；codex 的 `CompactionSummary::role()` 同样是 "user"。
+                    role: Role::User,
                     text: summary.clone(),
                     reasoning: None,
                 };
@@ -243,8 +254,10 @@ mod tests {
         assert_eq!(r.history.len(), 2, "3 条被压成 1 条摘要 + 第二轮 1 条");
         match &r.history[0] {
             HistoryItem::Message { role, text, .. } => {
-                assert_eq!(*role, Role::Assistant);
-                assert!(text.contains("此前"), "摘要应作为 assistant 消息回放：{text}");
+                // 摘要必须是 user：以 assistant 回放会让 thinking 端点因缺
+                // reasoning_content 直接 400（SH-032 修正，见模块头注记）。
+                assert_eq!(*role, Role::User);
+                assert!(text.contains("此前"), "摘要应作为 user 侧交接指令回放：{text}");
             }
             other => panic!("压缩锚点应回放为 message，收到 {other:?}"),
         }

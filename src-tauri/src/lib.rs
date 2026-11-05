@@ -185,8 +185,10 @@ fn project_entries(items: &[rollout::RolloutItem]) -> Vec<SessionEntry> {
             } => {}
             // 压缩锚点在 resume 时的语义就是"用 summary 取代那段区间"，
             // 展示也必须一致，否则用户会看到区间原文而模型看到的是摘要——两份真相。
+            // 角色取 user：与 resume 回放、thinking 档协议三者必须同源（摘要没有
+            // reasoning_content，以 assistant 身份喂端点会 400）。
             rollout::RolloutItem::Compacted { summary, .. } => out.push(SessionEntry::Message {
-                role: "assistant".to_string(),
+                role: "user".to_string(),
                 text: summary.clone(),
                 reasoning: None,
             }),
@@ -544,9 +546,11 @@ mod session_projection_tests {
     }
 
     #[test]
-    fn compaction_anchor_projects_as_assistant_summary() {
+    fn compaction_anchor_projects_as_user_summary() {
         // resume 时锚点的语义就是"摘要取代区间"，展示必须一致，
         // 否则用户看到区间原文而模型看到的是摘要——两份真相。
+        // 角色取 user 与回放同源：摘要没有 reasoning_content，以 assistant 身份
+        // 喂 thinking 端点会 400（SH-032 的真机回归就是这么撞出来的）。
         let items = vec![
             msg(Role::User, "早期任务"),
             RolloutItem::Compacted { range_start: 0, range_end: 3, summary: "已压缩的上下文".into() },
@@ -555,7 +559,7 @@ mod session_projection_tests {
         assert_eq!(entries.len(), 2);
         match &entries[1] {
             SessionEntry::Message { role, text, .. } => {
-                assert_eq!(role, "assistant");
+                assert_eq!(role, "user");
                 assert_eq!(text, "已压缩的上下文");
             }
             other => panic!("期望 Message，得到 {other:?}"),

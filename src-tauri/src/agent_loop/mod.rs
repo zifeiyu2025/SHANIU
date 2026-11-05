@@ -173,7 +173,14 @@ impl AgentLoop {
 
         history.splice(
             target.range_start..target.range_end,
-            [HistoryItem::Message { role: Role::Assistant, text: summary, reasoning: None }],
+            // 摘要必须是 **user** 而不是 assistant。两个理由各自独立、都成立：
+            // 1. thinking 档端点要求重放的每条 assistant 消息都带回 `reasoning_content`
+            //    （SH-083），而摘要没有 reasoning——以 assistant 身份进历史就直接 400。
+            //    这不是理论风险：1500 预算的真机基线里 `search-and-report` 就是这么挂的。
+            // 2. 摘要不是"模型说过的话"，而是交给下一个模型的交接指令——语义上就是 user 侧输入。
+            //    codex 同此：`CompactionSummary::role()` 返回 "user"。
+            // 注意这并不违反 04 §6.1 不变量③：那条禁止的是把摘要塞进 **system**。
+            [HistoryItem::Message { role: Role::User, text: summary, reasoning: None }],
         );
         *recorded = history.len();
         tracing::info!(
