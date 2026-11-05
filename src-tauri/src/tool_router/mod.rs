@@ -170,9 +170,43 @@ impl ToolRouter {
 
 // ============================== 工作区路径边界（共享助手） ==============================
 
+/// 去掉 Windows 的 `\\?\` verbatim 前缀，还原成 shell 可用的等价路径。
+///
+/// 为什么必须还原：`canonicalize()` 在 Windows 上**一定**产出 `\\?\C:\...` 形态，
+/// 而 cmd.exe 认不了它——`cd /d "\\?\C:\..."` 失败、`dir /b > out.txt` 静默不产出文件。
+/// 于是模型看到的 cwd 与它能用的 cwd 不是同一个东西，只能反复重试直到耗尽轮数预算
+/// （SH-085 的真实成因，基线里那条任务就是这么死的）。
+/// 只在**安全校验之后**调用：越界判定仍用 canonical 路径做，还原不改变指向的位置。
+/// 非 verbatim（普通绝对/相对路径）原样返回。
+pub fn shell_usable(path: &Path) -> PathBuf {
+    let mut components = path.components();
+    match components.next() {
+        Some(std::path::Component::Prefix(prefix)) => match prefix.kind() {
+            // drive 是 ASCII 码（u8），必须转成字符；根已在字符串里给出，
+            // 后面的 RootDir 组件必须跳过，否则拼出 "D:\\\x"
+            std::path::Prefix::VerbatimDisk(drive) => {
+                let mut out = PathBuf::from(format!("{}:\\", char::from(drive)));
+                out.extend(components.filter(|c| !matches!(c, std::path::Component::RootDir)));
+                out
+            }
+            std::path::Prefix::VerbatimUNC(host, share) => {
+                // host/share 是 OsStr，不能进 format!；用 push 逐段拼
+                let mut out = PathBuf::from(r"\\");
+                out.push(host);
+                out.push(share);
+                out.extend(components.filter(|c| !matches!(c, std::path::Component::RootDir)));
+                out
+            }
+            // 其它前缀（\\.\、\?\ 设备路径等）不是 canonicalize 的产物，原样交出
+            _ => path.to_path_buf(),
+        },
+        _ => path.to_path_buf(),
+    }
+}
+
 /// 解析工作区内路径：绝对路径与相对路径统一，canonicalize 后校验不越界。
 /// 要求目标**已存在**（读类工具用）。这是 M1 的逻辑边界；M2 sandbox 模块落地后
-/// 由 deny-ACE 接管强制力（ADR-002）。
+/// 由 deny-ACE 接管强制力（ADR-002）。返回 shell 可用形态（见 [`shell_usable`]）。
 pub fn resolve_in_workspace(workspace_root: &Path, path: &str) -> Result<PathBuf, ToolError> {
     if path.trim().is_empty() {
         return Err(ToolError::InvalidArgs("路径为空".into()));
@@ -188,7 +222,7 @@ pub fn resolve_in_workspace(workspace_root: &Path, path: &str) -> Result<PathBuf
     if !canonical.starts_with(&root) {
         return Err(ToolError::Execution(format!("路径越界（工作区之外）: {path}")));
     }
-    Ok(canonical)
+    Ok(shell_usable(&canonical))
 }
 
 /// 写类操作的工作区路径校验：允许目标**尚不存在**（如 Add File）。
@@ -236,7 +270,7 @@ pub fn resolve_for_write(workspace_root: &Path, path: &str) -> Result<PathBuf, T
     if !result.starts_with(&root) {
         return Err(ToolError::Execution(format!("路径越界（工作区之外）: {path}")));
     }
-    Ok(result)
+    Ok(shell_usable(&result))
 }
 
 #[cfg(test)]
@@ -346,12 +380,58 @@ mod tests {
         let ws = temp_workspace();
         // 允许尚不存在的目标（Add File 场景），含多级新目录
         let ok = resolve_for_write(&ws, "new/deep/file.txt").unwrap();
-        assert!(ok.starts_with(ws.canonicalize().unwrap().as_path()));
+        // 契约（SH-085）：返回 shell 可用形态，故与"还原后的根"比较，而不是 canonicalize 原值
+        assert!(ok.starts_with(shell_usable(&ws.canonicalize().unwrap()).as_path()));
         assert_eq!(ok.file_name().unwrap(), "file.txt");
         // 含 .. 的路径直接越界拒绝
         let err = resolve_for_write(&ws, "../evil.txt").unwrap_err();
         assert!(matches!(err, ToolError::Execution(_)));
         std::fs::remove_dir_all(&ws).ok();
+    }
+
+    /// SH-085 的回归锁：canonicalize 在 Windows 上必然产出 `\\?\` verbatim 路径，
+    /// 而 cmd.exe 拿它当 cwd 时 `dir /b > out.txt` 静默不产出文件、`cd /d "\\?\..."` 失败——
+    /// 模型看到的 cwd 与它能用的 cwd 不是同一个东西，只能反复重试到轮数预算耗尽。
+    #[cfg(windows)]
+    #[test]
+    fn resolvers_never_hand_verbatim_paths_to_shell_tools() {
+        let ws = temp_workspace();
+        std::fs::write(ws.join("a.txt"), "x").unwrap();
+        for resolved in [
+            resolve_in_workspace(&ws, "a.txt").unwrap(),
+            resolve_in_workspace(&ws, ".").unwrap(),
+            resolve_for_write(&ws, "new/deep/file.txt").unwrap(),
+        ] {
+            let text = resolved.display().to_string();
+            assert!(
+                !text.contains(r"\\?\"),
+                "交给 shell/模型的路径不该带 verbatim 前缀：{text}"
+            );
+        }
+        // 还原不改变指向：已存在的目标仍能在还原后的路径上命中
+        assert!(
+            resolve_in_workspace(&ws, "a.txt").unwrap().is_file(),
+            "还原后的路径不能再变成不可用"
+        );
+        std::fs::remove_dir_all(&ws).ok();
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn shell_usable_strips_verbatim_and_leaves_normal_paths() {
+        assert_eq!(
+            shell_usable(Path::new(r"\\?\C:\Users\jun\a")),
+            PathBuf::from(r"C:\Users\jun\a")
+        );
+        assert_eq!(
+            shell_usable(Path::new(r"\\?\UNC\fileserver\share\x")),
+            PathBuf::from(r"\\fileserver\share\x")
+        );
+        // 非 verbatim 原样交出（drive 是 u8 ASCII 码，转错就会产出 "68:\" 这种废路径）
+        assert_eq!(
+            shell_usable(Path::new(r"C:\Users\jun\a")),
+            PathBuf::from(r"C:\Users\jun\a")
+        );
     }
 
     #[test]

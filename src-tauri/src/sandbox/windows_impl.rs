@@ -292,17 +292,18 @@ pub fn spawn_restricted_command(
 /// std::thread 逐行读管道 → blocking_send 桥接 tokio 通道（codex read_handle_loop 同思路）。
 fn spawn_pipe_reader(read: std::fs::File, channel: u8, tx: mpsc::Sender<ExecLine>) {
     std::thread::spawn(move || {
-        let mut file = read;
+        use std::io::BufRead;
+        // BufReader 必须活在循环外。每轮新建的话，它会把一次 read 拿到的整块（默认 8KB）
+        // 读进自己的缓冲区、只交出一行，然后随本轮结束被 drop——缓冲区里剩下的行**全部丢弃**。
+        // 实测症状：受限沙箱里 `dir /b` 输出四行，模型只收到第一行，于是反复重跑同一命令
+        // 却永远看不到完整清单。
+        let mut reader = std::io::BufReader::new(read);
         let mut line = String::new();
         loop {
             line.clear();
-            {
-                use std::io::BufRead;
-                let mut reader = std::io::BufReader::new(&mut file);
-                match reader.read_line(&mut line) {
-                    Ok(0) | Err(_) => break,
-                    Ok(_) => {}
-                }
+            match reader.read_line(&mut line) {
+                Ok(0) | Err(_) => break,
+                Ok(_) => {}
             }
             let trimmed = line.trim_end_matches(['\r', '\n']).to_string();
             if tx.blocking_send((channel, trimmed)).is_err() {

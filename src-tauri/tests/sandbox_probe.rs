@@ -65,8 +65,7 @@ async fn readonly_mode_refuses_to_spawn() {
     std::fs::remove_dir_all(&ws).ok();
 }
 
-/// FF-3 核心不变量：工作区外写入必须失败。
-///
+/// FF-3 核心不变量：工作区外写入必须失败。///
 /// 预期当前失败（deny-ACE 未实现），故 ignore；SH-022 落地后移除 ignore 即成为回归门禁。
 #[tokio::test]
 #[ignore = "SH-022 deny-ACE 未实现：受限令牌不含路径级写封锁"]
@@ -84,4 +83,44 @@ async fn sandbox_denies_write_outside_workspace() {
     );
     std::fs::remove_dir_all(&ws).ok();
     std::fs::remove_dir_all(&outside).ok();
+}
+
+/// 输出**逐行完整性**探针（FF-3 沙箱路径的数据保真一侧）。
+///
+/// 回归锁：受限沙箱的管道读线程曾把 `BufReader` 建在读循环内部——每轮新建会读走一整块
+/// （默认 8KB）却只交出一行，缓冲区里的剩余行随 drop 一起丢弃。症状是"命令输出莫名缺行"：
+/// `dir /b` 有 5 个文件，模型只收到第一行，于是反复重跑同一条命令也看不到完整清单。
+/// 这类丢失不会让任何一退出码变红，只有把"每一行都必须到齐"写成断言才拦得住。
+#[tokio::test]
+async fn sandbox_streams_every_output_line() {
+    let names = ["alpha.txt", "bravo.txt", "charlie.txt", "delta.txt", "echofiv.txt"];
+    let ws = unique_dir("lines");
+    for name in names {
+        std::fs::write(ws.join(name), "x").unwrap();
+    }
+
+    let (tx, mut rx) = mpsc::channel(256);
+    let collector = tokio::spawn(async move {
+        let mut lines = Vec::new();
+        while let Some((_, line)) = rx.recv().await {
+            lines.push(line);
+        }
+        lines
+    });
+    let spawn = prepare_spawn(SandboxMode::WorkspaceWrite, "cmd", &["/C", "dir /b"], &ws, tx)
+        .expect("workspace-write 沙箱应可创建");
+    let code = match spawn {
+        PreparedSpawn::Restricted(mut child) => child.wait().await.expect("等待子进程失败"),
+        PreparedSpawn::Plain(_) => panic!("workspace-write 不得退化为无沙箱执行"),
+    };
+    assert_eq!(code, 0, "沙箱内 dir /b 应成功");
+
+    let lines = collector.await.expect("读线程不应 panic");
+    for name in names {
+        assert!(
+            lines.iter().any(|l| l == name),
+            "输出行 {name} 丢失（沙箱管道只回传了部分行）。实际收到：{lines:?}"
+        );
+    }
+    std::fs::remove_dir_all(&ws).ok();
 }
