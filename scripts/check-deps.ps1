@@ -45,7 +45,7 @@ $OutputEncoding = [System.Text.UTF8Encoding]::new($false)
 # 只有共享基础设施 config、events，而它们由下方 $infraModules 全局放行，故表内无需再列，
 # 顺手补进去只会造成冗余。要给这些模块新增业务依赖，必须先改 §2.3.1，再写进这里。
 $allow = @{
-    'agent_loop'   = @('model_client', 'tool_router', 'permission', 'rollout')  # E02–E04、E06
+    'agent_loop'   = @('model_client', 'tool_router', 'permission', 'rollout', 'compaction')  # E02–E04、E06、E23
     'tool_router'  = @('model_client', 'tools')                                 # E08、E11
     'tools'        = @('tool_router', 'sandbox', 'permission')                   # E12–E14
     'permission'   = @()
@@ -54,6 +54,7 @@ $allow = @{
     'events'       = @()
     'config'       = @()
     'rollout'      = @('model_client')                                            # E21
+    'compaction'   = @('model_client')                                             # E22
 }
 # rollout 已落地（SH-030）：它只借用 model_client 的 HistoryItem 作为条目载荷，
 # 不反向依赖循环或工具层——档案是被读写的对象，不是参与者。

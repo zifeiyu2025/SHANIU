@@ -269,6 +269,13 @@ async fn run_one(task: &Task, fixture: &BTreeMap<String, String>, backend: Arc<R
         plan_state,
         workspace_root: ws.clone(),
         max_turns: MAX_TURNS_PER_TASK,
+        // 压缩默认关闭，由 `SHANIU_EVAL_TOKEN_BUDGET` 显式打开。
+        // 必须能分别跑"禁用/启用"两档：SH-032 的验收是"长会话不丢上下文"，
+        // 而基线退化判定要能归因到压缩本身——混在一起就分不清是端点波动还是压缩代价。
+        token_budget: std::env::var("SHANIU_EVAL_TOKEN_BUDGET")
+            .ok()
+            .and_then(|v| v.parse().ok())
+            .unwrap_or(0),
         policy: policy::SessionPolicy {
             approval: ApprovalMode::AutoReadOnly,
             sandbox: SandboxMode::WorkspaceWrite,

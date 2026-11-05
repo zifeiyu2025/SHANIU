@@ -79,6 +79,9 @@ pub struct AgentLoop {
     pub plan_state: Arc<PlanState>,
     pub workspace_root: PathBuf,
     pub max_turns: u32,
+    /// 单会话 token 预算（04 §4 `[agent].token_budget`）：每轮采样前据此判定是否压缩。
+    /// 0 = 不启用压缩（`compaction::plan_if_needed` 对 0 直接返回 None）。
+    pub token_budget: usize,
     pub policy: policy::SessionPolicy,
     /// 会话档案写入器（SH-030）。None = 本次运行不落盘（测试与无目录启动用）。
     pub rollout: Option<Arc<crate::rollout::RolloutWriter>>,
@@ -113,6 +116,73 @@ impl AgentLoop {
         }
         *recorded = history.len();
     }
+
+    /// 就地压缩一段历史：发一次不带工具的总结请求 → 写 `Compacted` 锚点 → 用摘要替换区间。
+    ///
+    /// 三件事的顺序是硬性的：
+    /// 1. **先落锚点、再改内存**。锚点的语义是「重放出的 history 里 `[start,end)` 区间被
+    ///    summary 取代」，所以它必须写在那段条目**之后**——`recorded >= target.range_end`
+    ///    由「每轮末尾都 flush」保证，锚点紧随其后，回放时正好接在那些条目之后生效。
+    ///    顺序反了就会出现锚点指向尚未写入的条目，resume 直接报区间越界。
+    /// 2. **锚点写失败不阻断内存压缩**。丢一次存档可以补，预算超限继续原样发请求
+    ///    就是等着上下文溢出、整轮失败——后者严重得多。落盘失败本身已由
+    ///    `flush_history` 负责播报，这里不再重复刷一条。
+    /// 3. **压缩完必须把落盘游标收到新历史末尾**。`flush_history` 按
+    ///    `history[*recorded..]` 切片，而压缩让 history 变短了：不收游标就是 start > len
+    ///    直接 panic，而且是只在长会话跑到第 N 轮才炸的那种 panic。
+    async fn compact_in_place(
+        &self,
+        history: &mut Vec<HistoryItem>,
+        recorded: &mut usize,
+        target: crate::compaction::Target,
+        instructions: &str,
+        cancel: &tokio_util::sync::CancellationToken,
+    ) -> Result<(), String> {
+        let request = crate::compaction::build_request(history, &target);
+        // 总结请求不带工具声明：它不需要调工具，带上只会让端点多算一份声明开销，
+        // 并给模型一个"还可以继续查"的错误暗示。
+        let mut stream = self
+            .backend
+            .stream(&request, &[], instructions)
+            .await
+            .map_err(|e| format!("压缩请求发起失败，本轮中止：{e}"))?;
+        let mut summary = String::new();
+        loop {
+            let mut stream_pin = stream.as_mut();
+            let next_item = stream_pin.next();
+            tokio::select! {
+                _ = cancel.cancelled() => return Err("压缩被用户取消".to_string()),
+                item = next_item => match item {
+                    None => break,
+                    Some(ModelStreamEvent::OutputTextDelta { delta }) => summary.push_str(&delta),
+                    // 压缩请求不该产出工具调用；真产出了也只能忽略——它不是本轮的答案
+                    Some(_) => {}
+                }
+            }
+        }
+        let summary = crate::compaction::extract_summary(&summary)?;
+
+        if let Some(writer) = &self.rollout {
+            // 写失败在这里静默是刻意的：见上面第 2 点。
+            let _ = writer.append(&crate::rollout::RolloutItem::Compacted {
+                range_start: target.range_start,
+                range_end: target.range_end,
+                summary: summary.clone(),
+            });
+        }
+
+        history.splice(
+            target.range_start..target.range_end,
+            [HistoryItem::Message { role: Role::Assistant, text: summary, reasoning: None }],
+        );
+        *recorded = history.len();
+        tracing::info!(
+            compressed_items = target.range_end - target.range_start,
+            history_len = history.len(),
+            "上下文已压缩（SH-032）"
+        );
+        Ok(())
+    }
 }
 
 impl AgentLoop {
@@ -132,6 +202,7 @@ impl AgentLoop {
             plan_state,
             workspace_root,
             max_turns: TurnBudget::from_config(cfg).max_turns,
+            token_budget: cfg.agent.token_budget,
             policy: policy::SessionPolicy {
                 approval: cfg.approval.mode,
                 sandbox: cfg.sandbox.mode,
@@ -174,6 +245,9 @@ impl AgentLoop {
         let mut recorded = persisted.min(history.len());
         let mut reason = TurnEndReasonLocal::Completed;
         let mut last_turn = 0u32;
+        // 最近一次端点报回的上下文规模，作为压缩判据的观测侧（SH-032）。
+        // 字节估算看不见推理 token 与工具声明开销，只有端点的 input_tokens 是真实值。
+        let mut observed_input_tokens = 0usize;
         let emit = |sink: &Arc<dyn crate::events::EventSink>, msg: EventMsg| {
             let _ = sink.emit(&msg);
         };
@@ -191,6 +265,25 @@ impl AgentLoop {
             );
             // 计划态下只向模型声明只读工具 + exit_plan_mode（ADR-003 双层防御第一层）
             let declarations = declarations_for(&self.router, self.plan_state.is_active());
+
+            // 2.5) 采样前检查 token 预算（ADR-001：「每轮采样前检查 token 预算触发 compaction」）。
+            // 位置必须在采样之前：压缩的产物要对本轮请求可见才有意义，放轮末等于压了个寂寞
+            // ——那一轮的上下文照样发出去，溢出照旧。
+            if let Some(target) = crate::compaction::plan_if_needed(
+                observed_input_tokens,
+                &history,
+                self.token_budget,
+            ) {
+                if let Err(message) = self
+                    .compact_in_place(&mut history, &mut recorded, target, &instructions, &cancel)
+                    .await
+                {
+                    emit(&sink, EventMsg::Error { message });
+                    reason = TurnEndReasonLocal::Failed;
+                    break 'outer;
+                }
+            }
+
             let mut stream = match self.backend.stream(&history, &declarations, &instructions).await {
                 Ok(s) => s,
                 Err(e) => {
@@ -244,6 +337,7 @@ impl AgentLoop {
                 }
             }
             if let Some(u) = usage {
+                observed_input_tokens = usize::try_from(u.input_tokens).unwrap_or(usize::MAX);
                 emit(&sink, EventMsg::TokenUsage {
                     turn,
                     input_tokens: u.input_tokens,
@@ -564,6 +658,9 @@ mod tests {
             plan_state: Arc::new(PlanState::new()),
             workspace_root: std::env::temp_dir(),
             max_turns: 3,
+            // 既有循环用例一律不启用压缩：它们断言的是轮次与工具回填行为，
+            // 混进压缩会让"为什么这轮历史变短"变成隐性变量。
+            token_budget: 0,
             policy: policy::SessionPolicy {
                 approval: crate::config::ApprovalMode::Ask,
                 sandbox: crate::config::SandboxMode::WorkspaceWrite,
@@ -884,6 +981,7 @@ mod tests {
             plan_state,
             workspace_root: workspace,
             max_turns: 2,
+            token_budget: 0,
             policy: policy::SessionPolicy {
                 approval: crate::config::ApprovalMode::Ask,
                 sandbox: crate::config::SandboxMode::WorkspaceWrite,

@@ -105,6 +105,7 @@ fn harness(tool_name: &str) -> Harness {
         plan_state: Arc::new(PlanState::new()),
         workspace_root: std::env::temp_dir(),
         max_turns: 2,
+        token_budget: 0,
         policy: policy::SessionPolicy {
             approval: ApprovalMode::Ask,
             sandbox: SandboxMode::WorkspaceWrite,

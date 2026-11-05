@@ -111,6 +111,7 @@ async fn measure_once(first_byte: Duration) -> (Duration, Duration) {
         plan_state: Arc::new(PlanState::new()),
         workspace_root: std::env::temp_dir(),
         max_turns: 1,
+        token_budget: 0,
         policy: policy::SessionPolicy {
             approval: ApprovalMode::Ask,
             sandbox: SandboxMode::WorkspaceWrite,
@@ -227,6 +228,7 @@ async fn first_delta_latency_within_budget_on_real_endpoint() {
             plan_state: Arc::new(PlanState::new()),
             workspace_root: std::env::temp_dir(),
             max_turns: 1,
+            token_budget: 0,
             policy: policy::SessionPolicy {
                 approval: ApprovalMode::Ask,
                 sandbox: SandboxMode::ReadOnly,

@@ -2,6 +2,7 @@
 pub mod agent_loop;
 pub mod app_state;
 pub mod config;
+pub mod compaction;
 pub mod events;
 pub mod model_client;
 pub mod sandbox;

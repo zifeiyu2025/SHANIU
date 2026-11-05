@@ -30,6 +30,7 @@ pub struct AppConfig {
     pub sandbox: SandboxConfig,
     pub approval: ApprovalConfig,
     pub workspace: WorkspaceConfig,
+    pub agent: AgentConfig,
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
@@ -51,6 +52,24 @@ impl Default for ModelConfig {
             model: String::new(),
             max_turns: 32,
         }
+    }
+}
+
+/// Agent 运行预算（04 §4 的 `[agent]` 段）。
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(default)]
+pub struct AgentConfig {
+    /// 单会话累计 token 预算。达到它就触发压缩（SH-032），
+    /// 默认值取 04 §4 规定的 `token_budget = 500000`。
+    ///
+    /// 这是**预算**而不是硬顶：硬顶是 `model.max_turns`（轮数维度，SH-034 才补 token
+    /// 维度的硬顶）。预算的语义是"该收口了"，不是"必须停下"。
+    pub token_budget: usize,
+}
+
+impl Default for AgentConfig {
+    fn default() -> Self {
+        Self { token_budget: 500_000 }
     }
 }
 
