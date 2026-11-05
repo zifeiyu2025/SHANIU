@@ -1,4 +1,4 @@
-import type { ReactNode } from 'react';
+import { useState, type ReactNode } from 'react';
 import { useStoreSelector } from '../../store/engine';
 import type { SessionStore } from '../../store/session-store';
 import type { Transport } from '../../transport/types';
@@ -7,15 +7,17 @@ import { StreamingText } from '../markdown/StreamingText';
 import { ApprovalCard } from '../approval/ApprovalCard';
 import { ToolCallCard } from '../blocks/ToolCallCard';
 import { Composer } from './Composer';
+import { Greeting } from './Greeting';
 
 /** 会话内容列宽（dsh ConversationRoot.module.css:468-471）。 */
 const CONTENT_WIDTH = 'w-[clamp(680px,64%,920px)]';
 
 /**
  * 会话主区（复刻 dsh ConversationRoot）：
- * header 76px（0.5px l3 底边、面包屑 crumb）；空态输入卡垂直居中（32px 上浮）；
- * 有消息时内容列 clamp(680,64%,920) 居中 + composer sticky 沉底（顶部 36px 渐隐遮罩）。
- * 空态欢迎区（标题/徽章/工作区 chips）已按需求移除，后续参考 dsh HeroShell 补齐。
+ * header 76px（0.5px l3 底边、面包屑 crumb）；
+ * 空态：欢迎语（Greeting）+ 居中 hero 输入卡；有消息时内容列 clamp(680,64%,920)
+ * 居中 + composer sticky 沉底（顶部 36px 渐隐遮罩）。欢迎语在启动/新建对话时各取一次本地时间
+ * （零定时器：新会话按钮 reset 后换 greetingEpoch 作为 key 重新挂载）。标题/徽章/工作区 chips 仍未补齐。
  */
 export function ChatView({
   store,
@@ -30,12 +32,18 @@ export function ChatView({
   const status = useStoreSelector(store, (s) => s.status);
   const running = status === 'running';
   const empty = nodes.length === 0;
+  // 新建对话：清空会话 + 换 key，让欢迎语重新取一次时间（仅这两个时机更新，无定时器）
+  const [greetingEpoch, setGreetingEpoch] = useState(0);
 
   return (
     <div className="flex h-full min-h-0 flex-col">
       <header className="flex h-[76px] shrink-0 items-end justify-between border-b-[0.5px] border-line3 px-5 pb-2">
         <button
           type="button"
+          onClick={() => {
+            store.reset();
+            setGreetingEpoch((n) => n + 1);
+          }}
           className="max-w-[220px] truncate rounded-md px-2 py-1 text-[14px] leading-5 font-medium text-primary transition-colors duration-100 hover:bg-hover"
         >
           新会话
@@ -46,6 +54,7 @@ export function ChatView({
       {empty ? (
         <div className="flex min-h-0 flex-1 items-center justify-center px-4">
           <div className={`w-full ${CONTENT_WIDTH} max-w-full pb-8`}>
+            <Greeting key={greetingEpoch} />
             <Composer store={store} transport={transport} disabled={running} running={running} hero />
           </div>
         </div>
