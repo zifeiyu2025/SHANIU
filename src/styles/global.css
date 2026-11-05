@@ -90,6 +90,14 @@
     0 0 20px rgb(0 0 0 / 0.05);
 
   --ds-ease: cubic-bezier(0.4, 0, 0.2, 1);
+
+  /* —— 圆角原值（base.css:18-23）：与颜色同一分层，组件的裸 CSS 直接认 --dsw-* —— */
+  --dsw-radius-xs: 4px;
+  --dsw-radius-sm: 8px;
+  --dsw-radius-md: 12px;
+  --dsw-radius-lg: 16px;
+  --dsw-radius-xl: 20px;
+  --dsw-radius-panel: 28px;
 }
 
 /* —— 暗色覆盖（对齐 dsh design-platform.css:300-420） —— */
@@ -159,13 +167,13 @@ body[data-ds-dark-theme] {
   --color-input-major: var(--dsw-input-major);
   --color-mask: var(--dsw-mask-1);
 
-  /* 圆角体系（base.css:18-23）：chip 8 / 行卡 12 / 代码菜单 16 / 气泡 20 / composer 28 */
-  --radius-xs: 4px;
-  --radius-sm: 8px;
-  --radius-md: 12px;
-  --radius-lg: 16px;
-  --radius-xl: 20px;
-  --radius-panel: 28px;
+  /* 圆角体系：映射到 :root 的 --dsw-radius-*，值只有一处事实来源 */
+  --radius-xs: var(--dsw-radius-xs);
+  --radius-sm: var(--dsw-radius-sm);
+  --radius-md: var(--dsw-radius-md);
+  --radius-lg: var(--dsw-radius-lg);
+  --radius-xl: var(--dsw-radius-xl);
+  --radius-panel: var(--dsw-radius-panel);
 
   --shadow-soft: var(--dsw-elevation-soft);
   --shadow-panel: var(--dsw-elevation-panel);
@@ -218,14 +226,41 @@ body {
   background: transparent;
 }
 
-/* focus ring 2px 蓝（focus.css:3）；交互过渡 100ms（base.css:14-17） */
-:focus-visible {
-  outline: 2px solid var(--dsw-business-primary);
-  outline-offset: -1px;
+/* focus ring 2px 蓝（focus.css:3）。必须落在 base 层：未分层的规则优先级高于
+   Tailwind 的 utilities 层，那样输入卡里 textarea 的 `outline-none` 就压不住它，
+   结果是 28px 圆角卡内部被画出一圈方形蓝框（dsh 的 .input 是 outline:none，
+   焦点由卡承担，InputBar.module.css:198）。 */
+@layer base {
+  :focus-visible {
+    outline: 2px solid var(--dsw-business-primary);
+    outline-offset: -1px;
+  }
 }
 
 button {
   cursor: pointer;
+}
+
+/* 会话宽度轴（ConversationRoot.module.css:468-473 + ChatView.module.css:64-68）：
+   正文列、输入卡、回到底部控件共用同一条轴，而不是各自拼 Tailwind 宽度类——
+   拼类会出现 `w-full` 与 `w-[clamp(...)]` 同元素冲突，clamp 被静默覆盖，
+   输入卡铺满整幅而正文列仍是 680，两者边缘彻底脱开。
+   轴的度量：正文列 max-width = content-width；输入卡 = content-width + 32，
+   即卡的外缘正好比正文文字外缘各宽 16px（那 16px 是正文列外的 padding）。 */
+.chat-body {
+  --chat-content-width: clamp(680px, 64%, 920px);
+  --composer-card-max-width: calc(var(--chat-content-width) + 32px);
+}
+
+.chat-column {
+  width: 100%;
+  max-width: var(--chat-content-width);
+  margin-inline: auto;
+}
+
+.composer-seat {
+  width: min(var(--composer-card-max-width), 100%);
+  margin-inline: auto;
 }
 
 /* 消息行操作条（照抄 MessageIconActions.module.css:5-60,63-94）：

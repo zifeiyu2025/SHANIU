@@ -14,9 +14,6 @@ import { Greeting } from './Greeting';
 import { QueueDock } from './QueueDock';
 import { MessageActions } from '../message/MessageActions';
 
-/** 会话内容列宽（dsh ConversationRoot.module.css:468-471）。 */
-const CONTENT_WIDTH = 'w-[clamp(680px,64%,920px)]';
-
 /** 距底小于这个距离就算"贴在底部"，流式时继续跟随；超过说明用户在上翻，不再打断。
  *  24px 是 dsh 的 FOLLOW_THRESHOLD（use-chat-reading.ts:7，实际传入 24+1）。 */
 const PIN_TO_BOTTOM_PX = 24;
@@ -115,7 +112,7 @@ export function ChatView({
   }, [nodes]);
 
   return (
-    <div className="flex h-full min-h-0 flex-col">
+    <div className="chat-body flex h-full min-h-0 flex-col">
       <header className="flex h-[76px] shrink-0 items-center justify-between gap-3 border-b-[0.5px] border-line3 pl-5 pr-7">
         {/* crumb（dsh ConversationRoot.module.css:136-169）：.crumbs gap 4px、
             .crumbSep "/" 14/20 caption、.crumb max-w 220 + r8 + pad 4/8 + tertiary、
@@ -158,9 +155,9 @@ export function ChatView({
               const el = e.currentTarget;
               pinToBottom(el.scrollHeight - el.scrollTop - el.clientHeight < PIN_TO_BOTTOM_PX);
             }}
-            className="min-h-0 flex-1 overflow-y-auto"
+            className="min-h-0 flex-1 overflow-y-auto px-4"
           >
-            <div className={`mx-auto mt-4 flex flex-col ${CONTENT_WIDTH} max-w-full px-4 pb-6`}>
+            <div className="chat-column mt-4 flex flex-col pb-6">
               {nodes.map((node) => (
                 <NodeItem
                   key={node.id}
@@ -175,7 +172,7 @@ export function ChatView({
               !followingTail；控件 34 圆、静止时贴在输入卡上方 16px，右缘对齐内容列。 */}
           {!following && (
             <div className="pointer-events-none absolute inset-x-0 bottom-4 z-[8]">
-              <div className={`mx-auto flex ${CONTENT_WIDTH} max-w-full justify-end px-4`}>
+              <div className="chat-column flex justify-end">
                 <button
                   type="button"
                   aria-label="回到底部"
@@ -207,7 +204,7 @@ export function ChatView({
         {!empty && (
           <div className="pointer-events-none absolute bottom-full left-0 right-0 h-9 bg-gradient-to-t from-canvas to-transparent" />
         )}
-        <div className={`flex w-full max-w-full flex-col ${CONTENT_WIDTH}`}>
+        <div className="composer-seat flex flex-col">
           {empty && <Greeting key={generation} />}
           <QueueDock items={queued} onRemove={(i) => store.removeQueuedTask(i)} />
           <Composer
