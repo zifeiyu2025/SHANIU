@@ -187,6 +187,48 @@ export function StopIcon({ className }: IconProps) {
   );
 }
 
+/** 待发队列（dsh IconQueueOutlineRegular 同形：三条右对齐横线 + 引导线）。 */
+export function QueueIcon({ className }: IconProps) {
+  return (
+    <svg {...base(className)}>
+      <line x1="9" y1="6" x2="20" y2="6" />
+      <line x1="9" y1="12" x2="20" y2="12" />
+      <line x1="9" y1="18" x2="20" y2="18" />
+      <circle cx="4.5" cy="6" r="1" fill="currentColor" stroke="none" />
+      <circle cx="4.5" cy="12" r="1" fill="currentColor" stroke="none" />
+      <circle cx="4.5" cy="18" r="1" fill="currentColor" stroke="none" />
+    </svg>
+  );
+}
+
+export function TrashIcon({ className }: IconProps) {
+  return (
+    <svg {...base(className)}>
+      <line x1="4" y1="7" x2="20" y2="7" />
+      <path d="M6.5 7v12a1.5 1.5 0 0 0 1.5 1.5h8a1.5 1.5 0 0 0 1.5-1.5V7" />
+      <path d="M9.5 7V4.5A1.5 1.5 0 0 1 11 3h2a1.5 1.5 0 0 1 1.5 1.5V7" />
+    </svg>
+  );
+}
+
+/** 发送中：整圈淡、局部深的旋转弧（dsh 用 Spinner，同形态）。 */
+export function SpinnerIcon({ className }: IconProps) {
+  return (
+    <svg {...base(className)}>
+      <circle cx="12" cy="12" r="8" opacity="0.25" />
+      <path d="M20 12a8 8 0 0 0-8-8" />
+    </svg>
+  );
+}
+
+export function ChevronUpIcon({ className }: IconProps) {
+  return (
+    <svg {...base(className)}>
+      <polyline points="6,15 12,9 18,15" />
+    </svg>
+  );
+}
+
 export function SearchIcon({ className }: IconProps) {
   return (
     <svg {...base(className)}>

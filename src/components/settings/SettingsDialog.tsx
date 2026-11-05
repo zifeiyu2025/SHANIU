@@ -48,6 +48,16 @@ export function SettingsDialog({
     };
   }, [transport]);
 
+  // Esc 关设置卡。会话区的「Esc = 停止生成」看到 role=dialog 存在就让位（dsh 的
+  // Escape 分层关浮层），所以这里只管关掉自己，不需要 stopPropagation。
+  useEffect(() => {
+    const onKey = (e: KeyboardEvent) => {
+      if (e.key === 'Escape') onClose();
+    };
+    window.addEventListener('keydown', onKey);
+    return () => window.removeEventListener('keydown', onKey);
+  }, [onClose]);
+
   async function save() {
     setError(null);
     try {
@@ -67,9 +77,22 @@ export function SettingsDialog({
     <div
       className="fixed inset-0 z-40 flex items-center justify-center bg-mask"
       data-testid="settings-dialog"
+      onMouseDown={(e) => {
+        // 点遮罩关闭：只有落在遮罩本身才算"点外面"，冒泡自面板的不算
+        if (e.target === e.currentTarget) onClose();
+      }}
     >
-      <div className="w-[460px] rounded-lg bg-layer1 p-5 shadow-panel">
-        <h2 className="mb-4 text-[16px] font-medium leading-6 text-primary">设置</h2>
+      {/* role=dialog 同时是会话区 Esc 分层判据的依据：浮层开着时 Esc 归浮层，
+          不该顺手把正在跑的任务取消掉（dsh keymap 的 Escape 分层关浮层同规则）。 */}
+      <div
+        role="dialog"
+        aria-modal="true"
+        aria-labelledby="settings-title"
+        className="w-[460px] rounded-lg bg-layer1 p-5 shadow-panel"
+      >
+        <h2 id="settings-title" className="mb-4 text-[16px] font-medium leading-6 text-primary">
+          设置
+        </h2>
 
         {error && (
           <div role="alert" className="mb-3 rounded-md bg-danger/10 px-3 py-2 text-[13px] text-danger">

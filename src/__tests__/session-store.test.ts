@@ -46,6 +46,37 @@ describe('session store', () => {
     ]);
   });
 
+  // SH-088：待发队列的三条硬约束——不入空串、取走是原子的、越界撤回不动别的
+  describe('待发队列', () => {
+    it('enqueue 去空白、空串不入队；shift 取走即出队且保序', () => {
+      const store = createSessionStore();
+      store.enqueueTask('  甲  ');
+      store.enqueueTask('   ');
+      store.enqueueTask('乙');
+      expect(store.getState().queued).toEqual(['甲', '乙']);
+
+      expect(store.shiftQueuedTask()).toBe('甲');
+      expect(store.getState().queued).toEqual(['乙']);
+      expect(store.shiftQueuedTask()).toBe('乙');
+      expect(store.shiftQueuedTask()).toBeNull(); // 空队列取不到，也不会报错
+    });
+
+    it('removeQueuedTask 按下标撤回，越界不动状态', () => {
+      const store = createSessionStore();
+      store.enqueueTask('甲');
+      store.enqueueTask('乙');
+      const before = store.getState();
+
+      store.removeQueuedTask(9);
+      expect(store.getState().queued).toEqual(['甲', '乙']);
+      // immer 结构共享：没改动就不产生新快照
+      expect(store.getState().queued).toBe(before.queued);
+
+      store.removeQueuedTask(0);
+      expect(store.getState().queued).toEqual(['乙']);
+    });
+  });
+
   // SH-081：App 级全局订阅不受 reset 影响，旧轮在途事件必须被代次门禁丢弃
   describe('会话窗口门禁', () => {
     it('reset 后旧轮的在途事件不再落入新会话', () => {
@@ -53,6 +84,8 @@ describe('session store', () => {
       store.submitUserTask('旧任务');
       store.dispatch({ type: 'turn_started', turn: 1 });
       store.dispatch({ type: 'agent_message_delta', delta: '旧轮输出' });
+      store.setSending(true);
+      store.enqueueTask('旧会话的排队');
       expect(store.getState().nodes).toHaveLength(2);
 
       store.reset();
@@ -67,6 +100,9 @@ describe('session store', () => {
       expect(after.usage).toBeNull();
       expect(after.status).toBe('idle');
       expect(after.lastTurnEnd).toBeNull();
+      // 排队消息与在途标记同属上一个会话：带进新会话会在下一次空闲跃变时凭空发出去
+      expect(after.queued).toEqual([]);
+      expect(after.sending).toBe(false);
     });
 
     it('新会话提交任务后重开窗口，事件恢复归约', () => {

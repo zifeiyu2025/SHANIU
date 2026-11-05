@@ -9,6 +9,10 @@ export function applyTurnEvent(state: Draft<SessionState>, msg: TurnEvent): void
     case 'turn_started':
       state.status = 'running';
       state.currentTurn = msg.turn;
+      // 「提交在途」到这里为止（dsh 的 phase: sending → running）。不能等 transport 的
+      // promise 落地：mock 整轮流完才 resolve，真机 IPC 立刻返回——两种传输下 sending
+      // 的时长能差一整轮，主按钮就会在流式期间一直显示"正在发送消息"既不能停止也不能排队。
+      state.sending = false;
       break;
     case 'turn_completed':
       state.status = 'idle';

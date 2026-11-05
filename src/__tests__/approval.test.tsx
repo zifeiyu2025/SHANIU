@@ -4,10 +4,11 @@ import { produce } from 'immer';
 import { applyEvent } from '../store/reducers';
 import { ApprovalCard } from '../components/approval/ApprovalCard';
 import type { EventMsg, Transport } from '../transport/types';
+import { initialSessionState } from '../store/session-store';
 import type { SessionState } from '../store/session-store';
 
 function initialState(): SessionState {
-  return { status: 'idle', currentTurn: 0, lastTurnEnd: null, nodes: [], usage: null, generation: 0 };
+  return initialSessionState();
 }
 
 function reduce(state: SessionState, msg: EventMsg): SessionState {

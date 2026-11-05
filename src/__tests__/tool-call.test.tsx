@@ -7,12 +7,13 @@ import { ToolCallCard } from '../components/blocks/ToolCallCard';
 import { ChatView } from '../components/chat/ChatView';
 import { createSessionStore } from '../store/session-store';
 import { createMockTransport } from '../transport/mock';
+import { initialSessionState } from '../store/session-store';
 import type { SessionState } from '../store/session-store';
 import type { ToolCallNode, ToolCallStatus } from '../nodes/types';
 import type { EventMsg, ToolCallResult } from '../transport/types';
 
 function initialState(): SessionState {
-  return { status: 'idle', currentTurn: 0, lastTurnEnd: null, nodes: [], usage: null, generation: 0 };
+  return initialSessionState();
 }
 
 function reduce(state: SessionState, msg: EventMsg): SessionState {

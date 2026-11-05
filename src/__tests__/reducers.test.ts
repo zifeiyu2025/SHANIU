@@ -1,11 +1,12 @@
 import { describe, expect, it } from 'vitest';
 import { produce } from 'immer';
 import { applyEvent } from '../store/reducers';
+import { initialSessionState } from '../store/session-store';
 import type { SessionState } from '../store/session-store';
 import type { EventMsg } from '../transport/types';
 
 function initialState(): SessionState {
-  return { status: 'idle', currentTurn: 0, lastTurnEnd: null, nodes: [], usage: null, generation: 0 };
+  return initialSessionState();
 }
 
 function reduce(state: SessionState, msg: EventMsg): SessionState {
@@ -17,6 +18,14 @@ describe('reducers', () => {
     const state = reduce(initialState(), { type: 'turn_started', turn: 3 });
     expect(state.status).toBe('running');
     expect(state.currentTurn).toBe(3);
+  });
+
+  it('turn_started 结束「提交在途」：sending 不跟 transport 的 promise 走', () => {
+    const base = { ...initialState(), sending: true, queued: ['下一条'] };
+    const state = reduce(base, { type: 'turn_started', turn: 1 });
+    expect(state.sending).toBe(false);
+    // 队列不受轮次事件影响：收口由 ChatView 在 running→idle 跃变时做
+    expect(state.queued).toEqual(['下一条']);
   });
 
   it('agent_message_delta 首次新建流式节点，后续追加', () => {

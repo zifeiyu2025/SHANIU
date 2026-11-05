@@ -1,56 +1,96 @@
-import { useState } from 'react';
+import { useRef, useState } from 'react';
 import { useStoreSelector } from '../../store/engine';
 import type { SessionStore } from '../../store/session-store';
 import type { Transport } from '../../transport/types';
+import { sendTaskNow } from '../../utils/session-actions';
 import { formatTokens } from '../../utils/token-format';
-import { ArrowUpIcon, ChevronDownIcon, DatabaseIcon, PlusIcon, StopIcon, WarningIcon } from '../icons';
+import { ArrowUpIcon, ChevronDownIcon, DatabaseIcon, PlusIcon, QueueIcon, SpinnerIcon, StopIcon, WarningIcon } from '../icons';
 
 /**
  * 输入卡（复刻 dsh InputBar）：
  * r28(panel)、无 border（0.5px 描边画进 elevation-soft 阴影）、bg specific-input-major；
  * 文本面 hero 52px/停靠 36px、pad 4 8 0 14、placeholder #81858C；
  * 工具行 pad 2 8 6：+ 28 圆(selector)、chip 28(r8 13/20 wt500)、发送 34 圆(deepseek-400)。
+ *
+ * 交互判据照抄 dsh（InputBar.tsx:155-171,365-396）：
+ * - `editable` 不含 running——流式期间照样能打字（停止不锁输入）；只有 blocked
+ *   （审批挂起）才锁，对应 dsh 的 `disabled = ... || blocked !== undefined`。
+ * - `primaryStops = running && !sending && (empty || blocked)`——空草稿时主按钮是停止。
+ * - 我们只有单任务槽、没有插话（steer）能力，所以 running + 有草稿走**排队发送**：
+ *   真实入队、本轮结束后由 ChatView 按序发出，而不是把按钮画成点了必然失败的样子。
  */
 export function Composer({
   store,
   transport,
-  disabled,
   running,
+  blocked,
   hero = false,
 }: {
   store: SessionStore;
   transport: Transport;
-  disabled: boolean;
   running: boolean;
+  /** 有挂起审批：dsh 的 blocked，锁输入但不锁模型席位。 */
+  blocked: boolean;
   hero?: boolean;
 }) {
   const [text, setText] = useState('');
+  // dsh 的 IME 守卫是三重：isComposing / keyCode 229 / compositionend 后 10ms 窗口
+  // （keymap.ts:51-55,189-196）。只判 isComposing 在部分 WebView 上会漏——compositionend
+  // 与 keydown 的先后顺序不保证，漏判就是"选词回车把消息发出去了"。
+  const composingUntil = useRef(0);
   const currentTurn = useStoreSelector(store, (s) => s.currentTurn);
   const usage = useStoreSelector(store, (s) => s.usage);
+  const sending = useStoreSelector(store, (s) => s.sending);
 
-  function submit() {
+  const empty = text.trim() === '';
+  const primaryStops = running && !sending && (empty || blocked);
+  const primaryQueues = !primaryStops && !sending && running && !blocked && !empty;
+  const primaryDisabled = primaryStops ? false : sending || empty || blocked;
+  const primaryLabel = primaryStops
+    ? '停止生成'
+    : sending
+      ? '正在发送消息'
+      : primaryQueues
+        ? '排队发送'
+        : '发送消息';
+
+  function onPrimary() {
+    if (primaryStops) {
+      void transport.cancel();
+      return;
+    }
+    if (primaryDisabled) return;
     const task = text.trim();
-    if (!task || disabled) return;
     setText('');
-    store.submitUserTask(task);
-    transport.sendTask(task).catch((err: unknown) => {
-      store.dispatch({ type: 'error', message: `任务提交失败：${String(err)}` });
-    });
+    if (primaryQueues) store.enqueueTask(task);
+    else sendTaskNow(store, transport, task);
   }
 
   return (
-    <div className="w-full rounded-panel bg-input-major shadow-soft">
+    <div className="relative z-10 w-full rounded-panel bg-input-major shadow-soft">
       <textarea
         rows={hero ? 2 : 1}
         value={text}
-        disabled={disabled}
-        placeholder="描述你想要构建的内容， / 调用指令， @ 文件或对话"
+        disabled={blocked}
+        placeholder={blocked ? '等待审批裁决，处理完即可继续输入' : '描述你想要构建的内容， / 调用指令， @ 文件或对话'}
         onChange={(e) => setText(e.target.value)}
+        onCompositionEnd={() => {
+          composingUntil.current = Date.now() + 10;
+        }}
         onKeyDown={(e) => {
-          // Enter 提交，Shift+Enter 换行；输入法组词中不提交
-          if (e.key === 'Enter' && !e.shiftKey && !e.nativeEvent.isComposing) {
+          // Enter 提交，Shift+Enter 换行；输入法组词中不提交。
+          // 守卫必须在 preventDefault 之前：组词期间吞掉 keydown 会让输入法自己
+          // 没法确认候选词（表现为"按回车选不了字"）。
+          if (e.key === 'Enter' && !e.shiftKey) {
+            if (
+              e.nativeEvent.isComposing ||
+              e.keyCode === 229 ||
+              Date.now() < composingUntil.current
+            ) {
+              return;
+            }
             e.preventDefault();
-            submit();
+            onPrimary();
           }
         }}
         className={`w-full resize-none bg-transparent px-3.5 pt-2 text-[14px] leading-6 text-primary caret-accent outline-none placeholder:text-(--dsw-placeholder) disabled:opacity-50 ${
@@ -110,26 +150,25 @@ export function Composer({
             High
             <ChevronDownIcon className="h-3 w-3 text-caption" />
           </button>
-          {running ? (
-            <button
-              type="button"
-              aria-label="停止"
-              onClick={() => transport.cancel()}
-              className="flex h-[34px] w-[34px] -translate-y-0.5 items-center justify-center rounded-full bg-accent text-white transition-colors duration-100 hover:bg-accent-strong"
-            >
+          <button
+            type="button"
+            aria-label={primaryLabel}
+            title={primaryLabel}
+            aria-busy={sending}
+            disabled={primaryDisabled}
+            onClick={onPrimary}
+            className="flex h-[34px] w-[34px] -translate-y-0.5 items-center justify-center rounded-full bg-accent text-white transition-colors duration-100 hover:bg-accent-strong disabled:opacity-40"
+          >
+            {primaryStops ? (
               <StopIcon className="h-3 w-3" />
-            </button>
-          ) : (
-            <button
-              type="button"
-              aria-label="发送"
-              onClick={submit}
-              disabled={!text.trim()}
-              className="flex h-[34px] w-[34px] -translate-y-0.5 items-center justify-center rounded-full bg-accent text-white transition-opacity duration-100 disabled:opacity-40"
-            >
+            ) : sending ? (
+              <SpinnerIcon className="h-4 w-4 animate-spin" />
+            ) : primaryQueues ? (
+              <QueueIcon className="h-4 w-4" />
+            ) : (
               <ArrowUpIcon className="h-4 w-4" />
-            </button>
-          )}
+            )}
+          </button>
         </div>
       </div>
     </div>

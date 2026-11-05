@@ -18,3 +18,25 @@ export function workspaceDisplayName(root: string): string {
   const parts = trimmed.split(/[/\\]+/).filter(Boolean);
   return parts[parts.length - 1] ?? trimmed;
 }
+
+/**
+ * 发出一条任务的唯一路径（Composer 主按钮与队列收口共用，避免两处各写一半）：
+ * 记用户节点 → 标提交在途 → IPC → 失败落 error 事件并解除在途。
+ * 在途标记必须在这里而不是 Composer 里：发送成功后空态 hero 卡会换成沉底卡，
+ * 组件实例没了，局部 state 也就丢了。
+ */
+export function sendTaskNow(
+  store: SessionStore,
+  transport: Transport,
+  task: string,
+): void {
+  store.submitUserTask(task);
+  store.setSending(true);
+  transport.sendTask(task).then(
+    () => store.setSending(false),
+    (err: unknown) => {
+      store.setSending(false);
+      store.dispatch({ type: 'error', message: `任务提交失败：${String(err)}` });
+    },
+  );
+}

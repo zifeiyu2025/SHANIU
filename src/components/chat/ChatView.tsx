@@ -3,12 +3,14 @@ import { useStoreSelector } from '../../store/engine';
 import type { SessionStore } from '../../store/session-store';
 import type { Transport } from '../../transport/types';
 import type { ConversationNode } from '../../nodes/types';
+import { sendTaskNow } from '../../utils/session-actions';
 import { StreamingText } from '../markdown/StreamingText';
 import { ApprovalCard } from '../approval/ApprovalCard';
 import { ToolCallCard } from '../blocks/ToolCallCard';
 import { ReasoningBlock } from '../blocks/ReasoningBlock';
 import { Composer } from './Composer';
 import { Greeting } from './Greeting';
+import { QueueDock } from './QueueDock';
 
 /** 会话内容列宽（dsh ConversationRoot.module.css:468-471）。 */
 const CONTENT_WIDTH = 'w-[clamp(680px,64%,920px)]';
@@ -50,10 +52,43 @@ export function ChatView({
   const nodes = useStoreSelector(store, (s) => s.nodes);
   const status = useStoreSelector(store, (s) => s.status);
   const generation = useStoreSelector(store, (s) => s.generation);
+  const sending = useStoreSelector(store, (s) => s.sending);
+  const queued = useStoreSelector(store, (s) => s.queued);
   const running = status === 'running';
   const empty = nodes.length === 0;
+  // dsh 的 blocked（InputBar.tsx:155）：挂起审批才锁输入，running 本身不锁。
+  const blocked = nodes.some((n) => n.kind === 'approval' && n.status === 'pending');
   const scrollRef = useRef<HTMLDivElement>(null);
   const pinned = useRef(true);
+
+  // Esc = 停止生成（dsh apply.ts:292-299 `response.stop` 绑 Escape）。分层规则照抄
+  // dsh 的 keymap：浮层先吃 Esc——设置卡开着时 Esc 是关卡，不能顺手把任务也取消了。
+  useEffect(() => {
+    if (!running) return;
+    const onKey = (e: KeyboardEvent) => {
+      if (e.key !== 'Escape') return;
+      if (document.querySelector('[role="dialog"]')) return;
+      e.preventDefault();
+      void transport.cancel();
+    };
+    window.addEventListener('keydown', onKey);
+    return () => window.removeEventListener('keydown', onKey);
+  }, [running, transport]);
+
+  // 待发队列收口：只在「一轮刚跑完」这个跃变上放队首，不在挂载/空闲时凭空开火
+  // （dsh 的 inbox 语义就是 next-turn）。sending 还挂着时不清标记，等 IPC 回执到了再放，
+  // 避免并发提交撞上后端单任务槽。取走用 shiftQueuedTask()（原子删除），StrictMode 双跑也只发一次。
+  const wasRunning = useRef(false);
+  useEffect(() => {
+    if (running) {
+      wasRunning.current = true;
+      return;
+    }
+    if (!wasRunning.current || sending) return;
+    wasRunning.current = false;
+    const task = store.shiftQueuedTask();
+    if (task !== null) sendTaskNow(store, transport, task);
+  }, [running, sending, queued, store, transport]);
 
   // 新会话时代次变化：回到顶部语义（重新贴底），否则旧会话的上翻位置会残留
   useEffect(() => {
@@ -97,40 +132,48 @@ export function ChatView({
         </div>
       </header>
 
-      {empty ? (
-        <div className="flex min-h-0 flex-1 items-center justify-center px-4">
-          <div className={`w-full ${CONTENT_WIDTH} max-w-full pb-8`}>
-            <Greeting key={generation} />
-            <Composer store={store} transport={transport} disabled={running} running={running} hero />
+      {/* 输入区常驻（dsh 的 composer 在空态/会话态之间只由 CSS 位移，不换实例）：
+          换实例会把正在输入的草稿和焦点一起丢掉——真机实测第一条发出后第二条消失过。 */}
+      {!empty && (
+        <div
+          ref={scrollRef}
+          onScroll={(e) => {
+            const el = e.currentTarget;
+            pinned.current = el.scrollHeight - el.scrollTop - el.clientHeight < PIN_TO_BOTTOM_PX;
+          }}
+          className="min-h-0 flex-1 overflow-y-auto"
+        >
+          <div className={`mx-auto mt-4 flex flex-col ${CONTENT_WIDTH} max-w-full px-4 pb-6`}>
+            {nodes.map((node) => (
+              <NodeItem key={node.id} node={node} transport={transport} />
+            ))}
           </div>
         </div>
-      ) : (
-        <>
-          {/* 滚动区只包消息（dsh .scrollBody）：composer 是它的兄弟节点，
-              短会话时也常驻底部，而不是跟在最后一条消息后面飘在中间 */}
-          <div
-            ref={scrollRef}
-            onScroll={(e) => {
-              const el = e.currentTarget;
-              pinned.current = el.scrollHeight - el.scrollTop - el.clientHeight < PIN_TO_BOTTOM_PX;
-            }}
-            className="min-h-0 flex-1 overflow-y-auto"
-          >
-            <div className={`mx-auto mt-4 flex flex-col ${CONTENT_WIDTH} max-w-full px-4 pb-6`}>
-              {nodes.map((node) => (
-                <NodeItem key={node.id} node={node} transport={transport} />
-              ))}
-            </div>
-          </div>
-          {/* 沉底输入卡 + 卡片上方 36px 渐隐（ConversationRoot.module.css:447-550） */}
-          <div className="relative shrink-0 px-4 pb-4">
-            <div className="pointer-events-none absolute bottom-full left-0 right-0 h-9 bg-gradient-to-t from-canvas to-transparent" />
-            <div className={`mx-auto ${CONTENT_WIDTH} max-w-full`}>
-              <Composer store={store} transport={transport} disabled={running} running={running} />
-            </div>
-          </div>
-        </>
       )}
+
+      <div
+        className={
+          empty
+            ? 'flex min-h-0 flex-1 items-center justify-center px-4'
+            : 'relative shrink-0 px-4 pb-4'
+        }
+      >
+        {/* 卡片上方 36px 渐隐（ConversationRoot.module.css:447-550），只在会话态出现 */}
+        {!empty && (
+          <div className="pointer-events-none absolute bottom-full left-0 right-0 h-9 bg-gradient-to-t from-canvas to-transparent" />
+        )}
+        <div className={`flex w-full max-w-full flex-col ${CONTENT_WIDTH}`}>
+          {empty && <Greeting key={generation} />}
+          <QueueDock items={queued} onRemove={(i) => store.removeQueuedTask(i)} />
+          <Composer
+            store={store}
+            transport={transport}
+            running={running}
+            blocked={blocked}
+            hero={empty}
+          />
+        </div>
+      </div>
     </div>
   );
 }
