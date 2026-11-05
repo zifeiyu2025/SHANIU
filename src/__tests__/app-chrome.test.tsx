@@ -62,7 +62,7 @@ describe('App 窗口 chrome', () => {
     fireEvent.keyDown(input, { key: 'Enter' });
 
     // 用户气泡立即出现（store 同步记录）；composer 从 hero 切换为沉底实例，输入框为空
-    expect(screen.getByText('跑个任务')).toBeTruthy();
+    expect(screen.getByTestId('user-bubble').textContent).toContain('跑个任务');
     expect(screen.getByPlaceholderText(/描述你想要构建的内容/)).toHaveProperty('value', '');
     unmount();
   });
@@ -87,8 +87,9 @@ describe('App 窗口 chrome', () => {
       () => expect(screen.queryAllByTestId(/^tool-call-/).length).toBeGreaterThan(0),
       { timeout: 5000 },
     );
-    expect(screen.getByText('旧任务')).toBeTruthy();
+    expect(screen.getByTestId('user-bubble').textContent).toContain('旧任务');
 
+    // 「新会话」的唯一入口在侧栏（dsh 席位分工）
     act(() => {
       fireEvent.click(screen.getByRole('button', { name: '新会话' }));
     });
@@ -99,7 +100,7 @@ describe('App 窗口 chrome', () => {
       await wait(2000);
     }); // 放足时间让旧轮把剩余增量/工具卡/用量/轮次终态全部发完
 
-    expect(screen.queryByText('旧任务')).toBeNull();
+    expect(screen.queryByTestId('user-bubble')).toBeNull();
     expect(screen.getByTestId('greeting')).toBeTruthy(); // 欢迎语只在 nodes 为空时渲染
     expect(screen.queryAllByTestId(/^tool-call-/)).toHaveLength(0);
     expect(screen.queryByTestId('token-usage')).toBeNull();
@@ -114,7 +115,7 @@ describe('App 窗口 chrome', () => {
     await waitFor(() => expect(screen.getByTestId('streaming-cursor')).toBeTruthy(), {
       timeout: 5000,
     });
-    expect(screen.getByText('新任务')).toBeTruthy();
+    expect(screen.getByTestId('user-bubble').textContent).toContain('新任务');
     expect(screen.getByTestId('turn-status').textContent).toContain('运行中');
   });
 });

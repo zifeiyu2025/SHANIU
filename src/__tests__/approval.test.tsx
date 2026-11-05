@@ -7,7 +7,7 @@ import type { EventMsg, Transport } from '../transport/types';
 import type { SessionState } from '../store/session-store';
 
 function initialState(): SessionState {
-  return { status: 'idle', currentTurn: 0, lastTurnEnd: null, nodes: [], usage: null };
+  return { status: 'idle', currentTurn: 0, lastTurnEnd: null, nodes: [], usage: null, generation: 0 };
 }
 
 function reduce(state: SessionState, msg: EventMsg): SessionState {

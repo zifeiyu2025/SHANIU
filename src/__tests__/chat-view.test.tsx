@@ -1,5 +1,5 @@
 import { afterEach, describe, expect, it, vi } from 'vitest';
-import { act, fireEvent, render, screen } from '@testing-library/react';
+import { act, render, screen } from '@testing-library/react';
 import { ChatView } from '../components/chat/ChatView';
 import { createSessionStore } from '../store/session-store';
 import { createMockTransport } from '../transport/mock';
@@ -20,7 +20,9 @@ describe('ChatView', () => {
       store.dispatch({ type: 'agent_message_delta', delta: '正在读取' });
     });
 
-    expect(screen.getByText('读一下 README')).toBeTruthy();
+    // 用户气泡与 header crumb 标题都来自首条任务（dsh displayTitle 口径），分别断言
+    expect(screen.getByTestId('user-bubble').textContent).toContain('读一下 README');
+    expect(screen.getByTestId('session-title').textContent).toBe('读一下 README');
     expect(screen.getByText('正在读取')).toBeTruthy();
     expect(screen.getByTestId('streaming-cursor')).toBeTruthy();
     expect(screen.getByRole('button', { name: '停止' })).toBeTruthy();
@@ -70,25 +72,31 @@ describe('ChatView', () => {
     act(() => {
       store.submitUserTask('旧任务');
     });
-    expect(screen.getByText('旧任务')).toBeTruthy();
+    expect(screen.getByTestId('user-bubble').textContent).toContain('旧任务');
     expect(screen.queryByTestId('greeting')).toBeNull(); // 进入会话流后欢迎语卸载
 
     vi.setSystemTime(new Date('2026-11-05T14:30:00'));
-    fireEvent.click(screen.getByRole('button', { name: '新会话' }));
-    expect(screen.queryByText('旧任务')).toBeNull(); // 会话已清空
+    // 「新会话」按钮按 dsh 席位只在侧栏（App 层用例覆盖点击），这里验会话区契约：
+    // store.reset() 递增代次 → 会话区必须重挂载欢迎语并重新取时
+    act(() => {
+      store.reset();
+    });
+    expect(screen.queryByTestId('user-bubble')).toBeNull(); // 会话已清空
+    expect(screen.getByTestId('session-title').textContent).toBe('新会话');
     expect(screen.getByTestId('greeting').textContent).toBe('下午好呀，接下来交给我吧');
   });
 
-  it('空态下点新会话：换 key 重新挂载取时，且欢迎语节点不重复', () => {
+  it('空态下新建会话：换 key 重新挂载取时，且欢迎语节点不重复', () => {
     vi.useFakeTimers();
     vi.setSystemTime(new Date('2026-11-05T12:30:00'));
-    render(
-      <ChatView store={createSessionStore()} transport={createMockTransport()} />,
-    );
+    const store = createSessionStore();
+    render(<ChatView store={store} transport={createMockTransport()} />);
     expect(screen.getByTestId('greeting').textContent).toBe('中午好呀，要不要先休息一下');
 
     vi.setSystemTime(new Date('2026-11-05T14:30:00'));
-    fireEvent.click(screen.getByRole('button', { name: '新会话' }));
+    act(() => {
+      store.reset();
+    });
     expect(screen.getAllByTestId('greeting')).toHaveLength(1);
     expect(screen.getByTestId('greeting').textContent).toBe('下午好呀，接下来交给我吧');
   });

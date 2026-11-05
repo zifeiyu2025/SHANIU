@@ -15,6 +15,11 @@ export interface SessionState {
   lastTurnEnd: TurnEndReason | null;
   nodes: ConversationNode[];
   usage: TokenUsageState | null;
+  /**
+   * 会话代次：`reset()` 递增。既是事件窗口的账（SH-081 丢弃在途旧事件），
+   * 也是视图重挂载的 key（欢迎语只在启动/新建对话取一次时间，SH-080）。
+   */
+  generation: number;
 }
 
 export type SessionStore = SnapshotStore<SessionState> & {
@@ -29,18 +34,19 @@ export type SessionStore = SnapshotStore<SessionState> & {
   reset(): void;
 };
 
-function emptySession(): SessionState {
+function emptySession(generation: number): SessionState {
   return {
     status: 'idle',
     currentTurn: 0,
     lastTurnEnd: null,
     nodes: [],
     usage: null,
+    generation,
   };
 }
 
 export function createSessionStore(): SessionStore {
-  const store = createSnapshotStore<SessionState>(emptySession());
+  const store = createSnapshotStore<SessionState>(emptySession(0));
   // 会话窗口：初建即开，reset() 关闭，submitUserTask() 为重开的信号。
   // EventMsg 不带会话标识，跨会话唯一的判别依据是「这一轮是不是本会话用户提交的」：
   // 点新会话时旧轮可能仍在流式产出（真实 IPC 里连 cancel 回执都还没到），
@@ -63,7 +69,7 @@ export function createSessionStore(): SessionStore {
     },
     reset() {
       windowOpen = false;
-      store.setState(emptySession());
+      store.setState(emptySession(store.getState().generation + 1));
     },
   };
 }

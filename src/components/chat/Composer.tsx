@@ -99,7 +99,7 @@ export function Composer({
               title={`输入 ${usage.inputTokens} / 输出 ${usage.outputTokens} tokens`}
             >
               <DatabaseIcon className="h-3.5 w-3.5" />
-              {formatTokens(usage.inputTokens + usage.outputTokens)}
+              {formatTokens(usage.inputTokens + usage.outputTokens)} tok
             </span>
           )}
           <button
@@ -115,7 +115,7 @@ export function Composer({
               type="button"
               aria-label="停止"
               onClick={() => transport.cancel()}
-              className="flex h-[34px] w-[34px] items-center justify-center rounded-full bg-accent text-white transition-colors duration-100 hover:bg-accent-strong"
+              className="flex h-[34px] w-[34px] -translate-y-0.5 items-center justify-center rounded-full bg-accent text-white transition-colors duration-100 hover:bg-accent-strong"
             >
               <StopIcon className="h-3 w-3" />
             </button>
@@ -125,7 +125,7 @@ export function Composer({
               aria-label="发送"
               onClick={submit}
               disabled={!text.trim()}
-              className="flex h-[34px] w-[34px] items-center justify-center rounded-full bg-accent text-white transition-colors duration-100 hover:bg-accent-strong disabled:opacity-40"
+              className="flex h-[34px] w-[34px] -translate-y-0.5 items-center justify-center rounded-full bg-accent text-white transition-opacity duration-100 disabled:opacity-40"
             >
               <ArrowUpIcon className="h-4 w-4" />
             </button>

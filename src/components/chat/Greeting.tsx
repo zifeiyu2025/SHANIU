@@ -30,7 +30,7 @@ export function Greeting() {
   return (
     <p
       data-testid="greeting"
-      className="mb-7 text-center text-[22px] leading-8 font-medium text-primary"
+      className="mb-7 text-center text-[26px] leading-8 font-medium text-primary"
     >
       {text}
     </p>

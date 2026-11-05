@@ -14,9 +14,11 @@ export function createMockTransport(): Transport {
   let cancelRequested = false;
   let callSeq = 0;
   const settings: Settings = {
-    baseUrl: '',
-    model: '',
-    workspaceRoot: '',
+    // dev/mock 模式下 header crumb 与侧栏工作区行也要有可看的内容；
+    // 模型名与输入卡上的 M0-Mock 保持一致，避免两处显示互相打脸。
+    baseUrl: 'https://mock.local/v1',
+    model: 'M0-Mock',
+    workspaceRoot: 'D:/MyWorkspace/demo',
     hasApiKey: false,
   };
 
