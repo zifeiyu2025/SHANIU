@@ -443,6 +443,15 @@ describe('适配层的命令面映射', () => {
     expect(beyond['ok']).toBe(false)
     expect(bridge.calls.filter(call => call.command === 'fork_session')).toHaveLength(1)
 
+    // 分叉出来的会话必须立刻能看到拷来的历史。此前 fork 预置了一个空 journal，
+    // follow 因此命中"本进程已观察过"直接交空快照——用户点完分叉看到的是一个
+    // 历史全空的会话，而档案里条目明明拷过去了。
+    const forkedIterator = session.follow({ address: { kind: 'session', sessionId: 'agent-fork' } })
+    const forkedEvents = eventsOf((await forkedIterator.next()).value as Record<string, unknown>)
+    expect(forkedEvents.map(event => event.type)).toContain('user/message')
+    expect(forkedEvents.map(event => event.type)).toContain('assistant/message')
+    await forkedIterator.return?.(undefined)
+
     // 只有实时回合、没从档案重建过的会话同样没有对账表
     await session.prompt({ sessionId: 'agent-new', requestId: 'rpc-11', content: [{ type: 'text', text: '分支' }] })
     const unaligned = await session.fork({ sessionId: 'agent-new', throughSeq: 1 })

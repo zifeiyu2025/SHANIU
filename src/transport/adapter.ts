@@ -642,7 +642,11 @@ export function createAdapter(options: AdapterOptions): { remote: unknown; dispo
         // 并回退到最后一个调用/输出配对的边界，所以"全部"给 MAX_SAFE_INTEGER 是安全的。
         keepItems,
       })
-      journals.set(agentId, newJournal(now()))
+      // 分支出来的会话**不能**预置空 journal：那样 follow 会命中"本进程已观察过"，
+      // 直接交一个空快照，用户看到的是一个历史全空的会话，而档案里明明拷来了条目。
+      // 留空让第一次 follow 走档案重建，与"重开旧会话"同一条路径。
+      journals.delete(agentId)
+      workspaceLog.append({ type: 'upsert', workspace: await hostWorkspaceView() })
       return OK({ sessionId: agentId })
     },
     prompt: async (request: { sessionId?: string; requestId?: string; content?: readonly { type: string; text?: string }[] }) => {
