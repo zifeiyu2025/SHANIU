@@ -1786,9 +1786,25 @@ export function createAdapter(options: AdapterOptions): { remote: unknown; dispo
     },
   }
 
+  /**
+   * 目录选择流（SH-099）：侧栏「添加工作区」的 occupant（ui-directory-picker-native）
+   * 经此拿宿主目录。pick 返回路径或 null（取消）——上游 remote 契约同形状。
+   */
+  const directoryPickerNamespace = {
+    pick: async () => {
+      try {
+        return OK(await bridge.invoke<string | null>('pick_folder'))
+      } catch (reason) {
+        const message = reason instanceof Error ? reason.message : String(reason)
+        return { ok: false as const, error: new RemoteError('gateway/internal', message, {}) }
+      }
+    },
+  }
+
   const namespaces = new Map<string, unknown>([
     ['session', sessionNamespace],
     ['workspace', workspaceNamespace],
+    ['directoryPicker', directoryPickerNamespace],
     ['toolResults', toolResultsNamespace],
     ['settings', face.settings],
     ['llm', face.llm],
