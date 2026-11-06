@@ -23,6 +23,17 @@ pub const PORTABLE_MARKER: &str = "portable.marker";
 pub const CONFIG_FILE: &str = "config.toml";
 const APP_DIR_NAME: &str = "SHANIU";
 
+/// 产品目录布局（docs §9.1/§9.2）：两种发行形态共用同一套子目录，仅根目录不同。
+pub const SECRETS_DIR: &str = "secrets";
+pub const SETTINGS_BACKUP_DIR: &str = "settings-backup";
+pub const SESSIONS_DIR: &str = "sessions";
+pub const ROLLOUTS_DIR: &str = "rollouts";
+pub const LOGS_DIR: &str = "logs";
+pub const CACHE_DIR: &str = "cache";
+pub const CRASH_DIR: &str = "crash";
+/// 默认工作区：安装版与便携版都放在数据根下（`data\Workspace`），启动时随目录结构一并创建。
+pub const WORKSPACE_DIR: &str = "Workspace";
+
 #[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
 #[serde(default)]
 pub struct AppConfig {
@@ -122,6 +133,33 @@ pub struct DataDirs {
     pub data_root: PathBuf,
 }
 
+impl DataDirs {
+    /// 默认工作区（Agent 操作目录）：数据根下的 `Workspace`（docs §9.3）。
+    pub fn workspace_root(&self) -> PathBuf {
+        self.data_root.join(WORKSPACE_DIR)
+    }
+}
+
+/// 启动时提前创建产品目录结构（幂等，docs §9.1/§9.2）。
+///
+/// 配置侧：`secrets\` / `settings-backup\`；数据侧：`sessions\` / `rollouts\` /
+/// `logs\` / `cache\` / `crash\` 与默认工作区 `Workspace\`。便携模式下两侧根相同，
+/// 逐名创建互不影响。失败即报错：后续写路径不该带着一个建不出来的根继续跑。
+pub fn ensure_product_dirs(dirs: &DataDirs) -> Result<(), String> {
+    for name in [SECRETS_DIR, SETTINGS_BACKUP_DIR] {
+        create_subdir(&dirs.config_root, name)?;
+    }
+    for name in [SESSIONS_DIR, ROLLOUTS_DIR, LOGS_DIR, CACHE_DIR, CRASH_DIR, WORKSPACE_DIR] {
+        create_subdir(&dirs.data_root, name)?;
+    }
+    Ok(())
+}
+
+fn create_subdir(root: &Path, name: &str) -> Result<(), String> {
+    let path = root.join(name);
+    fs::create_dir_all(&path).map_err(|e| format!("创建目录失败 {}: {e}", path.display()))
+}
+
 /// 纯函数解析（输入显式注入，可单测各优先级分支）。
 pub fn resolve_dirs(
     env_data_dir: Option<&str>,
@@ -203,8 +241,6 @@ use windows::Win32::Foundation::{LocalFree, HLOCAL};
 use windows::Win32::Security::Cryptography::{
     CryptProtectData, CryptUnprotectData, CRYPT_INTEGER_BLOB,
 };
-
-pub const SECRETS_DIR: &str = "secrets";
 
 /// DPAPI 加密（用户作用域）。输出 blob 需 LocalFree，务必走完释放路径。
 fn dpapi_protect(plaintext: &[u8]) -> Result<Vec<u8>, String> {
@@ -435,7 +471,7 @@ pub const LOG_FILE_PREFIX: &str = "shaniu.log";
 pub fn build_logging(
     data_root: &Path,
 ) -> Result<(impl tracing::Subscriber + Send + Sync, WorkerGuard), String> {
-    let dir = data_root.join("logs");
+    let dir = data_root.join(LOGS_DIR);
     fs::create_dir_all(&dir).map_err(|e| format!("创建日志目录失败: {e}"))?;
     prune_expired_logs(&dir, LOG_RETENTION_DAYS);
 
@@ -579,6 +615,48 @@ mod tests {
         );
         assert_eq!(dirs.config_root, PathBuf::from("C:/appdata/SHANIU"));
         assert_eq!(dirs.data_root, PathBuf::from("C:/localdata/SHANIU"));
+    }
+
+    #[test]
+    fn product_dirs_are_created_for_installed_and_portable() {
+        let base = std::env::temp_dir().join(format!("shaniu-layout-{}", std::process::id()));
+        // 安装版：配置根与数据根分离（%APPDATA% / %LOCALAPPDATA%）
+        let installed = DataDirs {
+            config_root: base.join("appdata"),
+            data_root: base.join("localdata"),
+        };
+        ensure_product_dirs(&installed).unwrap();
+        for name in [SECRETS_DIR, SETTINGS_BACKUP_DIR] {
+            assert!(installed.config_root.join(name).is_dir(), "缺少配置侧目录 {name}");
+        }
+        for name in [SESSIONS_DIR, ROLLOUTS_DIR, LOGS_DIR, CACHE_DIR, CRASH_DIR, WORKSPACE_DIR] {
+            assert!(installed.data_root.join(name).is_dir(), "缺少数据侧目录 {name}");
+        }
+        // 默认工作区落在数据根下的 Workspace
+        assert_eq!(installed.workspace_root(), installed.data_root.join(WORKSPACE_DIR));
+
+        // 便携版：同一根（<exe>\data）；重复调用幂等
+        let portable = DataDirs {
+            config_root: base.join("data"),
+            data_root: base.join("data"),
+        };
+        ensure_product_dirs(&portable).unwrap();
+        ensure_product_dirs(&portable).unwrap();
+        assert!(portable.workspace_root().is_dir());
+        assert!(portable.config_root.join(SECRETS_DIR).is_dir());
+        fs::remove_dir_all(&base).ok();
+    }
+
+    #[test]
+    fn unwritable_root_reports_error_instead_of_silently_skipping() {
+        let base = std::env::temp_dir().join(format!("shaniu-layout-bad-{}", std::process::id()));
+        fs::create_dir_all(&base).unwrap();
+        // 数据根是一条文件路径：建子目录必然失败，必须如实报错而不是当作已建好
+        let blocked = base.join("blocked");
+        fs::write(&blocked, b"file").unwrap();
+        let dirs = DataDirs { config_root: blocked.clone(), data_root: blocked };
+        assert!(ensure_product_dirs(&dirs).is_err());
+        fs::remove_dir_all(&base).ok();
     }
 
     #[test]

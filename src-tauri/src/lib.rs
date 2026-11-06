@@ -446,6 +446,11 @@ fn show_main_window(app: &tauri::AppHandle) {
 pub fn run() {
     // 数据目录解析结果写入日志第一行（docs §9.3 的「解析结果写入日志第一行」即指此条）
     let dirs = config::resolve_dirs_from_env();
+    // 产品目录结构提前建好（幂等）：secrets/settings-backup、sessions/rollouts/logs/cache/crash
+    // 与默认工作区 Workspace。失败不拦启动——各写路径自己 fail-closed，这里只如实报告。
+    if let Err(e) = config::ensure_product_dirs(&dirs) {
+        eprintln!("[SHANIU] 产品目录创建失败（数据目录不可写？）: {e}");
+    }
     // 日志初始化必须早于一切 tracing:: 事件；guard 存活期 = 进程存活期
     let _log_guard = match config::init_logging(&dirs.data_root) {
         Ok(guard) => Some(guard),
@@ -457,6 +462,7 @@ pub fn run() {
     };
     tracing::info!("config_root: {}", dirs.config_root.display());
     tracing::info!("data_root:   {}", dirs.data_root.display());
+    tracing::info!("workspace:   {}", dirs.workspace_root().display());
 
     let (app_config, config_path) =
         AppConfig::load_or_create(&dirs.config_root).unwrap_or_else(|e| {
