@@ -227,7 +227,7 @@ mod tests {
 
     #[tokio::test]
     async fn parses_openai_data_array_and_carries_auth_and_custom_headers() {
-        let mut stub = Stub::start(
+        let stub = Stub::start(
             "HTTP/1.1 200 OK",
             r#"{"data":[{"id":"m2","context_length":32000},{"id":"m1","context_window":128000,"max_output_tokens":4096,"input_modalities":["text","image"]},{"id":"m1"}]}"#,
         );
@@ -249,7 +249,7 @@ mod tests {
 
     #[tokio::test]
     async fn auth_failure_reports_status_without_leaking_key() {
-        let mut stub = Stub::start("HTTP/1.1 401 Unauthorized", r#"{"error":"bad key ak_SUPERSECRET"}"#);
+        let stub = Stub::start("HTTP/1.1 401 Unauthorized", r#"{"error":"bad key ak_SUPERSECRET"}"#);
         let err = discover_endpoint_models(&stub.url, &Default::default(), "ak_SUPERSECRET").await.unwrap_err();
         assert!(err.contains("401"), "{err}");
         assert!(err.contains("API Key"), "{err}");
@@ -258,11 +258,11 @@ mod tests {
 
     #[tokio::test]
     async fn non_json_and_missing_listing_are_errors_with_hand_fill_hint() {
-        let mut bad = Stub::start("HTTP/1.1 200 OK", "<html>not json</html>");
+        let bad = Stub::start("HTTP/1.1 200 OK", "<html>not json</html>");
         let err = discover_endpoint_models(&bad.url, &Default::default(), "k").await.unwrap_err();
         assert!(err.contains("不是 JSON"), "{err}");
 
-        let mut empty = Stub::start("HTTP/1.1 200 OK", r#"{"object":"list","data":[]}"#);
+        let empty = Stub::start("HTTP/1.1 200 OK", r#"{"object":"list","data":[]}"#);
         let err = discover_endpoint_models(&empty.url, &Default::default(), "k").await.unwrap_err();
         assert!(err.contains("手工填写"), "{err}");
     }
