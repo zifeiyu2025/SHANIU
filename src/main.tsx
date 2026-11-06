@@ -3,6 +3,8 @@ import { installWindowChrome } from './host/tauri-chrome';
 
 // DSH 壳的基座样式（base.css：reset + boot page 变量）
 import '@deepseek-ai/dsh-client-web/base.css';
+// SHANIU 应用级版式微调（分栏控件隐藏等）
+import './host/app.css';
 
 const el = document.getElementById('root');
 if (el === null) throw new Error('missing #root');

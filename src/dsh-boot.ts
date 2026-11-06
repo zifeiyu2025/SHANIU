@@ -13,6 +13,8 @@ import { apply as uiSessionApply, inject as uiSessionInject } from '@deepseek-ai
 import { apply as uiWorkspaceApply, inject as uiWorkspaceInject } from '@deepseek-ai/dsh-client-ui-workspace/client'
 import { apply as uiSidebarApply, inject as uiSidebarInject } from '@deepseek-ai/dsh-client-ui-sidebar/client'
 import { apply as uiSidebarRightApply, inject as uiSidebarRightInject } from '@deepseek-ai/dsh-client-ui-sidebar-right/client'
+import { apply as uiSidebarFilesApply, inject as uiSidebarFilesInject } from '@deepseek-ai/dsh-client-ui-sidebar-files/client'
+import { apply as uiSidebarBrowserApply, inject as uiSidebarBrowserInject } from '@deepseek-ai/dsh-client-ui-sidebar-browser/client'
 import { apply as uiConversationApply, inject as uiConversationInject } from '@deepseek-ai/dsh-client-ui-conversation/client'
 import { apply as uiChatApply, inject as uiChatInject } from '@deepseek-ai/dsh-client-ui-chat/client'
 import { apply as uiApprovalApply, inject as uiApprovalInject } from '@deepseek-ai/dsh-client-ui-approval/client'
@@ -46,6 +48,7 @@ import {
   installMockRemoteNamespaces, mockConnection, mockModules, mockRemote, mockTypert,
 } from './transport/mock'
 import { apply as brandApply, inject as brandInject } from './brand'
+import { apply as headerActionsApply, inject as headerActionsInject } from './header-actions'
 
 export interface BootHandle {
   readonly ctx: Context
@@ -126,8 +129,11 @@ export async function bootShaniu(container: HTMLElement): Promise<BootHandle> {
     { inject: uiWorkspaceInject, apply: uiWorkspaceApply },
     { inject: uiConversationInject, apply: uiConversationApply },
     { inject: uiSidebarRightInject, apply: uiSidebarRightApply },
+    { inject: uiSidebarFilesInject, apply: uiSidebarFilesApply },
+    { inject: uiSidebarBrowserInject, apply: uiSidebarBrowserApply },
     { inject: uiSidebarInject, apply: uiSidebarApply },
     { inject: brandInject, apply: brandApply },
+    { inject: headerActionsInject, apply: headerActionsApply },
     { inject: uiSettingsGeneralInject, apply: uiSettingsGeneralApply },
     { inject: uiSettingsModelsInject, apply: uiSettingsModelsApply },
     { inject: uiChatInject, apply: uiChatApply },

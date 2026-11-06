@@ -1,0 +1,8 @@
+/*
+ * SHANIU 应用级版式微调（不改移植源码，只按稳定的 data 属性覆盖）。
+ */
+
+/* 右侧栏分栏：产品口径只要单栏，隐藏 dockkit 的拆分布钮（Ctrl+\ 命令仍在，只是不露出控件）。 */
+[data-dockkit-split-control] {
+  display: none !important;
+}
