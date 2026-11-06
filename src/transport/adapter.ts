@@ -455,6 +455,9 @@ export function createAdapter(options: AdapterOptions): { remote: unknown; dispo
           openTask(journal)
           pushEvent(journal, 'turn/start', { turn: journal.turn })
           pushEvent(journal, 'step/start', { turn: journal.turn, step: 0 })
+          // 不经 prompt 起来的回合（`resume_session` 续跑）也要报运行中，否则
+          // 恢复出来的会话跑着任务却没有 Stop 按钮。
+          dispatch('api-session/status', event.session_id, true)
         } else if (msg.turn > 1) {
           pushEvent(journal, 'step/end', { turn: journal.turn, step: journal.step })
           journal.step = msg.turn - 1
@@ -556,6 +559,9 @@ export function createAdapter(options: AdapterOptions): { remote: unknown; dispo
             ? { kind: 'aborted', reason: { kind: 'user' } }
             : { kind: 'error', error: { message: `回合以 ${msg.reason} 结束`, code: msg.reason } },
         msg.reason === 'cancelled')
+        // 运行态必须收回：输入卡的 Stop 按钮由 `api-session/status` 决定（`running`
+        // 为真才显示），只发 journal 的 turn/end 不发状态，按钮会永远停在发送态。
+        dispatch('api-session/status', event.session_id, false)
         return
       case 'error':
         // 全局错误不终结回合（回合终结只认 turn_completed）：这里只定稿已有的流，
@@ -647,6 +653,7 @@ export function createAdapter(options: AdapterOptions): { remote: unknown; dispo
       // 回合在这里开，不等后端的第一条事件：输入行必须落在回合内，
       // 而 send_task 已经返回 agent_id，说明后端确实接下了这个任务。
       if (!journal.taskOpen) openTask(journal)
+      dispatch('api-session/status', agentId, true)
       pushEvent(journal, 'turn/start', { turn: journal.turn })
       pushEvent(journal, 'step/start', { turn: journal.turn, step: journal.step })
       // rpcId 必须等于 prompt 的 requestId：客户端据此撤掉本地乐观回显（session.ts 的

@@ -513,6 +513,32 @@ describe('适配层的命令面映射', () => {
     dispose()
   })
 
+  it('回合的开与收都广播 api-session/status——Stop 按钮只认这个', async () => {
+    // 输入卡的 Stop 条件是 `running && !sending`，而 `running` 来自
+    // `api-session/status`（session-controller client 的 $on）与 session.list 摘要，
+    // 不看 journal 的 turn/end。只发 journal 不发状态，真机表现就是"跑着长任务
+    // 却没有停止按钮"——中断通道本身是通的，用户按不到。
+    const bridge = scriptedBridge()
+    const { remote, dispose } = createAdapter({ bridge })
+    const seen: [string, boolean][] = []
+    const face = remote as unknown as {
+      $on(event: string, listener: (...args: never[]) => unknown): () => void
+      session: { prompt(request: Record<string, unknown>): Promise<unknown> }
+    }
+    face.$on('api-session/status', (sessionId: string, running: boolean) => {
+      seen.push([sessionId, running])
+      return Promise.resolve('')
+    })
+    await face.session.prompt({ sessionId: 'agent-new', requestId: 'rpc-1', content: [{ type: 'text', text: '跑个长的' }] })
+    expect(seen).toEqual([['agent-new', true]])
+    bridge.emit('agent-new', { type: 'turn_started', turn: 1 })
+    // 同一个回合里不该重复报运行中
+    expect(seen).toEqual([['agent-new', true]])
+    bridge.emit('agent-new', { type: 'turn_completed', turn: 1, reason: 'completed' })
+    expect(seen).toEqual([['agent-new', true], ['agent-new', false]])
+    dispose()
+  })
+
   it('未接线的命名空间显式抛错并指向核销清单', async () => {
     const bridge = scriptedBridge()
     const { remote, dispose } = createAdapter({ bridge })
