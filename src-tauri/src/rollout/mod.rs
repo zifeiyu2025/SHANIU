@@ -223,6 +223,10 @@ pub struct SessionSummary {
     pub title: String,
     /// meta 之外的条目行数，前端用来区分"空会话"。
     pub item_count: usize,
+    /// 空白会话（SH-1099 对齐上游 blank 语义：折叠前缀无 turn）：meta 之外没有任何
+    /// 条目 = 用户还没发过首条任务。新建会话流程据此复用已有空白而不是无限新造
+    /// （上游 createInWorkspace→sessions.create{sessionId: blank} 同口径）。
+    pub blank: bool,
 }
 
 /// 标题口径与前端 `ChatView::sessionTitle` 一致：空白压成单空格、按字符数取 40。
@@ -423,6 +427,7 @@ fn summarize(path: &Path) -> Option<SessionSummary> {
         workspace_root: config_snapshot.workspace_root,
         title,
         item_count,
+        blank: item_count == 0,
     })
 }
 

@@ -610,7 +610,11 @@ fn rename_session(
 /// 之后 `send_task(agent_id)` 才能续到同一份档案上；让前端自己编 id 会让档案目录里
 /// 出现后端不认识的会话，会话列表也就永远读不回它。
 #[tauri::command]
-fn create_session(app: tauri::AppHandle, workspace_path: Option<String>) -> Result<String, String> {
+fn create_session(
+    app: tauri::AppHandle,
+    workspace_path: Option<String>,
+    session_id: Option<String>,
+) -> Result<String, String> {
     let state = app.state::<AppState>();
     // 工作区绑定（SH-099）：给了路径就用它（必须存在且是目录——工具沙箱的作用域
     // 由它决定），没给回落全局默认根。face 会把 workspaceId 解析成路径后再来。
@@ -627,8 +631,29 @@ fn create_session(app: tauri::AppHandle, workspace_path: Option<String>) -> Resu
         }
         None => state.workspace_root(),
     };
-    let (writer, agent_id) = new_session_writer(&state, &workspace_root)?;
-    //  writer 在这里只负责把首行落盘；后续写入由 send_task 重新 open_existing。
+    // 空白复用（对齐上游 blank 生命周期）：face 在工作区成员里找到的第一条空白，
+    // 带 sessionId 来请求创建。宿主二次校验后复用同一档案；校验不过（档案不存在
+    // 视作按该 id 新建、已有条目/正在运行视作不可复用）就新造一份，原空白原样留着
+    // ——上游 createMinted 同口径，绝不静默吞掉用户的任何一份会话。
+    if let Some(requested) = session_id.as_deref().map(str::trim).filter(|id| !id.is_empty()) {
+        let reuse_path = state.data_root().join(rollout::ROLLOUT_DIR).join(format!("{requested}.jsonl"));
+        let running_here = state.active_agent().as_deref() == Some(requested);
+        if reuse_path.is_file() && !running_here {
+            let blank = rollout::read(&reuse_path).map(|archive| archive.items.is_empty()).unwrap_or(false);
+            if blank {
+                return Ok(requested.to_string());
+            }
+        }
+        if !reuse_path.is_file() {
+            // 指名的 id 没有档案（比如 face 缓存了未落盘的空白）：以该 id 直接建档
+            let (writer, agent_id) = new_session_writer(&state, &workspace_root, Some(requested.to_string()))?;
+            drop(writer);
+            return Ok(agent_id);
+        }
+        // 不可复用（已开始任务）→ 落到下面新造，原会话原样保留
+    }
+    let (writer, agent_id) = new_session_writer(&state, &workspace_root, None)?;
+    //  writer 在这里只负责把首条落盘；后续写入由 send_task 重新 open_existing。
     drop(writer);
     Ok(agent_id)
 }
@@ -639,7 +664,7 @@ fn build_new_session(
     state: &AppState,
     workspace_root: &Path,
 ) -> Result<(agent_loop::AgentLoop, tokio_util::sync::CancellationToken, String), String> {
-    let (writer, agent_id) = new_session_writer(state, workspace_root)?;
+    let (writer, agent_id) = new_session_writer(state, workspace_root, None)?;
     let (agent, cancel) = build_agent_with(state, &agent_id, workspace_root.to_path_buf(), Some(writer))?;
     Ok((agent, cancel, agent_id))
 }
@@ -647,9 +672,10 @@ fn build_new_session(
 fn new_session_writer(
     state: &AppState,
     workspace_root: &Path,
+    explicit_id: Option<String>,
 ) -> Result<(Arc<rollout::RolloutWriter>, String), String> {
     let cfg = state.config();
-    let agent_id = state.next_session_id();
+    let agent_id = explicit_id.unwrap_or_else(|| state.next_session_id());
     let meta = rollout::RolloutItem::SessionMeta {
         session_id: agent_id.clone(),
         agent_id: agent_id.clone(),

@@ -24,6 +24,10 @@ import type { SessionId } from '@deepseek-ai/dsh-session/types'
 import type { WorkspaceId } from '@deepseek-ai/dsh-workspace/types'
 import type { MessageId } from '@deepseek-ai/dsh-llm'
 import { createSettingsFace } from './settings-face'
+import {
+  catalogEntryOf, foldTimingEvent, initTimingState, laneIdOf, timingProjectionOf,
+  type SubagentCatalogEntry, type SubagentTimingState,
+} from './subagent-wire'
 import type { AgentEvent, EventMsg } from './types'
 import type { HostBridge } from './tauri'
 
@@ -272,6 +276,27 @@ export function createAdapter(options: AdapterOptions): { remote: unknown; dispo
   /** 排队消息的 id 序列（inbox 行身份）。 */
   let queueSeq = 0
 
+  /**
+   * 子代理泳道登记表（SH-109）。后端没有子会话——子代理是 agent_loop task，事件经
+   * `AgentEvent` 信封（`agent_id ≠ 'root'`，`session_id` 仍是宿主任务会话）到达；
+   * 适配层把 `agent_id` 合成为泳道的 childSessionId（ULID 全局唯一，`laneIdOf`），
+   * 每个泳道一份独立 journal，父 journal 落 `subagent/catalog` 事件。
+   *
+   * 懒建口径：见到该 agent 的第一条事件才登记——"transport 亲眼见过它在干活"，
+   * catalog 事件写 v1 `mode:'unknown'`（上游 v3 不允许 unknown，诚实标注"没拿到
+   * spawn 元数据"；元数据要等 SH-053 的 `SubagentSpawned` 消息，届时升级 v3
+   * continuable）。泳道行在侧栏/目录树的出现由 session-controller 的 projectList
+   * 消费 `subagentCatalog` 投影自动完成，UI 零改动。
+   */
+  interface AgentLane {
+    readonly parentId: string
+    /** transport 首次见到该 agent 的时刻（懒建时刻，不是后端 spawn 时刻——如实标注）。 */
+    readonly createdAt: number
+    /** 泳道 timing 折叠（subagentTiming 投影的数据源，语义照上游 projection.ts）。 */
+    timing: SubagentTimingState
+  }
+  const agents = new Map<string, AgentLane>()
+
   const dispatch = (name: string, ...args: unknown[]): void => {
     for (const listener of listeners.get(name) ?? []) {
       try {
@@ -371,6 +396,77 @@ export function createAdapter(options: AdapterOptions): { remote: unknown; dispo
     if (changes.length === 0) return
     projectionSeq += 1
     projectionLog.append({ type: 'projection', sessionId, seq: projectionSeq, changes })
+  }
+
+  // ---- 子代理泳道（SH-109）：懒建、catalog/timing 投影 ----
+
+  /** 父会话的 `subagentCatalog` 投影值：没有登记泳道就缺席（不伪造空目录）。 */
+  const catalogProjectionOf = (parentId: string): SubagentCatalogEntry[] | undefined => {
+    const entries: SubagentCatalogEntry[] = []
+    for (const [laneId, lane] of agents) {
+      if (lane.parentId !== parentId) continue
+      entries.push(catalogEntryOf({
+        version: 1, childId: laneIdOf(laneId), childCreatedAt: lane.createdAt, mode: 'unknown',
+      }))
+    }
+    return entries.length === 0 ? undefined : entries
+  }
+
+  /** catalog 变化的统一推帧点（父会话的投影值整表替换，上游 catalog fold 的 wire 语义）。 */
+  const pushCatalogFrame = (parentId: string): void => {
+    const catalog = catalogProjectionOf(parentId)
+    if (catalog === undefined) return
+    projectionSeq += 1
+    projectionLog.append({
+      type: 'projection', sessionId: parentId, seq: projectionSeq,
+      changes: [{ key: 'subagentCatalog', val: catalog }],
+    })
+  }
+
+  /**
+   * 懒建泳道：该 agent 的首条事件到达时登记 + 父 journal 落 `subagent/catalog`
+   * 事件（回放可重建的持久事实）+ 父投影推一帧（侧栏/目录树立即出现该行）。
+   */
+  const ensureLane = (parentId: string, agentId: string): void => {
+    if (agents.has(agentId)) return
+    agents.set(agentId, { parentId, createdAt: now(), timing: initTimingState() })
+    pushEvent(journalOf(parentId), 'subagent/catalog', {
+      version: 1, childId: laneIdOf(agentId), childCreatedAt: now(), mode: 'unknown',
+    })
+    pushCatalogFrame(parentId)
+  }
+
+  /**
+   * 泳道 timing 推进。turn 开合时推投影帧；其余事件只折叠不推帧——运行中泳道的
+   * 时长由 UI 实时钟读（`activityDuration` 对 running 泳道取 now），`active.through`
+   * 只在"回合中断在半路"的收口展示里用到，逐 delta 推帧是纯浪费。
+   */
+  const foldLaneTiming = (laneId: string, eventType: 'turn/start' | 'turn/end' | 'advance', reasonKind?: string): void => {
+    const lane = agents.get(laneId)
+    if (lane === undefined) return
+    lane.timing = foldTimingEvent(lane.timing, eventType, now(), reasonKind)
+    if (eventType === 'advance') return
+    const timing = timingProjectionOf(lane.timing)
+    if (timing === undefined) return
+    projectionSeq += 1
+    projectionLog.append({
+      type: 'projection', sessionId: laneId, seq: projectionSeq,
+      changes: [{ key: 'subagentTiming', val: timing }],
+    })
+  }
+
+  /**
+   * 快照/基线里的泳道位：泳道挂 `subagentTiming`（未见回合则缺席），父会话挂
+   * `subagentCatalog`（无登记泳道则缺席）。投影缺席 = UI 按无数据判读，不伪造。
+   */
+  const subagentProjectionsOf = (sessionId: string): Record<string, unknown> => {
+    const lane = agents.get(sessionId)
+    if (lane !== undefined) {
+      const timing = timingProjectionOf(lane.timing)
+      return timing === undefined ? {} : { subagentTiming: timing }
+    }
+    const catalog = catalogProjectionOf(sessionId)
+    return catalog === undefined ? {} : { subagentCatalog: catalog }
   }
 
   // ---- 底部指标的折叠动作（字段语义照上游 session-stats；时间取事件到达时刻）----
@@ -853,8 +949,20 @@ export function createAdapter(options: AdapterOptions): { remote: unknown; dispo
   }
 
   const onEvent = (event: AgentEvent): void => {
-    const journal = journalOf(event.session_id)
     const msg = event.msg
+    // 子代理事件（agent_id ≠ 'root'）路由进该 agent 的泳道 journal（懒建，SH-109）；
+    // session_id 仍是宿主侧任务会话（泳道的父）。根事件走原路径。
+    const laneId = event.agent_id !== '' && event.agent_id !== 'root' && event.agent_id !== event.session_id
+      ? event.agent_id
+      : undefined
+    const sessionId = laneId ?? event.session_id
+    if (laneId !== undefined) ensureLane(event.session_id, laneId)
+    // 泳道 timing 的 advance 折叠：delta/tool/usage 等事件推进 active.through（不推帧，
+    // 见 foldLaneTiming 注记）；回合开合在各自 case 里折叠。
+    if (laneId !== undefined && msg.type !== 'turn_started' && msg.type !== 'turn_completed') {
+      foldLaneTiming(laneId, 'advance')
+    }
+    const journal = journalOf(sessionId)
     switch (msg.type) {
       case 'turn_started': {
         // 首条用户消息在本层落地时就开了回合（照 mock 的既定顺序：turn/start →
@@ -863,12 +971,13 @@ export function createAdapter(options: AdapterOptions): { remote: unknown; dispo
         // 后端每个采样迭代都发 turn_started，它对应 DSH 的 step 而不是 DSH 的回合。
         if (!journal.taskOpen) {
           openTask(journal)
-          pushTurnStart(event.session_id, journal)
+          pushTurnStart(sessionId, journal)
+          if (laneId !== undefined) foldLaneTiming(laneId, 'turn/start')
           pushEvent(journal, 'step/start', { turn: journal.turn, step: 0 })
           beginStepMetrics(journal)
           // 不经 prompt 起来的回合（`resume_session` 续跑）也要报运行中，否则
           // 恢复出来的会话跑着任务却没有 Stop 按钮。
-          dispatch('api-session/status', event.session_id, true)
+          dispatch('api-session/status', sessionId, true)
         } else if (msg.turn > 1) {
           pushEvent(journal, 'step/end', { turn: journal.turn, step: journal.step })
           closeStepMetrics(journal)
@@ -922,12 +1031,12 @@ export function createAdapter(options: AdapterOptions): { remote: unknown; dispo
           cacheWriteTokens: journal.metrics.buckets.cacheWriteTokens,
         }
         journal.pressure = { pressureTokens: msg.input_tokens, projectedTokens: msg.input_tokens }
-        pushMetricsFrame(event.session_id, journal)
+        pushMetricsFrame(sessionId, journal)
         return
       }
       case 'tool_call_begin':
         // 工具调用先定稿此前的正文：助手消息在 DSH 里排在调用之前。
-        closeAttempt(event.session_id, journal, true)
+        closeAttempt(sessionId, journal, true)
         pushEvent(journal, 'tool/call', {
           turn: journal.turn,
           step: journal.step,
@@ -980,7 +1089,7 @@ export function createAdapter(options: AdapterOptions): { remote: unknown; dispo
           if (todos !== undefined) {
             journal.todos = todos
             pushEvent(journal, 'todo/write', { todos })
-            pushTodosFrame(event.session_id, journal)
+            pushTodosFrame(sessionId, journal)
           }
         }
         pushEvent(journal, 'tool/result', {
@@ -997,7 +1106,7 @@ export function createAdapter(options: AdapterOptions): { remote: unknown; dispo
           ...(error === undefined ? {} : { error }),
         }, { surfaceOp: 'append' })
         settleToolMetrics(journal, msg.call_id)
-        pushMetricsFrame(event.session_id, journal)
+        pushMetricsFrame(sessionId, journal)
         // 计划态按工具**执行结果**推导：enter_plan_mode 免审批必执行；exit_plan_mode
         // 获批执行才退出（denied/interrupted 都保持计划态，与宿主 PlanState 一致）。
         if (toolName === 'enter_plan_mode' && !failed) setPlanActive(true)
@@ -1007,26 +1116,29 @@ export function createAdapter(options: AdapterOptions): { remote: unknown; dispo
       case 'turn_completed':
         // cancelled 的半截正文是真实发生过的输出：落进档案，但打 interrupted，
         // 不能当成正常答完。
-        closeTask(event.session_id, journal, msg.reason === 'completed'
+        closeTask(sessionId, journal, msg.reason === 'completed'
           ? { kind: 'completed' }
           : msg.reason === 'cancelled'
             ? { kind: 'aborted', reason: { kind: 'user' } }
             : { kind: 'error', error: { message: `回合以 ${msg.reason} 结束`, code: msg.reason } },
         msg.reason === 'cancelled')
+        if (laneId !== undefined) foldLaneTiming(laneId, 'turn/end', msg.reason)
         // 运行态必须收回：输入卡的 Stop 按钮由 `api-session/status` 决定（`running`
         // 为真才显示），只发 journal 的 turn/end 不发状态，按钮会永远停在发送态。
-        dispatch('api-session/status', event.session_id, false)
+        dispatch('api-session/status', sessionId, false)
         // 闸随任务协程收口释放（晚于本事件）：排队消息在这里按序补发，对短时拒绝重试。
         void drainQueues()
         return
       case 'error':
         // 全局错误不终结回合（回合终结只认 turn_completed）：这里只定稿已有的流，
         // 错误文案由随后的 turn_completed 呈现，避免在此造出一个假回合。
-        closeAttempt(event.session_id, journal, false)
+        closeAttempt(sessionId, journal, false)
         console.warn('[SHANIU] 后端错误事件', msg.message)
         return
       case 'exec_approval_request':
-        void requestApproval(event.session_id, msg)
+        // 泳道的审批请求按泳道会话作用域派发：审批卡落在该泳道的 composer 上，
+        // `this` 绑定泳道会话（上游子代理审批的同款作用域语义；冒泡聚合属 SH-054）。
+        void requestApproval(sessionId, msg)
         return
       default:
         // exec_approval_resolved / plan_delta / turn_diff：后端当前不产生，客户端无需感知。
@@ -1041,7 +1153,8 @@ export function createAdapter(options: AdapterOptions): { remote: unknown; dispo
 
   const sessionNamespace = {
     list: async () => {
-      const rows = await bridge.invoke<{ agentId: string; updatedAt: number; title: string; workspaceRoot: string }[]>('list_sessions')
+      const rows = await bridge
+        .invoke<{ agentId: string; updatedAt: number; title: string; workspaceRoot: string; blank: boolean }[]>('list_sessions')
       return OK({
         items: rows.map(row => {
           const title = titles.get(row.agentId) ?? row.title
@@ -1050,7 +1163,10 @@ export function createAdapter(options: AdapterOptions): { remote: unknown; dispo
             sessionId: row.agentId,
             cwd: row.workspaceRoot,
             running: journals.get(row.agentId)?.taskOpen === true,
-            blank: title === '',
+            // blank 的权威判定在宿主（折叠前缀无 turn，SH-100 探索报告 list.ts:51）：
+            // 后端按 item_count==0 给出，face 不用 title 猜——title 为空但已有
+            // turn 的会话（如被截断的 fork）不是 blank。
+            blank: row.blank,
             updatedAt: row.updatedAt,
             formatStatus: 'current',
             // 标题走 wire 摘要的投影提示块（cached）：客户端不给没打开过的会话建
@@ -1078,16 +1194,28 @@ export function createAdapter(options: AdapterOptions): { remote: unknown; dispo
         return FAIL(`工作区 ${request.workspaceId} 不存在，先在侧栏添加它`)
       }
       const cwd = byId?.path ?? (request.cwd !== undefined && request.cwd !== '' ? request.cwd : face.workspaceRoot())
+      // 空白复用（上游 createInWorkspace 的 findReusableBlank 同构）：先在工作区
+      // 成员里找第一条可复用的空白（blank + cwd 匹配 + 未归档），带 sessionId 请求
+      // 创建——宿主二次校验后复用同 id 或新造。没有这步，每次点新建/每次启动恢复
+      // 都会无声积累一份空白档案（真机曾积累到 10 份）。
+      const [flags, rows] = await Promise.all([
+        readWorkspaceFlags(),
+        bridge
+          .invoke<{ agentId: string; workspaceRoot: string; updatedAt: number; blank: boolean }[]>('list_sessions')
+          .catch((): { agentId: string; workspaceRoot: string; updatedAt: number; blank: boolean }[] => []),
+      ])
+      const reusableBlank = rows.find(row =>
+        row.blank && row.workspaceRoot === cwd
+          && !flags.archivedSessionIds.includes(row.agentId)
+          && journals.get(row.agentId)?.taskOpen !== true,
+      )?.agentId
       const agentId = await bridge.invoke<string>('create_session', {
         ...(cwd === face.workspaceRoot() ? {} : { workspacePath: cwd }),
+        ...(reusableBlank === undefined ? {} : { sessionId: reusableBlank }),
       })
       journals.set(agentId, newJournal(now()))
       // 工作区分组按 sessionIds 显示：新会话建完就要推一帧，否则侧栏的工作区树
       // 里看不到它，要重开窗口才出现。目标工作区可能不是默认那家，按路径找视图。
-      const flags = await readWorkspaceFlags()
-      const rows = await bridge
-        .invoke<{ agentId: string; workspaceRoot: string; updatedAt: number }[]>('list_sessions')
-        .catch((): { agentId: string; workspaceRoot: string; updatedAt: number }[] => [])
       const target = registered.find(ws => ws.path === cwd) ?? registered[0]
       if (target !== undefined) {
         workspaceLog.append({ type: 'upsert', workspace: await workspaceViewFor(target, rows, flags) })
@@ -1232,6 +1360,8 @@ export function createAdapter(options: AdapterOptions): { remote: unknown; dispo
               // 重建已折叠出步/回合计数：重开旧会话底部指标立即有值（时间不计，见
               // replay 的注记）；旧档案没有用量，tokenUsage/contextPressure 不挂。
               ...metricsProjectionsOf(replayed),
+              // 泳道位：父会话挂 subagentCatalog、泳道挂 subagentTiming（缺席=无数据）。
+              ...subagentProjectionsOf(sessionId),
             },
           },
           assistantStream: { revision: replayed.revision },
@@ -1267,6 +1397,8 @@ export function createAdapter(options: AdapterOptions): { remote: unknown; dispo
               : {}),
             ...todosProjectionValues(journal),
             ...metricsProjectionsOf(journal),
+            // 泳道位：父会话挂 subagentCatalog、泳道挂 subagentTiming（缺席=无数据）。
+            ...subagentProjectionsOf(sessionId),
           },
         },
         // 客户端总是带 assistantStream:true 打开，缺这个基线即 gateway/internal。
@@ -1292,6 +1424,8 @@ export function createAdapter(options: AdapterOptions): { remote: unknown; dispo
                 : {}),
               ...todosProjectionValues(journal),
               ...metricsProjectionsOf(journal),
+              // 泳道位：父会话挂 subagentCatalog、泳道挂 subagentTiming（缺席=无数据）。
+              ...subagentProjectionsOf(id),
             },
           }])),
         },
@@ -1801,6 +1935,24 @@ export function createAdapter(options: AdapterOptions): { remote: unknown; dispo
     },
   }
 
+  /**
+   * `remote.subagents`（SH-109）：泳道子会话的 prompt / interruptByUser 面。会话
+   * 控制器对 addressed 子会话硬性路由到这两个方法（`sessions/session.ts` 的 prompt
+   * 与 Stop 路径），适配层必须提供命名空间面。桌面真实态在 SH-053 交付前没有子代理
+   * 注入/逐个中断面——按上游错误码显式拒绝，不伪造受理；懒建泳道（unknown 模式）的
+   * composer 本来就是只读的，正常路径到不了这里。
+   */
+  const subagentsNamespace = {
+    prompt: async (request: { childSessionId?: string } = {}) => {
+      throw new RemoteError('subagent/delivery-unavailable', '子代理 steering 待后端 M5 交付（docs/05 SH-053）', {
+        childSessionId: laneIdOf(request.childSessionId ?? ''),
+      })
+    },
+    interruptByUser: async () => {
+      throw new RemoteError('gateway/internal', '子代理逐个中断待后端 M5 交付（docs/05 SH-053）', {})
+    },
+  }
+
   const namespaces = new Map<string, unknown>([
     ['session', sessionNamespace],
     ['workspace', workspaceNamespace],
@@ -1811,6 +1963,7 @@ export function createAdapter(options: AdapterOptions): { remote: unknown; dispo
     ['credentials', face.credentials],
     ['permissionPresets', permissionPresetsNamespace],
     ['commands', commandsNamespace],
+    ['subagents', subagentsNamespace],
   ])
 
   const remote: unknown = new Proxy({
