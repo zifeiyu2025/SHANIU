@@ -25,7 +25,17 @@ export function stubRemoteNamespace(name: string): unknown {
   })
 }
 
-/** batch-1/2 组装面涉及的 remote 命名空间（dotted inject + 属性访问两用）。 */
+/**
+ * batch-1/2 组装面涉及的 remote 命名空间（dotted inject + 属性访问两用）。
+ *
+ * 核销进度（适配层接管情况见 `transport/adapter.ts`，逐项对应 docs/05 卡号）：
+ * - `session` —— 已由适配层接管（SH-017 第一步：消息流、工具卡、终端输出、中断、
+ *   审批请求转译）。同会话内的分页游标对齐与历史回放仍缺，分属 SH-094/SH-033。
+ * - `llm` / `settings` / `credentials` —— **尚未接管**：桌面设置页此刻仍写 mock 存储，
+ *   而会话读的是 `config.toml` + DPAPI。把桌面数据源切到适配层之前必须先对齐这一组，
+ *   否则会出现"配了 Key 却读不到"。
+ * - 其余命名空间 —— 后端没有对应命令面，保持显式抛错。
+ */
 export const REMOTE_NAMESPACES = [
   'session', 'commands', 'toolResults', 'userQuestions', 'workspace', 'workspaceFiles',
   'directoryPicker', 'job', 'terminal', 'settings', 'subagents', 'modelSelection',
