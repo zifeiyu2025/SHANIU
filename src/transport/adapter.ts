@@ -20,6 +20,7 @@
  * - 审批：走 typert 事件面（`approval/request`），不是 journal 事件。
  */
 import { RemoteError } from '@deepseek-ai/dsh-typert-protocol'
+import type { SessionId } from '@deepseek-ai/dsh-session/types'
 import { createSettingsFace } from './settings-face'
 import type { AgentEvent, EventMsg } from './types'
 import type { HostBridge } from './tauri'
@@ -27,6 +28,12 @@ import type { HostBridge } from './tauri'
 const OK = <T>(value: T) => ({ ok: true as const, value })
 const FAIL = (message: string) =>
   ({ ok: false as const, error: new RemoteError('gateway/internal', message, {}) })
+
+/**
+ * 宿主的会话 id 是裸字符串；进 DSH 的类型化载荷时补上品牌。品牌运行时即擦除
+ * （铸造函数在宿主编译域，typecheck 域外），这里的显式转换表达"裸 id 进类型化载荷"。
+ */
+const asSessionId = (id: string) => id as unknown as SessionId
 
 /**
  * 会话的帧序列：journal 事件与助手流帧**同轴**入队，消费者按自己的下标追平。
@@ -794,7 +801,35 @@ export function createAdapter(options: AdapterOptions): { remote: unknown; dispo
       await face.refresh()
       return OK(undefined)
     },
-    rename: () => unimplemented('session.rename', 'SH-033'),
+    rename: async (request: { sessionId?: string; title?: string } = {}) => {
+      const sessionId = request.sessionId ?? ''
+      let accepted: string | null
+      try {
+        accepted = await bridge.invoke<string | null>('rename_session', {
+          agentId: sessionId,
+          title: request.title ?? '',
+        })
+      } catch (reason) {
+        // wire 契约：失败以 {ok:false} 回给客户端，不是 rejection——manager.rename 直接读
+        // result.ok，穿透的 rejection 会绕过 UI 的错误处理（重命名对话框收不到原因）。
+        // 宿主给的是 {code,message}（rollout::RenameError 的序列化形状）；title-invalid
+        // 映射 DSH 为非法标题声明的正式错误码 session/title-invalid，其余按网关内部错误回显文案。
+        const failure = reason as { code?: unknown; message?: unknown }
+        const message = typeof failure?.message === 'string' ? failure.message : String(reason)
+        if (failure?.code === 'title-invalid') {
+          return { ok: false as const, error: new RemoteError('session/title-invalid', message, { sessionId: asSessionId(sessionId) }) }
+        }
+        return FAIL(message)
+      }
+      // 本地标题缓存必须跟着改：它优先于宿主回显，留着旧值会让侧栏在下一次读列表时
+      // 又变回改名前的样子——用户看到的就是"改了一半"。
+      if (accepted === null) titles.delete(sessionId)
+      else titles.set(sessionId, accepted)
+      // DSH 的返回类型要求一个"提交位置"。标题不是 journal 事件（我们的词汇表里没有
+      // title 事件，surfaceOp 也只允许 5 类），所以给提交时刻的 journal 末尾 seq：
+      // 客户端只用它做投影排序，不会据此回放内容。
+      return OK({ title: accepted ?? '', seq: journals.get(sessionId)?.seq ?? -1 })
+    },
     attachment: () => unimplemented('session.attachment', 'SH-040'),
     updateQueue: () => unimplemented('session.updateQueue', 'SH-018'),
     state: () => unimplemented('session.state', 'SH-033'),

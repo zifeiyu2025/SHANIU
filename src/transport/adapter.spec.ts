@@ -53,6 +53,7 @@ interface ScriptedBridge extends HostBridge {
 function scriptedBridge(
   settings: Record<string, unknown> = HOST_SETTINGS,
   archive: Record<string, unknown>[] = [],
+  renameFailure?: unknown,
 ): ScriptedBridge {
   const calls: ScriptedBridge['calls'] = []
   const handlers = new Set<(event: AgentEvent) => void>()
@@ -69,6 +70,12 @@ function scriptedBridge(
         return [{ agentId: 'agent-new', updatedAt: 1, title: '首条任务', workspaceRoot: 'W' }] as T
       }
       if (command === 'fork_session') return 'agent-fork' as T
+      if (command === 'rename_session') {
+        // 模拟宿主语义：去掉首尾空白后为空 = 清除（回 null），否则回生效标题
+        if (renameFailure !== undefined) throw renameFailure
+        const title = String(args?.title ?? '').trim()
+        return (title === '' ? null : title) as T
+      }
       return undefined as T
     },
     listenEvents(handler) {
@@ -106,7 +113,8 @@ interface SessionFace {
   fork(request: Record<string, unknown>): Promise<Record<string, unknown>>
   modelCatalog(): Promise<Record<string, unknown>>
   selectModel(request: Record<string, unknown>): Promise<Record<string, unknown>>
-  rename(): Promise<Record<string, unknown>>
+  rename(request?: Record<string, unknown>): Promise<Record<string, unknown>>
+  attachment(): Promise<never>
 }
 
 interface RemoteFace {
@@ -398,6 +406,58 @@ describe('适配层的命令面映射', () => {
     dispose()
   })
 
+  it('rename 写回宿主并同步本地标题缓存，清空后投影回落 null 由客户端派生', async () => {
+    const bridge = scriptedBridge()
+    const { remote, dispose } = createAdapter({ bridge })
+    const session = faceOf(remote).session
+    await session.prompt({ sessionId: 'agent-new', requestId: 'rpc-5', content: [{ type: 'text', text: '第一条消息' }] })
+
+    const renamed = await session.rename({ sessionId: 'agent-new', title: '  我的会话  ' })
+    // 宿主回的是去掉首尾空白后的生效标题，适配层原样上交（不替宿主做归一化）
+    expect(renamed).toMatchObject({ ok: true, value: { title: '我的会话' } })
+    // 请求也原样转发：归一化是宿主（rollout::set_title）的职责，适配层不复制一份规则
+    expect(bridge.calls.find(call => call.command === 'rename_session')?.args)
+      .toEqual({ agentId: 'agent-new', title: '  我的会话  ' })
+    // 本地缓存同步：下一次快照的标题投影用新名字，而不是改名前的旧值
+    const iterator = session.follow({ address: { kind: 'session', sessionId: 'agent-new' } })
+    const snapshot = (await iterator.next()).value as { projections: { values: { title: string | null } } }
+    expect(snapshot.projections.values.title).toBe('我的会话')
+    await iterator.return?.(undefined)
+
+    // 空标题 = 清除自定义：投影回落 null（客户端据此派生标题），而不是留下空串
+    const cleared = await session.rename({ sessionId: 'agent-new', title: '   ' })
+    expect(cleared).toMatchObject({ ok: true, value: { title: '' } })
+    const iterator2 = session.follow({ address: { kind: 'session', sessionId: 'agent-new' } })
+    const snapshot2 = (await iterator2.next()).value as { projections: { values: { title: string | null } } }
+    expect(snapshot2.projections.values.title).toBeNull()
+    await iterator2.return?.(undefined)
+    dispose()
+  })
+
+  it('rename 失败按 wire 契约回 {ok:false}：超长标题映射 session/title-invalid，其余按网关内部错误', async () => {
+    const bridge = scriptedBridge(HOST_SETTINGS, [], { code: 'title-invalid', message: '标题最长 120 字，当前 121 字' })
+    const { remote, dispose } = createAdapter({ bridge })
+    const session = faceOf(remote).session
+    const invalid = await session.rename({ sessionId: 'agent-new', title: '字'.repeat(121) })
+    expect(invalid['ok']).toBe(false)
+    const error = invalid['error'] as { name: string; code: string; message: string; details: { sessionId?: string } }
+    // DSH 为非法标题声明的正式错误码，不是 rejection——客户端读 result.ok 就能拿到原因
+    expect(error.name).toBe('RemoteError')
+    expect(error.code).toBe('session/title-invalid')
+    expect(error.message).toContain('120')
+    expect(error.details.sessionId).toBe('agent-new')
+    dispose()
+
+    const bridge2 = scriptedBridge(HOST_SETTINGS, [], { code: 'not-found', message: '会话档案不存在：ghost' })
+    const { remote: remote2, dispose: dispose2 } = createAdapter({ bridge: bridge2 })
+    const session2 = faceOf(remote2).session
+    const missing = await session2.rename({ sessionId: 'ghost', title: '名字' })
+    expect(missing['ok']).toBe(false)
+    expect((missing['error'] as { code: string }).code).toBe('gateway/internal')
+    expect((missing['error'] as { message: string }).message).toContain('不存在')
+    dispose2()
+  })
+
   it('page 交出已提交事件，throughSeq 按内层信封的 seq 截断', async () => {
     const bridge = scriptedBridge()
     const { remote, dispose } = createAdapter({ bridge })
@@ -592,7 +652,7 @@ describe('适配层的命令面映射', () => {
     const workspaceFiles = faceOf(remote).workspaceFiles
     await expect(workspaceFiles['read']!()).rejects.toThrow(/未接线/)
     await expect(workspaceFiles['read']!()).rejects.toThrow(/SH-040/)
-    await expect(faceOf(remote).session.rename()).rejects.toThrow(/SH-033/)
+    await expect(faceOf(remote).session.attachment()).rejects.toThrow(/SH-040/)
     dispose()
   })
 

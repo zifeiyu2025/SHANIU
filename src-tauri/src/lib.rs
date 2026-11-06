@@ -230,6 +230,22 @@ fn fork_session(app: tauri::AppHandle, agent_id: String, keep_items: usize) -> R
     Ok(forked.new_agent_id)
 }
 
+/// 改会话标题（DSH 侧栏的「重命名」入口，`remote.session.rename`）。
+///
+/// 返回真正生效的标题：`None` = 清空了自定义名，界面据此回落到派生标题，而不是显示一个
+/// 空字符串——空标题在列表里看起来像"这个会话没有内容"。失败带机器可读的
+/// [`rollout::RenameError`]：前端按 `code` 分派 DSH wire 错误，不匹配文案。
+#[tauri::command]
+fn rename_session(
+    app: tauri::AppHandle,
+    agent_id: String,
+    title: String,
+) -> Result<Option<String>, rollout::RenameError> {
+    let state = app.state::<AppState>();
+    let dir = state.data_root().join(rollout::ROLLOUT_DIR);
+    rollout::set_title(&dir, &agent_id, &title)
+}
+
 /// 建一份空档案并返回 agent_id（SH-017：DSH 先建会话、再发首条消息）。
 ///
 /// 只建盘不跑任务。档案首行的 `SessionMeta` 是 `resume` 的准入条件，先建档、
@@ -674,6 +690,7 @@ pub fn run() {
             list_sessions,
             load_session,
             fork_session,
+            rename_session,
             cancel_task,
             approve,
             store_api_key,

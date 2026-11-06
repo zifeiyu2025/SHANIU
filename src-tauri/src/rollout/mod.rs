@@ -245,6 +245,7 @@ pub fn list(dir: &Path) -> Vec<SessionSummary> {
     let Ok(entries) = std::fs::read_dir(dir) else {
         return Vec::new();
     };
+    let titles = read_titles(dir);
     let mut out: Vec<SessionSummary> = entries
         .flatten()
         .filter_map(|entry| {
@@ -252,11 +253,91 @@ pub fn list(dir: &Path) -> Vec<SessionSummary> {
             if path.extension().and_then(|ext| ext.to_str()) != Some("jsonl") {
                 return None;
             }
-            summarize(&path)
+            summarize(&path).map(|mut summary| {
+                // 用户改过的标题优先于派生标题：派生只该在没人起名字时兜底
+                if let Some(custom) = titles.get(&summary.agent_id) {
+                    summary.title = custom.clone();
+                }
+                summary
+            })
         })
         .collect();
     out.sort_by(|a, b| b.updated_at.cmp(&a.updated_at).then_with(|| a.agent_id.cmp(&b.agent_id)));
     out
+}
+
+/// 用户改过的会话标题（`<rollouts>/titles.json`）。
+///
+/// 为什么不写进档案首行：rollout 是**只追加**的模型转录，`read()` 的准入条件就是首行
+/// 必须为 `session_meta`，而且写入方可能正持有文件句柄——为一个显示标题去原子重写首行，
+/// 等于拿转录的完整性冒险。标题是界面元数据，旁边存一份即可；`list()` 只扫 `.jsonl`，
+/// 这份文件不会被当成会话收进列表。
+pub const TITLES_FILE: &str = "titles.json";
+
+/// 标题长度上限（按字符数）。超界报错而不是截断：截断会让用户以为侧栏显示的是他打的
+/// 那串，实际是另一串。
+pub const TITLE_MAX_CHARS: usize = 120;
+
+/// 读自定义标题。文件缺失或 JSON 坏了都当空表处理：列表是摘要视图，不该被一份元数据
+/// 文件挡住——那会让"改标题失败"升级成"整个会话列表打不开"。
+pub fn read_titles(dir: &Path) -> std::collections::BTreeMap<String, String> {
+    let Ok(raw) = std::fs::read(dir.join(TITLES_FILE)) else {
+        return Default::default();
+    };
+    serde_json::from_str(&String::from_utf8_lossy(&raw)).unwrap_or_default()
+}
+
+/// `set_title` 的失败类型：`code` 给前端按类分派（`title-invalid` → DSH wire 的
+/// `session/title-invalid`），`message` 给界面直接显示。不靠匹配中文措辞——那是把
+/// 契约挂在文案上，改个字就断。
+#[derive(Debug, serde::Serialize)]
+#[serde(tag = "code", content = "message", rename_all = "kebab-case")]
+pub enum RenameError {
+    /// 标题本身不合法（超长等）。
+    TitleInvalid(String),
+    /// 会话档案不存在。
+    NotFound(String),
+    /// 其余失败（空 id、落盘 I/O）：前端按网关内部错误回显文案。
+    Rejected(String),
+}
+
+/// 写自定义标题；`title` 去掉首尾空白后为空 = 清除自定义，回落到首条用户消息派生的标题。
+/// 返回真正生效的标题（`None` = 已清除）。
+///
+/// 档案不存在时拒绝：给一个不存在的会话改名会留下一条没人认领的标题，将来真出现同
+/// `agent_id` 的档案就莫名其妙带上了它——而那种档案是 `fork`/`resume` 造出来的，用户
+/// 完全看不出标题不是自己起的。
+pub fn set_title(dir: &Path, agent_id: &str, title: &str) -> Result<Option<String>, RenameError> {
+    let id = agent_id.trim();
+    if id.is_empty() {
+        return Err(RenameError::Rejected("会话 id 为空，无法改名".into()));
+    }
+    if !dir.join(format!("{id}.jsonl")).is_file() {
+        return Err(RenameError::NotFound(format!("会话档案不存在：{id}")));
+    }
+    let trimmed = title.trim();
+    if trimmed.chars().count() > TITLE_MAX_CHARS {
+        return Err(RenameError::TitleInvalid(format!(
+            "标题最长 {TITLE_MAX_CHARS} 字，当前 {} 字",
+            trimmed.chars().count()
+        )));
+    }
+    let mut titles = read_titles(dir);
+    let accepted = if trimmed.is_empty() {
+        titles.remove(id);
+        None
+    } else {
+        titles.insert(id.to_string(), trimmed.to_string());
+        Some(trimmed.to_string())
+    };
+    // 原子替换：半截的 titles.json 会被当成空表，用户改过的所有标题一起丢
+    let tmp = dir.join(format!("{TITLES_FILE}.tmp"));
+    let body = serde_json::to_string_pretty(&titles)
+        .map_err(|e| RenameError::Rejected(format!("序列化标题失败: {e}")))?;
+    std::fs::write(&tmp, body).map_err(|e| RenameError::Rejected(format!("写标题临时文件失败: {e}")))?;
+    std::fs::rename(&tmp, dir.join(TITLES_FILE))
+        .map_err(|e| RenameError::Rejected(format!("替换标题文件失败: {e}")))?;
+    Ok(accepted)
 }
 
 fn summarize(path: &Path) -> Option<SessionSummary> {
@@ -557,6 +638,73 @@ mod tests {
         let one = &list(&dir)[0];
         assert_eq!(one.title.chars().count(), 41, "40 字 + 省略号，按字符数截断");
         assert!(one.title.ends_with('…'));
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn custom_title_overrides_derived_and_clearing_falls_back() {
+        let dir = temp_dir();
+        write_session(&dir, "a", "第一条用户消息");
+        assert_eq!(list(&dir)[0].title, "第一条用户消息", "没人改名时用派生标题");
+
+        assert_eq!(set_title(&dir, "a", "  我的会话  ").unwrap().as_deref(), Some("我的会话"), "首尾空白不该进标题");
+        assert_eq!(list(&dir)[0].title, "我的会话");
+
+        // 空标题 = 清除自定义，回落到派生标题：界面"清空名字"不该留下一个空标题行
+        assert_eq!(set_title(&dir, "a", "   ").unwrap(), None);
+        assert_eq!(list(&dir)[0].title, "第一条用户消息");
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn set_title_rejects_unknown_agent_and_overlong_title() {
+        let dir = temp_dir();
+        write_session(&dir, "a", "正文");
+        // 给不存在的会话改名会留下一条没人认领的标题：将来 fork/resume 造出同 id 的
+        // 档案时，它会莫名其妙带上这个标题，而用户看不出标题不是自己起的。
+        let err = set_title(&dir, "ghost", "标题").unwrap_err();
+        assert!(matches!(err, RenameError::NotFound(ref m) if m.contains("不存在")), "{err:?}");
+        assert!(!read_titles(&dir).contains_key("ghost"));
+
+        let long = "字".repeat(TITLE_MAX_CHARS + 1);
+        let err = set_title(&dir, "a", &long).unwrap_err();
+        assert!(matches!(err, RenameError::TitleInvalid(ref m) if m.contains(&TITLE_MAX_CHARS.to_string())), "{err:?}");
+        // 拒绝的写入必须一点都没落盘
+        assert!(read_titles(&dir).is_empty());
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    /// 序列化形状是前端契约：适配层按 `code` 分派（`title-invalid` → DSH wire 的
+    /// `session/title-invalid`），措辞怎么改都不该破坏这个形状。
+    #[test]
+    fn rename_error_serializes_to_tagged_code_and_message() {
+        assert_eq!(
+            serde_json::to_value(RenameError::TitleInvalid("标题最长 120 字，当前 121 字".into())).unwrap(),
+            serde_json::json!({ "code": "title-invalid", "message": "标题最长 120 字，当前 121 字" })
+        );
+        assert_eq!(
+            serde_json::to_value(RenameError::NotFound("会话档案不存在：a".into())).unwrap(),
+            serde_json::json!({ "code": "not-found", "message": "会话档案不存在：a" })
+        );
+        assert_eq!(
+            serde_json::to_value(RenameError::Rejected("会话 id 为空，无法改名".into())).unwrap(),
+            serde_json::json!({ "code": "rejected", "message": "会话 id 为空，无法改名" })
+        );
+    }
+
+    /// `titles.json` 不是档案：它既不能被扫成会话，也不能因为坏了就挡住整个列表。
+    #[test]
+    fn titles_sidecar_is_not_a_session_and_a_broken_one_does_not_break_the_list() {
+        let dir = temp_dir();
+        write_session(&dir, "a", "正文");
+        set_title(&dir, "a", "改名后的标题").unwrap();
+        assert_eq!(list(&dir).len(), 1, "侧车文件不该被当成第二个会话");
+        assert_eq!(list(&dir)[0].title, "改名后的标题");
+
+        std::fs::write(dir.join(TITLES_FILE), "{ not json").unwrap();
+        let rows = list(&dir);
+        assert_eq!(rows.len(), 1, "标题文件坏了也不能让列表打不开");
+        assert_eq!(rows[0].title, "正文", "读不到自定义标题就回落派生标题，而不是报错");
         std::fs::remove_dir_all(&dir).ok();
     }
 
