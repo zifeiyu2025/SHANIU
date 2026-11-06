@@ -394,6 +394,31 @@ fn save_settings(
     Ok(())
 }
 
+/// 在系统文件管理器里打开一个目录（会话头部「资源管理器」按钮的后端）。
+///
+/// 只接受**当前真实存在的目录**：路径由前端从会话 cwd 带来，这里不拼接、不创建、
+/// 不执行调用方给定的程序名——程序名固定为系统自带的 explorer / open / xdg-open。
+/// 用 `spawn` 而不是 `output`：explorer 即使成功也常返回非零退出码，等待它只会误报失败。
+#[tauri::command]
+fn open_in_explorer(path: String) -> Result<(), String> {
+    let target = std::path::PathBuf::from(&path);
+    if !target.is_dir() {
+        return Err(format!("不是可打开的目录: {path}"));
+    }
+    let program = if cfg!(target_os = "windows") {
+        "explorer"
+    } else if cfg!(target_os = "macos") {
+        "open"
+    } else {
+        "xdg-open"
+    };
+    std::process::Command::new(program)
+        .arg(&target)
+        .spawn()
+        .map(|_| ())
+        .map_err(|e| format!("打开文件管理器失败: {e}"))
+}
+
 /// 从托盘恢复主窗口：取消最小化 + 显示 + 聚焦。
 fn show_main_window(app: &tauri::AppHandle) {
     if let Some(window) = app.get_webview_window("main") {
@@ -438,7 +463,8 @@ pub fn run() {
             store_api_key,
             has_api_key,
             get_settings,
-            save_settings
+            save_settings,
+            open_in_explorer
         ])
         .on_window_event(|window, event| {
             // 关闭 = 隐藏到系统托盘（不退出）；真正退出只走托盘菜单「退出」
