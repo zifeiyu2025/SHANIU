@@ -19,6 +19,7 @@ import { apply as uiSidebarFilesApply, inject as uiSidebarFilesInject } from '@d
 import { apply as uiSidebarBrowserApply, inject as uiSidebarBrowserInject } from '@deepseek-ai/dsh-client-ui-sidebar-browser/client'
 import { apply as uiConversationApply, inject as uiConversationInject } from '@deepseek-ai/dsh-client-ui-conversation/client'
 import { apply as uiChatApply, inject as uiChatInject } from '@deepseek-ai/dsh-client-ui-chat/client'
+import { apply as uiSubagentApply, inject as uiSubagentInject } from '@deepseek-ai/dsh-client-ui-subagent/client'
 import { apply as uiSecretMaskApply, inject as uiSecretMaskInject } from '@deepseek-ai/dsh-client-ui-secret-mask/client'
 import { apply as uiWorkflowRunApply, inject as uiWorkflowRunInject } from '@deepseek-ai/dsh-client-ui-workflow-run/client'
 import { apply as uiSidebarDocumentPreviewApply, inject as uiSidebarDocumentPreviewInject } from '@deepseek-ai/dsh-client-ui-sidebar-documentpreview/client'
@@ -136,7 +137,7 @@ export async function bootShaniu(container: HTMLElement): Promise<BootHandle> {
         return typeof scoped?.scope === 'function' ? scoped.scope(sessionId) : undefined
       },
     })
-    const covered = ['session', 'workspace', 'toolResults', 'settings', 'llm', 'credentials', 'commands', 'permissionPresets']
+    const covered = ['session', 'workspace', 'toolResults', 'settings', 'llm', 'credentials', 'commands', 'permissionPresets', 'subagents']
     root.provide('remote', adapter.remote)
     // 适配层已接管的名字不再被 stub 覆盖：后注册的 stub 会让"消息流能跑、
     // 设置页永远抛错"，而抛错看起来像后端坏了，不像接线接反了。
@@ -208,6 +209,9 @@ export async function bootShaniu(container: HTMLElement): Promise<BootHandle> {
     { inject: uiSettingsGeneralInject, apply: uiSettingsGeneralApply },
     { inject: uiSettingsModelsInject, apply: uiSettingsModelsApply },
     { inject: uiChatInject, apply: uiChatApply },
+    // 子代理泳道 UI（SH-109）：会话头目录树/面包屑切换/侧栏子会话聊天。
+    // 数据面由 transport 提供 subagentCatalog/subagentTiming 投影帧。
+    { inject: uiSubagentInject, apply: uiSubagentApply },
     // 对话流补全：用户消息里的密钥打码、工作流节点、文档预览页签
     // （赞/踩反馈不挂：本地客户端没有反馈出口，点了只写内存属于假动作）
     { inject: uiSecretMaskInject, apply: uiSecretMaskApply },

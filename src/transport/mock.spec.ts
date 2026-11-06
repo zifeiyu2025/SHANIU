@@ -259,3 +259,138 @@ describe('mock 权限挡位目录', () => {
     expect(await currentPermission()).toBe('workspace-write')
   })
 })
+
+describe('mock 子代理泳道演示（SH-109）', () => {
+  /** 泳道 journal 的回放（follow 对 subagent 地址与 session 地址都按 childSessionId 解析）。 */
+  async function laneJournal(laneId: string, kind: 'session' | 'subagent' = 'subagent'): Promise<WireEvent[]> {
+    const address = kind === 'session'
+      ? { kind: 'session' as const, sessionId: laneId }
+      : { kind: 'subagent' as const, childSessionId: laneId }
+    const stream = (remote.session as unknown as {
+      follow(request: { address: { kind: string; sessionId?: string; childSessionId?: string } }): AsyncGenerator<JournalSnapshot>
+    }).follow({ address })
+    const first = await stream.next()
+    await stream.return?.(undefined)
+    if (first.done) throw new Error('泳道 follow 缺快照')
+    return first.value.records.map(record => record.event)
+  }
+
+  /** 控制基线里某会话的投影值（泳道 catalog/timing 的读取通道）。 */
+  async function baselineValues(id: string): Promise<Record<string, unknown>> {
+    const stream = (remote.session as unknown as {
+      control(): AsyncGenerator<{ value: { projections: Record<string, { values: Record<string, unknown> }> } }>
+    }).control()
+    const first = await stream.next()
+    await stream.return?.(undefined)
+    if (first.done) throw new Error('control 缺基线')
+    return first.value.value.projections[id]?.values ?? {}
+  }
+
+  /** 从父会话 journal 的 catalog 事件取泳道 id（run 序号隔离，测试不引用字面量）。 */
+  async function laneIdsOfCatalog(parentId: string): Promise<string[]> {
+    const stream = (remote.session as unknown as {
+      follow(request: { address: { kind: 'session'; sessionId: string } }): AsyncGenerator<JournalSnapshot>
+    }).follow({ address: { kind: 'session', sessionId: parentId } })
+    const first = await stream.next()
+    await stream.return?.(undefined)
+    if (first.done) throw new Error('父 follow 缺快照')
+    return first.value.records
+      .map(record => record.event)
+      .filter(event => event.type === 'subagent/catalog')
+      .map(event => (event.data as { childId: string }).childId)
+  }
+
+  it('/subagent-demo：父落 catalog v3 与汇总，泳道完整回合 + timing 收口', async () => {
+    const created = await remote.session.create()
+    const parentId = created.value.sessionId
+    await send(parentId, '/subagent-demo')
+    const events = await eventsAfterTurns(parentId, 1)
+
+    // 父 journal：catalog v3 两条（childId/label/name 齐备）+ 用户命令 + 汇总应答
+    const catalogEvents = events.filter(event => event.type === 'subagent/catalog')
+    expect(catalogEvents.map(event => event.data)).toEqual([
+      expect.objectContaining({ version: 3, mode: 'continuable', name: 'explorer-a', label: '探索 transport 模块边界' }),
+      expect.objectContaining({ version: 3, mode: 'continuable', name: 'explorer-b', label: '汇总测试基线' }),
+    ])
+    // 泳道 id 从 catalog 事件派生（带 run 序号，重复演示不撞 journal）
+    const laneIds = catalogEvents.map(event => (event.data as { childId: string }).childId)
+    expect(laneIds).toHaveLength(2)
+    const summary = events.filter(event => event.type === 'assistant/message').at(-1)
+    expect(JSON.stringify(summary?.data)).toContain('两条子代理已完成')
+
+    // 泳道 journal（subagent 地址解析）：descriptor v3 + 完整回合 + 工具调用
+    const lane = await laneJournal(laneIds[0]!)
+    expect(lane[0]?.type).toBe('subagent/descriptor')
+    expect(lane[0]?.data).toMatchObject({ version: 3, mode: 'continuable', provider: 'shaniu-mock', label: '探索 transport 模块边界' })
+    expect(lane.map(event => event.type)).toEqual([
+      'subagent/descriptor', 'turn/start', 'step/start', 'assistant/message', 'step/end',
+      'step/start', 'tool/call', 'tool/result', 'step/end', 'turn/end',
+    ])
+    expect(lane.at(-1)?.data).toMatchObject({ reason: { kind: 'completed' } })
+    // 泳道事件过 wire 闸（assertSessionWireEvent 由客户端 follow 时执行；这里对形状做窄断言）
+    expect(lane.every(event => Number.isInteger(event.seq))).toBe(true)
+
+    // session 地址同样能打开泳道（两路地址等价）
+    const viaSessionKind = await laneJournal(laneIds[1]!, 'session')
+    expect(viaSessionKind[0]?.type).toBe('subagent/descriptor')
+
+    // 控制基线：父挂 subagentCatalog 投影，泳道挂收口后的 subagentTiming
+    const parentValues = await baselineValues(parentId)
+    expect(parentValues['subagentCatalog']).toEqual([
+      expect.objectContaining({ id: laneIds[0], mode: 'continuable', label: '探索 transport 模块边界', name: 'explorer-a' }),
+      expect.objectContaining({ id: laneIds[1], mode: 'continuable', label: '汇总测试基线', name: 'explorer-b' }),
+    ])
+    const laneValues = await baselineValues(laneIds[0]!)
+    const timing = laneValues['subagentTiming'] as { settledMs: number; lastTurnCompleted?: boolean; active?: unknown }
+    expect(timing.lastTurnCompleted).toBe(true)
+    expect(timing.settledMs).toBeGreaterThan(0)
+    expect(timing.active).toBeUndefined()
+  }, 20_000)
+
+  it('remote.subagents：interrupt 让泳道按 aborted 收口，steering 开续聊回合', async () => {
+    const created = await remote.session.create()
+    const parentId = created.value.sessionId
+    await send(parentId, '/subagent-demo')
+    // 泳道 id 从本回合的 catalog 事件派生（run 序号隔离两次演示；catalog 事件在
+    // prompt 的同步段就落了，此刻取 id 不会漏）
+    const [laneA, laneB] = await laneIdsOfCatalog(parentId)
+    // interrupt 必须赶在泳道收口前：explorer-b 错峰 400ms 起步，此刻置中断位，
+    // 剧本在首个检查点退出并按 aborted 收口
+    const subagents = (remote as unknown as {
+      subagents: {
+        prompt(request: Record<string, unknown>): Promise<{ ok: boolean; value?: unknown; error?: { code: string } }>
+        interruptByUser(childSessionId: string): Promise<{ ok: boolean; value?: unknown }>
+      }
+    }).subagents
+    const interrupted = await subagents.interruptByUser(laneB!)
+    expect(interrupted.ok).toBe(true)
+
+    // explorer-a 正常跑完、父代理汇总收口（父回合结束 = 泳道已全部收口）
+    await eventsAfterTurns(parentId, 1)
+    const abortedEvents = await laneJournal(laneB!)
+    const abortedEnds = abortedEvents.filter(event => event.type === 'turn/end')
+    expect(abortedEnds).toHaveLength(1)
+    expect(abortedEnds[0]?.data).toMatchObject({ reason: { kind: 'aborted' } })
+
+    // 未知泳道如实拒绝
+    const missing = await subagents.prompt({ childSessionId: 'nope', content: [] })
+    expect(missing.ok).toBe(false)
+    expect(missing.error?.code).toBe('subagent/not-found')
+
+    // steering：continuable 泳道（已收口的 explorer-a）开新回合续聊，user/message 带 rpcId
+    const steered = await subagents.prompt({
+      childSessionId: laneA!, requestId: 'rpc-steer',
+      delivery: 'queue', content: [{ type: 'text', text: '补充：注意 settings-face 的边界' }],
+    })
+    expect(steered.ok).toBe(true)
+    const steeredEvents = await laneJournal(laneA!)
+    expect(steeredEvents.filter(event => event.type === 'turn/end')).toHaveLength(2)
+    expect(steeredEvents.filter(event => event.type === 'user/message').at(-1)?.data)
+      .toMatchObject({ source: { kind: 'user', rpcId: 'rpc-steer' } })
+
+    // 已中断的泳道 steering 通道关闭
+    const closed = await subagents.prompt({ childSessionId: laneB!, content: [] })
+    expect(closed.ok).toBe(false)
+    expect(closed.error?.code).toBe('subagent/delivery-unavailable')
+  }, 20_000)
+})

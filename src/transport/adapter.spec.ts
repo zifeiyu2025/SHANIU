@@ -47,7 +47,7 @@ const HOST_SETTINGS = {
 
 interface ScriptedBridge extends HostBridge {
   readonly calls: { command: string; args: Record<string, unknown> | undefined }[]
-  emit(sessionId: string, msg: EventMsg): void
+  emit(sessionId: string, msg: EventMsg, agentId?: string): void
 }
 
 function scriptedBridge(
@@ -138,13 +138,13 @@ function scriptedBridge(
       handlers.add(handler)
       return () => handlers.delete(handler)
     },
-    emit(sessionId, msg) {
+    emit(sessionId, msg, agentId = 'root') {
       counter += 1
       const event: AgentEvent = {
         event_id: `01J00000000000000000000${String(counter).padStart(2, '0')}`,
         session_id: sessionId,
-        agent_id: 'root',
-        parent_id: null,
+        agent_id: agentId,
+        parent_id: agentId === 'root' ? null : 'root',
         ts_ms: 1_700_000_000_000,
         msg,
       }
@@ -1528,6 +1528,122 @@ describe('workspace 面：归档/置顶/手动排序（SH-100）', () => {
     expect(baseline['archivedSessionIds']).toEqual([])
     expect(baseline['pinnedSessionIds']).toEqual([])
     await iterator.return?.(undefined)
+    dispose()
+  })
+})
+
+describe('子代理泳道（SH-109）：AgentEvent 信封的 agent_id 路由', () => {
+  /** 泳道面的窄声明：follow + 控制流基线。 */
+  interface ControlFace {
+    session: SessionFace & {
+      control(): AsyncGenerator<{ value: { projections: Record<string, { values: Record<string, unknown> }> } }>
+    }
+  }
+
+  it('懒建泳道：非 root 事件路由进泳道 journal，父 journal 只落 catalog 引用事件', async () => {
+    const bridge = scriptedBridge()
+    const { remote, dispose } = createAdapter({ bridge })
+    const session = faceOf(remote).session as ControlFace['session']
+    await session.prompt({ sessionId: 'agent-new', requestId: 'rpc-1', content: [{ type: 'text', text: '派子代理去探索' }] })
+    // 后端 spawn 后子代理的事件带 agent_id（session_id 仍是宿主任务会话）
+    bridge.emit('agent-new', { type: 'agent_message_delta', delta: '我去派子代理' })
+    bridge.emit('agent-new', { type: 'turn_started', turn: 1 }, 'lane-a')
+    bridge.emit('agent-new', { type: 'agent_message_delta', delta: '开始探索' }, 'lane-a')
+    bridge.emit('agent-new', { type: 'tool_call_begin', call_id: 'l1', tool: 'read_file', args: { path: 'src/transport' } }, 'lane-a')
+    bridge.emit('agent-new', { type: 'tool_call_end', call_id: 'l1', exit_code: 0, error: null, result: 'ok' }, 'lane-a')
+
+    // 泳道 journal：回合开 → 工具调用（delta 进的是助手流，不是 journal 事件）
+    const lane = session.follow({ address: { kind: 'subagent', parentSessionId: 'agent-new', childSessionId: 'lane-a', mode: 'unknown' } })
+    const laneSnapshot = (await lane.next()).value as Record<string, unknown>
+    const laneEvents = eventsOf(laneSnapshot)
+    // tool_call_begin 会先定稿此前的正文（assistant/message），再落调用
+    expect(laneEvents.map(event => event['type'])).toEqual(['turn/start', 'step/start', 'assistant/message', 'tool/call', 'tool/result'])
+    laneEvents.forEach(event => expect(() => assertSessionWireEvent(event)).not.toThrow())
+
+    // 父 journal：只有 catalog 引用事件，没有泳道的工具调用——回合/步数/指标不被污染
+    const parent = session.follow({ address: { kind: 'session', sessionId: 'agent-new' } })
+    const parentSnapshot = (await parent.next()).value as Record<string, unknown>
+    const parentEvents = eventsOf(parentSnapshot)
+    expect(parentEvents.map(event => event['type'])).toEqual([
+      'turn/start', 'step/start', 'user/message', 'subagent/catalog',
+    ])
+    expect((parentEvents.at(-1)?.['data'] as Record<string, unknown>)).toMatchObject({
+      version: 1, childId: 'lane-a', mode: 'unknown',
+    })
+    parentEvents.forEach(event => expect(() => assertSessionWireEvent(event)).not.toThrow())
+
+    // 控制基线：父挂 subagentCatalog（懒建泳道 = v1 unknown），泳道 timing 未见 descriptor 如实缺席
+    const control = session.control()
+    const baseline = (await control.next()).value
+    expect(baseline.value.projections['agent-new']?.values['subagentCatalog']).toEqual([
+      { id: 'lane-a', createdAt: expect.any(Number), mode: 'unknown' },
+    ])
+    expect(baseline.value.projections['lane-a']?.values['subagentTiming']).toBeUndefined()
+    await control.return?.(undefined)
+
+    await lane.return?.(undefined)
+    await parent.return?.(undefined)
+    dispose()
+  })
+
+  it('泳道完成态：turn/end 落定、运行状态收回，wire 规则全程过闸', async () => {
+    const bridge = scriptedBridge()
+    const { remote, dispose } = createAdapter({ bridge })
+    const session = faceOf(remote).session as ControlFace['session']
+    const statuses: [string, boolean][] = []
+    ;(remote as unknown as {
+      $on(event: string, listener: (...args: never[]) => unknown): () => void
+    }).$on('api-session/status', (id: string, running: boolean) => {
+      statuses.push([id, running])
+      return Promise.resolve('')
+    })
+
+    bridge.emit('agent-new', { type: 'turn_started', turn: 1 }, 'lane-a')
+    bridge.emit('agent-new', { type: 'agent_message_delta', delta: '结论：模块边界清晰' }, 'lane-a')
+    bridge.emit('agent-new', { type: 'turn_completed', turn: 1, reason: 'completed' }, 'lane-a')
+
+    // 运行状态的开与收都按泳道 id 广播（目录树徽标与 Stop 按钮的数据源）
+    expect(statuses).toEqual([['lane-a', true], ['lane-a', false]])
+
+    const lane = session.follow({ address: { kind: 'subagent', parentSessionId: 'agent-new', childSessionId: 'lane-a', mode: 'unknown' } })
+    const snapshot = (await lane.next()).value as Record<string, unknown>
+    const events = eventsOf(snapshot)
+    expect(events.map(event => event['type'])).toEqual(['turn/start', 'step/start', 'assistant/message', 'step/end', 'turn/end'])
+    expect((events.at(-1)?.['data'] as { reason: unknown }).reason).toEqual({ kind: 'completed' })
+    events.forEach(event => expect(() => assertSessionWireEvent(event)).not.toThrow())
+    await lane.return?.(undefined)
+    dispose()
+  })
+
+  it('泳道的审批请求按泳道会话作用域派发（审批卡落在泳道 composer 上）', async () => {
+    const bridge = scriptedBridge()
+    const scopes = new Map<string, unknown>([['lane-a', { sessionId: 'lane-a' }]])
+    const { remote, dispose } = createAdapter({ bridge, approvalScope: id => scopes.get(id) })
+    const seen: { self: unknown; request: Record<string, unknown> }[] = []
+    faceOf(remote).$on('approval/request', async function (this: unknown, request: Record<string, unknown>) {
+      seen.push({ self: this, request })
+      return 'allowed-once'
+    })
+    bridge.emit('agent-new', { type: 'exec_approval_request', request_id: 'r-l1', tool: 'apply_patch', args: { path: 'a.txt' }, risk: 'write_in_workspace' }, 'lane-a')
+    await vi.waitFor(() => { expect(seen).toHaveLength(1) })
+    expect(seen[0]!.self).toEqual({ sessionId: 'lane-a' })
+    expect(seen[0]!.request).toMatchObject({ agent: { id: 'lane-a' }, toolName: 'apply_patch' })
+    expect(bridge.calls.find(call => call.command === 'approve')?.args).toEqual({ requestId: 'r-l1', decision: 'allow' })
+    dispose()
+  })
+
+  it('remote.subagents 桌面真实态按上游错误码显式拒绝，不伪造受理', async () => {
+    const bridge = scriptedBridge()
+    const { remote, dispose } = createAdapter({ bridge })
+    const subagents = (remote as unknown as {
+      subagents: {
+        prompt(request: Record<string, unknown>): Promise<never>
+        interruptByUser(childSessionId: string): Promise<never>
+      }
+    }).subagents
+    await expect(subagents.prompt({ childSessionId: 'lane-a', requestId: 'r1', delivery: 'queue', content: [] }))
+      .rejects.toThrow('SH-053')
+    await expect(subagents.interruptByUser('lane-a')).rejects.toThrow('SH-053')
     dispose()
   })
 })

@@ -8,6 +8,10 @@ import type { SessionSummary } from '@deepseek-ai/dsh-api-session-controller/typ
 import type { ModelSelection } from '@deepseek-ai/dsh-api-session-controller/types'
 import type { WorkspaceView } from '@deepseek-ai/dsh-api-workspace-controller/client'
 import type { SessionId } from '@deepseek-ai/dsh-session/types'
+import {
+  catalogEntryOf, foldTimingEvent, initTimingState, timingProjectionOf,
+  type SubagentCatalogEntry, type SubagentTimingState,
+} from './subagent-wire'
 import { createModelsMock } from './mock-models'
 
 /**
@@ -373,6 +377,313 @@ function startMockTurn(sessionId: string, requestId: string | undefined, text: s
   })()
 }
 
+// ---- 子代理泳道演示（SH-109）：输入 /subagent-demo 触发 ----
+// 浏览器联调态没有真实子代理后端（M5 未开工），这条剧本按上游 wire 形状伪造
+// 「父代理 spawn 两条泳道并行探索」的完整一轮：父 journal 落 `subagent/catalog` v3、
+// 两条泳道各自 descriptor/turn/tool 事件流与 timing 折叠（subagent-wire 的单点语义）、
+// 运行状态经 api-session/status、投影值经控制流帧。形状与适配层将来产出的一致，
+// SH-053 接真实事件源时 UI 零改动。
+
+/** 演示触发命令：在会话输入框原样发送它。 */
+const SUBAGENT_DEMO_COMMAND = '/subagent-demo'
+
+/** 演示泳道登记：laneId → 父会话与中断标志（remote.subagents.interruptByUser 置位）。 */
+const DEMO_LANES = new Map<string, { parentSessionId: string; aborted: boolean }>()
+
+/** 演示泳道的父目录（subagentCatalog 投影值，控制流推帧与控制基线共用）。 */
+const DEMO_CATALOG = new Map<string, SubagentCatalogEntry[]>()
+
+/** 演示泳道的 timing 折叠（subagentTiming 投影值，语义照上游 projection.ts）。 */
+const DEMO_TIMING = new Map<string, SubagentTimingState>()
+
+/** 演示节奏：泳道流式帧间隔。 */
+const LANE_TICK_MS = 90
+
+/** 演示运行序号（泳道 id 的一部分，保证重复触发不撞同一 journal）。 */
+let demoRun = 0
+
+const sleep = (ms: number): Promise<void> => new Promise(resolve => setTimeout(resolve, ms))
+
+/** 一条演示泳道的剧本输入。 */
+interface MockLaneSpec {
+  readonly name: string
+  readonly label: string
+  readonly reply: string
+  readonly tool: { name: string; args: string; output: string }
+}
+
+const LANE_SPECS: readonly MockLaneSpec[] = [
+  {
+    name: 'explorer-a',
+    label: '探索 transport 模块边界',
+    reply: 'transport 层共 6 个模块：adapter/tauri/mock/stubs/settings-face/shims。adapter 是唯一对接面，事件入口 onEvent 按 EventMsg 分派到会话 journal。',
+    tool: { name: 'read_file', args: '{"path":"src/transport/adapter.ts"}', output: '/* 适配层源码约 1900 行：事件路由、journal 帧、投影推帧，此处省略 */' },
+  },
+  {
+    name: 'explorer-b',
+    label: '汇总测试基线',
+    reply: 'vitest 当前 156 例全绿，覆盖 adapter 契约、mock 回合剧本、投影折叠与挂载注册四类面。',
+    tool: { name: 'unified_exec', args: '{"command":"pnpm test"}', output: 'Test Files  9 passed (9)\n     Tests  156 passed (156)' },
+  },
+]
+
+/** 演示 journal 的一条事件推进（与 startMockTurn 内联版同一规则：seq +1、records/frames 双写）。 */
+function pushDemoEvent(journal: MockJournal, type: string, data: unknown, extra: Record<string, unknown> = {}, time = Date.now()): number {
+  journal.seq += 1
+  const record = { type: 'event', event: { type, seq: journal.seq, time, ...extra, data } }
+  journal.records.push(record)
+  journal.frames.push(record)
+  return journal.seq
+}
+
+/** 控制流投影帧（与 pushPermission 同一通道；帧会建出该会话的投影 store）。 */
+function pushLaneProjection(sessionId: string, changes: { key: string; val: unknown }[]): void {
+  projectionFrames.push({ type: 'projection', sessionId: sessionId as SessionId, seq: ++projectionSeq, changes })
+}
+
+/** subagentCatalog / subagentTiming 的当前投影值（控制基线用；帧路径另有整表推帧）。 */
+export function subagentProjectionsOf(sessionId: string): Record<string, unknown> {
+  const timing = DEMO_TIMING.get(sessionId)
+  if (timing !== undefined) {
+    const view = timingProjectionOf(timing)
+    return view === undefined ? {} : { subagentTiming: view }
+  }
+  const catalog = DEMO_CATALOG.get(sessionId)
+  return catalog === undefined ? {} : { subagentCatalog: catalog }
+}
+
+/**
+ * 一条演示泳道的完整剧本：descriptor → 回合（流式应答 + 工具调用）→ 收口。
+ * timing 按 subagent-wire 的上游语义折叠（turn 开合推帧，其余只推进不推帧）；
+ * `aborted` 是 interruptByUser 置的中断位，剧本在每个检查点退出并按 aborted 收口。
+ */
+function runMockLane(laneId: string, spec: MockLaneSpec): Promise<void> {
+  const lane = DEMO_LANES.get(laneId)
+  if (lane === undefined) return Promise.resolve()
+  const journal = journalOf(laneId)
+  const timingState = (): SubagentTimingState => DEMO_TIMING.get(laneId) ?? initTimingState()
+  const pushTimingFrame = (): void => {
+    const view = timingProjectionOf(timingState())
+    if (view !== undefined) pushLaneProjection(laneId, [{ key: 'subagentTiming', val: view }])
+  }
+  const pushStream = (frame: Record<string, unknown>): void => {
+    journal.revision += 1
+    journal.frames.push({
+      type: 'assistant-stream',
+      frame: { ...frame, attemptId: `mock-lane-attempt-${laneId}`, revision: journal.revision },
+    })
+  }
+  return (async () => {
+    const turn = 0
+    pushDemoEvent(journal, 'subagent/descriptor', {
+      version: 3, mode: 'continuable', provider: 'shaniu-mock', label: spec.label,
+    })
+    DEMO_TIMING.set(laneId, foldTimingEvent(timingState(), 'subagent/descriptor', Date.now()))
+    pushTimingFrame()
+    mockEmit('api-session/status', laneId, true)
+    pushDemoEvent(journal, 'turn/start', { turn })
+    DEMO_TIMING.set(laneId, foldTimingEvent(timingState(), 'turn/start', Date.now()))
+    pushTimingFrame()
+    pushDemoEvent(journal, 'step/start', { turn, step: 0 })
+    pushStream({ type: 'start', startedAfterSeq: journal.seq, turn, step: 0 })
+    let index = 0
+    for (const chunk of chunksOf(spec.reply, 8)) {
+      if (lane.aborted) break
+      await sleep(LANE_TICK_MS)
+      pushStream({ type: 'chunk', index, time: Date.now(), chunk: { type: 'text-delta', index: 0, text: chunk } })
+      index += 1
+      DEMO_TIMING.set(laneId, foldTimingEvent(timingState(), 'advance', Date.now()))
+    }
+    if (lane.aborted) {
+      pushStream({ type: 'end', index, outcome: { kind: 'abandoned' } })
+    } else {
+      const assistantSeq = pushDemoEvent(journal, 'assistant/message', {
+        turn, step: 0,
+        message: {
+          id: `mock-lane-assistant-${journal.seq + 1}`,
+          role: 'assistant',
+          content: [{ type: 'text', text: spec.reply }],
+          source: { kind: 'model', provider: 'shaniu-mock', model: 'lane-model' },
+        },
+        stream: [],
+        usage: { inputTokens: 1200, outputTokens: 180, totalTokens: 1380, cacheReadTokens: 0, cacheWriteTokens: 0 },
+      }, { surfaceOp: 'append' })
+      pushStream({ type: 'end', index, outcome: { kind: 'committed', eventType: 'assistant/message', seq: assistantSeq } })
+    }
+    pushDemoEvent(journal, 'step/end', { turn, step: 0 })
+    if (!lane.aborted) {
+      await sleep(LANE_TICK_MS * 2)
+      DEMO_TIMING.set(laneId, foldTimingEvent(timingState(), 'advance', Date.now()))
+      pushDemoEvent(journal, 'step/start', { turn, step: 1 })
+      pushDemoEvent(journal, 'tool/call', {
+        turn, step: 1, callId: `mock-lane-call-${laneId}`, name: spec.tool.name, arguments: spec.tool.args,
+      })
+      await sleep(LANE_TICK_MS * 3)
+      DEMO_TIMING.set(laneId, foldTimingEvent(timingState(), 'advance', Date.now()))
+      pushDemoEvent(journal, 'tool/result', {
+        turn, step: 1,
+        message: {
+          id: `mock-lane-result-${laneId}`,
+          role: 'tool',
+          source: { kind: 'tool', callId: `mock-lane-call-${laneId}` },
+          toolCallId: `mock-lane-call-${laneId}`,
+          content: [{ type: 'text', text: spec.tool.output }],
+          isError: false,
+        },
+      }, { surfaceOp: 'append' })
+      pushDemoEvent(journal, 'step/end', { turn, step: 1 })
+    }
+    pushDemoEvent(journal, 'turn/end', {
+      turn,
+      reason: lane.aborted ? { kind: 'aborted', reason: { kind: 'user' } } : { kind: 'completed' },
+    })
+    DEMO_TIMING.set(laneId, foldTimingEvent(timingState(), 'turn/end', Date.now(), lane.aborted ? 'aborted' : 'completed'))
+    pushTimingFrame()
+    mockEmit('api-session/status', laneId, false)
+  })()
+}
+
+/**
+ * 泳道演示剧本：父回合落用户命令 → catalog v3 事件与投影帧 → 两条泳道并行跑 →
+ * 父代理汇总收口。父回合的 turn/step 与消息流沿用 startMockTurn 的 wire 规则。
+ */
+function startMockSubagentDemo(parentId: string, requestId: string | undefined): void {
+  const journal = journalOf(parentId)
+  const createdAt = Date.now()
+  // 泳道 id 带 run 序号：演示可重复触发，两次运行的 lane journal 互不串味
+  demoRun += 1
+  const laneIds = LANE_SPECS.map(spec => `mock-subagent-${spec.name}-run${demoRun}`)
+  const catalog: SubagentCatalogEntry[] = []
+  LANE_SPECS.forEach((spec, i) => {
+    const childId = laneIds[i]! as SessionId
+    const data = {
+      version: 3 as const, childId, childCreatedAt: createdAt + i,
+      mode: 'continuable' as const, label: spec.label, name: spec.name,
+    }
+    pushDemoEvent(journal, 'subagent/catalog', data)
+    catalog.push(catalogEntryOf(data))
+    DEMO_LANES.set(laneIds[i]!, { parentSessionId: parentId, aborted: false })
+  })
+  DEMO_CATALOG.set(parentId, catalog)
+  pushLaneProjection(parentId, [{ key: 'subagentCatalog', val: catalog }])
+  // 父回合号接续既有计数（会话里跑过普通回合后再演示，回合头才不落在已关闭的回合上）
+  const turn = METRICS.get(parentId)?.turns ?? 0
+  pushDemoEvent(journal, 'turn/start', { turn })
+  pushDemoEvent(journal, 'step/start', { turn, step: 0 })
+  pushDemoEvent(journal, 'user/message', {
+    id: `mock-user-${journal.seq + 1}`,
+    role: 'user',
+    content: [{ type: 'text', text: SUBAGENT_DEMO_COMMAND }],
+    // rpcId 对账客户端的乐观回显：命中即退休本地行，避免消息出现两遍
+    source: { kind: 'user', ...(requestId === undefined ? {} : { rpcId: requestId }) },
+  }, { surfaceOp: 'append' })
+  void (async () => {
+    // 泳道错峰起步；全部收口后父代理才汇总（wait_agent 的剧本形态）
+    await Promise.all(LANE_SPECS.map(async (spec, i) => {
+      await sleep(i * 400)
+      await runMockLane(laneIds[i]!, spec)
+    }))
+    const summary = `两条子代理已完成：${LANE_SPECS.map(spec => spec.name).join('、')}。各自的探索结果已并入本轮上下文。`
+    const pushStream = (frame: Record<string, unknown>): void => {
+      journal.revision += 1
+      journal.frames.push({
+        type: 'assistant-stream',
+        frame: { ...frame, attemptId: `mock-demo-parent-${journal.revision}`, revision: journal.revision },
+      })
+    }
+    pushStream({ type: 'start', startedAfterSeq: journal.seq, turn, step: 0 })
+    let index = 0
+    for (const chunk of chunksOf(summary, 8)) {
+      await sleep(LANE_TICK_MS)
+      pushStream({ type: 'chunk', index, time: Date.now(), chunk: { type: 'text-delta', index: 0, text: chunk } })
+      index += 1
+    }
+    const assistantSeq = pushDemoEvent(journal, 'assistant/message', {
+      turn, step: 0,
+      message: {
+        id: `mock-demo-summary-${journal.seq + 1}`,
+        role: 'assistant',
+        content: [{ type: 'text', text: summary }],
+        source: { kind: 'model', provider: 'shaniu-mock', model: 'lane-model' },
+      },
+      stream: [],
+      usage: { inputTokens: 2600, outputTokens: 90, totalTokens: 2690, cacheReadTokens: 0, cacheWriteTokens: 0 },
+    }, { surfaceOp: 'append' })
+    pushStream({ type: 'end', index, outcome: { kind: 'committed', eventType: 'assistant/message', seq: assistantSeq } })
+    pushDemoEvent(journal, 'step/end', { turn, step: 0 })
+    pushDemoEvent(journal, 'turn/end', { turn, reason: { kind: 'completed' } })
+    pushTurnMetrics(parentId, 'model')
+  })()
+}
+
+/**
+ * `remote.subagents`（SH-109）：泳道子会话的 prompt / interruptByUser 面（上游
+ * session-controller 对 addressed 子会话的硬路由，见 sessions/session.ts）。演示
+ * 语义：prompt = 向运行中的演示泳道注入一条 steering 消息（当前 step 内落
+ * user/message + 短应答）；interruptByUser = 置中断位，剧本在下一检查点按 aborted
+ * 收口。非演示泳道如实拒绝（上游错误码），不伪造受理。
+ */
+function mockSubagentsNamespace(): unknown {
+  const steer = (laneId: string, requestId: string | undefined, text: string): void => {
+    // continuable 子会话的续聊：新开一个回合（与父会话 prompt 的事件序列同构）
+    const journal = journalOf(laneId)
+    const turn = 1
+    const step = 0
+    pushDemoEvent(journal, 'turn/start', { turn })
+    pushDemoEvent(journal, 'step/start', { turn, step })
+    pushDemoEvent(journal, 'user/message', {
+      id: `mock-lane-user-${journal.seq + 1}`,
+      role: 'user',
+      content: [{ type: 'text', text }],
+      source: { kind: 'user', ...(requestId === undefined ? {} : { rpcId: requestId }) },
+    }, { surfaceOp: 'append' })
+    const reply = `收到，补充上下文已并入当前探索：${text}`
+    journal.revision += 1
+    const attemptId = `mock-lane-steer-${journal.revision}`
+    journal.frames.push({ type: 'assistant-stream', frame: { type: 'start', startedAfterSeq: journal.seq, turn, step, attemptId, revision: journal.revision } })
+    const assistantSeq = pushDemoEvent(journal, 'assistant/message', {
+      turn, step,
+      message: {
+        id: `mock-lane-steer-reply-${journal.seq + 1}`,
+        role: 'assistant',
+        content: [{ type: 'text', text: reply }],
+        source: { kind: 'model', provider: 'shaniu-mock', model: 'lane-model' },
+      },
+      stream: [],
+    }, { surfaceOp: 'append' })
+    journal.revision += 1
+    journal.frames.push({ type: 'assistant-stream', frame: { type: 'end', index: 0, outcome: { kind: 'committed', eventType: 'assistant/message', seq: assistantSeq }, attemptId, revision: journal.revision } })
+    pushDemoEvent(journal, 'step/end', { turn, step })
+    pushDemoEvent(journal, 'turn/end', { turn, reason: { kind: 'completed' } })
+  }
+  return {
+    prompt: async (request: { childSessionId?: string; requestId?: string; content?: readonly { type: string; text?: string }[] } = {}) => {
+      const laneId = request.childSessionId
+      const lane = laneId === undefined ? undefined : DEMO_LANES.get(laneId)
+      if (laneId === undefined || lane === undefined) {
+        return FAIL('subagent/not-found', '没有这个子代理会话（演示泳道经 /subagent-demo 创建）')
+      }
+      if (lane.aborted) {
+        return FAIL('subagent/delivery-unavailable', '该子代理已结束，steering 通道已关闭')
+      }
+      const text = (request.content ?? [])
+        .filter(part => part.type === 'text')
+        .map(part => part.text ?? '')
+        .join('')
+      steer(laneId, request.requestId, text)
+      return OK({ messageId: `mock-lane-steer-${Date.now()}` })
+    },
+    interruptByUser: async (childSessionId?: string) => {
+      const lane = childSessionId === undefined ? undefined : DEMO_LANES.get(childSessionId)
+      if (lane === undefined) {
+        return FAIL('subagent/not-found', '没有这个子代理会话')
+      }
+      lane.aborted = true
+      return OK({ accepted: true })
+    },
+  }
+}
+
 function mockSessionRow(id: string, cwd: string): SessionSummary {
   // wire 形状（types.ts 的 SessionSummary，sessionId 字段）——manager.projectList 按
   // entry.sessionId 重建 client 行；给成 client 形状（id 字段）会整行退化为 undefined key
@@ -433,18 +744,22 @@ function mockSessionNamespace(): unknown {
     // 模型目录（composer 模型席位数据源）与设置页同源：只有已配置的服务商进得来。
     modelCatalog: () => MODELS.session.modelCatalog(),
     control: async function* (): AsyncGenerator<unknown> {
-      // 控制基线带 per-session 投影：modelSelection（composer 模型席位的当前选择来源）
+      // 控制基线带 per-session 投影：modelSelection（composer 模型席位的当前选择来源）。
+      // 泳道（演示子代理）不在侧栏行注册表里，但投影 store 由基线/帧建出——
+      // 目录树与泳道徽标读的就是这些值，基线必须把它们带上。
       const selection = await currentModelSelection()
+      const ids = [...MOCK_SESSION_ROWS.keys(), ...DEMO_LANES.keys()]
       yield {
         type: 'baseline',
         value: {
-          projections: Object.fromEntries([...MOCK_SESSION_ROWS.keys()].map(id => [id, {
+          projections: Object.fromEntries(ids.map(id => [id, {
             asOfSeq: 0,
             values: {
               modelSelection: { lastUsed: null, next: selection },
               permissions: { currentValue: PERMISSION_BY_SESSION.get(id) ?? DEFAULT_PERMISSION },
               title: SESSION_TITLES.get(id) ?? null,
               ...metricsProjectionsOf(id),
+              ...subagentProjectionsOf(id),
             },
           }])),
         },
@@ -487,6 +802,11 @@ function mockSessionNamespace(): unknown {
         .filter(part => part.type === 'text')
         .map(part => part.text ?? '')
         .join('')
+      // 子代理泳道演示（SH-109）：/subagent-demo 触发两条泳道并行探索的完整剧本
+      if (request.sessionId !== undefined && text.trim() === SUBAGENT_DEMO_COMMAND) {
+        startMockSubagentDemo(request.sessionId, request.requestId)
+        return OK({ accepted: true })
+      }
       if (request.sessionId !== undefined) startMockTurn(request.sessionId, request.requestId, text)
       return OK({ accepted: true })
     },
@@ -610,6 +930,9 @@ function mockPermissionPresetsNamespace(): unknown {
  */
 function mockCommandsNamespace(): unknown {
   return {
+    // 命令目录给空表（与适配层同口径）：ui-commands 的预热读不到 list 会在
+    // 输入 "/" 时报 warmup failed，slash 演示命令就被挡住了
+    list: async () => OK([]),
     execute: async (sessionId: string, line: string) => {
       const match = /^\/permission\s+([a-z][a-z-]*)\s*$/.exec(line.trim())
       if (match === null) return OK(undefined)
@@ -831,19 +1154,19 @@ const MOCK_REMOTE = buildMockRemote()
  * 设置页与席位都靠推送失效收敛（settings/document-updated、credentials/reference-updated、
  * llm/adapters-updated），空壳 $on 会让写入后界面停在旧视图——注册序就是它们的刷新序。
  */
-const mockListeners = new Map<string, Set<(payload: unknown) => void>>()
+const mockListeners = new Map<string, Set<(...args: unknown[]) => void>>()
 
-function mockOn(name: string, listener: (payload: unknown) => void): () => void {
+function mockOn(name: string, listener: (...args: unknown[]) => void): () => void {
   const listeners = mockListeners.get(name) ?? new Set<(payload: unknown) => void>()
   listeners.add(listener)
   mockListeners.set(name, listeners)
   return () => { listeners.delete(listener) }
 }
 
-function mockEmit(name: string, payload?: unknown): boolean {
+function mockEmit(name: string, ...args: unknown[]): boolean {
   const listeners = mockListeners.get(name)
   if (listeners === undefined || listeners.size === 0) return false
-  for (const listener of [...listeners]) listener(payload)
+  for (const listener of [...listeners]) listener(...args)
   return true
 }
 
@@ -866,6 +1189,8 @@ function buildMockRemote(): unknown {
     // 权限挡位：进程目录 + `/permission` 命令写回
     ['permissionPresets', mockPermissionPresetsNamespace()],
     ['commands', mockCommandsNamespace()],
+    // 子代理泳道（SH-109）：泳道子会话的 prompt/interruptByUser 面（演示语义）
+    ['subagents', mockSubagentsNamespace()],
   ])
   const base = {
     // 固定宿主事实：ui-tool 的读文件行会用 home 缩写路径；缺了它代理会返回假命名空间，

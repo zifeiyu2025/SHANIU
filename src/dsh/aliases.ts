@@ -143,6 +143,8 @@ export const dshAliases: { find: RegExp; replacement: string }[] = [
   { find: /^@deepseek-ai\/dsh-client-ui-sidebar-right\/(.*)$/, replacement: '/src/dsh/packages/client/ui-sidebar-right/src/$1' },
   { find: /^@deepseek-ai\/dsh-client-ui-slots$/, replacement: '/src/dsh/packages/client/ui-slots/src/index.ts' },
   { find: /^@deepseek-ai\/dsh-client-ui-slots\/(.*)$/, replacement: '/src/dsh/packages/client/ui-slots/src/$1' },
+  { find: /^@deepseek-ai\/dsh-client-ui-subagent$/, replacement: '/src/dsh/packages/client/ui-subagent/src/index.ts' },
+  { find: /^@deepseek-ai\/dsh-client-ui-subagent\/(.*)$/, replacement: '/src/dsh/packages/client/ui-subagent/src/$1' },
   { find: /^@deepseek-ai\/dsh-client-ui-theme$/, replacement: '/src/dsh/packages/client/ui-theme/src/index.ts' },
   { find: /^@deepseek-ai\/dsh-client-ui-theme\/(.*)$/, replacement: '/src/dsh/packages/client/ui-theme/src/$1' },
   { find: /^@deepseek-ai\/dsh-client-ui-tool$/, replacement: '/src/dsh/packages/client/ui-tool/src/index.ts' },
