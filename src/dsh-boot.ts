@@ -49,6 +49,7 @@ import {
 } from './transport/mock'
 import { apply as brandApply, inject as brandInject } from './brand'
 import { apply as headerActionsApply, inject as headerActionsInject } from './header-actions'
+import { apply as modelConfigApply, inject as modelConfigInject } from './model-config'
 
 export interface BootHandle {
   readonly ctx: Context
@@ -134,6 +135,7 @@ export async function bootShaniu(container: HTMLElement): Promise<BootHandle> {
     { inject: uiSidebarInject, apply: uiSidebarApply },
     { inject: brandInject, apply: brandApply },
     { inject: headerActionsInject, apply: headerActionsApply },
+    { inject: modelConfigInject, apply: modelConfigApply },
     { inject: uiSettingsGeneralInject, apply: uiSettingsGeneralApply },
     { inject: uiSettingsModelsInject, apply: uiSettingsModelsApply },
     { inject: uiChatInject, apply: uiChatApply },

@@ -210,6 +210,10 @@ export function apply(ctx: ClientContext): void {
       const shellHandle = createSettingsShellStore()
       const shellInstance = shellHandle.create()
       const shellStore: typeof shellHandle = { ...shellHandle, create: () => shellInstance }
+      // 宿主侧需要「打开到指定分段」的入口（输入框的模型配置按钮），把动作暴露成服务
+      const disposeShell = ctx.provide('settingsShell', {
+        openSection: (id: string) => { shellInstance.actions.openSection(id) },
+      })
       const disposeCommand = ctx.shortcuts.register({
         id: 'settings.open' as ShortcutCommandId, label: () => t('shortcut.open'), aliases: ['settings', 'preferences'],
         defaults: {
@@ -245,7 +249,7 @@ export function apply(ctx: ClientContext): void {
         },
         inject: shellInjected,
       }, SettingsRoot)
-      return () => { disposeCommand(); disposeSlot() }
+      return () => { disposeCommand(); disposeSlot(); disposeShell() }
     }))
 
   ctx.slots.inject('settings.trigger', () =>

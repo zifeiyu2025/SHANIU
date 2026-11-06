@@ -248,8 +248,9 @@ export function createModelsMock(options: ModelsMockOptions = { emit: () => fals
     }],
   ])
 
-  const credentials = new Map<string, string>([['MOCK_PROVIDER_API_KEY', 'mock-local-key']])
-  let selection: ModelSelection = { provider: SEEDED_ROUTE, model: 'mock-model-a' }
+  // 出厂不配任何密钥：席位在未配置时显示「模型配置」，按设置页填好才出现可用模型
+  const credentials = new Map<string, string>()
+  let selection: ModelSelection = { provider: '', model: '' }
 
   const viewOf = (ns: string): SettingsNamespaceView | undefined => {
     const section = sections.get(ns)

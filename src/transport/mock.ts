@@ -17,15 +17,16 @@ import { createModelsMock } from './mock-models'
  */
 const MODELS = createModelsMock({ emit: mockEmit, onSelectionChanged: pushModelSelection })
 
-const WORKSPACE_PATH = 'D:\\MyWorkspace\\SHANIU'
-const WORKSPACE_ID = 'mock-workspace-1'
+/** 宿主 home：`$host.home` 与路径缩写用，也作默认工作区的 mock 目录。 */
+const HOME_PATH = 'D:\\MyWorkspace\\SHANIU'
 const DEFAULT_WORKSPACE_ID = 'default-workspace'
 /**
  * 默认工作区的目录。真实落盘位置由 Rust 侧决定（用户口径是 data 目录下的 Workspace），
- * 这里只作为 mock 展示值；注意 docs/01:426 把自身 data 目录对 Agent 默认拒绝读写，
+ * mock 里取本机确实存在的目录——桌面壳的「资源管理器」按存在的目录校验，指向不存在的
+ * 路径就只是点了没反应。注意 docs/01:426 把自身 data 目录对 Agent 默认拒绝读写，
  * 工作区又是 Agent 可写作用域，落盘前必须先解决这条边界冲突。
  */
-const DEFAULT_WORKSPACE_PATH = `${WORKSPACE_PATH}\\Workspace`
+const DEFAULT_WORKSPACE_PATH = HOME_PATH
 
 /**
  * 权限挡位：值与上游 permission-presets 一致。
@@ -40,12 +41,30 @@ const PERMISSION_PRESETS = [
 ] as const
 
 const DEFAULT_PERMISSION = 'read-only'
-/** 多步演示会话：预置一整条「思考 + 多工具 + 任务清单」回合。 */
-const DEMO_SESSION_ID = 'mock-session-demo'
-const SESSION_IDS = ['mock-session-alpha', 'mock-session-beta', DEMO_SESSION_ID]
 
-/** 工作区行内的会话集（create/attach 时推进，follow 以 upsert 帧广播）。 */
-const WORKSPACE_SESSION_IDS: string[] = [...SESSION_IDS]
+/** 一个工作区在 mock 里的全部可变状态。 */
+interface MockWorkspace {
+  path: string
+  title: string
+  /** 行内会话（工作区视图的 sessionIds，侧栏分组与 inert 门控都读它）。 */
+  sessionIds: string[]
+  createdAt: string
+  updatedAt: string
+}
+
+/**
+ * 出厂态：只有默认工作区，里面一条会话也没有——首启的新会话由界面现场建出来。
+ * 工作区行与 `remote.session.list` 各自消费这两份注册表，创建路径同一次写入两侧。
+ */
+const WORKSPACES = new Map<string, MockWorkspace>([
+  [DEFAULT_WORKSPACE_ID, {
+    path: DEFAULT_WORKSPACE_PATH,
+    title: DEFAULT_WORKSPACE_ID,
+    sessionIds: [],
+    createdAt: new Date(Date.now() - 86_400_000).toISOString(),
+    updatedAt: new Date().toISOString(),
+  }],
+])
 
 /** 跨调用共享的 follow 帧队列（baseline 后挂起，push 即广播）。 */
 function createFrameQueue<T>() {
@@ -142,15 +161,15 @@ function journalOf(sessionId: string): MockJournal {
   return journal
 }
 
-/** 会话标题：侧栏行与会话头都读 `title` 投影。 */
-const SESSION_TITLES = new Map<string, string>([
-  [SESSION_IDS[0], '问候'],
-  [SESSION_IDS[1], '性能排查'],
-  [DEMO_SESSION_ID, '多步演示'],
-])
+/** 会话标题：侧栏行与会话头都读 `title` 投影。出厂为空，首条用户消息之后才起名。 */
+const SESSION_TITLES = new Map<string, string>()
 
 /** 固定演示剧本：本地 mock，不联网、不调用任何模型。 */
 const DEMO_REPLY = '你好！我是 SHANIU 的助手。这条回复来自本地 mock 剧本，用于演示流式渲染、消息动作条与用量统计。'
+
+/** 出厂未配置服务商时的失败回合：message 直接上屏（该 code 没有官方词典条目）。 */
+const NO_MODEL_CODE = 'NO_MODEL_CONFIGURED'
+const NO_MODEL_MESSAGE = '还没有配置可用的模型服务商，点输入框里的「模型配置」填一个 API Key。'
 
 function chunksOf(text: string, size: number): string[] {
   const parts: string[] = []
@@ -191,6 +210,7 @@ const PER_TURN = {
 function metricsProjectionsOf(sessionId: string): Record<string, unknown> {
   const metrics = METRICS.get(sessionId)
   if (metrics === undefined) return {}
+  const total = metrics.uncachedInputTokens + metrics.outputTokens + metrics.cacheReadTokens + metrics.cacheWriteTokens
   return {
     sessionStats: {
       turns: metrics.turns,
@@ -208,26 +228,35 @@ function metricsProjectionsOf(sessionId: string): Record<string, unknown> {
       cacheReadTokens: metrics.cacheReadTokens,
       cacheWriteTokens: metrics.cacheWriteTokens,
     },
-    // 上下文占用：projectedTokens / contextWindow 决定那个百分数
-    contextPressure: { pressureTokens: 9900, projectedTokens: 9900, contextWindow: 1_000_000 },
+    // 上下文占用：projectedTokens / contextWindow 决定那个百分数；没跑过模型就是 0%
+    contextPressure: {
+      pressureTokens: total,
+      projectedTokens: total,
+      contextWindow: 1_000_000,
+    },
   }
 }
 
-/** 回合收尾时累计统计并把三个投影推给界面（每一步的耗时与用量都来自本 mock 的固定剧本）。 */
-function pushTurnMetrics(sessionId: string): void {
+/**
+ * 回合收尾时把统计推给界面。`'none'` 是没跑到模型就失败的回合：只推进轮/步计数，
+ * 用量桶保持 0——真实后端此时不下发 usage，上游也只在 decodeMs>0 时才画速度。
+ */
+function pushTurnMetrics(sessionId: string, usage: 'model' | 'none'): void {
   const metrics = METRICS.get(sessionId) ?? {
     turns: 0, steps: 0, llmMs: 0, toolMs: 0, ttftMs: 0, ttftSteps: 0, decodeMs: 0, decodeTokens: 0,
     uncachedInputTokens: 0, outputTokens: 0, cacheReadTokens: 0, cacheWriteTokens: 0,
   }
   metrics.turns += 1
   metrics.steps += 1
-  metrics.llmMs += PER_TURN.llmMs
-  metrics.ttftMs += PER_TURN.ttftMs
-  metrics.ttftSteps += PER_TURN.ttftSteps
-  metrics.decodeMs += PER_TURN.decodeMs
-  metrics.decodeTokens += PER_TURN.decodeTokens
-  metrics.uncachedInputTokens += PER_TURN.uncachedInputTokens
-  metrics.outputTokens += PER_TURN.outputTokens
+  if (usage === 'model') {
+    metrics.llmMs += PER_TURN.llmMs
+    metrics.ttftMs += PER_TURN.ttftMs
+    metrics.ttftSteps += PER_TURN.ttftSteps
+    metrics.decodeMs += PER_TURN.decodeMs
+    metrics.decodeTokens += PER_TURN.decodeTokens
+    metrics.uncachedInputTokens += PER_TURN.uncachedInputTokens
+    metrics.outputTokens += PER_TURN.outputTokens
+  }
   METRICS.set(sessionId, metrics)
   projectionFrames.push({
     type: 'projection',
@@ -278,6 +307,19 @@ function startMockTurn(sessionId: string, requestId: string | undefined, text: s
       source: { kind: 'user', ...(requestId === undefined ? {} : { rpcId: requestId }) },
     }, { surfaceOp: 'append' })
 
+    const catalog = await MODELS.session.modelCatalog()
+    if (catalog.ok && catalog.value.groups.length === 0) {
+      // 一个服务商都没配（出厂态）：真实后端在这一步就失败，mock 不凭空编一段回答。
+      // code 不在上游可续跑集合（RATE_LIMIT/SERVER/…）里，界面因此只留这条错误行。
+      pushEvent('step/end', { turn, step })
+      pushEvent('turn/end', {
+        turn,
+        reason: { kind: 'error', error: { code: NO_MODEL_CODE, message: NO_MODEL_MESSAGE } },
+      }, {}, Date.now())
+      pushTurnMetrics(sessionId, 'none')
+      return
+    }
+
     const attemptId = `mock-attempt-${sessionId}-${journal.revision + 1}`
     const pushStream = (frame: Record<string, unknown>): void => {
       journal.revision += 1
@@ -307,173 +349,29 @@ function startMockTurn(sessionId: string, requestId: string | undefined, text: s
     // turn/end 的时间决定「已完成，用时 N 秒」的显示时长
     pushEvent('turn/end', { turn, reason: { kind: 'completed' } }, {}, turnStart + 4000)
     // 回合关闭后再发布统计：上游的轮/步计数只认已关闭的 step
-    pushTurnMetrics(sessionId)
+    pushTurnMetrics(sessionId, 'model')
   })()
 }
 
-function mockSessionRow(id: string, minutesAgo: number, running = false): SessionSummary {
+function mockSessionRow(id: string, cwd: string): SessionSummary {
   // wire 形状（types.ts 的 SessionSummary，sessionId 字段）——manager.projectList 按
   // entry.sessionId 重建 client 行；给成 client 形状（id 字段）会整行退化为 undefined key
   return {
     agentAvailable: true,
     sessionId: id as SessionId,
-    cwd: WORKSPACE_PATH,
-    running,
+    cwd,
+    running: false,
     blank: false,
-    updatedAt: Date.now() - minutesAgo * 60_000,
+    updatedAt: Date.now(),
     formatStatus: 'current',
   }
 }
 
 /**
- * 预置会话行的共享可变注册表：workspace 分组（sessionIds）与 session.list RPC
- * 消费同一份数据，保证侧栏与主区一致。
+ * 会话行注册表：workspace 分组（sessionIds）与 session.list RPC 消费同一份数据，
+ * 保证侧栏与主区一致。出厂为空——首启那条由界面建出来。
  */
-const MOCK_SESSION_ROWS = new Map<string, SessionSummary>([
-  [SESSION_IDS[0], mockSessionRow(SESSION_IDS[0], 42)],
-  [SESSION_IDS[1], mockSessionRow(SESSION_IDS[1], 7, true)],
-  [DEMO_SESSION_ID, mockSessionRow(DEMO_SESSION_ID, 2)],
-])
-
-/** 演示回合的固定用量：与 mock 其它回合同形，total 等于输入 + 输出 + 缓存两侧。 */
-const DEMO_USAGE = {
-  inputTokens: 9600, outputTokens: 300, totalTokens: 9900, cacheReadTokens: 0, cacheWriteTokens: 0,
-}
-
-const DEMO_TODOS_V1 = [
-  { content: '盘点 src/transport 下的 mock 数据源', status: 'in_progress' },
-  { content: '核对 mock-models 与 mock 的衔接', status: 'pending' },
-  { content: '汇总结论并输出', status: 'pending' },
-]
-
-/**
- * 预置一条多步演示回合：思考 → 建任务清单 → 并行检索与读文件 → 更新任务 → 结论。
- * 事件形状与真实 wire 一致，对话视图、过程折叠与轨迹视图都能直接消费。
- */
-function seedDemoJournal(sessionId: string): void {
-  const journal = journalOf(sessionId)
-  const at = (ms: number): number => Date.now() - 6 * 60_000 + ms
-  const append = { surfaceOp: 'append' } as const
-  const emit = (type: string, data: unknown, extra: Record<string, unknown> = {}, time = at(0)): void => {
-    journal.seq += 1
-    journal.records.push({ type: 'event', event: { type, seq: journal.seq, time, ...extra, data } })
-  }
-  let assistantIndex = 0
-  const assistant = (step: number, content: unknown[], time: number): void => {
-    assistantIndex += 1
-    emit('assistant/message', {
-      turn: 0,
-      step,
-      message: {
-        id: `demo-assistant-${assistantIndex}`,
-        role: 'assistant',
-        content,
-        source: { kind: 'model', provider: 'mock-provider', model: 'mock-model-a' },
-      },
-      stream: [],
-      usage: DEMO_USAGE,
-    }, append, time)
-  }
-  const call = (step: number, callId: string, name: string, args: unknown, time: number): void => {
-    emit('tool/call', { turn: 0, step, callId, name, arguments: JSON.stringify(args) }, {}, time)
-  }
-  const result = (step: number, callId: string, text: string, time: number): void => {
-    emit('tool/result', {
-      turn: 0,
-      step,
-      message: {
-        id: `demo-tool-${callId}`,
-        role: 'tool',
-        toolCallId: callId,
-        source: { kind: 'tool', callId },
-        content: [{ type: 'text', text }],
-        isError: false,
-      },
-    }, append, time)
-  }
-  const stepStart = (step: number, time: number): void => emit('step/start', { turn: 0, step }, {}, time)
-  const stepEnd = (step: number, time: number): void => emit('step/end', { turn: 0, step }, {}, time)
-  const todoArgs = (todos: readonly unknown[]): unknown => ({ todos })
-
-  emit('turn/start', { turn: 0 }, {}, at(0))
-  stepStart(0, at(200))
-  emit('user/message', {
-    id: 'demo-user-1',
-    role: 'user',
-    content: [{ type: 'text', text: DEMO_USER }],
-    source: { kind: 'user' },
-  }, append, at(400))
-  assistant(0, [
-    { type: 'reasoning', text: '先拆任务：盘点数据源 → 核对两套 mock 的衔接 → 汇总结论。把清单写下来再逐项执行。' },
-    { type: 'tool-call', id: 'demo-call-todo-1', name: 'todo_write', arguments: JSON.stringify(todoArgs(DEMO_TODOS_V1)) },
-  ], at(1800))
-  call(0, 'demo-call-todo-1', 'todo_write', todoArgs(DEMO_TODOS_V1), at(2000))
-  result(0, 'demo-call-todo-1', 'Updated todo list: 2 pending, 1 in progress, 0 completed.', at(3200))
-  stepEnd(0, at(3400))
-
-  stepStart(1, at(3600))
-  assistant(1, [
-    { type: 'reasoning', text: '清单已建。目录入口和模型数据是两条独立的线，可以并行看：先搜引用点，再读 mock.ts 的会话剧本部分。' },
-    { type: 'tool-call', id: 'demo-call-grep', name: 'grep', arguments: JSON.stringify({ pattern: 'createModelsMock|SESSION_IDS', path: 'src/transport' }) },
-    { type: 'tool-call', id: 'demo-call-read', name: 'read', arguments: JSON.stringify({ file_path: 'src/transport/mock.ts', limit: 80 }) },
-  ], at(5200))
-  call(1, 'demo-call-grep', 'grep', { pattern: 'createModelsMock|SESSION_IDS', path: 'src/transport' }, at(5400))
-  result(1, 'demo-call-grep', [
-    'src/transport/mock.ts:43:const SESSION_IDS = [\'mock-session-alpha\', \'mock-session-beta\', DEMO_SESSION_ID]',
-    'src/transport/mock.ts:82:const MODELS = createModelsMock({ emit: mockEmit, onSelectionChanged: pushModelSelection })',
-    'src/transport/mock-models.ts:1:/** 模型目录、设置文档与凭据的单一事实源。 */',
-    '',
-    '3 处匹配（2 个文件）',
-  ].join('\n'), at(6600))
-  call(1, 'demo-call-read', 'read', { file_path: 'src/transport/mock.ts', limit: 80 }, at(6700))
-  result(1, 'demo-call-read', [
-    '   1  const WORKSPACE_PATH = \'D:\\\\MyWorkspace\\\\SHANIU\'',
-    '   2  const SESSION_IDS = [\'mock-session-alpha\', \'mock-session-beta\']',
-    '  82  const MODELS = createModelsMock({ emit: mockEmit, onSelectionChanged: pushModelSelection })',
-    '  96  const projectionFrames = createFrameBroadcast<Record<string, unknown>>()',
-    '  ...（共 800+ 行，已截断）',
-  ].join('\n'), at(8200))
-  stepEnd(1, at(8400))
-
-  stepStart(2, at(8600))
-  assistant(2, [
-    { type: 'reasoning', text: '信息齐了：mock.ts 负责会话、事件流与投影，mock-models.ts 负责模型目录与设置文档，两者通过 MODELS 单例衔接。把任务全部标记完成。' },
-    { type: 'tool-call', id: 'demo-call-todo-2', name: 'todo_write', arguments: JSON.stringify(todoArgs(DEMO_TODOS_V1.map(todo => ({ ...todo, status: 'completed' })))) },
-  ], at(10200))
-  call(2, 'demo-call-todo-2', 'todo_write', todoArgs(DEMO_TODOS_V1.map(todo => ({ ...todo, status: 'completed' }))), at(10400))
-  result(2, 'demo-call-todo-2', 'Updated todo list: 0 pending, 0 in progress, 3 completed.', at(11000))
-  stepEnd(2, at(11200))
-
-  stepStart(3, at(11400))
-  assistant(3, [
-    { type: 'reasoning', text: '结论分三层：数据源、共享方式、渲染链路。用一段话收尾。' },
-    {
-      type: 'text',
-      text: [
-        '梳理完成，结论如下：',
-        '',
-        '- **mock.ts**：负责会话列表、follow 事件流、权限挡位与统计投影，同时预置这条多步演示回合',
-        '- **mock-models.ts**：负责模型目录、设置文档、凭据与推理等级',
-        '- 两者通过 `MODELS` 单例共享同一份模型数据，设置页与输入框席位因此始终一致',
-        '',
-        '本回合包含 4 个步骤、3 次工具调用（其中 2 次 `todo_write`），全部来自本地剧本，不触网。',
-      ].join('\n'),
-    },
-  ], at(13200))
-  stepEnd(3, at(13400))
-
-  emit('turn/end', { turn: 0, reason: { kind: 'completed' } }, {}, at(13800))
-
-  METRICS.set(sessionId, {
-    turns: 1, steps: 4, llmMs: 6400, toolMs: 4500, ttftMs: 400, ttftSteps: 4,
-    decodeMs: 5200, decodeTokens: 900,
-    uncachedInputTokens: 38400, outputTokens: 1200, cacheReadTokens: 0, cacheWriteTokens: 0,
-  })
-}
-
-const DEMO_USER = '帮我把 src/transport 的 mock 数据梳理一遍，先建任务清单，再把结论写出来。'
-
-seedDemoJournal(DEMO_SESSION_ID)
+const MOCK_SESSION_ROWS = new Map<string, SessionSummary>()
 
 /**
  * 席位投影里的当前选择：直接取同源目录的默认项，
@@ -495,14 +393,17 @@ function mockSessionNamespace(): unknown {
     list: async () => OK({ items: [...MOCK_SESSION_ROWS.values()] }),
     create: async (payload: { workspaceId?: string; cwd?: string } = {}) => {
       const id = `mock-session-${MOCK_SESSION_ROWS.size + 1}`
-      MOCK_SESSION_ROWS.set(id, mockSessionRow(id, 0))
+      const workspaceId = payload.workspaceId !== undefined && WORKSPACES.has(payload.workspaceId)
+        ? payload.workspaceId
+        : DEFAULT_WORKSPACE_ID
+      const workspace = WORKSPACES.get(workspaceId)!
+      MOCK_SESSION_ROWS.set(id, mockSessionRow(id, payload.cwd ?? workspace.path))
       // 新建会话吃设置里的「权限默认档」；已存在的会话保持各自当前值（上游语义）
       PERMISSION_BY_SESSION.set(id, MODELS.permissionDefault() ?? DEFAULT_PERMISSION)
       // 新会话挂进工作区行（workspace-view.sessionIds），推 upsert 帧——
       // 会话视图的 chip/inert 门控读取 sessionWorkspace（未挂接 = 输入框 inert）
-      WORKSPACE_SESSION_IDS.push(id)
-      workspaceFrames.push({ type: 'upsert', workspace: mockWorkspaceView() })
-      void payload
+      workspace.sessionIds.push(id)
+      pushWorkspaceFrame(workspaceId)
       return OK({ sessionId: id as SessionId })
     },
     fork: async () => OK({ sessionId: `mock-session-${MOCK_SESSION_ROWS.size + 1}` as SessionId }),
@@ -612,7 +513,7 @@ export function mockConnection(): unknown {
     {
       // 形状必须是 ConnectionGeneration（{id, host}）：权限目录按 generation.id 栅栏，
       // 给裸数字会让它永远读不出目录，输入卡的挡位控件就静默不渲染
-      generation: { getSnapshot: () => ({ id: 1, host: { home: WORKSPACE_PATH } }), subscribe: () => () => {} },
+      generation: { getSnapshot: () => ({ id: 1, host: { home: HOME_PATH } }), subscribe: () => () => {} },
       state: { getSnapshot: () => 'ready', subscribe: () => () => {} },
       interactions: {},
       isLoopback: true,
@@ -643,18 +544,29 @@ export function mockTypert(): unknown {
   )
 }
 
-function mockWorkspaceView(id: string = WORKSPACE_ID): WorkspaceView {
-  const isDefault = id === DEFAULT_WORKSPACE_ID
+/**
+ * 工作区行。默认工作区的 title 就是 'default-workspace'，上游据此判定首启自动标题并
+ * 渲染成「默认工作区」（见 api-workspace-controller/src/default-workspace.ts），
+ * 没有独立的 isDefault 字段。
+ */
+function workspaceView(id: string): WorkspaceView {
+  const workspace = WORKSPACES.get(id)!
   return {
     workspaceId: id as WorkspaceView['workspaceId'],
-    path: isDefault ? DEFAULT_WORKSPACE_PATH : WORKSPACE_PATH,
-    // 上游用「title === 'default-workspace'」判定默认工作区，界面据此渲染成「默认工作区」；
-    // 不是独立选项，也没有 isDefault 字段（见 api/workspace-controller/src/default-workspace.ts）
-    title: isDefault ? DEFAULT_WORKSPACE_ID : 'SHANIU',
-    sessionIds: (isDefault ? [] : WORKSPACE_SESSION_IDS) as unknown as WorkspaceView['sessionIds'],
-    createdAt: new Date(Date.now() - 86_400_000).toISOString(),
-    updatedAt: new Date(Date.now()).toISOString(),
+    path: workspace.path,
+    title: workspace.title,
+    sessionIds: workspace.sessionIds as unknown as WorkspaceView['sessionIds'],
+    createdAt: workspace.createdAt,
+    updatedAt: workspace.updatedAt,
   }
+}
+
+/** 变更过后广播一行工作区（follow 的增量面）。 */
+function pushWorkspaceFrame(id: string): void {
+  const workspace = WORKSPACES.get(id)
+  if (workspace === undefined) return
+  workspace.updatedAt = new Date().toISOString()
+  workspaceFrames.push({ type: 'upsert', workspace: workspaceView(id) })
 }
 
 const OK = <T>(value: T) => ({ ok: true as const, value })
@@ -696,84 +608,49 @@ function mockWorkspaceNamespace(): unknown {
     follow: async function* (_request: unknown): AsyncGenerator<unknown> {
       yield {
         type: 'baseline',
-        // 默认工作区排在最前：它的 title 就是 'default-workspace'，界面会渲染成「默认工作区」
-        value: { items: [mockWorkspaceView(DEFAULT_WORKSPACE_ID), mockWorkspaceView()], archivedSessionIds: [], pinnedSessionIds: [] },
+        // 出厂只有默认工作区；用户后来添加的目录由 create 进注册表
+        value: { items: [...WORKSPACES.keys()].map(workspaceView), archivedSessionIds: [], pinnedSessionIds: [] },
       }
       // 活流：baseline 后消费帧队列（create/attach 推 upsert），无帧则挂起保持"已连接"
       for (;;) {
         yield await workspaceFrames.next()
       }
     },
-    create: async (input: { path: string }) => OK({
-      workspace: {
-        ...mockWorkspaceView(),
+    create: async (input: { path: string }) => {
+      const id = `mock-workspace-${WORKSPACES.size + 1}`
+      const now = new Date().toISOString()
+      WORKSPACES.set(id, {
         path: input.path,
         title: input.path.split(/[\\/]/).pop() ?? input.path,
-      },
-    }),
-    rename: async (_id: string, title: string) => OK({ workspace: { ...mockWorkspaceView(), title } }),
+        sessionIds: [],
+        createdAt: now,
+        updatedAt: now,
+      })
+      pushWorkspaceFrame(id)
+      return OK({ workspace: workspaceView(id) })
+    },
+    rename: async (id: string, title: string) => {
+      const workspace = WORKSPACES.get(id)
+      if (workspace !== undefined) workspace.title = title
+      pushWorkspaceFrame(id)
+      return OK({ workspace: workspaceView(id) })
+    },
     // 上游语义：注册表为空且无任何持久化/归档会话时才创建；mock 里默认工作区已存在，直接回它
-    initializeDefault: async () => OK({ workspace: mockWorkspaceView(DEFAULT_WORKSPACE_ID) }),
+    initializeDefault: async () => OK({ workspace: workspaceView(DEFAULT_WORKSPACE_ID) }),
     delete: async () => OK({}),
-    insertBefore: async () => OK({ workspaceIds: [WORKSPACE_ID] }),
+    insertBefore: async () => OK({ workspaceIds: [...WORKSPACES.keys()] }),
     archiveSession: async () => OK({ archivedSessionIds: [] }),
     unarchiveSession: async () => OK({ archivedSessionIds: [] }),
-    pinSession: async () => OK({ pinnedSessionIds: [...WORKSPACE_SESSION_IDS] }),
+    pinSession: async () => OK({ pinnedSessionIds: [...WORKSPACES.values()].flatMap(workspace => workspace.sessionIds) }),
     unpinSession: async () => OK({ pinnedSessionIds: [] }),
-    insertSessionBefore: async () => OK({ workspace: mockWorkspaceView() }),
+    insertSessionBefore: async () => OK({ workspace: workspaceView(DEFAULT_WORKSPACE_ID) }),
   }
 }
 
-/** 资源管理器的演示目录树：只按目录名给一层内容，够展开/收起与滚动。 */
-const MOCK_FILE_TREE: Record<string, readonly { name: string; type: 'file' | 'directory'; size?: number }[]> = {
-  '': [
-    { name: 'docs', type: 'directory' },
-    { name: 'evals', type: 'directory' },
-    { name: 'scripts', type: 'directory' },
-    { name: 'src', type: 'directory' },
-    { name: 'src-tauri', type: 'directory' },
-    { name: 'AGENTS.md', type: 'file', size: 12_800 },
-    { name: 'package.json', type: 'file', size: 3_100 },
-    { name: 'pnpm-lock.yaml', type: 'file', size: 214_000 },
-    { name: 'tsconfig.json', type: 'file', size: 78_000 },
-    { name: 'vite.config.ts', type: 'file', size: 2_400 },
-  ],
-  docs: [
-    { name: '01-架构需求文档.md', type: 'file', size: 42_000 },
-    { name: '02-二期需求文档.md', type: 'file', size: 31_000 },
-    { name: '03-三期需求文档.md', type: 'file', size: 9_800 },
-    { name: '04-协议规范.md', type: 'file', size: 26_000 },
-    { name: '05-实施任务清单.md', type: 'file', size: 55_000 },
-  ],
-  src: [
-    { name: 'brand', type: 'directory' },
-    { name: 'header-actions', type: 'directory' },
-    { name: 'host', type: 'directory' },
-    { name: 'transport', type: 'directory' },
-    { name: 'dsh-boot.ts', type: 'file', size: 8_400 },
-    { name: 'main.tsx', type: 'file', size: 900 },
-  ],
-  transport: [
-    { name: 'mock.ts', type: 'file', size: 62_000 },
-    { name: 'mock-models.ts', type: 'file', size: 34_000 },
-    { name: 'stubs.ts', type: 'file', size: 9_600 },
-  ],
-  'header-actions': [
-    { name: 'index.ts', type: 'file', size: 2_600 },
-    { name: 'ExplorerButton.tsx', type: 'file', size: 1_100 },
-    { name: 'locales.ts', type: 'file', size: 900 },
-  ],
-}
-
-/** mock 的 `remote.workspaceFiles` 命名空间：静态目录树 + 只发一次 ready 的变更流。 */
+/** mock 的 `remote.workspaceFiles` 命名空间：目录清空，只剩保持打开的变更流。 */
 function mockWorkspaceFilesNamespace(): unknown {
   return {
-    list: async (_sessionId: string, path: string) => {
-      const normalized = path.replace(/[/\\]+$/, '')
-      // 根目录用会话 cwd 绝对路径传进来，树按键名存，所以根归一到 ''
-      const segment = normalized === '' || normalized === WORKSPACE_PATH ? '' : (normalized.split(/[/\\]/).pop() ?? '')
-      return OK({ path: segment, entries: MOCK_FILE_TREE[segment] ?? [], truncated: false })
-    },
+    list: async (_sessionId: string, path: string) => OK({ path, entries: [], truncated: false }),
     // 变更流必须保持打开：结束会被文件面板当成 watch 失败并弹提示
     changes: async function* (_sessionId: string, _path: string, signal?: AbortSignal): AsyncGenerator<unknown> {
       yield { kind: 'ready' }
@@ -839,7 +716,7 @@ function buildMockRemote(): unknown {
     // 固定宿主事实：ui-tool 的读文件行会用 home 缩写路径；缺了它代理会返回假命名空间，
     // 行内 abbreviateHomePath 收到对象而不是字符串，整行被槽位错误边界吞掉。
     // isLoopback 保持 false：此前缺省即 falsy，换成 true 会顺带打开设置页的文档控制器。
-    $host: { home: WORKSPACE_PATH, isLoopback: false },
+    $host: { home: HOME_PATH, isLoopback: false },
     $on: mockOn,
     $emit: mockEmit,
     $call: () => Promise.reject(new Error('mock(remote).$call: 该调用尚未 mock，见 transport/mock.ts')),

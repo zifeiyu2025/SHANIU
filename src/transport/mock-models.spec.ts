@@ -20,6 +20,16 @@ async function viewOf(mock: ModelsMock, ns: string) {
   return view
 }
 
+/** 出厂不配密钥；需要走 mock-provider 的用例临时配上，结束后收回，保持默认演示态。 */
+async function withProviderConfigured<T>(mock: ModelsMock, run: () => Promise<T>): Promise<T> {
+  await mock.credentials.set('MOCK_PROVIDER_API_KEY', 'mock-local-key')
+  try {
+    return await run()
+  } finally {
+    await mock.credentials.unset('MOCK_PROVIDER_API_KEY')
+  }
+}
+
 describe('mock-models：设置页的可读基线', () => {
   let mock: ModelsMock
   beforeEach(() => {
@@ -210,12 +220,22 @@ describe('mock-models：模型席位与设置页同源', () => {
     expect(afterKey.value.routableProviders).toContain('acme')
   })
 
-  it('席位默认项始终落在目录里，避免既有选择退化', async () => {
+  it('出厂未配置：目录为空，席位默认项是空选择', async () => {
     const catalog = await mock.session.modelCatalog()
     expect(catalog.ok).toBe(true)
     if (!catalog.ok) return
-    const group = catalog.value.groups.find(candidate => candidate.id === catalog.value.default.provider)
-    expect(group?.models.map(model => model.id)).toContain(catalog.value.default.model)
+    expect(catalog.value.groups).toEqual([])
+    expect(catalog.value.default).toEqual({ provider: '', model: '' })
+  })
+
+  it('席位默认项始终落在目录里，避免既有选择退化', async () => {
+    await withProviderConfigured(mock, async () => {
+      const catalog = await mock.session.modelCatalog()
+      expect(catalog.ok).toBe(true)
+      if (!catalog.ok) return
+      const group = catalog.value.groups.find(candidate => candidate.id === catalog.value.default.provider)
+      expect(group?.models.map(model => model.id)).toContain(catalog.value.default.model)
+    })
   })
 
   it('账号提供商已彻底移除：设置目录与席位分组都不再有 deepseek-account', async () => {
@@ -237,12 +257,14 @@ describe('mock-models：模型席位与设置页同源', () => {
   })
 
   it('listProviders 只报可路由的路由', async () => {
-    const providers = await mock.llm.listProviders()
-    expect(providers.ok).toBe(true)
-    if (!providers.ok) return
-    const ids = providers.value.map(provider => provider.id)
-    expect(ids).toContain('mock-provider')
-    expect(ids).not.toContain('deepseek')
+    await withProviderConfigured(mock, async () => {
+      const providers = await mock.llm.listProviders()
+      expect(providers.ok).toBe(true)
+      if (!providers.ok) return
+      const ids = providers.value.map(provider => provider.id)
+      expect(ids).toContain('mock-provider')
+      expect(ids).not.toContain('deepseek')
+    })
   })
 })
 
@@ -260,11 +282,13 @@ describe('mock-models：模型的推理等级', () => {
   }
 
   it('声明了 reasoningEfforts 的模型带档位，没声明的模型没有 reasoning', async () => {
-    const reasoningModel = await modelOf('mock-provider', 'mock-model-a')
-    expect(reasoningModel?.reasoning?.efforts.map(effort => effort.id)).toEqual(['off', 'low', 'medium', 'high', 'max'])
-    expect(reasoningModel?.reasoning?.defaultEffort).toBe('high')
-    const plainModel = await modelOf('mock-provider', 'mock-model-b')
-    expect(plainModel?.reasoning).toBeUndefined()
+    await withProviderConfigured(mock, async () => {
+      const reasoningModel = await modelOf('mock-provider', 'mock-model-a')
+      expect(reasoningModel?.reasoning?.efforts.map(effort => effort.id)).toEqual(['off', 'low', 'medium', 'high', 'max'])
+      expect(reasoningModel?.reasoning?.defaultEffort).toBe('high')
+      const plainModel = await modelOf('mock-provider', 'mock-model-b')
+      expect(plainModel?.reasoning).toBeUndefined()
+    })
   })
 
   it('出厂 DeepSeek 模型带上游硬编码的 off/low/high/max 档位', async () => {
@@ -280,21 +304,25 @@ describe('mock-models：模型的推理等级', () => {
   })
 
   it('席位默认项带上有效档位；换模型后旧档不跟着串台', async () => {
-    await mock.session.selectModel({ provider: 'mock-provider', model: 'mock-model-a', reasoningEffort: 'low' })
-    const kept = await mock.session.modelCatalog()
-    expect(kept.ok && kept.value.default).toMatchObject({ model: 'mock-model-a', reasoningEffort: 'low' })
+    await withProviderConfigured(mock, async () => {
+      await mock.session.selectModel({ provider: 'mock-provider', model: 'mock-model-a', reasoningEffort: 'low' })
+      const kept = await mock.session.modelCatalog()
+      expect(kept.ok && kept.value.default).toMatchObject({ model: 'mock-model-a', reasoningEffort: 'low' })
 
-    // mock-model-b 没有推理档：旧档必须作废，而不是把 'low' 带过去
-    await mock.session.selectModel({ provider: 'mock-provider', model: 'mock-model-b' })
-    const switched = await mock.session.modelCatalog()
-    expect(switched.ok && switched.value.default).toMatchObject({ model: 'mock-model-b' })
-    expect(switched.ok && switched.value.default.reasoningEffort).toBeUndefined()
+      // mock-model-b 没有推理档：旧档必须作废，而不是把 'low' 带过去
+      await mock.session.selectModel({ provider: 'mock-provider', model: 'mock-model-b' })
+      const switched = await mock.session.modelCatalog()
+      expect(switched.ok && switched.value.default).toMatchObject({ model: 'mock-model-b' })
+      expect(switched.ok && switched.value.default.reasoningEffort).toBeUndefined()
+    })
   })
 
   it('给不支持该档的模型强塞 effort 时回落到它自己的默认档', async () => {
-    await mock.session.selectModel({ provider: 'mock-provider', model: 'mock-model-a', reasoningEffort: 'xhigh' })
-    const catalog = await mock.session.modelCatalog()
-    expect(catalog.ok && catalog.value.default.reasoningEffort).toBe('high')
+    await withProviderConfigured(mock, async () => {
+      await mock.session.selectModel({ provider: 'mock-provider', model: 'mock-model-a', reasoningEffort: 'xhigh' })
+      const catalog = await mock.session.modelCatalog()
+      expect(catalog.ok && catalog.value.default.reasoningEffort).toBe('high')
+    })
   })
 })
 
