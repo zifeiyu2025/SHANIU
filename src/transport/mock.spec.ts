@@ -25,6 +25,9 @@ interface WorkspaceFace {
     type: string
     value: { items: { path: string; title: string }[] }
   }>
+  create(input: { path: string }): Promise<MockResult<{
+    workspace: { workspaceId: string; path: string; title: string }
+  }>>
 }
 
 interface CredentialFace {
@@ -186,5 +189,26 @@ describe('mock 默认工作区路径', () => {
     } finally {
       if (before !== undefined) setDefaultWorkspacePath(before.path)
     }
+  })
+})
+
+describe('mock 添加工作区', () => {
+  it('按目录路径建行并广播，默认工作区保留；新会话落在新工作区', async () => {
+    const before = await workspaceBaseline()
+    const path = 'D:\\MyWorkspace\\SHANIU\\docs'
+    const created = await remote.workspace.create({ path })
+    if (!created.ok) throw new Error(`创建失败：${created.error.message}`)
+
+    // 标题取目录名；新行进入 follow 基线，默认工作区仍在
+    expect(created.value.workspace).toMatchObject({ path, title: 'docs' })
+    const after = await workspaceBaseline()
+    expect(after).toHaveLength(before.length + 1)
+    expect(after.map(row => row.path)).toContain(path)
+    expect(after.map(row => row.title)).toContain('default-workspace')
+
+    // 会话挂进新工作区时 cwd 跟着工作区路径走（不传 cwd 的默认路径）
+    const session = await remote.session.create({ workspaceId: created.value.workspace.workspaceId })
+    const list = await remote.session.list()
+    expect(list.value.items.find(item => item.sessionId === session.value.sessionId)?.cwd).toBe(path)
   })
 })
