@@ -292,3 +292,24 @@ describe('mock-models：模型的推理等级', () => {
     expect(catalog.ok && catalog.value.default.reasoningEffort).toBe('high')
   })
 })
+
+describe('mock-models：权限默认档设置', () => {
+  it('挂出 permission 命名空间，默认档是 read-only', async () => {
+    const mock = createModelsMock()
+    const view = await viewOf(mock, 'permission')
+    expect(schema.getPath(view.value, ['defaultPreset'])).toBe('read-only')
+    expect(mock.permissionDefault()).toBe('read-only')
+  })
+
+  it('写入 defaultPreset 后视图与访问器一起更新', async () => {
+    const mock = createModelsMock()
+    const before = await viewOf(mock, 'permission')
+    const written = await mock.settings.mutate('permission', [
+      { op: 'set', path: ['defaultPreset'], value: 'workspace-write' },
+    ], before.revision)
+    expect(written.ok).toBe(true)
+    if (!written.ok) return
+    expect(schema.getPath(written.value.user, ['defaultPreset'])).toBe('workspace-write')
+    expect(mock.permissionDefault()).toBe('workspace-write')
+  })
+})

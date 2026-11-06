@@ -165,6 +165,8 @@ function mockSessionNamespace(): unknown {
     create: async (payload: { workspaceId?: string; cwd?: string } = {}) => {
       const id = `mock-session-${MOCK_SESSION_ROWS.size + 1}`
       MOCK_SESSION_ROWS.set(id, mockSessionRow(id, 0))
+      // 新建会话吃设置里的「权限默认档」；已存在的会话保持各自当前值（上游语义）
+      PERMISSION_BY_SESSION.set(id, MODELS.permissionDefault() ?? DEFAULT_PERMISSION)
       // 新会话挂进工作区行（workspace-view.sessionIds），推 upsert 帧——
       // 会话视图的 chip/inert 门控读取 sessionWorkspace（未挂接 = 输入框 inert）
       WORKSPACE_SESSION_IDS.push(id)
@@ -197,7 +199,9 @@ function mockSessionNamespace(): unknown {
       for await (const frame of projectionFrames.subscribe()) yield frame
     },
     follow: async function* (request: unknown): AsyncGenerator<unknown> {
-      const sessionId = (request as { sessionId?: string } | undefined)?.sessionId
+      // 会话地址是联合类型：`{kind:'session', sessionId}` 或 `{kind:'subagent', childSessionId}`
+      const address = (request as { address?: { kind?: string; sessionId?: string; childSessionId?: string } } | undefined)?.address
+      const sessionId = address?.kind === 'session' ? address.sessionId : address?.childSessionId
       yield {
         type: 'snapshot',
         header: { version: 0, id: '' as SessionId, createdAt: Date.now(), isSeeded: false },

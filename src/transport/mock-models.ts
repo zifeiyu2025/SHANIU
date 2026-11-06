@@ -188,6 +188,8 @@ export interface ModelsMock {
     set(ref: string, value: string): Promise<MockResult<void>>
     unset(ref: string): Promise<MockResult<void>>
   }
+  /** 设置里「权限默认档」的当前值；新建会话按它初始化挡位。 */
+  permissionDefault(): string | undefined
   readonly session: {
     modelCatalog(): Promise<MockResult<ModelCatalog>>
     selectModel(request: ModelSelection): Promise<MockResult<{ selected: ModelSelection }>>
@@ -255,6 +257,13 @@ export function createModelsMock(options: ModelsMockOptions = { emit: () => fals
       schema: envelope(z.object({ welcomeNoticeVersion: z.string() })),
       // SHANIU 不在 DSH 的预览版计划里：预置成"已确认"，首屏不再弹上游的预览说明
       base: { [WELCOME_NOTICE_ACK_FIELD]: WELCOME_NOTICE_VERSION },
+      user: {},
+      revision: 0,
+    }],
+    ['permission', {
+      // 设置-通用里的「权限默认档」行读这个命名空间；新建会话按它初始化
+      schema: envelope(z.object({ defaultPreset: z.string() })),
+      base: { defaultPreset: 'read-only' },
       user: {},
       revision: 0,
     }],
@@ -449,6 +458,11 @@ export function createModelsMock(options: ModelsMockOptions = { emit: () => fals
         emit('llm/adapters-updated')
         return OK(undefined)
       },
+    },
+    permissionDefault: () => {
+      const view = viewOf('permission')
+      const value = view === undefined ? undefined : at(view.value, ['defaultPreset'])
+      return typeof value === 'string' && value.length > 0 ? value : undefined
     },
     session: {
       modelCatalog: async () => {
