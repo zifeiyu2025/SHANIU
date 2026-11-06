@@ -42,6 +42,8 @@ pub struct AppConfig {
     pub approval: ApprovalConfig,
     pub workspace: WorkspaceConfig,
     pub agent: AgentConfig,
+    /// 会话标题自动生成（04 §4 `[session_title]`）。缺段 = 默认开启。
+    pub session_title: SessionTitleConfig,
     /// 可选的服务商列表（04 §4 `[[providers]]`）。**为空就是旧行为**：生效档直接取
     /// `[model]` 段。这是 additive 扩展而不是替换——已有 config.toml 不改一个字也能跑，
     /// 而逼用户迁移配置文件等于让升级即失效。
@@ -259,6 +261,44 @@ pub struct AgentConfig {
 impl Default for AgentConfig {
     fn default() -> Self {
         Self { token_budget: 500_000 }
+    }
+}
+
+/// 会话标题自动生成（04 §4 `[session_title]`，对齐上游 `dsh-session-title-first-prompt-llm`
+/// 在 base bundle 的开箱默认）。
+///
+/// 语义：全新会话（无父、非分叉）收到首条用户消息后，用**生效路由**发一次辅助请求
+/// 总结该消息生成标题；截断派生降级为 fallback（生成失败保持 fallback，不自动重试）；
+/// 用户手改（`titles.json`）优先且不被生成覆盖。数值照抄上游 base bundle。
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(default)]
+pub struct SessionTitleConfig {
+    /// 开箱默认开（上游正式产品即默认挂载）。关掉 = 只用截断 fallback。
+    pub enabled: bool,
+    /// 非 CJK 语言的目标词数。
+    pub target_words: u32,
+    /// CJK 语言的目标字数。
+    pub target_cjk_characters: u32,
+    /// 框架后的输入字节上限：超限**拒绝**而不是截断（上游语义——截断会让标题基于
+    /// 被切开的文本编造）。超限保持 fallback。
+    pub max_input_bytes: u64,
+    /// 辅助请求的输出 token 上限：防失控的兜底而不是长度目标（系统提示已约束短标题；
+    /// 推理模型关不掉的思考也计入输出）。独立于会话主请求的输出上限。
+    pub max_output_tokens: u32,
+    /// 辅助请求端到端超时。迟到的成功结果不采纳（流被超时掐断）。
+    pub timeout_ms: u64,
+}
+
+impl Default for SessionTitleConfig {
+    fn default() -> Self {
+        Self {
+            enabled: true,
+            target_words: 5,
+            target_cjk_characters: 10,
+            max_input_bytes: 4096,
+            max_output_tokens: 4096,
+            timeout_ms: 60_000,
+        }
     }
 }
 
@@ -1000,6 +1040,10 @@ mod provider_tests {
         assert_eq!(active.max_turns, 7);
         // 回落路径的密钥名沿用 [model].provider——这正是改动前 build_agent 读的那个文件
         assert_eq!(active.secret_name, "openai-chat");
+        // 缺 `[session_title]` 段 = 开箱默认开（上游 base bundle 即默认挂载），不是关
+        assert!(cfg.session_title.enabled);
+        assert_eq!(cfg.session_title.target_words, 5);
+        assert_eq!(cfg.session_title.max_input_bytes, 4096);
     }
 
     #[test]

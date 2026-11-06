@@ -8,6 +8,7 @@ pub mod model_client;
 pub mod sandbox;
 pub mod permission;
 pub mod rollout;
+pub mod session_title;
 pub mod tool_router;
 pub mod tools;
 
@@ -48,6 +49,9 @@ fn send_task(app: tauri::AppHandle, task: String, agent_id: Option<String>) -> R
         }
         None => {
             let (agent, cancel, new_id) = build_new_session(&state)?;
+            // 首条消息 = 标题自动生成的触发点（first-prompt 节奏）：后台辅助请求，
+            // 不阻塞主回合；失败/关开关/没密钥都静默保持截断 fallback。
+            session_title::spawn_generation(app.clone(), new_id.clone(), task.clone());
             let sink: Arc<dyn events::EventSink> =
                 Arc::new(events::TauriEventSink::root(app.clone(), new_id.clone()));
             tauri::async_runtime::spawn(async move {
@@ -77,6 +81,11 @@ fn continue_session(
         .join(format!("{agent_id}.jsonl"));
     let resumed = rollout::resume::resume(&path).map_err(|e| format!("恢复会话失败: {e}"))?;
     let persisted = resumed.history.len();
+    // first-prompt 资格看**追加前**的历史：档案里从没有过用户消息、又不是分叉，
+    // 这条新任务才是"首条合格消息"（崩溃恢复/续跑/分叉都不重新生成标题）。
+    if session_title::eligible(resumed.parent_id.as_deref(), &resumed.history) {
+        session_title::spawn_generation(app.clone(), agent_id.clone(), task.to_string());
+    }
     let mut history = resumed.history;
     history.push(model_client::HistoryItem::Message {
         role: model_client::Role::User,
