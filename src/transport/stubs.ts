@@ -31,7 +31,6 @@ export const REMOTE_NAMESPACES = [
   'directoryPicker', 'job', 'terminal', 'settings', 'subagents', 'modelSelection',
   'credentials', 'llm', 'permissionPresets',
   'pluginManager', 'pluginInventory', 'pluginRegistryProbe', 'schedule',
-  'messageFeedback', 'sessionFeedback',
 ] as const
 
 /**

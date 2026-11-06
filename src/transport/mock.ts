@@ -808,63 +808,6 @@ function mockScheduleNamespace(): unknown {
   }
 }
 
-/**
- * mock 的消息反馈：put/delete/list 走内存存储（版本号单调递增，冲突面不模拟），
- * 外层信封与宿主 RemoteResult 同形；内层信封是反馈 Controller 自己读的结果联合。
- */
-function mockMessageFeedbackNamespace(): unknown {
-  interface FeedbackEntry {
-    messageId: string
-    rating: 'positive' | 'negative'
-    note?: string
-    category?: string
-    version: number
-    createdAt: number
-    updatedAt: number
-  }
-  const items = new Map<string, FeedbackEntry>()
-  let version = 0
-  const key = (sessionId: string, messageId: string): string => `${sessionId}\u0000${messageId}`
-  return {
-    put: async (request: {
-      sessionId: string
-      messageId: string
-      rating: 'positive' | 'negative'
-      note?: string
-      category?: string
-    }) => {
-      version += 1
-      const now = Date.now()
-      const entry: FeedbackEntry = {
-        messageId: request.messageId,
-        rating: request.rating,
-        ...(request.note === undefined ? {} : { note: request.note }),
-        ...(request.category === undefined ? {} : { category: request.category }),
-        version,
-        createdAt: now,
-        updatedAt: now,
-      }
-      items.set(key(request.sessionId, request.messageId), entry)
-      return OK({ ok: true, value: entry })
-    },
-    delete: async (request: { sessionId: string; messageId: string }) => {
-      items.delete(key(request.sessionId, request.messageId))
-      return OK({ ok: true })
-    },
-    list: async (request: { sessionId: string }) => {
-      const prefix = `${request.sessionId}\u0000`
-      return OK({ ok: true, value: { items: [...items.entries()].filter(([name]) => name.startsWith(prefix)).map(([, entry]) => entry) } })
-    },
-  }
-}
-
-/** mock 的会话级反馈：直接收下，不落盘（真实实现属宿主 feedback 服务）。 */
-function mockSessionFeedbackNamespace(): unknown {
-  return {
-    record: async () => OK({ ok: true }),
-  }
-}
-
 /** 尚未 mock 的命名空间维持显式抛错面（按界面迭代逐个补）。 */
 function mockNamespace(name: string): unknown {
   const thrower = () => {
@@ -913,9 +856,6 @@ function buildMockRemote(): unknown {
     ['pluginManager', mockPluginManagerNamespace()],
     ['pluginRegistryProbe', mockPluginRegistryProbeNamespace()],
     ['schedule', mockScheduleNamespace()],
-    // 消息反馈（动作条点赞/点踩与会话反馈）
-    ['messageFeedback', mockMessageFeedbackNamespace()],
-    ['sessionFeedback', mockSessionFeedbackNamespace()],
     ['session', mockSessionNamespace()],
     // 模型设置页的三张面：由同一份 mock-models 事实源应答（见 mock-models.ts）
     ['llm', MODELS.llm],
@@ -1002,7 +942,6 @@ const NAMESPACES = [
   'directoryPicker', 'job', 'terminal', 'settings', 'subagents', 'modelSelection',
   'credentials', 'llm', 'permissionPresets',
   'pluginManager', 'pluginInventory', 'pluginRegistryProbe', 'schedule',
-  'messageFeedback', 'sessionFeedback',
 ] as const
 
 /** 批量注册 mock 的 `remote.<ns>` 点分服务（与 ctx.remote.<ns> 同源同实例）。 */
