@@ -208,6 +208,7 @@ async fn first_delta_latency_within_budget_on_real_endpoint() {
         base_url: std::env::var("SHANIU_TEST_BASE_URL")
             .unwrap_or_else(|_| "https://api.longcat.chat/openai/v1".into()),
         model: std::env::var("SHANIU_TEST_MODEL").unwrap_or_else(|_| "LongCat-2.5".into()),
+        reasoning_effort: None,
     };
     let backend = Arc::new(shaniu_lib::agent_loop::ResponsesBackend {
         provider: provider.clone(),

@@ -314,11 +314,8 @@ fn build_agent_with(
     // 这里不再自己写死 provider 字符串：写死就等于多服务商列表里换了一家、
     // 密钥却仍从同一个文件读。
     let active = cfg.effective_model();
-    let provider = model_client::provider::ProviderConfig {
-        provider: active.provider.clone(),
-        base_url: active.base_url.clone(),
-        model: active.model.clone(),
-    };
+    // 推理档已在配置层解析成 wire 值（档位查表 / off / 未声明都在那边收口）
+    let provider = model_client::provider::ProviderConfig::from_resolved(&active);
     let secret = config::SecretStore::new(&state.config_root());
     let api_key = secret
         .load_key(&active.secret_name)?
@@ -404,7 +401,12 @@ fn get_settings(app: tauri::AppHandle) -> Result<serde_json::Value, String> {
                 "contextWindow": m.context_window,
                 "maxTokens": m.max_tokens,
                 "input": m.input,
+                // 推理档声明（SH-096）：档位 → wire 值；空串 = off 档（不发字段）。
+                // 前端视图把它翻成 null，写回时再归一成空串。
+                "reasoningEfforts": m.reasoning_efforts,
             })).collect::<Vec<_>>(),
+            // 席位选中的推理档位（档位名；空 = 服务商默认）
+            "reasoningEffort": p.reasoning_effort,
         }));
     }
     let active = cfg.effective_model();

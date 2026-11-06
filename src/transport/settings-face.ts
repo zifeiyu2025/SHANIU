@@ -29,6 +29,11 @@ interface HostModelRow {
   readonly contextWindow: number
   readonly maxTokens: number
   readonly input: readonly string[]
+  /**
+   * 推理档位声明（SH-096）：档位名 → wire 值；**空串 = off 档**（不发字段）——
+   * TOML 没有 null，宿主文档用空串承载上游的 null，视图与写面在此双向翻译。
+   */
+  readonly reasoningEfforts?: Readonly<Record<string, string>>
 }
 
 /** `get_settings` 里一家服务商的完整回显。 */
@@ -38,6 +43,8 @@ interface HostProviderRow {
   readonly provider: string
   readonly baseUrl: string
   readonly model: string
+  /** 席位选中的推理档位（档位名）；空 = 服务商默认（不发字段）。 */
+  readonly reasoningEffort?: string
   /** 生效的密钥文件名：显式名或按 id 派生名，由宿主算好。 */
   readonly secretRef: string
   readonly hasApiKey: boolean
@@ -65,6 +72,8 @@ interface ProviderPayload {
   readonly provider: string
   readonly base_url: string
   readonly model: string
+  /** 席位选中的推理档位（档位名）。设置页不编辑，从快照透传防丢失。 */
+  readonly reasoning_effort: string
   readonly secret_ref: string
   readonly models: readonly {
     id: string
@@ -72,6 +81,8 @@ interface ProviderPayload {
     context_window: number
     max_tokens: number
     input: string[]
+    /** 档位 → wire 值；空串 = off（上游 null 的落盘形态）。 */
+    reasoning_efforts?: Record<string, string>
   }[]
 }
 
@@ -129,10 +140,14 @@ const refused = <T>(error: RemoteError): FaceResult<T> => ({ ok: false, error })
 /** 设置页写面里一个服务商 profile 允许的键；其余一律拒绝（见 PROFILE_KEYS 的注释）。 */
 const PROFILE_KEYS = new Set(['displayName', 'apiKeyEnv', 'api', 'baseURL', 'models'])
 /**
- * 一行模型允许的键。不含 `reasoningEfforts`（后端不发送 reasoning_effort，SH-096），
- * 也不含 `description`：schema 里没声明的字段界面不会给，真给了就报错而不是收下再丢。
+ * 一行模型允许的键（SH-096 起 `reasoningEfforts` 接线）。不含 `description`：
+ * schema 里没声明的字段界面不会给，真给了就报错而不是收下再丢。
  */
-const MODEL_KEYS = new Set(['id', 'name', 'contextWindow', 'maxTokens', 'input'])
+const MODEL_KEYS = new Set(['id', 'name', 'contextWindow', 'maxTokens', 'input', 'reasoningEfforts'])
+
+/** 推理档位全集（SH-096，上游 THINKING_LEVELS；后端校验/展示顺序共用）。 */
+const THINKING_LEVELS = ['off', 'minimal', 'low', 'medium', 'high', 'xhigh', 'max'] as const
+const THINKING_LEVEL_SET = new Set<string>(THINKING_LEVELS)
 
 /** 宿主协议族 ⇄ DSH 的 `api` 名。两边都只认这两个值，其余按"未实现"处理。 */
 const API_OF_HOST: Record<string, string> = { 'openai-chat': 'openai-completions', 'openai-responses': 'openai-responses' }
@@ -153,6 +168,9 @@ const modelRowSchema = z.object({
   contextWindow: z.number().step(1).min(1),
   maxTokens: z.number().step(1).min(1),
   input: z.array(z.union(['text', 'image'])),
+  // 推理档位（SH-096）：值是 string 或 null（off 档）。schema 与上游
+  // llm-pi-ai config.ts 同构——设置页的档位编辑器从这里的键 union 取可选档。
+  reasoningEfforts: z.union([z.const(false), z.dict(z.union([z.string(), z.const(null)]), z.union(THINKING_LEVELS as unknown as string[]))]),
 })
 
 const piAiSchema = z.object({
@@ -249,6 +267,19 @@ export function createSettingsFace(bridge: HostBridge, options: SettingsFaceOpti
         if (model.contextWindow > 0) entry.contextWindow = model.contextWindow
         if (model.maxTokens > 0) entry.maxTokens = model.maxTokens
         if (model.input.length > 0) entry.input = [...model.input]
+        // 推理档声明（SH-096）：空串翻回 null（off 档的上游形态），键按全集顺序
+        // 排——设置页的档位编辑器按 dict 条目顺序渲染，BTreeMap 的字母序会让
+        // off 排在 low 后面，视觉上像"档位乱序"。
+        const declared = model.reasoningEfforts
+        if (declared !== undefined && Object.keys(declared).length > 0) {
+          const efforts: Record<string, JsonValue> = {}
+          for (const level of THINKING_LEVELS) {
+            if (!(level in declared)) continue
+            const wire = declared[level]
+            efforts[level] = wire === '' ? null : wire
+          }
+          entry.reasoningEfforts = efforts
+        }
         return entry
       })
     }
@@ -344,6 +375,9 @@ export function createSettingsFace(bridge: HostBridge, options: SettingsFaceOpti
       provider,
       base_url: baseURL,
       model: pickActiveModel(models, previous),
+      // 选中档位不在设置页文档里（上游同口径：选中档属于席位状态）——从快照
+      // 透传防丢失，只有席位的 selectModel 会写它
+      reasoning_effort: previous?.reasoningEffort ?? '',
       secret_ref: secretRef,
       models,
     }
@@ -353,9 +387,7 @@ export function createSettingsFace(bridge: HostBridge, options: SettingsFaceOpti
     if (!isRecord(raw)) throw new Refusal(`服务商 ${route} 有模型行不是对象`)
     for (const key of Object.keys(raw)) {
       if (MODEL_KEYS.has(key)) continue
-      throw new Refusal(key === 'reasoningEfforts'
-        ? `服务商 ${route} 的推理档未接线：SHANIU 后端不发送 reasoning_effort（见 docs/05 SH-096）`
-        : `服务商 ${route} 的模型行含 SHANIU 不认识的字段 ${key}`)
+      throw new Refusal(`服务商 ${route} 的模型行含 SHANIU 不认识的字段 ${key}`)
     }
     const id = typeof raw.id === 'string' ? raw.id.trim() : ''
     if (id === '') throw new Refusal(`服务商 ${route} 有模型行缺 id`)
@@ -371,12 +403,36 @@ export function createSettingsFace(bridge: HostBridge, options: SettingsFaceOpti
     if (!Array.isArray(input) || input.some(item => item !== 'text' && item !== 'image')) {
       throw new Refusal(`服务商 ${route} 的模型 ${id} 的 input 只能是 text / image`)
     }
+    // 推理档声明（SH-096）：`false` = 显式声明非推理模型，SHANIU 没有可继承的
+    // 目录，与缺席等价，归一成空 map；dict 的 null 值（off 档）落盘成空串。
+    const rawEfforts = raw.reasoningEfforts
+    const reasoning_efforts: Record<string, string> = {}
+    if (rawEfforts !== undefined && rawEfforts !== false) {
+      if (!isRecord(rawEfforts)) throw new Refusal(`服务商 ${route} 的模型 ${id} 的 reasoningEfforts 必须是档位到 wire 值的映射`)
+      for (const [level, wire] of Object.entries(rawEfforts)) {
+        if (!THINKING_LEVEL_SET.has(level)) {
+          throw new Refusal(`服务商 ${route} 的模型 ${id} 有未知推理档位 ${level}（可用：${THINKING_LEVELS.join('/')}）`)
+        }
+        const value = wire === null || wire === undefined ? '' : wire
+        if (typeof value !== 'string') {
+          throw new Refusal(`服务商 ${route} 的模型 ${id} 的推理档位 ${level} 的 wire 值必须是字符串或 null`)
+        }
+        if (level !== 'off' && value.trim() === '') {
+          throw new Refusal(`服务商 ${route} 的模型 ${id} 的推理档位 ${level} 缺 wire 值（只有 off 允许为空）`)
+        }
+        reasoning_efforts[level] = value
+      }
+      if (Object.values(reasoning_efforts).every(v => v.trim() === '')) {
+        throw new Refusal(`服务商 ${route} 的模型 ${id} 的推理档位只声明了 off：至少给一个非 off 档 wire 值`)
+      }
+    }
     return {
       id,
       name: typeof raw.name === 'string' ? raw.name : id,
       context_window: positive('contextWindow'),
       max_tokens: positive('maxTokens'),
       input: input as string[],
+      ...(Object.keys(reasoning_efforts).length > 0 ? { reasoning_efforts } : {}),
     }
   }
 
@@ -442,10 +498,25 @@ export function createSettingsFace(bridge: HostBridge, options: SettingsFaceOpti
     if (row.baseUrl === '' && entry === undefined) return { failure: { id: row.id, name, message: '缺端点地址' } }
     if (!row.hasApiKey) return { failure: { id: row.id, name, message: `未配置密钥（引用名 ${row.secretRef}）` } }
     const models = modelRowsOf(row, entry).filter(isRecord)
-      .map(model => ({ id: String(model.id ?? ''), name: String(model.name ?? model.id ?? '') }))
+      .map(model => {
+        const out: Record<string, unknown> = { id: String(model.id ?? ''), name: String(model.name ?? model.id ?? '') }
+        // 声明了推理档位的模型把可选档带给席位（SH-096）：下拉按 efforts 列档、
+        // 按 defaultEffort 预选；未声明的模型不出档位（席位的既有判据）。
+        const declared = row.models.find(candidate => candidate.id === out.id)?.reasoningEfforts
+        if (declared !== undefined && Object.keys(declared).length > 0) {
+          const efforts = THINKING_LEVELS.filter(level => level in declared)
+            .map(level => ({ id: level, name: level }))
+          const selected = row.reasoningEffort ?? ''
+          out.reasoning = {
+            efforts,
+            ...(selected !== '' && selected in declared ? { defaultEffort: selected } : {}),
+          }
+        }
+        return out
+      })
       .filter(model => model.id !== '')
     if (models.length === 0) return { failure: { id: row.id, name, message: '模型清单为空' } }
-    return { group: { id: row.id, name, models } }
+    return { group: { id: row.id, name, models: models as unknown as ModelProviderGroup['models'] } }
   }
 
   const catalog = async (): Promise<ModelCatalog> => {
@@ -474,7 +545,9 @@ export function createSettingsFace(bridge: HostBridge, options: SettingsFaceOpti
     if (view === undefined || view.providers.length === 0) return { provider: '', model: '' }
     const row = view.providers.find(candidate => candidate.id === view.activeProvider)
     if (row === undefined || routeState(row).failure !== undefined) return { provider: '', model: '' }
-    return { provider: row.id, model: row.model }
+    // 选中档位随档回显：席位据此预选推理档（ModelSelect 的 effectiveEffort 链）
+    const effort = row.reasoningEffort ?? ''
+    return { provider: row.id, model: row.model, ...(effort === '' ? {} : { reasoningEffort: effort }) }
   }
 
   /** 读不到快照时回落宿主默认档（config.rs 的 SandboxMode `#[default]` = ReadOnly）。 */
@@ -666,18 +739,35 @@ export function createSettingsFace(bridge: HostBridge, options: SettingsFaceOpti
         if (selectable.length > 0 && !selectable.includes(request.model)) {
           return refused(new RemoteError('gateway/bad-request', `服务商 ${row.id} 的模型清单里没有 ${request.model}`, {}))
         }
+        // 选中推理档位（SH-096）：必须是该模型声明过的档位，空串 = 回到服务商默认。
+        // 席位只会从 catalog 的 reasoning.efforts 里发起选择，这里再校验一次是防
+        // 直呼 invocation——静默收下未声明的档位，运行时查不到 wire 值就不发字段，
+        // 用户选了 high 实际跑的是默认档，比报错难发现得多。
+        const effort = (request.reasoningEffort ?? '').trim()
+        if (effort !== '') {
+          const declared = row.models.find(candidate => candidate.id === request.model)?.reasoningEfforts
+          if (declared === undefined || !(effort in declared)) {
+            return refused(new RemoteError('gateway/bad-request', `模型 ${request.model} 未声明推理档位 ${effort}`, {}))
+          }
+        }
         const providers = snapshot.providers.map(candidate => ({
           id: candidate.id,
           label: candidate.label,
           provider: candidate.provider,
           base_url: candidate.baseUrl,
           secret_ref: candidate.secretRef,
+          // 每行的选中档位原样透传；被选中的那家写新值。模型行的档位声明同理，
+          // 整份替换的写面上丢一个字段 = 用户配置凭空消失。
+          reasoning_effort: candidate.id === row.id ? effort : candidate.reasoningEffort ?? '',
           models: candidate.models.map(model => ({
             id: model.id,
             name: model.name,
             context_window: model.contextWindow,
             max_tokens: model.maxTokens,
             input: [...model.input],
+            ...(model.reasoningEfforts === undefined || Object.keys(model.reasoningEfforts).length === 0
+              ? {}
+              : { reasoning_efforts: { ...model.reasoningEfforts } }),
           })),
           model: candidate.id === row.id ? request.model : candidate.model,
         }))
@@ -691,7 +781,11 @@ export function createSettingsFace(bridge: HostBridge, options: SettingsFaceOpti
           return refused(new RemoteError('gateway/internal', reason instanceof Error ? reason.message : String(reason), {}))
         }
         await read()
-        const selected: ModelSelection = { provider: row.id, model: request.model }
+        const selected: ModelSelection = {
+          provider: row.id,
+          model: request.model,
+          ...(effort === '' ? {} : { reasoningEffort: effort }),
+        }
         return ok({ selected })
       },
     },

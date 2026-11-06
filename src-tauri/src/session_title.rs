@@ -206,10 +206,13 @@ pub fn spawn_generation(app: tauri::AppHandle, agent_id: String, first_message: 
         return;
     }
     let active = cfg.effective_model();
+    // 标题辅助请求不启用推理档：档位属于主回合的采样质量选择，辅助请求要的是
+    // 快与省，带上档位只会拖慢标题生成并多烧 token。
     let provider = ProviderConfig {
         provider: active.provider.clone(),
         base_url: active.base_url.clone(),
         model: active.model.clone(),
+        reasoning_effort: None,
     };
     let api_key = match crate::config::SecretStore::new(&state.config_root()).load_key(&active.secret_name) {
         Ok(Some(key)) => key,
@@ -321,6 +324,7 @@ mod tests {
             provider: "openai-chat".into(),
             base_url: "http://127.0.0.1:1/v1".into(),
             model: "stub".into(),
+            reasoning_effort: None,
         };
         let err = generate_title(&provider, "k", "这是一条很长很长很长很长的用户消息，用来超出 64 字节的框架上限……", &cfg)
             .await
@@ -337,6 +341,7 @@ mod tests {
             provider: "openai-chat".into(),
             base_url: "http://127.0.0.1:1/v1".into(),
             model: "stub".into(),
+            reasoning_effort: None,
         };
         let result = generate_title(&provider, "k", "你好", &cfg).await;
         // 契约只有一条：端点不可达必须整体失败（fallback 保持），绝不交出空标题

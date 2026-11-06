@@ -11,6 +11,9 @@ pub struct ProviderConfig {
     pub provider: String,
     pub base_url: String,
     pub model: String,
+    /// 生效的推理档 wire 值（SH-096）。`effective_model()` 已完成"档位名 → wire 值"
+    /// 的查表（off/未声明都是 None），这里只看最终字符串：Some 且非空才进请求体。
+    pub reasoning_effort: Option<String>,
 }
 
 impl ProviderConfig {
@@ -19,6 +22,17 @@ impl ProviderConfig {
             provider: cfg.provider.clone(),
             base_url: cfg.base_url.trim_end_matches('/').to_string(),
             model: cfg.model.clone(),
+            reasoning_effort: None,
+        }
+    }
+
+    /// 从生效端点构造：推理档已在配置层解析成 wire 值。
+    pub fn from_resolved(cfg: &crate::config::ResolvedModel) -> Self {
+        Self {
+            provider: cfg.provider.clone(),
+            base_url: cfg.base_url.trim_end_matches('/').to_string(),
+            model: cfg.model.clone(),
+            reasoning_effort: cfg.reasoning_effort.clone().filter(|e| !e.is_empty()),
         }
     }
 
@@ -44,6 +58,23 @@ mod tests {
             model: "test-model".into(),
             max_turns: 8,
         }
+    }
+
+    #[test]
+    fn from_resolved_carries_reasoning_effort() {
+        let mut resolved = crate::config::ResolvedModel {
+            id: "p".into(),
+            provider: "openai-chat".into(),
+            base_url: "https://a/v1".into(),
+            model: "m1".into(),
+            max_turns: 8,
+            secret_name: "K".into(),
+            reasoning_effort: Some("high".into()),
+        };
+        let p = ProviderConfig::from_resolved(&resolved);
+        assert_eq!(p.reasoning_effort.as_deref(), Some("high"));
+        resolved.reasoning_effort = None;
+        assert_eq!(ProviderConfig::from_resolved(&resolved).reasoning_effort, None);
     }
 
     #[test]

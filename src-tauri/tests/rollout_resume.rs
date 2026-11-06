@@ -303,6 +303,7 @@ async fn resume_continues_real_work_on_a_real_endpoint() {
         base_url: std::env::var("SHANIU_TEST_BASE_URL")
             .unwrap_or_else(|_| "https://api.deepseek.com/v1".into()),
         model: std::env::var("SHANIU_TEST_MODEL").unwrap_or_else(|_| "deepseek-flash".into()),
+        reasoning_effort: None,
     };
     println!("[resume-e2e] 端点 {} {}", provider.base_url, provider.model);
 

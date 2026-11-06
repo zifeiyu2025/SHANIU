@@ -28,8 +28,10 @@ interface Row {
   provider: string
   base_url: string
   model: string
+  /** 席位选中的推理档位（档位名）；空 = 服务商默认。 */
+  reasoning_effort?: string
   secret_ref: string
-  models: { id: string; name: string; context_window: number; max_tokens: number; input: string[] }[]
+  models: { id: string; name: string; context_window: number; max_tokens: number; input: string[]; reasoning_efforts?: Record<string, string> }[]
 }
 
 function fakeHost(rows: Row[] = []): FakeHost {
@@ -79,7 +81,10 @@ function fakeHost(rows: Row[] = []): FakeHost {
                 contextWindow: model.context_window,
                 maxTokens: model.max_tokens,
                 input: model.input,
+                // 空串 = off 档的落盘形态（TOML 无 null），与真实宿主同形
+                ...(model.reasoning_efforts === undefined ? {} : { reasoningEfforts: model.reasoning_efforts }),
               })),
+              reasoningEffort: row.reasoning_effort ?? '',
             })),
           } as T
         }
@@ -150,6 +155,16 @@ const LONGCAT: Row = {
   model: 'LongCat-2.5',
   secret_ref: 'LONGCAT_API_KEY',
   models: [{ id: 'LongCat-2.5', name: 'LongCat 2.5', context_window: 128_000, max_tokens: 8_192, input: ['text'] }],
+}
+
+/** 声明了推理档位的变体（SH-096）：off 空串 + 两个非 off 档，选中档 high。 */
+const LONGCAT_WITH_EFFORTS: Row = {
+  ...LONGCAT,
+  reasoning_effort: 'high',
+  models: [{
+    id: 'LongCat-2.5', name: 'LongCat 2.5', context_window: 128_000, max_tokens: 8_192, input: ['text'],
+    reasoning_efforts: { off: '', low: 'low', high: 'ultra' },
+  }],
 }
 
 function profileValue(overrides: Record<string, unknown> = {}): Record<string, unknown> {
@@ -313,19 +328,98 @@ describe('settings 面：写路径', () => {
     expect(badRoute['ok']).toBe(false)
     expect((badRoute['error'] as Error).message).toContain('路由名')
 
-    const efforts = await face.settings.mutate('llm-pi-ai', [{
+    // 推理档自 SH-096 起接线：拒绝断言换成校验断言（未知档位 / 非 off 缺 wire 值）
+    const unknownLevel = await face.settings.mutate('llm-pi-ai', [{
       op: 'set',
       path: ['providers', 'x'],
-      value: profileValue({ models: [{ id: 'a', reasoningEfforts: { high: 'high' } }] }),
+      value: profileValue({ models: [{ id: 'a', reasoningEfforts: { ultra: 'ultra' } }] }),
     }], 0)
-    expect(efforts['ok']).toBe(false)
-    expect((efforts['error'] as Error).message).toContain('推理档未接线')
+    expect(unknownLevel['ok']).toBe(false)
+    expect((unknownLevel['error'] as Error).message).toContain('未知推理档位')
+
+    const blankWire = await face.settings.mutate('llm-pi-ai', [{
+      op: 'set',
+      path: ['providers', 'x'],
+      value: profileValue({ models: [{ id: 'a', reasoningEfforts: { low: '' } }] }),
+    }], 0)
+    expect(blankWire['ok']).toBe(false)
+    expect((blankWire['error'] as Error).message).toContain('缺 wire 值')
 
     const badRef = await face.settings.mutate('llm-pi-ai', [{
       op: 'set', path: ['providers', 'x'], value: profileValue({ apiKeyEnv: '../evil' }),
     }], 0)
     expect(badRef['ok']).toBe(false)
     expect((badRef['error'] as Error).message).toContain('密钥引用名')
+  })
+
+  it('推理档声明（SH-096）：null 翻成落盘空串、false 归一缺席，写面带校验', async () => {
+    const host = fakeHost([LONGCAT])
+    const face = faceOf(host)
+    const result = await face.settings.mutate('llm-pi-ai', [{
+      op: 'set',
+      path: ['providers', 'longcat'],
+      value: profileValue({ models: [{ id: 'LongCat-2.5', reasoningEfforts: { off: null, low: 'low', high: 'ultra' } }] }),
+    }], 0)
+    expect(result['ok']).toBe(true)
+    const saved = host.calls.find(call => call.command === 'save_providers')?.args as {
+      providers: { models: { reasoning_efforts?: Record<string, string> }[] }[]
+    }
+    // off 的 null → 空串（TOML 无 null）；wire 值是界面写的自定义拼写
+    expect(saved.providers[0]!.models[0]!.reasoning_efforts).toEqual({ off: '', low: 'low', high: 'ultra' })
+
+    // false（显式声明非推理模型）与缺席等价：不产出 reasoning_efforts。
+    // 修订号不传 = 用快照现值（上一笔写入已把 revision 推进一格）。
+    const disabled = await face.settings.mutate('llm-pi-ai', [{
+      op: 'set',
+      path: ['providers', 'longcat'],
+      value: profileValue({ models: [{ id: 'LongCat-2.5', reasoningEfforts: false }] }),
+    }])
+    expect(disabled['ok']).toBe(true)
+    const saved2 = host.calls.filter(call => call.command === 'save_providers').at(-1)?.args as {
+      providers: { models: { reasoning_efforts?: Record<string, string> }[] }[]
+    }
+    expect(saved2.providers[0]!.models[0]!.reasoning_efforts).toBeUndefined()
+  })
+
+  it('视图把落盘空串翻回 null（off 档），键按档位全集顺序排列', async () => {
+    const host = fakeHost([LONGCAT_WITH_EFFORTS])
+    host.active = 'longcat'
+    const view = (await faceOf(host).settings.describe())['value'] as {
+      namespaces: { ns: string; user: { providers: Record<string, { models: Record<string, unknown>[] }> } }[]
+    }
+    const model = view.namespaces.find(ns => ns['ns'] === 'llm-pi-ai')!.user.providers['longcat']!.models[0]!
+    expect(model['reasoningEfforts']).toEqual({ off: null, low: 'low', high: 'ultra' })
+  })
+
+  it('席位档位（SH-096）：catalog 挂 reasoning，selectModel 持久化档位并校验声明', async () => {
+    const host = fakeHost([LONGCAT_WITH_EFFORTS])
+    host.active = 'longcat'
+    const face = faceOf(host)
+    // 可路由（有密钥）才进目录 groups——与既有判据同源
+    await face.credentials.set('LONGCAT_API_KEY', 'k')
+    // catalog：声明了档位的模型带 reasoning.efforts + defaultEffort；未声明的模型不带
+    const catalog = (await face.session.modelCatalog())['value'] as {
+      groups: { models: { id: string; reasoning?: { efforts: { id: string }[]; defaultEffort?: string } }[] }[]
+    }
+    const model = catalog.groups[0]!.models[0]!
+    expect(model.reasoning?.efforts.map(effort => effort.id)).toEqual(['off', 'low', 'high'])
+    expect(model.reasoning?.defaultEffort).toBe('high')
+    expect(face.activeSelection()).toMatchObject({ provider: 'longcat', model: 'LongCat-2.5', reasoningEffort: 'high' })
+
+    // 换档：写入服务商文档的 reasoning_effort（档位名）
+    const picked = await face.session.selectModel({ provider: 'longcat', model: 'LongCat-2.5', reasoningEffort: 'low' })
+    expect(picked['ok']).toBe(true)
+    expect((picked['value'] as { selected: { reasoningEffort?: string } }).selected.reasoningEffort).toBe('low')
+    const saved = host.calls.find(call => call.command === 'save_providers')?.args as { providers: { reasoning_effort: string }[] }
+    expect(saved.providers[0]!.reasoning_effort).toBe('low')
+
+    // 未声明的档位拒绝：静默收下会让运行时查不到 wire 值、跑的还是默认档
+    const bogus = await face.session.selectModel({ provider: 'longcat', model: 'LongCat-2.5', reasoningEffort: 'xhigh' })
+    expect(bogus['ok']).toBe(false)
+    expect((bogus['error'] as Error).message).toContain('未声明推理档位')
+    // 空档位 = 回到服务商默认，放行
+    const clear = await face.session.selectModel({ provider: 'longcat', model: 'LongCat-2.5' })
+    expect(clear['ok']).toBe(true)
   })
 
   it('未接线的配置域直接拒绝，不返回一个能写但没人读的空文档', async () => {

@@ -163,7 +163,7 @@ pub fn build_responses_request(
     tools: &[ToolDeclaration],
     instructions: &str,
 ) -> serde_json::Value {
-    serde_json::json!({
+    let mut body = serde_json::json!({
         "model": provider.model,
         "instructions": instructions,
         "input": history,
@@ -174,7 +174,13 @@ pub fn build_responses_request(
             "description": t.description,
             "parameters": t.parameters,
         })).collect::<Vec<_>>(),
-    })
+    });
+    // 推理档（SH-096）：Responses 协议的推理参数是结构化的 `reasoning.effort`。
+    // 缺省不产生该键——给不认它的端点塞陌生字段等于赌端点的宽容度。
+    if let Some(effort) = provider.reasoning_effort.as_deref().filter(|e| !e.is_empty()) {
+        body["reasoning"] = serde_json::json!({ "effort": effort });
+    }
+    body
 }
 
 /// 构造 ChatCompletions API 请求体（stream:true；工具为 function 包装）。
@@ -185,7 +191,7 @@ pub fn build_chat_request(
     tools: &[ToolDeclaration],
     instructions: &str,
 ) -> serde_json::Value {
-    serde_json::json!({
+    let mut body = serde_json::json!({
         "model": provider.model,
         "messages": chat_messages(instructions, history),
         "stream": true,
@@ -197,7 +203,13 @@ pub fn build_chat_request(
                 "parameters": t.parameters,
             },
         })).collect::<Vec<_>>(),
-    })
+    });
+    // 推理档（SH-096）：ChatCompletions 的顶层 `reasoning_effort`，wire 值来自
+    // 模型行的档位声明表（off/未声明在配置层已经解析成 None，不会到这里）。
+    if let Some(effort) = provider.reasoning_effort.as_deref().filter(|e| !e.is_empty()) {
+        body["reasoning_effort"] = serde_json::Value::String(effort.into());
+    }
+    body
 }
 
 /// 扁平 history → ChatCompletions messages（协议硬约束的唯一落点）。
@@ -616,6 +628,7 @@ mod tests {
             provider: "openai-responses".into(),
             base_url: "https://x/v1".into(),
             model: "m1".into(),
+            reasoning_effort: None,
         };
         let history = vec![
             HistoryItem::Message { role: Role::User, text: "任务".into(), reasoning: None },
@@ -644,11 +657,43 @@ mod chat_tests {
     use super::*;
 
     #[test]
+    fn chat_request_carries_reasoning_effort_only_when_set() {
+        let base = ProviderConfig {
+            provider: "openai-chat".into(),
+            base_url: "https://x/v1".into(),
+            model: "m1".into(),
+            reasoning_effort: None,
+        };
+        let body = build_chat_request(&base, &[], &[], "SYS");
+        assert!(body.get("reasoning_effort").is_none(), "未配置档位不得产生该键：陌生字段等于赌端点宽容");
+
+        let mut p = base.clone();
+        p.reasoning_effort = Some("high".into());
+        let body = build_chat_request(&p, &[], &[], "SYS");
+        assert_eq!(body["reasoning_effort"], "high");
+    }
+
+    #[test]
+    fn responses_request_carries_structured_reasoning_effort() {
+        let mut p = ProviderConfig {
+            provider: "openai-responses".into(),
+            base_url: "https://x/v1".into(),
+            model: "m1".into(),
+            reasoning_effort: None,
+        };
+        assert!(build_responses_request(&p, &[], &[], "SYS").get("reasoning").is_none());
+        p.reasoning_effort = Some("low".into());
+        let body = build_responses_request(&p, &[], &[], "SYS");
+        assert_eq!(body["reasoning"]["effort"], "low");
+    }
+
+    #[test]
     fn chat_request_maps_history_and_function_tools() {
         let p = ProviderConfig {
             provider: "openai-chat".into(),
             base_url: "https://api.longcat.chat/openai/v1".into(),
             model: "LongCat-2.5".into(),
+            reasoning_effort: None,
         };
         let history = vec![
             HistoryItem::Message { role: Role::User, text: "任务".into(), reasoning: None },
@@ -709,6 +754,7 @@ mod chat_tests {
             provider: "openai-chat".into(),
             base_url: "https://x/v1".into(),
             model: "m".into(),
+            reasoning_effort: None,
         };
         // agent_loop 的真实产出形态：一轮里先连续 push 所有 FunctionCall，再连续 push 输出
         let history = vec![
@@ -738,6 +784,7 @@ mod chat_tests {
             provider: "openai-chat".into(),
             base_url: "https://x/v1".into(),
             model: "m".into(),
+            reasoning_effort: None,
         };
         let history = vec![
             HistoryItem::Message { role: Role::User, text: "任务".into(), reasoning: None },
@@ -760,6 +807,7 @@ mod chat_tests {
             provider: "openai-chat".into(),
             base_url: "https://x/v1".into(),
             model: "m".into(),
+            reasoning_effort: None,
         };
         // 取消打断工具循环：c2 已声明但从未执行，历史里没有它的输出项
         let history = vec![
@@ -782,12 +830,14 @@ mod chat_tests {
             provider: "openai-chat".into(),
             base_url: "https://api.longcat.chat/openai/v1".into(),
             model: "m".into(),
+            reasoning_effort: None,
         };
         assert_eq!(chat_url(&p1), "https://api.longcat.chat/openai/v1/chat/completions");
         let p2 = ProviderConfig {
             provider: "openai-chat".into(),
             base_url: "https://api.longcat.chat/openai/v1/chat/completions".into(),
             model: "m".into(),
+            reasoning_effort: None,
         };
         assert_eq!(chat_url(&p2), "https://api.longcat.chat/openai/v1/chat/completions");
     }

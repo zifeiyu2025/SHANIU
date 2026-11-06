@@ -54,11 +54,16 @@ pub struct AppConfig {
     pub provider_revision: u64,
 }
 
+/// 推理档位全集（SH-096，上游 llm-pi-ai `THINKING_LEVELS`）。设置页的档位编辑器
+/// 与后端校验共用这一份清单——两处各写一份迟早漂移。
+pub const THINKING_LEVELS: [&str; 7] = ["off", "minimal", "low", "medium", "high", "xhigh", "max"];
+
 /// 设置页里一行模型档位（04 §4 `[[providers.models]]`）。
 ///
-/// 运行期只消费 `id`（`ProviderProfile::model` 就是它当前选中的那一行）；其余四个
-/// 字段是设置页写面的原样留存。存下来但不生效，比"用户加了四行、重载只剩一行"
-/// 更接近事实——后者的代价是用户以为自己配好了。
+/// 运行期消费 `id`（`ProviderProfile::model` 就是它当前选中的那一行）与
+/// `reasoning_efforts`（SH-096：推理档位声明）；其余字段是设置页写面的原样留存。
+/// 存下来但不生效，比"用户加了四行、重载只剩一行"更接近事实——后者的代价是
+/// 用户以为自己配好了。
 #[derive(Debug, Clone, PartialEq, Eq, Default, Serialize, Deserialize)]
 #[serde(default)]
 pub struct ModelProfile {
@@ -77,6 +82,12 @@ pub struct ModelProfile {
     pub max_tokens: u32,
     /// 该模型接受的输入模态（`text` / `image`）。
     pub input: Vec<String>,
+    /// 推理档位声明（SH-096）：档位名 → 发往 `reasoning_effort` 的 wire 值。
+    /// 空串值 = 该档不发任何字段（off 档的语义）。空 map = 未声明推理能力，
+    /// 席位不出档位选择。上游还有 `false`（显式声明非推理模型）——SHANIU 没有
+    /// 可继承的目录，false 与缺席等价，前端写面把 false 归一成空 map。
+    #[serde(alias = "reasoningEfforts")]
+    pub reasoning_efforts: std::collections::BTreeMap<String, String>,
 }
 
 /// 一家可切换的服务商（04 §4 `[[providers]]` 的一行）。
@@ -95,6 +106,12 @@ pub struct ProviderProfile {
     #[serde(alias = "baseUrl")]
     pub base_url: String,
     pub model: String,
+    /// 席位选中的推理档位（SH-096，存**档位名**而非 wire 值——wire 拼写以模型行的
+    /// `reasoning_efforts` 为准）。空 = 服务商默认（不发字段）。设置页不编辑它：
+    /// 上游的选中档属于席位状态，这里按"选中档随配置持久化"的既有先例（`model`
+    /// 字段同此）落进服务商文档，由席位 selectModel 写入。
+    #[serde(alias = "reasoningEffort")]
+    pub reasoning_effort: String,
     /// 密钥存放名（DPAPI 文件名 / 设置页 ref）。空 = 按 id 派生。
     #[serde(alias = "secretRef")]
     pub secret_ref: String,
@@ -112,6 +129,7 @@ impl Default for ProviderProfile {
             provider: "openai-chat".into(),
             base_url: String::new(),
             model: String::new(),
+            reasoning_effort: String::new(),
             secret_ref: String::new(),
             models: Vec::new(),
         }
@@ -147,6 +165,9 @@ pub struct ResolvedModel {
     /// 密钥文件名。回落路径上等于 `[model].provider`，
     /// 这样升级前存的那份 DPAPI 密钥仍然读得回来。
     pub secret_name: String,
+    /// 生效的推理档 wire 值（SH-096）：选中档位在该模型 `reasoning_efforts` 里
+    /// 查到的字符串，None = 不发字段（未声明 / 选了 off / 档位未命中）。
+    pub reasoning_effort: Option<String>,
 }
 
 impl AppConfig {
@@ -156,14 +177,30 @@ impl AppConfig {
     /// 必须和不配列表时行为逐字一致。
     pub fn effective_model(&self) -> ResolvedModel {
         match self.providers.iter().find(|p| p.id == self.active_provider) {
-            Some(p) => ResolvedModel {
-                id: p.id.clone(),
-                provider: p.provider.clone(),
-                base_url: p.base_url.clone(),
-                model: p.model.clone(),
-                max_turns: self.model.max_turns,
-                secret_name: p.secret_name(),
-            },
+            Some(p) => {
+                // 档位 → wire 值在这里一次解析完，model_client 只看最终字符串：
+                // 查表规则（off 空值不发、未声明不发）不该散进每个请求构造点。
+                let level = p.reasoning_effort.trim();
+                let reasoning_effort = if level.is_empty() {
+                    None
+                } else {
+                    p.models
+                        .iter()
+                        .find(|m| m.id == p.model)
+                        .and_then(|m| m.reasoning_efforts.get(level))
+                        .filter(|wire| !wire.is_empty())
+                        .cloned()
+                };
+                ResolvedModel {
+                    id: p.id.clone(),
+                    provider: p.provider.clone(),
+                    base_url: p.base_url.clone(),
+                    model: p.model.clone(),
+                    max_turns: self.model.max_turns,
+                    secret_name: p.secret_name(),
+                    reasoning_effort,
+                }
+            }
             None => ResolvedModel {
                 id: self.model.provider.clone(),
                 provider: self.model.provider.clone(),
@@ -171,6 +208,8 @@ impl AppConfig {
                 model: self.model.model.clone(),
                 max_turns: self.model.max_turns,
                 secret_name: self.model.provider.clone(),
+                // 回落段没有档位清单，推理档无从谈起（04 §4 兼容姿态的一部分）
+                reasoning_effort: None,
             },
         }
     }
@@ -207,6 +246,32 @@ impl AppConfig {
                     return Err(format!("服务商 {} 的模型 id 重复：{}", p.id, row.id));
                 }
                 rows.push(row.id.as_str());
+                // 推理档声明（SH-096）：档位名必须来自全集；只有 off 允许空 wire 值；
+                // 全表只声明 off 没有意义（席位会列出一个"永远不发字段"的档位）。
+                for (level, wire) in &row.reasoning_efforts {
+                    if !THINKING_LEVELS.contains(&level.as_str()) {
+                        return Err(format!(
+                            "服务商 {} 的模型 {} 有未知推理档位 {level}（可用：{}）",
+                            p.id,
+                            row.id,
+                            THINKING_LEVELS.join("/")
+                        ));
+                    }
+                    if level != "off" && wire.trim().is_empty() {
+                        return Err(format!(
+                            "服务商 {} 的模型 {} 的推理档位 {level} 缺 wire 值（只有 off 允许为空）",
+                            p.id, row.id
+                        ));
+                    }
+                }
+                if !row.reasoning_efforts.is_empty()
+                    && row.reasoning_efforts.values().all(|wire| wire.trim().is_empty())
+                {
+                    return Err(format!(
+                        "服务商 {} 的模型 {} 的推理档位只声明了 off：至少给一个非 off 档 wire 值",
+                        p.id, row.id
+                    ));
+                }
             }
             // 清单非空时当前生效行必须在里面：不在的话席位下拉里没有它，用户看不到
             // 自己正在跑的模型，随手点一下别的行就把运行档换掉了。
@@ -215,6 +280,22 @@ impl AppConfig {
                     "服务商 {} 的当前模型 {} 不在模型清单里，请先把它加进清单",
                     p.id, p.model
                 ));
+            }
+            // 选中档位必须命中生效模型声明的档位：不在清单里的档位查不到 wire 值，
+            // 静默不发字段的话，用户选了 high 实际跑的还是默认档——比报错难发现得多。
+            let level = p.reasoning_effort.trim();
+            if !level.is_empty() {
+                let declared = p
+                    .models
+                    .iter()
+                    .find(|m| m.id == p.model)
+                    .is_some_and(|m| m.reasoning_efforts.contains_key(level));
+                if !declared {
+                    return Err(format!(
+                        "服务商 {} 的选中推理档位 {level} 不在生效模型 {} 的档位声明里",
+                        p.id, p.model
+                    ));
+                }
             }
         }
         if !active.is_empty() && !providers.iter().any(|p| p.id == active) {
@@ -1013,6 +1094,7 @@ mod provider_tests {
             provider: "openai-chat".into(),
             base_url: base.into(),
             model: model.into(),
+            reasoning_effort: String::new(),
             secret_ref: String::new(),
             models: Vec::new(),
         }
@@ -1025,6 +1107,7 @@ mod provider_tests {
             context_window: 128_000,
             max_tokens: 8_192,
             input: vec!["text".into()],
+            reasoning_efforts: std::collections::BTreeMap::new(),
         }
     }
 
@@ -1182,5 +1265,112 @@ mod provider_tests {
         let body = toml::to_string_pretty(&cfg).unwrap();
         assert!(!body.contains("providers.models"), "{body}");
         assert_eq!(toml::from_str::<AppConfig>(&body).unwrap(), cfg);
+    }
+
+    // ---- 推理档（SH-096）----
+
+    fn effort_row(id: &str) -> ModelProfile {
+        let mut r = row(id);
+        // off 的 wire 值是空串（不发字段）；其余档位给非空 wire 值
+        r.reasoning_efforts = [
+            ("off".to_string(), String::new()),
+            ("low".to_string(), "low".to_string()),
+            ("high".to_string(), "high".to_string()),
+        ]
+        .into_iter()
+        .collect();
+        r
+    }
+
+    #[test]
+    fn reasoning_efforts_round_trip_through_toml_and_json() {
+        let mut listed = profile("longcat", "https://lc/v1", "LongCat-2.5");
+        listed.reasoning_effort = "high".into();
+        listed.models = vec![effort_row("LongCat-2.5")];
+        let cfg = AppConfig {
+            providers: vec![listed.clone()],
+            active_provider: "longcat".into(),
+            ..Default::default()
+        };
+        // TOML 往返：档位表住在 [[providers.models]] 元素里，写出/读回必须无损
+        let body = toml::to_string_pretty(&cfg).unwrap();
+        assert_eq!(toml::from_str::<AppConfig>(&body).unwrap(), cfg, "TOML 往返丢档位表 = 用户配的推理档重载即失");
+        // JSON 往返：serde 序列化用落盘名（snake_case）；camelCase 只在
+        // get_settings 的手工拼装里出现，由 alias 保证反序列化两侧都认
+        let json = serde_json::to_value(&cfg.providers).unwrap();
+        assert_eq!(json[0]["reasoning_effort"], "high");
+        assert_eq!(json[0]["models"][0]["reasoning_efforts"]["off"], "");
+        let back: Vec<ProviderProfile> = serde_json::from_value(json).unwrap();
+        assert_eq!(back, cfg.providers);
+    }
+
+    #[test]
+    fn effective_model_resolves_effort_to_wire_value() {
+        let mut listed = profile("longcat", "https://lc/v1", "LongCat-2.5");
+        listed.models = vec![effort_row("LongCat-2.5")];
+        let mut cfg = AppConfig {
+            providers: vec![listed.clone()],
+            active_provider: "longcat".into(),
+            ..Default::default()
+        };
+        // 选中 high → wire 值原样下发
+        listed.reasoning_effort = "high".into();
+        cfg.providers = vec![listed.clone()];
+        assert_eq!(cfg.effective_model().reasoning_effort.as_deref(), Some("high"));
+
+        // 选中 off → 不发字段
+        listed.reasoning_effort = "off".into();
+        cfg.providers = vec![listed.clone()];
+        assert_eq!(cfg.effective_model().reasoning_effort, None);
+
+        // 选中档位不在模型声明里（防御；validate 会拦）→ 不发而不是猜
+        listed.reasoning_effort = "xhigh".into();
+        cfg.providers = vec![listed.clone()];
+        assert_eq!(cfg.effective_model().reasoning_effort, None);
+
+        // 未选（空）→ 不发
+        listed.reasoning_effort = String::new();
+        cfg.providers = vec![listed];
+        assert_eq!(cfg.effective_model().reasoning_effort, None);
+    }
+
+    #[test]
+    fn validate_providers_rejects_bad_reasoning_declarations() {
+        // 未知档位名：席位会列出后端查不到 wire 值的档
+        let mut unknown = profile("longcat", "b", "m1");
+        let mut r = row("m1");
+        r.reasoning_efforts = [("ultra".to_string(), "ultra".to_string())].into_iter().collect();
+        unknown.models = vec![r];
+        let err = AppConfig::validate_providers(&[unknown], "").unwrap_err();
+        assert!(err.contains("未知推理档位"), "{err}");
+
+        // 非 off 档缺 wire 值：等于让模型"选了 low 却什么都不发"
+        let mut blank = profile("longcat", "b", "m1");
+        let mut r = row("m1");
+        r.reasoning_efforts = [("low".to_string(), String::new())].into_iter().collect();
+        blank.models = vec![r];
+        let err = AppConfig::validate_providers(&[blank], "").unwrap_err();
+        assert!(err.contains("缺 wire 值"), "{err}");
+
+        // 只声明 off：席位列出一个"永远不发字段"的档位，没有意义
+        let mut all_off = profile("longcat", "b", "m1");
+        let mut r = row("m1");
+        r.reasoning_efforts = [("off".to_string(), String::new())].into_iter().collect();
+        all_off.models = vec![r];
+        let err = AppConfig::validate_providers(&[all_off], "").unwrap_err();
+        assert!(err.contains("只声明了 off"), "{err}");
+
+        // 选中档位不在生效模型的声明里
+        let mut undeclared = profile("longcat", "b", "m1");
+        undeclared.reasoning_effort = "high".into();
+        undeclared.models = vec![row("m1")];
+        let err = AppConfig::validate_providers(&[undeclared], "").unwrap_err();
+        assert!(err.contains("不在生效模型"), "{err}");
+
+        // 合法声明 + 命中的选中档位放行
+        let mut ok = profile("longcat", "b", "m1");
+        ok.reasoning_effort = "low".into();
+        ok.models = vec![effort_row("m1")];
+        assert!(AppConfig::validate_providers(&[ok], "").is_ok());
     }
 }
