@@ -112,6 +112,12 @@ pub struct ProviderProfile {
     /// 字段同此）落进服务商文档，由席位 selectModel 写入。
     #[serde(alias = "reasoningEffort")]
     pub reasoning_effort: String,
+    /// 自定义请求头（SH-097，additive）：发往该服务商端点的附加头。上游同字段
+    /// 位于服务商 profile（llm-pi-ai config.ts），语义一致：部署头先放，认证头
+    /// 与保留名后到者胜。不标 secret——代理网关签名这类值本来就要在设置页明文
+    /// 可见，与上游的"headers 非 credential 角色"同口径。
+    #[serde(alias = "headers")]
+    pub headers: std::collections::BTreeMap<String, String>,
     /// 密钥存放名（DPAPI 文件名 / 设置页 ref）。空 = 按 id 派生。
     #[serde(alias = "secretRef")]
     pub secret_ref: String,
@@ -119,6 +125,24 @@ pub struct ProviderProfile {
     /// 必须排在最后：TOML 要求标量先于子表，把 `[[providers.models]]` 放前面会让整个
     /// `[[providers]]` 的缩进归属变成 models，写出去的配置直接解析不回来。
     pub models: Vec<ModelProfile>,
+}
+
+/// 自定义请求头校验（SH-097）：名字必须是 RFC 7230 token（分隔符与空格都不行），
+/// 值不得含 CR/LF/NUL（头注入）。空值放行——空值是合法 HTTP。
+/// 上游用 `new Headers(...)` 做同一件事（llm-pi-ai config.ts 的 assertValidHeaders），
+/// 这里按同一语义手写，不给 config 层引入 reqwest 类型依赖。
+pub fn validate_header_pair(name: &str, value: &str) -> Result<(), String> {
+    let is_tchar = |b: u8| matches!(b,
+        b'!' | b'#' | b'$' | b'%' | b'&' | b'\'' | b'*' | b'+' | b'-' | b'.'
+        | b'^' | b'_' | b'`' | b'|' | b'~'
+        | b'0'..=b'9' | b'a'..=b'z' | b'A'..=b'Z');
+    if name.is_empty() || !name.bytes().all(is_tchar) {
+        return Err(format!("请求头名 {name:?} 不合法：必须是不含空格与冒号的 HTTP 头名"));
+    }
+    if value.bytes().any(|b| matches!(b, b'\r' | b'\n' | 0)) {
+        return Err(format!("请求头 {name} 的值含换行或控制字符：头注入防线不允许"));
+    }
+    Ok(())
 }
 
 impl Default for ProviderProfile {
@@ -130,6 +154,7 @@ impl Default for ProviderProfile {
             base_url: String::new(),
             model: String::new(),
             reasoning_effort: String::new(),
+            headers: std::collections::BTreeMap::new(),
             secret_ref: String::new(),
             models: Vec::new(),
         }
@@ -168,6 +193,8 @@ pub struct ResolvedModel {
     /// 生效的推理档 wire 值（SH-096）：选中档位在该模型 `reasoning_efforts` 里
     /// 查到的字符串，None = 不发字段（未声明 / 选了 off / 档位未命中）。
     pub reasoning_effort: Option<String>,
+    /// 该服务商的自定义请求头（SH-097），原样带到模型请求。
+    pub headers: std::collections::BTreeMap<String, String>,
 }
 
 impl AppConfig {
@@ -199,6 +226,7 @@ impl AppConfig {
                     max_turns: self.model.max_turns,
                     secret_name: p.secret_name(),
                     reasoning_effort,
+                    headers: p.headers.clone(),
                 }
             }
             None => ResolvedModel {
@@ -210,6 +238,7 @@ impl AppConfig {
                 secret_name: self.model.provider.clone(),
                 // 回落段没有档位清单，推理档无从谈起（04 §4 兼容姿态的一部分）
                 reasoning_effort: None,
+                headers: Default::default(),
             },
         }
     }
@@ -296,6 +325,11 @@ impl AppConfig {
                         p.id, p.model
                     ));
                 }
+            }
+            // 自定义请求头（SH-097）：坏名字/头注入必须在写入时拦下，运行期只管发
+            for (name, value) in &p.headers {
+                validate_header_pair(name, value)
+                    .map_err(|e| format!("服务商 {} 的自定义请求头：{e}", p.id))?;
             }
         }
         if !active.is_empty() && !providers.iter().any(|p| p.id == active) {
@@ -1095,6 +1129,7 @@ mod provider_tests {
             base_url: base.into(),
             model: model.into(),
             reasoning_effort: String::new(),
+            headers: std::collections::BTreeMap::new(),
             secret_ref: String::new(),
             models: Vec::new(),
         }
@@ -1371,6 +1406,43 @@ mod provider_tests {
         let mut ok = profile("longcat", "b", "m1");
         ok.reasoning_effort = "low".into();
         ok.models = vec![effort_row("m1")];
+        assert!(AppConfig::validate_providers(&[ok], "").is_ok());
+    }
+
+    // ---- 自定义请求头（SH-097）----
+
+    #[test]
+    fn headers_round_trip_through_toml_and_reach_resolved_model() {
+        let mut listed = profile("longcat", "https://lc/v1", "m1");
+        listed.headers = [("X-Gateway-Sign".to_string(), "abc".to_string())].into_iter().collect();
+        let cfg = AppConfig {
+            providers: vec![listed.clone()],
+            active_provider: "longcat".into(),
+            ..Default::default()
+        };
+        let body = toml::to_string_pretty(&cfg).unwrap();
+        assert_eq!(toml::from_str::<AppConfig>(&body).unwrap(), cfg, "头表往返无损");
+        let resolved = cfg.effective_model();
+        assert_eq!(resolved.headers.get("X-Gateway-Sign").map(String::as_str), Some("abc"));
+    }
+
+    #[test]
+    fn validate_providers_rejects_bad_header_names_and_injection() {
+        // 名字带空格：不是合法 HTTP 头名，reqwest 在发送期才会炸，写入期就该拦
+        let mut space = profile("longcat", "b", "m1");
+        space.headers = [("bad name".to_string(), "v".to_string())].into_iter().collect();
+        let err = AppConfig::validate_providers(&[space], "").unwrap_err();
+        assert!(err.contains("不合法"), "{err}");
+
+        // 值带换行 = 头注入防线，绝对不允许
+        let mut injection = profile("longcat", "b", "m1");
+        injection.headers = [("X-A".to_string(), "v\r\nX-Evil: 1".to_string())].into_iter().collect();
+        let err = AppConfig::validate_providers(&[injection], "").unwrap_err();
+        assert!(err.contains("头注入"), "{err}");
+
+        // 合法头放行（空值也合法）
+        let mut ok = profile("longcat", "b", "m1");
+        ok.headers = [("X-Gateway-Sign".to_string(), String::new())].into_iter().collect();
         assert!(AppConfig::validate_providers(&[ok], "").is_ok());
     }
 }

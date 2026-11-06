@@ -45,6 +45,8 @@ interface HostProviderRow {
   readonly model: string
   /** 席位选中的推理档位（档位名）；空 = 服务商默认（不发字段）。 */
   readonly reasoningEffort?: string
+  /** 自定义请求头（SH-097）：发往该端点的附加头，设置页可编辑。 */
+  readonly headers?: Readonly<Record<string, string>>
   /** 生效的密钥文件名：显式名或按 id 派生名，由宿主算好。 */
   readonly secretRef: string
   readonly hasApiKey: boolean
@@ -74,6 +76,8 @@ interface ProviderPayload {
   readonly model: string
   /** 席位选中的推理档位（档位名）。设置页不编辑，从快照透传防丢失。 */
   readonly reasoning_effort: string
+  /** 自定义请求头（SH-097）：设置页可编辑，整份替换写面原样承载。 */
+  readonly headers?: Record<string, string>
   readonly secret_ref: string
   readonly models: readonly {
     id: string
@@ -138,7 +142,7 @@ const ok = <T>(value: T): FaceResult<T> => ({ ok: true, value })
 const refused = <T>(error: RemoteError): FaceResult<T> => ({ ok: false, error })
 
 /** 设置页写面里一个服务商 profile 允许的键；其余一律拒绝（见 PROFILE_KEYS 的注释）。 */
-const PROFILE_KEYS = new Set(['displayName', 'apiKeyEnv', 'api', 'baseURL', 'models'])
+const PROFILE_KEYS = new Set(['displayName', 'apiKeyEnv', 'api', 'baseURL', 'models', 'headers'])
 /**
  * 一行模型允许的键（SH-096 起 `reasoningEfforts` 接线）。不含 `description`：
  * schema 里没声明的字段界面不会给，真给了就报错而不是收下再丢。
@@ -179,6 +183,8 @@ const piAiSchema = z.object({
     apiKeyEnv: z.string().role('credential-ref'),
     api: z.union(['openai-completions', 'openai-responses']),
     baseURL: z.string(),
+    // 自定义请求头（SH-097）：schemastery 按这个 dict 渲染编辑器
+    headers: z.dict(z.string()),
     models: z.array(modelRowSchema),
   })),
 })
@@ -251,6 +257,11 @@ export function createSettingsFace(bridge: HostBridge, options: SettingsFaceOpti
       apiKeyEnv: row.secretRef,
     }
     if (row.label !== '') profile.displayName = row.label
+    // 自定义请求头（SH-097）随视图透传：设置页整份替换写，视图不带这份就会被
+    // 一次提交静默抹掉
+    if (row.headers !== undefined && Object.keys(row.headers).length > 0) {
+      profile.headers = { ...row.headers }
+    }
     return profile
   }
 
@@ -338,9 +349,19 @@ export function createSettingsFace(bridge: HostBridge, options: SettingsFaceOpti
     if (!isRecord(profile)) throw new Refusal(`服务商 ${route} 的配置必须是对象`)
     for (const key of Object.keys(profile)) {
       if (PROFILE_KEYS.has(key)) continue
-      throw new Refusal(key === 'headers'
-        ? `服务商 ${route} 的自定义请求头未接线：SHANIU 后端不发送额外请求头（见 docs/05 SH-097）`
-        : `服务商 ${route} 含 SHANIU 不认识的配置项 ${key}`)
+      throw new Refusal(`服务商 ${route} 含 SHANIU 不认识的配置项 ${key}`)
+    }
+    // 自定义请求头（SH-097）：结构由 schema 保证（dict<string>），名字与值的
+    // 合法性（头名 token、头注入）交给宿主 validate_providers 统一拦
+    const rawHeaders = profile.headers
+    let headers: Record<string, string> | undefined
+    if (rawHeaders !== undefined) {
+      if (!isRecord(rawHeaders)) throw new Refusal(`服务商 ${route} 的 headers 必须是字符串到字符串的映射`)
+      headers = {}
+      for (const [name, value] of Object.entries(rawHeaders)) headers[name] = String(value)
+    } else if (previous?.headers !== undefined && Object.keys(previous.headers).length > 0) {
+      // 视图没带（老视图缓存）也保住既有头，等价"没改"
+      headers = { ...previous.headers }
     }
     const api = profile.api
     let provider = 'openai-chat'
@@ -378,6 +399,7 @@ export function createSettingsFace(bridge: HostBridge, options: SettingsFaceOpti
       // 选中档位不在设置页文档里（上游同口径：选中档属于席位状态）——从快照
       // 透传防丢失，只有席位的 selectModel 会写它
       reasoning_effort: previous?.reasoningEffort ?? '',
+      ...(headers === undefined ? {} : { headers }),
       secret_ref: secretRef,
       models,
     }
@@ -660,9 +682,29 @@ export function createSettingsFace(bridge: HostBridge, options: SettingsFaceOpti
             inputModalities: ['text'],
           })))
         }
-        return refused(new RemoteError('llm/model-discovery-rejected',
-          'SHANIU 后端未开放"从端点拉取模型列表"：需要宿主带密钥访问任意端点，属新增网络面（见 docs/05 SH-098）。模型行仍可手工填写。',
-          { settingsNs, ...(request.baseURL === undefined ? {} : { baseURL: request.baseURL }) }))
+        // 自建端点（SH-098）：宿主带密钥访问 GET {baseURL}/models。探针密钥
+        // （表单里刚输入未存的）由宿主优先使用、用完即弃。
+        const baseURL = (request.baseURL ?? '').trim()
+        if (baseURL === '') {
+          return refused(new RemoteError('llm/model-discovery-rejected', '端点地址为空：拉取模型需要 baseURL，或手工填写模型行', { settingsNs }))
+        }
+        const api = request.api
+        if (api !== undefined && api !== 'openai-completions' && api !== 'openai-responses') {
+          return refused(new RemoteError('llm/model-discovery-rejected',
+            `SHANIU 只支持 OpenAI 兼容端点的模型发现（openai-completions / openai-responses），收到 ${api}`,
+            { settingsNs, baseURL }))
+        }
+        try {
+          const models = await bridge.invoke<LlmDiscoveredModel[]>('discover_models', {
+            provider: request.provider ?? '',
+            baseUrl: baseURL,
+            apiKey: request.apiKey,
+          })
+          return ok(models)
+        } catch (reason) {
+          const message = reason instanceof Error ? reason.message : String(reason)
+          return refused(new RemoteError('llm/model-discovery-rejected', message, { settingsNs, baseURL }))
+        }
       },
     },
     credentials: {
@@ -759,6 +801,10 @@ export function createSettingsFace(bridge: HostBridge, options: SettingsFaceOpti
           // 每行的选中档位原样透传；被选中的那家写新值。模型行的档位声明同理，
           // 整份替换的写面上丢一个字段 = 用户配置凭空消失。
           reasoning_effort: candidate.id === row.id ? effort : candidate.reasoningEffort ?? '',
+          // 自定义头（SH-097）整表透传
+          ...(candidate.headers === undefined || Object.keys(candidate.headers).length === 0
+            ? {}
+            : { headers: { ...candidate.headers } }),
           models: candidate.models.map(model => ({
             id: model.id,
             name: model.name,

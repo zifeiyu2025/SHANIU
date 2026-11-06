@@ -14,6 +14,9 @@ pub struct ProviderConfig {
     /// 生效的推理档 wire 值（SH-096）。`effective_model()` 已完成"档位名 → wire 值"
     /// 的查表（off/未声明都是 None），这里只看最终字符串：Some 且非空才进请求体。
     pub reasoning_effort: Option<String>,
+    /// 服务商自定义请求头（SH-097）。部署头先放，`bearer_auth` 后到——authorization
+    /// 冲突时认证头获胜（上游同口径）。
+    pub headers: std::collections::BTreeMap<String, String>,
 }
 
 impl ProviderConfig {
@@ -23,6 +26,7 @@ impl ProviderConfig {
             base_url: cfg.base_url.trim_end_matches('/').to_string(),
             model: cfg.model.clone(),
             reasoning_effort: None,
+            headers: Default::default(),
         }
     }
 
@@ -33,6 +37,7 @@ impl ProviderConfig {
             base_url: cfg.base_url.trim_end_matches('/').to_string(),
             model: cfg.model.clone(),
             reasoning_effort: cfg.reasoning_effort.clone().filter(|e| !e.is_empty()),
+            headers: cfg.headers.clone(),
         }
     }
 
@@ -70,6 +75,7 @@ mod tests {
             max_turns: 8,
             secret_name: "K".into(),
             reasoning_effort: Some("high".into()),
+            headers: Default::default(),
         };
         let p = ProviderConfig::from_resolved(&resolved);
         assert_eq!(p.reasoning_effort.as_deref(), Some("high"));

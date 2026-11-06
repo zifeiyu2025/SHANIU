@@ -507,8 +507,12 @@ pub async fn stream_body(
 ) -> Result<ModelStream, String> {
     let client = reqwest::Client::new();
     let url = if provider.is_responses() { provider.responses_url() } else { chat_url(provider) };
-    let response = client
-        .post(url)
+    // 自定义请求头（SH-097）先放：bearer_auth 后到，authorization 冲突时认证头获胜
+    let mut request = client.post(url);
+    for (name, value) in &provider.headers {
+        request = request.header(name.as_str(), value.as_str());
+    }
+    let response = request
         .bearer_auth(api_key)
         .json(&body)
         .send()
@@ -629,6 +633,7 @@ mod tests {
             base_url: "https://x/v1".into(),
             model: "m1".into(),
             reasoning_effort: None,
+            headers: Default::default(),
         };
         let history = vec![
             HistoryItem::Message { role: Role::User, text: "任务".into(), reasoning: None },
@@ -663,6 +668,7 @@ mod chat_tests {
             base_url: "https://x/v1".into(),
             model: "m1".into(),
             reasoning_effort: None,
+            headers: Default::default(),
         };
         let body = build_chat_request(&base, &[], &[], "SYS");
         assert!(body.get("reasoning_effort").is_none(), "未配置档位不得产生该键：陌生字段等于赌端点宽容");
@@ -680,6 +686,7 @@ mod chat_tests {
             base_url: "https://x/v1".into(),
             model: "m1".into(),
             reasoning_effort: None,
+            headers: Default::default(),
         };
         assert!(build_responses_request(&p, &[], &[], "SYS").get("reasoning").is_none());
         p.reasoning_effort = Some("low".into());
@@ -694,6 +701,7 @@ mod chat_tests {
             base_url: "https://api.longcat.chat/openai/v1".into(),
             model: "LongCat-2.5".into(),
             reasoning_effort: None,
+            headers: Default::default(),
         };
         let history = vec![
             HistoryItem::Message { role: Role::User, text: "任务".into(), reasoning: None },
@@ -755,6 +763,7 @@ mod chat_tests {
             base_url: "https://x/v1".into(),
             model: "m".into(),
             reasoning_effort: None,
+            headers: Default::default(),
         };
         // agent_loop 的真实产出形态：一轮里先连续 push 所有 FunctionCall，再连续 push 输出
         let history = vec![
@@ -785,6 +794,7 @@ mod chat_tests {
             base_url: "https://x/v1".into(),
             model: "m".into(),
             reasoning_effort: None,
+            headers: Default::default(),
         };
         let history = vec![
             HistoryItem::Message { role: Role::User, text: "任务".into(), reasoning: None },
@@ -808,6 +818,7 @@ mod chat_tests {
             base_url: "https://x/v1".into(),
             model: "m".into(),
             reasoning_effort: None,
+            headers: Default::default(),
         };
         // 取消打断工具循环：c2 已声明但从未执行，历史里没有它的输出项
         let history = vec![
@@ -831,6 +842,7 @@ mod chat_tests {
             base_url: "https://api.longcat.chat/openai/v1".into(),
             model: "m".into(),
             reasoning_effort: None,
+            headers: Default::default(),
         };
         assert_eq!(chat_url(&p1), "https://api.longcat.chat/openai/v1/chat/completions");
         let p2 = ProviderConfig {
@@ -838,6 +850,7 @@ mod chat_tests {
             base_url: "https://api.longcat.chat/openai/v1/chat/completions".into(),
             model: "m".into(),
             reasoning_effort: None,
+            headers: Default::default(),
         };
         assert_eq!(chat_url(&p2), "https://api.longcat.chat/openai/v1/chat/completions");
     }

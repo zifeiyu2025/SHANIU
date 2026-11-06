@@ -19,6 +19,8 @@ interface FakeHost {
   revision: number
   active: string
   failRead: boolean
+  /** discover_models 桩：设了错误就抛，否则回固定清单。 */
+  discoverError: string | undefined
   rows(): Row[]
 }
 
@@ -30,6 +32,8 @@ interface Row {
   model: string
   /** 席位选中的推理档位（档位名）；空 = 服务商默认。 */
   reasoning_effort?: string
+  /** 自定义请求头（SH-097）。 */
+  headers?: Record<string, string>
   secret_ref: string
   models: { id: string; name: string; context_window: number; max_tokens: number; input: string[]; reasoning_efforts?: Record<string, string> }[]
 }
@@ -38,7 +42,7 @@ function fakeHost(rows: Row[] = []): FakeHost {
   const calls: FakeHost['calls'] = []
   const emitted: FakeHost['emitted'] = []
   const keys = new Set<string>()
-  const state = { revision: 0, active: '', failRead: false, rows }
+  const state = { revision: 0, active: '', failRead: false, rows, discoverError: undefined as string | undefined }
   const host: FakeHost = {
     calls,
     emitted,
@@ -48,6 +52,8 @@ function fakeHost(rows: Row[] = []): FakeHost {
     set active(value) { state.active = value },
     get failRead() { return state.failRead },
     set failRead(value) { state.failRead = value },
+    get discoverError() { return state.discoverError },
+    set discoverError(value) { state.discoverError = value },
     rows: () => state.rows,
     bridge: {
       async invoke<T>(command: string, args?: Record<string, unknown>): Promise<T> {
@@ -73,6 +79,10 @@ function fakeHost(rows: Row[] = []): FakeHost {
               model: row.model,
               secretRef: row.secret_ref,
               hasApiKey: keys.has(row.secret_ref),
+              // 自定义头（SH-097）按宿主真实形状回显（camelCase 无翻译）
+              ...(row.headers === undefined || Object.keys(row.headers).length === 0
+                ? {}
+                : { headers: row.headers }),
               // 宿主回显是 camelCase，落盘名是 snake_case（04 §4）——替身必须按真实
               // 形状回显，否则这个差异就会在测试里被抹平，而线上不会。
               models: row.models.map(model => ({
@@ -106,6 +116,13 @@ function fakeHost(rows: Row[] = []): FakeHost {
         if (command === 'delete_api_key') {
           keys.delete(args?.provider as string)
           return undefined as T
+        }
+        if (command === 'discover_models') {
+          if (state.discoverError !== undefined) throw new Error(state.discoverError)
+          return [
+            { id: 'm-a', name: 'Model A', contextWindow: 128_000, maxTokens: 8_192, inputModalities: ['text'] },
+            { id: 'm-b', name: null, contextWindow: null, maxTokens: null, inputModalities: ['text'] },
+          ] as T
         }
         return undefined as T
       },
@@ -313,8 +330,8 @@ describe('settings 面：写路径', () => {
 
   it('后端吃不下的写面逐项拒绝并说明原因', async () => {
     const face = faceOf(fakeHost([LONGCAT]))
+    // 自定义请求头自 SH-097 起接线，从拒绝清单移除
     const cases: [string, Record<string, unknown>, string][] = [
-      ['自定义请求头', profileValue({ headers: { 'X-A': 'b' } }), '请求头未接线'],
       ['非 OpenAI 协议', profileValue({ api: 'anthropic-messages' }), '不支持协议'],
       ['非法路由名', profileValue(), ''],
     ]
@@ -389,6 +406,35 @@ describe('settings 面：写路径', () => {
     }
     const model = view.namespaces.find(ns => ns['ns'] === 'llm-pi-ai')!.user.providers['longcat']!.models[0]!
     expect(model['reasoningEfforts']).toEqual({ off: null, low: 'low', high: 'ultra' })
+  })
+
+  it('自定义请求头（SH-097）：写面承载、视图透传、席位切换不丢失', async () => {
+    const host = fakeHost([LONGCAT])
+    const face = faceOf(host)
+    // 写面：headers 随 profile 进 payload
+    const written = await face.settings.mutate('llm-pi-ai', [{
+      op: 'set', path: ['providers', 'longcat'],
+      value: profileValue({ headers: { 'X-Gateway-Sign': 'sig', 'X-Trace': 't1' } }),
+    }], 0)
+    expect(written['ok']).toBe(true)
+    const saved = host.calls.find(call => call.command === 'save_providers')?.args as {
+      providers: { headers?: Record<string, string> }[]
+    }
+    expect(saved.providers[0]!.headers).toEqual({ 'X-Gateway-Sign': 'sig', 'X-Trace': 't1' })
+
+    // 视图透传：快照里的头原样回到设置页
+    const view = (await face.settings.describe())['value'] as {
+      namespaces: { ns: string; user: { providers: Record<string, Record<string, unknown>> } }[]
+    }
+    const profile = view.namespaces.find(ns => ns['ns'] === 'llm-pi-ai')!.user.providers['longcat']!
+    expect(profile['headers']).toEqual({ 'X-Gateway-Sign': 'sig', 'X-Trace': 't1' })
+
+    // 席位切换整份替换：其它字段透传时头不丢
+    await face.session.selectModel({ provider: 'longcat', model: 'LongCat-2.5' })
+    const resaved = host.calls.filter(call => call.command === 'save_providers').at(-1)?.args as {
+      providers: { headers?: Record<string, string> }[]
+    }
+    expect(resaved.providers[0]!.headers).toEqual({ 'X-Gateway-Sign': 'sig', 'X-Trace': 't1' })
   })
 
   it('席位档位（SH-096）：catalog 挂 reasoning，selectModel 持久化档位并校验声明', async () => {
@@ -503,16 +549,46 @@ describe('llm 面', () => {
     expect(byProvider.get('anthropic')).not.toHaveProperty('nativeAuth')
   })
 
-  it('目录内 provider 直接答自己的模型；未知端点如实拒绝而不是编一个假目录', async () => {
+  it('目录内 provider 直接答自己的模型；自建端点转宿主命令（SH-098），失败包 llm/model-discovery-rejected', async () => {
     const face = faceOf(fakeHost([]))
     const known = await face.llm.discoverModels('llm-pi-ai', { provider: 'zai' })
     expect((known['value'] as { id: string }[]).map(model => model.id)).toContain('glm-5.3')
-    const unknown = await face.llm.discoverModels('llm-pi-ai', { baseURL: 'https://api.example.com/v1' })
-    expect(unknown['ok']).toBe(false)
-    expect((unknown['error'] as { code: string }).code).toBe('llm/model-discovery-rejected')
-    expect((unknown['error'] as Error).message).toContain('手工填写')
     const wrongNs = await face.llm.discoverModels('llm-deepseek', { provider: 'deepseek' })
     expect(wrongNs['ok']).toBe(false)
+  })
+
+  it('自建端点模型发现（SH-098）：探针密钥透传宿主，失败按 llm/model-discovery-rejected 回显', async () => {
+    const host = fakeHost([])
+    const face = faceOf(host)
+    // 成功：走宿主命令，探针密钥原样透传（宿主优先用表单未存的 Key）
+    const found = await face.llm.discoverModels('llm-pi-ai', {
+      baseURL: 'https://api.example.com/v1', api: 'openai-completions', apiKey: 'probe-key',
+    })
+    expect(found['ok']).toBe(true)
+    expect((found['value'] as { id: string }[]).map(model => model.id)).toEqual(['m-a', 'm-b'])
+    const call = host.calls.find(entry => entry.command === 'discover_models')
+    expect(call?.args).toEqual({ provider: '', baseUrl: 'https://api.example.com/v1', apiKey: 'probe-key' })
+
+    // 失败：宿主消息按原码回显，绝不被吞成空列表
+    host.discoverError = 'https://api.example.com/v1/models 返回 401（请检查 API Key 是否正确）'
+    const failed = await face.llm.discoverModels('llm-pi-ai', { baseURL: 'https://api.example.com/v1' })
+    expect(failed['ok']).toBe(false)
+    expect((failed['error'] as { code: string }).code).toBe('llm/model-discovery-rejected')
+    expect((failed['error'] as Error).message).toContain('401')
+
+    // 空端点：不 invoke（宿主一次网络面都不开）
+    const calls = host.calls.filter(entry => entry.command === 'discover_models').length
+    const blank = await face.llm.discoverModels('llm-pi-ai', {})
+    expect(blank['ok']).toBe(false)
+    expect((blank['error'] as Error).message).toContain('端点地址为空')
+    expect(host.calls.filter(entry => entry.command === 'discover_models').length).toBe(calls)
+
+    // 不支持的协议：上游目录之外的 api 拒绝
+    const unsupported = await face.llm.discoverModels('llm-pi-ai', {
+      baseURL: 'https://x/v1', api: 'anthropic-messages',
+    })
+    expect(unsupported['ok']).toBe(false)
+    expect((unsupported['error'] as Error).message).toContain('OpenAI 兼容端点')
   })
 
   it('listProviders 只列真能跑的，名字取展示名并回落目录名', async () => {
