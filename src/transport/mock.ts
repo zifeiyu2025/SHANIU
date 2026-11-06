@@ -668,8 +668,12 @@ function mockWorkspaceNamespace(): unknown {
 
 /** mock 的 `remote.workspaceFiles` 命名空间：目录清空，只剩保持打开的变更流。 */
 function mockWorkspaceFilesNamespace(): unknown {
+  const unavailable = async () => FAIL('workspace-files/unavailable', 'mock 尚未接线文件读取')
   return {
     list: async (_sessionId: string, path: string) => OK({ path, entries: [], truncated: false }),
+    // 文档预览会按需读文件；mock 没有真实工作区文件，如实失败而不是给空内容
+    read: unavailable,
+    readBytes: unavailable,
     // 变更流必须保持打开：结束会被文件面板当成 watch 失败并弹提示
     changes: async function* (_sessionId: string, _path: string, signal?: AbortSignal): AsyncGenerator<unknown> {
       yield { kind: 'ready' }
@@ -804,6 +808,63 @@ function mockScheduleNamespace(): unknown {
   }
 }
 
+/**
+ * mock 的消息反馈：put/delete/list 走内存存储（版本号单调递增，冲突面不模拟），
+ * 外层信封与宿主 RemoteResult 同形；内层信封是反馈 Controller 自己读的结果联合。
+ */
+function mockMessageFeedbackNamespace(): unknown {
+  interface FeedbackEntry {
+    messageId: string
+    rating: 'positive' | 'negative'
+    note?: string
+    category?: string
+    version: number
+    createdAt: number
+    updatedAt: number
+  }
+  const items = new Map<string, FeedbackEntry>()
+  let version = 0
+  const key = (sessionId: string, messageId: string): string => `${sessionId}\u0000${messageId}`
+  return {
+    put: async (request: {
+      sessionId: string
+      messageId: string
+      rating: 'positive' | 'negative'
+      note?: string
+      category?: string
+    }) => {
+      version += 1
+      const now = Date.now()
+      const entry: FeedbackEntry = {
+        messageId: request.messageId,
+        rating: request.rating,
+        ...(request.note === undefined ? {} : { note: request.note }),
+        ...(request.category === undefined ? {} : { category: request.category }),
+        version,
+        createdAt: now,
+        updatedAt: now,
+      }
+      items.set(key(request.sessionId, request.messageId), entry)
+      return OK({ ok: true, value: entry })
+    },
+    delete: async (request: { sessionId: string; messageId: string }) => {
+      items.delete(key(request.sessionId, request.messageId))
+      return OK({ ok: true })
+    },
+    list: async (request: { sessionId: string }) => {
+      const prefix = `${request.sessionId}\u0000`
+      return OK({ ok: true, value: { items: [...items.entries()].filter(([name]) => name.startsWith(prefix)).map(([, entry]) => entry) } })
+    },
+  }
+}
+
+/** mock 的会话级反馈：直接收下，不落盘（真实实现属宿主 feedback 服务）。 */
+function mockSessionFeedbackNamespace(): unknown {
+  return {
+    record: async () => OK({ ok: true }),
+  }
+}
+
 /** 尚未 mock 的命名空间维持显式抛错面（按界面迭代逐个补）。 */
 function mockNamespace(name: string): unknown {
   const thrower = () => {
@@ -852,6 +913,9 @@ function buildMockRemote(): unknown {
     ['pluginManager', mockPluginManagerNamespace()],
     ['pluginRegistryProbe', mockPluginRegistryProbeNamespace()],
     ['schedule', mockScheduleNamespace()],
+    // 消息反馈（动作条点赞/点踩与会话反馈）
+    ['messageFeedback', mockMessageFeedbackNamespace()],
+    ['sessionFeedback', mockSessionFeedbackNamespace()],
     ['session', mockSessionNamespace()],
     // 模型设置页的三张面：由同一份 mock-models 事实源应答（见 mock-models.ts）
     ['llm', MODELS.llm],
@@ -938,6 +1002,7 @@ const NAMESPACES = [
   'directoryPicker', 'job', 'terminal', 'settings', 'subagents', 'modelSelection',
   'credentials', 'llm', 'permissionPresets',
   'pluginManager', 'pluginInventory', 'pluginRegistryProbe', 'schedule',
+  'messageFeedback', 'sessionFeedback',
 ] as const
 
 /** 批量注册 mock 的 `remote.<ns>` 点分服务（与 ctx.remote.<ns> 同源同实例）。 */

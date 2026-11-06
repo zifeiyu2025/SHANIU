@@ -519,6 +519,12 @@
    "@deepseek-ai/dsh-client-ui-schedule/*": [
     "./src/dsh/packages/client/ui-schedule/src/*"
    ],
+   "@deepseek-ai/dsh-client-ui-secret-mask": [
+    "./src/dsh/packages/client/ui-secret-mask/src/index.ts"
+   ],
+   "@deepseek-ai/dsh-client-ui-secret-mask/*": [
+    "./src/dsh/packages/client/ui-secret-mask/src/*"
+   ],
    "@deepseek-ai/dsh-client-ui-session": [
     "./src/dsh/packages/client/ui-session/src/index.ts"
    ],
@@ -590,6 +596,12 @@
    ],
    "@deepseek-ai/dsh-client-ui-user-questions/*": [
     "./src/dsh/packages/client/ui-user-questions/src/*"
+   ],
+   "@deepseek-ai/dsh-client-ui-workflow-run": [
+    "./src/dsh/packages/client/ui-workflow-run/src/index.ts"
+   ],
+   "@deepseek-ai/dsh-client-ui-workflow-run/*": [
+    "./src/dsh/packages/client/ui-workflow-run/src/*"
    ],
    "@deepseek-ai/dsh-client-ui-workspace": [
     "./src/dsh/packages/client/ui-workspace/src/index.ts"
@@ -1515,6 +1527,12 @@
    "@deepseek-ai/dsh-win32-process/*": [
     "./src/dsh/packages/subprocess/win32-process/src/*"
    ],
+   "@deepseek-ai/dsh-workflow/types": [
+    "./src/dsh/packages/workflow/workflow/src/types.ts"
+   ],
+   "@deepseek-ai/dsh-tool-workflow/types": [
+    "./src/dsh/packages/workflow/tool-workflow/src/types.ts"
+   ],
    "@deepseek-ai/dsh-working-directory": [
     "./src/dsh/packages/session/working-directory/src/index.ts"
    ],
@@ -1689,6 +1707,9 @@
    "@deepseek-ai/dsh-client-ui-schedule/client": [
     "./src/dsh/packages/client/ui-schedule/src/client/index.ts"
    ],
+   "@deepseek-ai/dsh-client-ui-secret-mask/client": [
+    "./src/dsh/packages/client/ui-secret-mask/src/client/index.ts"
+   ],
    "@deepseek-ai/dsh-client-ui-session/client": [
     "./src/dsh/packages/client/ui-session/src/client/index.ts"
    ],
@@ -1727,6 +1748,9 @@
    ],
    "@deepseek-ai/dsh-client-ui-user-questions/client": [
     "./src/dsh/packages/client/ui-user-questions/src/client/index.ts"
+   ],
+   "@deepseek-ai/dsh-client-ui-workflow-run/client": [
+    "./src/dsh/packages/client/ui-workflow-run/src/client/index.ts"
    ],
    "@deepseek-ai/dsh-client-ui-workspace/client": [
     "./src/dsh/packages/client/ui-workspace/src/client/index.ts"
@@ -3092,6 +3116,18 @@
   "./src/dsh/packages/client/ui-layout/src/client/shortcut-locales.ts",
   "./src/dsh/packages/client/ui-layout/src/client/stores.ts",
   "./src/dsh/packages/client/ui-layout/src/client/theme-presenter.ts",
+  "./src/dsh/packages/client/ui-message-feedback/src/client/FeedbackDialog.module.css",
+  "./src/dsh/packages/client/ui-message-feedback/src/client/FeedbackDialog.tsx",
+  "./src/dsh/packages/client/ui-message-feedback/src/client/MessageFeedbackActions.module.css",
+  "./src/dsh/packages/client/ui-message-feedback/src/client/MessageFeedbackActions.tsx",
+  "./src/dsh/packages/client/ui-message-feedback/src/client/controller.ts",
+  "./src/dsh/packages/client/ui-message-feedback/src/client/dialog.ts",
+  "./src/dsh/packages/client/ui-message-feedback/src/client/index.ts",
+  "./src/dsh/packages/client/ui-message-feedback/src/client/locales.ts",
+  "./src/dsh/packages/client/ui-message-feedback/src/client/slots.ts",
+  "./src/dsh/packages/client/ui-message-feedback/src/client/surface.ts",
+  "./src/dsh/packages/client/ui-message-feedback/src/css-modules.d.ts",
+  "./src/dsh/packages/client/ui-message-feedback/src/index.ts",
   "./src/dsh/packages/client/ui-model-selection/src/client/ModelSelect.module.css",
   "./src/dsh/packages/client/ui-model-selection/src/client/ModelSelect.tsx",
   "./src/dsh/packages/client/ui-model-selection/src/client/catalog.ts",
@@ -3348,6 +3384,17 @@
   "./src/dsh/packages/client/ui-schedule/src/client/task-tab-target.ts",
   "./src/dsh/packages/client/ui-schedule/src/css-modules.d.ts",
   "./src/dsh/packages/client/ui-schedule/src/index.ts",
+  "./src/dsh/packages/client/ui-secret-mask/src/client/SecretText.module.css",
+  "./src/dsh/packages/client/ui-secret-mask/src/client/SecretText.tsx",
+  "./src/dsh/packages/client/ui-secret-mask/src/client/credential-formats.ts",
+  "./src/dsh/packages/client/ui-secret-mask/src/client/credential-masks.ts",
+  "./src/dsh/packages/client/ui-secret-mask/src/client/credential-scanner.ts",
+  "./src/dsh/packages/client/ui-secret-mask/src/client/format-tables.ts",
+  "./src/dsh/packages/client/ui-secret-mask/src/client/index.ts",
+  "./src/dsh/packages/client/ui-secret-mask/src/client/locales.ts",
+  "./src/dsh/packages/client/ui-secret-mask/src/client/secret-rule.ts",
+  "./src/dsh/packages/client/ui-secret-mask/src/css-modules.d.ts",
+  "./src/dsh/packages/client/ui-secret-mask/src/index.ts",
   "./src/dsh/packages/client/ui-session/src/client/index.ts",
   "./src/dsh/packages/client/ui-session/src/client/session-provider.tsx",
   "./src/dsh/packages/client/ui-settings-general/src/client/CurrentVersionRow.module.css",
@@ -3705,6 +3752,13 @@
   "./src/dsh/packages/client/ui-workspace/src/client/WorkspacePicker.tsx",
   "./src/dsh/packages/client/ui-workspace/src/client/contract/slots.ts",
   "./src/dsh/packages/client/ui-workspace/src/client/contract/toast.ts",
+  "./src/dsh/packages/client/ui-workflow-run/src/client/WorkflowRunPanel.module.css",
+  "./src/dsh/packages/client/ui-workflow-run/src/client/WorkflowRunPanel.tsx",
+  "./src/dsh/packages/client/ui-workflow-run/src/client/index.ts",
+  "./src/dsh/packages/client/ui-workflow-run/src/client/locales.ts",
+  "./src/dsh/packages/client/ui-workflow-run/src/client/workflow-definition.ts",
+  "./src/dsh/packages/client/ui-workflow-run/src/css-modules.d.ts",
+  "./src/dsh/packages/client/ui-workflow-run/src/index.ts",
   "./src/dsh/packages/client/ui-workspace/src/client/index.ts",
   "./src/dsh/packages/client/ui-workspace/src/client/locales.ts",
   "./src/dsh/packages/client/ui-workspace/src/client/navigation.ts",
@@ -3820,6 +3874,10 @@
   "./src/dsh/packages/typert/protocol/src/remote-error.ts",
   "./src/dsh/packages/typert/protocol/src/remote-info.ts",
   "./src/dsh/packages/typert/protocol/src/types.ts",
+  "./src/dsh/packages/feedback/command-feedback/src/types.ts",
+  "./src/dsh/packages/feedback/message-feedback/src/types.ts",
+  "./src/dsh/packages/workflow/workflow/src/types.ts",
+  "./src/dsh/packages/workflow/tool-workflow/src/types.ts",
   "./src/dsh/packages/util/brand/src/index.ts",
   "./src/dsh/packages/util/code-language/src/index.ts",
   "./src/dsh/packages/util/crypto/src/index.ts",

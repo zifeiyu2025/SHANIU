@@ -532,6 +532,12 @@
       "@deepseek-ai/dsh-client-ui-schedule/*": [
         "./node_modules/.cache/dsh-types-client/src/dsh/packages/client/ui-schedule/src/*"
       ],
+      "@deepseek-ai/dsh-client-ui-secret-mask": [
+        "./node_modules/.cache/dsh-types-client/src/dsh/packages/client/ui-secret-mask/src/index.d.ts"
+      ],
+      "@deepseek-ai/dsh-client-ui-secret-mask/*": [
+        "./node_modules/.cache/dsh-types-client/src/dsh/packages/client/ui-secret-mask/src/*"
+      ],
       "@deepseek-ai/dsh-client-ui-session": [
         "./node_modules/.cache/dsh-types-client/src/dsh/packages/client/ui-session/src/index.d.ts"
       ],
@@ -603,6 +609,12 @@
       ],
       "@deepseek-ai/dsh-client-ui-user-questions/*": [
         "./node_modules/.cache/dsh-types-client/src/dsh/packages/client/ui-user-questions/src/*"
+      ],
+      "@deepseek-ai/dsh-client-ui-workflow-run": [
+        "./node_modules/.cache/dsh-types-client/src/dsh/packages/client/ui-workflow-run/src/index.d.ts"
+      ],
+      "@deepseek-ai/dsh-client-ui-workflow-run/*": [
+        "./node_modules/.cache/dsh-types-client/src/dsh/packages/client/ui-workflow-run/src/*"
       ],
       "@deepseek-ai/dsh-client-ui-workspace": [
         "./node_modules/.cache/dsh-types-client/src/dsh/packages/client/ui-workspace/src/index.d.ts"
@@ -1528,6 +1540,12 @@
       "@deepseek-ai/dsh-win32-process/*": [
         "./node_modules/.cache/dsh-types-client/src/dsh/packages/subprocess/win32-process/src/*"
       ],
+      "@deepseek-ai/dsh-workflow/types": [
+        "./node_modules/.cache/dsh-types-client/src/dsh/packages/workflow/workflow/src/types.d.ts"
+      ],
+      "@deepseek-ai/dsh-tool-workflow/types": [
+        "./node_modules/.cache/dsh-types-client/src/dsh/packages/workflow/tool-workflow/src/types.d.ts"
+      ],
       "@deepseek-ai/dsh-working-directory": [
         "./node_modules/.cache/dsh-types-client/src/dsh/packages/session/working-directory/src/index.d.ts"
       ],
@@ -1702,6 +1720,9 @@
       "@deepseek-ai/dsh-client-ui-schedule/client": [
         "./node_modules/.cache/dsh-types-client/src/dsh/packages/client/ui-schedule/src/client/index.d.ts"
       ],
+      "@deepseek-ai/dsh-client-ui-secret-mask/client": [
+        "./node_modules/.cache/dsh-types-client/src/dsh/packages/client/ui-secret-mask/src/client/index.d.ts"
+      ],
       "@deepseek-ai/dsh-client-ui-session/client": [
         "./node_modules/.cache/dsh-types-client/src/dsh/packages/client/ui-session/src/client/index.d.ts"
       ],
@@ -1740,6 +1761,9 @@
       ],
       "@deepseek-ai/dsh-client-ui-user-questions/client": [
         "./node_modules/.cache/dsh-types-client/src/dsh/packages/client/ui-user-questions/src/client/index.d.ts"
+      ],
+      "@deepseek-ai/dsh-client-ui-workflow-run/client": [
+        "./node_modules/.cache/dsh-types-client/src/dsh/packages/client/ui-workflow-run/src/client/index.d.ts"
       ],
       "@deepseek-ai/dsh-client-ui-workspace/client": [
         "./node_modules/.cache/dsh-types-client/src/dsh/packages/client/ui-workspace/src/client/index.d.ts"

@@ -19,6 +19,10 @@ import { apply as uiSidebarFilesApply, inject as uiSidebarFilesInject } from '@d
 import { apply as uiSidebarBrowserApply, inject as uiSidebarBrowserInject } from '@deepseek-ai/dsh-client-ui-sidebar-browser/client'
 import { apply as uiConversationApply, inject as uiConversationInject } from '@deepseek-ai/dsh-client-ui-conversation/client'
 import { apply as uiChatApply, inject as uiChatInject } from '@deepseek-ai/dsh-client-ui-chat/client'
+import { apply as uiSecretMaskApply, inject as uiSecretMaskInject } from '@deepseek-ai/dsh-client-ui-secret-mask/client'
+import { apply as uiWorkflowRunApply, inject as uiWorkflowRunInject } from '@deepseek-ai/dsh-client-ui-workflow-run/client'
+import { apply as uiMessageFeedbackApply, inject as uiMessageFeedbackInject } from '@deepseek-ai/dsh-client-ui-message-feedback/client'
+import { apply as uiSidebarDocumentPreviewApply, inject as uiSidebarDocumentPreviewInject } from '@deepseek-ai/dsh-client-ui-sidebar-documentpreview/client'
 import { apply as uiApprovalApply, inject as uiApprovalInject } from '@deepseek-ai/dsh-client-ui-approval/client'
 import { apply as uiToolApply, inject as uiToolInject } from '@deepseek-ai/dsh-client-ui-tool/client'
 import { apply as uiTrajectoryApply, inject as uiTrajectoryInject } from '@deepseek-ai/dsh-client-ui-trajectory/client'
@@ -166,6 +170,11 @@ export async function bootShaniu(container: HTMLElement): Promise<BootHandle> {
     { inject: uiSettingsGeneralInject, apply: uiSettingsGeneralApply },
     { inject: uiSettingsModelsInject, apply: uiSettingsModelsApply },
     { inject: uiChatInject, apply: uiChatApply },
+    // 对话流补全：用户消息里的密钥打码、工作流节点、消息反馈、文档预览页签
+    { inject: uiSecretMaskInject, apply: uiSecretMaskApply },
+    { inject: uiWorkflowRunInject, apply: uiWorkflowRunApply },
+    { inject: uiMessageFeedbackInject, apply: uiMessageFeedbackApply },
+    { inject: uiSidebarDocumentPreviewInject, apply: uiSidebarDocumentPreviewApply },
     { inject: uiApprovalInject, apply: uiApprovalApply },
     { inject: uiToolInject, apply: uiToolApply },
     { inject: uiTrajectoryInject, apply: uiTrajectoryApply },
