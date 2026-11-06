@@ -31,7 +31,10 @@ const DEFAULT_WORKSPACE_ID = 'default-workspace'
 const DEFAULT_WORKSPACE_PATH = HOME_PATH
 
 /**
- * 权限挡位：值与上游 permission-presets 一致。
+ * 权限挡位：值与上游 permission-presets 一致，但**不含 `auto`（实验档）**——那是
+ * "让当前模型自动审查每次工具调用再决定放行"的档位，SHANIU 后端没有对应语义，
+ * 用户裁定移除（2026-11-07）。桌面侧这张面整个未挂（见 transport/stubs.ts 的
+ * `sandbox.mode × approval.mode` 映射说明），mock 不单独保留一个后端给不出的挡位。
  * name 直接给机器值——上游 displayPermissionPreset 只在 name === value 或等于其英文默认标签时
  * 才走界面词典，给自定义英文名会让中文界面露出英文标签。
  */
@@ -39,7 +42,6 @@ const PERMISSION_PRESETS = [
   { value: 'read-only', name: 'read-only', description: '只读查看，不产生任何写入' },
   { value: 'workspace-write', name: 'workspace-write', description: '仅在工作区内读写' },
   { value: 'danger-full-access', name: 'danger-full-access', description: '不受工作区边界限制' },
-  { value: 'auto', name: 'auto', description: '自动审查后再决定是否放行' },
 ] as const
 
 const DEFAULT_PERMISSION = 'read-only'
@@ -594,9 +596,9 @@ const FAIL = (code: string, message: string) => ({ ok: false as const, error: { 
 function mockPermissionPresetsNamespace(): unknown {
   return {
     catalog: async () => OK({
+      // 挡位清单本身就不含实验档 auto（见 PERMISSION_PRESETS 注记），目录与默认值同表
       options: PERMISSION_PRESETS.map(preset => ({ ...preset })),
-      // 自动审查是实验档，不作为新会话的默认值
-      defaultOptions: PERMISSION_PRESETS.filter(preset => preset.value !== 'auto').map(preset => ({ ...preset })),
+      defaultOptions: PERMISSION_PRESETS.map(preset => ({ ...preset })),
       defaultPreset: DEFAULT_PERMISSION,
     }),
   }

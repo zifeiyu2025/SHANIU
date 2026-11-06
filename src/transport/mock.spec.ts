@@ -10,6 +10,7 @@ interface WireEvent {
 
 interface JournalSnapshot {
   records: { type: string; event: WireEvent }[]
+  projections: { values: { permissions?: { currentValue: string } } }
 }
 
 interface SessionFace {
@@ -56,11 +57,25 @@ interface DirectoryPickerFace {
   createDirectory(path: string, name: string): Promise<MockResult<string>>
 }
 
+interface PermissionPresetsFace {
+  catalog(): Promise<MockResult<{
+    options: { value: string }[]
+    defaultOptions: { value: string }[]
+    defaultPreset: string
+  }>>
+}
+
+interface CommandsFace {
+  execute(sessionId: string, line: string): Promise<MockResult<unknown>>
+}
+
 const remote = mockRemote() as {
   session: SessionFace
   credentials: CredentialFace
   directoryPicker: DirectoryPickerFace
   workspace: WorkspaceFace
+  permissionPresets: PermissionPresetsFace
+  commands: CommandsFace
 }
 
 /** 读工作区 follow 的第一帧（baseline 就是全集）。 */
@@ -210,5 +225,37 @@ describe('mock 添加工作区', () => {
     const session = await remote.session.create({ workspaceId: created.value.workspace.workspaceId })
     const list = await remote.session.list()
     expect(list.value.items.find(item => item.sessionId === session.value.sessionId)?.cwd).toBe(path)
+  })
+})
+
+describe('mock 权限挡位目录', () => {
+  it('目录只含三个内置挡位：实验档 auto 不出现，默认表与目录同表', async () => {
+    const catalog = await remote.permissionPresets.catalog()
+    if (!catalog.ok) throw new Error(`catalog 失败：${catalog.error.message}`)
+    // auto（模型自动审查）在 SHANIU 后端没有对应语义，用户裁定不进目录
+    expect(catalog.value.options.map(option => option.value))
+      .toEqual(['read-only', 'workspace-write', 'danger-full-access'])
+    expect(catalog.value.defaultOptions.map(option => option.value))
+      .toEqual(catalog.value.options.map(option => option.value))
+    expect(catalog.value.defaultPreset).toBe('read-only')
+  })
+
+  it('/permission 按目录白名单裁决：挡内切换推投影，auto 回未命中且挡位不动', async () => {
+    const created = await remote.session.create()
+    const sessionId = created.value.sessionId
+    const currentPermission = async (): Promise<string | undefined> => {
+      const stream = remote.session.follow({ address: { kind: 'session', sessionId } })
+      const snapshot = await stream.next()
+      await stream.return?.(undefined)
+      return snapshot.value.projections.values.permissions?.currentValue
+    }
+
+    const switched = await remote.commands.execute(sessionId, '/permission workspace-write')
+    expect(switched).toEqual({ ok: true, value: { matched: true } })
+    expect(await currentPermission()).toBe('workspace-write')
+
+    const unmatched = await remote.commands.execute(sessionId, '/permission auto')
+    expect(unmatched).toEqual({ ok: true, value: undefined })
+    expect(await currentPermission()).toBe('workspace-write')
   })
 })
