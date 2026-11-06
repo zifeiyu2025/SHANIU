@@ -261,8 +261,12 @@ function startMockTurn(sessionId: string, requestId: string | undefined, text: s
       })
     }
     const turnStart = Date.now()
-    pushEvent('turn/start', { turn: 0 }, {}, turnStart)
-    pushEvent('step/start', { turn: 0, step: 0 })
+    // turn/step 必须逐轮递增：写死 0 会让第二轮的 turn/start 落在一个已关闭的回合上，
+    // 过程头（已完成，用时 N 秒）就不出现
+    const turn = METRICS.get(sessionId)?.turns ?? 0
+    const step = METRICS.get(sessionId)?.steps ?? 0
+    pushEvent('turn/start', { turn }, {}, turnStart)
+    pushEvent('step/start', { turn, step })
     const userSeq = pushEvent('user/message', {
       id: `mock-user-${journal.seq + 1}`,
       role: 'user',
@@ -276,7 +280,7 @@ function startMockTurn(sessionId: string, requestId: string | undefined, text: s
       journal.revision += 1
       journal.frames.push({ type: 'assistant-stream', frame: { ...frame, attemptId, revision: journal.revision } })
     }
-    pushStream({ type: 'start', startedAfterSeq: userSeq, turn: 0, step: 0 })
+    pushStream({ type: 'start', startedAfterSeq: userSeq, turn, step })
     let index = 0
     for (const chunk of chunksOf(DEMO_REPLY, 6)) {
       await new Promise<void>(resolve => setTimeout(resolve, 45))
@@ -284,7 +288,7 @@ function startMockTurn(sessionId: string, requestId: string | undefined, text: s
       index += 1
     }
     const assistantSeq = pushEvent('assistant/message', {
-      turn: 0, step: 0,
+      turn, step,
       message: {
         id: `mock-assistant-${journal.seq + 1}`,
         role: 'assistant',
@@ -296,9 +300,9 @@ function startMockTurn(sessionId: string, requestId: string | undefined, text: s
       usage: { inputTokens: 9600, outputTokens: 300, totalTokens: 9900, cacheReadTokens: 0, cacheWriteTokens: 0 },
     }, { surfaceOp: 'append' })
     pushStream({ type: 'end', index, outcome: { kind: 'committed', eventType: 'assistant/message', seq: assistantSeq } })
-    pushEvent('step/end', { turn: 0, step: 0 })
+    pushEvent('step/end', { turn, step })
     // turn/end 的时间决定「已完成，用时 N 秒」的显示时长
-    pushEvent('turn/end', { turn: 0, reason: { kind: 'completed' } }, {}, turnStart + 4000)
+    pushEvent('turn/end', { turn, reason: { kind: 'completed' } }, {}, turnStart + 4000)
     // 回合关闭后再发布统计：上游的轮/步计数只认已关闭的 step
     pushTurnMetrics(sessionId)
   })()
