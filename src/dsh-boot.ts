@@ -21,6 +21,7 @@ import { apply as uiTrajectoryApply, inject as uiTrajectoryInject } from '@deeps
 import { apply as uiUserQuestionsApply, inject as uiUserQuestionsInject } from '@deepseek-ai/dsh-client-ui-user-questions/client'
 import { apply as uiModelSelectionApply, inject as uiModelSelectionInject } from '@deepseek-ai/dsh-client-ui-model-selection/client'
 import { apply as uiPlanApply, inject as uiPlanInject } from '@deepseek-ai/dsh-client-ui-plan/client'
+import { apply as uiPermissionApply, inject as uiPermissionInject } from '@deepseek-ai/dsh-client-ui-permission-presets/client'
 import { apply as uiDeliverablesApply, inject as uiDeliverablesInject } from '@deepseek-ai/dsh-client-ui-deliverables/client'
 import { apply as uiAttachmentApply, inject as uiAttachmentInject } from '@deepseek-ai/dsh-client-ui-attachment/client'
 import { apply as uiContextMenuApply, inject as uiContextMenuInject } from '@deepseek-ai/dsh-client-ui-context-menu/client'
@@ -136,6 +137,7 @@ export async function bootShaniu(container: HTMLElement): Promise<BootHandle> {
     { inject: uiUserQuestionsInject, apply: uiUserQuestionsApply },
     { inject: uiModelSelectionInject, apply: uiModelSelectionApply },
     { inject: uiPlanInject, apply: uiPlanApply },
+    { inject: uiPermissionInject, apply: uiPermissionApply },
     { inject: uiDeliverablesInject, apply: uiDeliverablesApply },
     { inject: uiAttachmentInject, apply: uiAttachmentApply },
   ]

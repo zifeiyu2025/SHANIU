@@ -468,6 +468,15 @@
    "@deepseek-ai/dsh-client-ui-model-selection/*": [
     "./src/dsh/packages/client/ui-model-selection/src/*"
    ],
+   "@deepseek-ai/dsh-client-ui-permission-presets": [
+    "./src/dsh/packages/client/ui-permission-presets/src/index.ts"
+   ],
+   "@deepseek-ai/dsh-client-ui-permission-presets/*": [
+    "./src/dsh/packages/client/ui-permission-presets/src/*"
+   ],
+   "@deepseek-ai/dsh-client-ui-permission-presets/client": [
+    "./src/dsh/packages/client/ui-permission-presets/src/client/index.ts"
+   ],
    "@deepseek-ai/dsh-client-ui-plan": [
     "./src/dsh/packages/client/ui-plan/src/index.ts"
    ],
@@ -3289,6 +3298,16 @@
   "./src/dsh/packages/client/ui-settings-models/src/css-modules.d.ts",
   "./src/dsh/packages/client/ui-settings-models/src/onboarding-config.ts",
   "./src/dsh/packages/client/ui-settings-models/src/onboarding-copy.ts",
+  "./src/dsh/packages/client/ui-permission-presets/src/client/PermissionRow.tsx",
+  "./src/dsh/packages/client/ui-permission-presets/src/client/PermissionSelect.tsx",
+  "./src/dsh/packages/client/ui-permission-presets/src/client/catalog.ts",
+  "./src/dsh/packages/client/ui-permission-presets/src/client/index.ts",
+  "./src/dsh/packages/client/ui-permission-presets/src/client/locales.ts",
+  "./src/dsh/packages/client/ui-permission-presets/src/client/presentation.ts",
+  "./src/dsh/packages/client/ui-permission-presets/src/client/settings-store.ts",
+  "./src/dsh/packages/client/ui-permission-presets/src/css-modules.d.ts",
+  "./src/dsh/packages/client/ui-permission-presets/src/index.ts",
+  "./src/dsh/packages/interaction/permission-presets/src/client.ts",
   "./src/dsh/packages/client/ui-settings/src/client/config-form-types.ts",
   "./src/dsh/packages/client/ui-settings/src/client/config-form.ts",
   "./src/dsh/packages/client/ui-settings/src/client/contract/slots.ts",

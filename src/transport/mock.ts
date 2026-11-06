@@ -26,6 +26,20 @@ const DEFAULT_WORKSPACE_ID = 'default-workspace'
  * 工作区又是 Agent 可写作用域，落盘前必须先解决这条边界冲突。
  */
 const DEFAULT_WORKSPACE_PATH = `${WORKSPACE_PATH}\\Workspace`
+
+/**
+ * 权限挡位：值与上游 permission-presets 一致。
+ * name 直接给机器值——上游 displayPermissionPreset 只在 name === value 或等于其英文默认标签时
+ * 才走界面词典，给自定义英文名会让中文界面露出英文标签。
+ */
+const PERMISSION_PRESETS = [
+  { value: 'read-only', name: 'read-only', description: '只读查看，不产生任何写入' },
+  { value: 'workspace-write', name: 'workspace-write', description: '仅在工作区内读写' },
+  { value: 'danger-full-access', name: 'danger-full-access', description: '不受工作区边界限制' },
+  { value: 'auto', name: 'auto', description: '自动审查后再决定是否放行' },
+] as const
+
+const DEFAULT_PERMISSION = 'read-only'
 const SESSION_IDS = ['mock-session-alpha', 'mock-session-beta']
 
 /** 工作区行内的会话集（create/attach 时推进，follow 以 upsert 帧广播）。 */
@@ -79,19 +93,32 @@ function createFrameBroadcast<T>() {
   }
 }
 
-const selectionFrames = createFrameBroadcast<Record<string, unknown>>()
+const projectionFrames = createFrameBroadcast<Record<string, unknown>>()
 let projectionSeq = 0
 
 /** 把一次选择变化推给每个已知会话的控制流。 */
 function pushModelSelection(selection: ModelSelection): void {
   for (const id of MOCK_SESSION_ROWS.keys()) {
-    selectionFrames.push({
+    projectionFrames.push({
       type: 'projection',
       sessionId: id as SessionId,
       seq: ++projectionSeq,
       changes: [{ key: 'modelSelection', val: { lastUsed: null, next: selection } }],
     })
   }
+}
+
+/** 每个会话的当前权限挡位；`permissions` 投影只带 currentValue，未设置即默认档。 */
+const PERMISSION_BY_SESSION = new Map<string, string>()
+
+/** 把一次挡位切换推给对应会话（宿主 `/permission` 命令的确认帧）。 */
+function pushPermission(sessionId: string, currentValue: string): void {
+  projectionFrames.push({
+    type: 'projection',
+    sessionId,
+    seq: ++projectionSeq,
+    changes: [{ key: 'permissions', val: { currentValue } }],
+  })
 }
 
 function mockSessionRow(id: string, minutesAgo: number, running = false): SessionSummary {
@@ -161,14 +188,16 @@ function mockSessionNamespace(): unknown {
             asOfSeq: 0,
             values: {
               modelSelection: { lastUsed: null, next: selection },
+              permissions: { currentValue: PERMISSION_BY_SESSION.get(id) ?? DEFAULT_PERMISSION },
             },
           }])),
         },
       }
       // 基线之后持续推送选择变化：席位读投影，不回推会导致选档后回弹
-      for await (const frame of selectionFrames.subscribe()) yield frame
+      for await (const frame of projectionFrames.subscribe()) yield frame
     },
-    follow: async function* (_request: unknown): AsyncGenerator<unknown> {
+    follow: async function* (request: unknown): AsyncGenerator<unknown> {
+      const sessionId = (request as { sessionId?: string } | undefined)?.sessionId
       yield {
         type: 'snapshot',
         header: { version: 0, id: '' as SessionId, createdAt: Date.now(), isSeeded: false },
@@ -180,6 +209,7 @@ function mockSessionNamespace(): unknown {
           asOfSeq: 0,
           values: {
             modelSelection: { lastUsed: null, next: await currentModelSelection() },
+            permissions: { currentValue: (sessionId === undefined ? undefined : PERMISSION_BY_SESSION.get(sessionId)) ?? DEFAULT_PERMISSION },
           },
         },
         assistantStream: { revision: 0 },
@@ -229,7 +259,9 @@ export function mockModules(): unknown {
 export function mockConnection(): unknown {
   return new Proxy(
     {
-      generation: { getSnapshot: () => 1, subscribe: () => () => {} },
+      // 形状必须是 ConnectionGeneration（{id, host}）：权限目录按 generation.id 栅栏，
+      // 给裸数字会让它永远读不出目录，输入卡的挡位控件就静默不渲染
+      generation: { getSnapshot: () => ({ id: 1, host: { home: WORKSPACE_PATH } }), subscribe: () => () => {} },
       state: { getSnapshot: () => 'ready', subscribe: () => () => {} },
       interactions: {},
       isLoopback: true,
@@ -275,6 +307,36 @@ function mockWorkspaceView(id: string = WORKSPACE_ID): WorkspaceView {
 }
 
 const OK = <T>(value: T) => ({ ok: true as const, value })
+
+/** `remote.permissionPresets`：进程级目录（与上游 PermissionCatalog 同形）。 */
+function mockPermissionPresetsNamespace(): unknown {
+  return {
+    catalog: async () => OK({
+      options: PERMISSION_PRESETS.map(preset => ({ ...preset })),
+      // 自动审查是实验档，不作为新会话的默认值
+      defaultOptions: PERMISSION_PRESETS.filter(preset => preset.value !== 'auto').map(preset => ({ ...preset })),
+      defaultPreset: DEFAULT_PERMISSION,
+    }),
+  }
+}
+
+/**
+ * `remote.commands`：目前只需要 `/permission <preset>` 这一条。
+ * 返回值非 undefined 即"命中命令"（SessionFace.command 据此给出 matched）。
+ */
+function mockCommandsNamespace(): unknown {
+  return {
+    execute: async (sessionId: string, line: string) => {
+      const match = /^\/permission\s+([a-z][a-z-]*)\s*$/.exec(line.trim())
+      if (match === null) return OK(undefined)
+      const preset = match[1]!
+      if (!PERMISSION_PRESETS.some(candidate => candidate.value === preset)) return OK(undefined)
+      PERMISSION_BY_SESSION.set(sessionId, preset)
+      pushPermission(sessionId, preset)
+      return OK({ matched: true })
+    },
+  }
+}
 
 /** mock 的 `remote.workspace` 命名空间：follow 活流（baseline + 队列广播）+ 本地可变更方法。 */
 function mockWorkspaceNamespace(): unknown {
@@ -356,6 +418,9 @@ function buildMockRemote(): unknown {
     ['llm', MODELS.llm],
     ['settings', MODELS.settings],
     ['credentials', MODELS.credentials],
+    // 权限挡位：进程目录 + `/permission` 命令写回
+    ['permissionPresets', mockPermissionPresetsNamespace()],
+    ['commands', mockCommandsNamespace()],
   ])
   const base = {
     $on: mockOn,
@@ -428,7 +493,7 @@ export function mockRemote(): unknown {
 const NAMESPACES = [
   'session', 'commands', 'toolResults', 'userQuestions', 'workspace', 'workspaceFiles',
   'directoryPicker', 'job', 'terminal', 'settings', 'subagents', 'modelSelection',
-  'credentials', 'llm',
+  'credentials', 'llm', 'permissionPresets',
 ] as const
 
 /** 批量注册 mock 的 `remote.<ns>` 点分服务（与 ctx.remote.<ns> 同源同实例）。 */

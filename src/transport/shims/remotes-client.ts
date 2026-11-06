@@ -19,6 +19,7 @@ import type {
 import type {
   SettingsDescribeValue, SettingsNamespaceView, SettingsPathOpView,
 } from '@deepseek-ai/dsh-settings/types'
+import type { PermissionCatalog } from '@deepseek-ai/dsh-permission-presets/client'
 
 /**
  * 已接线命名空间的 `ctx.remote.<ns>` 面。上游由 typert generator 从宿主服务生成，
@@ -49,11 +50,16 @@ interface LlmRemote {
   discoverModels(settingsNs: string, request: LlmModelDiscoveryRequest): Promise<RemoteResult<LlmDiscoveredModel[]>>
 }
 
+interface PermissionPresetsRemote {
+  catalog(): Promise<RemoteResult<PermissionCatalog>>
+}
+
 declare module '@deepseek-ai/dsh-api-gateway/client' {
   interface ClientRemote {
     readonly settings?: SettingsRemote
     readonly credentials?: CredentialsRemote
     readonly llm?: LlmRemote
+    readonly permissionPresets?: PermissionPresetsRemote
   }
 }
 

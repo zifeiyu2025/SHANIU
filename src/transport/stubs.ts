@@ -29,7 +29,7 @@ export function stubRemoteNamespace(name: string): unknown {
 export const REMOTE_NAMESPACES = [
   'session', 'commands', 'toolResults', 'userQuestions', 'workspace', 'workspaceFiles',
   'directoryPicker', 'job', 'terminal', 'settings', 'subagents', 'modelSelection',
-  'credentials', 'llm',
+  'credentials', 'llm', 'permissionPresets',
 ] as const
 
 /**
