@@ -5,8 +5,17 @@
  * （workspace-controller 的 follow 流/模型机制原样运行），用于把界面各区域填充到可联调状态。
  */
 import type { SessionSummary } from '@deepseek-ai/dsh-api-session-controller/types'
+import type { ModelSelection } from '@deepseek-ai/dsh-api-session-controller/types'
 import type { WorkspaceView } from '@deepseek-ai/dsh-api-workspace-controller/client'
 import type { SessionId } from '@deepseek-ai/dsh-session/types'
+import { createModelsMock } from './mock-models'
+
+/**
+ * 模型设置页与 composer 模型席位共用的那份 mock 事实源（见 mock-models.ts）。
+ * 单例：设置页写入的 provider 必须就是席位读到的那一个。
+ * emit 走 mock 的事件总线，写入后设置页与席位才会各自收到失效推送。
+ */
+const MODELS = createModelsMock({ emit: mockEmit })
 
 const WORKSPACE_PATH = 'D:\\MyWorkspace\\SHANIU'
 const WORKSPACE_ID = 'mock-workspace-1'
@@ -57,6 +66,15 @@ const MOCK_SESSION_ROWS = new Map<string, SessionSummary>([
 ])
 
 /**
+ * 席位投影里的当前选择：直接取同源目录的默认项，
+ * 免得设置页删掉某条路由后投影还指向一个不存在的分组。
+ */
+async function currentModelSelection(): Promise<ModelSelection> {
+  const catalog = await MODELS.session.modelCatalog()
+  return catalog.ok ? catalog.value.default : { provider: '', model: '' }
+}
+
+/**
  * `remote.session` 命名空间 mock：喂真实的 session-controller 客户端运行时。
  * 四个面 = manager 消费契约（见 api-session-controller/src/client/transport.ts）：
  * ① list RPC（侧栏列表）② control 流（会话级控制基线）③ follow 流（journal 窗口，
@@ -78,34 +96,20 @@ function mockSessionNamespace(): unknown {
     fork: async () => OK({ sessionId: `mock-session-${MOCK_SESSION_ROWS.size + 1}` as SessionId }),
     search: async () => OK({ items: [], hasMore: false }),
     selectModel: async (req: { provider: string; model: string }) =>
-      OK({ selected: { provider: req.provider, model: req.model } }),
+      MODELS.session.selectModel({ provider: req.provider, model: req.model }),
     projections: async () => OK(null),
-    // 模型目录（composer 模型席位数据源，形状 = session-controller 的 ModelCatalog）
-    modelCatalog: async () => OK({
-      default: { provider: 'mock-provider', model: 'mock-model-a' },
-      routableProviders: ['mock-provider'],
-      groups: [{
-        id: 'mock-provider',
-        name: 'Mock Provider',
-        models: [
-          { id: 'mock-model-a', name: 'Mock Model A', description: 'mock 旗舰模型' },
-          { id: 'mock-model-b', name: 'Mock Model B', description: 'mock 轻量模型' },
-        ],
-      }],
-      failures: [],
-    }),
+    // 模型目录（composer 模型席位数据源）与设置页同源：只有已配置的服务商进得来。
+    modelCatalog: () => MODELS.session.modelCatalog(),
     control: async function* (): AsyncGenerator<unknown> {
       // 控制基线带 per-session 投影：modelSelection（composer 模型席位的当前选择来源）
+      const selection = await currentModelSelection()
       yield {
         type: 'baseline',
         value: {
           projections: Object.fromEntries([...MOCK_SESSION_ROWS.keys()].map(id => [id, {
             asOfSeq: 0,
             values: {
-              modelSelection: {
-                lastUsed: null,
-                next: { provider: 'mock-provider', model: 'mock-model-a' },
-              },
+              modelSelection: { lastUsed: null, next: selection },
             },
           }])),
         },
@@ -123,7 +127,7 @@ function mockSessionNamespace(): unknown {
         projections: {
           asOfSeq: 0,
           values: {
-            modelSelection: { lastUsed: null, next: { provider: 'mock-provider', model: 'mock-model-a' } },
+            modelSelection: { lastUsed: null, next: await currentModelSelection() },
           },
         },
         assistantStream: { revision: 0 },
@@ -266,14 +270,39 @@ function mockNamespace(name: string): unknown {
 /** 单例 mock remote：保证 `ctx.remote.<ns>` 与 `remote.<ns>` 点分服务同源。 */
 const MOCK_REMOTE = buildMockRemote()
 
+/**
+ * mock 的事件总线：`$on` 按注册序登记、`$emit` 同步派发。
+ * 设置页与席位都靠推送失效收敛（settings/document-updated、credentials/reference-updated、
+ * llm/adapters-updated），空壳 $on 会让写入后界面停在旧视图——注册序就是它们的刷新序。
+ */
+const mockListeners = new Map<string, Set<(payload: unknown) => void>>()
+
+function mockOn(name: string, listener: (payload: unknown) => void): () => void {
+  const listeners = mockListeners.get(name) ?? new Set<(payload: unknown) => void>()
+  listeners.add(listener)
+  mockListeners.set(name, listeners)
+  return () => { listeners.delete(listener) }
+}
+
+function mockEmit(name: string, payload?: unknown): boolean {
+  const listeners = mockListeners.get(name)
+  if (listeners === undefined || listeners.size === 0) return false
+  for (const listener of [...listeners]) listener(payload)
+  return true
+}
+
 function buildMockRemote(): unknown {
   const namespaces = new Map<string, unknown>([
     ['workspace', mockWorkspaceNamespace()],
     ['session', mockSessionNamespace()],
+    // 模型设置页的三张面：由同一份 mock-models 事实源应答（见 mock-models.ts）
+    ['llm', MODELS.llm],
+    ['settings', MODELS.settings],
+    ['credentials', MODELS.credentials],
   ])
   const base = {
-    $on: () => () => {},
-    $emit: () => false,
+    $on: mockOn,
+    $emit: mockEmit,
     $call: () => Promise.reject(new Error('mock(remote).$call: 该调用尚未 mock，见 transport/mock.ts')),
     // 转发 open() 的异步可迭代：mock follow 帧经真实客户端投影机制流动。
     // 对齐 gateway RemoteStream 语义：
@@ -342,6 +371,7 @@ export function mockRemote(): unknown {
 const NAMESPACES = [
   'session', 'commands', 'toolResults', 'userQuestions', 'workspace', 'workspaceFiles',
   'directoryPicker', 'job', 'terminal', 'settings', 'subagents', 'modelSelection',
+  'credentials', 'llm',
 ] as const
 
 /** 批量注册 mock 的 `remote.<ns>` 点分服务（与 ctx.remote.<ns> 同源同实例）。 */

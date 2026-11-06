@@ -2016,6 +2016,15 @@
       ],
       "@deepseek-ai/dsh-client-ui-settings-general/client": [
         "./node_modules/.cache/dsh-types-client/src/dsh/packages/client/ui-settings-general/src/client/index.d.ts"
+      ],
+      "@deepseek-ai/dsh-client-ui-settings-models": [
+        "./node_modules/.cache/dsh-types-client/src/dsh/packages/client/ui-settings-models/src/index.d.ts"
+      ],
+      "@deepseek-ai/dsh-client-ui-settings-models/*": [
+        "./node_modules/.cache/dsh-types-client/src/dsh/packages/client/ui-settings-models/src/*"
+      ],
+      "@deepseek-ai/dsh-client-ui-settings-models/client": [
+        "./node_modules/.cache/dsh-types-client/src/dsh/packages/client/ui-settings-models/src/client/index.d.ts"
       ]
     }
   },

@@ -2004,6 +2004,15 @@
    "@deepseek-ai/dsh-client-ui-settings-general/client": [
     "./src/dsh/packages/client/ui-settings-general/src/client/index.ts"
    ],
+   "@deepseek-ai/dsh-client-ui-settings-models": [
+    "./src/dsh/packages/client/ui-settings-models/src/index.ts"
+   ],
+   "@deepseek-ai/dsh-client-ui-settings-models/*": [
+    "./src/dsh/packages/client/ui-settings-models/src/*"
+   ],
+   "@deepseek-ai/dsh-client-ui-settings-models/client": [
+    "./src/dsh/packages/client/ui-settings-models/src/client/index.ts"
+   ],
    "@deepseek-ai/dsh-api-remotes/client": [
     "./src/dsh/packages/api/remotes/src/client/index.ts"
    ],
@@ -2152,6 +2161,9 @@
     "./src/transport/shims/remote-module.ts"
    ],
    "@deepseek-ai/dsh-client-ui-settings-general/remote": [
+    "./src/transport/shims/remote-module.ts"
+   ],
+   "@deepseek-ai/dsh-client-ui-settings-models/remote": [
     "./src/transport/shims/remote-module.ts"
    ],
    "@deepseek-ai/dsh-client-ui-settings-plugin-inventory/remote": [

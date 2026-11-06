@@ -465,4 +465,6 @@ export const dshAliases: { find: RegExp; replacement: string }[] = [
   { find: /^@deepseek-ai\/schemastery\/(.*)$/, replacement: '/src/dsh/vendor/schemastery/src/$1' },
   { find: /^@deepseek-ai\/dsh-client-ui-settings-general$/, replacement: '/src/dsh/packages/client/ui-settings-general/src/index.ts' },
   { find: /^@deepseek-ai\/dsh-client-ui-settings-general\/(.*)$/, replacement: '/src/dsh/packages/client/ui-settings-general/src/$1' },
+  { find: /^@deepseek-ai\/dsh-client-ui-settings-models$/, replacement: '/src/dsh/packages/client/ui-settings-models/src/index.ts' },
+  { find: /^@deepseek-ai\/dsh-client-ui-settings-models\/(.*)$/, replacement: '/src/dsh/packages/client/ui-settings-models/src/$1' },
 ]

@@ -33,6 +33,8 @@ import { apply as workspaceControllerApply, inject as workspaceControllerInject 
 import { apply as sessionControllerApply, inject as sessionControllerInject } from '@deepseek-ai/dsh-api-session-controller/client'
 import { apply as uiSettingsApply, inject as uiSettingsInject } from '@deepseek-ai/dsh-client-ui-settings/client'
 import { apply as uiSettingsGeneralApply, inject as uiSettingsGeneralInject } from '@deepseek-ai/dsh-client-ui-settings-general/client'
+import { apply as uiSettingsModelsApply, inject as uiSettingsModelsInject } from '@deepseek-ai/dsh-client-ui-settings-models/client'
+import { ONBOARDING_CONFIG_GLOBAL } from '@deepseek-ai/dsh-client-ui-settings-models/onboarding-config'
 import ShortcutsService from '@deepseek-ai/dsh-client-shortcuts/client'
 import { apply as localeApply, inject as localeInject } from '@deepseek-ai/dsh-client-locale/client'
 import {
@@ -60,6 +62,12 @@ function usingTauriBackend(): boolean {
 export async function bootShaniu(container: HTMLElement): Promise<BootHandle> {
   const root = new Context()
   const tauri = usingTauriBackend()
+
+  // 模型设置页的公开引导开关：SHANIU 没有 DeepSeek 云端账号，
+  // 关掉自动弹出的官方登录引导（该 payload 就是上游为此留的接入口）。
+  ;(globalThis as Partial<Record<typeof ONBOARDING_CONFIG_GLOBAL, unknown>>)[ONBOARDING_CONFIG_GLOBAL] = {
+    credentialOnboarding: false,
+  }
 
   // 渲染基座：SlotRegistry + slot renderer + ctx.uiRenderer.mount
   await root.plugin({ inject: [], apply: rendererApply }).await()
@@ -110,6 +118,7 @@ export async function bootShaniu(container: HTMLElement): Promise<BootHandle> {
     { inject: uiSidebarRightInject, apply: uiSidebarRightApply },
     { inject: uiSidebarInject, apply: uiSidebarApply },
     { inject: uiSettingsGeneralInject, apply: uiSettingsGeneralApply },
+    { inject: uiSettingsModelsInject, apply: uiSettingsModelsApply },
     { inject: uiChatInject, apply: uiChatApply },
     { inject: uiApprovalInject, apply: uiApprovalApply },
     { inject: uiToolInject, apply: uiToolApply },

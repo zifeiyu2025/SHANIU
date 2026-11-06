@@ -2004,6 +2004,15 @@
    "@deepseek-ai/dsh-client-ui-settings-general/client": [
     "./src/dsh/packages/client/ui-settings-general/src/client/index.ts"
    ],
+   "@deepseek-ai/dsh-client-ui-settings-models": [
+    "./src/dsh/packages/client/ui-settings-models/src/index.ts"
+   ],
+   "@deepseek-ai/dsh-client-ui-settings-models/*": [
+    "./src/dsh/packages/client/ui-settings-models/src/*"
+   ],
+   "@deepseek-ai/dsh-client-ui-settings-models/client": [
+    "./src/dsh/packages/client/ui-settings-models/src/client/index.ts"
+   ],
    "@deepseek-ai/dsh-api-remotes/client": [
     "./src/dsh/packages/api/remotes/src/client/index.ts"
    ],
@@ -2152,6 +2161,9 @@
     "./src/transport/shims/remote-module.ts"
    ],
    "@deepseek-ai/dsh-client-ui-settings-general/remote": [
+    "./src/transport/shims/remote-module.ts"
+   ],
+   "@deepseek-ai/dsh-client-ui-settings-models/remote": [
     "./src/transport/shims/remote-module.ts"
    ],
    "@deepseek-ai/dsh-client-ui-settings-plugin-inventory/remote": [
@@ -2629,6 +2641,7 @@
   "./src/dsh/packages/api/remote-access/src/snapshot.ts",
   "./src/dsh/packages/api/remote-access/src/types.ts",
   "./src/dsh/packages/api/remotes/src/client/index.ts",
+  "./src/transport/shims/remotes-client.ts",
   "./src/dsh/packages/api/remotes/src/remote-events.ts",
   "./src/dsh/packages/api/remotes/src/types.ts",
   "./src/dsh/packages/api/session-controller/src/client/contract/events.ts",
@@ -3270,6 +3283,36 @@
   "./src/dsh/packages/client/ui-settings-general/src/client/shell-store.ts",
   "./src/dsh/packages/client/ui-settings-general/src/css-modules.d.ts",
   "./src/dsh/packages/client/ui-settings-general/src/types.ts",
+  "./src/dsh/packages/client/ui-settings-models/src/client/ApiKeyInput.tsx",
+  "./src/dsh/packages/client/ui-settings-models/src/client/CustomProviderCard.tsx",
+  "./src/dsh/packages/client/ui-settings-models/src/client/DeepSeekModelsEditor.tsx",
+  "./src/dsh/packages/client/ui-settings-models/src/client/DeepSeekOnboardingDialog.module.css",
+  "./src/dsh/packages/client/ui-settings-models/src/client/DeepSeekOnboardingDialog.tsx",
+  "./src/dsh/packages/client/ui-settings-models/src/client/EditorFooter.tsx",
+  "./src/dsh/packages/client/ui-settings-models/src/client/ModelInputTypes.tsx",
+  "./src/dsh/packages/client/ui-settings-models/src/client/ModelListEditor.tsx",
+  "./src/dsh/packages/client/ui-settings-models/src/client/ModelReasoningEfforts.tsx",
+  "./src/dsh/packages/client/ui-settings-models/src/client/ModelRow.tsx",
+  "./src/dsh/packages/client/ui-settings-models/src/client/ModelsSection.module.css",
+  "./src/dsh/packages/client/ui-settings-models/src/client/ModelsSection.tsx",
+  "./src/dsh/packages/client/ui-settings-models/src/client/OnboardingModal.module.css",
+  "./src/dsh/packages/client/ui-settings-models/src/client/OnboardingModal.tsx",
+  "./src/dsh/packages/client/ui-settings-models/src/client/ProviderEditor.tsx",
+  "./src/dsh/packages/client/ui-settings-models/src/client/WelcomeNotice.module.css",
+  "./src/dsh/packages/client/ui-settings-models/src/client/WelcomeNotice.tsx",
+  "./src/dsh/packages/client/ui-settings-models/src/client/apiKey.ts",
+  "./src/dsh/packages/client/ui-settings-models/src/client/index.ts",
+  "./src/dsh/packages/client/ui-settings-models/src/client/locales.ts",
+  "./src/dsh/packages/client/ui-settings-models/src/client/operations.ts",
+  "./src/dsh/packages/client/ui-settings-models/src/client/protocol-label.ts",
+  "./src/dsh/packages/client/ui-settings-models/src/client/schema-operations.ts",
+  "./src/dsh/packages/client/ui-settings-models/src/client/slot-contract.ts",
+  "./src/dsh/packages/client/ui-settings-models/src/client/store.ts",
+  "./src/dsh/packages/client/ui-settings-models/src/client/useModelRows.ts",
+  "./src/dsh/packages/client/ui-settings-models/src/client/welcome-store.ts",
+  "./src/dsh/packages/client/ui-settings-models/src/css-modules.d.ts",
+  "./src/dsh/packages/client/ui-settings-models/src/onboarding-config.ts",
+  "./src/dsh/packages/client/ui-settings-models/src/onboarding-copy.ts",
   "./src/dsh/packages/client/ui-settings/src/client/config-form-types.ts",
   "./src/dsh/packages/client/ui-settings/src/client/config-form.ts",
   "./src/dsh/packages/client/ui-settings/src/client/contract/slots.ts",
