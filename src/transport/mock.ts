@@ -121,6 +121,108 @@ function pushPermission(sessionId: string, currentValue: string): void {
   })
 }
 
+/** 每个会话的 mock journal：已提交事件（供重开 follow 回放）+ seq 游标 + 帧广播 + 流式 revision。 */
+interface MockJournal {
+  seq: number
+  revision: number
+  readonly records: unknown[]
+  readonly frames: ReturnType<typeof createFrameBroadcast<Record<string, unknown>>>
+}
+
+const JOURNALS = new Map<string, MockJournal>()
+
+function journalOf(sessionId: string): MockJournal {
+  let journal = JOURNALS.get(sessionId)
+  if (journal === undefined) {
+    journal = { seq: -1, revision: 0, records: [], frames: createFrameBroadcast<Record<string, unknown>>() }
+    JOURNALS.set(sessionId, journal)
+  }
+  return journal
+}
+
+/** 会话标题：侧栏行与会话头都读 `title` 投影。 */
+const SESSION_TITLES = new Map<string, string>([
+  [SESSION_IDS[0], '问候'],
+  [SESSION_IDS[1], '性能排查'],
+])
+
+/** 固定演示剧本：本地 mock，不联网、不调用任何模型。 */
+const DEMO_REPLY = '你好！我是 SHANIU 的助手。这条回复来自本地 mock 剧本，用于演示流式渲染、消息动作条与用量统计。'
+
+function chunksOf(text: string, size: number): string[] {
+  const parts: string[] = []
+  for (let index = 0; index < text.length; index += size) parts.push(text.slice(index, index + size))
+  return parts
+}
+
+/**
+ * 演示用助手回合：按真实 wire 形状推 journal 事件与 assistant-stream 帧。
+ * 两条硬约束来自客户端的 journal 流（gateway/client/journal-stream.ts）：
+ * 事件 seq 必须严格 +1（否则触发 page 补齐并报协议错），
+ * assistant-stream 的 revision 必须跨回合单调 +1。
+ */
+function startMockTurn(sessionId: string, requestId: string | undefined, text: string): void {
+  const journal = journalOf(sessionId)
+  const pushEvent = (type: string, data: unknown, extra: Record<string, unknown> = {}, time = Date.now()): number => {
+    journal.seq += 1
+    const record = { type: 'event', event: { type, seq: journal.seq, time, ...extra, data } }
+    journal.records.push(record)
+    journal.frames.push(record)
+    return journal.seq
+  }
+  void (async () => {
+    if (!SESSION_TITLES.has(sessionId)) {
+      const title = text.trim().slice(0, 12) || '新会话'
+      SESSION_TITLES.set(sessionId, title)
+      projectionFrames.push({
+        type: 'projection',
+        sessionId,
+        seq: ++projectionSeq,
+        changes: [{ key: 'title', val: title }],
+      })
+    }
+    const turnStart = Date.now()
+    pushEvent('turn/start', { turn: 0 }, {}, turnStart)
+    pushEvent('step/start', { turn: 0, step: 0 })
+    const userSeq = pushEvent('user/message', {
+      id: `mock-user-${journal.seq + 1}`,
+      role: 'user',
+      content: [{ type: 'text', text }],
+      // rpcId 必须等于 prompt 请求里的 requestId，客户端据此去重掉本地乐观回显
+      source: { kind: 'user', ...(requestId === undefined ? {} : { rpcId: requestId }) },
+    }, { surfaceOp: 'append' })
+
+    const attemptId = `mock-attempt-${sessionId}-${journal.revision + 1}`
+    const pushStream = (frame: Record<string, unknown>): void => {
+      journal.revision += 1
+      journal.frames.push({ type: 'assistant-stream', frame: { ...frame, attemptId, revision: journal.revision } })
+    }
+    pushStream({ type: 'start', startedAfterSeq: userSeq, turn: 0, step: 0 })
+    let index = 0
+    for (const chunk of chunksOf(DEMO_REPLY, 6)) {
+      await new Promise<void>(resolve => setTimeout(resolve, 45))
+      pushStream({ type: 'chunk', index, time: Date.now(), chunk: { type: 'text-delta', index: 0, text: chunk } })
+      index += 1
+    }
+    const assistantSeq = pushEvent('assistant/message', {
+      turn: 0, step: 0,
+      message: {
+        id: `mock-assistant-${journal.seq + 1}`,
+        role: 'assistant',
+        content: [{ type: 'text', text: DEMO_REPLY }],
+        source: { kind: 'model', provider: 'mock-provider', model: 'mock-model-a' },
+      },
+      stream: [],
+      // 三个桶齐全时必须满足 total = input + output + read + write
+      usage: { inputTokens: 9600, outputTokens: 300, totalTokens: 9900, cacheReadTokens: 0, cacheWriteTokens: 0 },
+    }, { surfaceOp: 'append' })
+    pushStream({ type: 'end', index, outcome: { kind: 'committed', eventType: 'assistant/message', seq: assistantSeq } })
+    pushEvent('step/end', { turn: 0, step: 0 })
+    // turn/end 的时间决定「已完成，用时 N 秒」的显示时长
+    pushEvent('turn/end', { turn: 0, reason: { kind: 'completed' } }, {}, turnStart + 4000)
+  })()
+}
+
 function mockSessionRow(id: string, minutesAgo: number, running = false): SessionSummary {
   // wire 形状（types.ts 的 SessionSummary，sessionId 字段）——manager.projectList 按
   // entry.sessionId 重建 client 行；给成 client 形状（id 字段）会整行退化为 undefined key
@@ -191,6 +293,7 @@ function mockSessionNamespace(): unknown {
             values: {
               modelSelection: { lastUsed: null, next: selection },
               permissions: { currentValue: PERMISSION_BY_SESSION.get(id) ?? DEFAULT_PERMISSION },
+              title: SESSION_TITLES.get(id) ?? null,
             },
           }])),
         },
@@ -202,26 +305,39 @@ function mockSessionNamespace(): unknown {
       // 会话地址是联合类型：`{kind:'session', sessionId}` 或 `{kind:'subagent', childSessionId}`
       const address = (request as { address?: { kind?: string; sessionId?: string; childSessionId?: string } } | undefined)?.address
       const sessionId = address?.kind === 'session' ? address.sessionId : address?.childSessionId
+      const journal = sessionId === undefined ? undefined : journalOf(sessionId)
       yield {
         type: 'snapshot',
         header: { version: 0, id: '' as SessionId, createdAt: Date.now(), isSeeded: false },
-        // 空 journal：cursor = 会话 emptyCursor（-1），与 journal 流的空页校验一致
-        cursor: -1,
-        records: [],
+        // 回放已提交事件：cursor 必须等于最后一条 record 的 seq（空则 -1），
+        // 否则 journal 流会触发 page 补齐并判协议错
+        cursor: journal?.seq ?? -1,
+        records: journal?.records ?? [],
         hasMore: false,
         projections: {
           asOfSeq: 0,
           values: {
             modelSelection: { lastUsed: null, next: await currentModelSelection() },
             permissions: { currentValue: (sessionId === undefined ? undefined : PERMISSION_BY_SESSION.get(sessionId)) ?? DEFAULT_PERMISSION },
+            title: sessionId === undefined ? null : (SESSION_TITLES.get(sessionId) ?? null),
           },
         },
-        assistantStream: { revision: 0 },
+        assistantStream: { revision: journal?.revision ?? 0 },
       }
-      await new Promise<void>(() => {})
+      // 存档回放完毕后接着推实时帧（助手回合的事件与流式块）
+      if (journal !== undefined) {
+        for await (const frame of journal.frames.subscribe()) yield frame
+      }
     },
     page: async () => OK({ records: [], hasMore: false }),
-    prompt: async () => OK({}),
+    prompt: async (request: { requestId?: string; sessionId?: string; content?: readonly { type: string; text?: string }[] } = {}) => {
+      const text = (request.content ?? [])
+        .filter(part => part.type === 'text')
+        .map(part => part.text ?? '')
+        .join('')
+      if (request.sessionId !== undefined) startMockTurn(request.sessionId, request.requestId, text)
+      return OK({ accepted: true })
+    },
     cancel: async () => OK({ accepted: false }),
     rename: async () => OK({}),
     attachment: async () => OK({}),
