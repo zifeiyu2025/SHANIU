@@ -1,0 +1,63 @@
+/* 输入框右键菜单（host/input-context-menu.ts 注入的 DOM）。
+   全局表（非 CSS Modules），类名稳定；颜色/圆角/阴影一律取 DSH 主题变量，
+   与 ui-primitives 的 Menu 表面同一套 token。 */
+
+.sn-input-menu {
+  position: fixed;
+  z-index: 10000;
+  min-width: 176px;
+  padding: 4px;
+  display: flex;
+  flex-direction: column;
+  border: 0;
+  border-radius: var(--dsw-radius-md);
+  /* 与 ui-primitives 的 Menu 表面同构：半透明底 + backdrop 模糊 + 色带描边，
+     缺了 backdrop-filter 会退化成一块灰板。 */
+  --dsw-elevation-stroke-color: var(--dsw-alias-border-l1);
+  background: var(--dsw-menu-surface-fill);
+  backdrop-filter: var(--dsw-menu-backdrop-filter);
+  -webkit-backdrop-filter: var(--dsw-menu-backdrop-filter);
+  box-shadow: var(--dsw-elevation-prominent);
+  color: var(--dsw-alias-label-primary);
+  font-size: 13px;
+  line-height: 1.4;
+  user-select: none;
+}
+
+.sn-input-menu-item {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 24px;
+  width: 100%;
+  padding: 6px 10px;
+  border: 0;
+  border-radius: var(--dsw-radius-sm);
+  background: transparent;
+  color: inherit;
+  font: inherit;
+  text-align: left;
+  cursor: default;
+}
+
+.sn-input-menu-item:hover:not(:disabled) {
+  background: var(--dsw-alias-interactive-bg-hover);
+}
+
+.sn-input-menu-item:disabled {
+  color: var(--dsw-alias-label-secondary);
+  opacity: 0.55;
+}
+
+.sn-input-menu-shortcut {
+  flex: none;
+  color: var(--dsw-alias-label-secondary);
+  font-size: 11px;
+  font-variant-numeric: tabular-nums;
+}
+
+.sn-input-menu-sep {
+  height: 1px;
+  margin: 4px 6px;
+  background: var(--dsw-alias-border-l2);
+}

@@ -440,6 +440,75 @@ fn get_product_dirs() -> config::ProductDirsView {
     config::resolve_dirs_from_env().view()
 }
 
+/// 读取系统剪贴板的纯文本（输入框右键菜单「粘贴」）。
+///
+/// 桌面必须走宿主：WebView2 的 `navigator.clipboard.readText()` 走权限提示，
+/// 被拒时粘贴会静默失败。读不到文本（无剪贴板内容/格式不符）返回空串。
+#[tauri::command]
+fn read_clipboard_text() -> Result<String, String> {
+    use windows::Win32::Foundation::HGLOBAL;
+    use windows::Win32::System::DataExchange::{
+        CloseClipboard, GetClipboardData, IsClipboardFormatAvailable, OpenClipboard,
+    };
+    use windows::Win32::System::Memory::{GlobalLock, GlobalUnlock};
+    use windows::Win32::System::Ole::CF_UNICODETEXT;
+
+    unsafe {
+        OpenClipboard(None).map_err(|e| format!("打开剪贴板失败: {e}"))?;
+        let read = (|| -> Result<String, String> {
+            if IsClipboardFormatAvailable(CF_UNICODETEXT.0 as u32).is_err() {
+                return Ok(String::new());
+            }
+            let handle = GetClipboardData(CF_UNICODETEXT.0 as u32)
+                .map_err(|e| format!("读取剪贴板失败: {e}"))?;
+            let hglobal = HGLOBAL(handle.0);
+            let ptr = GlobalLock(hglobal);
+            if ptr.is_null() {
+                return Err("剪贴板内存不可读".into());
+            }
+            let text = windows::core::PCWSTR(ptr as *const u16).to_string().unwrap_or_default();
+            let _ = GlobalUnlock(hglobal);
+            Ok(text)
+        })();
+        let _ = CloseClipboard();
+        read
+    }
+}
+
+/// 写入系统剪贴板的纯文本（execCommand 复制失败时的兜底）。
+#[tauri::command]
+fn write_clipboard_text(text: String) -> Result<(), String> {
+    use windows::Win32::Foundation::HANDLE;
+    use windows::Win32::System::DataExchange::{
+        CloseClipboard, EmptyClipboard, OpenClipboard, SetClipboardData,
+    };
+    use windows::Win32::System::Memory::{GlobalAlloc, GlobalLock, GlobalUnlock, GMEM_MOVEABLE};
+    use windows::Win32::System::Ole::CF_UNICODETEXT;
+
+    unsafe {
+        OpenClipboard(None).map_err(|e| format!("打开剪贴板失败: {e}"))?;
+        let write = (|| -> Result<(), String> {
+            EmptyClipboard().map_err(|e| format!("清空剪贴板失败: {e}"))?;
+            let wide: Vec<u16> = text.encode_utf16().chain(std::iter::once(0)).collect();
+            let bytes = wide.len() * std::mem::size_of::<u16>();
+            let hmem = GlobalAlloc(GMEM_MOVEABLE, bytes)
+                .map_err(|e| format!("分配剪贴板内存失败: {e}"))?;
+            let ptr = GlobalLock(hmem);
+            if ptr.is_null() {
+                return Err("剪贴板内存不可写".into());
+            }
+            std::ptr::copy_nonoverlapping(wide.as_ptr().cast::<u8>(), ptr.cast::<u8>(), bytes);
+            let _ = GlobalUnlock(hmem);
+            // 成功后内存所有权移交系统，不能再释放
+            SetClipboardData(CF_UNICODETEXT.0 as u32, Some(HANDLE(hmem.0)))
+                .map_err(|e| format!("写入剪贴板失败: {e}"))?;
+            Ok(())
+        })();
+        let _ = CloseClipboard();
+        write
+    }
+}
+
 /// 从托盘恢复主窗口：取消最小化 + 显示 + 聚焦。
 fn show_main_window(app: &tauri::AppHandle) {
     if let Some(window) = app.get_webview_window("main") {
@@ -494,7 +563,9 @@ pub fn run() {
             save_settings,
             open_in_explorer,
             pick_folder,
-            get_product_dirs
+            get_product_dirs,
+            read_clipboard_text,
+            write_clipboard_text
         ])
         .on_window_event(|window, event| {
             // 关闭 = 隐藏到系统托盘（不退出）；真正退出只走托盘菜单「退出」

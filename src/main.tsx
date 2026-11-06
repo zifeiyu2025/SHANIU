@@ -1,6 +1,7 @@
 import { bootShaniu } from './dsh-boot';
 import { installWindowChrome } from './host/tauri-chrome';
 import { installDesktopEnvironment } from './host/desktop-env';
+import { installInputContextMenu } from './host/input-context-menu';
 
 // DSH 壳的基座样式（base.css：reset + boot page 变量）
 import '@deepseek-ai/dsh-client-web/base.css';
@@ -17,6 +18,10 @@ if ('__TAURI_INTERNALS__' in window) {
   installWindowChrome();
   installDesktopEnvironment();
 }
+
+// 所有输入框的右键菜单：桌面发布版没有可用的 WebView2 默认菜单，统一由宿主自绘，
+// 开发窗口与浏览器联调看到的是同一套行为。
+installInputContextMenu();
 
 bootShaniu(el).catch((reason: unknown) => {
   console.error(reason);
