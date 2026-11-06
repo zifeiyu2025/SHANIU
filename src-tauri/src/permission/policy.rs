@@ -29,6 +29,9 @@ pub struct SessionPolicy {
 pub fn risk_of(tool_name: &str) -> RiskLevel {
     match tool_name {
         "read_file" | "list_dir" | "search" => RiskLevel::Read,
+        // todo_write（SH-108）：会话内任务清单，不触碰工作区，上游同名工具从不审批；
+        // Read 档让它进计划态白名单（计划态列 todo 是上游规划工作流的形态）。
+        "todo_write" => RiskLevel::Read,
         "apply_patch" => RiskLevel::WriteInWorkspace,
         "unified_exec" => RiskLevel::Execute,
         // Plan Mode：进入免确认（read 档）；退出必须用户评审（ADR-003）
@@ -82,6 +85,8 @@ mod tests {
         assert_eq!(risk_of("read_file"), RiskLevel::Read);
         assert_eq!(risk_of("list_dir"), RiskLevel::Read);
         assert_eq!(risk_of("search"), RiskLevel::Read);
+        // todo_write（SH-108）：会话内清单不触碰工作区，永不审批
+        assert_eq!(risk_of("todo_write"), RiskLevel::Read);
     }
 
     #[test]
@@ -128,6 +133,8 @@ mod tests {
         assert!(plan_mode_allows("read_file"));
         assert!(plan_mode_allows("list_dir"));
         assert!(plan_mode_allows("search"));
+        // 计划态列 todo 是上游规划工作流的形态（清单就是规划产物）
+        assert!(plan_mode_allows("todo_write"));
         assert!(plan_mode_allows("exit_plan_mode"));
         assert!(!plan_mode_allows("apply_patch"));
         assert!(!plan_mode_allows("unified_exec"));
