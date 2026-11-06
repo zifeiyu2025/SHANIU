@@ -1,0 +1,113 @@
+/* 无边框窗口的宿主控制层样式，由 src/host/chrome.ts 注入的 DOM 使用。
+   全局表（非 CSS Modules），类名保持稳定；颜色一律取 DSH 主题变量，随 data-theme 翻。 */
+
+.sn-chrome {
+  position: fixed;
+  inset: 0;
+  /* DSH 自有浮层最高 1101（dockkit），控制层必须压在其上才接得到边缘按下 */
+  z-index: 9999;
+  /* 整块透明：只有按钮和手柄各自接事件，否则覆盖层会吞掉 app 内容的点击 */
+  pointer-events: none;
+}
+
+.sn-caption {
+  position: absolute;
+  top: 0;
+  right: 0;
+  display: flex;
+  height: var(--dsh-windows-titlebar-height, 40px);
+  pointer-events: none;
+}
+
+.sn-caption-btn {
+  /* Windows 标题按钮档口：46x40，无圆角、无描边 */
+  position: relative;
+  /* 压在东北角缩放手柄之上：按钮永远点得动，缩让步给命中区更小的角 */
+  z-index: 2;
+  width: 46px;
+  height: 100%;
+  display: grid;
+  place-items: center;
+  padding: 0;
+  border: 0;
+  border-radius: 0;
+  background: transparent;
+  color: var(--dsw-alias-label-primary);
+  pointer-events: auto;
+  cursor: default;
+}
+
+.sn-caption-btn:hover {
+  background: var(--dsw-alias-interactive-bg-hover);
+}
+
+.sn-caption-btn:active {
+  background: var(--dsw-alias-interactive-bg-active);
+}
+
+.sn-close:hover {
+  background: var(--dsw-alias-interactive-bg-hover-danger);
+}
+
+.sn-caption-btn > svg,
+.sn-glyph-restore > svg {
+  width: 10px;
+  height: 10px;
+  display: block;
+}
+
+/* 最大化/还原两枚图形靠 html[data-maximized] 切换，该属性由 chrome.ts 回查窗口后写入 */
+.sn-glyph-restore {
+  display: none;
+}
+
+html[data-maximized] .sn-caption-btn > svg {
+  display: none;
+}
+
+html[data-maximized] .sn-glyph-restore {
+  display: block;
+}
+
+/* 缩放手柄：贴窗口外沿的透明条。边 5px、角 12px，和 Windows 命中档一致。
+   角在手之后追加且同为 z-index:1，重叠处由角接管。 */
+.sn-resize {
+  position: absolute;
+  z-index: 1;
+  pointer-events: auto;
+}
+
+.sn-resize-north,
+.sn-resize-south {
+  left: 12px;
+  right: 12px;
+  height: 5px;
+  cursor: ns-resize;
+}
+
+.sn-resize-north { top: 0; }
+.sn-resize-south { bottom: 0; }
+
+.sn-resize-east,
+.sn-resize-west {
+  top: 12px;
+  bottom: 12px;
+  width: 5px;
+  cursor: ew-resize;
+}
+
+.sn-resize-west { left: 0; }
+.sn-resize-east { right: 0; }
+
+.sn-resize-northwest,
+.sn-resize-northeast,
+.sn-resize-southwest,
+.sn-resize-southeast {
+  width: 12px;
+  height: 12px;
+}
+
+.sn-resize-northwest { left: 0; top: 0; cursor: nwse-resize; }
+.sn-resize-northeast { right: 0; top: 0; cursor: nesw-resize; }
+.sn-resize-southwest { left: 0; bottom: 0; cursor: nesw-resize; }
+.sn-resize-southeast { right: 0; bottom: 0; cursor: nwse-resize; }
