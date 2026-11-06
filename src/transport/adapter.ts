@@ -21,6 +21,7 @@
  */
 import { RemoteError } from '@deepseek-ai/dsh-typert-protocol'
 import type { SessionId } from '@deepseek-ai/dsh-session/types'
+import type { WorkspaceId } from '@deepseek-ai/dsh-workspace/types'
 import type { MessageId } from '@deepseek-ai/dsh-llm'
 import { createSettingsFace } from './settings-face'
 import type { AgentEvent, EventMsg } from './types'
@@ -35,6 +36,7 @@ const FAIL = (message: string) =>
  * （铸造函数在宿主编译域，typecheck 域外），这里的显式转换表达"裸 id 进类型化载荷"。
  */
 const asSessionId = (id: string) => id as unknown as SessionId
+const asWorkspaceId = (id: string) => id as unknown as WorkspaceId
 
 /**
  * DSH 一维权限挡位 ↔ 宿主 `sandbox.mode` 的映射（产品拍板，2026-11-07）。
@@ -1431,30 +1433,122 @@ export function createAdapter(options: AdapterOptions): { remote: unknown; dispo
   const workspaceLog = new FrameLog()
   const bootedAt = new Date().toISOString()
 
-  const hostWorkspaceView = async (): Promise<Record<string, unknown>> => {
+  /** 归档/置顶/手动排序的宿主侧车状态（SH-100，`get_workspace_flags` 的形状）。 */
+  interface WorkspaceFlags {
+    readonly archivedSessionIds: readonly string[]
+    readonly pinnedSessionIds: readonly string[]
+    readonly sessionOrder: readonly string[]
+  }
+  let workspaceFlags: WorkspaceFlags = { archivedSessionIds: [], pinnedSessionIds: [], sessionOrder: [] }
+  const readWorkspaceFlags = async (): Promise<WorkspaceFlags> => {
+    workspaceFlags = await bridge
+      .invoke<WorkspaceFlags>('get_workspace_flags')
+      .catch((): WorkspaceFlags => workspaceFlags)
+    return workspaceFlags
+  }
+
+  /**
+   * 单工作区视图。`sessionIds` 按 SH-100 的手动顺序排（侧车序 ∩ 现存，缺的按列表
+   * 序补位）——上游 per-workspace `sessionIds` 数组就是展示顺序；归档会话**保留
+   * 槽位**（上游"never touches workspace accounting"），隐藏由客户端按
+   * archivedSessionIds 集过滤，不从视图里删。
+   */
+  const hostWorkspaceView = async (flags: WorkspaceFlags = workspaceFlags): Promise<Record<string, unknown>> => {
     const path = face.workspaceRoot()
     const rows = await bridge.invoke<{ agentId: string; workspaceRoot: string; updatedAt: number }[]>('list_sessions')
       .catch((): [] => [])
     const mine = rows.filter(row => row.workspaceRoot === path)
     const latest = mine.reduce((max, row) => Math.max(max, row.updatedAt), 0)
+    const ordered = [
+      ...flags.sessionOrder.filter(id => mine.some(row => row.agentId === id)),
+      ...mine.filter(row => !flags.sessionOrder.includes(row.agentId)).map(row => row.agentId),
+    ]
     return {
       workspaceId: HOST_WORKSPACE_ID,
       path,
       // 上游按 title === 'default-workspace' 判定首启自动标题并渲染成「默认工作区」
       title: HOST_WORKSPACE_ID,
-      sessionIds: mine.map(row => row.agentId),
+      sessionIds: ordered,
       createdAt: bootedAt,
       updatedAt: latest === 0 ? bootedAt : new Date(latest).toISOString(),
     }
   }
 
+  /** 集合变化检测：全量替换帧只在集合真的变了时发（上游 feed 的同口径）。 */
+  const sameSet = (a: readonly string[], b: readonly string[]): boolean =>
+    a.length === b.length && a.every((id, index) => id === b[index])
+
+  /** 宿主 WorkspaceOpError → wire 错误码（上游 workspace-controller types.ts 的同一批语义）。 */
+  /** 变更上下文：details 类型按 vendored RemoteErrorDetailsMap 的形状要求携带。 */
+  interface WorkspaceOpContext {
+    readonly sessionId?: string
+    readonly beforeSessionId?: string
+  }
+  const workspaceOpFailure = (
+    reason: unknown,
+    context: WorkspaceOpContext = {},
+  ): { ok: false; error: RemoteError } => {
+    const failure = reason as { code?: unknown; message?: unknown }
+    const message = typeof failure?.message === 'string' ? failure.message : String(reason)
+    const code = typeof failure?.code === 'string' ? failure.code : ''
+    switch (code) {
+      // activity 空：SHANIU 的活动判定只有"任务闸占着"一个来源，没有更细的清单可给
+      case 'session-active':
+        return {
+          ok: false,
+          error: new RemoteError('workspace/session-active', message, {
+            sessionId: asSessionId(context.sessionId ?? ''),
+            activity: [],
+          }),
+        }
+      case 'not-found':
+        return {
+          ok: false,
+          error: new RemoteError('session/not-found', message, { sessionId: asSessionId(context.sessionId ?? '') }),
+        }
+      case 'pin-archived':
+        return { ok: false, error: new RemoteError('gateway/bad-request', message, {}) }
+      case 'move-invalid':
+        return {
+          ok: false,
+          error: new RemoteError('workspace/move-invalid', message, {
+            workspaceId: asWorkspaceId(HOST_WORKSPACE_ID),
+            sessionId: asSessionId(context.sessionId ?? ''),
+            ...(context.beforeSessionId === undefined ? {} : { beforeSessionId: asSessionId(context.beforeSessionId) }),
+          }),
+        }
+      default:
+        return { ok: false, error: new RemoteError('gateway/internal', message, {}) }
+    }
+  }
+
+  /** 变更后统一收口：重读宿主侧车 → 对比推帧（archived/pinned/order）→ 返回集合值。 */
+  const applyFlagsMutation = async (
+    previous: WorkspaceFlags,
+    value: Record<string, unknown>,
+    orderChanged: boolean,
+  ): Promise<Record<string, unknown>> => {
+    const next = await readWorkspaceFlags()
+    if (!sameSet(previous.archivedSessionIds, next.archivedSessionIds)) {
+      workspaceLog.append({ type: 'archived', archivedSessionIds: next.archivedSessionIds })
+    }
+    if (!sameSet(previous.pinnedSessionIds, next.pinnedSessionIds)) {
+      workspaceLog.append({ type: 'pinned', pinnedSessionIds: next.pinnedSessionIds })
+    }
+    if (orderChanged || !sameSet(previous.sessionOrder, next.sessionOrder)) {
+      workspaceLog.append({ type: 'upsert', workspace: await hostWorkspaceView(next) })
+    }
+    return value
+  }
+
   const workspaceNamespace = {
     follow: async function* (): AsyncGenerator<Record<string, unknown>> {
       await face.refresh()
+      const flags = await readWorkspaceFlags()
       const from = workspaceLog.length
       yield {
         type: 'baseline',
-        value: { items: [await hostWorkspaceView()], archivedSessionIds: [], pinnedSessionIds: [] },
+        value: { items: [await hostWorkspaceView(flags)], archivedSessionIds: flags.archivedSessionIds, pinnedSessionIds: flags.pinnedSessionIds },
       }
       for await (const frame of workspaceLog.tail(from)) yield frame
     },
@@ -1467,11 +1561,59 @@ export function createAdapter(options: AdapterOptions): { remote: unknown; dispo
     create: () => unimplemented('workspace.create', 'SH-099'),
     rename: () => unimplemented('workspace.rename', 'SH-099'),
     delete: () => unimplemented('workspace.delete', 'SH-099'),
-    archiveSession: () => unimplemented('workspace.archiveSession', 'SH-100'),
-    unarchiveSession: () => unimplemented('workspace.unarchiveSession', 'SH-100'),
-    pinSession: () => unimplemented('workspace.pinSession', 'SH-100'),
-    unpinSession: () => unimplemented('workspace.unpinSession', 'SH-100'),
-    insertSessionBefore: () => unimplemented('workspace.insertSessionBefore', 'SH-100'),
+    archiveSession: async (request: { sessionId?: string; stopActivity?: boolean } = {}) => {
+      const sessionId = request.sessionId ?? ''
+      const previous = await readWorkspaceFlags()
+      try {
+        const value = await bridge.invoke<Record<string, unknown>>('archive_session', {
+          sessionId,
+          ...(request.stopActivity === true ? { stopActivity: true } : {}),
+        })
+        return OK(await applyFlagsMutation(previous, value, false))
+      } catch (reason) {
+        return workspaceOpFailure(reason, { sessionId: request.sessionId ?? '' })
+      }
+    },
+    unarchiveSession: async (request: { sessionId?: string } = {}) => {
+      const previous = await readWorkspaceFlags()
+      try {
+        const value = await bridge.invoke<Record<string, unknown>>('unarchive_session', { sessionId: request.sessionId ?? '' })
+        return OK(await applyFlagsMutation(previous, value, false))
+      } catch (reason) {
+        return workspaceOpFailure(reason)
+      }
+    },
+    pinSession: async (request: { sessionId?: string } = {}) => {
+      const previous = await readWorkspaceFlags()
+      try {
+        const value = await bridge.invoke<Record<string, unknown>>('pin_session', { sessionId: request.sessionId ?? '' })
+        return OK(await applyFlagsMutation(previous, value, false))
+      } catch (reason) {
+        return workspaceOpFailure(reason, { sessionId: request.sessionId ?? '' })
+      }
+    },
+    unpinSession: async (request: { sessionId?: string } = {}) => {
+      const previous = await readWorkspaceFlags()
+      try {
+        const value = await bridge.invoke<Record<string, unknown>>('unpin_session', { sessionId: request.sessionId ?? '' })
+        return OK(await applyFlagsMutation(previous, value, false))
+      } catch (reason) {
+        return workspaceOpFailure(reason, { sessionId: request.sessionId ?? '' })
+      }
+    },
+    insertSessionBefore: async (request: { sessionId?: string; beforeSessionId?: string } = {}) => {
+      const previous = await readWorkspaceFlags()
+      try {
+        const value = await bridge.invoke<Record<string, unknown>>('insert_session_before', {
+          sessionId: request.sessionId ?? '',
+          ...(request.beforeSessionId === undefined ? {} : { beforeSessionId: request.beforeSessionId }),
+        })
+        // 顺序变了：upsert 一帧携带重排后的 sessionIds（上游 order 变化的同款推送）
+        return OK(await applyFlagsMutation(previous, value, true))
+      } catch (reason) {
+        return workspaceOpFailure(reason, { sessionId: request.sessionId ?? '', beforeSessionId: request.beforeSessionId })
+      }
+    },
   }
 
   /**

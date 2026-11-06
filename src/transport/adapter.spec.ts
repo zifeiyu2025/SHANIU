@@ -59,6 +59,8 @@ function scriptedBridge(
   const calls: ScriptedBridge['calls'] = []
   const handlers = new Set<(event: AgentEvent) => void>()
   let counter = 0
+  // SH-100 的侧车状态（每份桥独立克隆，避免测试间串味）
+  const workspaceFlags = { archived: [] as string[], pinned: [] as string[], order: [] as string[] }
   // 宿主语义的关键一条：save_settings 落盘 config.toml，之后的 get_settings 回读新值。
   // 测试桥按同一语义模拟（每份桥独立的克隆，避免测试间串味），挡位切换的投影推帧
   // 才能测到"切换后 UI 显示新挡位"而不是停在旧值。
@@ -88,6 +90,47 @@ function scriptedBridge(
         if (renameFailure !== undefined) throw renameFailure
         const title = String(args?.title ?? '').trim()
         return (title === '' ? null : title) as T
+      }
+      // SH-100 的宿主替身：归档/置顶/顺序按真实宿主语义模拟（含集合互斥与排序补位）
+      if (command === 'get_workspace_flags') {
+        return { archivedSessionIds: [...workspaceFlags.archived], pinnedSessionIds: [...workspaceFlags.pinned], sessionOrder: [...workspaceFlags.order] } as T
+      }
+      if (command === 'archive_session') {
+        const id = String(args?.sessionId ?? '')
+        // 运行中的会话：不带 stopActivity 拒绝（session-active），带了先取消再归档
+        if (id === 'agent-running' && args?.stopActivity !== true) throw { code: 'session-active', message: `会话 ${id} 正在运行：先停止任务，或携带 stopActivity 归档` }
+        if (id === 'agent-ghost') throw { code: 'not-found', message: `会话档案不存在：${id}` }
+        if (!workspaceFlags.archived.includes(id)) workspaceFlags.archived.push(id)
+        workspaceFlags.pinned = workspaceFlags.pinned.filter(pinned => pinned !== id)
+        return { archivedSessionIds: [...workspaceFlags.archived] } as T
+      }
+      if (command === 'unarchive_session') {
+        const id = String(args?.sessionId ?? '')
+        workspaceFlags.archived = workspaceFlags.archived.filter(item => item !== id)
+        return { archivedSessionIds: [...workspaceFlags.archived] } as T
+      }
+      if (command === 'pin_session') {
+        const id = String(args?.sessionId ?? '')
+        if (id === 'agent-ghost') throw { code: 'not-found', message: `会话档案不存在：${id}` }
+        if (workspaceFlags.archived.includes(id)) throw { code: 'pin-archived', message: `会话 ${id} 已归档：先取消归档才能置顶` }
+        if (!workspaceFlags.pinned.includes(id)) workspaceFlags.pinned.unshift(id)
+        return { pinnedSessionIds: [...workspaceFlags.pinned] } as T
+      }
+      if (command === 'unpin_session') {
+        const id = String(args?.sessionId ?? '')
+        if (id === 'agent-ghost') throw { code: 'not-found', message: `会话档案不存在：${id}` }
+        workspaceFlags.pinned = workspaceFlags.pinned.filter(item => item !== id)
+        return { pinnedSessionIds: [...workspaceFlags.pinned] } as T
+      }
+      if (command === 'insert_session_before') {
+        const id = String(args?.sessionId ?? '')
+        const before = args?.beforeSessionId as string | undefined
+        if (id === 'agent-ghost' || before === 'agent-ghost') throw { code: 'not-found', message: '会话档案不存在' }
+        if (before !== undefined && !workspaceFlags.order.includes(before)) throw { code: 'move-invalid', message: `锚点会话 ${before} 不在排序账户里` }
+        workspaceFlags.order = workspaceFlags.order.filter(item => item !== id)
+        if (before === undefined) workspaceFlags.order.push(id)
+        else workspaceFlags.order.splice(workspaceFlags.order.indexOf(before), 0, id)
+        return { sessionOrder: [...workspaceFlags.order] } as T
       }
       return undefined as T
     },
@@ -1366,5 +1409,125 @@ describe('todos 投影（SH-108：todo_write → journal todo/write → TodoDock
     const liveWrite = liveJournal.find(event => event['type'] === 'todo/write')
     const replayWrite = replayJournal.find(event => event['type'] === 'todo/write')
     expect(replayWrite!['data']).toEqual(liveWrite!['data'])
+  })
+})
+
+describe('workspace 面：归档/置顶/手动排序（SH-100）', () => {
+  interface WorkspaceTestFace {
+    workspace: {
+      follow(): AsyncGenerator<Record<string, unknown>>
+      archiveSession(request: Record<string, unknown>): Promise<Record<string, unknown>>
+      unarchiveSession(request: Record<string, unknown>): Promise<Record<string, unknown>>
+      pinSession(request: Record<string, unknown>): Promise<Record<string, unknown>>
+      unpinSession(request: Record<string, unknown>): Promise<Record<string, unknown>>
+      insertSessionBefore(request: Record<string, unknown>): Promise<Record<string, unknown>>
+    }
+  }
+
+  const faceOfWorkspace = (remote: unknown): WorkspaceTestFace => remote as WorkspaceTestFace
+
+  it('baseline 带归档/置顶集合；归档推 archived 全量替换帧', async () => {
+    const bridge = scriptedBridge()
+    const { remote, dispose } = createAdapter({ bridge })
+    const face = faceOfWorkspace(remote)
+    const iterator = face.workspace.follow()
+    const baseline = ((await iterator.next()).value as { value: Record<string, unknown> }).value
+    expect(baseline['archivedSessionIds']).toEqual([])
+    expect(baseline['pinnedSessionIds']).toEqual([])
+
+    const result = await face.workspace.archiveSession({ sessionId: 'agent-new' })
+    expect(result['ok']).toBe(true)
+    expect((result['value'] as { archivedSessionIds: string[] }).archivedSessionIds).toEqual(['agent-new'])
+    const frame = (await iterator.next()).value as { type: string; archivedSessionIds: string[] }
+    expect(frame.type).toBe('archived')
+    expect(frame.archivedSessionIds).toEqual(['agent-new'])
+    await iterator.return?.(undefined)
+    dispose()
+  })
+
+  it('置顶 prepend（最近置顶在前）推 pinned 帧；归档即掉置顶（同一次写）', async () => {
+    const bridge = scriptedBridge()
+    const { remote, dispose } = createAdapter({ bridge })
+    const face = faceOfWorkspace(remote)
+    await face.workspace.pinSession({ sessionId: 'a' })
+    await face.workspace.pinSession({ sessionId: 'b' })
+    // 已置顶的幂等不重排
+    await face.workspace.pinSession({ sessionId: 'a' })
+    const iterator = face.workspace.follow()
+    const baseline = ((await iterator.next()).value as { value: Record<string, unknown> }).value
+    // prepend：最近置顶在前（上游 pinnedSessionIds 的 unshift 语义）
+    expect(baseline['pinnedSessionIds']).toEqual(['b', 'a'])
+
+    // 已置顶的会话归档：archived 与 pinned 两帧都推（一次写里两个集合都变了）
+    await face.workspace.archiveSession({ sessionId: 'a' })
+    const frames: Record<string, unknown>[] = []
+    for (let i = 0; i < 2; i += 1) frames.push((await iterator.next()).value as Record<string, unknown>)
+    expect(frames.map(frame => frame['type']).sort()).toEqual(['archived', 'pinned'])
+    const pinned = frames.find(frame => frame['type'] === 'pinned') as { pinnedSessionIds: string[] }
+    expect(pinned.pinnedSessionIds).toEqual(['b'])
+    await iterator.return?.(undefined)
+    dispose()
+  })
+
+  it('错误按类映射 wire 码：运行中/不存在/置顶已归档；stopActivity 先取消再归档', async () => {
+    const bridge = scriptedBridge()
+    const { remote, dispose } = createAdapter({ bridge })
+    const face = faceOfWorkspace(remote)
+    const active = await face.workspace.archiveSession({ sessionId: 'agent-running' })
+    expect(active['ok']).toBe(false)
+    expect((active['error'] as { code: string }).code).toBe('workspace/session-active')
+    expect((active['error'] as Error).message).toContain('agent-running')
+
+    const ghost = await face.workspace.archiveSession({ sessionId: 'agent-ghost' })
+    expect((ghost['error'] as { code: string }).code).toBe('session/not-found')
+
+    // stopActivity=true：宿主先取消再归档，一次成功
+    const stopped = await face.workspace.archiveSession({ sessionId: 'agent-running', stopActivity: true })
+    expect(stopped['ok']).toBe(true)
+    expect((stopped['value'] as { archivedSessionIds: string[] }).archivedSessionIds).toContain('agent-running')
+
+    // 已归档的会话置顶：gateway/bad-request
+    const pinArchived = await face.workspace.pinSession({ sessionId: 'agent-running' })
+    expect(pinArchived['ok']).toBe(false)
+    expect((pinArchived['error'] as { code: string }).code).toBe('gateway/bad-request')
+    dispose()
+  })
+
+  it('insertSessionBefore：insertBefore 式移动推 upsert 帧；锚点缺失按 move-invalid', async () => {
+    const bridge = scriptedBridge()
+    const { remote, dispose } = createAdapter({ bridge })
+    const face = faceOfWorkspace(remote)
+    await face.workspace.insertSessionBefore({ sessionId: 'agent-new' })
+    const forked = await face.workspace.insertSessionBefore({ sessionId: 'agent-fork', beforeSessionId: 'agent-new' })
+    expect(forked['ok']).toBe(true)
+    expect((forked['value'] as { sessionOrder: string[] }).sessionOrder).toEqual(['agent-fork', 'agent-new'])
+
+    const iterator = face.workspace.follow()
+    const baseline = ((await iterator.next()).value as { value: Record<string, unknown> }).value
+    const view = (baseline['items'] as { sessionIds: string[] }[])[0]!
+    // 视图顺序按侧车序排：现存才进账户，fork 在 new 前面
+    expect(view['sessionIds']).toEqual(['agent-new'])
+    await iterator.return?.(undefined)
+
+    const badAnchor = await face.workspace.insertSessionBefore({ sessionId: 'agent-new', beforeSessionId: 'agent-ghost' })
+    expect(badAnchor['ok']).toBe(false)
+    expect((badAnchor['error'] as { code: string }).code).toBe('session/not-found')
+    dispose()
+  })
+
+  it('取消归档/取消置顶：集合回到空，帧随之推送', async () => {
+    const bridge = scriptedBridge()
+    const { remote, dispose } = createAdapter({ bridge })
+    const face = faceOfWorkspace(remote)
+    await face.workspace.archiveSession({ sessionId: 'agent-new' })
+    await face.workspace.pinSession({ sessionId: 'agent-fork' })
+    await face.workspace.unarchiveSession({ sessionId: 'agent-new' })
+    await face.workspace.unpinSession({ sessionId: 'agent-fork' })
+    const iterator = face.workspace.follow()
+    const baseline = ((await iterator.next()).value as { value: Record<string, unknown> }).value
+    expect(baseline['archivedSessionIds']).toEqual([])
+    expect(baseline['pinnedSessionIds']).toEqual([])
+    await iterator.return?.(undefined)
+    dispose()
   })
 })

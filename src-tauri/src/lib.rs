@@ -96,7 +96,7 @@ fn continue_session(
 
     let writer = rollout::RolloutWriter::open_existing(&resumed.path)
         .map_err(|e| format!("档案续写打不开: {e}"))?;
-    let (agent, cancel) = build_agent_with(state, Some(Arc::new(writer)))?;
+    let (agent, cancel) = build_agent_with(state, &agent_id, Some(Arc::new(writer)))?;
     let sink: Arc<dyn events::EventSink> = Arc::new(events::TauriEventSink::root(app.clone(), agent_id));
     // spawn 的 future 必须是 'static：借用的 app 只能换成 owned 句柄再 move 进去。
     let app_handle = app.clone();
@@ -225,6 +225,185 @@ fn load_session(app: tauri::AppHandle, agent_id: String) -> Result<Vec<SessionEn
     Ok(project_entries(&archive.items))
 }
 
+/// 归档/置顶/排序操作的类型化错误（SH-100）：`code` 给前端按类映射 wire 错误码
+/// （上游 workspace-controller types.ts 的同一批语义），措辞怎么改都不破坏形状。
+#[derive(Debug, serde::Serialize)]
+#[serde(tag = "code", content = "message", rename_all = "kebab-case")]
+pub enum WorkspaceOpError {
+    /// 目标会话正在跑任务：先停止，或携带 stopActivity 让宿主先取消再归档。
+    SessionActive(String),
+    /// 会话档案不存在。
+    NotFound(String),
+    /// 已归档的会话不能再置顶（上游按 gateway/bad-request 分派）。
+    PinArchived(String),
+    /// 排序移动的锚点会话不存在。
+    MoveInvalid(String),
+    /// 其余失败（落盘 I/O）。
+    Rejected(String),
+}
+
+fn session_exists(state: &AppState, id: &str) -> bool {
+    state
+        .data_root()
+        .join(rollout::ROLLOUT_DIR)
+        .join(format!("{}.jsonl", id.trim()))
+        .is_file()
+}
+
+/// 归档会话（SH-100）。归档即从置顶集剔除（上游同一次持久化写里原子完成）；
+/// 已归档幂等 no-op。运行中的会话：不带 stopActivity 拒绝，带了先取消再归档
+/// （上游"先写归档集、再派发 stop"的顺序——单任务闸下取消即收口）。
+#[tauri::command]
+fn archive_session(
+    app: tauri::AppHandle,
+    session_id: String,
+    stop_activity: Option<bool>,
+) -> Result<serde_json::Value, WorkspaceOpError> {
+    let state = app.state::<AppState>();
+    let id = session_id.trim().to_string();
+    if !session_exists(&state, &id) {
+        return Err(WorkspaceOpError::NotFound(format!("会话档案不存在：{id}")));
+    }
+    if state.active_agent().as_deref() == Some(id.as_str()) {
+        if stop_activity == Some(true) {
+            state.cancel_active();
+        } else {
+            return Err(WorkspaceOpError::SessionActive(format!(
+                "会话 {id} 正在运行：先停止任务，或携带 stopActivity 归档"
+            )));
+        }
+    }
+    let dir = state.data_root().join(rollout::ROLLOUT_DIR);
+    let mut flags = rollout::read_session_order(&dir);
+    if !flags.archived_session_ids.iter().any(|x| x == &id) {
+        flags.archived_session_ids.push(id.clone());
+    }
+    flags.pinned_session_ids.retain(|x| x != &id);
+    rollout::write_session_order(&dir, &flags).map_err(WorkspaceOpError::Rejected)?;
+    Ok(serde_json::json!({ "archivedSessionIds": flags.archived_session_ids }))
+}
+
+/// 取消归档（SH-100）。幂等：会话回到其工作区槽位的原位置。
+#[tauri::command]
+fn unarchive_session(app: tauri::AppHandle, session_id: String) -> Result<serde_json::Value, WorkspaceOpError> {
+    let state = app.state::<AppState>();
+    let id = session_id.trim().to_string();
+    let dir = state.data_root().join(rollout::ROLLOUT_DIR);
+    let mut flags = rollout::read_session_order(&dir);
+    flags.archived_session_ids.retain(|x| x != &id);
+    rollout::write_session_order(&dir, &flags).map_err(WorkspaceOpError::Rejected)?;
+    Ok(serde_json::json!({ "archivedSessionIds": flags.archived_session_ids }))
+}
+
+/// 置顶会话（SH-100）：prepend——置顶序 = 最近置顶在前（上游同口径）。
+/// 已置顶幂等不重排；已归档拒绝（置顶集与归档集互斥）。
+#[tauri::command]
+fn pin_session(app: tauri::AppHandle, session_id: String) -> Result<serde_json::Value, WorkspaceOpError> {
+    let state = app.state::<AppState>();
+    let id = session_id.trim().to_string();
+    if !session_exists(&state, &id) {
+        return Err(WorkspaceOpError::NotFound(format!("会话档案不存在：{id}")));
+    }
+    let dir = state.data_root().join(rollout::ROLLOUT_DIR);
+    let mut flags = rollout::read_session_order(&dir);
+    if flags.archived_session_ids.iter().any(|x| x == &id) {
+        return Err(WorkspaceOpError::PinArchived(format!(
+            "会话 {id} 已归档：先取消归档才能置顶"
+        )));
+    }
+    if !flags.pinned_session_ids.iter().any(|x| x == &id) {
+        flags.pinned_session_ids.insert(0, id.clone());
+    }
+    rollout::write_session_order(&dir, &flags).map_err(WorkspaceOpError::Rejected)?;
+    Ok(serde_json::json!({ "pinnedSessionIds": flags.pinned_session_ids }))
+}
+
+/// 取消置顶（SH-100）。
+#[tauri::command]
+fn unpin_session(app: tauri::AppHandle, session_id: String) -> Result<serde_json::Value, WorkspaceOpError> {
+    let state = app.state::<AppState>();
+    let id = session_id.trim().to_string();
+    if !session_exists(&state, &id) {
+        return Err(WorkspaceOpError::NotFound(format!("会话档案不存在：{id}")));
+    }
+    let dir = state.data_root().join(rollout::ROLLOUT_DIR);
+    let mut flags = rollout::read_session_order(&dir);
+    flags.pinned_session_ids.retain(|x| x != &id);
+    rollout::write_session_order(&dir, &flags).map_err(WorkspaceOpError::Rejected)?;
+    Ok(serde_json::json!({ "pinnedSessionIds": flags.pinned_session_ids }))
+}
+
+/// 手动排序（SH-100）：DOM-insertBefore 式移动——把 `session_id` 移到
+/// `before_session_id` 之前；锚点省略 = 追加到末尾。顺序以侧车为准，现存但
+/// 不在侧车里的会话按列表序补位（新会话出现在末尾，与上游 recency 补位同向）。
+#[tauri::command]
+fn insert_session_before(
+    app: tauri::AppHandle,
+    session_id: String,
+    before_session_id: Option<String>,
+) -> Result<serde_json::Value, WorkspaceOpError> {
+    let state = app.state::<AppState>();
+    let id = session_id.trim().to_string();
+    let before = before_session_id
+        .as_deref()
+        .map(str::trim)
+        .filter(|b| !b.is_empty())
+        .map(str::to_string);
+    if !session_exists(&state, &id) {
+        return Err(WorkspaceOpError::NotFound(format!("会话档案不存在：{id}")));
+    }
+    if let Some(anchor) = &before {
+        if !session_exists(&state, anchor) {
+            return Err(WorkspaceOpError::NotFound(format!("会话档案不存在：{anchor}")));
+        }
+    }
+    let dir = state.data_root().join(rollout::ROLLOUT_DIR);
+    // 与界面同源的单工作区账户：workspaceRoot 命中配置根的会话才参与排序
+    let workspace = state.workspace_root().display().to_string();
+    let mine: Vec<String> = rollout::list(&dir)
+        .into_iter()
+        .filter(|row| row.workspace_root == workspace)
+        .map(|row| row.agent_id)
+        .collect();
+    let mut flags = rollout::read_session_order(&dir);
+    let mut order: Vec<String> = flags
+        .session_order
+        .into_iter()
+        .filter(|known| mine.contains(known))
+        .collect();
+    for id in &mine {
+        if !order.contains(id) {
+            order.push(id.clone());
+        }
+    }
+    order.retain(|x| x != &id);
+    match &before {
+        Some(anchor) => {
+            let pos = order
+                .iter()
+                .position(|x| x == anchor)
+                .ok_or_else(|| WorkspaceOpError::MoveInvalid(format!("锚点会话 {anchor} 不在排序账户里")))?;
+            order.insert(pos, id.clone());
+        }
+        None => order.push(id.clone()),
+    }
+    flags.session_order = order;
+    rollout::write_session_order(&dir, &flags).map_err(WorkspaceOpError::Rejected)?;
+    Ok(serde_json::json!({ "sessionOrder": flags.session_order }))
+}
+
+/// 归档/置顶/顺序状态的一次性读取（SH-100）：workspace 面的 baseline 与帧都从这里来。
+#[tauri::command]
+fn get_workspace_flags(app: tauri::AppHandle) -> serde_json::Value {
+    let state = app.state::<AppState>();
+    let flags = rollout::read_session_order(&state.data_root().join(rollout::ROLLOUT_DIR));
+    serde_json::json!({
+        "archivedSessionIds": flags.archived_session_ids,
+        "pinnedSessionIds": flags.pinned_session_ids,
+        "sessionOrder": flags.session_order,
+    })
+}
+
 /// 从既有会话分支出一个新档案，返回新 agent_id（SH-033 的 fork 入口）。
 ///
 /// 截断点由 `nearest_safe_cut` 兜底：前端要 N 条，实际可能给得更少（从中间切会留下
@@ -276,7 +455,7 @@ fn build_new_session(
     state: &AppState,
 ) -> Result<(agent_loop::AgentLoop, tokio_util::sync::CancellationToken, String), String> {
     let (writer, agent_id) = new_session_writer(state)?;
-    let (agent, cancel) = build_agent_with(state, Some(writer))?;
+    let (agent, cancel) = build_agent_with(state, &agent_id, Some(writer))?;
     Ok((agent, cancel, agent_id))
 }
 
@@ -308,6 +487,7 @@ fn new_session_writer(state: &AppState) -> Result<(Arc<rollout::RolloutWriter>, 
 
 fn build_agent_with(
     state: &AppState,
+    agent_id: &str,
     writer: Option<Arc<rollout::RolloutWriter>>,
 ) -> Result<(agent_loop::AgentLoop, tokio_util::sync::CancellationToken), String> {
     let cfg = state.config();
@@ -323,7 +503,7 @@ fn build_agent_with(
         .ok_or_else(|| format!("未配置 {} 的 API Key，请先在设置中保存", active.id))?;
 
     let cancel = tokio_util::sync::CancellationToken::new();
-    if !state.begin_task(cancel.clone()) {
+    if !state.begin_task(agent_id, cancel.clone()) {
         return Err("已有任务在运行".into());
     }
 
@@ -705,6 +885,12 @@ pub fn run() {
             load_session,
             fork_session,
             rename_session,
+            archive_session,
+            unarchive_session,
+            pin_session,
+            unpin_session,
+            insert_session_before,
+            get_workspace_flags,
             cancel_task,
             approve,
             store_api_key,

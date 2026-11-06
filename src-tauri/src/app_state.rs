@@ -18,8 +18,9 @@ pub struct AppState {
     /// 从 config_path 反推会把档案写错地方。
     data_root: PathBuf,
     session_seq: AtomicU32,
-    /// 当前活动任务的取消令牌（None = 空闲）。
-    active_task: Mutex<Option<CancellationToken>>,
+    /// 当前活动任务（None = 空闲）：(会话 id, 取消令牌)。会话 id 供归档/置顶
+    /// 等操作判断"目标会话是否正在跑"（SH-100）——单任务闸下它就是唯一的那个。
+    active_task: Mutex<Option<(String, CancellationToken)>>,
     /// 审批 broker（approve 命令回执入口）。
     pub broker: Arc<ApprovalBroker>,
     /// 计划态标志（Plan Mode，跨任务保留：同一会话内后续任务仍在计划态时继续只读）。
@@ -87,13 +88,13 @@ impl AppState {
         new_session_id(seq)
     }
 
-    /// 登记活动任务；已有任务在跑时返回 false（防重入）。
-    pub fn begin_task(&self, cancel: CancellationToken) -> bool {
+    /// 登记活动任务（带会话 id）；已有任务在跑时返回 false（防重入）。
+    pub fn begin_task(&self, agent_id: &str, cancel: CancellationToken) -> bool {
         let mut guard = self.active_task.lock().expect("active_task 锁中毒");
         if guard.is_some() {
             return false;
         }
-        *guard = Some(cancel);
+        *guard = Some((agent_id.to_string(), cancel));
         true
     }
 
@@ -102,10 +103,19 @@ impl AppState {
         *self.active_task.lock().expect("active_task 锁中毒") = None;
     }
 
+    /// 正在跑任务的会话 id（None = 空闲）。
+    pub fn active_agent(&self) -> Option<String> {
+        self.active_task
+            .lock()
+            .expect("active_task 锁中毒")
+            .as_ref()
+            .map(|(id, _)| id.clone())
+    }
+
     /// 取消活动任务；无任务返回 false。
     pub fn cancel_active(&self) -> bool {
         match self.active_task.lock().expect("active_task 锁中毒").clone() {
-            Some(token) => {
+            Some((_, token)) => {
                 token.cancel();
                 true
             }
@@ -159,13 +169,15 @@ mod tests {
         let s = state();
         assert!(!s.has_active_task());
         let token = CancellationToken::new();
-        assert!(s.begin_task(token.clone()));
-        assert!(!s.begin_task(CancellationToken::new()), "重入必须被拒");
+        assert!(s.begin_task("sess-1", token.clone()));
+        assert!(!s.begin_task("sess-2", CancellationToken::new()), "重入必须被拒");
         assert!(s.has_active_task());
+        assert_eq!(s.active_agent().as_deref(), Some("sess-1"));
         assert!(s.cancel_active());
         assert!(token.is_cancelled());
         s.end_task();
         assert!(!s.has_active_task());
+        assert_eq!(s.active_agent(), None);
         assert!(!s.cancel_active());
     }
 

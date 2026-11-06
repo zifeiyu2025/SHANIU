@@ -287,6 +287,41 @@ pub fn read_titles(dir: &Path) -> std::collections::BTreeMap<String, String> {
     serde_json::from_str(&String::from_utf8_lossy(&raw)).unwrap_or_default()
 }
 
+/// 会话归档/置顶/手动排序的侧车状态（SH-100，`<rollouts>/session-order.json`）。
+///
+/// 为什么像 titles.json 一样放侧车而不是动档案：归档/置顶是**界面元数据**——
+/// 归档会话的档案必须原样可读（unarchive 后回原位），往只追加的转录里写状态
+/// 等于拿档案完整性换一个过滤器。集合是 registry-global（上游 workspace 域同
+/// 口径），`session_order` 是单工作区的展示顺序（上游 per-workspace `sessionIds`
+/// 的 SHANIU 单工作区等价物，缺省按更新时间倒序补位）。
+pub const SESSION_ORDER_FILE: &str = "session-order.json";
+
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(default)]
+pub struct SessionOrderState {
+    pub archived_session_ids: Vec<String>,
+    pub pinned_session_ids: Vec<String>,
+    pub session_order: Vec<String>,
+}
+
+/// 读归档/置顶/顺序状态。文件缺失或 JSON 坏了都当空表：这是界面过滤器，
+/// 不该挡住会话列表本身（与 titles.json 同一容错口径）。
+pub fn read_session_order(dir: &Path) -> SessionOrderState {
+    let Ok(raw) = std::fs::read(dir.join(SESSION_ORDER_FILE)) else {
+        return SessionOrderState::default();
+    };
+    serde_json::from_str(&String::from_utf8_lossy(&raw)).unwrap_or_default()
+}
+
+/// 原子替换侧车（半截文件会被当成空表，用户的归档/置顶一起丢——同 titles）。
+pub fn write_session_order(dir: &Path, state: &SessionOrderState) -> Result<(), String> {
+    let tmp = dir.join(format!("{SESSION_ORDER_FILE}.tmp"));
+    let body = serde_json::to_string_pretty(state).map_err(|e| format!("序列化失败: {e}"))?;
+    std::fs::write(&tmp, body).map_err(|e| format!("写临时文件失败: {e}"))?;
+    std::fs::rename(&tmp, dir.join(SESSION_ORDER_FILE))
+        .map_err(|e| format!("替换文件失败: {e}"))
+}
+
 /// `set_title` 的失败类型：`code` 给前端按类分派（`title-invalid` → DSH wire 的
 /// `session/title-invalid`），`message` 给界面直接显示。不靠匹配中文措辞——那是把
 /// 契约挂在文案上，改个字就断。
@@ -711,5 +746,45 @@ mod tests {
     #[test]
     fn list_of_missing_dir_is_empty_not_an_error() {
         assert_eq!(list(Path::new("Z:\\definitely-not-here\\shaniu")), Vec::<SessionSummary>::new());
+    }
+
+    // ---- 归档/置顶/顺序侧车（SH-100）----
+
+    #[test]
+    fn session_order_round_trips_and_tolerates_missing_or_broken_file() {
+        let dir = temp_dir();
+        assert_eq!(read_session_order(&dir), SessionOrderState::default(), "缺失 = 空状态");
+
+        let state = SessionOrderState {
+            archived_session_ids: vec!["a".into()],
+            pinned_session_ids: vec!["b".into(), "c".into()],
+            session_order: vec!["c".into(), "a".into(), "b".into()],
+        };
+        write_session_order(&dir, &state).unwrap();
+        assert_eq!(read_session_order(&dir), state, "往返必须无损：重启后归档/置顶/顺序全靠它");
+
+        std::fs::write(dir.join(SESSION_ORDER_FILE), "{ not json").unwrap();
+        assert_eq!(read_session_order(&dir), SessionOrderState::default(), "坏文件当空表，不挡列表");
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    /// 归档与置顶的互斥写是上层命令的职责，这里只钉一件事：同一次写里两个集合
+    /// 必须一起落盘（上层"归档即掉 pin"依赖这个原子性）。
+    #[test]
+    fn archive_and_pin_sets_persist_together() {
+        let dir = temp_dir();
+        let state = SessionOrderState {
+            archived_session_ids: vec!["x".into()],
+            pinned_session_ids: vec![],
+            session_order: vec![],
+        };
+        write_session_order(&dir, &state).unwrap();
+        let mut back = read_session_order(&dir);
+        back.pinned_session_ids.push("y".into());
+        write_session_order(&dir, &back).unwrap();
+        let final_state = read_session_order(&dir);
+        assert_eq!(final_state.archived_session_ids, vec!["x".to_string()]);
+        assert_eq!(final_state.pinned_session_ids, vec!["y".to_string()]);
+        std::fs::remove_dir_all(&dir).ok();
     }
 }
