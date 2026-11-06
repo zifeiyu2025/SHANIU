@@ -434,6 +434,12 @@ async fn pick_folder(app: tauri::AppHandle) -> Option<String> {
         .map(|path| path.to_string_lossy().into_owned())
 }
 
+/// 产品目录视图：前端用它把默认工作区基线落到宿主解析出的 `<数据根>\Workspace`。
+#[tauri::command]
+fn get_product_dirs() -> config::ProductDirsView {
+    config::resolve_dirs_from_env().view()
+}
+
 /// 从托盘恢复主窗口：取消最小化 + 显示 + 聚焦。
 fn show_main_window(app: &tauri::AppHandle) {
     if let Some(window) = app.get_webview_window("main") {
@@ -487,7 +493,8 @@ pub fn run() {
             get_settings,
             save_settings,
             open_in_explorer,
-            pick_folder
+            pick_folder,
+            get_product_dirs
         ])
         .on_window_event(|window, event| {
             // 关闭 = 隐藏到系统托盘（不退出）；真正退出只走托盘菜单「退出」

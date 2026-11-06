@@ -48,6 +48,7 @@ import {
 } from './transport/stubs'
 import {
   installMockRemoteNamespaces, mockConnection, mockModules, mockRemote, mockTypert,
+  setDefaultWorkspacePath,
 } from './transport/mock'
 import { apply as brandApply, inject as brandInject } from './brand'
 import { apply as headerActionsApply, inject as headerActionsInject } from './header-actions'
@@ -64,6 +65,22 @@ type FeaturePlugin = { inject: readonly string[]; apply: (ctx: Context) => unkno
 /** 纯浏览器开发态走 mock 数据源（SH-008 mock 联调）；Tauri 内默认走显式 stub 等待接线。 */
 function usingTauriBackend(): boolean {
   return typeof window !== 'undefined' && '__TAURI_INTERNALS__' in window
+}
+
+/**
+ * 桌面壳的默认工作区以宿主解析结果为准（`<数据根>\Workspace`，docs/01 §9.3）；
+ * 浏览器联调没有宿主，保留 mock 的展示路径。读取失败只告警，不拦启动。
+ */
+async function applyProductWorkspacePath(): Promise<void> {
+  try {
+    const { invoke } = await import('@tauri-apps/api/core')
+    const dirs = await invoke<{ workspaceRoot?: string }>('get_product_dirs')
+    if (typeof dirs.workspaceRoot === 'string' && dirs.workspaceRoot !== '') {
+      setDefaultWorkspacePath(dirs.workspaceRoot)
+    }
+  } catch (reason) {
+    console.warn('[SHANIU] 读取产品目录失败，默认工作区退回 mock 展示路径', reason)
+  }
 }
 
 /**
@@ -95,6 +112,8 @@ export async function bootShaniu(container: HTMLElement): Promise<BootHandle> {
     root.provide('sessions', stubSessions())
     root.provide('modules', mockModules())
   } else {
+    // 默认工作区基线：桌面壳用宿主解析出的 <数据根>\Workspace（必须在挂载前写入）
+    if (usingTauriBackend()) await applyProductWorkspacePath()
     root.provide('remote', mockRemote())
     installMockRemoteNamespaces(root)
     root.provide('connection', mockConnection())

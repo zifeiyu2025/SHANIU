@@ -21,10 +21,12 @@ const MODELS = createModelsMock({ emit: mockEmit, onSelectionChanged: pushModelS
 const HOME_PATH = 'D:\\MyWorkspace\\SHANIU'
 const DEFAULT_WORKSPACE_ID = 'default-workspace'
 /**
- * 默认工作区的目录。真实落盘位置由 Rust 侧决定（用户口径是 data 目录下的 Workspace），
- * mock 里取本机确实存在的目录——桌面壳的「资源管理器」按存在的目录校验，指向不存在的
- * 路径就只是点了没反应。注意 docs/01:426 把自身 data 目录对 Agent 默认拒绝读写，
- * 工作区又是 Agent 可写作用域，落盘前必须先解决这条边界冲突。
+ * 默认工作区的目录。真实落盘位置由 Rust 侧决定：安装版 `%LOCALAPPDATA%\SHANIU\Workspace`、
+ * 便携版 `<exe>\data\Workspace`（docs/01 §9.3），桌面壳启动时经 `get_product_dirs` 覆盖进来
+ * （见 setDefaultWorkspacePath）。这里的常量只是纯浏览器联调的展示值——取本机确实存在的目录，
+ * 桌面壳的「资源管理器」按存在的目录校验，指向不存在的路径就只是点了没反应。
+ * 注意 docs/01 §9.3 把自身 data 目录对 Agent 默认拒绝读写，工作区又是 Agent 可写作用域——
+ * 边界例外已写明放行 `<数据根>\Workspace` 子树。
  */
 const DEFAULT_WORKSPACE_PATH = HOME_PATH
 
@@ -65,6 +67,16 @@ const WORKSPACES = new Map<string, MockWorkspace>([
     updatedAt: new Date().toISOString(),
   }],
 ])
+
+/**
+ * 桌面壳把默认工作区指到宿主解析出的 `<数据根>\Workspace`（boot 时经 `get_product_dirs` 读取）。
+ * 必须早于界面读取工作区基线；行由 `workspaceView` 现场投影，改注册表即生效。
+ * @param path - 宿主给出的默认工作区绝对路径。
+ */
+export function setDefaultWorkspacePath(path: string): void {
+  const workspace = WORKSPACES.get(DEFAULT_WORKSPACE_ID)
+  if (workspace !== undefined) workspace.path = path
+}
 
 /** 跨调用共享的 follow 帧队列（baseline 后挂起，push 即广播）。 */
 function createFrameQueue<T>() {

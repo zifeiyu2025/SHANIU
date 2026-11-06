@@ -138,6 +138,24 @@ impl DataDirs {
     pub fn workspace_root(&self) -> PathBuf {
         self.data_root.join(WORKSPACE_DIR)
     }
+
+    /// 前端视图（camelCase）：`get_product_dirs` 命令把它交给界面做工作区基线。
+    pub fn view(&self) -> ProductDirsView {
+        ProductDirsView {
+            config_root: self.config_root.display().to_string(),
+            data_root: self.data_root.display().to_string(),
+            workspace_root: self.workspace_root().display().to_string(),
+        }
+    }
+}
+
+/// 产品目录的前端视图（字段名与前端 `get_product_dirs` 的读法一致）。
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ProductDirsView {
+    pub config_root: String,
+    pub data_root: String,
+    pub workspace_root: String,
 }
 
 /// 启动时提前创建产品目录结构（幂等，docs §9.1/§9.2）。
@@ -657,6 +675,18 @@ mod tests {
         let dirs = DataDirs { config_root: blocked.clone(), data_root: blocked };
         assert!(ensure_product_dirs(&dirs).is_err());
         fs::remove_dir_all(&base).ok();
+    }
+
+    #[test]
+    fn product_dirs_view_is_camel_case_for_the_frontend() {
+        let dirs = DataDirs {
+            config_root: PathBuf::from("C:/cfg"),
+            data_root: PathBuf::from("C:/data"),
+        };
+        let json = serde_json::to_value(dirs.view()).unwrap();
+        // 前端按 camelCase 读，工作区路径 = 数据根下的 Workspace
+        assert_eq!(json["workspaceRoot"], dirs.workspace_root().display().to_string());
+        assert!(json.get("workspace_root").is_none());
     }
 
     #[test]

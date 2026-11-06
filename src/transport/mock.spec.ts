@@ -1,5 +1,5 @@
 import { describe, expect, it } from 'vitest'
-import { mockRemote } from './mock'
+import { mockRemote, setDefaultWorkspacePath } from './mock'
 
 /** 只声明本文件用到的几个面，其余成员按 mock 的实际形状留着。 */
 interface WireEvent {
@@ -17,6 +17,14 @@ interface SessionFace {
   prompt(request: { requestId?: string; sessionId?: string; content: readonly unknown[] }): Promise<unknown>
   selectModel(selection: Record<string, unknown>): Promise<unknown>
   follow(request: { address: { kind: 'session'; sessionId: string } }): AsyncGenerator<JournalSnapshot>
+  list(): Promise<{ ok: true; value: { items: { sessionId: string; cwd: string }[] } }>
+}
+
+interface WorkspaceFace {
+  follow(request: unknown): AsyncGenerator<{
+    type: string
+    value: { items: { path: string; title: string }[] }
+  }>
 }
 
 interface CredentialFace {
@@ -49,6 +57,16 @@ const remote = mockRemote() as {
   session: SessionFace
   credentials: CredentialFace
   directoryPicker: DirectoryPickerFace
+  workspace: WorkspaceFace
+}
+
+/** 读工作区 follow 的第一帧（baseline 就是全集）。 */
+async function workspaceBaseline(): Promise<{ path: string; title: string }[]> {
+  const stream = remote.workspace.follow({})
+  const first = await stream.next()
+  await stream.return?.(undefined)
+  if (first.done) throw new Error('workspace follow 缺少 baseline')
+  return first.value.value.items
 }
 
 /**
@@ -149,5 +167,24 @@ describe('mock 目录选择器', () => {
 
     const duplicate = await remote.directoryPicker.createDirectory(home.value.path, 'mock-new-dir')
     expect(duplicate.ok ? 'unexpected ok' : duplicate.error.code).toBe('directory-picker/exists')
+  })
+})
+
+describe('mock 默认工作区路径', () => {
+  it('桌面壳可把默认工作区指到宿主解析出的 <数据根>\\Workspace，新会话 cwd 跟随', async () => {
+    const [before] = await workspaceBaseline()
+    const target = 'D:\\data\\Workspace'
+    try {
+      setDefaultWorkspacePath(target)
+      const [after] = await workspaceBaseline()
+      // 标题保持自动名（界面据此渲染「默认工作区」），路径换成宿主给的
+      expect(after).toMatchObject({ path: target, title: 'default-workspace' })
+
+      const created = await remote.session.create()
+      const list = await remote.session.list()
+      expect(list.value.items.find(item => item.sessionId === created.value.sessionId)?.cwd).toBe(target)
+    } finally {
+      if (before !== undefined) setDefaultWorkspacePath(before.path)
+    }
   })
 })
