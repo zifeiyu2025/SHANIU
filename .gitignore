@@ -31,6 +31,9 @@ pnpm-debug.log*
 *.njsproj
 *.sln
 *.sw?
+# Trae 的工作目录与分享包（本机工具产物，不属于项目内容）
+.trae/
+.trae-html-share-packages/
 
 # Secrets / env files (禁止入库，见 AGENTS.md §3)
 .env
