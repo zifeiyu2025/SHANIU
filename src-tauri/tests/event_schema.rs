@@ -11,7 +11,7 @@
 
 use serde::Serialize;
 use shaniu_lib::events::{
-    ApprovalDecision, EventMsg, IoChannel, RiskLevel, ToolCallResult, TurnEndReason,
+    AgentEvent, ApprovalDecision, EventMsg, IoChannel, RiskLevel, ToolCallResult, TurnEndReason,
 };
 
 /// 与 src/transport/types.ts 的 type 判别值逐一对应。
@@ -206,11 +206,77 @@ fn tool_call_end_result_is_additive_and_null_tolerant() {
     assert_eq!(with_result["result"], "denied", "变体名必须是 snake_case");
 }
 
-/// FF-2 的前端镜像文件。该文件随 DSH 全量移植（`edea37d`）删除，镜像源待定（SH-084）；
-/// 读文件而不是 `include_str!`，至少让整个测试目标可编译，挂起状态由两条用例的 `#[ignore]` 显式声明。
 fn frontend_mirror() -> String {
-    std::fs::read_to_string(concat!(env!("CARGO_MANIFEST_DIR"), "/../src/transport/types.ts"))
-        .expect("前端镜像缺失（SH-084）：src/transport/types.ts 已随 DSH 移植删除，镜像源待定")
+    include_str!("../../src/transport/types.ts").to_owned()
+}
+
+fn ts_object_fields(declaration: &str) -> std::collections::BTreeMap<String, bool> {
+    let start = declaration.find('{').expect("TS 对象声明缺少左括号");
+    let end = declaration.rfind('}').expect("TS 对象声明缺少右括号");
+    declaration[start + 1..end].split(';').filter_map(|field| {
+        let field = field.trim();
+        if field.is_empty() {
+            return None;
+        }
+        let (name, _) = field.split_once(':').expect("TS 字段缺少类型声明");
+        let name = name.trim();
+        Some((name.trim_end_matches('?').to_string(), name.ends_with('?')))
+    }).collect()
+}
+
+#[test]
+fn event_payload_fields_match_frontend_mirror() {
+    let ts = frontend_mirror();
+    let variants = all_variants();
+    for tag in EXPECTED_TAGS {
+        let marker = format!("type: '{tag}'");
+        let declaration = ts.lines().find(|line| line.contains(&marker)).expect("TS 事件载荷缺失");
+        let fields = ts_object_fields(declaration);
+        let mut actual = std::collections::BTreeSet::new();
+        for msg in &variants {
+            let json = serde_json::to_value(msg).unwrap();
+            if json["type"] != tag {
+                continue;
+            }
+            actual.extend(json.as_object().unwrap().keys().cloned());
+            for (field, optional) in &fields {
+                if *optional {
+                    let mut absent = json.clone();
+                    absent.as_object_mut().unwrap().remove(field);
+                    serde_json::from_value::<EventMsg>(absent).unwrap_or_else(|error| {
+                        panic!("TS 的 {tag}.{field} 标为 optional，但 Rust 拒绝缺省: {error}")
+                    });
+                } else {
+                    assert!(json.get(field).is_some(), "TS 要求 {tag}.{field} 必填，但 Rust 未发送");
+                }
+            }
+        }
+        assert_eq!(actual, fields.keys().cloned().collect(), "{tag} 载荷字段与 TS 镜像漂移");
+    }
+}
+
+#[test]
+fn envelope_keeps_existing_payload_and_matches_frontend_fields() {
+    let ts = frontend_mirror();
+    let declaration = ts.split_once("export interface AgentEvent ").expect("信封镜像缺失").1;
+    let fields = ts_object_fields(declaration);
+    for msg in all_variants() {
+        let event = AgentEvent {
+            event_id: ulid::Ulid::generate().to_string(),
+            session_id: "session-a".into(),
+            agent_id: "root".into(),
+            parent_id: None,
+            ts_ms: 123,
+            msg: msg.clone(),
+        };
+        let json = serde_json::to_value(&event).unwrap();
+        let actual: std::collections::BTreeSet<_> = json.as_object().unwrap().keys().cloned().collect();
+        assert_eq!(actual, fields.keys().cloned().collect(), "信封字段与 TS 镜像漂移");
+        assert!(json.get("type").is_none(), "事件标签留在 msg 内，不混入信封");
+        assert!(json.get("parent_id").unwrap().is_null(), "root 的 parent_id 明确为 null");
+        assert_eq!(serde_json::from_value::<EventMsg>(json["msg"].clone()).unwrap(), msg);
+        assert_eq!(serde_json::from_value::<AgentEvent>(json).unwrap(), event);
+    }
 }
 
 /// 取出前端镜像里 `export type X = ...;` 的声明体，只在声明内匹配，避免全文件模糊命中。
@@ -268,7 +334,6 @@ fn assert_union_covers<T: Serialize>(type_name: &str, variants: &[T]) {
 /// 由 events.rs 各枚举的 `all_variants()`（无通配臂 match，编译期穷举证明）单一供给。
 /// 任一 Rust 枚举新增变体而 TS 镜像未同步时：先编译失败逼清单同步，再断言失败指向 TS 镜像。
 #[test]
-#[ignore = "SH-084：前端镜像 src/transport/types.ts 随 DSH 移植删除，镜像源待定；恢复后移除本标记"]
 fn every_enum_variant_is_mirrored_in_frontend_types() {
     assert_union_covers("RiskLevel", RiskLevel::all_variants());
     assert_union_covers("ToolCallResult", ToolCallResult::all_variants());
@@ -282,7 +347,6 @@ fn every_enum_variant_is_mirrored_in_frontend_types() {
 /// EventMsg union 里只有判别字段带字符串字面量（其余字段引用枚举名，无内联字面量），
 /// 故提取出的集合恰为 tag 集合。
 #[test]
-#[ignore = "SH-084：前端镜像 src/transport/types.ts 随 DSH 移植删除，镜像源待定；恢复后移除本标记"]
 fn event_msg_tags_are_mechanically_bound_to_frontend_mirror() {
     let ts = frontend_mirror();
     let marker = "export type EventMsg ";

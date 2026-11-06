@@ -189,3 +189,43 @@ async fn second_task_gets_its_own_rollout_file_not_overwrite() {
     assert!(matches!(err, rollout::RolloutError::AlreadyExists(_)), "{err}");
     std::fs::remove_dir_all(&dir).ok();
 }
+
+/// `create_session`（SH-017 的宿主建档）依赖的前提：只写过首行的档案必须能被
+/// `resume` 读回成**空历史**并可继续追加。前端先建会话、再发首条消息，
+/// 走的正是这条路径——首行档案若读不回或读出脏历史，第一条消息就会丢上下文。
+#[test]
+fn meta_only_archive_resumes_to_empty_history_and_still_appends() {
+    let dir = temp_dir("meta-only");
+    let meta = RolloutItem::SessionMeta {
+        session_id: "s-meta".into(),
+        agent_id: "agent-meta".into(),
+        parent_id: None,
+        created_at: 1,
+        config_snapshot: ConfigSnapshot::default(),
+    };
+    {
+        let writer = rollout::RolloutWriter::create(&dir, &meta).unwrap();
+        drop(writer);
+    }
+    let path = dir.join("agent-meta.jsonl");
+
+    let resumed = shaniu_lib::rollout::resume::resume(&path).unwrap();
+    assert!(resumed.history.is_empty(), "只有首行时历史必须为空，实际：{:?}", resumed.history);
+
+    let writer = rollout::RolloutWriter::open_existing(&path).unwrap();
+    writer
+        .append(&RolloutItem::ResponseItem {
+            item: HistoryItem::Message { role: Role::User, text: "第一条消息".into(), reasoning: None },
+        })
+        .unwrap();
+    drop(writer);
+
+    let after = shaniu_lib::rollout::resume::resume(&path).unwrap();
+    assert_eq!(after.history.len(), 1, "建档后续写应追加一条历史");
+    assert_eq!(
+        std::fs::read_to_string(&path).unwrap().lines().filter(|l| l.contains("\"type\":\"session_meta\"")).count(),
+        1,
+        "续写不得重写首行"
+    );
+    std::fs::remove_dir_all(&dir).ok();
+}

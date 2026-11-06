@@ -48,7 +48,8 @@ fn send_task(app: tauri::AppHandle, task: String, agent_id: Option<String>) -> R
         }
         None => {
             let (agent, cancel, new_id) = build_new_session(&state)?;
-            let sink: Arc<dyn events::EventSink> = Arc::new(events::TauriEventSink(app.clone()));
+            let sink: Arc<dyn events::EventSink> =
+                Arc::new(events::TauriEventSink::root(app.clone(), new_id.clone()));
             tauri::async_runtime::spawn(async move {
                 let _ = agent.run_task(&task, sink, cancel).await;
                 app.state::<AppState>().end_task();
@@ -86,7 +87,7 @@ fn continue_session(
     let writer = rollout::RolloutWriter::open_existing(&resumed.path)
         .map_err(|e| format!("档案续写打不开: {e}"))?;
     let (agent, cancel) = build_agent_with(state, Some(Arc::new(writer)))?;
-    let sink: Arc<dyn events::EventSink> = Arc::new(events::TauriEventSink(app.clone()));
+    let sink: Arc<dyn events::EventSink> = Arc::new(events::TauriEventSink::root(app.clone(), agent_id));
     // spawn 的 future 必须是 'static：借用的 app 只能换成 owned 句柄再 move 进去。
     let app_handle = app.clone();
     tauri::async_runtime::spawn(async move {
@@ -227,6 +228,20 @@ fn fork_session(app: tauri::AppHandle, agent_id: String, keep_items: usize) -> R
     let forked = rollout::resume::fork(&src, &dir, &new_id, keep_items)
         .map_err(|e| format!("分支失败: {e}"))?;
     Ok(forked.new_agent_id)
+}
+
+/// 建一份空档案并返回 agent_id（SH-017：DSH 先建会话、再发首条消息）。
+///
+/// 只建盘不跑任务。档案首行的 `SessionMeta` 是 `resume` 的准入条件，先建档、
+/// 之后 `send_task(agent_id)` 才能续到同一份档案上；让前端自己编 id 会让档案目录里
+/// 出现后端不认识的会话，会话列表也就永远读不回它。
+#[tauri::command]
+fn create_session(app: tauri::AppHandle) -> Result<String, String> {
+    let state = app.state::<AppState>();
+    let (writer, agent_id) = new_session_writer(&state)?;
+    //  writer 在这里只负责把首行落盘；后续写入由 send_task 重新 open_existing。
+    drop(writer);
+    Ok(agent_id)
 }
 
 /// 组装一次新会话所需的 AgentLoop + 取消令牌 + 它的 agent_id（现场建档）。
@@ -551,6 +566,7 @@ pub fn run() {
         .invoke_handler(tauri::generate_handler![
             dev_ping,
             send_task,
+            create_session,
             resume_session,
             list_sessions,
             load_session,

@@ -4,6 +4,9 @@
 //! 新增事件类型或新增 `Option` 字段；字段命名 snake_case，与 `src/transport/types.ts` 镜像。
 //! 修改本文件必须同步前端镜像并更新 `tests/event_schema.rs`。
 
+use std::sync::Mutex;
+use std::time::{SystemTime, UNIX_EPOCH};
+
 use serde::{Deserialize, Serialize};
 use tauri::Emitter;
 
@@ -161,14 +164,54 @@ pub trait EventSink: Send + Sync {
     fn emit(&self, msg: &EventMsg) -> Result<(), String>;
 }
 
-/// Tauri 广播桥：EventMsg 序列化后经 `shaniu://event` 广播到 WebView。
-pub struct TauriEventSink(pub tauri::AppHandle);
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct AgentEvent {
+    pub event_id: String,
+    pub session_id: String,
+    pub agent_id: String,
+    pub parent_id: Option<String>,
+    pub ts_ms: u64,
+    pub msg: EventMsg,
+}
+
+static EVENT_IDS: Mutex<ulid::Generator> = Mutex::new(ulid::Generator::new());
+
+fn emit_root_event(
+    session_id: &str,
+    msg: &EventMsg,
+    publish: impl FnOnce(&AgentEvent) -> Result<(), String>,
+) -> Result<(), String> {
+    // 编号与发送共用临界区，否则并发生产者可先发出较大的 event_id。
+    let mut ids = EVENT_IDS.lock().map_err(|e| format!("事件编号锁不可用: {e}"))?;
+    let now = SystemTime::now();
+    let ts_ms = now.duration_since(UNIX_EPOCH).map_err(|e| format!("事件时间不可用: {e}"))?.as_millis() as u64;
+    let event_id = ids.generate_from_datetime(now).map_err(|e| format!("事件编号生成失败: {e}"))?;
+    publish(&AgentEvent {
+        event_id: event_id.to_string(),
+        session_id: session_id.to_owned(),
+        agent_id: "root".into(),
+        parent_id: None,
+        ts_ms,
+        msg: msg.clone(),
+    })
+}
+
+pub struct TauriEventSink {
+    app: tauri::AppHandle,
+    session_id: String,
+}
+
+impl TauriEventSink {
+    pub fn root(app: tauri::AppHandle, session_id: String) -> Self {
+        Self { app, session_id }
+    }
+}
 
 impl EventSink for TauriEventSink {
     fn emit(&self, msg: &EventMsg) -> Result<(), String> {
-        self.0
-            .emit(EVENT_CHANNEL, msg)
-            .map_err(|e| format!("事件广播失败: {e}"))
+        emit_root_event(&self.session_id, msg, |event| {
+            self.app.emit(EVENT_CHANNEL, event).map_err(|e| format!("事件广播失败: {e}"))
+        })
     }
 }
 
@@ -190,5 +233,87 @@ pub struct NullEventSink;
 impl EventSink for NullEventSink {
     fn emit(&self, _msg: &EventMsg) -> Result<(), String> {
         Ok(())
+    }
+}
+
+#[cfg(test)]
+mod envelope_tests {
+    use super::*;
+
+    #[test]
+    fn root_event_keeps_session_payload_and_timestamp() {
+        let msg = EventMsg::ReasoningDelta { delta: "推理片段".into() };
+        let before = SystemTime::now().duration_since(UNIX_EPOCH).unwrap().as_millis() as u64;
+        emit_root_event("session-a", &msg, |event| {
+            assert_eq!(event.session_id, "session-a");
+            assert_eq!(event.agent_id, "root");
+            assert_eq!(event.parent_id, None);
+            assert_eq!(event.msg, msg);
+            assert!(event.ts_ms >= before);
+            let id = event.event_id.parse::<ulid::Ulid>().unwrap();
+            assert!(id.timestamp_ms() >= event.ts_ms);
+            Ok(())
+        }).unwrap();
+    }
+
+    #[test]
+    fn ids_remain_ordered_across_sessions_and_resumed_tasks() {
+        let mut ids = Vec::new();
+        for session in ["first", "second", "first"] {
+            emit_root_event(session, &EventMsg::TurnStarted { turn: 1 }, |event| {
+                assert_eq!(event.session_id, session);
+                ids.push(event.event_id.clone());
+                Ok(())
+            }).unwrap();
+        }
+        assert!(ids.windows(2).all(|pair| pair[0] < pair[1]));
+    }
+
+    #[test]
+    fn concurrent_publish_order_matches_id_order_without_losing_events() {
+        let received = Mutex::new(Vec::new());
+        let barrier = std::sync::Barrier::new(8);
+        std::thread::scope(|scope| {
+            for worker in 0..8 {
+                let received = &received;
+                let barrier = &barrier;
+                scope.spawn(move || {
+                    barrier.wait();
+                    let session_id = format!("session-{worker}");
+                    for index in 0..64 {
+                        emit_root_event(&session_id, &EventMsg::AgentMessageDelta { delta: index.to_string() }, |event| {
+                            received.lock().unwrap().push(event.clone());
+                            Ok(())
+                        }).unwrap();
+                    }
+                });
+            }
+        });
+        let events = received.into_inner().unwrap();
+        assert_eq!(events.len(), 512);
+        assert!(events.windows(2).all(|pair| pair[0].event_id < pair[1].event_id));
+        for worker in 0..8 {
+            let session_id = format!("session-{worker}");
+            let messages: Vec<_> = events.iter().filter(|event| event.session_id == session_id).map(|event| &event.msg).collect();
+            assert_eq!(messages.len(), 64);
+            for (index, msg) in messages.into_iter().enumerate() {
+                assert_eq!(*msg, EventMsg::AgentMessageDelta { delta: index.to_string() });
+            }
+        }
+    }
+
+    #[test]
+    fn publish_failure_propagates_without_poisoning_the_next_event() {
+        let mut failed_id = String::new();
+        let msg = EventMsg::Error { message: "测试错误".into() };
+        let result = emit_root_event("session-a", &msg, |event| {
+            failed_id = event.event_id.clone();
+            Err("传输不可用".into())
+        });
+        assert_eq!(result, Err("传输不可用".into()));
+        emit_root_event("session-a", &msg, |event| {
+            assert!(event.event_id > failed_id);
+            Ok(())
+        }).unwrap();
     }
 }
