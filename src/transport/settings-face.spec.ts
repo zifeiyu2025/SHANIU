@@ -229,7 +229,9 @@ describe('settings 面：写路径', () => {
     expect(result['ok']).toBe(true)
     const write = host.calls.find(call => call.command === 'save_providers')
     expect(write?.args).toMatchObject({
-      activeProvider: '',
+      // 之前没有生效档（空 active），新文档落回第一家：留着空 active 会让刚配好的
+      // 服务商永远不进席位，运行时继续吃 [model] 回落段
+      activeProvider: 'longcat',
       expectedRevision: 2,
       providers: [
         { id: 'longcat', secret_ref: 'LONGCAT_API_KEY', base_url: 'https://api.longcat.chat/openai/v1' },
@@ -270,6 +272,15 @@ describe('settings 面：写路径', () => {
     await face.settings.mutate('llm-pi-ai', [{ op: 'unset', path: ['providers', 'longcat'] }])
     expect(host.rows()).toEqual([])
     expect(host.active).toBe('')
+  })
+
+  it('删掉生效那家后落到剩下的第一家，不回落到 [model] 的旧端点', async () => {
+    const other: Row = { ...LONGCAT, id: 'minimax', label: 'MiniMax', secret_ref: 'MINIMAX_API_KEY', model: 'MiniMax-M2' }
+    const host = fakeHost([LONGCAT, other])
+    host.active = 'longcat'
+    await faceOf(host).settings.mutate('llm-pi-ai', [{ op: 'unset', path: ['providers', 'longcat'] }])
+    // 留空 active 会让运行时静默切回 [model] 回落段——用户删的是一家服务商，不是想换端点
+    expect(host.active).toBe('minimax')
   })
 
   it('修订号对不上时报 conflict 并停在写宿主之前', async () => {

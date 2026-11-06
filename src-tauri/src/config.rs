@@ -323,8 +323,36 @@ impl DataDirs {
             config_root: self.config_root.display().to_string(),
             data_root: self.data_root.display().to_string(),
             workspace_root: self.workspace_root().display().to_string(),
+            // 界面上"显示路径缩写"用的家目录必须与运行时的回落工作区同源，
+            // 否则同一份文档在界面里会被缩成另一个前缀。
+            home_dir: home_dir().display().to_string(),
         }
     }
+}
+
+/// 用户主目录：`%USERPROFILE%`（Windows）→ `%HOME%`（POSIX）→ 临时目录。
+/// 空字符串按"没设"处理：设了空值的变量不能当目录用。
+pub fn home_dir() -> PathBuf {
+    home_dir_from(
+        std::env::var_os("USERPROFILE").as_deref(),
+        std::env::var_os("HOME").as_deref(),
+        &std::env::temp_dir(),
+    )
+}
+
+/// `home_dir` 的纯函数部分：环境变量与回退目录由调用方给出，便于测试不动全局环境。
+fn home_dir_from(
+    profile: Option<&std::ffi::OsStr>,
+    home: Option<&std::ffi::OsStr>,
+    fallback: &Path,
+) -> PathBuf {
+    if let Some(value) = profile.filter(|value| !value.is_empty()) {
+        return PathBuf::from(value);
+    }
+    if let Some(value) = home.filter(|value| !value.is_empty()) {
+        return PathBuf::from(value);
+    }
+    fallback.to_path_buf()
 }
 
 /// 产品目录的前端视图（字段名与前端 `get_product_dirs` 的读法一致）。
@@ -334,6 +362,8 @@ pub struct ProductDirsView {
     pub config_root: String,
     pub data_root: String,
     pub workspace_root: String,
+    /// 用户主目录：界面用它把显示路径缩写成 `~` 形式（04 §1.3）。
+    pub home_dir: String,
 }
 
 /// 启动时提前创建产品目录结构（幂等，docs §9.1/§9.2）。
@@ -902,6 +932,33 @@ mod tests {
         let b = new_session_id(2);
         assert!(a.starts_with("sess-") && b.starts_with("sess-"));
         assert_ne!(a, b);
+    }
+
+    /// 家目录的取值顺序必须固定：`%USERPROFILE%` 优先，其次 `%HOME%`，都没有才回落。
+    /// 空串算"没设"——把空值当目录用会指向当前工作目录，界面缩写路径时就错了根。
+    #[test]
+    fn home_dir_prefers_profile_then_home_then_fallback() {
+        use std::ffi::OsStr;
+        let temp = Path::new("T:/tmp");
+        assert_eq!(
+            home_dir_from(Some(OsStr::new("C:/Users/a")), Some(OsStr::new("/home/a")), temp),
+            PathBuf::from("C:/Users/a")
+        );
+        assert_eq!(
+            home_dir_from(Some(OsStr::new("")), Some(OsStr::new("/home/a")), temp),
+            PathBuf::from("/home/a"),
+            "设成空串的 USERPROFILE 不能当目录用"
+        );
+        assert_eq!(home_dir_from(None, None, temp), PathBuf::from("T:/tmp"));
+        // 真实环境下不能给出空目录：界面拿它缩写显示路径
+        assert!(!home_dir().as_os_str().is_empty());
+        assert_eq!(
+            resolve_dirs(None, None, Some(Path::new("C:/appdata")), Some(Path::new("L:/local")))
+                .view()
+                .home_dir,
+            home_dir().display().to_string(),
+            "界面读的家目录必须与运行时的默认工作区回落同源"
+        );
     }
 }
 

@@ -96,6 +96,8 @@ export interface SettingsFace {
   }
   /** 席位投影用的生效档；不可路由时两个键都留空（未配置的提示态）。 */
   activeSelection(): ModelSelection
+  /** 宿主当前工作区根（`[workspace].root`）；读不到文档时是空串。 */
+  workspaceRoot(): string
   /** 强制回宿主重读一次。装配时与外部改动后调用；失败保留上一次缓存（见 read 的注释）。 */
   refresh(): Promise<void>
 }
@@ -389,10 +391,13 @@ export function createSettingsFace(bridge: HostBridge, options: SettingsFaceOpti
       const message = reason instanceof Refusal ? reason.message : `写入被拒绝：${String(reason)}`
       return refused(new RemoteError('settings/rejected', message, { ns: 'llm-pi-ai' }))
     }
-    const active = snapshot?.activeProvider ?? ''
-    // 删掉当前生效那家时把 active 清空而不是留一个指不到任何 id 的名字：宿主 validate
-    // 会拒绝这种文档，用户看到的就是一条"删除失败"，而他要的只是删掉它。
-    const activeProvider = payload.some(row => row.id === active) ? active : ''
+    const previousActive = snapshot?.activeProvider ?? ''
+    // active 的落点规则：原来指得到就保持；指不到（空文档、或刚把生效那家删掉）
+    // 就落到清单里的第一家。留空会让"刚配好的服务商"永远不进席位——运行时继续用
+    // [model] 回落段，用户在设置页添加的那家根本不会被选中过。
+    const activeProvider = payload.some(row => row.id === previousActive)
+      ? previousActive
+      : payload[0]?.id ?? ''
     try {
       await bridge.invoke<number>('save_providers', {
         providers: payload,
@@ -650,6 +655,7 @@ export function createSettingsFace(bridge: HostBridge, options: SettingsFaceOpti
       },
     },
     activeSelection,
+    workspaceRoot: () => snapshot?.workspaceRoot ?? '',
     refresh: async () => {
       await read()
     },

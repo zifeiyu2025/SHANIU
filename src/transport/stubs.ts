@@ -28,12 +28,17 @@ export function stubRemoteNamespace(name: string): unknown {
 /**
  * batch-1/2 组装面涉及的 remote 命名空间（dotted inject + 属性访问两用）。
  *
- * 核销进度（适配层接管情况见 `transport/adapter.ts`，逐项对应 docs/05 卡号）：
+ * 核销进度（适配层接管情况见 `transport/adapter.ts` 与 `transport/settings-face.ts`，
+ * 逐项对应 docs/05 卡号）：
  * - `session` —— 已由适配层接管（SH-017 第一步：消息流、工具卡、终端输出、中断、
  *   审批请求转译）。同会话内的分页游标对齐与历史回放仍缺，分属 SH-094/SH-033。
- * - `llm` / `settings` / `credentials` —— **尚未接管**：桌面设置页此刻仍写 mock 存储，
- *   而会话读的是 `config.toml` + DPAPI。把桌面数据源切到适配层之前必须先对齐这一组，
- *   否则会出现"配了 Key 却读不到"。
+ * - `llm` / `settings` / `credentials` —— 已由适配层接管（读 `get_settings`，写
+ *   `save_providers` / `store_api_key` / `delete_api_key`）。设置页写得出而后端吃不下
+ *   的部分逐项拒绝并给原因，转 SH-096（推理档）/ SH-097（自定义请求头）/
+ *   SH-098（端点模型发现）。
+ * - `permissionPresets` —— 后端没有与 DSH 权限挡位对应的目录：我们的安全面是
+ *   `sandbox.mode × approval.mode` 两维，官方 preset 是一维档位，映射属产品决策，
+ *   未拍板前不挂这张面（设置-通用的权限行会因此不出现，而不是显示一套假挡位）。
  * - 其余命名空间 —— 后端没有对应命令面，保持显式抛错。
  */
 export const REMOTE_NAMESPACES = [
@@ -80,9 +85,15 @@ export function stubRemote(): unknown {
   })
 }
 
-/** 批量注册 `remote.<ns>` 点分服务（cordis inject 的 'remote.session' 等按服务名解析）。 */
-export function installRemoteNamespaceStubs(ctx: Context): void {
+/**
+ * 批量注册 `remote.<ns>` 点分服务（cordis inject 的 'remote.session' 等按服务名解析）。
+ *
+ * `covered` 列出**已由别处提供**的命名空间（适配层接管的那几个），这里就跳过它们——
+ * 后注册的 stub 会把真实现覆盖掉，症状是"消息流能跑但设置页永远抛错"。
+ */
+export function installRemoteNamespaceStubs(ctx: Context, covered: readonly string[] = []): void {
   for (const ns of REMOTE_NAMESPACES) {
+    if (covered.includes(ns)) continue
     ctx.reflect.provide(`remote.${ns}`, stubRemoteNamespace(ns))
   }
 }

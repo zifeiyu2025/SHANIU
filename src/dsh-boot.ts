@@ -51,6 +51,9 @@ import {
   StubRemoteAccess, installRemoteNamespaceStubs,
   stubRemote, stubSessions,
 } from './transport/stubs'
+import { createAdapter } from './transport/adapter'
+import { hostServices } from './transport/host-services'
+import { tauriBridge } from './transport/tauri'
 import {
   installMockRemoteNamespaces, mockConnection, mockModules, mockRemote, mockTypert,
   setDefaultWorkspacePath,
@@ -74,32 +77,41 @@ function usingTauriBackend(): boolean {
 
 /**
  * 桌面壳的默认工作区以宿主解析结果为准（`<数据根>\Workspace`，docs/01 §9.3）；
- * 浏览器联调没有宿主，保留 mock 的展示路径。读取失败只告警，不拦启动。
+ * 浏览器联调没有宿主，保留 mock 的展示路径。返回的家目录给 connection 基线用
+ * （界面缩写显示路径）。读取失败只告警，不拦启动——那时家目录取空串，
+ * 界面按完整路径显示，比因为读不到目录而起不来好。
  */
-async function applyProductWorkspacePath(): Promise<void> {
+async function applyProductWorkspacePath(): Promise<{ homeDir: string }> {
   try {
     const { invoke } = await import('@tauri-apps/api/core')
-    const dirs = await invoke<{ workspaceRoot?: string }>('get_product_dirs')
+    const dirs = await invoke<{ workspaceRoot?: string; homeDir?: string }>('get_product_dirs')
     if (typeof dirs.workspaceRoot === 'string' && dirs.workspaceRoot !== '') {
       setDefaultWorkspacePath(dirs.workspaceRoot)
     }
+    return { homeDir: typeof dirs.homeDir === 'string' ? dirs.homeDir : '' }
   } catch (reason) {
     console.warn('[SHANIU] 读取产品目录失败，默认工作区退回 mock 展示路径', reason)
+    return { homeDir: '' }
   }
 }
 
 /**
  * 壳内数据源开关（开发期）：true = 桌面窗口也装 mock 事实源，用来看界面的实际效果；
- * false = 窗口走 stub 核销清单，如实反映后端未接的能力。
+ * false = 桌面窗口装适配层（`transport/adapter.ts` + `transport/settings-face.ts`），
+ * 事件流与设置面都走宿主命令；仍未接线的命令面继续落到显式 stub 核销清单。
  * 这是有意偏离 ADR-006 的临时口径——docs/01 风险表把"适配层掩盖能力缺口"列为风险，
- * 所以后端接线里程碑（SH-025 审批 / SH-026 密钥 / SH-063 配置）逐项核销后应改回 false。
+ * 所以未接线项（SH-025 审批 UI、SH-094 WS、SH-033 历史回放…）核销前，浏览器开发态
+ * 仍留在 mock 上，只有真实桌面切过去。
  */
-const MOCK_IN_DESKTOP = true
+const MOCK_IN_DESKTOP = false
 
 /** 组装并挂载完整 UI；失败时把原因抛给调用方（入口页自绘错误）。 */
 export async function bootShaniu(container: HTMLElement): Promise<BootHandle> {
   const root = new Context()
   const mockData = !usingTauriBackend() || MOCK_IN_DESKTOP
+  const realData = usingTauriBackend() && !MOCK_IN_DESKTOP
+  /** 桌面适配层：卸载会话时要一起拆掉事件订阅。 */
+  let adapter: { remote: unknown; dispose(): void } | undefined
 
   // 模型设置页的公开引导开关：SHANIU 没有 DeepSeek 云端账号，
   // 关掉自动弹出的官方登录引导（该 payload 就是上游为此留的接入口）。
@@ -110,8 +122,33 @@ export async function bootShaniu(container: HTMLElement): Promise<BootHandle> {
   // 渲染基座：SlotRegistry + slot renderer + ctx.uiRenderer.mount
   await root.plugin({ inject: [], apply: rendererApply }).await()
 
-  // 宿主侧服务：mock（联调数据源，见 transport/mock.ts）或 stub（等待接线，见 transport/stubs.ts）
-  if (!mockData) {
+  // 宿主侧服务：适配层（桌面真实后端）、mock（浏览器联调）或 stub（等待接线的核销清单）
+  if (realData) {
+    // 默认工作区基线必须在挂载前写入；家目录给 connection 基线缩写路径用
+    const { homeDir } = await applyProductWorkspacePath()
+    adapter = createAdapter({
+      bridge: tauriBridge(),
+      // 审批卡靠监听器的 `this` 认会话，而会话作用域 Context 由 sessions 服务持有
+      // （装配时还没装好），所以给的是"派发时再取"的闭包。
+      approvalScope: (sessionId: string): unknown => {
+        const sessions = root.get('sessions') as unknown
+        const scoped = sessions as { scope?: (id: string) => unknown } | undefined
+        return typeof scoped?.scope === 'function' ? scoped.scope(sessionId) : undefined
+      },
+    })
+    const covered = ['session', 'workspace', 'settings', 'llm', 'credentials']
+    root.provide('remote', adapter.remote)
+    // 适配层已接管的名字不再被 stub 覆盖：后注册的 stub 会让"消息流能跑、
+    // 设置页永远抛错"，而抛错看起来像后端坏了，不像接线接反了。
+    installRemoteNamespaceStubs(root, covered)
+    for (const ns of covered) {
+      root.reflect.provide(`remote.${ns}`, (adapter.remote as Record<string, unknown>)[ns])
+    }
+    const services = hostServices(homeDir)
+    root.provide('connection', services.connection)
+    root.provide('typert', services.typert)
+    root.provide('modules', services.modules)
+  } else if (!mockData) {
     root.provide('remote', stubRemote())
     installRemoteNamespaceStubs(root)
     root.provide('sessions', stubSessions())
@@ -127,9 +164,11 @@ export async function bootShaniu(container: HTMLElement): Promise<BootHandle> {
     // 真实 sessions 服务（ClientSessions 运行时）吃 mock 的 remote.session 面：
     // list 拉预置行、control/follow 流空基线（会话内容原样渲染为空态）
   }
-  // Service 子类：构造即自注册 'remoteAccess' 并发布 useRemoteAccess 全局座席；
-  // mock 态授权（mock 后端语义），stub 态全拒（等待 SH-025 接线）
-  new StubRemoteAccess(root, mockData)
+  // Service 子类：构造即自注册 'remoteAccess' 并发布 useRemoteAccess 全局座席。
+  // mock 态与桌面适配层态都授权：本地单用户壳没有远端 ACL 可咨询，命令面就在
+  // 进程内执行；工具要不要执行仍由 permission broker 裁决（SH-025），不受这里影响。
+  // 纯 stub 态全拒（那条路径下任何命令面都会抛错，授权只会让 UI 显得在 work）。
+  new StubRemoteAccess(root, mockData || realData)
 
   // 基础服务：locale 插件（词典注册 + slots.installLocale，渲染机合成 t 座席）
   // → shortcuts（依赖 locale）→ theme（依赖 slots/locale/remote/configForms）
@@ -210,6 +249,7 @@ export async function bootShaniu(container: HTMLElement): Promise<BootHandle> {
     ctx: root,
     async dispose() {
       unmount()
+      adapter?.dispose()
       await root.fiber.dispose()
     },
   }

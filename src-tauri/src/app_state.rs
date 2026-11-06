@@ -66,9 +66,9 @@ impl AppState {
         if !configured.is_empty() {
             return PathBuf::from(configured);
         }
-        std::env::var_os("USERPROFILE")
-            .map(PathBuf::from)
-            .unwrap_or_else(std::env::temp_dir)
+        // 与 `get_product_dirs` 回给界面的 homeDir 同一个来源：两处各读各的环境变量，
+        // 就会出现"工作区建在 A、界面按 B 缩写路径"。
+        crate::config::home_dir()
     }
 
     /// 更新并持久化配置（M1 的 set_model_config / set_workspace 命令复用）。

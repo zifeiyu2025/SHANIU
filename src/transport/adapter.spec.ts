@@ -112,7 +112,7 @@ interface SessionFace {
 interface RemoteFace {
   readonly session: SessionFace
   readonly workspaceFiles: Record<string, () => Promise<unknown>>
-  $on(event: string, listener: () => Promise<string>): () => void
+  $on(event: string, listener: (this: unknown, ...args: never[]) => unknown): () => void
 }
 
 function faceOf(remote: unknown): RemoteFace {
@@ -470,6 +470,46 @@ describe('适配层的命令面映射', () => {
     await vi.waitFor(() => {
       expect(bridge.calls.find(call => call.command === 'approve')?.args).toEqual({ requestId: 'r2', decision: 'allow' })
     })
+    dispose()
+  })
+
+  it('审批请求按 DSH 声明的载荷派发，并把会话作用域绑给监听器', async () => {
+    // 真机踩过一次：监听器是普通函数、靠 `this` 认会话（ui-approval 的第一行就是
+    // ctx.sessions.scopeOf(this)）。裸调 listener 会让审批卡根本不出现，后端只看到
+    // 一个没人裁决的请求，最终按拒绝收口——表现像"用户拒绝了"，实际是接线错了。
+    const bridge = scriptedBridge()
+    const scope = { sessionId: 'agent-new' }
+    const { remote, dispose } = createAdapter({ bridge, approvalScope: () => scope })
+    const seen: { self: unknown; request: Record<string, unknown> }[] = []
+    faceOf(remote).$on('approval/request', async function (this: unknown, request: Record<string, unknown>) {
+      seen.push({ self: this, request })
+      return 'allowed-once'
+    })
+    bridge.emit('agent-new', { type: 'exec_approval_request', request_id: 'r9', tool: 'write_file', args: { path: 'a.txt' }, risk: 'write_in_workspace' })
+    await vi.waitFor(() => { expect(seen).toHaveLength(1) })
+    expect(seen[0]!.self).toBe(scope)
+    expect(seen[0]!.request).toMatchObject({ agent: { id: 'agent-new' }, toolName: 'write_file' })
+    // args/risk 不在 DSH 的载荷声明里，必须并进 reason，否则卡片只写工具名不说执行什么
+    expect(String(seen[0]!.request['reason'])).toContain('write_file')
+    expect(String(seen[0]!.request['reason'])).toContain('a.txt')
+    expect(bridge.calls.find(call => call.command === 'approve')?.args).toEqual({ requestId: 'r9', decision: 'allow' })
+    dispose()
+  })
+
+  it('审批监听器抛错时按拒绝收口并留下日志，不冒充用户裁决', async () => {
+    const bridge = scriptedBridge()
+    const { remote, dispose } = createAdapter({ bridge })
+    const logged = vi.spyOn(console, 'error').mockImplementation(() => {})
+    faceOf(remote).$on('approval/request', async () => {
+      throw new Error('作用域取不到')
+    })
+    bridge.emit('agent-new', { type: 'exec_approval_request', request_id: 'r10', tool: 'write_file', args: {}, risk: 'write_in_workspace' })
+    await vi.waitFor(() => {
+      expect(bridge.calls.find(call => call.command === 'approve')?.args).toEqual({ requestId: 'r10', decision: 'deny' })
+    })
+    // 静默按拒绝回执会让一次接线错误长得像一次正常否决
+    expect(logged.mock.calls.some(call => String(call[0]).includes('抛错'))).toBe(true)
+    logged.mockRestore()
     dispose()
   })
 

@@ -24,15 +24,22 @@ export function tauriBridge(): HostBridge {
       return await invoke<T>(command, args)
     },
     listenEvents(handler: (event: AgentEvent) => void): () => void {
-      let dispose: (() => void) | undefined
+      let unlisten: (() => void) | undefined
+      // 订阅是异步的（动态 import）。若在登记完成前就被卸载，必须一登记完就立刻拆掉，
+      // 否则这个监听器会一直留在 Tauri 侧，回调指向一个已经卸载的适配层。
+      let closed = false
       void import('@tauri-apps/api/event').then(({ listen }) =>
         listen<AgentEvent>('shaniu://event', ({ payload }) => { handler(payload) }),
-      ).then((unlisten) => {
-        dispose = unlisten
+      ).then((off) => {
+        unlisten = off
+        if (closed) off()
       }).catch((reason: unknown) => {
         console.error('[SHANIU] 事件通道订阅失败，会话流不会更新', reason)
       })
-      return () => { dispose?.() }
+      return () => {
+        closed = true
+        unlisten?.()
+      }
     },
   }
   return bridge

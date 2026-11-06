@@ -109,8 +109,17 @@ type SessionEntry =
 export interface AdapterOptions {
   readonly bridge: HostBridge
   readonly now?: () => number
+  /**
+   * 取某个会话在客户端侧的 Agent 作用域 Context。
+   *
+   * typert 的 waterfall 监听器是靠 `this` 认会话的：DSH 审批卡的第一行就是
+   * `ctx.sessions.scopeOf(this)`，拿不到 sessionId 就直接 `next()` 放行（见
+   * `client/ui-approval/src/client/index.ts:45`）。适配层自己派发事件，就必须自己
+   * 把这个 `this` 补上——裸调 listener 会让审批卡根本不出现，而后端只看到一个
+   * 没人裁决的请求，最终按拒绝收口。
+   */
+  readonly approvalScope?: (sessionId: string) => unknown
 }
-
 
 function newJournal(createdAt: number): Journal {
   return {
@@ -127,11 +136,17 @@ function unimplemented(name: string, milestone: string): Promise<never> {
 
 export function createAdapter(options: AdapterOptions): { remote: unknown; dispose(): void } {
   const { bridge } = options
+  const approvalScope = options.approvalScope
   const now = options.now ?? ((): number => Date.now())
   const journals = new Map<string, Journal>()
   const titles = new Map<string, string>()
-  /** 审批监听器（DSH 的 ui-approval 在装配时注册）。 */
-  const approvalListeners: ((request: Record<string, unknown>, next: () => Promise<never>) => Promise<string>)[] = []
+  /**
+   * 审批监听器（DSH 的 ui-approval 在装配时注册）。`this` 由 typert 派发时绑定，
+   * 所以这里保留函数本体、由调用点用 `.call(scope, …)` 触发。
+   */
+  const approvalListeners: ((
+    this: unknown, request: Record<string, unknown>, next: () => Promise<never>,
+  ) => Promise<string>)[] = []
   /**
    * 数据面事件的监听器（`settings/document-updated`、`llm/adapters-updated`、
    * `credentials/*`）。DSH 的席位与设置页都靠这些通知重读目录，收不到通知的形态是
@@ -389,26 +404,38 @@ export function createAdapter(options: AdapterOptions): { remote: unknown; dispo
   }
 
   /** 审批：把后端的请求交给 DSH 审批卡，裁决回执只认后端签发过的 request_id。 */
-  const requestApproval = async (msg: Extract<EventMsg, { type: 'exec_approval_request' }>): Promise<void> => {
+  const requestApproval = async (
+    sessionId: string, msg: Extract<EventMsg, { type: 'exec_approval_request' }>,
+  ): Promise<void> => {
     const listener = approvalListeners[0]
     if (listener === undefined) {
       // 没有审批 UI 在听 = 没有人能裁决：按拒绝收口，绝不因为「没人反对」就执行。
+      console.warn('[SHANIU] 没有审批界面在听 approval/request，本次请求按拒绝回执收口')
       await bridge.invoke('approve', { requestId: msg.request_id, decision: 'deny' }).catch(() => {})
       return
     }
     const next = async (): Promise<never> => {
       throw new RemoteError('gateway/internal', 'approval/request 没有下游处理者', {})
     }
+    // 载荷照 user-approval 的事件声明（ApprovalRequestEvent）：必填只有 toolName，
+    // 卡片把 reason 当描述文本。`args`/`risk` 不在声明里，直接塞进去会被无声忽略——
+    // 表现就是卡片只写"要执行工具"而不说执行什么，所以把它们并进 reason。
+    const preview = JSON.stringify(msg.args)
+    const reason = `风险 ${msg.risk}：${msg.tool} ${preview.length > 160 ? `${preview.slice(0, 160)}…` : preview}`
     let decision = 'deny'
     try {
-      const outcome = await listener(
-        { toolName: msg.tool, args: msg.args, risk: msg.risk },
-        next,
-      )
+      const outcome = await listener.call(approvalScope?.(sessionId), {
+        agent: { id: sessionId },
+        toolName: msg.tool,
+        reason,
+        displayReason: { en: reason },
+      }, next)
       // DSH 的 PendingApproval 只回答 allowed-once / rejected；「本会话记住」需要
       // SH-025 把这档语义接进审批卡，这里不自造第三态。
       decision = outcome === 'allowed-once' ? 'allow' : 'deny'
-    } catch {
+    } catch (reason) {
+      // 抛错和"用户点了拒绝"必须分开：静默按拒绝收口会让一次接线错误长得像一次正常否决。
+      console.error('[SHANIU] 审批界面处理请求时抛错，本次按拒绝收口', reason)
       decision = 'deny'
     }
     await bridge.invoke('approve', { requestId: msg.request_id, decision })
@@ -537,7 +564,7 @@ export function createAdapter(options: AdapterOptions): { remote: unknown; dispo
         console.warn('[SHANIU] 后端错误事件', msg.message)
         return
       case 'exec_approval_request':
-        void requestApproval(msg)
+        void requestApproval(event.session_id, msg)
         return
       default:
         // exec_approval_resolved / plan_delta / turn_diff：后端当前不产生，客户端无需感知。
@@ -566,8 +593,20 @@ export function createAdapter(options: AdapterOptions): { remote: unknown; dispo
       })
     },
     create: async (request: { cwd?: string } = {}) => {
-      const agentId = await bridge.invoke<string>('create_session', { workspaceRoot: request.cwd })
+      // 先回宿主读一次：没有缓存时 workspaceRoot() 是空串，会把合法请求误判成
+      // "给了别的目录"。建档是一次显式用户动作，多一个 invoke 不算代价。
+      await face.refresh()
+      const root = face.workspaceRoot()
+      // 后端只在配置的工作区根上跑（create_session 不收 cwd）。界面给了别的目录
+      // 就必须拒绝：静默用宿主根建会话，等于用户以为会话在 A、实际工具在 B 里跑。
+      if (request.cwd !== undefined && request.cwd !== '' && request.cwd !== root) {
+        return FAIL(`宿主只在配置的工作区根（${root}）上运行，暂不支持在 ${request.cwd} 建会话（见 docs/05 SH-099）`)
+      }
+      const agentId = await bridge.invoke<string>('create_session')
       journals.set(agentId, newJournal(now()))
+      // 工作区分组按 sessionIds 显示：新会话建完就要推一帧，否则侧栏的工作区树
+      // 里看不到它，要重开窗口才出现。
+      workspaceLog.append({ type: 'upsert', workspace: await hostWorkspaceView() })
       return OK({ sessionId: agentId })
     },
     fork: async (request: { sessionId: string; throughSeq?: number }) => {
@@ -756,8 +795,63 @@ export function createAdapter(options: AdapterOptions): { remote: unknown; dispo
     workspacePathApplications: () => unimplemented('session.workspacePathApplications', 'SH-092'),
   }
 
+  /**
+   * 工作区面：宿主只有一个工作区 = `config.toml` 的 `[workspace].root`。
+   *
+   * 只读成员给真状态（一个工作区、无归档、无置顶），会改状态的成员一律显式未接线：
+   * 后端没有多工作区注册表，"添加工作区"若返回成功就等于在界面上造出一个
+   * 运行时根本不会用的目录。多工作区与归档/置顶分属 SH-099/SH-100。
+   */
+  const HOST_WORKSPACE_ID = 'default-workspace'
+  const workspaceLog = new FrameLog()
+  const bootedAt = new Date().toISOString()
+
+  const hostWorkspaceView = async (): Promise<Record<string, unknown>> => {
+    const path = face.workspaceRoot()
+    const rows = await bridge.invoke<{ agentId: string; workspaceRoot: string; updatedAt: number }[]>('list_sessions')
+      .catch((): [] => [])
+    const mine = rows.filter(row => row.workspaceRoot === path)
+    const latest = mine.reduce((max, row) => Math.max(max, row.updatedAt), 0)
+    return {
+      workspaceId: HOST_WORKSPACE_ID,
+      path,
+      // 上游按 title === 'default-workspace' 判定首启自动标题并渲染成「默认工作区」
+      title: HOST_WORKSPACE_ID,
+      sessionIds: mine.map(row => row.agentId),
+      createdAt: bootedAt,
+      updatedAt: latest === 0 ? bootedAt : new Date(latest).toISOString(),
+    }
+  }
+
+  const workspaceNamespace = {
+    follow: async function* (): AsyncGenerator<Record<string, unknown>> {
+      await face.refresh()
+      const from = workspaceLog.length
+      yield {
+        type: 'baseline',
+        value: { items: [await hostWorkspaceView()], archivedSessionIds: [], pinnedSessionIds: [] },
+      }
+      for await (const frame of workspaceLog.tail(from)) yield frame
+    },
+    initializeDefault: async () => {
+      await face.refresh()
+      return OK({ workspace: await hostWorkspaceView() })
+    },
+    // 单工作区只有一种合法顺序，回写真顺序而不是抛错：这是状态读取，不是变更成功
+    insertBefore: async () => OK({ workspaceIds: [HOST_WORKSPACE_ID] }),
+    create: () => unimplemented('workspace.create', 'SH-099'),
+    rename: () => unimplemented('workspace.rename', 'SH-099'),
+    delete: () => unimplemented('workspace.delete', 'SH-099'),
+    archiveSession: () => unimplemented('workspace.archiveSession', 'SH-100'),
+    unarchiveSession: () => unimplemented('workspace.unarchiveSession', 'SH-100'),
+    pinSession: () => unimplemented('workspace.pinSession', 'SH-100'),
+    unpinSession: () => unimplemented('workspace.unpinSession', 'SH-100'),
+    insertSessionBefore: () => unimplemented('workspace.insertSessionBefore', 'SH-100'),
+  }
+
   const namespaces = new Map<string, unknown>([
     ['session', sessionNamespace],
+    ['workspace', workspaceNamespace],
     ['settings', face.settings],
     ['llm', face.llm],
     ['credentials', face.credentials],
@@ -767,7 +861,7 @@ export function createAdapter(options: AdapterOptions): { remote: unknown; dispo
     $host: { home: undefined, isLoopback: true },
     $on(event: string, listener: (...args: never[]) => unknown): () => void {
       if (event === 'approval/request') {
-        const next = listener as (request: Record<string, unknown>, next: () => Promise<never>) => Promise<string>
+        const next = listener as (this: unknown, request: Record<string, unknown>, next: () => Promise<never>) => Promise<string>
         approvalListeners.push(next)
         return (): void => {
           const index = approvalListeners.indexOf(next)
