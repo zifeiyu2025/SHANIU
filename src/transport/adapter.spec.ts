@@ -17,6 +17,7 @@ interface ScriptedBridge extends HostBridge {
 
 function scriptedBridge(
   settings = { baseUrl: 'https://x/v1', model: 'm', workspaceRoot: 'W', hasApiKey: true },
+  archive: Record<string, unknown>[] = [],
 ): ScriptedBridge {
   const calls: ScriptedBridge['calls'] = []
   const handlers = new Set<(event: AgentEvent) => void>()
@@ -28,6 +29,7 @@ function scriptedBridge(
       if (command === 'get_settings') return settings as T
       if (command === 'create_session') return 'agent-new' as T
       if (command === 'send_task') return (args?.agentId ?? 'agent-new') as T
+      if (command === 'load_session') return archive as T
       if (command === 'list_sessions') {
         return [{ agentId: 'agent-new', updatedAt: 1, title: '首条任务', workspaceRoot: 'W' }] as T
       }
@@ -379,21 +381,38 @@ describe('适配层的命令面映射', () => {
     dispose()
   })
 
-  it('按游标分支在游标对齐持久化前明确拒绝，不猜档案条数', async () => {
-    const bridge = scriptedBridge()
+  it('按游标分支用档案对账表换算条目数，表外才拒绝', async () => {
+    // 一个条目会展开成多条 journal 事件：seq 与档案条目数不是一回事，
+    // 直接把 seq 当 keep_items 传给后端就会从历史中间切断（有 call 无 output → 续跑 400）。
+    const archive = [
+      { kind: 'message', role: 'user', text: '第一步' },
+      { kind: 'message', role: 'assistant', text: '先看', reasoning: '想' },
+      { kind: 'tool_call', call_id: 'c1', tool: 'read_file', arguments: '{}', output: '内容' },
+      { kind: 'message', role: 'user', text: '第二步' },
+    ]
+    const bridge = scriptedBridge(undefined, archive)
     const { remote, dispose } = createAdapter({ bridge })
     const session = faceOf(remote).session
-    await session.prompt({ sessionId: 'agent-new', requestId: 'rpc-11', content: [{ type: 'text', text: '分支' }] })
-    bridge.emit('agent-new', { type: 'turn_completed', turn: 1, reason: 'completed' })
-
-    const refused = await session.fork({ sessionId: 'agent-new', throughSeq: 1 })
-    expect(refused['ok']).toBe(false)
-    expect(bridge.calls.some(call => call.command === 'fork_session')).toBe(false)
-
-    const tail = await session.fork({ sessionId: 'agent-new' })
-    expect(tail).toEqual({ ok: true, value: { sessionId: 'agent-fork' } })
+    const iterator = session.follow({ address: { kind: 'session', sessionId: 'agent-old' } })
+    const journal = eventsOf((await iterator.next()).value as Record<string, unknown>)
+    // 档案四条 → 事件 13 条：条目 2（那条 tool_call）展开到的最后一个 seq 是 5，
+    // 而 6/7 只是 step/end、turn/end 这类边界事件。截断点落在 8（边界事件上）也必须
+    // 只保留前 3 个完整条目——按 seq 直接当条数就会切出"有调用没结果"的历史。
+    const forked = await session.fork({ sessionId: 'agent-old', throughSeq: 8 })
+    expect(forked['ok']).toBe(true)
     const forkCall = bridge.calls.find(call => call.command === 'fork_session')
-    expect(forkCall?.args).toEqual({ agentId: 'agent-new', keepItems: Number.MAX_SAFE_INTEGER })
+    expect(forkCall?.args).toEqual({ agentId: 'agent-old', keepItems: 3 })
+
+    // 截断点落在对账表覆盖不到的位置：宁可不接，也不猜一个条目数
+    const beyond = await session.fork({ sessionId: 'agent-old', throughSeq: journal.length + 50 })
+    expect(beyond['ok']).toBe(false)
+    expect(bridge.calls.filter(call => call.command === 'fork_session')).toHaveLength(1)
+
+    // 只有实时回合、没从档案重建过的会话同样没有对账表
+    await session.prompt({ sessionId: 'agent-new', requestId: 'rpc-11', content: [{ type: 'text', text: '分支' }] })
+    const unaligned = await session.fork({ sessionId: 'agent-new', throughSeq: 1 })
+    expect(unaligned['ok']).toBe(false)
+    await iterator.return?.(undefined)
     dispose()
   })
 
@@ -427,6 +446,95 @@ describe('适配层的命令面映射', () => {
     await expect(workspaceFiles['read']!()).rejects.toThrow(/SH-040/)
     await expect(faceOf(remote).session.rename()).rejects.toThrow(/SH-033/)
     dispose()
+  })
+
+  it('重开旧会话：从档案重建 journal，回合边界与 wire 校验都成立', async () => {
+    const archive = [
+      { kind: 'message', role: 'user', text: '把端口改成 9090' },
+      { kind: 'message', role: 'assistant', text: '我先看一眼', reasoning: '要确认文件位置' },
+      { kind: 'tool_call', call_id: 'c1', tool: 'unified_exec', arguments: '{"cmd":"ls"}', output: 'port.txt\n[exit code: 0]' },
+      { kind: 'message', role: 'assistant', text: '改好了' },
+      { kind: 'tool_call', call_id: 'c2', tool: 'apply_patch', arguments: '{}', output: '失败\n[exit code: 1]' },
+    ]
+    const bridge = scriptedBridge(undefined, archive)
+    const { remote, dispose } = createAdapter({ bridge })
+    const iterator = faceOf(remote).session.follow({ address: { kind: 'session', sessionId: 'agent-old' } })
+    const snapshot = (await iterator.next()).value as Record<string, unknown>
+    const journal = eventsOf(snapshot)
+
+    expect(journal.map(event => event['type'])).toEqual([
+      'turn/start', 'step/start', 'user/message',
+      'assistant/message', 'tool/call', 'tool/result',
+      'step/end', 'step/start',
+      'assistant/message', 'tool/call', 'tool/result',
+      'step/end', 'turn/end',
+    ])
+    journal.forEach(event => expect(() => assertSessionWireEvent(event)).not.toThrow())
+    expect(snapshot['cursor']).toBe(journal.at(-1)?.['seq'])
+
+    // 档案里的思考原文回到 reasoning 块，不混进正文
+    const assistant = journal.find(event => event['type'] === 'assistant/message')?.['data'] as {
+      message: { content: { type: string }[] }
+    }
+    expect(assistant.message.content.map(block => block.type)).toEqual(['reasoning', 'text'])
+    // 退出码标记是档案里本来就有的尾标记，重建时不能再追加一次
+    const results = journal.filter(event => event['type'] === 'tool/result')
+      .map(event => (event['data'] as { message: { content: { text: string }[] } }).message.content[0]?.text)
+    expect(results[0]).toBe('port.txt\n[exit code: 0]')
+    expect((journal.filter(event => event['type'] === 'tool/result')[1]?.['data'] as { message: { isError: boolean } }).message.isError)
+      .toBe(true)
+
+    await iterator.return?.(undefined)
+    dispose()
+  })
+
+  it('没有观察过的会话档案也为空时交空快照，不挂起', async () => {
+    const bridge = scriptedBridge(undefined, [])
+    const { remote, dispose } = createAdapter({ bridge })
+    const iterator = faceOf(remote).session.follow({ address: { kind: 'session', sessionId: 'agent-empty' } })
+    const snapshot = (await iterator.next()).value as Record<string, unknown>
+    expect(snapshot['cursor']).toBe(-1)
+    expect(snapshot['records']).toEqual([])
+    expect((await iterator.next()).done).toBe(true)
+    dispose()
+  })
+
+  it('同一份历史：实时跑出来的事件序列与重开时重建的完全一致', async () => {
+    // 这条等价性是 lib.rs 里"展示与回放必须同源"的前端面判据：不一致就意味着用户
+    // 重开旧会话看到的分组（回合头、用时、工具卡归属）和刚跑完时不一样。
+    const liveBridge = scriptedBridge()
+    const live = createAdapter({ bridge: liveBridge })
+    const liveSession = faceOf(live.remote).session
+    await liveSession.prompt({ sessionId: 'agent-new', requestId: 'rpc-eq', content: [{ type: 'text', text: '第一步' }] })
+    liveBridge.emit('agent-new', { type: 'agent_message_delta', delta: '先看' })
+    liveBridge.emit('agent-new', { type: 'tool_call_begin', call_id: 'c1', tool: 'read_file', args: {} })
+    liveBridge.emit('agent-new', { type: 'tool_call_output_delta', call_id: 'c1', channel: 'stdout', delta: '内容' })
+    liveBridge.emit('agent-new', { type: 'tool_call_end', call_id: 'c1', exit_code: 0, error: null, result: 'ok' })
+    liveBridge.emit('agent-new', { type: 'turn_started', turn: 2 })
+    liveBridge.emit('agent-new', { type: 'agent_message_delta', delta: '改好了' })
+    liveBridge.emit('agent-new', { type: 'turn_completed', turn: 2, reason: 'completed' })
+
+    const liveIterator = liveSession.follow({ address: { kind: 'session', sessionId: 'agent-new' } })
+    const liveTypes = eventsOf((await liveIterator.next()).value as Record<string, unknown>)
+      .map(event => event['type'])
+    await liveIterator.return?.(undefined)
+    live.dispose()
+
+    // 同一轮任务落进档案的形状（FunctionCall + FunctionCallOutput 并成一条 ToolCall）
+    const archive = [
+      { kind: 'message', role: 'user', text: '第一步' },
+      { kind: 'message', role: 'assistant', text: '先看' },
+      { kind: 'tool_call', call_id: 'c1', tool: 'read_file', arguments: '{}', output: '内容\n[exit code: 0]' },
+      { kind: 'message', role: 'assistant', text: '改好了' },
+    ]
+    const reopened = createAdapter({ bridge: scriptedBridge(undefined, archive) })
+    const replayIterator = faceOf(reopened.remote).session.follow({ address: { kind: 'session', sessionId: 'agent-old' } })
+    const replayTypes = eventsOf((await replayIterator.next()).value as Record<string, unknown>)
+      .map(event => event['type'])
+    await replayIterator.return?.(undefined)
+    reopened.dispose()
+
+    expect(replayTypes).toEqual(liveTypes)
   })
 
   it('模型席位只反映宿主真实配置，选模写回设置并推投影', async () => {

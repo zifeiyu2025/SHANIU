@@ -14,8 +14,9 @@
  * 后端没有的能力在这里**如实缺省**，不伪造：
  * - 工具输出增量：DSH 词汇表里没有「输出流事件」，终端卡片只读 `tool/result` 的最终内容，
  *   所以 stdout/stderr 在此累积到终态一次性呈现（逐字流式输出属于 SH-094 的传输面）。
- * - 历史回放：档案历史（`load_session`）→ journal 事件的重建是 SH-033 的范畴，
- *   本层只为当前进程内观察到的回合建 journal。
+ * - 历史回放：`follow` 打开本进程没观察过的会话时读 `load_session` 重建 journal
+ *   （SH-033），重建出的事件序列与实时路径逐项一致——否则"重开旧会话"和"刚跑完"
+ *   会给出两份不同的真相。用量不伪造：档案没有回合级汇总就不写 `usage`。
  * - 审批：走 typert 事件面（`approval/request`），不是 journal 事件。
  */
 import { RemoteError } from '@deepseek-ai/dsh-typert-protocol'
@@ -89,6 +90,11 @@ interface Journal {
   attemptId: string
   usage: Record<string, number> | undefined
   outputs: Map<string, { stdout: string[]; stderr: string[] }>
+  /**
+   * 档案条目下标 → 该条目回放出的最后一个 journal seq（SH-033 的重建产物）。
+   * 空数组表示这个会话的 journal 全部来自当前进程观察，没有可对账的档案前缀。
+   */
+  entryToSeq: number[]
 }
 
 interface SettingsView {
@@ -97,6 +103,14 @@ interface SettingsView {
   workspaceRoot: string
   hasApiKey: boolean
 }
+
+/**
+ * `load_session` 的档案投影（与 `src-tauri/src/lib.rs` 的 `SessionEntry` 同形）。
+ * 字段名跟着 Rust 的 serde 走：这里刻意**不**重命名，改名就会和后端序列化结果漂移。
+ */
+type SessionEntry =
+  | { kind: 'message'; role: string; text: string; reasoning?: string }
+  | { kind: 'tool_call'; call_id: string; tool: string; arguments: string; output?: string }
 
 export interface AdapterOptions {
   readonly bridge: HostBridge
@@ -112,6 +126,7 @@ function newJournal(createdAt: number): Journal {
     seq: -1, revision: 0, log: new FrameLog(), createdAt,
     turn: 0, step: 0, taskOpen: false, text: '', reasoning: '', chunkIndex: 0,
     attemptOpen: false, attemptSeq: -1, attemptId: '', usage: undefined, outputs: new Map(),
+    entryToSeq: [],
   }
 }
 
@@ -240,6 +255,129 @@ export function createAdapter(options: AdapterOptions): { remote: unknown; dispo
     pushEvent(journal, 'step/end', { turn: journal.turn, step: journal.step })
     pushEvent(journal, 'turn/end', { turn: journal.turn, reason })
     journal.taskOpen = false
+  }
+
+  /**
+   * 档案历史 → journal 事件重建（SH-033 的"打开旧会话"）。
+   *
+   * 档案里没有 DSH 的回合边界——它记的是模型侧条目序列。这里按与实时路径同构的规则
+   * 重建：一条用户消息开一个回合（一次用户任务），一条 assistant 消息开一个 step
+   * （一次采样迭代）。不这么重建的话，重开的会话里每条消息都没有归属，回合头与
+   * 「用时 N 秒」都无处可算。
+   *
+   * 两处刻意不伪造：
+   * - 用量：档案没有回合级 usage 汇总，缺就不写 `usage` 字段，不回填一个看起来
+   *   合理的数——那会让用户拿它当真实账单。
+   * - 终态：档案里的工具输出**已经**带着后端写的 `[exit code: N]` 尾标记，这里只
+   *   读它、不再追加一次。
+   */
+  const replayArchive = (entries: readonly SessionEntry[]): Journal => {
+    const journal = newJournal(now())
+    let stepOpen = false
+    /**
+     * 当前 step 里是否已经落过助手消息。实时路径里"正文 + 它的工具调用 + 结果"属于
+     * **同一次采样迭代**，只有下一次迭代才换 step；重建时若每条助手消息都新开 step，
+     * 同一个档案回合会被拆成两套步序，回合头与「用时 N 秒」的分组就和实时跑出来的不一样。
+     */
+    let stepHasAssistant = false
+    const openStep = (step: number): void => {
+      pushEvent(journal, 'step/start', { turn: journal.turn, step })
+      stepOpen = true
+      stepHasAssistant = false
+    }
+    const closeStep = (): void => {
+      if (!stepOpen) return
+      pushEvent(journal, 'step/end', { turn: journal.turn, step: journal.step })
+      stepOpen = false
+    }
+    const closeTurn = (): void => {
+      closeStep()
+      if (!journal.taskOpen) return
+      pushEvent(journal, 'turn/end', { turn: journal.turn, reason: { kind: 'completed' } })
+      journal.taskOpen = false
+    }
+    const startTurn = (): void => {
+      closeTurn()
+      journal.turn += 1
+      journal.step = 0
+      journal.taskOpen = true
+      pushEvent(journal, 'turn/start', { turn: journal.turn })
+    }
+
+    entries.forEach((entry, index) => {
+      if (entry.kind === 'message' && entry.role === 'user') {
+        startTurn()
+        openStep(0)
+        pushEvent(journal, 'user/message', {
+          id: `shaniu-replay-user-${index}`,
+          role: 'user',
+          content: [{ type: 'text', text: entry.text }],
+          source: { kind: 'user' },
+        }, { surfaceOp: 'append' })
+      } else if (entry.kind === 'message') {
+        // 档案开头就是助手消息（压缩锚点之类）：也得给它一个回合，否则这条消息
+        // 在界面上没有归属，会被静默丢掉。
+        if (!journal.taskOpen) startTurn()
+        if (!stepOpen) {
+          journal.step += 1
+          openStep(journal.step)
+        } else if (stepHasAssistant) {
+          // 同一个 step 里已经有过一次助手输出 → 这是下一次采样迭代，换 step
+          closeStep()
+          journal.step += 1
+          openStep(journal.step)
+        }
+        stepHasAssistant = true
+        const content: Record<string, unknown>[] = []
+        if (entry.reasoning !== undefined && entry.reasoning !== '') content.push({ type: 'reasoning', text: entry.reasoning })
+        content.push({ type: 'text', text: entry.text })
+        pushEvent(journal, 'assistant/message', {
+          turn: journal.turn,
+          step: journal.step,
+          message: {
+            id: `shaniu-replay-assistant-${index}`,
+            role: 'assistant',
+            content,
+            source: { kind: 'model', provider: PROVIDER_ID, model: settingsCache?.model ?? '' },
+          },
+          stream: [],
+        }, { surfaceOp: 'append' })
+      } else {
+        if (!journal.taskOpen) startTurn()
+        if (!stepOpen) { journal.step += 1; openStep(journal.step) }
+        pushEvent(journal, 'tool/call', {
+          turn: journal.turn,
+          step: journal.step,
+          callId: entry.call_id,
+          name: entry.tool,
+          arguments: entry.arguments,
+        })
+        const exited = entry.output !== undefined
+          ? /\[exit code: (-?\d+)\]\s*$/.exec(entry.output)?.[1]
+          : undefined
+        const failed = entry.output === undefined || (exited !== undefined && exited !== '0')
+        pushEvent(journal, 'tool/result', {
+          turn: journal.turn,
+          step: journal.step,
+          message: {
+            id: `shaniu-replay-result-${index}`,
+            role: 'tool',
+            source: { kind: 'tool', callId: entry.call_id },
+            toolCallId: entry.call_id,
+            content: entry.output === undefined || entry.output === ''
+              ? []
+              : [{ type: 'text', text: entry.output }],
+            isError: failed,
+          },
+          ...(entry.output === undefined
+            ? { error: { name: 'Interrupted', code: 'interrupted', reason: '该调用没有留下结果' } }
+            : {}),
+        }, { surfaceOp: 'append' })
+      }
+      journal.entryToSeq[index] = journal.seq
+    })
+    closeTurn()
+    return journal
   }
 
   const readSettings = async (): Promise<SettingsView | undefined> => {
@@ -450,17 +588,30 @@ export function createAdapter(options: AdapterOptions): { remote: unknown; dispo
     },
     fork: async (request: { sessionId: string; throughSeq?: number }) => {
       const journal = journals.get(request.sessionId)
-      if (journal !== undefined && request.throughSeq !== undefined && request.throughSeq < journal.seq) {
-        // 中间游标的分支要求「事件 seq → 档案条目」的对齐表，而信封目前没有落盘
-        // （docs/04 §1.1 的 SH-094 前置项）。这里宁可不接，也不按 journal 条数猜一个
-        // keep_items——猜错就是静默丢掉一段模型历史。
-        return FAIL('按游标分支需要事件与档案的对齐关系，尚未持久化（见 docs/05 SH-094）')
+      let keepItems = Number.MAX_SAFE_INTEGER
+      if (request.throughSeq !== undefined) {
+        const through = request.throughSeq
+        // 截断点必须换算成**档案条目数**：journal 的 seq 是事件序号，一个条目会展开
+        // 成好几条事件，拿 seq 当条数传给后端就会从历史中间切断（有 call 无 output，
+        // 续跑第一次请求直接 400）。所以只用重建时记下的对账表换算，表外一律拒绝。
+        const map = journal?.entryToSeq ?? []
+        if (map.length === 0) {
+          return FAIL('该会话还没有档案↔事件的对账表（打开过一次会话后即可按游标分支）')
+        }
+        if (through > map[map.length - 1]!) {
+          return FAIL('截断点超出已对账的档案前缀：那之后的事件还没有对应的档案条目可换算')
+        }
+        let kept = 0
+        for (const [index, seq] of map.entries()) {
+          if (seq <= through) kept = index + 1
+        }
+        keepItems = kept
       }
       const agentId = await bridge.invoke<string>('fork_session', {
         agentId: request.sessionId,
         // 末尾分支 = 整份档案续一份。后端 nearest_safe_cut 会把请求量钳到档案实际条数
-        // 并回退到最后一个调用/输出配对的边界，所以这里给"全部"而不是猜一个条数。
-        keepItems: Number.MAX_SAFE_INTEGER,
+        // 并回退到最后一个调用/输出配对的边界，所以"全部"给 MAX_SAFE_INTEGER 是安全的。
+        keepItems,
       })
       journals.set(agentId, newJournal(now()))
       return OK({ sessionId: agentId })
@@ -499,9 +650,35 @@ export function createAdapter(options: AdapterOptions): { remote: unknown; dispo
       }
       const journal = journals.get(sessionId)
       if (journal === undefined) {
-        // 没有观察过这个会话：交空快照（不替它建 journal——follow 不该凭空造会话身份），
-        // 但也不能挂着不返回，客户端要的是确定的空态。
-        yield emptySnapshot(sessionId, now())
+        // 没在当前进程里观察过：能从档案重建就重建（SH-033 的"打开旧会话"），
+        // 重建不出内容才交空快照。档案读不回是硬错误——静默交空态会让用户以为
+        // 会话没了，而实际只是宿主读失败。
+        const entries = await bridge.invoke<SessionEntry[]>('load_session', { agentId: sessionId })
+        if (entries.length === 0) {
+          yield emptySnapshot(sessionId, now())
+          return
+        }
+        const replayed = replayArchive(entries)
+        journals.set(sessionId, replayed)
+        if (!titles.has(sessionId)) {
+          const firstUser = entries.find(entry => entry.kind === 'message' && entry.role === 'user')
+          const text = firstUser?.kind === 'message' ? firstUser.text : ''
+          pushTitle(sessionId, text.trim().slice(0, 12) || '新会话')
+        }
+        const from = replayed.log.length
+        yield {
+          type: 'snapshot',
+          header: { version: 0, id: sessionId, createdAt: replayed.createdAt, isSeeded: false },
+          cursor: replayed.seq,
+          records: replayed.log.eventsUpTo(from),
+          hasMore: false,
+          projections: {
+            asOfSeq: 0,
+            values: { modelSelection: currentModelSelection(), title: titles.get(sessionId) ?? null },
+          },
+          assistantStream: { revision: replayed.revision },
+        }
+        for await (const frame of replayed.log.tail(from)) yield frame
         return
       }
       // 下标在同步块里一次捕获：cursor / revision / records 必须描述同一时刻，
