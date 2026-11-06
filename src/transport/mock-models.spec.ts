@@ -87,11 +87,13 @@ describe('mock-models：设置页的可读基线', () => {
     expect(levels).toEqual(expect.arrayContaining(['off', 'low', 'medium', 'high']))
   })
 
-  it('出厂没有自定义服务商：设置页只有官方 DeepSeek 一行', async () => {
+  it('出厂没有自定义服务商：providers 为空，目录只列内建服务商', async () => {
     const view = await viewOf(mock, 'llm-pi-ai')
     expect(schema.getPath(view.value, ['providers'])).toEqual({})
     const declared = await mock.llm.listConfigurableProviders()
-    expect(declared.ok && declared.value.map(entry => entry.provider)).toEqual(['deepseek'])
+    if (!declared.ok) return
+    expect(declared.value.filter(entry => entry.declared === true)).toEqual([])
+    expect(declared.value.map(entry => entry.provider)).toEqual(expect.arrayContaining(['deepseek', 'openai', 'anthropic']))
   })
 
   it('预置的 DeepSeek 行有密钥引用但没有密钥（页面据此画红点）', async () => {
@@ -363,5 +365,69 @@ describe('mock-models：权限默认档设置', () => {
     if (!written.ok) return
     expect(schema.getPath(written.value.user, ['defaultPreset'])).toBe('workspace-write')
     expect(mock.permissionDefault()).toBe('workspace-write')
+  })
+})
+
+describe('mock-models：第三方服务商目录', () => {
+  it('目录列出内建服务商；发现模型直接答本地目录、不发请求', async () => {
+    const mock = createModelsMock()
+    const directory = await mock.llm.listConfigurableProviders()
+    if (!directory.ok) throw new Error('directory failed')
+    expect(directory.value.find(entry => entry.provider === 'openai')).toMatchObject({
+      displayName: 'OpenAI',
+      settingsNs: 'llm-pi-ai',
+      settingsPath: ['providers', 'openai'],
+      declared: false,
+      defaultBaseURL: 'https://api.openai.com/v1',
+      nativeAuth: { env: ['OPENAI_API_KEY'], oauth: false },
+    })
+
+    const fetchSpy = vi.fn()
+    globalThis.fetch = fetchSpy
+    // 内建服务商既不需要端点，也不触网（与官方适配器「答自己的模型」同口径）
+    const found = await mock.llm.discoverModels('llm-pi-ai', { provider: 'openai' })
+    expect(found.ok).toBe(true)
+    if (!found.ok) return
+    expect(found.value.map(model => model.id)).toEqual(expect.arrayContaining(['gpt-6.1-sol', 'o4-mini']))
+    expect(fetchSpy).not.toHaveBeenCalled()
+  })
+
+  it('添加内建服务商：只写 apiKeyEnv，配上密钥后模型来自内建目录', async () => {
+    const mock = createModelsMock()
+    const view = await viewOf(mock, 'llm-pi-ai')
+    await mock.settings.mutate('llm-pi-ai', [
+      { op: 'set', path: ['providers', 'openai'], value: { apiKeyEnv: 'OPENAI_API_KEY' } },
+    ], view.revision)
+
+    // 未配密钥：不进席位目录
+    const before = await mock.session.modelCatalog()
+    expect(before.ok && before.value.groups.map(group => group.id)).not.toContain('openai')
+
+    await mock.credentials.set('OPENAI_API_KEY', 'sk-openai-test')
+    try {
+      const after = await mock.session.modelCatalog()
+      if (!after.ok) throw new Error('catalog failed')
+      const group = after.value.groups.find(candidate => candidate.id === 'openai')
+      expect(group?.name).toBe('OpenAI')
+      const model = group?.models.find(entry => entry.id === 'gpt-6.1-sol')
+      expect(model?.reasoning?.efforts.map(effort => effort.id)).toEqual(['off', 'low', 'medium', 'high', 'max'])
+    } finally {
+      await mock.credentials.unset('OPENAI_API_KEY')
+    }
+  })
+
+  it('内建服务商被用户覆盖字段后仍算内建（declared=false）', async () => {
+    const mock = createModelsMock()
+    const view = await viewOf(mock, 'llm-pi-ai')
+    await mock.settings.mutate('llm-pi-ai', [
+      { op: 'set', path: ['providers', 'openai'], value: { displayName: 'My OpenAI', apiKeyEnv: 'OPENAI_API_KEY' } },
+    ], view.revision)
+    const directory = await mock.llm.listConfigurableProviders()
+    if (!directory.ok) throw new Error('directory failed')
+    expect(directory.value.find(entry => entry.provider === 'openai')).toMatchObject({
+      displayName: 'My OpenAI',
+      declared: false,
+      defaultBaseURL: 'https://api.openai.com/v1',
+    })
   })
 })

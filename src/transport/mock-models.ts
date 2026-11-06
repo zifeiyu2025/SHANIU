@@ -95,6 +95,113 @@ const DEEPSEEK_MODELS: JsonValue = [
   { id: 'deepseek-v4-pro', name: 'DeepSeek-V4-Pro', description: '', contextWindow: 1_000_000, maxTokens: 131_072 },
 ]
 
+/** 内建目录模型的统一推理档：官方按模型各异，mock 只做界面展示，用一套通用档位。 */
+const CATALOG_REASONING_EFFORTS = { off: null, low: 'low', medium: 'medium', high: 'high', max: 'max' }
+
+/** 一个内建服务商（官方 llm-pi-ai 目录项的精简面）。 */
+interface CatalogProvider {
+  readonly displayName: string
+  readonly defaultBaseURL: string
+  /** 适配器原生读取的密钥环境变量（第一个作为首选提示）。 */
+  readonly env: readonly string[]
+  readonly models: readonly CatalogModel[]
+}
+
+interface CatalogModel {
+  readonly id: string
+  readonly name: string
+  readonly contextWindow: number
+  readonly maxTokens: number
+  readonly reasoning: boolean
+}
+
+/**
+ * 第三方服务商目录的子集：id / 模型名 / 上下文 / 输出上限逐字取自官方
+ * `@earendil-works/pi-ai@1.3.0` 的模型数据，端点和密钥环境变量取自 DSH 的
+ * `provider-data.generated.ts`。完整目录（41 家）属于后端适配器的接线面，
+ * mock 只收录 SHANIU 常用的七家，避免把整份目录塞进前端包。
+ */
+const CATALOG: Record<string, CatalogProvider> = {
+  openai: {
+    displayName: 'OpenAI',
+    defaultBaseURL: 'https://api.openai.com/v1',
+    env: ['OPENAI_API_KEY'],
+    models: [
+      { id: 'gpt-6.1-sol', name: 'GPT-6.1 Sol', contextWindow: 272_000, maxTokens: 128_000, reasoning: true },
+      { id: 'gpt-6-sol', name: 'GPT-6 Sol', contextWindow: 272_000, maxTokens: 128_000, reasoning: true },
+      { id: 'gpt-6-luna', name: 'GPT-6 Luna', contextWindow: 272_000, maxTokens: 128_000, reasoning: true },
+      { id: 'o3-pro', name: 'o3-pro', contextWindow: 200_000, maxTokens: 100_000, reasoning: true },
+      { id: 'o4-mini', name: 'o4-mini', contextWindow: 200_000, maxTokens: 100_000, reasoning: true },
+    ],
+  },
+  anthropic: {
+    displayName: 'Anthropic',
+    defaultBaseURL: 'https://api.anthropic.com',
+    env: ['ANTHROPIC_API_KEY'],
+    models: [
+      { id: 'claude-opus-5-5', name: 'Claude Opus 5.5', contextWindow: 1_000_000, maxTokens: 128_000, reasoning: true },
+      { id: 'claude-sonnet-5-5', name: 'Claude Sonnet 5.5', contextWindow: 1_000_000, maxTokens: 128_000, reasoning: true },
+      { id: 'claude-opus-5', name: 'Claude Opus 5', contextWindow: 1_000_000, maxTokens: 128_000, reasoning: true },
+      { id: 'claude-sonnet-5', name: 'Claude Sonnet 5', contextWindow: 1_000_000, maxTokens: 128_000, reasoning: true },
+      { id: 'claude-opus-4-8', name: 'Claude Opus 4.8', contextWindow: 1_000_000, maxTokens: 128_000, reasoning: true },
+    ],
+  },
+  google: {
+    displayName: 'Google',
+    defaultBaseURL: 'https://generativelanguage.googleapis.com/v1beta',
+    env: ['GEMINI_API_KEY'],
+    models: [
+      { id: 'gemini-4-argon', name: 'Gemini 4 Argon', contextWindow: 1_048_576, maxTokens: 32_768, reasoning: true },
+      { id: 'gemini-3.8-flash', name: 'Gemini 3.8 Flash', contextWindow: 1_048_576, maxTokens: 65_536, reasoning: true },
+      { id: 'gemini-3.1-pro-preview', name: 'Gemini 3.1 Pro Preview', contextWindow: 1_048_576, maxTokens: 65_536, reasoning: true },
+      { id: 'gemini-flash-latest', name: 'Gemini Flash Latest', contextWindow: 1_048_576, maxTokens: 65_536, reasoning: true },
+    ],
+  },
+  xai: {
+    displayName: 'xAI',
+    defaultBaseURL: 'https://api.x.ai/v1',
+    env: ['XAI_API_KEY'],
+    models: [
+      { id: 'grok-4.7', name: 'Grok 4.7', contextWindow: 500_000, maxTokens: 500_000, reasoning: true },
+      { id: 'grok-4.6', name: 'Grok 4.6', contextWindow: 500_000, maxTokens: 500_000, reasoning: true },
+      { id: 'grok-4.5', name: 'Grok 4.5', contextWindow: 500_000, maxTokens: 500_000, reasoning: true },
+      { id: 'grok-4.3', name: 'Grok 4.3', contextWindow: 1_000_000, maxTokens: 30_000, reasoning: true },
+    ],
+  },
+  moonshotai: {
+    displayName: 'Moonshot AI',
+    defaultBaseURL: 'https://api.moonshot.ai/v1',
+    env: ['MOONSHOT_API_KEY'],
+    models: [
+      { id: 'kimi-k3', name: 'Kimi K3', contextWindow: 1_048_576, maxTokens: 1_048_576, reasoning: true },
+      { id: 'kimi-k2.7-code', name: 'Kimi K2.7 Code', contextWindow: 262_144, maxTokens: 262_144, reasoning: true },
+      { id: 'kimi-k2.7-code-highspeed', name: 'Kimi K2.7 Code HighSpeed', contextWindow: 262_144, maxTokens: 262_144, reasoning: true },
+      { id: 'kimi-k2.6', name: 'Kimi K2.6', contextWindow: 262_144, maxTokens: 262_144, reasoning: true },
+    ],
+  },
+  zai: {
+    displayName: 'Z.ai',
+    defaultBaseURL: 'https://api.z.ai/api/coding/paas/v4',
+    env: ['ZAI_API_KEY'],
+    models: [
+      { id: 'glm-5.3', name: 'GLM-5.3', contextWindow: 1_000_000, maxTokens: 131_072, reasoning: true },
+      { id: 'glm-5.3-flash', name: 'GLM-5.3-Flash', contextWindow: 1_000_000, maxTokens: 131_072, reasoning: true },
+      { id: 'glm-5.3-highspeed', name: 'GLM-5.3 Highspeed', contextWindow: 1_000_000, maxTokens: 131_072, reasoning: true },
+      { id: 'glm-5.2', name: 'GLM-5.2', contextWindow: 1_000_000, maxTokens: 131_072, reasoning: true },
+    ],
+  },
+  groq: {
+    displayName: 'Groq',
+    defaultBaseURL: 'https://api.groq.com/openai/v1',
+    env: ['GROQ_API_KEY'],
+    models: [
+      { id: 'openai/gpt-oss-120b', name: 'GPT OSS 120B', contextWindow: 131_072, maxTokens: 65_536, reasoning: true },
+      { id: 'llama-3.3-70b-versatile', name: 'Llama 3.3 70B', contextWindow: 131_072, maxTokens: 32_768, reasoning: false },
+      { id: 'qwen/qwen3.8-27b', name: 'Qwen3.8 27B', contextWindow: 131_042, maxTokens: 16_384, reasoning: true },
+    ],
+  },
+}
+
 const isRecord = (value: unknown): value is Record<string, JsonValue> =>
   typeof value === 'object' && value !== null && !Array.isArray(value)
 
@@ -261,11 +368,33 @@ export function createModelsMock(options: ModelsMockOptions = { emit: () => fals
   /** profile 引用的密钥是否已就位；没有引用即无需密钥。 */
   const keyReady = (ref: string | undefined): boolean => ref === undefined || credentials.has(ref)
 
-  const profileUsable = (profile: Record<string, JsonValue>): boolean => {
-    const models = profile.models
-    return typeof profile.baseURL === 'string' && profile.baseURL.length > 0
-      && Array.isArray(models) && models.length > 0
-      && keyReady(typeof profile.apiKeyEnv === 'string' ? profile.apiKeyEnv : undefined)
+  /** 目录项的模型行：带 reasoningEfforts 的就有推理档（与手声明 profile 同一形状）。 */
+  const catalogRows = (entry: CatalogProvider): unknown[] =>
+    entry.models.map(model => ({
+      id: model.id,
+      name: model.name,
+      ...(model.reasoning ? { reasoningEfforts: CATALOG_REASONING_EFFORTS } : {}),
+    }))
+
+  /**
+   * 一个可路由的服务商分组；字段优先取 profile，缺省回落到内建目录——
+   * 与官方 pi-ai 同口径：路由名命中已安装服务商时，端点/模型/鉴权都由目录补齐。
+   */
+  const usableGroup = (provider: string, profile: Record<string, JsonValue>): ModelProviderGroup | undefined => {
+    const catalog = CATALOG[provider]
+    const baseURL = typeof profile.baseURL === 'string' && profile.baseURL.length > 0
+      ? profile.baseURL : catalog?.defaultBaseURL
+    const declaredModels = Array.isArray(profile.models) ? profile.models : []
+    const models = declaredModels.length > 0 ? declaredModels : (catalog === undefined ? [] : catalogRows(catalog))
+    const keyRef = typeof profile.apiKeyEnv === 'string' ? profile.apiKeyEnv : catalog?.env[0]
+    if (baseURL === undefined || baseURL.length === 0 || models.length === 0 || !keyReady(keyRef)) return undefined
+    return {
+      id: provider,
+      name: typeof profile.displayName === 'string' && profile.displayName.length > 0
+        ? profile.displayName
+        : catalog?.displayName ?? provider,
+      models: catalogModels(models),
+    }
   }
 
   /** 一个可路由的 provider 分组；目录项与席位分组由同一判定产生。 */
@@ -277,14 +406,8 @@ export function createModelsMock(options: ModelsMockOptions = { emit: () => fals
       if (Array.isArray(models) && models.length > 0) groups.push({ id: 'deepseek', name: 'DeepSeek', models: catalogModels(models, DEEPSEEK_REASONING) })
     }
     for (const [provider, profile] of declaredProfiles()) {
-      if (!profileUsable(profile)) continue
-      const models = Array.isArray(profile.models) ? profile.models : []
-      if (models.length === 0) continue
-      groups.push({
-        id: provider,
-        name: typeof profile.displayName === 'string' && profile.displayName.length > 0 ? profile.displayName : provider,
-        models: catalogModels(models),
-      })
+      const group = usableGroup(provider, profile)
+      if (group !== undefined) groups.push(group)
     }
     return groups
   }
@@ -351,26 +474,60 @@ export function createModelsMock(options: ModelsMockOptions = { emit: () => fals
         return OK(providers)
       },
       listConfigurableProviders: async () => {
-        const directory: LlmConfigurableProvider[] = [
-          {
+        const directory = new Map<string, LlmConfigurableProvider>([
+          ['deepseek', {
             provider: 'deepseek', displayName: 'DeepSeek',
             settingsNs: 'llm-deepseek', settingsPath: [],
             defaultBaseURL: 'https://api.deepseek.com',
-          },
-        ]
-        for (const [provider, profile] of declaredProfiles()) {
-          directory.push({
+          }],
+        ])
+        // 内建目录：适配器自带的服务商（未配置也可从「第三方模型提供商」里添加）
+        for (const [provider, entry] of Object.entries(CATALOG)) {
+          directory.set(provider, {
             provider,
-            displayName: typeof profile.displayName === 'string' && profile.displayName.length > 0 ? profile.displayName : provider,
-            settingsNs: 'llm-pi-ai', settingsPath: ['providers', provider], declared: true,
-            ...(typeof profile.baseURL === 'string' ? { defaultBaseURL: profile.baseURL } : {}),
+            displayName: entry.displayName,
+            settingsNs: 'llm-pi-ai',
+            settingsPath: ['providers', provider],
+            declared: false,
+            defaultBaseURL: entry.defaultBaseURL,
+            ...(entry.env.length === 0 ? {} : { nativeAuth: { env: [...entry.env], oauth: false } }),
           })
         }
-        return OK(directory)
+        // 用户写入的 profile：命中内建目录时仍算内建（官方同口径），否则是手声明路由
+        for (const [provider, profile] of declaredProfiles()) {
+          const catalog = CATALOG[provider]
+          directory.set(provider, {
+            provider,
+            displayName: typeof profile.displayName === 'string' && profile.displayName.length > 0
+              ? profile.displayName
+              : catalog?.displayName ?? provider,
+            settingsNs: 'llm-pi-ai',
+            settingsPath: ['providers', provider],
+            ...(catalog === undefined
+              ? { declared: true, ...(typeof profile.baseURL === 'string' ? { defaultBaseURL: profile.baseURL } : {}) }
+              : {
+                declared: false,
+                defaultBaseURL: catalog.defaultBaseURL,
+                ...(catalog.env.length === 0 ? {} : { nativeAuth: { env: [...catalog.env], oauth: false } }),
+              }),
+          })
+        }
+        return OK([...directory.values()])
       },
       discoverModels: async (settingsNs, request) => {
         if (!sections.has(settingsNs)) {
           return FAIL<LlmDiscoveredModel[]>('llm/model-discovery-rejected', `没有名为 ${settingsNs} 的服务商配置域`)
+        }
+        // 路由名命中内建目录：适配器直接答自己的模型，不触网也无需端点（官方同口径）
+        const catalog = request.provider === undefined ? undefined : CATALOG[request.provider]
+        if (catalog !== undefined) {
+          return OK<LlmDiscoveredModel[]>(catalog.models.map(model => ({
+            id: model.id,
+            name: model.name,
+            contextWindow: model.contextWindow,
+            maxTokens: model.maxTokens,
+            inputModalities: ['text'],
+          })))
         }
         if (typeof request.baseURL !== 'string' || !/^https?:\/\//.test(request.baseURL)) {
           return FAIL<LlmDiscoveredModel[]>('llm/model-discovery-rejected', '该路由需要一个 http(s) 端点才能列模型')
