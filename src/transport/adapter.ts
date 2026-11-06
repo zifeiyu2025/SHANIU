@@ -1062,21 +1062,36 @@ export function createAdapter(options: AdapterOptions): { remote: unknown; dispo
         }),
       })
     },
-    create: async (request: { cwd?: string } = {}) => {
-      // 先回宿主读一次：没有缓存时 workspaceRoot() 是空串，会把合法请求误判成
-      // "给了别的目录"。建档是一次显式用户动作，多一个 invoke 不算代价。
+    create: async (request: { workspaceId?: string; cwd?: string } = {}) => {
+      // 先回宿主读一次：没有缓存时 workspaceRoot() 是空串，会把 workspaceId 解析错。
+      // 建档是一次显式用户动作，多一个 invoke 不算代价。
       await face.refresh()
-      const root = face.workspaceRoot()
-      // 后端只在配置的工作区根上跑（create_session 不收 cwd）。界面给了别的目录
-      // 就必须拒绝：静默用宿主根建会话，等于用户以为会话在 A、实际工具在 B 里跑。
-      if (request.cwd !== undefined && request.cwd !== '' && request.cwd !== root) {
-        return FAIL(`宿主只在配置的工作区根（${root}）上运行，暂不支持在 ${request.cwd} 建会话（见 docs/05 SH-099）`)
+      // 工作区解析（SH-099）：workspaceId 是 composer 选择工作区的正式载荷（上游
+      // createInWorkspace 同形状）；cwd 作为未指名工作区时的目录回落。解析成路径
+      // 后交 create_session —— 会话按 cwd 绑定（config_snapshot.workspace_root），
+      // 工具沙箱作用域跟随。
+      const registered = registeredWorkspaces()
+      const byId = request.workspaceId === undefined
+        ? undefined
+        : registered.find(ws => ws.id === request.workspaceId)
+      if (request.workspaceId !== undefined && byId === undefined) {
+        return FAIL(`工作区 ${request.workspaceId} 不存在，先在侧栏添加它`)
       }
-      const agentId = await bridge.invoke<string>('create_session')
+      const cwd = byId?.path ?? (request.cwd !== undefined && request.cwd !== '' ? request.cwd : face.workspaceRoot())
+      const agentId = await bridge.invoke<string>('create_session', {
+        ...(cwd === face.workspaceRoot() ? {} : { workspacePath: cwd }),
+      })
       journals.set(agentId, newJournal(now()))
       // 工作区分组按 sessionIds 显示：新会话建完就要推一帧，否则侧栏的工作区树
-      // 里看不到它，要重开窗口才出现。
-      workspaceLog.append({ type: 'upsert', workspace: await hostWorkspaceView() })
+      // 里看不到它，要重开窗口才出现。目标工作区可能不是默认那家，按路径找视图。
+      const flags = await readWorkspaceFlags()
+      const rows = await bridge
+        .invoke<{ agentId: string; workspaceRoot: string; updatedAt: number }[]>('list_sessions')
+        .catch((): { agentId: string; workspaceRoot: string; updatedAt: number }[] => [])
+      const target = registered.find(ws => ws.path === cwd) ?? registered[0]
+      if (target !== undefined) {
+        workspaceLog.append({ type: 'upsert', workspace: await workspaceViewFor(target, rows, flags) })
+      }
       return OK({ sessionId: agentId })
     },
     fork: async (request: { sessionId: string; throughSeq?: number }) => {
@@ -1110,7 +1125,14 @@ export function createAdapter(options: AdapterOptions): { remote: unknown; dispo
       // 直接交一个空快照，用户看到的是一个历史全空的会话，而档案里明明拷来了条目。
       // 留空让第一次 follow 走档案重建，与"重开旧会话"同一条路径。
       journals.delete(agentId)
-      workspaceLog.append({ type: 'upsert', workspace: await hostWorkspaceView() })
+      // fork 会话继承源会话的工作区（可能在任意一家）：逐家重推受影响的视图
+      const flags = await readWorkspaceFlags()
+      const rows = await bridge
+        .invoke<{ agentId: string; workspaceRoot: string; updatedAt: number }[]>('list_sessions')
+        .catch((): { agentId: string; workspaceRoot: string; updatedAt: number }[] => [])
+      for (const ws of registeredWorkspaces()) {
+        workspaceLog.append({ type: 'upsert', workspace: await workspaceViewFor(ws, rows, flags) })
+      }
       return OK({ sessionId: agentId })
     },
     prompt: async (request: { sessionId?: string; requestId?: string; content?: readonly { type: string; text?: string }[] }) => {
@@ -1448,30 +1470,48 @@ export function createAdapter(options: AdapterOptions): { remote: unknown; dispo
   }
 
   /**
-   * 单工作区视图。`sessionIds` 按 SH-100 的手动顺序排（侧车序 ∩ 现存，缺的按列表
-   * 序补位）——上游 per-workspace `sessionIds` 数组就是展示顺序；归档会话**保留
-   * 槽位**（上游"never touches workspace accounting"），隐藏由客户端按
-   * archivedSessionIds 集过滤，不从视图里删。
+   * 工作区注册表（SH-099）：默认工作区来自 [workspace].root（id 固定），额外
+   * 工作区来自宿主 `[[workspaces]]`（face.refresh 后随快照读取）。
    */
-  const hostWorkspaceView = async (flags: WorkspaceFlags = workspaceFlags): Promise<Record<string, unknown>> => {
-    const path = face.workspaceRoot()
-    const rows = await bridge.invoke<{ agentId: string; workspaceRoot: string; updatedAt: number }[]>('list_sessions')
-      .catch((): [] => [])
-    const mine = rows.filter(row => row.workspaceRoot === path)
+  interface RegisteredWorkspace { readonly id: string; readonly path: string; readonly title: string }
+  const registeredWorkspaces = (): RegisteredWorkspace[] => [
+    { id: HOST_WORKSPACE_ID, path: face.workspaceRoot(), title: HOST_WORKSPACE_ID },
+    ...face.workspaces(),
+  ]
+
+  /**
+   * 一个工作区的视图。`sessionIds` 按 SH-100 的手动顺序排（侧车序 ∩ 本工作区现存，
+   * 缺的按列表序补位）——上游 per-workspace `sessionIds` 就是展示顺序，且其 getter
+   * 本就按 cwd 动态过滤（entity.ts:102-104），SHANIU 的按 path 过滤与之同构；归档
+   * 会话**保留槽位**，隐藏由客户端按 archivedSessionIds 集过滤。
+   */
+  const workspaceViewFor = async (
+    ws: RegisteredWorkspace,
+    rows: { agentId: string; workspaceRoot: string; updatedAt: number }[],
+    flags: WorkspaceFlags,
+  ): Promise<Record<string, unknown>> => {
+    const mine = rows.filter(row => row.workspaceRoot === ws.path)
     const latest = mine.reduce((max, row) => Math.max(max, row.updatedAt), 0)
     const ordered = [
       ...flags.sessionOrder.filter(id => mine.some(row => row.agentId === id)),
       ...mine.filter(row => !flags.sessionOrder.includes(row.agentId)).map(row => row.agentId),
     ]
     return {
-      workspaceId: HOST_WORKSPACE_ID,
-      path,
+      workspaceId: ws.id,
+      path: ws.path,
       // 上游按 title === 'default-workspace' 判定首启自动标题并渲染成「默认工作区」
-      title: HOST_WORKSPACE_ID,
+      title: ws.title,
       sessionIds: ordered,
       createdAt: bootedAt,
       updatedAt: latest === 0 ? bootedAt : new Date(latest).toISOString(),
     }
+  }
+
+  const allWorkspaceViews = async (flags: WorkspaceFlags): Promise<Record<string, unknown>[]> => {
+    const rows = await bridge
+      .invoke<{ agentId: string; workspaceRoot: string; updatedAt: number }[]>('list_sessions')
+      .catch((): { agentId: string; workspaceRoot: string; updatedAt: number }[] => [])
+    return Promise.all(registeredWorkspaces().map(ws => workspaceViewFor(ws, rows, flags)))
   }
 
   /** 集合变化检测：全量替换帧只在集合真的变了时发（上游 feed 的同口径）。 */
@@ -1536,7 +1576,10 @@ export function createAdapter(options: AdapterOptions): { remote: unknown; dispo
       workspaceLog.append({ type: 'pinned', pinnedSessionIds: next.pinnedSessionIds })
     }
     if (orderChanged || !sameSet(previous.sessionOrder, next.sessionOrder)) {
-      workspaceLog.append({ type: 'upsert', workspace: await hostWorkspaceView(next) })
+      // 手动顺序在 sidecar 是全局扁平表，任何一家都可能受影响：逐家重推视图
+      for (const view of await allWorkspaceViews(next)) {
+        workspaceLog.append({ type: 'upsert', workspace: view })
+      }
     }
     return value
   }
@@ -1548,19 +1591,51 @@ export function createAdapter(options: AdapterOptions): { remote: unknown; dispo
       const from = workspaceLog.length
       yield {
         type: 'baseline',
-        value: { items: [await hostWorkspaceView(flags)], archivedSessionIds: flags.archivedSessionIds, pinnedSessionIds: flags.pinnedSessionIds },
+        value: { items: await allWorkspaceViews(flags), archivedSessionIds: flags.archivedSessionIds, pinnedSessionIds: flags.pinnedSessionIds },
       }
       for await (const frame of workspaceLog.tail(from)) yield frame
     },
     initializeDefault: async () => {
       await face.refresh()
-      return OK({ workspace: await hostWorkspaceView() })
+      const flags = await readWorkspaceFlags()
+      return OK({ workspace: (await allWorkspaceViews(flags))[0] })
     },
     // 单工作区只有一种合法顺序，回写真顺序而不是抛错：这是状态读取，不是变更成功
     insertBefore: async () => OK({ workspaceIds: [HOST_WORKSPACE_ID] }),
-    create: () => unimplemented('workspace.create', 'SH-099'),
-    rename: () => unimplemented('workspace.rename', 'SH-099'),
-    delete: () => unimplemented('workspace.delete', 'SH-099'),
+    /** 注册新工作区（SH-099）：路径来自目录选择流；幂等重复注册 created:false。 */
+    create: async (request: { path?: string } = {}) => {
+      try {
+        const value = await bridge.invoke<Record<string, unknown>>('create_workspace', { path: request.path ?? '' })
+        await readWorkspaceFlags()
+        const workspace = value['workspace'] as Record<string, unknown> | undefined
+        if (workspace !== undefined) workspaceLog.append({ type: 'upsert', workspace })
+        return OK(value)
+      } catch (reason) {
+        return workspaceOpFailure(reason, {})
+      }
+    },
+    rename: async (request: { workspaceId?: string; title?: string } = {}) => {
+      try {
+        const value = await bridge.invoke<Record<string, unknown>>('rename_workspace', {
+          workspaceId: request.workspaceId ?? '',
+          title: request.title ?? '',
+        })
+        const workspace = value['workspace'] as Record<string, unknown> | undefined
+        if (workspace !== undefined) workspaceLog.append({ type: 'upsert', workspace })
+        return OK(value)
+      } catch (reason) {
+        return workspaceOpFailure(reason, {})
+      }
+    },
+    delete: async (request: { workspaceId?: string } = {}) => {
+      try {
+        await bridge.invoke<Record<string, unknown>>('delete_workspace', { workspaceId: request.workspaceId ?? '' })
+        workspaceLog.append({ type: 'remove', workspaceId: request.workspaceId ?? '' })
+        return OK({ removed: request.workspaceId ?? '' })
+      } catch (reason) {
+        return workspaceOpFailure(reason, {})
+      }
+    },
     archiveSession: async (request: { sessionId?: string; stopActivity?: boolean } = {}) => {
       const sessionId = request.sessionId ?? ''
       const previous = await readWorkspaceFlags()

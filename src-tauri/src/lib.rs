@@ -13,6 +13,7 @@ pub mod session_title;
 pub mod tool_router;
 pub mod tools;
 
+use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
 use tauri::{
@@ -49,7 +50,7 @@ fn send_task(app: tauri::AppHandle, task: String, agent_id: Option<String>) -> R
             Ok(id)
         }
         None => {
-            let (agent, cancel, new_id) = build_new_session(&state)?;
+            let (agent, cancel, new_id) = build_new_session(&state, state.workspace_root().as_path())?;
             // 首条消息 = 标题自动生成的触发点（first-prompt 节奏）：后台辅助请求，
             // 不阻塞主回合；失败/关开关/没密钥都静默保持截断 fallback。
             session_title::spawn_generation(app.clone(), new_id.clone(), task.clone());
@@ -94,9 +95,17 @@ fn continue_session(
         reasoning: None,
     });
 
+    // 会话绑定的工作区在建档时固化（SH-099）：resume 时从档案 meta 带出来，
+    // 工具沙箱与文件工具的作用域跟随原目录而不是全局默认根。
+    let session_workspace = PathBuf::from(&resumed.workspace_root);
     let writer = rollout::RolloutWriter::open_existing(&resumed.path)
         .map_err(|e| format!("档案续写打不开: {e}"))?;
-    let (agent, cancel) = build_agent_with(state, &agent_id, Some(Arc::new(writer)))?;
+    let (agent, cancel) = build_agent_with(
+        state,
+        &agent_id,
+        if session_workspace.as_os_str().is_empty() { state.workspace_root() } else { session_workspace },
+        Some(Arc::new(writer)),
+    )?;
     let sink: Arc<dyn events::EventSink> = Arc::new(events::TauriEventSink::root(app.clone(), agent_id));
     // spawn 的 future 必须是 'static：借用的 app 只能换成 owned 句柄再 move 进去。
     let app_handle = app.clone();
@@ -238,6 +247,12 @@ pub enum WorkspaceOpError {
     PinArchived(String),
     /// 排序移动的锚点会话不存在。
     MoveInvalid(String),
+    /// 路径不合法（不存在/非目录/相对路径/重复注册）。
+    InvalidPath(String),
+    /// 改名与另一家工作区重名。
+    NameConflict(String),
+    /// 参数本身不合法（如给默认工作区做不支持的操作）。
+    BadRequest(String),
     /// 其余失败（落盘 I/O）。
     Rejected(String),
 }
@@ -392,6 +407,160 @@ fn insert_session_before(
     Ok(serde_json::json!({ "sessionOrder": flags.session_order }))
 }
 
+/// 默认工作区的 workspaceId（face 同款常量；配置根派生，不进 [[workspaces]]）。
+pub const DEFAULT_WORKSPACE_ID: &str = "default-workspace";
+
+fn workspace_view_of(state: &AppState, id: &str, path: &str, title: &str) -> serde_json::Value {
+    let rows = rollout::list(&state.data_root().join(rollout::ROLLOUT_DIR));
+    let mine: Vec<String> = rows
+        .into_iter()
+        .filter(|row| row.workspace_root == path)
+        .map(|row| row.agent_id)
+        .collect();
+    let latest = mine.len();
+    serde_json::json!({
+        "workspaceId": id,
+        "path": path,
+        "title": title,
+        "sessionIds": mine,
+        "createdAt": "",
+        "updatedAt": if latest == 0 { "" } else { "" },
+    })
+}
+
+/// 注册新工作区（SH-099）：路径必须已存在且是目录；同一路径幂等返回已有项
+/// （上游 created:false 同口径）。id 由宿主生成，title 缺省 = 目录名。
+#[tauri::command]
+fn create_workspace(
+    app: tauri::AppHandle,
+    path: String,
+) -> Result<serde_json::Value, WorkspaceOpError> {
+    let state = app.state::<AppState>();
+    let raw = path.trim().to_string();
+    let canonical = std::path::Path::new(&raw)
+        .canonicalize()
+        .map_err(|e| WorkspaceOpError::InvalidPath(format!("工作区路径 {raw} 不可用: {e}")))?;
+    if !canonical.is_dir() {
+        return Err(WorkspaceOpError::InvalidPath(format!(
+            "工作区路径 {raw} 不是目录"
+        )));
+    }
+    let canonical_str = canonical.to_string_lossy().to_string();
+    let cfg = state.config();
+    if canonical_str == state.workspace_root().canonicalize().unwrap_or_default().to_string_lossy() {
+        // 与默认工作区同一路径：幂等返回默认项
+        return Ok(serde_json::json!({
+            "workspace": workspace_view_of(&state, DEFAULT_WORKSPACE_ID, state.workspace_root().display().to_string().as_str(), DEFAULT_WORKSPACE_ID),
+            "created": false,
+        }));
+    }
+    if let Some(existing) = cfg.workspaces.iter().find(|ws| {
+        std::path::Path::new(&ws.path)
+            .canonicalize()
+            .map(|p| p.to_string_lossy() == canonical_str)
+            .unwrap_or(false)
+    }) {
+        return Ok(serde_json::json!({
+            "workspace": workspace_view_of(&state, &existing.id, &existing.path, &existing.display_title()),
+            "created": false,
+        }));
+    }
+    let id = format!(
+        "ws-{}",
+        ulid::Generator::new().generate_from_datetime(std::time::SystemTime::now())
+            .map_err(|e| WorkspaceOpError::Rejected(format!("工作区 id 生成失败: {e}")))?
+    );
+    let title = std::path::Path::new(&canonical_str)
+        .file_name()
+        .map(|n| n.to_string_lossy().to_string())
+        .unwrap_or_else(|| canonical_str.clone());
+    let mut next = cfg.clone();
+    next.workspaces.push(config::WorkspaceProfile {
+        id: id.clone(),
+        path: canonical_str.clone(),
+        title,
+    });
+    config::AppConfig::validate_workspaces(&next.workspaces).map_err(WorkspaceOpError::Rejected)?;
+    state.update_config(next).map_err(WorkspaceOpError::Rejected)?;
+    Ok(serde_json::json!({
+        "workspace": workspace_view_of(&state, &id, &canonical_str, std::path::Path::new(&canonical_str).file_name().map(|n| n.to_string_lossy().to_string()).unwrap_or_default().as_str()),
+        "created": true,
+    }))
+}
+
+/// 改工作区显示名（SH-099）：只写 title，路径不动；与其它家重名拒绝。
+/// 默认工作区显示名由前端按 id 特判渲染，不支持改名（SHANIU 的默认项是
+/// [workspace].root 派生，没有可写的 title 字段）。
+#[tauri::command]
+fn rename_workspace(
+    app: tauri::AppHandle,
+    workspace_id: String,
+    title: String,
+) -> Result<serde_json::Value, WorkspaceOpError> {
+    let state = app.state::<AppState>();
+    let id = workspace_id.trim().to_string();
+    let title = title.trim().to_string();
+    if id == DEFAULT_WORKSPACE_ID {
+        return Err(WorkspaceOpError::BadRequest(
+            "默认工作区的显示名固定为「默认工作区」，不支持改名".into(),
+        ));
+    }
+    if title.is_empty() {
+        return Err(WorkspaceOpError::BadRequest("工作区名不能为空".into()));
+    }
+    let cfg = state.config();
+    let target = cfg
+        .workspaces
+        .iter()
+        .find(|ws| ws.id == id)
+        .ok_or_else(|| WorkspaceOpError::NotFound(format!("工作区不存在：{id}")))?;
+    if cfg
+        .workspaces
+        .iter()
+        .any(|ws| ws.id != id && ws.display_title() == title)
+    {
+        return Err(WorkspaceOpError::NameConflict(format!(
+            "已有名为 {title} 的工作区，换一个名字"
+        )));
+    }
+    let mut next = cfg.clone();
+    if let Some(ws) = next.workspaces.iter_mut().find(|ws| ws.id == id) {
+        ws.title = title.clone();
+    }
+    let _ = target;
+    state.update_config(next).map_err(WorkspaceOpError::Rejected)?;
+    let updated = state.config().workspace_by_id(&id).cloned();
+    let ws = updated.ok_or_else(|| WorkspaceOpError::Rejected("改名后读不回工作区".into()))?;
+    Ok(serde_json::json!({
+        "workspace": workspace_view_of(&state, &ws.id, &ws.path, &ws.display_title()),
+    }))
+}
+
+/// 删除工作区注册（SH-099）：只删注册，目录与会话档案全保留——会话在侧栏
+/// 落到「未分组」（上游同口径）。默认工作区拒绝（它来自 [workspace].root，
+/// 删注册等于停用全局默认根）。
+#[tauri::command]
+fn delete_workspace(
+    app: tauri::AppHandle,
+    workspace_id: String,
+) -> Result<serde_json::Value, WorkspaceOpError> {
+    let state = app.state::<AppState>();
+    let id = workspace_id.trim().to_string();
+    if id == DEFAULT_WORKSPACE_ID {
+        return Err(WorkspaceOpError::BadRequest(
+            "默认工作区不可删除：它是 [workspace].root 的注册形态".into(),
+        ));
+    }
+    let mut next = state.config();
+    let before = next.workspaces.len();
+    next.workspaces.retain(|ws| ws.id != id);
+    if next.workspaces.len() == before {
+        return Err(WorkspaceOpError::NotFound(format!("工作区不存在：{id}")));
+    }
+    state.update_config(next).map_err(WorkspaceOpError::Rejected)?;
+    Ok(serde_json::json!({ "removed": id }))
+}
+
 /// 归档/置顶/顺序状态的一次性读取（SH-100）：workspace 面的 baseline 与帧都从这里来。
 #[tauri::command]
 fn get_workspace_flags(app: tauri::AppHandle) -> serde_json::Value {
@@ -441,9 +610,24 @@ fn rename_session(
 /// 之后 `send_task(agent_id)` 才能续到同一份档案上；让前端自己编 id 会让档案目录里
 /// 出现后端不认识的会话，会话列表也就永远读不回它。
 #[tauri::command]
-fn create_session(app: tauri::AppHandle) -> Result<String, String> {
+fn create_session(app: tauri::AppHandle, workspace_path: Option<String>) -> Result<String, String> {
     let state = app.state::<AppState>();
-    let (writer, agent_id) = new_session_writer(&state)?;
+    // 工作区绑定（SH-099）：给了路径就用它（必须存在且是目录——工具沙箱的作用域
+    // 由它决定），没给回落全局默认根。face 会把 workspaceId 解析成路径后再来。
+    let workspace_root = match workspace_path.as_deref().map(str::trim).filter(|p| !p.is_empty()) {
+        Some(path) => {
+            let root = PathBuf::from(path);
+            if !root.is_absolute() {
+                return Err(format!("工作区路径必须是绝对路径: {path}"));
+            }
+            if !root.is_dir() {
+                return Err(format!("工作区路径不存在或不是目录: {path}"));
+            }
+            root.canonicalize().unwrap_or(root)
+        }
+        None => state.workspace_root(),
+    };
+    let (writer, agent_id) = new_session_writer(&state, &workspace_root)?;
     //  writer 在这里只负责把首行落盘；后续写入由 send_task 重新 open_existing。
     drop(writer);
     Ok(agent_id)
@@ -453,13 +637,17 @@ fn create_session(app: tauri::AppHandle) -> Result<String, String> {
 /// 建档失败就直接报错给前端——静默不落盘会让用户以为"能 resume"，实际不能。
 fn build_new_session(
     state: &AppState,
+    workspace_root: &Path,
 ) -> Result<(agent_loop::AgentLoop, tokio_util::sync::CancellationToken, String), String> {
-    let (writer, agent_id) = new_session_writer(state)?;
-    let (agent, cancel) = build_agent_with(state, &agent_id, Some(writer))?;
+    let (writer, agent_id) = new_session_writer(state, workspace_root)?;
+    let (agent, cancel) = build_agent_with(state, &agent_id, workspace_root.to_path_buf(), Some(writer))?;
     Ok((agent, cancel, agent_id))
 }
 
-fn new_session_writer(state: &AppState) -> Result<(Arc<rollout::RolloutWriter>, String), String> {
+fn new_session_writer(
+    state: &AppState,
+    workspace_root: &Path,
+) -> Result<(Arc<rollout::RolloutWriter>, String), String> {
     let cfg = state.config();
     let agent_id = state.next_session_id();
     let meta = rollout::RolloutItem::SessionMeta {
@@ -476,7 +664,8 @@ fn new_session_writer(state: &AppState) -> Result<(Arc<rollout::RolloutWriter>, 
             model: cfg.model.model.clone(),
             sandbox: format!("{:?}", cfg.sandbox.mode),
             approval: format!("{:?}", cfg.approval.mode),
-            workspace_root: state.workspace_root().display().to_string(),
+            // 会话的工作区在建档时固化（SH-099）：之后 resume/工具沙箱都读这一行
+            workspace_root: workspace_root.display().to_string(),
         },
     };
     let writer = rollout::RolloutWriter::create(&state.data_root().join(rollout::ROLLOUT_DIR), &meta)
@@ -488,6 +677,7 @@ fn new_session_writer(state: &AppState) -> Result<(Arc<rollout::RolloutWriter>, 
 fn build_agent_with(
     state: &AppState,
     agent_id: &str,
+    workspace_root: PathBuf,
     writer: Option<Arc<rollout::RolloutWriter>>,
 ) -> Result<(agent_loop::AgentLoop, tokio_util::sync::CancellationToken), String> {
     let cfg = state.config();
@@ -516,7 +706,7 @@ fn build_agent_with(
         state.broker.clone(),
         state.plan_state.clone(),
         &cfg,
-        state.workspace_root(),
+        workspace_root,
         writer,
     );
     Ok((agent, cancel))
@@ -607,6 +797,12 @@ fn get_settings(app: tauri::AppHandle) -> Result<serde_json::Value, String> {
         "activeProvider": if cfg.active_provider.is_empty() { active.id.clone() } else { cfg.active_provider.clone() },
         "providerRevision": cfg.provider_revision,
         "providers": profiles,
+        // 额外工作区注册表（SH-099）：face 的多视图 baseline 从这里来
+        "workspaces": cfg.workspaces.iter().map(|ws| serde_json::json!({
+            "id": ws.id,
+            "path": ws.path,
+            "title": ws.display_title(),
+        })).collect::<Vec<_>>(),
     }))
 }
 
@@ -891,6 +1087,9 @@ pub fn run() {
             unpin_session,
             insert_session_before,
             get_workspace_flags,
+            create_workspace,
+            rename_workspace,
+            delete_workspace,
             cancel_task,
             approve,
             store_api_key,

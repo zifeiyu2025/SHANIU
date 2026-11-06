@@ -65,6 +65,8 @@ interface SettingsSnapshot {
   readonly activeProvider: string
   readonly providerRevision: number
   readonly providers: readonly HostProviderRow[]
+  /** 额外工作区注册表（SH-099）：默认工作区不在其中（来自 [workspace].root）。 */
+  readonly workspaces: readonly { id: string; path: string; title: string }[]
 }
 
 /** `save_providers` 写入的一行：04 §4 的落盘名。Tauri 只转顶层参数名，嵌套结构体按 serde 名走。 */
@@ -115,6 +117,8 @@ export interface SettingsFace {
   workspaceRoot(): string
   /** 安全场当前沙箱档（`get_settings` 的 sandboxMode：read_only / workspace_write / danger_full_access）。 */
   sandboxMode(): string
+  /** 额外工作区注册表（SH-099）：默认工作区不在其中，face 自己拼 [workspace].root 项。 */
+  workspaces(): readonly { id: string; path: string; title: string }[]
   /**
    * 生效模型的上下文窗口（`[[providers]]` 的 contextWindow）。未配置或为 0 时 undefined：
    * 没有真实容量就不给分母，占用仪表按"数据缺席"隐藏，不猜一个数。
@@ -840,6 +844,7 @@ export function createSettingsFace(bridge: HostBridge, options: SettingsFaceOpti
     },
     activeSelection,
     sandboxMode,
+    workspaces: (): readonly { id: string; path: string; title: string }[] => snapshot?.workspaces ?? [],
     activeContextWindow,
     applySandboxMode,
     workspaceRoot: () => snapshot?.workspaceRoot ?? '',

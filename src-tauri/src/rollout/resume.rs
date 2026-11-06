@@ -19,6 +19,9 @@ pub struct Resumed {
     pub parent_id: Option<String>,
     pub history: Vec<HistoryItem>,
     pub path: PathBuf,
+    /// 会话建档时固化的工作区根（SH-099）：resume 时工具作用域跟随原目录。
+    /// 旧档案没有该字段时是空串，调用方回落全局默认根。
+    pub workspace_root: String,
     /// 档案里被应用的压缩锚点数（SH-032 落地后用于核对）。
     pub applied_compactions: usize,
     /// 末行半截写被丢弃的行数。
@@ -40,9 +43,9 @@ pub struct Resumed {
 /// 所以当初那条论证真正排除的只有 system，并没有支持 assistant。
 pub fn resume(path: &Path) -> Result<Resumed, RolloutError> {
     let archive = rollout::read(path)?;
-    let (session_id, agent_id, parent_id) = match &archive.meta {
-        RolloutItem::SessionMeta { session_id, agent_id, parent_id, .. } => {
-            (session_id.clone(), agent_id.clone(), parent_id.clone())
+    let (session_id, agent_id, parent_id, workspace_root) = match &archive.meta {
+        RolloutItem::SessionMeta { session_id, agent_id, parent_id, config_snapshot, .. } => {
+            (session_id.clone(), agent_id.clone(), parent_id.clone(), config_snapshot.workspace_root.clone())
         }
         // read() 已保证首行是 session_meta，这里不可达；留 debug_assert 而不是运行时兜底
         other => {
@@ -97,6 +100,7 @@ pub fn resume(path: &Path) -> Result<Resumed, RolloutError> {
         parent_id,
         history,
         path: path.to_path_buf(),
+        workspace_root,
         applied_compactions: applied,
         torn_tail_lines: archive.torn_tail_lines,
     })

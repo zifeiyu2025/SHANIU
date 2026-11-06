@@ -48,10 +48,45 @@ pub struct AppConfig {
     /// `[model]` 段。这是 additive 扩展而不是替换——已有 config.toml 不改一个字也能跑，
     /// 而逼用户迁移配置文件等于让升级即失效。
     pub providers: Vec<ProviderProfile>,
+    /// 额外工作区（SH-099，additive `[[workspaces]]`）。默认工作区来自
+    /// `[workspace].root`（workspaceId 固定 `default-workspace`，不进本列表），
+    /// 这里只存用户通过侧栏「添加工作区」注册的那几家。为空 = 旧单工作区行为。
+    pub workspaces: Vec<WorkspaceProfile>,
+
     /// 当前生效的服务商 id；空或指不到任何一项时同样回落 `[model]`。
     pub active_provider: String,
     /// 服务商文档的修订号（设置页乐观锁的比对基准），每次写入 +1。
     pub provider_revision: u64,
+}
+
+/// 一家额外工作区（SH-099）。`id` 由宿主生成（ULID）；`title` 缺省 = 路径目录名
+/// （上游 defaultWorkspaceTitle 同口径）。
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(default)]
+pub struct WorkspaceProfile {
+    pub id: String,
+    pub path: String,
+    pub title: String,
+}
+
+impl Default for WorkspaceProfile {
+    fn default() -> Self {
+        Self { id: String::new(), path: String::new(), title: String::new() }
+    }
+}
+
+impl WorkspaceProfile {
+    /// 展示名：显式 title 优先，否则回落路径目录名（盘根回落根拼写，上游同口径）。
+    pub fn display_title(&self) -> String {
+        if !self.title.trim().is_empty() {
+            return self.title.trim().to_string();
+        }
+        std::path::Path::new(&self.path)
+            .file_name()
+            .map(|n| n.to_string_lossy().to_string())
+            .filter(|n| !n.is_empty())
+            .unwrap_or_else(|| self.path.clone())
+    }
 }
 
 /// 推理档位全集（SH-096，上游 llm-pi-ai `THINKING_LEVELS`）。设置页的档位编辑器
@@ -198,6 +233,44 @@ pub struct ResolvedModel {
 }
 
 impl AppConfig {
+    /// 校验额外工作区清单（SH-099）：id 唯一非空、路径唯一非空且是绝对路径。
+    /// 存在性/目录类型在创建命令里即时校验（配置里存的是用户意图，目录后来被删
+    /// 不该让整个 config.toml 拒载）。
+    pub fn validate_workspaces(workspaces: &[WorkspaceProfile]) -> Result<(), String> {
+        let mut seen_ids: Vec<&str> = Vec::with_capacity(workspaces.len());
+        let mut seen_paths: Vec<String> = Vec::with_capacity(workspaces.len());
+        for ws in workspaces {
+            if ws.id.trim().is_empty() {
+                return Err("工作区缺 id：侧栏按它寻址，空 id 选不中".into());
+            }
+            if seen_ids.contains(&ws.id.as_str()) {
+                return Err(format!("工作区 id 重复：{}", ws.id));
+            }
+            seen_ids.push(ws.id.as_str());
+            let path = ws.path.trim();
+            if path.is_empty() {
+                return Err(format!("工作区 {} 缺路径", ws.id));
+            }
+            if !std::path::Path::new(path).is_absolute() {
+                return Err(format!("工作区 {} 的路径 {path} 不是绝对路径", ws.id));
+            }
+            let canonical = std::path::Path::new(path)
+                .canonicalize()
+                .map_err(|e| format!("工作区 {} 的路径 {path} 不可用: {e}", ws.id))?;
+            let key = canonical.to_string_lossy().to_string();
+            if seen_paths.iter().any(|p| p == &key) {
+                return Err(format!("工作区路径重复（含符号链接指向同一目录）: {path}"));
+            }
+            seen_paths.push(key);
+        }
+        Ok(())
+    }
+
+    /// 按 id 找额外工作区；`default-workspace` 不在这里（它来自 [workspace].root）。
+    pub fn workspace_by_id(&self, id: &str) -> Option<&WorkspaceProfile> {
+        self.workspaces.iter().find(|ws| ws.id == id)
+    }
+
     /// 生效端点：`active_provider` 命中列表就用那家，否则回落 `[model]`。
     ///
     /// 回落**不是**容错降级，而是文档规定的兼容姿态：只配了 `[model]` 的安装
