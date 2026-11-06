@@ -548,6 +548,44 @@ describe('适配层的命令面映射', () => {
     dispose()
   })
 
+  it('工具结果检视流：冷读报不可用，结果落定后交真值', async () => {
+    // 详情面板的数据本来就在 journal 里，此前只是没入口：落到"未接线"代理时，
+    // 点开工具卡只会报命令面未接线。语义照 DSH host：available:false 与
+    // "结果本身是 JSON null" 必须分得开。
+    const bridge = scriptedBridge()
+    const { remote, dispose } = createAdapter({ bridge })
+    const session = faceOf(remote).session
+    const face = remote as unknown as {
+      toolResults: { watch(request: Record<string, unknown>, signal?: AbortSignal): AsyncGenerator<Record<string, unknown>> }
+    }
+
+    // 本进程没观察过的会话：不猜一份结果出来，直接不可用
+    const cold = face.toolResults.watch({ sessionId: 'agent-ghost', seq: 3 })
+    expect((await cold.next()).value).toEqual({ available: false })
+    await cold.return(undefined)
+
+    await session.prompt({ sessionId: 'agent-new', requestId: 'rpc-20', content: [{ type: 'text', text: '列目录' }] })
+    bridge.emit('agent-new', { type: 'tool_call_begin', call_id: 'c9', tool: 'unified_exec', args: { cmd: 'ls' } })
+    const pending = face.toolResults.watch({ sessionId: 'agent-new', seq: 999 })
+    // 结果还没落定时先交不可用，而不是挂住
+    expect((await pending.next()).value).toEqual({ available: false })
+    bridge.emit('agent-new', { type: 'tool_call_output_delta', call_id: 'c9', channel: 'stdout', delta: 'port.txt\n' })
+    bridge.emit('agent-new', { type: 'tool_call_end', call_id: 'c9', exit_code: 0, error: null })
+    const paged = (await session.page({ sessionId: 'agent-new' }))['value'] as Record<string, unknown>
+    const resultSeq = (eventsOf(paged).find(event => event.type === 'tool/result') as { seq: number }).seq
+    const live = face.toolResults.watch({ sessionId: 'agent-new', seq: resultSeq })
+    const first = (await live.next()).value as { available: boolean; value?: Record<string, unknown> }
+    // 落定前那一帧可能是 false（取决于订阅与入队的先后），继续读到 available 为止
+    const settledFrame = first.available
+      ? first
+      : (await live.next()).value as { available: boolean; value?: Record<string, unknown> }
+    expect(settledFrame.available).toBe(true)
+    expect(settledFrame.value).toMatchObject({ toolCallId: 'c9', content: [{ type: 'text', text: 'port.txt\n\n[exit code: 0]' }] })
+    await live.return(undefined)
+    await pending.return(undefined)
+    dispose()
+  })
+
   it('未接线的命名空间显式抛错并指向核销清单', async () => {
     const bridge = scriptedBridge()
     const { remote, dispose } = createAdapter({ bridge })

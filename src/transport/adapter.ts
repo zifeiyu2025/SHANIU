@@ -860,9 +860,52 @@ export function createAdapter(options: AdapterOptions): { remote: unknown; dispo
     insertSessionBefore: () => unimplemented('workspace.insertSessionBefore', 'SH-100'),
   }
 
+  /**
+   * 工具结果检视流（Trajectory 的详情面板）。数据本来就在 journal 里，缺的只是入口：
+   * 此前落到"未接线"代理，点开工具卡详情只会报命令面未接线。
+   *
+   * 语义照 DSH 的 host 实现（`client/ui-trajectory/src/index.ts:105`）：冷读先交
+   * `{available:false}`，值落定再交一帧——`available:false` 与"结果本身是 JSON null"
+   * 必须分得开。结果落定后不再变化（后端没有工具输出的增量事件，见文件头），所以交完
+   * 真值就收流；消费者拆流走 `$stream` 的 dispose 路径，不靠 signal。
+   *
+   * 交出去的是 journal 里那条 `tool/result` 的 `message`——DSH host 存的是工具自己的
+   * JSON 返回值，而 SHANIU 的后端把输出收成文本消息（含 `[exit code: N]` 尾标），
+   * message 是这一侧最接近的事实形状。
+   */
+  const toolResultsNamespace = {
+    watch: async function* (
+      request: { sessionId?: string; seq?: number } = {}, _signal?: AbortSignal,
+    ): AsyncGenerator<Record<string, unknown>> {
+      const journal = request.sessionId === undefined ? undefined : journals.get(request.sessionId)
+      const seq = request.seq ?? -1
+      const settled = (): Record<string, unknown> | undefined => journal?.log
+        .eventsUpTo(journal.log.length)
+        .map(entry => entry['event'] as Record<string, unknown> | undefined)
+        .find(event => event !== undefined && event.type === 'tool/result' && event.seq === seq)
+      if (journal === undefined) {
+        yield { available: false }
+        return
+      }
+      const first = settled()
+      if (first !== undefined) {
+        yield { available: true, value: (first.data as Record<string, unknown>).message ?? null }
+        return
+      }
+      yield { available: false }
+      for await (const entry of journal.log.tail(journal.log.length)) {
+        const event = entry['event'] as Record<string, unknown> | undefined
+        if (event === undefined || event.type !== 'tool/result' || event.seq !== seq) continue
+        yield { available: true, value: (event.data as Record<string, unknown>).message ?? null }
+        return
+      }
+    },
+  }
+
   const namespaces = new Map<string, unknown>([
     ['session', sessionNamespace],
     ['workspace', workspaceNamespace],
+    ['toolResults', toolResultsNamespace],
     ['settings', face.settings],
     ['llm', face.llm],
     ['credentials', face.credentials],
