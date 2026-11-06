@@ -114,3 +114,15 @@ html[data-maximized] .sn-glyph-restore {
 .sn-resize-northeast { right: 0; top: 0; cursor: nesw-resize; }
 .sn-resize-southwest { left: 0; bottom: 0; cursor: nesw-resize; }
 .sn-resize-southeast { right: 0; bottom: 0; cursor: nwse-resize; }
+
+/*
+ * 上游 SidebarRoot 的 Windows 版式分支给 .brandIdentity 加了 translateY(1px) 做光学对齐，
+ * 但 .brand 是 height:24px + overflow:hidden——24 高的内容下移 1px 就撑成 25，
+ * 品牌名底部被切掉 1 物理像素。overflow 不能放开（侧栏收窄时靠它截断长品牌名），
+ * 所以在这里取消那 1px 位移。选择器用 [class*=] 命中 CSS Modules 的哈希名：
+ * 默认 pattern 是 [name]_[local]_[hash]，local 段稳定，比写死 _brandIdentity_16k6k_68 可靠。
+ * 只在 html[data-windows-titlebar] 下生效，纯浏览器联调不受影响。
+ */
+html[data-windows-titlebar] [class*="brandIdentity"] {
+  transform: none;
+}
