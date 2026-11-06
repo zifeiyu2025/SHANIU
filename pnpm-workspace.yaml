@@ -1,0 +1,18 @@
+# pnpm 项目配置（pnpm 11+ 起，构建设置只从这里读）。
+#
+# allowBuilds 取代了旧的 onlyBuiltDependencies / ignoredBuiltDependencies：
+# 那几项在 pnpm 11 之后被**静默忽略**，所以 package.json 里写着的
+# `pnpm.ignoredBuiltDependencies` 其实一直没生效——CI 的
+# ERR_PNPM_IGNORED_BUILDS 卡的就是"这三个包的构建脚本从未被裁决过"。
+#
+# 这里取 false（显式拒绝），与本仓已验证可用的状态一致：
+# vite build / vitest / 桌面壳都在"这些脚本没跑"的前提下跑通。
+# 需要放开时逐项改成 true，并说明哪个能力依赖它。
+#
+# - esbuild：前端链路实际走 vite 8 的 rolldown，不依赖 esbuild 的 postinstall 二进制。
+# - koffi / node-pty：二期交互式终端（SH-070/071）才会用到其原生 addon；
+#   在那之前不引入未审计的构建脚本执行面。
+allowBuilds:
+  esbuild: false
+  koffi: false
+  node-pty: false
