@@ -594,15 +594,23 @@ export function createAdapter(options: AdapterOptions): { remote: unknown; dispo
     list: async () => {
       const rows = await bridge.invoke<{ agentId: string; updatedAt: number; title: string; workspaceRoot: string }[]>('list_sessions')
       return OK({
-        items: rows.map(row => ({
-          agentAvailable: true,
-          sessionId: row.agentId,
-          cwd: row.workspaceRoot,
-          running: journals.get(row.agentId)?.taskOpen === true,
-          blank: (titles.get(row.agentId) ?? row.title) === '',
-          updatedAt: row.updatedAt,
-          formatStatus: 'current',
-        })),
+        items: rows.map(row => {
+          const title = titles.get(row.agentId) ?? row.title
+          return {
+            agentAvailable: true,
+            sessionId: row.agentId,
+            cwd: row.workspaceRoot,
+            running: journals.get(row.agentId)?.taskOpen === true,
+            blank: title === '',
+            updatedAt: row.updatedAt,
+            formatStatus: 'current',
+            // 标题走 wire 摘要的投影提示块（cached）：客户端不给没打开过的会话建
+            // journal，侧栏冷标题只能从这里来（manager.applyListBlock 只填还没有
+            // sequenced 值的键，不会盖掉改名时的实时写入）。空标题缺席=未知，
+            // 界面按"未命名"渲染，不发显式 null 去清别人的值。
+            ...(title === '' ? {} : { projections: { kind: 'cached', asOfSeq: 0, values: { title } } }),
+          }
+        }),
       })
     },
     create: async (request: { cwd?: string } = {}) => {
@@ -702,9 +710,19 @@ export function createAdapter(options: AdapterOptions): { remote: unknown; dispo
         const replayed = replayArchive(entries)
         journals.set(sessionId, replayed)
         if (!titles.has(sessionId)) {
-          const firstUser = entries.find(entry => entry.kind === 'message' && entry.role === 'user')
-          const text = firstUser?.kind === 'message' ? firstUser.text : ''
-          pushTitle(sessionId, text.trim().slice(0, 12) || '新会话')
+          // 宿主回显优先：list_sessions 的 title 已合并 titles.json 的自定义标题
+          // （缺省回落后端自己的派生规则）。本地再从档案派生一份会把它盖掉——
+          // 重启后用户改过的名字就丢了（真机实测暴露的缺陷）。
+          const rows = await bridge.invoke<{ agentId: string; title: string }[]>('list_sessions')
+            .catch((): { agentId: string; title: string }[] => [])
+          const hostTitle = rows.find(row => row.agentId === sessionId)?.title ?? ''
+          if (hostTitle !== '') {
+            pushTitle(sessionId, hostTitle)
+          } else {
+            const firstUser = entries.find(entry => entry.kind === 'message' && entry.role === 'user')
+            const text = firstUser?.kind === 'message' ? firstUser.text : ''
+            pushTitle(sessionId, text.trim().slice(0, 12) || '新会话')
+          }
         }
         const from = replayed.log.length
         yield {

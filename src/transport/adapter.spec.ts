@@ -646,6 +646,28 @@ describe('适配层的命令面映射', () => {
     dispose()
   })
 
+  it('侧栏冷标题走摘要投影提示块；重开会话时标题从宿主回显预热，不从档案重新派生', async () => {
+    const archive = [{ kind: 'message', role: 'user', text: '一条很长的用户消息，本地派生规则只取前十二个字' }]
+    const bridge = scriptedBridge(undefined, archive)
+    const { remote, dispose } = createAdapter({ bridge })
+    const session = faceOf(remote).session
+
+    // list 面：有标题的行带 cached 投影提示块，标题用宿主回显（已合并 titles.json）
+    const listed = (await session.list())['value'] as { items: Record<string, unknown>[] }
+    expect(listed.items[0]).toMatchObject({
+      sessionId: 'agent-new',
+      projections: { kind: 'cached', asOfSeq: 0, values: { title: '首条任务' } },
+    })
+
+    // 重开：宿主回显标题优先于本地派生——档案首条用户消息的前 12 字不是宿主标题，
+    // 若标题被本地重派生，这里会拿到"一条很长的用户消息，本地派"而失败
+    const iterator = session.follow({ address: { kind: 'session', sessionId: 'agent-new' } })
+    const snapshot = (await iterator.next()).value as { projections: { values: { title: string | null } } }
+    expect(snapshot.projections.values.title).toBe('首条任务')
+    await iterator.return?.(undefined)
+    dispose()
+  })
+
   it('未接线的命名空间显式抛错并指向核销清单', async () => {
     const bridge = scriptedBridge()
     const { remote, dispose } = createAdapter({ bridge })
