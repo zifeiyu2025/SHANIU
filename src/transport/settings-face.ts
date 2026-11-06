@@ -781,11 +781,13 @@ export function createSettingsFace(bridge: HostBridge, options: SettingsFaceOpti
         if (selectable.length > 0 && !selectable.includes(request.model)) {
           return refused(new RemoteError('gateway/bad-request', `服务商 ${row.id} 的模型清单里没有 ${request.model}`, {}))
         }
-        // 选中推理档位（SH-096）：必须是该模型声明过的档位，空串 = 回到服务商默认。
-        // 席位只会从 catalog 的 reasoning.efforts 里发起选择，这里再校验一次是防
-        // 直呼 invocation——静默收下未声明的档位，运行时查不到 wire 值就不发字段，
-        // 用户选了 high 实际跑的是默认档，比报错难发现得多。
+        // 选中推理档位（SH-096）：请求带档位时必须是该模型声明过的档位；**缺席 =
+        // 保留现有档位**。上游的模型行点击本就不带 effort（ModelSelect.tsx:596），
+        // 而 SHANIU 的持久档就在这份文档里——照"缺席即清空"处理会让配置里选好的
+        // 档位被一次普通选模型抹掉（真机缺陷）。回到"不发字段"的席位路径是选 off
+        // 档（同样不发字段，与上游 provider default 语义对齐）。
         const effort = (request.reasoningEffort ?? '').trim()
+        const effectiveEffort = effort !== '' ? effort : row.reasoningEffort ?? ''
         if (effort !== '') {
           const declared = row.models.find(candidate => candidate.id === request.model)?.reasoningEfforts
           if (declared === undefined || !(effort in declared)) {
@@ -798,9 +800,9 @@ export function createSettingsFace(bridge: HostBridge, options: SettingsFaceOpti
           provider: candidate.provider,
           base_url: candidate.baseUrl,
           secret_ref: candidate.secretRef,
-          // 每行的选中档位原样透传；被选中的那家写新值。模型行的档位声明同理，
+          // 每行的选中档位原样透传；被选中的那家写生效值。模型行的档位声明同理，
           // 整份替换的写面上丢一个字段 = 用户配置凭空消失。
-          reasoning_effort: candidate.id === row.id ? effort : candidate.reasoningEffort ?? '',
+          reasoning_effort: candidate.id === row.id ? effectiveEffort : candidate.reasoningEffort ?? '',
           // 自定义头（SH-097）整表透传
           ...(candidate.headers === undefined || Object.keys(candidate.headers).length === 0
             ? {}
@@ -830,7 +832,8 @@ export function createSettingsFace(bridge: HostBridge, options: SettingsFaceOpti
         const selected: ModelSelection = {
           provider: row.id,
           model: request.model,
-          ...(effort === '' ? {} : { reasoningEffort: effort }),
+          // 生效档位随应答回显（缺席=保留时的现值），席位据此显示而不回落错位
+          ...(effectiveEffort === '' ? {} : { reasoningEffort: effectiveEffort }),
         }
         return ok({ selected })
       },

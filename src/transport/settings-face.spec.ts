@@ -463,9 +463,14 @@ describe('settings 面：写路径', () => {
     const bogus = await face.session.selectModel({ provider: 'longcat', model: 'LongCat-2.5', reasoningEffort: 'xhigh' })
     expect(bogus['ok']).toBe(false)
     expect((bogus['error'] as Error).message).toContain('未声明推理档位')
-    // 空档位 = 回到服务商默认，放行
-    const clear = await face.session.selectModel({ provider: 'longcat', model: 'LongCat-2.5' })
-    expect(clear['ok']).toBe(true)
+
+    // 模型行点击不带 effort（上游 ModelSelect.tsx:596 的事实形状）= 保留现有档位，
+    // 绝不清空——清空会让"配置选好的 high"被一次普通选模型抹掉（真机缺陷 05:08）
+    const keep = await face.session.selectModel({ provider: 'longcat', model: 'LongCat-2.5' })
+    expect(keep['ok']).toBe(true)
+    expect((keep['value'] as { selected: { reasoningEffort?: string } }).selected.reasoningEffort).toBe('low')
+    const resaved = host.calls.filter(call => call.command === 'save_providers').at(-1)?.args as { providers: { reasoning_effort: string }[] }
+    expect(resaved.providers[0]!.reasoning_effort).toBe('low')
   })
 
   it('未接线的配置域直接拒绝，不返回一个能写但没人读的空文档', async () => {
