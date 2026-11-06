@@ -19,7 +19,7 @@ export function useSearchableHidden(
   hidden: boolean,
   reveal: () => void,
   transition?: HiddenTransition,
-): RefObject<HTMLDivElement> {
+): RefObject<HTMLDivElement | null> {
   const ref = useRef<HTMLDivElement>(null)
   useLayoutEffect(() => {
     const element = ref.current

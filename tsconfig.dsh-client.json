@@ -2632,6 +2632,7 @@
   ],
   "jsx": "react-jsx",
   "strict": false,
+  "strictNullChecks": true,
   "types": [
    "client-build-environment",
    "client-assets"
@@ -2695,12 +2696,6 @@
   "./src/dsh/packages/api/workspace-files/src/client/remote.ts",
   "./src/dsh/packages/api/workspace-files/src/client/types.ts",
   "./src/dsh/packages/api/workspace-files/src/types.ts",
-  "./src/dsh/packages/attachment/attachment/src/admission.ts",
-  "./src/dsh/packages/attachment/attachment/src/brand.ts",
-  "./src/dsh/packages/attachment/attachment/src/error.ts",
-  "./src/dsh/packages/attachment/attachment/src/index.ts",
-  "./src/dsh/packages/attachment/attachment/src/request-projection.ts",
-  "./src/dsh/packages/attachment/attachment/src/types.ts",
   "./src/dsh/packages/boot/plugin-manager/src/types.ts",
   "./src/dsh/packages/boot/plugin-market/src/types.ts",
   "./src/dsh/packages/client/connection/src/client/api.ts",
@@ -3760,16 +3755,6 @@
   "./src/dsh/packages/core/agent/src/types.ts",
   "./src/dsh/packages/core/scope/src/index.ts",
   "./src/dsh/packages/core/scope/src/store.ts",
-  "./src/dsh/packages/core/session/src/fork.ts",
-  "./src/dsh/packages/core/session/src/index.ts",
-  "./src/dsh/packages/core/session/src/known-event-types.ts",
-  "./src/dsh/packages/core/session/src/preparation.ts",
-  "./src/dsh/packages/core/session/src/repair.ts",
-  "./src/dsh/packages/core/session/src/request-header.ts",
-  "./src/dsh/packages/core/session/src/seq-ranges.ts",
-  "./src/dsh/packages/core/session/src/surface.ts",
-  "./src/dsh/packages/core/session/src/tool-history.ts",
-  "./src/dsh/packages/core/session/src/types.ts",
   "./src/dsh/packages/core/tool-executor-ptc/src/client.ts",
   "./src/dsh/packages/core/tool-executor-ptc/src/types.ts",
   "./src/dsh/packages/credentials/credentials/src/types.ts",
@@ -3797,19 +3782,6 @@
   "./src/dsh/packages/jobs/jobs/src/view.ts",
   "./src/dsh/packages/llm/llm-retry/src/brand.ts",
   "./src/dsh/packages/llm/llm-retry/src/types.ts",
-  "./src/dsh/packages/llm/llm/src/adapter-failure.ts",
-  "./src/dsh/packages/llm/llm/src/api-key.ts",
-  "./src/dsh/packages/llm/llm/src/assembler.ts",
-  "./src/dsh/packages/llm/llm/src/assistant-stream.ts",
-  "./src/dsh/packages/llm/llm/src/attribution.ts",
-  "./src/dsh/packages/llm/llm/src/brand.ts",
-  "./src/dsh/packages/llm/llm/src/call-config.ts",
-  "./src/dsh/packages/llm/llm/src/content.ts",
-  "./src/dsh/packages/llm/llm/src/error.ts",
-  "./src/dsh/packages/llm/llm/src/index.ts",
-  "./src/dsh/packages/llm/llm/src/message.ts",
-  "./src/dsh/packages/llm/llm/src/retry-policy.ts",
-  "./src/dsh/packages/llm/llm/src/types.ts",
   "./src/dsh/packages/llm/token-meter/src/client.ts",
   "./src/dsh/packages/llm/token-meter/src/projection.ts",
   "./src/dsh/packages/llm/token-meter/src/turn-usage.ts",
@@ -3871,11 +3843,20 @@
   "./src/dsh/packages/util/workspace-path/src/index.ts",
   "./src/dsh/packages/web/web/src/types.ts",
   "./src/dsh/packages/workspace/workspace/src/types.ts",
-  "./src/transport/shims/remote-module.ts"
+  "./src/transport/shims/remote-module.ts",
+  "./src/transport/shims/session-remote.ts",
+  "./src/dsh/packages/api/settings-controller/src/types.ts",
+  "./src/dsh/packages/util/official-bundles/src/index.ts",
+  "./src/dsh/packages/util/official-bundles/src/bundles.ts",
+  "./src/dsh/packages/util/official-bundles/src/plugin-manager.ts",
+  "./src/dsh/packages/util/official-bundles/src/catalog.generated.ts"
  ],
  "references": [
   {
    "path": "./tsconfig.dsh-vendor.json"
+  },
+  {
+   "path": "./tsconfig.dsh-host.json"
   }
  ]
 }

@@ -416,7 +416,7 @@ export class SessionManager {
           for (const s of baseline) {
             if (s.running && !removedSincePull.has(s.sessionId)) this.engagedSessions.add(s.sessionId)
           }
-          const summaries = mutations.reduce(applyMutation, baseline)
+          const summaries = mutations.reduce<SessionSummary[]>(applyMutation, baseline)
           this.summaries = summaries
           // A full list can remove identities without a removal frame.
           const retained = this.retainedIds(summaries)

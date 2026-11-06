@@ -124,7 +124,7 @@ export function createSessionControlStream(
       : new Error('session control stream ended before its opening snapshot'),
     ...(options.carrierFailed === undefined ? {} : { carrierFailed: options.carrierFailed }),
   })
-  return new RemoteSnapshotStream(stream, {
+  return new RemoteSnapshotStream<SessionControlBaselineFrame, SessionControlDeltaFrame>(stream, {
     name: 'session control stream',
     isSnapshot: (frame): frame is SessionControlBaselineFrame => frame.type === 'baseline',
     replace: options.accept,

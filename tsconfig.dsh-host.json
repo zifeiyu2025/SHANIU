@@ -1,0 +1,26 @@
+{
+  "extends": "./tsconfig.dsh-vendor.json",
+  "compilerOptions": {
+    "outDir": "./node_modules/.cache/dsh-types-host"
+  },
+  "include": [
+    "./src/dsh/packages/core/session/src/**/*.ts",
+    "./src/dsh/packages/llm/llm/src/**/*.ts",
+    "./src/dsh/packages/attachment/attachment/src/**/*.ts",
+    "./src/dsh/packages/boot/plugin-manager/src/types.ts",
+    "./src/dsh/packages/boot/plugin-manager/src/registry.ts",
+    "./src/dsh/packages/boot/plugin-manager/src/install-spec.ts",
+    "./src/dsh/packages/host/plugin-inventory/src/types.ts",
+    "./src/dsh/packages/util/plugin-detail/src/types.ts",
+    "./src/dsh/packages/core/scope/src/**/*.ts",
+    "./src/dsh/packages/util/brand/src/index.ts",
+    "./src/dsh/packages/typert/protocol/src/**/*.ts",
+    "./src/dsh/packages/util/values/src/**/*.ts",
+    "./src/dsh/packages/util/crypto/src/index.ts",
+    "./src/dsh/packages/util/timeout/src/index.ts",
+    "./src/dsh/packages/util/package-manifest/src/**/*.ts"
+  ],
+  "references": [
+    { "path": "./tsconfig.dsh-vendor.json" }
+  ]
+}

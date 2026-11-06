@@ -26,7 +26,7 @@ interface FileUploadResponse {
   readonly body: string
 }
 
-interface FileUploadRemoteContext extends Context {
+interface FileUploadRemoteContext extends Omit<Context, 'remote'> {
   readonly remote: {
     readonly fileUploads: {
       upload(

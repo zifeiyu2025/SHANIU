@@ -34,7 +34,7 @@ export interface SidebarRightNavigator {
   /** Open a resource in one session; see `ISidebarRight.openResource`. */
   openResourceIn(sessionId: SessionId, address: string, options?: SidebarRightOpenResourceOptions): void
   /** Open a page type in one session; see `ISidebarRight.openTab`. */
-  openTabIn(sessionId: SessionId, kind: string, options?: SidebarRightOpenTabOptions): void
+  openTabIn<K extends string>(sessionId: SessionId, kind: K, options?: SidebarRightOpenTabOptions<K>): void
   /** Close a tab of one session. */
   closeIn(sessionId: SessionId, tabId: TabId): void
 }

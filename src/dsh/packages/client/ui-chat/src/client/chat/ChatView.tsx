@@ -176,7 +176,7 @@ export function ChatView({
     )), observed.lastInputTurn] as const
   }, [pendingSubmissions, order, nodeStore])
   const pendingInputs = useMemo(() => {
-    const local = new Map(visibleSubmissions.map(submission => [submission.requestId, submission]))
+    const local = new Map(visibleSubmissions.map(submission => [submission.requestId, submission] as const))
     // Admitted local identities outlive their bubbles until the Inbox claim watermark.
     const localIds = new Set(pendingSubmissions.filter(submission => submission.placement !== 'queued')
       .map(submission => submission.requestId))

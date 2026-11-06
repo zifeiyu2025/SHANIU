@@ -11,7 +11,7 @@ import { DecoratorPortals } from './DecoratorPortals.tsx'
 export interface DraftEditorProps {
   readonly classNames: Readonly<Record<string, string>>
   readonly editor: LexicalEditor | null
-  readonly scrollRef: RefObject<HTMLDivElement>
+  readonly scrollRef: RefObject<HTMLDivElement | null>
   readonly editable: boolean
   readonly editorDisabled: boolean
   readonly phase: InputState['phase'] | 'inert'

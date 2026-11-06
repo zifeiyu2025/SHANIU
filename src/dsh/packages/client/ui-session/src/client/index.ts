@@ -250,7 +250,7 @@ interface RuntimeSessionSourceDescriptor {
   resolve(binding: SessionBinding): RuntimeSessionSourceContribution
 }
 
-type RuntimePendingDomain = PendingInteractionDomain<SessionPendingInteractionBase>
+type RuntimePendingDomain = PendingInteractionDomain<SessionPendingInteraction>
 
 interface MaterializedBinding {
   readonly owner: SessionBinding
@@ -287,7 +287,7 @@ export class UiSession extends Service {
   private readonly absent: BindingSource
   private readonly current: BindingSource
   private readonly pendingDomains: RuntimePendingDomain[] = []
-  private pendingSnapshot: ReadonlyMap<SessionId, SessionPendingInteractionBase> = new Map()
+  private pendingSnapshot: ReadonlyMap<SessionId, SessionPendingInteraction> = new Map()
   private readonly running = new Map<SessionId, boolean>()
   private readonly completionUnread = new Set<SessionId>()
   private statusSnapshot: SessionStatusSnapshot = new Map()
@@ -413,7 +413,7 @@ export class UiSession extends Service {
    * @param precedence - deterministic cross-domain precedence; larger values win.
    * @returns a function that publishes one interaction and its teardown delegation.
    */
-  registerPendingInteraction<T extends SessionPendingInteractionBase>(
+  registerPendingInteraction<T extends SessionPendingInteraction>(
     precedence: (interaction: T) => number,
   ): PendingInteractionPublisher<T> {
     const domain = new PendingInteractionDomain(precedence, () => {
@@ -485,7 +485,7 @@ export class UiSession extends Service {
 
   private publishPendingInteractions(): void {
     const next = new Map<SessionId, {
-      interaction: SessionPendingInteractionBase
+      interaction: SessionPendingInteraction
       precedence: number
     }>()
     for (const domain of this.pendingDomains) {

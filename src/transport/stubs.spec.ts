@@ -1,5 +1,11 @@
 import { describe, expect, it, vi } from 'vitest'
 import { StubRemoteAccess } from './stubs'
+import { remote } from './shims/remote-module'
+
+it('未接线的 remote 描述符读取时显式失败，不伪造空贡献', () => {
+  expect(() => remote.package).toThrow('未接线')
+  expect(() => remote.descriptors).toThrow('未接线')
+})
 
 /** 最小 ctx：Service 构造只要求 reflect.provide，StubRemoteAccess 另写 slots.provideRoot。 */
 function harness(allow: boolean): StubRemoteAccess {

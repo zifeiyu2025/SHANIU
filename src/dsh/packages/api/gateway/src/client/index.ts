@@ -15,6 +15,7 @@ import type {
   InvocationDescriptor,
   TypertClientEventListener,
   TypertClientRemote,
+  TypertRemoteNamespaceMap,
   RemoteFailure,
   RemoteResult,
   RemoteStreamHandle,
@@ -142,7 +143,7 @@ export function apply(ctx: Context): void {
   new ClientRemoteService(ctx)
 }
 
-class ClientRemoteService extends Service implements ClientRemote {
+class ClientRemoteService extends Service implements Omit<ClientRemote, keyof TypertRemoteNamespaceMap> {
   private readonly ownerCtx: Context
   private readonly connection: ConnectionHandle
   private readonly namespaces = new Map<string, RemoteNamespaceHandle>()

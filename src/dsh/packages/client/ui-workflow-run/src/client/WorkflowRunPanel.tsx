@@ -364,7 +364,7 @@ export function WorkflowRunPanel({ node, sessionId, useSessions, useSessionStatu
   const runContentRef = useRef<HTMLDivElement>(null)
   const phaseContentRefs = useRef(new Map<string, HTMLDivElement>())
   const statuses = useSessionStatus(value => value)
-  const navigable = useSessions(
+  const navigable = useSessions<ReadonlyMap<SessionId, ChildMode>>(
     sessions => navigableMembers(sessions, node.data.phases, sessionId, statuses),
     shallowEqual,
   )
