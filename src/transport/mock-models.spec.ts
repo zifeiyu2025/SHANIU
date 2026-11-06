@@ -246,3 +246,49 @@ describe('mock-models：模型席位与设置页同源', () => {
     expect(ids).not.toContain('deepseek')
   })
 })
+
+describe('mock-models：模型的推理等级', () => {
+  let mock: ModelsMock
+  beforeEach(() => {
+    mock = createModelsMock()
+  })
+
+  /** 取某个分组里的某个模型。 */
+  async function modelOf(provider: string, model: string) {
+    const catalog = await mock.session.modelCatalog()
+    if (!catalog.ok) throw new Error('catalog failed')
+    return catalog.value.groups.find(group => group.id === provider)?.models.find(entry => entry.id === model)
+  }
+
+  it('声明了 reasoningEfforts 的模型带档位，没声明的模型没有 reasoning', async () => {
+    const reasoningModel = await modelOf('mock-provider', 'mock-model-a')
+    expect(reasoningModel?.reasoning?.efforts.map(effort => effort.id)).toEqual(['off', 'low', 'medium', 'high'])
+    expect(reasoningModel?.reasoning?.defaultEffort).toBe('high')
+    const plainModel = await modelOf('mock-provider', 'mock-model-b')
+    expect(plainModel?.reasoning).toBeUndefined()
+  })
+
+  it('出厂 DeepSeek 模型带上游硬编码的 off/low/high/max 档位', async () => {
+    const accountModel = await modelOf('deepseek-account', 'deepseek-v4-flash')
+    expect(accountModel?.reasoning?.efforts.map(effort => effort.id)).toEqual(['off', 'low', 'high', 'max'])
+    expect(accountModel?.reasoning?.defaultEffort).toBe('high')
+  })
+
+  it('席位默认项带上有效档位；换模型后旧档不跟着串台', async () => {
+    await mock.session.selectModel({ provider: 'mock-provider', model: 'mock-model-a', reasoningEffort: 'low' })
+    const kept = await mock.session.modelCatalog()
+    expect(kept.ok && kept.value.default).toMatchObject({ model: 'mock-model-a', reasoningEffort: 'low' })
+
+    // mock-model-b 没有推理档：旧档必须作废，而不是把 'low' 带过去
+    await mock.session.selectModel({ provider: 'mock-provider', model: 'mock-model-b' })
+    const switched = await mock.session.modelCatalog()
+    expect(switched.ok && switched.value.default).toMatchObject({ model: 'mock-model-b' })
+    expect(switched.ok && switched.value.default.reasoningEffort).toBeUndefined()
+  })
+
+  it('给不支持该档的模型强塞 effort 时回落到它自己的默认档', async () => {
+    await mock.session.selectModel({ provider: 'mock-provider', model: 'mock-model-a', reasoningEffort: 'xhigh' })
+    const catalog = await mock.session.modelCatalog()
+    expect(catalog.ok && catalog.value.default.reasoningEffort).toBe('high')
+  })
+})

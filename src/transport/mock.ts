@@ -15,10 +15,17 @@ import { createModelsMock } from './mock-models'
  * 单例：设置页写入的 provider 必须就是席位读到的那一个。
  * emit 走 mock 的事件总线，写入后设置页与席位才会各自收到失效推送。
  */
-const MODELS = createModelsMock({ emit: mockEmit })
+const MODELS = createModelsMock({ emit: mockEmit, onSelectionChanged: pushModelSelection })
 
 const WORKSPACE_PATH = 'D:\\MyWorkspace\\SHANIU'
 const WORKSPACE_ID = 'mock-workspace-1'
+const DEFAULT_WORKSPACE_ID = 'default-workspace'
+/**
+ * 默认工作区的目录。真实落盘位置由 Rust 侧决定（用户口径是 data 目录下的 Workspace），
+ * 这里只作为 mock 展示值；注意 docs/01:426 把自身 data 目录对 Agent 默认拒绝读写，
+ * 工作区又是 Agent 可写作用域，落盘前必须先解决这条边界冲突。
+ */
+const DEFAULT_WORKSPACE_PATH = `${WORKSPACE_PATH}\\Workspace`
 const SESSION_IDS = ['mock-session-alpha', 'mock-session-beta']
 
 /** 工作区行内的会话集（create/attach 时推进，follow 以 upsert 帧广播）。 */
@@ -41,6 +48,51 @@ function createFrameQueue<T>() {
   }
 }
 const workspaceFrames = createFrameQueue<{ readonly type: 'upsert'; readonly workspace: WorkspaceView }>()
+
+/**
+ * 广播式帧通道：控制流每个订阅者都要看到同一份变化（单消费者队列会把帧分给其中一条流）。
+ * 用于 modelSelection 投影——席位读投影，不回推就会在选档后回弹。
+ */
+function createFrameBroadcast<T>() {
+  interface Subscriber { buffer: T[]; waiters: ((value: T) => void)[] }
+  const subscribers = new Set<Subscriber>()
+  return {
+    push(value: T): void {
+      for (const subscriber of [...subscribers]) {
+        const waiter = subscriber.waiters.shift()
+        if (waiter !== undefined) waiter(value)
+        else subscriber.buffer.push(value)
+      }
+    },
+    async *subscribe(): AsyncGenerator<T> {
+      const subscriber: Subscriber = { buffer: [], waiters: [] }
+      subscribers.add(subscriber)
+      try {
+        for (;;) {
+          if (subscriber.buffer.length > 0) yield subscriber.buffer.shift()!
+          else yield await new Promise<T>(resolve => subscriber.waiters.push(resolve))
+        }
+      } finally {
+        subscribers.delete(subscriber)
+      }
+    },
+  }
+}
+
+const selectionFrames = createFrameBroadcast<Record<string, unknown>>()
+let projectionSeq = 0
+
+/** 把一次选择变化推给每个已知会话的控制流。 */
+function pushModelSelection(selection: ModelSelection): void {
+  for (const id of MOCK_SESSION_ROWS.keys()) {
+    selectionFrames.push({
+      type: 'projection',
+      sessionId: id as SessionId,
+      seq: ++projectionSeq,
+      changes: [{ key: 'modelSelection', val: { lastUsed: null, next: selection } }],
+    })
+  }
+}
 
 function mockSessionRow(id: string, minutesAgo: number, running = false): SessionSummary {
   // wire 形状（types.ts 的 SessionSummary，sessionId 字段）——manager.projectList 按
@@ -95,8 +147,7 @@ function mockSessionNamespace(): unknown {
     },
     fork: async () => OK({ sessionId: `mock-session-${MOCK_SESSION_ROWS.size + 1}` as SessionId }),
     search: async () => OK({ items: [], hasMore: false }),
-    selectModel: async (req: { provider: string; model: string }) =>
-      MODELS.session.selectModel({ provider: req.provider, model: req.model }),
+    selectModel: async (req: ModelSelection) => MODELS.session.selectModel(req),
     projections: async () => OK(null),
     // 模型目录（composer 模型席位数据源）与设置页同源：只有已配置的服务商进得来。
     modelCatalog: () => MODELS.session.modelCatalog(),
@@ -114,7 +165,8 @@ function mockSessionNamespace(): unknown {
           }])),
         },
       }
-      await new Promise<void>(() => {})
+      // 基线之后持续推送选择变化：席位读投影，不回推会导致选档后回弹
+      for await (const frame of selectionFrames.subscribe()) yield frame
     },
     follow: async function* (_request: unknown): AsyncGenerator<unknown> {
       yield {
@@ -208,12 +260,15 @@ export function mockTypert(): unknown {
   )
 }
 
-function mockWorkspaceView(): WorkspaceView {
+function mockWorkspaceView(id: string = WORKSPACE_ID): WorkspaceView {
+  const isDefault = id === DEFAULT_WORKSPACE_ID
   return {
-    workspaceId: WORKSPACE_ID as WorkspaceView['workspaceId'],
-    path: WORKSPACE_PATH,
-    title: 'SHANIU',
-    sessionIds: WORKSPACE_SESSION_IDS as unknown as WorkspaceView['sessionIds'],
+    workspaceId: id as WorkspaceView['workspaceId'],
+    path: isDefault ? DEFAULT_WORKSPACE_PATH : WORKSPACE_PATH,
+    // 上游用「title === 'default-workspace'」判定默认工作区，界面据此渲染成「默认工作区」；
+    // 不是独立选项，也没有 isDefault 字段（见 api/workspace-controller/src/default-workspace.ts）
+    title: isDefault ? DEFAULT_WORKSPACE_ID : 'SHANIU',
+    sessionIds: (isDefault ? [] : WORKSPACE_SESSION_IDS) as unknown as WorkspaceView['sessionIds'],
     createdAt: new Date(Date.now() - 86_400_000).toISOString(),
     updatedAt: new Date(Date.now()).toISOString(),
   }
@@ -228,7 +283,8 @@ function mockWorkspaceNamespace(): unknown {
     follow: async function* (_request: unknown): AsyncGenerator<unknown> {
       yield {
         type: 'baseline',
-        value: { items: [mockWorkspaceView()], archivedSessionIds: [], pinnedSessionIds: [] },
+        // 默认工作区排在最前：它的 title 就是 'default-workspace'，界面会渲染成「默认工作区」
+        value: { items: [mockWorkspaceView(DEFAULT_WORKSPACE_ID), mockWorkspaceView()], archivedSessionIds: [], pinnedSessionIds: [] },
       }
       // 活流：baseline 后消费帧队列（create/attach 推 upsert），无帧则挂起保持"已连接"
       for (;;) {
@@ -243,7 +299,8 @@ function mockWorkspaceNamespace(): unknown {
       },
     }),
     rename: async (_id: string, title: string) => OK({ workspace: { ...mockWorkspaceView(), title } }),
-    initializeDefault: async () => OK({ workspace: mockWorkspaceView() }),
+    // 上游语义：注册表为空且无任何持久化/归档会话时才创建；mock 里默认工作区已存在，直接回它
+    initializeDefault: async () => OK({ workspace: mockWorkspaceView(DEFAULT_WORKSPACE_ID) }),
     delete: async () => OK({}),
     insertBefore: async () => OK({ workspaceIds: [WORKSPACE_ID] }),
     archiveSession: async () => OK({ archivedSessionIds: [] }),

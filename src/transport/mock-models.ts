@@ -11,7 +11,7 @@ import type { JsonValue } from '@deepseek-ai/dsh-util-values'
 import type { SettingsDescribeValue, SettingsNamespaceView, SettingsPathOpView } from '@deepseek-ai/dsh-settings/types'
 import type { CredentialInfo } from '@deepseek-ai/dsh-credentials/types'
 import type { LlmConfigurableProvider, LlmDiscoveredModel, LlmModelDiscoveryRequest, LlmProviderInfo } from '@deepseek-ai/dsh-llm/types'
-import type { ModelCatalog, ModelProviderGroup, ModelSelection } from '@deepseek-ai/dsh-api-session-controller/types'
+import type { ModelCatalog, ModelProviderGroup, ModelReasoning, ModelSelection } from '@deepseek-ai/dsh-api-session-controller/types'
 // 预览说明的确认字段与版本从设置页本身取，避免这里抄一份会漂移的字面量
 import { WELCOME_NOTICE_ACK_FIELD, WELCOME_NOTICE_VERSION } from '@deepseek-ai/dsh-client-ui-settings-models/onboarding-copy'
 
@@ -33,6 +33,18 @@ interface Section {
 
 const PROTOCOLS = ['openai-completions', 'openai-responses', 'anthropic-messages'] as const
 const REASONING_LEVELS = ['off', 'low', 'medium', 'high', 'xhigh', 'max'] as const
+/** 目录里档位的展示顺序（升级序）；profile 里声明了哪些就只列哪些。 */
+const REASONING_ORDER = REASONING_LEVELS
+/** 出厂 deepseek 的档位来自上游 model-info 的硬编码表，不是 profile 字段。 */
+const DEEPSEEK_REASONING: ModelReasoning = {
+  efforts: [
+    { id: 'off', name: 'Off' },
+    { id: 'low', name: 'Low' },
+    { id: 'high', name: 'High' },
+    { id: 'max', name: 'Max' },
+  ],
+  defaultEffort: 'high',
+}
 
 /** 手声明路由的模型行：id 必填，其余可缺；reasoningEfforts 是 `false | { [level]: wire }`。 */
 const piAiModel = z.object({
@@ -188,6 +200,11 @@ const MAX_DESCRIBE_REFS = 64
 /** mock 的推送失效出口，与 remote 的 $emit 同签名。 */
 export interface ModelsMockOptions {
   emit(name: string, payload?: unknown): boolean
+  /**
+   * 选择变化回调。席位读的是 `modelSelection` 投影而非目录默认项，
+   * 不回推的话选了推理档会在下一次读投影时回弹到默认档。
+   */
+  onSelectionChanged?(selection: ModelSelection): void
 }
 
 export function createModelsMock(options: ModelsMockOptions = { emit: () => false }): ModelsMock {
@@ -216,7 +233,11 @@ export function createModelsMock(options: ModelsMockOptions = { emit: () => fals
             baseURL: 'https://mock.invalid/v1',
             apiKeyEnv: 'MOCK_PROVIDER_API_KEY',
             models: [
-              { id: 'mock-model-a', name: 'Mock Model A', description: 'mock 旗舰模型', contextWindow: 128_000, maxTokens: 8_192 },
+              {
+                id: 'mock-model-a', name: 'Mock Model A', description: 'mock 旗舰模型', contextWindow: 128_000, maxTokens: 8_192,
+                // 会推理的模型：档位就是目录里能选的那几行（Model B 故意不声明，用于对照"无推理档"的表现）
+                reasoningEfforts: { off: null, low: 'low', medium: 'medium', high: 'high' },
+              },
               { id: 'mock-model-b', name: 'Mock Model B', description: 'mock 轻量模型', contextWindow: 64_000, maxTokens: 4_096 },
             ],
           },
@@ -282,12 +303,12 @@ export function createModelsMock(options: ModelsMockOptions = { emit: () => fals
     const account = viewOf('llm-deepseek-account')
     const accountModels = account === undefined ? undefined : at(account.value, ['models'])
     if (Array.isArray(accountModels) && accountModels.length > 0) {
-      groups.push({ id: 'deepseek-account', name: 'DeepSeek Account', models: catalogModels(accountModels) })
+      groups.push({ id: 'deepseek-account', name: 'DeepSeek Account', models: catalogModels(accountModels, DEEPSEEK_REASONING) })
     }
     const deepseek = viewOf('llm-deepseek')
     if (deepseek !== undefined && keyReady(at(deepseek.value, ['apiKeyEnv']) as string | undefined)) {
       const models = at(deepseek.value, ['models'])
-      if (Array.isArray(models) && models.length > 0) groups.push({ id: 'deepseek', name: 'DeepSeek', models: catalogModels(models) })
+      if (Array.isArray(models) && models.length > 0) groups.push({ id: 'deepseek', name: 'DeepSeek', models: catalogModels(models, DEEPSEEK_REASONING) })
     }
     for (const [provider, profile] of declaredProfiles()) {
       if (!profileUsable(profile)) continue
@@ -302,12 +323,35 @@ export function createModelsMock(options: ModelsMockOptions = { emit: () => fals
     return groups
   }
 
-  const catalogModels = (models: readonly unknown[]): ModelProviderGroup['models'] =>
-    models.filter(isRecord).map(model => ({
-      id: String(model.id ?? ''),
-      name: String(model.name ?? model.id ?? ''),
-      ...(typeof model.description === 'string' ? { description: model.description } : {}),
-    })).filter(model => model.id.length > 0)
+  /**
+   * 模型目录里的推理等级：席位在没有 reasoning 时整行不渲染，所以这里必须从 profile 的
+   * `reasoningEfforts` 键推出来。出厂 deepseek 走上游 model-info 的硬编码档位（off/low/high/max），
+   * 手声明路由按模型自己声明的键。档位的 wire 值只影响真实请求，目录里只需要 id 与显示名。
+   */
+  const reasoningOf = (model: Record<string, JsonValue>, fallback?: ModelReasoning): ModelReasoning | undefined => {
+    const declared = model.reasoningEfforts
+    if (!isRecord(declared)) return fallback
+    const levels = REASONING_ORDER.filter(level => Object.hasOwn(declared, level))
+    if (levels.length === 0) return undefined
+    return {
+      efforts: levels.map(level => ({ id: level, name: level[0]!.toUpperCase() + level.slice(1) })),
+      defaultEffort: levels.includes('high') ? 'high' : levels[levels.length - 1]!,
+    }
+  }
+
+  const catalogModels = (
+    models: readonly unknown[],
+    fallbackReasoning?: ModelReasoning,
+  ): ModelProviderGroup['models'] =>
+    models.filter(isRecord).map(model => {
+      const reasoning = reasoningOf(model, fallbackReasoning)
+      return {
+        id: String(model.id ?? ''),
+        name: String(model.name ?? model.id ?? ''),
+        ...(typeof model.description === 'string' ? { description: model.description } : {}),
+        ...(reasoning === undefined ? {} : { reasoning }),
+      }
+    }).filter(model => model.id.length > 0)
 
   return {
     settings: {
@@ -410,20 +454,33 @@ export function createModelsMock(options: ModelsMockOptions = { emit: () => fals
       modelCatalog: async () => {
         const groups = usableGroups()
         const routableProviders = groups.map(group => group.id)
-        const held = groups.find(group => group.id === selection.provider)
-          ?.models.find(model => model.id === selection.model)
-        const fallback = held === undefined
-          ? (groups[0] === undefined ? undefined : { provider: groups[0]!.id, model: groups[0]!.models[0]?.id ?? '' })
-          : undefined
+        const heldGroup = groups.find(group => group.id === selection.provider)
+        const heldModel = heldGroup?.models.find(model => model.id === selection.model)
+        const chosenGroup = heldModel === undefined ? groups[0] : heldGroup
+        const chosenModel = heldModel ?? chosenGroup?.models[0]
+        // 席位每次读目录都按"当前选择 + 该模型可用档位"解析有效 effort：
+        // 换了模型时旧档作废，避免把一个模型的推理档带到另一个模型上。
+        const defaultSelection = (): ModelSelection => {
+          if (chosenGroup === undefined || chosenModel === undefined) return selection
+          const effort = selection.reasoningEffort
+          const usable = effort !== undefined && chosenModel.reasoning?.efforts.some(option => option.id === effort)
+          const reasoningEffort = usable ? effort : chosenModel.reasoning?.defaultEffort
+          return {
+            provider: chosenGroup.id,
+            model: chosenModel.id,
+            ...(reasoningEffort === undefined ? {} : { reasoningEffort }),
+          }
+        }
         return OK<ModelCatalog>({
-          default: fallback ?? selection,
+          default: defaultSelection(),
           routableProviders,
           groups,
           failures: [],
         })
       },
       selectModel: async (request) => {
-        selection = { provider: request.provider, model: request.model }
+        selection = { ...request }
+        options.onSelectionChanged?.(selection)
         return OK({ selected: selection })
       },
     },
