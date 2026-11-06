@@ -53,15 +53,23 @@ export interface BootHandle {
 /** 按依赖序安装一个 {inject, apply} 特性插件。 */
 type FeaturePlugin = { inject: readonly string[]; apply: (ctx: Context) => unknown }
 
-/** 纯浏览器开发态走 mock 数据源（SH-008 mock 联调）；Tauri 内走显式 stub 等待接线。 */
+/** 纯浏览器开发态走 mock 数据源（SH-008 mock 联调）；Tauri 内默认走显式 stub 等待接线。 */
 function usingTauriBackend(): boolean {
   return typeof window !== 'undefined' && '__TAURI_INTERNALS__' in window
 }
 
+/**
+ * 壳内数据源开关（开发期）：true = 桌面窗口也装 mock 事实源，用来看界面的实际效果；
+ * false = 窗口走 stub 核销清单，如实反映后端未接的能力。
+ * 这是有意偏离 ADR-006 的临时口径——docs/01 风险表把"适配层掩盖能力缺口"列为风险，
+ * 所以后端接线里程碑（SH-025 审批 / SH-026 密钥 / SH-063 配置）逐项核销后应改回 false。
+ */
+const MOCK_IN_DESKTOP = true
+
 /** 组装并挂载完整 UI；失败时把原因抛给调用方（入口页自绘错误）。 */
 export async function bootShaniu(container: HTMLElement): Promise<BootHandle> {
   const root = new Context()
-  const tauri = usingTauriBackend()
+  const mockData = !usingTauriBackend() || MOCK_IN_DESKTOP
 
   // 模型设置页的公开引导开关：SHANIU 没有 DeepSeek 云端账号，
   // 关掉自动弹出的官方登录引导（该 payload 就是上游为此留的接入口）。
@@ -72,8 +80,8 @@ export async function bootShaniu(container: HTMLElement): Promise<BootHandle> {
   // 渲染基座：SlotRegistry + slot renderer + ctx.uiRenderer.mount
   await root.plugin({ inject: [], apply: rendererApply }).await()
 
-  // 宿主侧服务：mock（浏览器联调，见 transport/mock.ts）或 stub（Tauri 内等待接线，见 transport/stubs.ts）
-  if (tauri) {
+  // 宿主侧服务：mock（联调数据源，见 transport/mock.ts）或 stub（等待接线，见 transport/stubs.ts）
+  if (!mockData) {
     root.provide('remote', stubRemote())
     installRemoteNamespaceStubs(root)
     root.provide('sessions', stubSessions())
@@ -88,8 +96,8 @@ export async function bootShaniu(container: HTMLElement): Promise<BootHandle> {
     // list 拉预置行、control/follow 流空基线（会话内容原样渲染为空态）
   }
   // Service 子类：构造即自注册 'remoteAccess' 并发布 useRemoteAccess 全局座席；
-  // mock 态授权（mock 后端语义），Tauri 态全拒（等待 SH-025 接线）
-  new StubRemoteAccess(root, !tauri)
+  // mock 态授权（mock 后端语义），stub 态全拒（等待 SH-025 接线）
+  new StubRemoteAccess(root, mockData)
 
   // 基础服务：locale 插件（词典注册 + slots.installLocale，渲染机合成 t 座席）
   // → shortcuts（依赖 locale）→ theme（依赖 slots/locale/remote/configForms）
