@@ -188,6 +188,14 @@ interface Journal {
   pressure: { pressureTokens: number; projectedTokens: number } | undefined
   /** 本会话的待发队列（回合进行中的提交；按序补发）。 */
   queue: QueuedSubmission[]
+  /**
+   * `todos` 投影（上游 tool-todo 的 fold 语义）：todo/write 整表替换、turn/start 清空
+   * （turn/end 保留已完成的清单可见）。undefined = 尚无写入或已被清空（投影缺席，
+   * TodoDock 不渲染）；快照仅在非 undefined 时挂键。
+   */
+  todos: Record<string, unknown>[] | undefined
+  /** 进行中工具调用的参数（callId → 解析后的 args；todo/write 推导与结算都要用）。 */
+  callArgs: Map<string, unknown>
 }
 
 /**
@@ -223,6 +231,7 @@ function newJournal(createdAt: number): Journal {
     stepStartAt: undefined, firstDeltaAt: undefined, countedTurn: undefined,
     toolStartAt: new Map(), callTools: new Map(), pressure: undefined,
     queue: [],
+    todos: undefined, callArgs: new Map(),
   }
 }
 
@@ -436,6 +445,68 @@ export function createAdapter(options: AdapterOptions): { remote: unknown; dispo
     pushPlanToAll()
   }
 
+  // ---- todos 投影（上游 tool-todo 的 journal 事件与 fold 语义，SH-108）----
+
+  /** `todo_write` 的合法 status（上游 STATUSES）。 */
+  const TODO_STATUSES = new Set(['pending', 'in_progress', 'completed'])
+
+  /**
+   * `todo_write` 参数 → 整表清单；不可信输入一律返回 undefined（不 emit、不伪造）。
+   *
+   * 这是后端 `tools/todo.rs::validate` 的 TS 镜像（同一组纯谓词）：trim 后非空、
+   * trim 后判重、status 三枚举、条目只接受 content/status 两键。实时路径从执行
+   * 结果（result=ok）取信，回放路径拿不到执行位，只能用同一组谓词重演后端裁决——
+   * 校验被拒的调用留不下 todo/write，镜像谓词保证两条路径逐项相等。
+   * 部署口径 ALLOW_PARALLEL_IN_PROGRESS=true（对齐上游 base bundle），故无单活跃检查。
+   */
+  const parseTodos = (args: unknown): Record<string, unknown>[] | undefined => {
+    if (typeof args !== 'object' || args === null) return undefined
+    const raw = (args as { todos?: unknown }).todos
+    if (!Array.isArray(raw)) return undefined
+    const seen = new Set<string>()
+    const todos: Record<string, unknown>[] = []
+    for (const item of raw) {
+      if (typeof item !== 'object' || item === null || Array.isArray(item)) return undefined
+      const record = item as Record<string, unknown>
+      const keys = Object.keys(record)
+      if (keys.length !== 2 || !keys.includes('content') || !keys.includes('status')) return undefined
+      const content = record['content']
+      const status = record['status']
+      if (typeof content !== 'string' || typeof status !== 'string') return undefined
+      const trimmed = content.trim()
+      if (trimmed === '' || !TODO_STATUSES.has(status) || seen.has(trimmed)) return undefined
+      seen.add(trimmed)
+      todos.push({ content: trimmed, status })
+    }
+    return todos
+  }
+
+  /** todos 投影变化统一从这里推帧；无值时交显式 null（客户端据此清掉旧清单）。 */
+  const pushTodosFrame = (sessionId: string, journal: Journal): void => {
+    projectionSeq += 1
+    projectionLog.append({
+      type: 'projection', sessionId, seq: projectionSeq,
+      changes: [{ key: 'todos', val: journal.todos ?? null }],
+    })
+  }
+
+  /**
+   * 开回合 = 上游 fold 的 turn/start 清空位：上一回合的清单收起（turn/end 不清，
+   * 完成的清单在回合结束前保持可见）。仅当确有旧值时推 null 帧——没有写入过的
+   * 会话不需要一帧「本来就是空」的投影。
+   */
+  const pushTurnStart = (sessionId: string | undefined, journal: Journal): void => {
+    pushEvent(journal, 'turn/start', { turn: journal.turn })
+    if (journal.todos !== undefined) {
+      journal.todos = undefined
+      if (sessionId !== undefined) pushTodosFrame(sessionId, journal)
+    }
+  }
+
+  /** 快照/基线里的 todos 位：仅已有清单时挂键（投影缺席 = TodoDock 不渲染，不伪造）。 */
+  const todosProjectionValues = (journal: Journal): Record<string, unknown> =>
+    journal.todos !== undefined ? { todos: journal.todos } : {}
+
   // ---- 客户端排队（运行中提交 → inbox 投影行 → 回合收口按序自动补发）----
 
   const queueRowOf = (item: QueuedSubmission): Record<string, unknown> => ({
@@ -460,7 +531,7 @@ export function createAdapter(options: AdapterOptions): { remote: unknown; dispo
     journal.queue = journal.queue.filter(candidate => candidate.id !== item.id)
     pushInboxFrame(sessionId, journal)
     if (!journal.taskOpen) openTask(journal)
-    pushEvent(journal, 'turn/start', { turn: journal.turn })
+    pushTurnStart(sessionId, journal)
     pushEvent(journal, 'step/start', { turn: journal.turn, step: journal.step })
     beginStepMetrics(journal)
     pushEvent(journal, 'user/message', {
@@ -638,7 +709,8 @@ export function createAdapter(options: AdapterOptions): { remote: unknown; dispo
       journal.turn += 1
       journal.step = 0
       journal.taskOpen = true
-      pushEvent(journal, 'turn/start', { turn: journal.turn })
+      // 档案重建没有投影流可推，只折叠状态：最终快照带出的就是 fold 到尾的值
+      pushTurnStart(undefined, journal)
     }
 
     entries.forEach((entry, index) => {
@@ -689,6 +761,23 @@ export function createAdapter(options: AdapterOptions): { remote: unknown; dispo
           name: entry.tool,
           arguments: entry.arguments,
         })
+        // todo/write 重建（SH-108）：档案没有独立的 journal 事件，事实源就是这条
+        // 工具调用记录本身。推导规则与实时路径同构——调用留下了结果、参数通过
+        // parseTodos 的同一组谓词（后端校验被拒的调用只留错误文本，重演谓词即得
+        // 同一裁决），才补一条 todo/write；位置在上游序列的 tool/call 与 tool/result 之间。
+        if (entry.tool === 'todo_write' && entry.output !== undefined) {
+          let args: unknown
+          try {
+            args = JSON.parse(entry.arguments)
+          } catch {
+            args = undefined
+          }
+          const todos = parseTodos(args)
+          if (todos !== undefined) {
+            journal.todos = todos
+            pushEvent(journal, 'todo/write', { todos })
+          }
+        }
         const exited = entry.output !== undefined
           ? /\[exit code: (-?\d+)\]\s*$/.exec(entry.output)?.[1]
           : undefined
@@ -772,7 +861,7 @@ export function createAdapter(options: AdapterOptions): { remote: unknown; dispo
         // 后端每个采样迭代都发 turn_started，它对应 DSH 的 step 而不是 DSH 的回合。
         if (!journal.taskOpen) {
           openTask(journal)
-          pushEvent(journal, 'turn/start', { turn: journal.turn })
+          pushTurnStart(event.session_id, journal)
           pushEvent(journal, 'step/start', { turn: journal.turn, step: 0 })
           beginStepMetrics(journal)
           // 不经 prompt 起来的回合（`resume_session` 续跑）也要报运行中，否则
@@ -848,6 +937,7 @@ export function createAdapter(options: AdapterOptions): { remote: unknown; dispo
         journal.outputs.set(msg.call_id, { stdout: [], stderr: [] })
         journal.toolStartAt.set(msg.call_id, now())
         journal.callTools.set(msg.call_id, msg.tool)
+        journal.callArgs.set(msg.call_id, msg.args)
         return
       case 'tool_call_output_delta': {
         const buffer = journal.outputs.get(msg.call_id) ?? { stdout: [], stderr: [] }
@@ -860,6 +950,8 @@ export function createAdapter(options: AdapterOptions): { remote: unknown; dispo
         journal.outputs.delete(msg.call_id)
         const toolName = journal.callTools.get(msg.call_id)
         journal.callTools.delete(msg.call_id)
+        const toolArgs = journal.callArgs.get(msg.call_id)
+        journal.callArgs.delete(msg.call_id)
         const lines = [...(buffer?.stdout ?? []), ...(buffer?.stderr ?? [])]
         // result 存在时是唯一状态判据（docs/04 §1.2.1）；缺失才回退 exit_code/error。
         const failed = msg.result !== undefined
@@ -878,6 +970,17 @@ export function createAdapter(options: AdapterOptions): { remote: unknown; dispo
               : undefined
         // validator 要求：带 data.error 时 message.isError 必须为 true。
         const isError = error !== undefined || failed
+        // todo_write（SH-108）：执行成功才落 `todo/write` journal 事件（上游顺序
+        // tool/call → todo/write → tool/result），整表替换进 todos 投影。失败的
+        // 调用（校验拒绝/取消/拒绝）什么都不落——回声复活成清单才是伪造。
+        if (toolName === 'todo_write' && !failed) {
+          const todos = parseTodos(toolArgs)
+          if (todos !== undefined) {
+            journal.todos = todos
+            pushEvent(journal, 'todo/write', { todos })
+            pushTodosFrame(event.session_id, journal)
+          }
+        }
         pushEvent(journal, 'tool/result', {
           turn: journal.turn,
           step: journal.step,
@@ -1033,7 +1136,7 @@ export function createAdapter(options: AdapterOptions): { remote: unknown; dispo
       // 而 send_task 已经返回 agent_id，说明后端确实接下了这个任务。
       if (!journal.taskOpen) openTask(journal)
       dispatch('api-session/status', agentId, true)
-      pushEvent(journal, 'turn/start', { turn: journal.turn })
+      pushTurnStart(agentId, journal)
       pushEvent(journal, 'step/start', { turn: journal.turn, step: journal.step })
       beginStepMetrics(journal)
       // rpcId 必须等于 prompt 的 requestId：客户端据此撤掉本地乐观回显（session.ts 的
@@ -1099,6 +1202,9 @@ export function createAdapter(options: AdapterOptions): { remote: unknown; dispo
               title: titles.get(sessionId) ?? null,
               permissions: permissionsProjection(),
               ...(planProjectionValues()),
+              // 档案重建出的任务清单（todo/write 推导）随快照带出：重开旧会话
+              // TodoDock 直接回到最后一份清单（上游回放语义）。
+              ...todosProjectionValues(replayed),
               // 重建已折叠出步/回合计数：重开旧会话底部指标立即有值（时间不计，见
               // replay 的注记）；旧档案没有用量，tokenUsage/contextPressure 不挂。
               ...metricsProjectionsOf(replayed),
@@ -1135,6 +1241,7 @@ export function createAdapter(options: AdapterOptions): { remote: unknown; dispo
             ...(journal.queue.length > 0
               ? { inbox: { 'next-turn': journal.queue.map(queueRowOf) } }
               : {}),
+            ...todosProjectionValues(journal),
             ...metricsProjectionsOf(journal),
           },
         },
@@ -1159,6 +1266,7 @@ export function createAdapter(options: AdapterOptions): { remote: unknown; dispo
               ...(journal.queue.length > 0
                 ? { inbox: { 'next-turn': journal.queue.map(queueRowOf) } }
                 : {}),
+              ...todosProjectionValues(journal),
               ...metricsProjectionsOf(journal),
             },
           }])),

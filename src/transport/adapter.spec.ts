@@ -1213,3 +1213,158 @@ describe('Plan 芯片与客户端排队', () => {
     dispose()
   })
 })
+
+describe('todos 投影（SH-108：todo_write → journal todo/write → TodoDock 数据面）', () => {
+  interface TodoTestFace {
+    session: SessionFace & {
+      control(): AsyncGenerator<Record<string, unknown>>
+    }
+  }
+
+  const faceOfTodo = (remote: unknown): TodoTestFace => remote as TodoTestFace
+
+  const TODO_ARGS = {
+    todos: [
+      { content: ' 调研现状 ', status: 'completed' },
+      { content: '写实现', status: 'in_progress' },
+    ],
+  }
+  /** trim 后的整表（上游 toTodoList 语义：入库存 trim 结果）。 */
+  const TRIMMED_TODOS = [
+    { content: '调研现状', status: 'completed' },
+    { content: '写实现', status: 'in_progress' },
+  ]
+
+  it('todo_write 执行成功：todo/write 落在 tool/call 与 tool/result 之间，投影带 trim 后整表，事件过 wire 闸', async () => {
+    const bridge = scriptedBridge()
+    const { remote, dispose } = createAdapter({ bridge })
+    const session = faceOfTodo(remote).session
+    await session.prompt({ sessionId: 'agent-new', requestId: 'rpc-t1', content: [{ type: 'text', text: '列个清单' }] })
+    bridge.emit('agent-new', { type: 'tool_call_begin', call_id: 'tw1', tool: 'todo_write', args: TODO_ARGS })
+    bridge.emit('agent-new', { type: 'tool_call_end', call_id: 'tw1', exit_code: 0, error: null, result: 'ok' })
+
+    const iterator = session.follow({ address: { kind: 'session', sessionId: 'agent-new' } })
+    const snapshot = (await iterator.next()).value as Record<string, unknown>
+    const journal = eventsOf(snapshot)
+    expect(journal.map(event => event['type'])).toEqual([
+      'turn/start', 'step/start', 'user/message', 'tool/call', 'todo/write', 'tool/result',
+    ])
+    const write = journal.find(event => event['type'] === 'todo/write')
+    expect((write!['data'] as { todos: unknown }).todos).toEqual(TRIMMED_TODOS)
+    // 这条事件走客户端运行时会过的同一道 wire 闸
+    expect(() => assertSessionWireEvent(write!)).not.toThrow()
+    // 投影整表替换：TodoDock 从这里拿渲染数据
+    expect((snapshot['projections'] as { values: Record<string, unknown> }).values['todos']).toEqual(TRIMMED_TODOS)
+    await iterator.return?.(undefined)
+    dispose()
+  })
+
+  it('失败的调用不落清单：result 非 ok 不 emit，参数不可信时即便 ok 也拒绝推导', async () => {
+    const bridge = scriptedBridge()
+    const { remote, dispose } = createAdapter({ bridge })
+    const session = faceOfTodo(remote).session
+    await session.prompt({ sessionId: 'agent-new', requestId: 'rpc-t2', content: [{ type: 'text', text: '列个清单' }] })
+
+    // 校验被拒（后端 Err 路径）→ ToolCallResult::Error → 不落
+    bridge.emit('agent-new', { type: 'tool_call_begin', call_id: 'tw2', tool: 'todo_write', args: TODO_ARGS })
+    bridge.emit('agent-new', { type: 'tool_call_end', call_id: 'tw2', exit_code: null, error: 'invalid todos: duplicate content "调研现状"', result: 'error' })
+    let snapshot = (await session.follow({ address: { kind: 'session', sessionId: 'agent-new' } }).next()).value as Record<string, unknown>
+    expect(eventsOf(snapshot).some(event => event['type'] === 'todo/write')).toBe(false)
+    expect((snapshot['projections'] as { values: Record<string, unknown> }).values['todos']).toBeUndefined()
+
+    // 防御位：执行结果 ok 但参数不是对象形状（协议违规）→ 一样不落，不伪造清单
+    bridge.emit('agent-new', { type: 'tool_call_begin', call_id: 'tw3', tool: 'todo_write', args: 'not-an-object' })
+    bridge.emit('agent-new', { type: 'tool_call_end', call_id: 'tw3', exit_code: 0, error: null, result: 'ok' })
+    snapshot = (await session.follow({ address: { kind: 'session', sessionId: 'agent-new' } }).next()).value as Record<string, unknown>
+    expect(eventsOf(snapshot).filter(event => event['type'] === 'todo/write')).toHaveLength(0)
+    expect((snapshot['projections'] as { values: Record<string, unknown> }).values['todos']).toBeUndefined()
+    dispose()
+  })
+
+  it('回合边界：turn/end 保留已完成的清单可见，下一次 turn/start 清空（显式 null 帧 + 快照缺席）', async () => {
+    const bridge = scriptedBridge()
+    const { remote, dispose } = createAdapter({ bridge })
+    const session = faceOfTodo(remote).session
+    await session.prompt({ sessionId: 'agent-new', requestId: 'rpc-t3a', content: [{ type: 'text', text: '第一件事' }] })
+    bridge.emit('agent-new', { type: 'tool_call_begin', call_id: 'tw1', tool: 'todo_write', args: TODO_ARGS })
+    bridge.emit('agent-new', { type: 'tool_call_end', call_id: 'tw1', exit_code: 0, error: null, result: 'ok' })
+    bridge.emit('agent-new', { type: 'turn_completed', turn: 1, reason: 'completed' })
+
+    // turn/end 不清空：已完成的清单在回合结束后仍可见（上游 fold 注释的语义）
+    const control = session.control()
+    const baseline = (await control.next()).value as { value: { projections: Record<string, { values: Record<string, unknown> }> } }
+    expect(baseline.value.projections['agent-new']!.values['todos']).toEqual(TRIMMED_TODOS)
+
+    // 新回合（turn/start）清空：同一客户端收到显式 null 帧
+    await session.prompt({ sessionId: 'agent-new', requestId: 'rpc-t3b', content: [{ type: 'text', text: '第二件事' }] })
+    const frame = (await control.next()).value as { changes: { key: string; val: unknown }[] }
+    expect(frame.changes).toEqual([{ key: 'todos', val: null }])
+    await control.return?.(undefined)
+    // 新观察者从快照进来：todos 键缺席（投影缺席 = TodoDock 不渲染）
+    const values = await (async () => {
+      const iterator = session.follow({ address: { kind: 'session', sessionId: 'agent-new' } })
+      const snap = (await iterator.next()).value as Record<string, unknown>
+      await iterator.return?.(undefined)
+      return (snap['projections'] as { values: Record<string, unknown> }).values
+    })()
+    expect(values['todos']).toBeUndefined()
+    dispose()
+  })
+
+  it('重开旧会话：清单从档案重建（trim 镜像同源），校验被拒的调用不伪造', async () => {
+    const archive = [
+      { kind: 'message', role: 'user', text: '列个清单' },
+      { kind: 'tool_call', call_id: 'tw1', tool: 'todo_write', arguments: JSON.stringify(TODO_ARGS), output: 'Updated todo list: 0 pending, 1 in progress, 1 completed.\n[exit code: 0]' },
+      // 后端校验拒绝的调用只留错误文本（Err 路径无 exit 标记）：镜像谓词重演同一裁决
+      { kind: 'tool_call', call_id: 'tw2', tool: 'todo_write', arguments: '{"todos":[{"content":"x","status":"pending"},{"content":"x","status":"pending"}]}', output: '参数非法: invalid todos: duplicate content "x"' },
+      { kind: 'message', role: 'assistant', text: '清单好了' },
+    ]
+    const bridge = scriptedBridge(undefined, archive)
+    const { remote, dispose } = createAdapter({ bridge })
+    const iterator = faceOfTodo(remote).session.follow({ address: { kind: 'session', sessionId: 'agent-old' } })
+    const snapshot = (await iterator.next()).value as Record<string, unknown>
+    const journal = eventsOf(snapshot)
+    const types = journal.map(event => event['type'])
+    // todo/write 紧跟第一份调用的 tool/call、先于 tool/result；第二份调用没有 todo/write
+    expect(types.filter(type => type === 'todo/write')).toHaveLength(1)
+    const writeIndex = types.indexOf('todo/write')
+    expect(types[writeIndex - 1]).toBe('tool/call')
+    expect(types[writeIndex + 1]).toBe('tool/result')
+    expect((journal[writeIndex]!['data'] as { todos: unknown }).todos).toEqual(TRIMMED_TODOS)
+    journal.forEach(event => expect(() => assertSessionWireEvent(event)).not.toThrow())
+    // 投影随快照带出：重开旧会话 TodoDock 直接回到最后一份清单
+    expect((snapshot['projections'] as { values: Record<string, unknown> }).values['todos']).toEqual(TRIMMED_TODOS)
+    await iterator.return?.(undefined)
+    dispose()
+  })
+
+  it('同一份历史：todo 的实时序列与重开重建序列逐项一致（含 todo/write 载荷）', async () => {
+    const liveBridge = scriptedBridge()
+    const live = createAdapter({ bridge: liveBridge })
+    const liveSession = faceOfTodo(live.remote).session
+    await liveSession.prompt({ sessionId: 'agent-new', requestId: 'rpc-teq', content: [{ type: 'text', text: '第一步' }] })
+    liveBridge.emit('agent-new', { type: 'tool_call_begin', call_id: 'tw1', tool: 'todo_write', args: TODO_ARGS })
+    liveBridge.emit('agent-new', { type: 'tool_call_end', call_id: 'tw1', exit_code: 0, error: null, result: 'ok' })
+    liveBridge.emit('agent-new', { type: 'turn_completed', turn: 1, reason: 'completed' })
+
+    const liveIterator = liveSession.follow({ address: { kind: 'session', sessionId: 'agent-new' } })
+    const liveJournal = eventsOf((await liveIterator.next()).value as Record<string, unknown>)
+    await liveIterator.return?.(undefined)
+    live.dispose()
+
+    const archive = [
+      { kind: 'message', role: 'user', text: '第一步' },
+      { kind: 'tool_call', call_id: 'tw1', tool: 'todo_write', arguments: JSON.stringify(TODO_ARGS), output: '[exit code: 0]' },
+    ]
+    const reopened = createAdapter({ bridge: scriptedBridge(undefined, archive) })
+    const replayIterator = faceOfTodo(reopened.remote).session.follow({ address: { kind: 'session', sessionId: 'agent-old' } })
+    const replayJournal = eventsOf((await replayIterator.next()).value as Record<string, unknown>)
+    await replayIterator.return?.(undefined)
+    reopened.dispose()
+
+    expect(replayJournal.map(event => event['type'])).toEqual(liveJournal.map(event => event['type']))
+    const liveWrite = liveJournal.find(event => event['type'] === 'todo/write')
+    const replayWrite = replayJournal.find(event => event['type'] === 'todo/write')
+    expect(replayWrite!['data']).toEqual(liveWrite!['data'])
+  })
+})
