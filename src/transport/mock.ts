@@ -155,6 +155,85 @@ function chunksOf(text: string, size: number): string[] {
   return parts
 }
 
+/** 演示用整轮统计：字段与上游 sessionStats / tokenUsage / contextPressure 三个投影一一对应。 */
+interface MockMetrics {
+  turns: number
+  steps: number
+  llmMs: number
+  toolMs: number
+  ttftMs: number
+  ttftSteps: number
+  decodeMs: number
+  decodeTokens: number
+  uncachedInputTokens: number
+  outputTokens: number
+  cacheReadTokens: number
+  cacheWriteTokens: number
+}
+
+const METRICS = new Map<string, MockMetrics>()
+
+/** 一个演示回合的统计增量：decode 900 tok / 5.2s ≈ 173 tok/s，与参照截图同量级。 */
+const PER_TURN = {
+  llmMs: 3800,
+  ttftMs: 300,
+  ttftSteps: 1,
+  decodeMs: 5200,
+  decodeTokens: 900,
+  uncachedInputTokens: 9600,
+  outputTokens: 300,
+}
+
+/** 该会话当前的三个统计投影；没有跑过回合就不挂（界面据此隐藏底部指标）。 */
+function metricsProjectionsOf(sessionId: string): Record<string, unknown> {
+  const metrics = METRICS.get(sessionId)
+  if (metrics === undefined) return {}
+  return {
+    sessionStats: {
+      turns: metrics.turns,
+      steps: metrics.steps,
+      llmMs: metrics.llmMs,
+      toolMs: metrics.toolMs,
+      ttftMs: metrics.ttftMs,
+      ttftSteps: metrics.ttftSteps,
+      decodeMs: metrics.decodeMs,
+      decodeTokens: metrics.decodeTokens,
+    },
+    tokenUsage: {
+      uncachedInputTokens: metrics.uncachedInputTokens,
+      outputTokens: metrics.outputTokens,
+      cacheReadTokens: metrics.cacheReadTokens,
+      cacheWriteTokens: metrics.cacheWriteTokens,
+    },
+    // 上下文占用：projectedTokens / contextWindow 决定那个百分数
+    contextPressure: { pressureTokens: 9900, projectedTokens: 9900, contextWindow: 1_000_000 },
+  }
+}
+
+/** 回合收尾时累计统计并把三个投影推给界面（每一步的耗时与用量都来自本 mock 的固定剧本）。 */
+function pushTurnMetrics(sessionId: string): void {
+  const metrics = METRICS.get(sessionId) ?? {
+    turns: 0, steps: 0, llmMs: 0, toolMs: 0, ttftMs: 0, ttftSteps: 0, decodeMs: 0, decodeTokens: 0,
+    uncachedInputTokens: 0, outputTokens: 0, cacheReadTokens: 0, cacheWriteTokens: 0,
+  }
+  metrics.turns += 1
+  metrics.steps += 1
+  metrics.llmMs += PER_TURN.llmMs
+  metrics.ttftMs += PER_TURN.ttftMs
+  metrics.ttftSteps += PER_TURN.ttftSteps
+  metrics.decodeMs += PER_TURN.decodeMs
+  metrics.decodeTokens += PER_TURN.decodeTokens
+  metrics.uncachedInputTokens += PER_TURN.uncachedInputTokens
+  metrics.outputTokens += PER_TURN.outputTokens
+  METRICS.set(sessionId, metrics)
+  projectionFrames.push({
+    type: 'projection',
+    sessionId,
+    seq: ++projectionSeq,
+    changes: Object.entries(metricsProjectionsOf(sessionId)).map(([key, val]) => ({ key, val })),
+  })
+}
+
 /**
  * 演示用助手回合：按真实 wire 形状推 journal 事件与 assistant-stream 帧。
  * 两条硬约束来自客户端的 journal 流（gateway/client/journal-stream.ts）：
@@ -220,6 +299,8 @@ function startMockTurn(sessionId: string, requestId: string | undefined, text: s
     pushEvent('step/end', { turn: 0, step: 0 })
     // turn/end 的时间决定「已完成，用时 N 秒」的显示时长
     pushEvent('turn/end', { turn: 0, reason: { kind: 'completed' } }, {}, turnStart + 4000)
+    // 回合关闭后再发布统计：上游的轮/步计数只认已关闭的 step
+    pushTurnMetrics(sessionId)
   })()
 }
 
@@ -294,6 +375,7 @@ function mockSessionNamespace(): unknown {
               modelSelection: { lastUsed: null, next: selection },
               permissions: { currentValue: PERMISSION_BY_SESSION.get(id) ?? DEFAULT_PERMISSION },
               title: SESSION_TITLES.get(id) ?? null,
+              ...metricsProjectionsOf(id),
             },
           }])),
         },
@@ -320,6 +402,7 @@ function mockSessionNamespace(): unknown {
             modelSelection: { lastUsed: null, next: await currentModelSelection() },
             permissions: { currentValue: (sessionId === undefined ? undefined : PERMISSION_BY_SESSION.get(sessionId)) ?? DEFAULT_PERMISSION },
             title: sessionId === undefined ? null : (SESSION_TITLES.get(sessionId) ?? null),
+            ...(sessionId === undefined ? {} : metricsProjectionsOf(sessionId)),
           },
         },
         assistantStream: { revision: journal?.revision ?? 0 },
