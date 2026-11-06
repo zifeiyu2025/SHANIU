@@ -371,6 +371,15 @@ fn get_settings(app: tauri::AppHandle) -> Result<serde_json::Value, String> {
             "model": p.model,
             "secretRef": p.secret_name(),
             "hasApiKey": secret.load_key(&p.secret_name())?.is_some(),
+            // 模型清单原样回显，空清单不替 `model` 补一行：补出来的那行看起来像
+            // "用户自己加的"，设置页就会给一个根本没被声明过的档位提供删除按钮。
+            "models": p.models.iter().map(|m| serde_json::json!({
+                "id": m.id,
+                "name": m.name,
+                "contextWindow": m.context_window,
+                "maxTokens": m.max_tokens,
+                "input": m.input,
+            })).collect::<Vec<_>>(),
         }));
     }
     let active = cfg.effective_model();
@@ -455,6 +464,18 @@ fn save_settings(
     } else {
         let target = cfg.active_provider.clone();
         if let Some(profile) = cfg.providers.iter_mut().find(|p| p.id == target) {
+            // 与 validate_providers 同一条不变式：这里也要守。save_settings 走的是
+            // update_config，不经过 save_providers 的校验，漏掉这一步就能把生效模型
+            // 改成清单里没有的一行，而席位下拉只列清单——用户看到的就是"跑着一个
+            // 选不出来的模型"。
+            if !profile.models.is_empty()
+                && !model.trim().is_empty()
+                && !profile.models.iter().any(|m| m.id == model)
+            {
+                return Err(format!(
+                    "服务商 {target} 的模型清单里没有 {model}，请先在设置里添加这一行"
+                ));
+            }
             profile.base_url = base_url.trim_end_matches('/').to_string();
             profile.model = model;
         } else {

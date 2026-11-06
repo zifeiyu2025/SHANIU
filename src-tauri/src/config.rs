@@ -52,6 +52,31 @@ pub struct AppConfig {
     pub provider_revision: u64,
 }
 
+/// 设置页里一行模型档位（04 §4 `[[providers.models]]`）。
+///
+/// 运行期只消费 `id`（`ProviderProfile::model` 就是它当前选中的那一行）；其余四个
+/// 字段是设置页写面的原样留存。存下来但不生效，比"用户加了四行、重载只剩一行"
+/// 更接近事实——后者的代价是用户以为自己配好了。
+#[derive(Debug, Clone, PartialEq, Eq, Default, Serialize, Deserialize)]
+#[serde(default)]
+pub struct ModelProfile {
+    /// 传给端点的模型 id。
+    pub id: String,
+    /// 选择器里的显示名。
+    pub name: String,
+    /// 上下文窗口（token）。compaction 目前用固定预算，这一行只作显示与留存。
+    /// `alias` 不是照顾拼写：`save_providers` 收的是 JSON，前端送来 `contextWindow`
+    /// 而这里只认 `context_window` 的话，serde 会**静默**按缺省给 0——设置页显示
+    /// 配了 128K、后端读到一个空窗口。落盘仍然写 snake_case（与 04 §4 同源）。
+    #[serde(alias = "contextWindow")]
+    pub context_window: u32,
+    /// 单次响应输出上限（token）。
+    #[serde(alias = "maxTokens")]
+    pub max_tokens: u32,
+    /// 该模型接受的输入模态（`text` / `image`）。
+    pub input: Vec<String>,
+}
+
 /// 一家可切换的服务商（04 §4 `[[providers]]` 的一行）。
 ///
 /// `secret_ref` 是 DPAPI 里的密钥文件名，同时兼作设置页的凭据 ref：
@@ -65,10 +90,16 @@ pub struct ProviderProfile {
     pub label: String,
     /// 协议族：`openai-responses` | `openai-chat`。
     pub provider: String,
+    #[serde(alias = "baseUrl")]
     pub base_url: String,
     pub model: String,
     /// 密钥存放名（DPAPI 文件名 / 设置页 ref）。空 = 按 id 派生。
+    #[serde(alias = "secretRef")]
     pub secret_ref: String,
+    /// 这一家的模型档位清单（设置页写面）。空 = 只用 `model` 那一行，旧文档不改一字也能跑。
+    /// 必须排在最后：TOML 要求标量先于子表，把 `[[providers.models]]` 放前面会让整个
+    /// `[[providers]]` 的缩进归属变成 models，写出去的配置直接解析不回来。
+    pub models: Vec<ModelProfile>,
 }
 
 impl Default for ProviderProfile {
@@ -80,6 +111,7 @@ impl Default for ProviderProfile {
             base_url: String::new(),
             model: String::new(),
             secret_ref: String::new(),
+            models: Vec::new(),
         }
     }
 }
@@ -162,6 +194,24 @@ impl AppConfig {
                 return Err(format!(
                     "服务商 {} 的密钥名 {name} 含非法字符，会被清洗成 {sanitized}——请直接用一个合法名字",
                     p.id
+                ));
+            }
+            let mut rows: Vec<&str> = Vec::with_capacity(p.models.len());
+            for row in &p.models {
+                if row.id.trim().is_empty() {
+                    return Err(format!("服务商 {} 有模型行缺 id：席位按 id 选中一行，空 id 选不中", p.id));
+                }
+                if rows.contains(&row.id.as_str()) {
+                    return Err(format!("服务商 {} 的模型 id 重复：{}", p.id, row.id));
+                }
+                rows.push(row.id.as_str());
+            }
+            // 清单非空时当前生效行必须在里面：不在的话席位下拉里没有它，用户看不到
+            // 自己正在跑的模型，随手点一下别的行就把运行档换掉了。
+            if !p.models.is_empty() && !p.model.trim().is_empty() && !rows.contains(&p.model.as_str()) {
+                return Err(format!(
+                    "服务商 {} 的当前模型 {} 不在模型清单里，请先把它加进清单",
+                    p.id, p.model
                 ));
             }
         }
@@ -867,6 +917,17 @@ mod provider_tests {
             base_url: base.into(),
             model: model.into(),
             secret_ref: String::new(),
+            models: Vec::new(),
+        }
+    }
+
+    fn row(id: &str) -> ModelProfile {
+        ModelProfile {
+            id: id.into(),
+            name: id.into(),
+            context_window: 128_000,
+            max_tokens: 8_192,
+            input: vec!["text".into()],
         }
     }
 
@@ -943,8 +1004,10 @@ mod provider_tests {
 
     #[test]
     fn provider_document_round_trips_through_toml() {
+        let mut listed = profile("longcat", "https://lc/v1", "LongCat-2.5");
+        listed.models = vec![row("LongCat-2.5"), row("LongCat-mini")];
         let cfg = AppConfig {
-            providers: vec![profile("longcat", "https://lc/v1", "LongCat-2.5")],
+            providers: vec![listed],
             active_provider: "longcat".into(),
             provider_revision: 3,
             ..Default::default()
@@ -954,5 +1017,69 @@ mod provider_tests {
         let back: AppConfig = toml::from_str(&std::fs::read_to_string(&path).unwrap()).unwrap();
         assert_eq!(back, cfg, "服务商文档必须原样往返：半途丢字段就等于用户配的 Key 名变了");
         std::fs::remove_file(&path).ok();
+    }
+
+    /// 设置页写的是 JSON，字段名却是 camelCase。serde 对结构体字段**不做**大小写转换，
+    /// 认不到的键会被 `#[serde(default)]` 静默填成缺省值——写出去就是"界面显示 128K
+    /// 上下文、文档里是 0"。这条测试钉住 alias 生效。
+    #[test]
+    fn camel_case_json_from_frontend_deserializes_into_the_same_document() {
+        let parsed: Vec<ProviderProfile> = serde_json::from_value(serde_json::json!([
+            {
+                "id": "longcat",
+                "label": "LongCat",
+                "provider": "openai-chat",
+                "baseUrl": "https://api.longcat.chat/openai/v1",
+                "model": "LongCat-2.5",
+                "secretRef": "LONGCAT_API_KEY",
+                "models": [
+                    { "id": "LongCat-2.5", "name": "LongCat 2.5", "contextWindow": 128_000, "maxTokens": 8_192, "input": ["text"] }
+                ]
+            }
+        ]))
+        .expect("设置页送来的 camelCase 文档必须解析成同一份结构");
+        assert_eq!(parsed[0].base_url, "https://api.longcat.chat/openai/v1");
+        assert_eq!(parsed[0].secret_ref, "LONGCAT_API_KEY");
+        assert_eq!(parsed[0].models[0].context_window, 128_000);
+        assert_eq!(parsed[0].models[0].input, vec!["text".to_string()]);
+    }
+
+    #[test]
+    fn model_roster_rejects_blank_duplicate_and_unlisted_active_rows() {
+        let mut blank = profile("longcat", "b", "m");
+        blank.models = vec![row("")];
+        let err = AppConfig::validate_providers(&[blank.clone()], "").unwrap_err();
+        assert!(err.contains("缺 id"), "{err}");
+
+        let mut dup = profile("longcat", "b", "m");
+        dup.models = vec![row("a"), row("a")];
+        let err = AppConfig::validate_providers(&[dup], "").unwrap_err();
+        assert!(err.contains("模型 id 重复"), "{err}");
+
+        // 生效行不在清单里：席位下拉里没有正在跑的模型，用户下一次点选就把档位换走了
+        let mut unlisted = profile("longcat", "b", "ghost");
+        unlisted.models = vec![row("a")];
+        let err = AppConfig::validate_providers(&[unlisted], "").unwrap_err();
+        assert!(err.contains("不在模型清单里"), "{err}");
+
+        // 空清单仍按 model 单行跑：这是升级前文档的原样姿态
+        let listed = profile("longcat", "b", "m");
+        assert!(AppConfig::validate_providers(&[listed], "longcat").is_ok());
+        let mut legacy = profile("longcat", "b", "m");
+        legacy.models = vec![row("m")];
+        assert!(AppConfig::validate_providers(&[legacy], "longcat").is_ok());
+    }
+
+    /// 空 `models` 必须**不产出** `[[providers.models]]` 这一节：写出一张空表会让
+    /// 旧版后端读到多余的一节，而往返测试比对的是整份 AppConfig 的相等性。
+    #[test]
+    fn empty_roster_writes_no_models_section() {
+        let cfg = AppConfig {
+            providers: vec![profile("longcat", "https://lc/v1", "LongCat-2.5")],
+            ..Default::default()
+        };
+        let body = toml::to_string_pretty(&cfg).unwrap();
+        assert!(!body.contains("providers.models"), "{body}");
+        assert_eq!(toml::from_str::<AppConfig>(&body).unwrap(), cfg);
     }
 }
