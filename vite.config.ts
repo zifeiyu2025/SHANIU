@@ -3,6 +3,7 @@ import { defineConfig } from 'vite';
 import react from '@vitejs/plugin-react';
 import tailwindcss from '@tailwindcss/vite';
 import { dshAliases } from './src/dsh/aliases.ts';
+import { SHANIU_BRAND_NAME } from './src/brand/brand-name.ts';
 
 export default defineConfig({
   plugins: [react(), tailwindcss()],
@@ -11,7 +12,7 @@ export default defineConfig({
   define: {
     'process.env': JSON.stringify({
       NODE_ENV: process.env.NODE_ENV ?? 'development',
-      DSH_CLIENT_TITLE: 'SHANIU',
+      DSH_CLIENT_TITLE: SHANIU_BRAND_NAME,
       DSH_CLIENT_COMMIT_HASH: '',
     }),
   },

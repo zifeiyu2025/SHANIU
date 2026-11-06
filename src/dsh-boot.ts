@@ -44,6 +44,7 @@ import {
 import {
   installMockRemoteNamespaces, mockConnection, mockModules, mockRemote, mockTypert,
 } from './transport/mock'
+import { apply as brandApply, inject as brandInject } from './brand'
 
 export interface BootHandle {
   readonly ctx: Context
@@ -125,6 +126,7 @@ export async function bootShaniu(container: HTMLElement): Promise<BootHandle> {
     { inject: uiConversationInject, apply: uiConversationApply },
     { inject: uiSidebarRightInject, apply: uiSidebarRightApply },
     { inject: uiSidebarInject, apply: uiSidebarApply },
+    { inject: brandInject, apply: brandApply },
     { inject: uiSettingsGeneralInject, apply: uiSettingsGeneralApply },
     { inject: uiSettingsModelsInject, apply: uiSettingsModelsApply },
     { inject: uiChatInject, apply: uiChatApply },
