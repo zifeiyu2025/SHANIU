@@ -20,6 +20,7 @@
  * - 审批：走 typert 事件面（`approval/request`），不是 journal 事件。
  */
 import { RemoteError } from '@deepseek-ai/dsh-typert-protocol'
+import { createSettingsFace } from './settings-face'
 import type { AgentEvent, EventMsg } from './types'
 import type { HostBridge } from './tauri'
 
@@ -97,13 +98,6 @@ interface Journal {
   entryToSeq: number[]
 }
 
-interface SettingsView {
-  baseUrl: string
-  model: string
-  workspaceRoot: string
-  hasApiKey: boolean
-}
-
 /**
  * `load_session` 的档案投影（与 `src-tauri/src/lib.rs` 的 `SessionEntry` 同形）。
  * 字段名跟着 Rust 的 serde 走：这里刻意**不**重命名，改名就会和后端序列化结果漂移。
@@ -117,9 +111,6 @@ export interface AdapterOptions {
   readonly now?: () => number
 }
 
-/** 与 `config.rs` 的 `[model].provider` 缺省同源。 */
-const PROVIDER_ID = 'openai-compatible'
-const PROVIDER_NAME = '本地配置端点'
 
 function newJournal(createdAt: number): Journal {
   return {
@@ -141,9 +132,28 @@ export function createAdapter(options: AdapterOptions): { remote: unknown; dispo
   const titles = new Map<string, string>()
   /** 审批监听器（DSH 的 ui-approval 在装配时注册）。 */
   const approvalListeners: ((request: Record<string, unknown>, next: () => Promise<never>) => Promise<string>)[] = []
+  /**
+   * 数据面事件的监听器（`settings/document-updated`、`llm/adapters-updated`、
+   * `credentials/*`）。DSH 的席位与设置页都靠这些通知重读目录，收不到通知的形态是
+   * "设置里改了服务商，席位还显示上一个"——那不是报错，是更难发现的错。
+   */
+  const listeners = new Map<string, ((...args: unknown[]) => unknown)[]>()
   const projectionLog = new FrameLog()
   let projectionSeq = 0
-  let settingsCache: SettingsView | undefined
+
+  const dispatch = (name: string, ...args: unknown[]): void => {
+    for (const listener of listeners.get(name) ?? []) {
+      try {
+        void listener(...args)
+      } catch (reason) {
+        // 监听器抛错不能把已提交的写回滚掉——DSH 自己的事件面同样是"包含式派发"。
+        console.error(`[SHANIU] ${name} 监听器抛错`, reason)
+      }
+    }
+  }
+
+  /** 设置页 / 凭据 / 模型目录三张面：事实来源是宿主的 `[[providers]]` 文档。 */
+  const face = createSettingsFace(bridge, { emit: dispatch })
 
   const journalOf = (sessionId: string): Journal => {
     let journal = journals.get(sessionId)
@@ -176,9 +186,7 @@ export function createAdapter(options: AdapterOptions): { remote: unknown; dispo
 
   const currentModelSelection = (): Record<string, unknown> => ({
     lastUsed: null,
-    next: settingsCache?.hasApiKey === true && settingsCache.model !== ''
-      ? { provider: PROVIDER_ID, model: settingsCache.model }
-      : { provider: '', model: '' },
+    next: face.activeSelection(),
   })
 
   /** 空会话的快照帧：cursor -1、无记录、revision 0，且仍带上客户端要求的两个基线。 */
@@ -225,7 +233,7 @@ export function createAdapter(options: AdapterOptions): { remote: unknown; dispo
           id: `shaniu-assistant-${journal.seq + 1}`,
           role: 'assistant',
           content,
-          source: { kind: 'model', provider: PROVIDER_ID, model: settingsCache?.model ?? '' },
+          source: { kind: 'model', ...face.activeSelection() },
         },
         stream: [],
         ...(journal.usage === undefined ? {} : { usage: journal.usage }),
@@ -338,7 +346,7 @@ export function createAdapter(options: AdapterOptions): { remote: unknown; dispo
             id: `shaniu-replay-assistant-${index}`,
             role: 'assistant',
             content,
-            source: { kind: 'model', provider: PROVIDER_ID, model: settingsCache?.model ?? '' },
+            source: { kind: 'model', ...face.activeSelection() },
           },
           stream: [],
         }, { surfaceOp: 'append' })
@@ -378,30 +386,6 @@ export function createAdapter(options: AdapterOptions): { remote: unknown; dispo
     })
     closeTurn()
     return journal
-  }
-
-  const readSettings = async (): Promise<SettingsView | undefined> => {
-    try {
-      settingsCache = await bridge.invoke<SettingsView>('get_settings')
-      return settingsCache
-    } catch (reason) {
-      // 读不到宿主设置时模型席位留空，而不是编一个默认档位：席位空着用户会去配，
-      // 编出来的档位会让用户以为已经配好了。
-      console.warn('[SHANIU] 读取宿主设置失败', reason)
-      return undefined
-    }
-  }
-
-  const catalogOf = (view: SettingsView | undefined): Record<string, unknown> => {
-    if (view === undefined || !view.hasApiKey || view.model === '') {
-      return { default: { provider: '', model: '' }, routableProviders: [], groups: [], failures: [] }
-    }
-    return {
-      default: { provider: PROVIDER_ID, model: view.model },
-      routableProviders: [PROVIDER_ID],
-      groups: [{ id: PROVIDER_ID, name: PROVIDER_NAME, models: [{ id: view.model, name: view.model }] }],
-      failures: [],
-    }
   }
 
   /** 审批：把后端的请求交给 DSH 审批卡，裁决回执只认后端签发过的 request_id。 */
@@ -709,7 +693,7 @@ export function createAdapter(options: AdapterOptions): { remote: unknown; dispo
       for await (const frame of journal.log.tail(from)) yield frame
     },
     control: async function* (): AsyncGenerator<Record<string, unknown>> {
-      await readSettings()
+      await face.refresh()
       const from = projectionLog.length
       yield {
         type: 'baseline',
@@ -734,13 +718,14 @@ export function createAdapter(options: AdapterOptions): { remote: unknown; dispo
     },
     projections: async () => OK(null),
     search: async () => OK({ items: [], hasMore: false }),
-    modelCatalog: async () => OK(catalogOf(await readSettings())),
-    selectModel: async (request: { model?: string }) => {
-      const view = await readSettings()
-      if (view === undefined) return FAIL('读不到宿主设置，无法保存模型选择')
-      const model = request.model ?? view.model
-      await bridge.invoke('save_settings', { baseUrl: view.baseUrl, model, workspaceRoot: view.workspaceRoot })
-      await readSettings()
+    modelCatalog: async () => face.session.modelCatalog(),
+    selectModel: async (request: { sessionId?: string; provider?: string; model?: string; reasoningEffort?: string }) => {
+      const selected = await face.session.selectModel({
+        provider: request.provider ?? '',
+        model: request.model ?? '',
+        ...(request.reasoningEffort === undefined ? {} : { reasoningEffort: request.reasoningEffort }),
+      })
+      if (!selected.ok) return selected
       projectionSeq += 1
       for (const id of journals.keys()) {
         projectionLog.append({
@@ -748,7 +733,7 @@ export function createAdapter(options: AdapterOptions): { remote: unknown; dispo
           changes: [{ key: 'modelSelection', val: currentModelSelection() }],
         })
       }
-      return OK({ provider: PROVIDER_ID, model })
+      return selected
     },
     canOpenWorkspacePath: async () => OK(true),
     openWorkspacePath: async (request: { path?: string } = {}) => {
@@ -756,7 +741,7 @@ export function createAdapter(options: AdapterOptions): { remote: unknown; dispo
       return OK({ opened: true })
     },
     initializeDefaultModel: async () => {
-      await readSettings()
+      await face.refresh()
       return OK(undefined)
     },
     rename: () => unimplemented('session.rename', 'SH-033'),
@@ -771,16 +756,31 @@ export function createAdapter(options: AdapterOptions): { remote: unknown; dispo
     workspacePathApplications: () => unimplemented('session.workspacePathApplications', 'SH-092'),
   }
 
-  const namespaces = new Map<string, unknown>([['session', sessionNamespace]])
+  const namespaces = new Map<string, unknown>([
+    ['session', sessionNamespace],
+    ['settings', face.settings],
+    ['llm', face.llm],
+    ['credentials', face.credentials],
+  ])
 
   const remote: unknown = new Proxy({
     $host: { home: undefined, isLoopback: true },
-    $on(event: string, listener: (request: Record<string, unknown>, next: () => Promise<never>) => Promise<string>): () => void {
-      if (event !== 'approval/request') return () => {}
-      approvalListeners.push(listener)
-      return () => {
-        const index = approvalListeners.indexOf(listener)
-        if (index >= 0) approvalListeners.splice(index, 1)
+    $on(event: string, listener: (...args: never[]) => unknown): () => void {
+      if (event === 'approval/request') {
+        const next = listener as (request: Record<string, unknown>, next: () => Promise<never>) => Promise<string>
+        approvalListeners.push(next)
+        return (): void => {
+          const index = approvalListeners.indexOf(next)
+          if (index >= 0) approvalListeners.splice(index, 1)
+        }
+      }
+      const list = listeners.get(event) ?? []
+      const next = listener as (...args: unknown[]) => unknown
+      list.push(next)
+      listeners.set(event, list)
+      return (): void => {
+        const index = (listeners.get(event) ?? []).indexOf(next)
+        if (index >= 0) list.splice(index, 1)
       }
     },
     $emit: () => false,
@@ -834,7 +834,7 @@ export function createAdapter(options: AdapterOptions): { remote: unknown; dispo
   })
 
   const unlisten = bridge.listenEvents(onEvent)
-  void readSettings()
+  void face.refresh()
 
   return {
     remote,

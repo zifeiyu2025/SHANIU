@@ -10,13 +10,48 @@ import { createAdapter } from './adapter'
 import type { HostBridge } from './tauri'
 import type { AgentEvent, EventMsg } from './types'
 
+/** 宿主 `get_settings` 的真实形状（04 §1.3）：服务商文档 + 逐家 hasApiKey。 */
+const HOST_SETTINGS = {
+  baseUrl: 'https://lc/v1',
+  model: 'LongCat-2.5',
+  maxTurns: 32,
+  workspaceRoot: 'W',
+  hasApiKey: true,
+  sandboxMode: 'workspace_write',
+  approvalMode: 'ask',
+  activeProvider: 'longcat',
+  providerRevision: 4,
+  providers: [
+    {
+      id: 'longcat',
+      label: 'LongCat',
+      provider: 'openai-chat',
+      baseUrl: 'https://lc/v1',
+      model: 'LongCat-2.5',
+      secretRef: 'LONGCAT_API_KEY',
+      hasApiKey: true,
+      models: [{ id: 'LongCat-2.5', name: 'LongCat 2.5', contextWindow: 128_000, maxTokens: 8_192, input: ['text'] }],
+    },
+    {
+      id: 'ghost',
+      label: 'Ghost',
+      provider: 'openai-chat',
+      baseUrl: 'https://g/v1',
+      model: 'g-1',
+      secretRef: 'GHOST_API_KEY',
+      hasApiKey: false,
+      models: [],
+    },
+  ],
+}
+
 interface ScriptedBridge extends HostBridge {
   readonly calls: { command: string; args: Record<string, unknown> | undefined }[]
   emit(sessionId: string, msg: EventMsg): void
 }
 
 function scriptedBridge(
-  settings = { baseUrl: 'https://x/v1', model: 'm', workspaceRoot: 'W', hasApiKey: true },
+  settings: Record<string, unknown> = HOST_SETTINGS,
   archive: Record<string, unknown>[] = [],
 ): ScriptedBridge {
   const calls: ScriptedBridge['calls'] = []
@@ -537,28 +572,103 @@ describe('适配层的命令面映射', () => {
     expect(replayTypes).toEqual(liveTypes)
   })
 
-  it('模型席位只反映宿主真实配置，选模写回设置并推投影', async () => {
+  it('模型席位只反映宿主真实配置，选模写回服务商文档并推投影', async () => {
     const bridge = scriptedBridge()
     const { remote, dispose } = createAdapter({ bridge })
     const session = faceOf(remote).session
-    const catalogA = (await session.modelCatalog())['value'] as { groups: unknown[]; routableProviders: string[] }
-    expect(catalogA.groups).toHaveLength(1)
-    expect(catalogA.routableProviders).toEqual(['openai-compatible'])
+    const catalog = (await session.modelCatalog())['value'] as {
+      groups: { id: string; models: { id: string }[] }[]
+      routableProviders: string[]
+      failures: { id: string; message: string }[]
+      default: Record<string, string>
+    }
+    // 没配密钥的那家进 failures 并带原因，而不是从目录里静默消失：
+    // 用户看得见"为什么不能用"，才会去配，而不是以为自己没添加成功。
+    expect(catalog.groups).toEqual([{ id: 'longcat', name: 'LongCat', models: [{ id: 'LongCat-2.5', name: 'LongCat 2.5' }] }])
+    expect(catalog.routableProviders).toEqual(['longcat'])
+    expect(catalog.failures).toEqual([{ id: 'ghost', name: 'Ghost', message: '未配置密钥（引用名 GHOST_API_KEY）' }])
+    expect(catalog.default).toEqual({ provider: 'longcat', model: 'LongCat-2.5' })
 
     await session.prompt({ sessionId: 'agent-new', requestId: 'rpc-12', content: [{ type: 'text', text: '换模型' }] })
-    await session.selectModel({ model: 'other-model' })
-    expect(bridge.calls.find(call => call.command === 'save_settings')?.args).toEqual({
-      baseUrl: 'https://x/v1', model: 'other-model', workspaceRoot: 'W',
+    const before = bridge.calls.length
+    const chosen = await session.selectModel({ sessionId: 'agent-new', provider: 'longcat', model: 'LongCat-2.5' })
+    expect(chosen['ok']).toBe(true)
+    const write = bridge.calls.slice(before).find(call => call.command === 'save_providers')
+    const saved = write?.args as { providers: Record<string, unknown>[]; activeProvider: string; expectedRevision: number }
+    // 席位切换写的是**整份**文档：没被选中的那家也必须原样在场，否则切一次模型
+    // 就把别的服务商删了。
+    expect(saved.providers.map(row => row.id)).toEqual(['longcat', 'ghost'])
+    expect(saved.activeProvider).toBe('longcat')
+    expect(saved.expectedRevision).toBe(4)
+    expect(saved.providers[0]).toMatchObject({
+      id: 'longcat',
+      base_url: 'https://lc/v1',
+      secret_ref: 'LONGCAT_API_KEY',
+      model: 'LongCat-2.5',
+      // 嵌套结构体按 04 §4 的落盘名送，Tauri 只转顶层参数名
+      models: [{ id: 'LongCat-2.5', name: 'LongCat 2.5', context_window: 128_000, max_tokens: 8_192, input: ['text'] }],
+    })
+    expect(saved.providers[1]).toMatchObject({ id: 'ghost', model: 'g-1', secret_ref: 'GHOST_API_KEY' })
+    dispose()
+  })
+
+  it('席位选一个清单外的模型就是拒绝，不写出一份后端会拒收的文档', async () => {
+    const bridge = scriptedBridge()
+    const { remote, dispose } = createAdapter({ bridge })
+    const result = await faceOf(remote).session.selectModel({ sessionId: 'a', provider: 'longcat', model: '不存在的模型' })
+    expect(result['ok']).toBe(false)
+    expect((result['error'] as Error).message).toContain('模型清单里没有')
+    expect(bridge.calls.some(call => call.command === 'save_providers')).toBe(false)
+    dispose()
+  })
+
+  it('只有 [model] 回落段的安装：席位显示未配置，不编一个存不回密钥的档位', async () => {
+    const bridge = scriptedBridge({ ...HOST_SETTINGS, activeProvider: 'openai-responses', providerRevision: 0, hasApiKey: true, providers: [] })
+    const { remote, dispose } = createAdapter({ bridge })
+    const catalog = (await faceOf(remote).session.modelCatalog())['value'] as { groups: unknown[]; default: Record<string, string> }
+    // `[model].provider` 带连字符，不是 DSH 合法的凭据引用名；把它当档位显示，
+    // 用户在界面里填的 Key 会存成 OPENAI_RESPONSES_API_KEY，而后端读的是 openai-responses。
+    expect(catalog.groups).toEqual([])
+    expect(catalog.default).toEqual({ provider: '', model: '' })
+    dispose()
+  })
+})
+
+describe('设置 / 凭据 / 目录三张面经 remote 可达', () => {
+  interface FaceProxy {
+    settings: Record<string, (...args: unknown[]) => Promise<Record<string, unknown>>>
+    llm: Record<string, (...args: unknown[]) => Promise<Record<string, unknown>>>
+    credentials: Record<string, (...args: unknown[]) => Promise<Record<string, unknown>>>
+    $on(event: string, listener: (...args: never[]) => unknown): () => void
+  }
+
+  const faces = (remote: unknown): FaceProxy => remote as FaceProxy
+
+  it('三个命名空间由适配层直供，不再落到"未接线"代理', async () => {
+    const { remote, dispose } = createAdapter({ bridge: scriptedBridge() })
+    const face = faces(remote)
+    expect((await face.settings['describe']!())['ok']).toBe(true)
+    const listed = await face.llm['listConfigurableProviders']!()
+    expect((listed['value'] as unknown[]).length).toBeGreaterThan(0)
+    const described = await face.credentials['describe']!(['LONGCAT_API_KEY', 'GHOST_API_KEY'])
+    expect(described['value']).toMatchObject({
+      LONGCAT_API_KEY: { configured: true, source: 'shaniu-dpapi' },
+      GHOST_API_KEY: { configured: false },
     })
     dispose()
   })
 
-  it('没配 Key 就是空目录，席位不编默认档', async () => {
-    const bridge = scriptedBridge({ baseUrl: '', model: '', workspaceRoot: 'W', hasApiKey: false })
-    const { remote, dispose } = createAdapter({ bridge })
-    const catalog = (await faceOf(remote).session.modelCatalog())['value'] as { groups: unknown[]; default: Record<string, string> }
-    expect(catalog.groups).toEqual([])
-    expect(catalog.default).toEqual({ provider: '', model: '' })
+  it('存密钥后向已注册的监听器广播；退订后不再收到', async () => {
+    const { remote, dispose } = createAdapter({ bridge: scriptedBridge() })
+    const face = faces(remote)
+    const seen: string[] = []
+    const off = face.$on('llm/adapters-updated', () => { seen.push('adapters') })
+    await face.credentials['set']!('MINIMAX_API_KEY', 'sk-m')
+    expect(seen).toEqual(['adapters'])
+    off()
+    await face.credentials['set']!('MINIMAX_API_KEY', 'sk-m')
+    // 退订之后不该再被叫到，否则监听器会越积越多
+    expect(seen).toEqual(['adapters'])
     dispose()
   })
 })
