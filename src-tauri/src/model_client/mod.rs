@@ -469,30 +469,7 @@ pub async fn stream_chat(
     tools: &[ToolDeclaration],
     instructions: &str,
 ) -> Result<impl Stream<Item = ModelStreamEvent>, String> {
-    let client = reqwest::Client::new();
-    let body = build_chat_request(provider, history, tools, instructions);
-    let response = client
-        .post(chat_url(provider))
-        .bearer_auth(api_key)
-        .json(&body)
-        .send()
-        .await
-        .map_err(|e| format!("模型请求失败: {e}"))?;
-    if !response.status().is_success() {
-        let status = response.status();
-        let body_text = response.text().await.unwrap_or_default();
-        let snippet: String = body_text.chars().take(200).collect();
-        return Err(format!("模型端点返回 {status}: {snippet}"));
-    }
-    let acc = std::cell::RefCell::new(ChatStreamAccumulator::default());
-    Ok(response
-        .bytes_stream()
-        .eventsource()
-        .map(move |res| match res {
-            Ok(event) => translate_chat_data(&event.data, &mut acc.borrow_mut()),
-            Err(e) => vec![ModelStreamEvent::Failed { message: format!("SSE 流错误: {e}") }],
-        })
-        .flat_map(futures::stream::iter))
+    stream_body(provider, api_key, build_chat_request(provider, history, tools, instructions)).await
 }
 
 /// 打开 Responses API SSE 流。
@@ -503,10 +480,23 @@ pub async fn stream_responses(
     tools: &[ToolDeclaration],
     instructions: &str,
 ) -> Result<impl Stream<Item = ModelStreamEvent>, String> {
+    stream_body(provider, api_key, build_responses_request(provider, history, tools, instructions)).await
+}
+
+/// 按**已备好的请求体**打开模型 SSE 流；URL 与响应解析按协议族选择。
+///
+/// 主循环（`stream_chat` / `stream_responses`）与辅助请求（标题生成）共用同一条传输
+/// 管线：两者差别只在请求体字段（辅助请求自带 `max_tokens` 这类主循环没有的字段），
+/// 不在传输本身——复制管线等于让两处各自腐化。
+pub async fn stream_body(
+    provider: &ProviderConfig,
+    api_key: &str,
+    body: serde_json::Value,
+) -> Result<ModelStream, String> {
     let client = reqwest::Client::new();
-    let body = build_responses_request(provider, history, tools, instructions);
+    let url = if provider.is_responses() { provider.responses_url() } else { chat_url(provider) };
     let response = client
-        .post(provider.responses_url())
+        .post(url)
         .bearer_auth(api_key)
         .json(&body)
         .send()
@@ -519,14 +509,26 @@ pub async fn stream_responses(
         let snippet: String = body_text.chars().take(200).collect();
         return Err(format!("模型端点返回 {status}: {snippet}"));
     }
-    Ok(response
-        .bytes_stream()
-        .eventsource()
-        .map(|res| match res {
-            Ok(event) => translate_sse_event(&event),
-            Err(e) => Some(ModelStreamEvent::Failed { message: format!("SSE 流错误: {e}") }),
-        })
-        .filter_map(|ev| async move { ev })) // None = 无法翻译的事件，忽略
+    if provider.is_responses() {
+        Ok(Box::pin(response
+            .bytes_stream()
+            .eventsource()
+            .map(|res| match res {
+                Ok(event) => translate_sse_event(&event),
+                Err(e) => Some(ModelStreamEvent::Failed { message: format!("SSE 流错误: {e}") }),
+            })
+            .filter_map(|ev| async move { ev }))) // None = 无法翻译的事件，忽略
+    } else {
+        let acc = std::cell::RefCell::new(ChatStreamAccumulator::default());
+        Ok(Box::pin(response
+            .bytes_stream()
+            .eventsource()
+            .map(move |res| match res {
+                Ok(event) => translate_chat_data(&event.data, &mut acc.borrow_mut()),
+                Err(e) => vec![ModelStreamEvent::Failed { message: format!("SSE 流错误: {e}") }],
+            })
+            .flat_map(futures::stream::iter)))
+    }
 }
 
 #[cfg(test)]
