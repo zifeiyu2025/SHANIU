@@ -526,6 +526,12 @@
       "@deepseek-ai/dsh-client-ui-renderer/*": [
         "./node_modules/.cache/dsh-types-client/src/dsh/packages/client/ui-renderer/src/*"
       ],
+      "@deepseek-ai/dsh-client-ui-schedule": [
+        "./node_modules/.cache/dsh-types-client/src/dsh/packages/client/ui-schedule/src/index.d.ts"
+      ],
+      "@deepseek-ai/dsh-client-ui-schedule/*": [
+        "./node_modules/.cache/dsh-types-client/src/dsh/packages/client/ui-schedule/src/*"
+      ],
       "@deepseek-ai/dsh-client-ui-session": [
         "./node_modules/.cache/dsh-types-client/src/dsh/packages/client/ui-session/src/index.d.ts"
       ],
@@ -1692,6 +1698,9 @@
       ],
       "@deepseek-ai/dsh-client-ui-renderer/client": [
         "./node_modules/.cache/dsh-types-client/src/dsh/packages/client/ui-renderer/src/client/index.d.ts"
+      ],
+      "@deepseek-ai/dsh-client-ui-schedule/client": [
+        "./node_modules/.cache/dsh-types-client/src/dsh/packages/client/ui-schedule/src/client/index.d.ts"
       ],
       "@deepseek-ai/dsh-client-ui-session/client": [
         "./node_modules/.cache/dsh-types-client/src/dsh/packages/client/ui-session/src/client/index.d.ts"

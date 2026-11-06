@@ -753,6 +753,57 @@ function mockDirectoryPickerNamespace(): unknown {
   }
 }
 
+/** mock 的插件管理面：面板如实显示「此环境不可管理」（真实管理属二期/打包接线）。 */
+function mockPluginInventoryNamespace(): unknown {
+  return {
+    list: async () => OK({ managementAvailable: false }),
+  }
+}
+
+function mockPluginManagerNamespace(): unknown {
+  const unavailable = async () => FAIL('plugin-manager/unavailable', '桌面壳尚未接线插件管理')
+  return {
+    listBundles: unavailable,
+    listPlugins: unavailable,
+    registries: unavailable,
+    readBundleDetail: unavailable,
+    setBundleEnabled: unavailable,
+    setPluginEnabled: unavailable,
+    removeBundle: unavailable,
+    listVersions: unavailable,
+    updateBundle: unavailable,
+    inspect: unavailable,
+    installBundle: unavailable,
+    waitForInstall: unavailable,
+    cancelInstall: unavailable,
+  }
+}
+
+function mockPluginRegistryProbeNamespace(): unknown {
+  return {
+    fastest: async () => FAIL('plugin-registry/unavailable', '桌面壳尚未接线插件源探测'),
+  }
+}
+
+/**
+ * mock 的 `remote.schedule`：目录为空，自动化面板显示空态；
+ * 写入面显式失败——不为「创建/运行自动化任务」伪造成功。
+ */
+function mockScheduleNamespace(): unknown {
+  const unavailable = async () => FAIL('schedule/unavailable', 'mock 未实现自动化任务写入')
+  return {
+    catalog: async () => OK([]),
+    history: async () => OK({ items: [], hasMore: false }),
+    deliveryLimits: async () => OK({}),
+    list: async () => OK({ items: [] }),
+    view: async () => OK({}),
+    create: unavailable,
+    edit: unavailable,
+    run: unavailable,
+    deleteInactive: unavailable,
+  }
+}
+
 /** 尚未 mock 的命名空间维持显式抛错面（按界面迭代逐个补）。 */
 function mockNamespace(name: string): unknown {
   const thrower = () => {
@@ -796,6 +847,11 @@ function buildMockRemote(): unknown {
     ['workspaceFiles', mockWorkspaceFilesNamespace()],
     // 「添加工作区」对话框的浏览原语（应用内目录树）
     ['directoryPicker', mockDirectoryPickerNamespace()],
+    // 侧栏面板：插件（只读不可管理）与自动化任务（空目录）
+    ['pluginInventory', mockPluginInventoryNamespace()],
+    ['pluginManager', mockPluginManagerNamespace()],
+    ['pluginRegistryProbe', mockPluginRegistryProbeNamespace()],
+    ['schedule', mockScheduleNamespace()],
     ['session', mockSessionNamespace()],
     // 模型设置页的三张面：由同一份 mock-models 事实源应答（见 mock-models.ts）
     ['llm', MODELS.llm],
@@ -881,6 +937,7 @@ const NAMESPACES = [
   'session', 'commands', 'toolResults', 'userQuestions', 'workspace', 'workspaceFiles',
   'directoryPicker', 'job', 'terminal', 'settings', 'subagents', 'modelSelection',
   'credentials', 'llm', 'permissionPresets',
+  'pluginManager', 'pluginInventory', 'pluginRegistryProbe', 'schedule',
 ] as const
 
 /** 批量注册 mock 的 `remote.<ns>` 点分服务（与 ctx.remote.<ns> 同源同实例）。 */

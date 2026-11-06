@@ -28,6 +28,8 @@ import { apply as uiPlanApply, inject as uiPlanInject } from '@deepseek-ai/dsh-c
 import { apply as uiPermissionApply, inject as uiPermissionInject } from '@deepseek-ai/dsh-client-ui-permission-presets/client'
 import { apply as uiDeliverablesApply, inject as uiDeliverablesInject } from '@deepseek-ai/dsh-client-ui-deliverables/client'
 import { apply as uiAttachmentApply, inject as uiAttachmentInject } from '@deepseek-ai/dsh-client-ui-attachment/client'
+import { apply as uiPluginManagerApply, inject as uiPluginManagerInject } from '@deepseek-ai/dsh-client-ui-plugin-manager/client'
+import { apply as uiScheduleApply, inject as uiScheduleInject } from '@deepseek-ai/dsh-client-ui-schedule/client'
 import { apply as uiContextMenuApply, inject as uiContextMenuInject } from '@deepseek-ai/dsh-client-ui-context-menu/client'
 import { apply as uiFileDragApply, inject as uiFileDragInject } from '@deepseek-ai/dsh-client-ui-file-drag/client'
 import { apply as uiInputTriggerApply, inject as uiInputTriggerInject } from '@deepseek-ai/dsh-client-ui-input-trigger/client'
@@ -173,6 +175,9 @@ export async function bootShaniu(container: HTMLElement): Promise<BootHandle> {
     { inject: uiPermissionInject, apply: uiPermissionApply },
     { inject: uiDeliverablesInject, apply: uiDeliverablesApply },
     { inject: uiAttachmentInject, apply: uiAttachmentApply },
+    // 侧栏面板：插件管理（remote 面只读不可管理）与自动化任务（空目录）
+    { inject: uiPluginManagerInject, apply: uiPluginManagerApply },
+    { inject: uiScheduleInject, apply: uiScheduleApply },
   ]
   for (const feature of features) {
     await root.plugin({ inject: [...feature.inject], apply: feature.apply }).await()
@@ -180,6 +185,7 @@ export async function bootShaniu(container: HTMLElement): Promise<BootHandle> {
 
   // 布局壳：占据 root slot（sidebar/main/rightbar/shell.*）
   await root.plugin({ inject: [...layoutInject], apply: layoutApply }).await()
+  await new Promise<void>(resolve => setTimeout(resolve, 0))
 
   // 挂载：等价 DSH mountClient —— 等 uiRenderer 就位后 mount
 

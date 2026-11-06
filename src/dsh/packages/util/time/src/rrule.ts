@@ -1,6 +1,8 @@
 /** Bounded RFC 5545 recurrence over UTC or explicit local wall time. */
 import { Temporal } from '@js-temporal/polyfill'
-import rrulePackage from 'rrule'
+// 上游用默认导入拿命名空间，依赖它自己的打包器做 CJS 互操作；SHANIU 的 vite/rolldown
+// 解析到 rrule 的 ESM 构建（只有命名导出），这里改为命名导入，语义不变。
+import { Weekday, rrulestr } from 'rrule'
 import { MAX_FOUR_DIGIT_YEAR_MS, canonicalizeTimeZone, isFourDigitYearInstant, resolveLocalInstant } from './instant.ts'
 import { RecurrenceInputError, parseRecurrence, recurrenceDecision } from './recurrence.ts'
 import type { RecurrenceOccurrence, RecurrenceResult } from './recurrence.ts'
@@ -12,7 +14,7 @@ function validatedZone(value: string): string {
   return result.timeZone
 }
 
-const { Weekday, rrulestr } = rrulePackage
+
 
 /** Largest accepted COUNT; a longer finite recurrence uses UNTIL. */
 const MAX_RRULE_COUNT = 1_000

@@ -30,6 +30,7 @@ export const REMOTE_NAMESPACES = [
   'session', 'commands', 'toolResults', 'userQuestions', 'workspace', 'workspaceFiles',
   'directoryPicker', 'job', 'terminal', 'settings', 'subagents', 'modelSelection',
   'credentials', 'llm', 'permissionPresets',
+  'pluginManager', 'pluginInventory', 'pluginRegistryProbe', 'schedule',
 ] as const
 
 /**
@@ -123,12 +124,25 @@ export class StubRemoteAccess extends Service {
 
   private runEffect(callback: () => unknown): () => void {
     const effect = callback() as unknown
-    return () => {
-      if (typeof effect === 'function') (effect as () => void)()
-      else if (effect !== undefined && Symbol.iterator in (effect as object)) {
-        for (const dispose of effect as Iterable<() => void>) dispose()
-      }
+    let done = false
+    const once = (disposers: readonly (() => void)[]): (() => void) => () => {
+      if (done) return
+      done = true
+      for (const dispose of [...disposers].reverse()) dispose()
     }
+    if (effect === undefined) return once([])
+    // 与 ctx.effect 同语义：生成器一次性跑完，把 yield 出的 disposer 留着，
+    // 逆序统一卸载。此前在这里逐个立即调用，等于「注册完马上拆」——
+    // 受 whenAccess 保护的侧栏面板因此从未出现。
+    if (typeof effect === 'function') return once([effect as () => void])
+    if (typeof effect === 'object' && effect !== null && Symbol.iterator in effect) {
+      const disposers: (() => void)[] = []
+      for (const yielded of effect as Iterable<unknown>) {
+        if (typeof yielded === 'function') disposers.push(yielded as () => void)
+      }
+      return once(disposers)
+    }
+    return once([])
   }
 }
 
