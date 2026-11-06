@@ -39,9 +39,14 @@ export function stubRemoteNamespace(name: string): unknown {
  *   `save_providers` / `store_api_key` / `delete_api_key`）。设置页写得出而后端吃不下
  *   的部分逐项拒绝并给原因，转 SH-096（推理档）/ SH-097（自定义请求头）/
  *   SH-098（端点模型发现）。
- * - `permissionPresets` —— 后端没有与 DSH 权限挡位对应的目录：我们的安全面是
- *   `sandbox.mode × approval.mode` 两维，官方 preset 是一维档位，映射属产品决策，
- *   未拍板前不挂这张面（设置-通用的权限行会因此不出现，而不是显示一套假挡位）。
+ * - `permissionPresets` —— 已由适配层接管（2026-11-07 拍板）：目录 = 静态三挡映射到
+ *   宿主 `sandbox.mode`（approval 维不动，裁决矩阵当前不消费它），切换经
+ *   `/permission <preset>` 走 `save_settings`。映射语义见 `transport/adapter.ts` 的
+ *   PRESET_TO_SANDBOX 注记；上游实验档 `auto` 不进目录。
+ * - `commands` —— 部分接管：`/permission`（挡位芯片的提交路径）、`/plan off`
+ *   （PlanChip 退出 → 指引审批卡：宿主 PlanState 只认 exit_plan_mode 工具执行，前端
+ *   无真实退出手段）与空 `list`（"+"菜单据此恢复到客户端贡献行）；其余命令行宿主
+ *   没有命令日志面，如实未命中。
  * - 其余命名空间 —— 后端没有对应命令面，保持显式抛错。
  */
 export const REMOTE_NAMESPACES = [

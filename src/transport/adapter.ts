@@ -21,6 +21,7 @@
  */
 import { RemoteError } from '@deepseek-ai/dsh-typert-protocol'
 import type { SessionId } from '@deepseek-ai/dsh-session/types'
+import type { MessageId } from '@deepseek-ai/dsh-llm'
 import { createSettingsFace } from './settings-face'
 import type { AgentEvent, EventMsg } from './types'
 import type { HostBridge } from './tauri'
@@ -34,6 +35,74 @@ const FAIL = (message: string) =>
  * （铸造函数在宿主编译域，typecheck 域外），这里的显式转换表达"裸 id 进类型化载荷"。
  */
 const asSessionId = (id: string) => id as unknown as SessionId
+
+/**
+ * DSH 一维权限挡位 ↔ 宿主 `sandbox.mode` 的映射（产品拍板，2026-11-07）。
+ *
+ * 宿主的安全面是 `sandbox.mode × approval.mode` 两维，但裁决矩阵（permission/policy.rs
+ * 的 decide）当前只消费沙箱维，所以挡位只映射沙箱档、approval_mode 不动。目录不含
+ * 上游实验档 `auto`：它是 danger-full-access × ask 的组合，在"裁决不看 approval"的
+ * 宿主里与完全权限行为相同，挂出来是一枚假挡位。挡位语义是**全局**的（写 config.toml，
+ * 不随会话走）：agent_loop 在任务启动时固化 SessionPolicy，进行中回合不受切换影响。
+ */
+const PRESET_TO_SANDBOX: Record<string, string> = {
+  'read-only': 'read_only',
+  'workspace-write': 'workspace_write',
+  'danger-full-access': 'danger_full_access',
+}
+const SANDBOX_TO_PRESET: Record<string, string> = Object.fromEntries(
+  Object.entries(PRESET_TO_SANDBOX).map(([preset, mode]) => [mode, preset]),
+)
+
+/** 挡位选项的静态目录（形状照上游 PermissionCatalog.options；name 给机器值走界面词典）。 */
+const PERMISSION_PRESET_OPTIONS = Object.keys(PRESET_TO_SANDBOX).map(value => ({
+  value,
+  name: value,
+  description: value === 'read-only'
+    ? '只读查看，不产生任何写入'
+    : value === 'workspace-write'
+      ? '仅在工作区内读写'
+      : '不受工作区边界限制',
+}))
+
+/** 上游 token-meter 的用量四桶（usage-projection.ts bucketsFrom 的 wire 形状）。 */
+interface TokenBuckets {
+  readonly uncachedInputTokens: number
+  readonly outputTokens: number
+  readonly cacheReadTokens: number
+  readonly cacheWriteTokens: number
+}
+
+/** 客户端排队的一条待发消息（回合进行中的提交；回合收口后按序自动补发）。 */
+interface QueuedSubmission {
+  /** inbox 行与 updateQueue 的 itemId（上游 = UserMessage.id）。 */
+  readonly id: string
+  /** 客户端提交身份；补发落 durable user/message 时回填 source.rpcId，客户端据此退休回声。 */
+  readonly requestId: string
+  text: string
+}
+
+/**
+ * 底部指标 pill 的折叠状态，字段语义照上游 session-stats：全量日志折叠出的回合/步数
+ * 与墙钟时间，与客户端分页了多少历史无关。时间按事件到达时刻测量（墙钟口径，与上游
+ * 同义）；档案重建没有可信时刻，只折叠计数、不折叠时间。
+ */
+interface SessionMetrics {
+  turns: number
+  steps: number
+  llmMs: number
+  toolMs: number
+  ttftMs: number
+  ttftSteps: number
+  decodeMs: number
+  decodeTokens: number
+  buckets: TokenBuckets
+}
+
+const zeroMetrics = (): SessionMetrics => ({
+  turns: 0, steps: 0, llmMs: 0, toolMs: 0, ttftMs: 0, ttftSteps: 0, decodeMs: 0, decodeTokens: 0,
+  buckets: { uncachedInputTokens: 0, outputTokens: 0, cacheReadTokens: 0, cacheWriteTokens: 0 },
+})
 
 /**
  * 会话的帧序列：journal 事件与助手流帧**同轴**入队，消费者按自己的下标追平。
@@ -103,6 +172,22 @@ interface Journal {
    * 空数组表示这个会话的 journal 全部来自当前进程观察，没有可对账的档案前缀。
    */
   entryToSeq: number[]
+  /** 底部指标折叠状态（sessionStats/tokenUsage 的数据源），见 SessionMetrics 注记。 */
+  metrics: SessionMetrics
+  /** 本步计时的起点（step/start 时刻）；undefined = 本步还没开始计时（档案重建路径）。 */
+  stepStartAt: number | undefined
+  /** 本步首个非空 delta 的时刻；undefined = 本步还没吐出 token。 */
+  firstDeltaAt: number | undefined
+  /** 最近一个已经计过「回合数」的 turn；同 turn 的后续 step/end 不再重复计回合。 */
+  countedTurn: number | undefined
+  /** 进行中工具调用的起点（tool/call → tool/result 按 callId 配对结算）。 */
+  toolStartAt: Map<string, number>
+  /** 进行中工具调用的名字（callId → 工具名；plan 态推导与结算都要按名字认）。 */
+  callTools: Map<string, string>
+  /** 最近一次用量采样的 prompt 侧压力（contextPressure 投影的分子，不含输出）。 */
+  pressure: { pressureTokens: number; projectedTokens: number } | undefined
+  /** 本会话的待发队列（回合进行中的提交；按序补发）。 */
+  queue: QueuedSubmission[]
 }
 
 /**
@@ -134,6 +219,10 @@ function newJournal(createdAt: number): Journal {
     turn: 0, step: 0, taskOpen: false, text: '', reasoning: '', chunkIndex: 0,
     attemptOpen: false, attemptSeq: -1, attemptId: '', usage: undefined, outputs: new Map(),
     entryToSeq: [],
+    metrics: zeroMetrics(),
+    stepStartAt: undefined, firstDeltaAt: undefined, countedTurn: undefined,
+    toolStartAt: new Map(), callTools: new Map(), pressure: undefined,
+    queue: [],
   }
 }
 
@@ -162,6 +251,15 @@ export function createAdapter(options: AdapterOptions): { remote: unknown; dispo
   const listeners = new Map<string, ((...args: unknown[]) => unknown)[]>()
   const projectionLog = new FrameLog()
   let projectionSeq = 0
+  /**
+   * 计划态（上游 `plan` 投影的数据源）。宿主 PlanState 是进程级全局（app_state.rs 的
+   * Arc<PlanState>，跨任务/跨会话持久），这里镜像它：模型调 enter_plan_mode 执行成功
+   * 置真、exit_plan_mode 执行成功置假。唯一已知缺口：适配层重启丢状态而宿主持久——
+   * 宿主没有"读当前计划态"的命令面，如实声明（docs/05 SH-105）。
+   */
+  let planActive = false
+  /** 排队消息的 id 序列（inbox 行身份）。 */
+  let queueSeq = 0
 
   const dispatch = (name: string, ...args: unknown[]): void => {
     for (const listener of listeners.get(name) ?? []) {
@@ -211,6 +309,202 @@ export function createAdapter(options: AdapterOptions): { remote: unknown; dispo
     next: face.activeSelection(),
   })
 
+  /**
+   * `permissions` 投影（{currentValue}）：挡位全局共享，所有会话读同一份宿主沙箱档。
+   * 快照里给不出映射（快照读失败回落 read_only）也照实给——UI 的芯片要有一个确定态。
+   */
+  const currentPermission = (): string => SANDBOX_TO_PRESET[face.sandboxMode()] ?? 'read-only'
+  const permissionsProjection = (): Record<string, unknown> => ({ currentValue: currentPermission() })
+
+  /** 挡位切换成功后向所有已知会话广播一帧（值来自刚刷新的 face，照 selectModel 的广播方式）。 */
+  const pushPermissionToAll = (): void => {
+    projectionSeq += 1
+    for (const id of journals.keys()) {
+      projectionLog.append({
+        type: 'projection', sessionId: id, seq: projectionSeq,
+        changes: [{ key: 'permissions', val: permissionsProjection() }],
+      })
+    }
+  }
+
+  /**
+   * 底部指标投影：没跑出内容的会话不挂键，界面据此隐藏 pill/仪表而不是显示一套零值
+   * （照 mock 的既定口径）。tokenUsage 只在真的烧过 token 后挂；contextPressure 还
+   * 需要生效模型给得出上下文窗口——没有分母就不挂，占用仪表按数据缺席隐藏。
+   */
+  const metricsProjectionsOf = (journal: Journal): Record<string, unknown> => {
+    const out: Record<string, unknown> = {}
+    const m = journal.metrics
+    if (m.steps > 0 || m.turns > 0) {
+      out.sessionStats = {
+        turns: m.turns, steps: m.steps, llmMs: m.llmMs, toolMs: m.toolMs,
+        ttftMs: m.ttftMs, ttftSteps: m.ttftSteps, decodeMs: m.decodeMs, decodeTokens: m.decodeTokens,
+      }
+    }
+    const b = m.buckets
+    if (b.uncachedInputTokens > 0 || b.outputTokens > 0 || b.cacheReadTokens > 0 || b.cacheWriteTokens > 0) {
+      out.tokenUsage = { ...b }
+    }
+    if (journal.pressure !== undefined) {
+      const contextWindow = face.activeContextWindow()
+      if (contextWindow !== undefined) {
+        out.contextPressure = { ...journal.pressure, contextWindow }
+      }
+    }
+    return out
+  }
+
+  /** 指标变化的结算点统一从这里推帧；没有合格的键就不推（不伪造一帧空投影）。 */
+  const pushMetricsFrame = (sessionId: string, journal: Journal): void => {
+    const changes = Object.entries(metricsProjectionsOf(journal)).map(([key, val]) => ({ key, val }))
+    if (changes.length === 0) return
+    projectionSeq += 1
+    projectionLog.append({ type: 'projection', sessionId, seq: projectionSeq, changes })
+  }
+
+  // ---- 底部指标的折叠动作（字段语义照上游 session-stats；时间取事件到达时刻）----
+
+  /** 一次采样迭代开始计时（实时路径才有：档案重建没有可信时刻，不伪造时间）。 */
+  const beginStepMetrics = (journal: Journal): void => {
+    journal.stepStartAt = now()
+    journal.firstDeltaAt = undefined
+  }
+
+  /** 一步收口：计步 + 给该回合计一次回合数（上游口径：有闭合 step 的回合才计）。 */
+  const closeStepMetrics = (journal: Journal): void => {
+    journal.metrics.steps += 1
+    if (journal.countedTurn !== journal.turn) {
+      journal.metrics.turns += 1
+      journal.countedTurn = journal.turn
+    }
+  }
+
+  /**
+   * 一条助手消息落定：结算本步的模型墙钟（step/start → 落定）、首 token 延迟与
+   * 解码段（首 delta → 落定，decodeTokens 取最近一次采样的输出桶）。结算后清掉
+   * 计时光标——同一步若再落一条消息，各段独立测量、总量保持可加。
+   */
+  const settleAssistantMetrics = (journal: Journal): void => {
+    const settledAt = now()
+    const m = journal.metrics
+    const stepStart = journal.stepStartAt
+    const firstDelta = journal.firstDeltaAt
+    if (stepStart !== undefined) {
+      m.llmMs += Math.max(0, settledAt - stepStart)
+      journal.stepStartAt = undefined
+    }
+    if (firstDelta !== undefined) {
+      m.ttftSteps += 1
+      if (stepStart !== undefined) m.ttftMs += Math.max(0, firstDelta - stepStart)
+      m.decodeMs += Math.max(0, settledAt - firstDelta)
+      m.decodeTokens += journal.usage?.['outputTokens'] ?? 0
+      journal.firstDeltaAt = undefined
+    }
+  }
+
+  /** 一次工具调用结算（callId 配对；没配上对的 begin（被中断）自然漏算，不伪造时长）。 */
+  const settleToolMetrics = (journal: Journal, callId: string): void => {
+    const startedAt = journal.toolStartAt.get(callId)
+    journal.toolStartAt.delete(callId)
+    if (startedAt !== undefined) journal.metrics.toolMs += Math.max(0, now() - startedAt)
+  }
+
+  // ---- 计划态投影（上游 plan = {active, pending}；pending 是命令在途位，宿主没有
+  // /plan 命令面所以恒 false）----
+
+  /** inactive 时返回 undefined：投影键缺席 = 无芯片（PlanChip 与 plan 占位都按此判据）。 */
+  const planProjection = (): Record<string, unknown> | undefined =>
+    planActive ? { active: true, pending: false } : undefined
+
+  /** 快照/基线里的 plan 位：仅计划态挂键（inactive 缺席，UI 回到无芯片态）。 */
+  const planProjectionValues = (): Record<string, unknown> =>
+    planActive ? { plan: { active: true, pending: false } } : {}
+
+  const pushPlanToAll = (): void => {
+    projectionSeq += 1
+    for (const id of journals.keys()) {
+      projectionLog.append({
+        type: 'projection', sessionId: id, seq: projectionSeq,
+        changes: [{ key: 'plan', val: planProjection() ?? { active: false, pending: false } }],
+      })
+    }
+  }
+
+  const setPlanActive = (active: boolean): void => {
+    if (planActive === active) return
+    planActive = active
+    pushPlanToAll()
+  }
+
+  // ---- 客户端排队（运行中提交 → inbox 投影行 → 回合收口按序自动补发）----
+
+  const queueRowOf = (item: QueuedSubmission): Record<string, unknown> => ({
+    id: item.id,
+    role: 'user',
+    content: [{ type: 'text', text: item.text }],
+    source: { kind: 'user', rpcId: item.requestId },
+  })
+
+  /** inbox 投影只带 next-turn（宿主没有 next-step 注入面）；空队列交空数组以清除旧行。 */
+  const pushInboxFrame = (sessionId: string, journal: Journal): void => {
+    projectionSeq += 1
+    projectionLog.append({
+      type: 'projection', sessionId, seq: projectionSeq,
+      changes: [{ key: 'inbox', val: { 'next-turn': journal.queue.map(queueRowOf) } }],
+    })
+  }
+
+  /** 把一条排队消息真正发出去并开回合（与 prompt 同一事件序列；rpcId 回填原始请求身份）。 */
+  const launchQueuedTurn = (sessionId: string, journal: Journal, item: QueuedSubmission): void => {
+    if (!titles.has(sessionId)) pushTitle(sessionId, item.text.trim().slice(0, 12) || '新会话')
+    journal.queue = journal.queue.filter(candidate => candidate.id !== item.id)
+    pushInboxFrame(sessionId, journal)
+    if (!journal.taskOpen) openTask(journal)
+    pushEvent(journal, 'turn/start', { turn: journal.turn })
+    pushEvent(journal, 'step/start', { turn: journal.turn, step: journal.step })
+    beginStepMetrics(journal)
+    pushEvent(journal, 'user/message', {
+      id: `shaniu-user-${journal.seq + 1}`,
+      role: 'user',
+      content: [{ type: 'text', text: item.text }],
+      source: { kind: 'user', rpcId: item.requestId },
+    }, { surfaceOp: 'append' })
+    dispatch('api-session/status', sessionId, true)
+  }
+
+  const delay = (ms: number): Promise<void> => new Promise(resolve => setTimeout(resolve, ms))
+
+  /**
+   * 回合收口后按序补发排队消息。单任务闸是进程级的，且释放时机在任务协程收口之后
+   * （turn_completed 先于 end_task 到达）：补发对短时拒绝做有限重试；闸被其他会话的
+   * 任务占着就留给下一次收口再试——每个任务都会发 turn_completed，队列不会饿死。
+   * 先领取后发送：补发在途时用户移除该行会得到"可能已经开始发送"的如实拒绝。
+   */
+  const drainQueues = async (): Promise<void> => {
+    for (const [sessionId, journal] of journals.entries()) {
+      const item = journal.queue[0]
+      if (item === undefined || journal.taskOpen) continue
+      journal.queue = journal.queue.filter(candidate => candidate.id !== item.id)
+      let sent = false
+      for (let attempt = 0; attempt < 5 && !sent; attempt += 1) {
+        try {
+          await bridge.invoke<string>('send_task', { task: item.text, agentId: sessionId })
+          sent = true
+        } catch {
+          await delay(250)
+        }
+      }
+      if (sent) {
+        launchQueuedTurn(sessionId, journal, item)
+        return
+      }
+      // 五次仍被拒：闸被别的任务占着。退回队首，等下一个 turn_completed 再试。
+      journal.queue = [item, ...journal.queue.filter(candidate => candidate.id !== item.id)]
+      pushInboxFrame(sessionId, journal)
+      return
+    }
+  }
+
   /** 空会话的快照帧：cursor -1、无记录、revision 0，且仍带上客户端要求的两个基线。 */
   const emptySnapshot = (id: string, createdAt: number): Record<string, unknown> => ({
     type: 'snapshot',
@@ -218,7 +512,13 @@ export function createAdapter(options: AdapterOptions): { remote: unknown; dispo
     cursor: -1,
     records: [],
     hasMore: false,
-    projections: { asOfSeq: 0, values: { modelSelection: currentModelSelection(), title: null } },
+    projections: {
+      asOfSeq: 0,
+      values: {
+        modelSelection: currentModelSelection(), title: null, permissions: permissionsProjection(),
+        ...(planProjectionValues()),
+      },
+    },
     assistantStream: { revision: 0 },
   })
 
@@ -239,7 +539,7 @@ export function createAdapter(options: AdapterOptions): { remote: unknown; dispo
    * `interrupted` 只在中断路径上打标：半截正文是真实发生过的输出，不能假装没说过，
    * 但也不能当成正常答完——两者在界面上是两种状态。
    */
-  const closeAttempt = (journal: Journal, committed: boolean, interrupted = false): void => {
+  const closeAttempt = (sessionId: string, journal: Journal, committed: boolean, interrupted = false): void => {
     if (!journal.attemptOpen) return
     journal.attemptOpen = false
     const hasBody = journal.text.length > 0 || journal.reasoning.length > 0
@@ -261,6 +561,9 @@ export function createAdapter(options: AdapterOptions): { remote: unknown; dispo
         ...(journal.usage === undefined ? {} : { usage: journal.usage }),
         ...(interrupted ? { interrupted: true } : {}),
       }, { surfaceOp: 'append' })
+      // 消息落定即一次模型墙钟结算；工具调用前的定稿（tool_call_begin 路径）同此口径。
+      settleAssistantMetrics(journal)
+      pushMetricsFrame(sessionId, journal)
     }
     pushStreamFrame(journal, {
       type: 'end',
@@ -279,12 +582,14 @@ export function createAdapter(options: AdapterOptions): { remote: unknown; dispo
     journal.taskOpen = true
   }
 
-  const closeTask = (journal: Journal, reason: Record<string, unknown>, interrupted: boolean): void => {
-    closeAttempt(journal, true, interrupted)
+  const closeTask = (sessionId: string, journal: Journal, reason: Record<string, unknown>, interrupted: boolean): void => {
+    closeAttempt(sessionId, journal, true, interrupted)
     if (!journal.taskOpen) return
     pushEvent(journal, 'step/end', { turn: journal.turn, step: journal.step })
+    closeStepMetrics(journal)
     pushEvent(journal, 'turn/end', { turn: journal.turn, reason })
     journal.taskOpen = false
+    pushMetricsFrame(sessionId, journal)
   }
 
   /**
@@ -318,6 +623,8 @@ export function createAdapter(options: AdapterOptions): { remote: unknown; dispo
     const closeStep = (): void => {
       if (!stepOpen) return
       pushEvent(journal, 'step/end', { turn: journal.turn, step: journal.step })
+      // 重建只有计数、没有可信时刻：步/回合数如实折叠，墙钟一律不计。
+      closeStepMetrics(journal)
       stepOpen = false
     }
     const closeTurn = (): void => {
@@ -403,6 +710,11 @@ export function createAdapter(options: AdapterOptions): { remote: unknown; dispo
             ? { error: { name: 'Interrupted', code: 'interrupted', reason: '该调用没有留下结果' } }
             : {}),
         }, { surfaceOp: 'append' })
+        // 计划态从档案重建：有输出 = 工具真的执行过（enter 免审批必执行；exit 获批
+        // 才有输出，denied/中断不留）。被别的会话事件更晚翻转的边角属已知近似
+        // （宿主 PlanState 全局，见 SH-105 注记）。
+        if (entry.tool === 'enter_plan_mode' && !failed) setPlanActive(true)
+        if (entry.tool === 'exit_plan_mode' && !failed) setPlanActive(false)
       }
       journal.entryToSeq[index] = journal.seq
     })
@@ -462,19 +774,23 @@ export function createAdapter(options: AdapterOptions): { remote: unknown; dispo
           openTask(journal)
           pushEvent(journal, 'turn/start', { turn: journal.turn })
           pushEvent(journal, 'step/start', { turn: journal.turn, step: 0 })
+          beginStepMetrics(journal)
           // 不经 prompt 起来的回合（`resume_session` 续跑）也要报运行中，否则
           // 恢复出来的会话跑着任务却没有 Stop 按钮。
           dispatch('api-session/status', event.session_id, true)
         } else if (msg.turn > 1) {
           pushEvent(journal, 'step/end', { turn: journal.turn, step: journal.step })
+          closeStepMetrics(journal)
           journal.step = msg.turn - 1
           pushEvent(journal, 'step/start', { turn: journal.turn, step: journal.step })
+          beginStepMetrics(journal)
         }
         return
       }
       case 'agent_message_delta':
         ensureAttempt(journal)
         journal.text += msg.delta
+        if (journal.firstDeltaAt === undefined) journal.firstDeltaAt = now()
         pushStreamFrame(journal, {
           type: 'chunk', index: journal.chunkIndex, time: now(),
           chunk: { type: 'text-delta', index: 0, text: msg.delta },
@@ -484,6 +800,7 @@ export function createAdapter(options: AdapterOptions): { remote: unknown; dispo
       case 'reasoning_delta':
         ensureAttempt(journal)
         journal.reasoning += msg.delta
+        if (journal.firstDeltaAt === undefined) journal.firstDeltaAt = now()
         pushStreamFrame(journal, {
           type: 'chunk', index: journal.chunkIndex, time: now(),
           chunk: { type: 'reasoning-delta', index: 0, text: msg.delta },
@@ -491,20 +808,35 @@ export function createAdapter(options: AdapterOptions): { remote: unknown; dispo
         journal.chunkIndex += 1
         return
       case 'token_usage': {
-        // 三桶齐全才满足上游判据 total = input + output + read + write。
+        // 上游 TokenUsage 语义：inputTokens 是**未命中缓存**的输入（bucketsFrom 直接
+        // 拿它当 uncachedInputTokens 桶，total = input + output + read + write）。后端
+        // 的 input_tokens 是全量 prompt（含缓存命中），必须先扣掉 cached 再进 usage，
+        // 否则 totalTokens 和用量桶都把缓存部分算两遍。
         const read = msg.cached_input_tokens ?? 0
+        const uncached = Math.max(0, msg.input_tokens - read)
         journal.usage = {
-          inputTokens: msg.input_tokens,
+          inputTokens: uncached,
           outputTokens: msg.output_tokens,
           cacheReadTokens: read,
           cacheWriteTokens: 0,
-          totalTokens: msg.input_tokens + msg.output_tokens + read,
+          totalTokens: uncached + msg.output_tokens + read,
         }
+        // 指标同步折叠：用量桶累加（后端没有重试事件可做 last-wins 替换，逐次累加是
+        // 当前事件源下唯一诚实的口径）；压力分子取 prompt 侧全量（上游 pressureFrom
+        // = 未缓存输入 + 缓存读写，即整个 prompt）。
+        journal.metrics.buckets = {
+          uncachedInputTokens: journal.metrics.buckets.uncachedInputTokens + uncached,
+          outputTokens: journal.metrics.buckets.outputTokens + msg.output_tokens,
+          cacheReadTokens: journal.metrics.buckets.cacheReadTokens + read,
+          cacheWriteTokens: journal.metrics.buckets.cacheWriteTokens,
+        }
+        journal.pressure = { pressureTokens: msg.input_tokens, projectedTokens: msg.input_tokens }
+        pushMetricsFrame(event.session_id, journal)
         return
       }
       case 'tool_call_begin':
         // 工具调用先定稿此前的正文：助手消息在 DSH 里排在调用之前。
-        closeAttempt(journal, true)
+        closeAttempt(event.session_id, journal, true)
         pushEvent(journal, 'tool/call', {
           turn: journal.turn,
           step: journal.step,
@@ -514,6 +846,8 @@ export function createAdapter(options: AdapterOptions): { remote: unknown; dispo
           arguments: typeof msg.args === 'string' ? msg.args : JSON.stringify(msg.args ?? {}),
         })
         journal.outputs.set(msg.call_id, { stdout: [], stderr: [] })
+        journal.toolStartAt.set(msg.call_id, now())
+        journal.callTools.set(msg.call_id, msg.tool)
         return
       case 'tool_call_output_delta': {
         const buffer = journal.outputs.get(msg.call_id) ?? { stdout: [], stderr: [] }
@@ -524,6 +858,8 @@ export function createAdapter(options: AdapterOptions): { remote: unknown; dispo
       case 'tool_call_end': {
         const buffer = journal.outputs.get(msg.call_id)
         journal.outputs.delete(msg.call_id)
+        const toolName = journal.callTools.get(msg.call_id)
+        journal.callTools.delete(msg.call_id)
         const lines = [...(buffer?.stdout ?? []), ...(buffer?.stderr ?? [])]
         // result 存在时是唯一状态判据（docs/04 §1.2.1）；缺失才回退 exit_code/error。
         const failed = msg.result !== undefined
@@ -555,12 +891,18 @@ export function createAdapter(options: AdapterOptions): { remote: unknown; dispo
           },
           ...(error === undefined ? {} : { error }),
         }, { surfaceOp: 'append' })
+        settleToolMetrics(journal, msg.call_id)
+        pushMetricsFrame(event.session_id, journal)
+        // 计划态按工具**执行结果**推导：enter_plan_mode 免审批必执行；exit_plan_mode
+        // 获批执行才退出（denied/interrupted 都保持计划态，与宿主 PlanState 一致）。
+        if (toolName === 'enter_plan_mode' && !failed) setPlanActive(true)
+        if (toolName === 'exit_plan_mode' && !failed) setPlanActive(false)
         return
       }
       case 'turn_completed':
         // cancelled 的半截正文是真实发生过的输出：落进档案，但打 interrupted，
         // 不能当成正常答完。
-        closeTask(journal, msg.reason === 'completed'
+        closeTask(event.session_id, journal, msg.reason === 'completed'
           ? { kind: 'completed' }
           : msg.reason === 'cancelled'
             ? { kind: 'aborted', reason: { kind: 'user' } }
@@ -569,11 +911,13 @@ export function createAdapter(options: AdapterOptions): { remote: unknown; dispo
         // 运行态必须收回：输入卡的 Stop 按钮由 `api-session/status` 决定（`running`
         // 为真才显示），只发 journal 的 turn/end 不发状态，按钮会永远停在发送态。
         dispatch('api-session/status', event.session_id, false)
+        // 闸随任务协程收口释放（晚于本事件）：排队消息在这里按序补发，对短时拒绝重试。
+        void drainQueues()
         return
       case 'error':
         // 全局错误不终结回合（回合终结只认 turn_completed）：这里只定稿已有的流，
         // 错误文案由随后的 turn_completed 呈现，避免在此造出一个假回合。
-        closeAttempt(journal, false)
+        closeAttempt(event.session_id, journal, false)
         console.warn('[SHANIU] 后端错误事件', msg.message)
         return
       case 'exec_approval_request':
@@ -666,6 +1010,22 @@ export function createAdapter(options: AdapterOptions): { remote: unknown; dispo
     },
     prompt: async (request: { sessionId?: string; requestId?: string; content?: readonly { type: string; text?: string }[] }) => {
       const text = (request.content ?? []).filter(part => part.type === 'text').map(part => part.text ?? '').join('')
+      // 本会话回合进行中 → 客户端排队（上游宿主 durable inbox 的前端等价物）：
+      // 登记进队列 + 推 inbox 投影行（QueueDock 出行、可编辑/移除），回合收口后按序
+      // 自动补发。跨会话撞全局单任务闸仍走原路报错（队列只管本会话的收口补发）。
+      if (request.sessionId !== undefined) {
+        const busy = journals.get(request.sessionId)
+        if (busy?.taskOpen === true && request.requestId !== undefined) {
+          queueSeq += 1
+          busy.queue = [...busy.queue, {
+            id: `shaniu-queued-${queueSeq}`,
+            requestId: request.requestId,
+            text,
+          }]
+          pushInboxFrame(request.sessionId, busy)
+          return OK({ accepted: true })
+        }
+      }
       const agentId = await bridge.invoke<string>('send_task', { task: text, agentId: request.sessionId })
       const journal = journalOf(agentId)
       if (!titles.has(agentId)) pushTitle(agentId, text.trim().slice(0, 12) || '新会话')
@@ -675,6 +1035,7 @@ export function createAdapter(options: AdapterOptions): { remote: unknown; dispo
       dispatch('api-session/status', agentId, true)
       pushEvent(journal, 'turn/start', { turn: journal.turn })
       pushEvent(journal, 'step/start', { turn: journal.turn, step: journal.step })
+      beginStepMetrics(journal)
       // rpcId 必须等于 prompt 的 requestId：客户端据此撤掉本地乐观回显（session.ts 的
       // observeSubmissionMessage），否则同一条消息会出现两遍。
       pushEvent(journal, 'user/message', {
@@ -733,7 +1094,15 @@ export function createAdapter(options: AdapterOptions): { remote: unknown; dispo
           hasMore: false,
           projections: {
             asOfSeq: 0,
-            values: { modelSelection: currentModelSelection(), title: titles.get(sessionId) ?? null },
+            values: {
+              modelSelection: currentModelSelection(),
+              title: titles.get(sessionId) ?? null,
+              permissions: permissionsProjection(),
+              ...(planProjectionValues()),
+              // 重建已折叠出步/回合计数：重开旧会话底部指标立即有值（时间不计，见
+              // replay 的注记）；旧档案没有用量，tokenUsage/contextPressure 不挂。
+              ...metricsProjectionsOf(replayed),
+            },
           },
           assistantStream: { revision: replayed.revision },
         }
@@ -760,6 +1129,13 @@ export function createAdapter(options: AdapterOptions): { remote: unknown; dispo
           values: {
             modelSelection: currentModelSelection(),
             title: titles.get(sessionId) ?? null,
+            permissions: permissionsProjection(),
+            ...(planProjectionValues()),
+            // 有排队消息才挂 inbox：QueueDock/steer 占位都按投影缺席=无队列判读。
+            ...(journal.queue.length > 0
+              ? { inbox: { 'next-turn': journal.queue.map(queueRowOf) } }
+              : {}),
+            ...metricsProjectionsOf(journal),
           },
         },
         // 客户端总是带 assistantStream:true 打开，缺这个基线即 gateway/internal。
@@ -773,9 +1149,18 @@ export function createAdapter(options: AdapterOptions): { remote: unknown; dispo
       yield {
         type: 'baseline',
         value: {
-          projections: Object.fromEntries([...journals.keys()].map(id => [id, {
+          projections: Object.fromEntries([...journals.entries()].map(([id, journal]) => [id, {
             asOfSeq: 0,
-            values: { modelSelection: currentModelSelection(), title: titles.get(id) ?? null },
+            values: {
+              modelSelection: currentModelSelection(),
+              title: titles.get(id) ?? null,
+              permissions: permissionsProjection(),
+              ...(planProjectionValues()),
+              ...(journal.queue.length > 0
+                ? { inbox: { 'next-turn': journal.queue.map(queueRowOf) } }
+                : {}),
+              ...metricsProjectionsOf(journal),
+            },
           }])),
         },
       }
@@ -802,10 +1187,16 @@ export function createAdapter(options: AdapterOptions): { remote: unknown; dispo
       })
       if (!selected.ok) return selected
       projectionSeq += 1
-      for (const id of journals.keys()) {
+      for (const [id, journal] of journals.entries()) {
+        // 模型切换会换上下文窗口：有过压力采样的会话随 modelSelection 一帧补推新的
+        // 占用读数，仪表不用等到下回合才反映新容量。
+        const window = face.activeContextWindow()
+        const pressure = journal.pressure !== undefined && window !== undefined
+          ? [{ key: 'contextPressure', val: { ...journal.pressure, contextWindow: window } }]
+          : []
         projectionLog.append({
           type: 'projection', sessionId: id, seq: projectionSeq,
-          changes: [{ key: 'modelSelection', val: currentModelSelection() }],
+          changes: [{ key: 'modelSelection', val: currentModelSelection() }, ...pressure],
         })
       }
       return selected
@@ -849,7 +1240,69 @@ export function createAdapter(options: AdapterOptions): { remote: unknown; dispo
       return OK({ title: accepted ?? '', seq: journals.get(sessionId)?.seq ?? -1 })
     },
     attachment: () => unimplemented('session.attachment', 'SH-040'),
-    updateQueue: () => unimplemented('session.updateQueue', 'SH-018'),
+    /**
+     * 客户端队列的行内操作（上游语义见 commands.ts:447-519；这里操作适配层自己的
+     * 待发队列——补发前的编辑/移除都是真实生效的）。steer 的上游语义（注入进行中的
+     * 回合）需要宿主注入面，后端没有：落成"移到队首、下一轮优先补发"的真实近似，
+     * 行保持可见。删除/替换在途消息的竞态与上游同款：先领取后发送，迟到操作收到
+     * queue-item-not-found（行内文案"可能已经开始发送"正是为这个竞态写的）。
+     */
+    updateQueue: async (
+      request: { sessionId?: string; itemId?: string; action?: { kind?: string; content?: readonly { type: string; text?: string }[] } } = {},
+    ) => {
+      const journal = request.sessionId === undefined ? undefined : journals.get(request.sessionId)
+      const index = journal?.queue.findIndex(item => item.id === request.itemId) ?? -1
+      if (journal === undefined || index < 0 || request.action === undefined) {
+        return {
+          ok: false as const,
+          error: new RemoteError('session/queue-item-not-found',
+            `队列里没有 ${request.itemId ?? '<无 id>'} 这条待发消息（它可能已经开始发送）`,
+            // 队列行 id 就是 UserMessage.id（wire 的 MessageId 品牌）
+            { itemId: (request.itemId ?? '') as unknown as MessageId }),
+        }
+      }
+      const item = journal.queue[index]!
+      switch (request.action.kind) {
+        case 'edit': {
+          const text = (request.action.content ?? [])
+            .filter(part => part.type === 'text').map(part => part.text ?? '').join('')
+          if (text.trim() === '') {
+            return {
+              ok: false as const,
+              error: new RemoteError('gateway/bad-request', '编辑后的消息不能为空', {}),
+            }
+          }
+          item.text = text
+          pushInboxFrame(request.sessionId!, journal)
+          return OK({ accepted: true })
+        }
+        case 'remove': {
+          journal.queue = journal.queue.filter(candidate => candidate.id !== item.id)
+          pushInboxFrame(request.sessionId!, journal)
+          // 回声退休靠这条 journal 事件（outcome canceled）：只推投影会让本地回声行
+          // 在 rpcId 对账里复活成"发送中"的幽灵行。
+          pushEvent(journal, 'agent/inbox/spliced', {
+            target: 'next-turn',
+            start: index,
+            removedCount: 1,
+            inserted: [],
+            outcome: 'canceled',
+          })
+          return OK({ accepted: true })
+        }
+        case 'steer': {
+          // 无注入面：真实近似 = 提到队首，当前回合收口后第一个补发。
+          journal.queue = [item, ...journal.queue.filter(candidate => candidate.id !== item.id)]
+          pushInboxFrame(request.sessionId!, journal)
+          return OK({ accepted: true })
+        }
+        default:
+          return {
+            ok: false as const,
+            error: new RemoteError('gateway/bad-request', `未知的队列操作 ${String(request.action.kind)}`, {}),
+          }
+      }
+    },
     state: () => unimplemented('session.state', 'SH-033'),
     wait: () => unimplemented('session.wait', 'SH-033'),
     events: () => unimplemented('session.events', 'SH-033'),
@@ -955,6 +1408,59 @@ export function createAdapter(options: AdapterOptions): { remote: unknown; dispo
     },
   }
 
+  /**
+   * `remote.permissionPresets`：权限挡位目录（形状照上游 PermissionCatalog，mock 同款）。
+   * 目录是静态三挡（映射见 PRESET_TO_SANDBOX 注记），defaultPreset 动态反推自宿主
+   * 当前沙箱档——宿主重启后 UI 显示的就是 config.toml 里真实生效的那档。静态目录
+   * 不会失效，所以不发上游的 `permission-presets/catalog-changed` 失效事件。
+   */
+  const permissionPresetsNamespace = {
+    catalog: async () => {
+      // 首开竞态兜底：适配层装配时的那次 face.refresh 是异步的，芯片在它完成前
+      // 打开会拿到 undefined 快照、回落成 read_only——先同步读一次宿主再回答。
+      await face.refresh()
+      const options = PERMISSION_PRESET_OPTIONS.map(option => ({ ...option }))
+      return OK({
+        options,
+        defaultOptions: options.map(option => ({ ...option })),
+        defaultPreset: currentPermission(),
+      })
+    },
+  }
+
+  /**
+   * `remote.commands`：`/permission <preset>`（挡位芯片的提交路径）与 `/plan off`
+   * （PlanChip 退出 → 指引审批卡，见上）。返回值非 undefined 即"命中命令"（session.ts
+   * 的 matched 判据）；未命中/非本命令的行一律 OK(undefined)，命令生命周期记录属
+   * 上游宿主职责，宿主没有命令日志面就不伪造。`list` 给空目录："+"菜单据此恢复到
+   * 客户端贡献行（附件/模型入口），而不是骨架屏闪一下就自动关闭。
+   */
+  const commandsNamespace = {
+    list: async () => OK([]),
+    execute: async (_sessionId: string, line: string, _args: readonly unknown[] = []) => {
+      // /plan off（PlanChip 的退出路径）：宿主 PlanState 只认 exit_plan_mode 工具执行，
+      // 前端没有真实退出手段——按业界成熟口径给可行动指引（退出 = 在「计划评审」
+      // 审批卡上批准），不伪造一次退出。其余 /plan 变体（激活/带消息）没有对应宿主
+      // 语义，照旧未命中。
+      if (/^\/plan\s+off\s*$/.test(line.trim())) {
+        return FAIL('计划态由「计划评审」审批卡退出：助手调用 exit_plan_mode 时对话流会出现审批卡，批准即退出。')
+      }
+      const match = /^\/permission\s+([a-z][a-z-]*)\s*$/.exec(line.trim())
+      if (match === null) return OK(undefined)
+      const sandbox = PRESET_TO_SANDBOX[match[1]!]
+      if (sandbox === undefined) return OK(undefined)
+      try {
+        await face.applySandboxMode(sandbox)
+      } catch (reason) {
+        // wire 契约：失败以 {ok:false} 回给客户端，不是 rejection——UI 的错误处理
+        // 读 result.ok，穿透的 rejection 会绕过它（挡位芯片收不到失败原因）。
+        return FAIL(reason instanceof Error ? reason.message : String(reason))
+      }
+      pushPermissionToAll()
+      return OK({ matched: true })
+    },
+  }
+
   const namespaces = new Map<string, unknown>([
     ['session', sessionNamespace],
     ['workspace', workspaceNamespace],
@@ -962,6 +1468,8 @@ export function createAdapter(options: AdapterOptions): { remote: unknown; dispo
     ['settings', face.settings],
     ['llm', face.llm],
     ['credentials', face.credentials],
+    ['permissionPresets', permissionPresetsNamespace],
+    ['commands', commandsNamespace],
   ])
 
   const remote: unknown = new Proxy({

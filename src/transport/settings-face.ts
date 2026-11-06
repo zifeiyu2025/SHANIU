@@ -98,6 +98,20 @@ export interface SettingsFace {
   activeSelection(): ModelSelection
   /** 宿主当前工作区根（`[workspace].root`）；读不到文档时是空串。 */
   workspaceRoot(): string
+  /** 安全场当前沙箱档（`get_settings` 的 sandboxMode：read_only / workspace_write / danger_full_access）。 */
+  sandboxMode(): string
+  /**
+   * 生效模型的上下文窗口（`[[providers]]` 的 contextWindow）。未配置或为 0 时 undefined：
+   * 没有真实容量就不给分母，占用仪表按"数据缺席"隐藏，不猜一个数。
+   */
+  activeContextWindow(): number | undefined
+  /**
+   * 把沙箱档写进宿主 config（`save_settings` 的 sandbox_mode 参数）。其余必填参数
+   * （base_url/model/workspace_root）传快照现值原样写回，宿主按"只改沙箱档"的保存处理；
+   * approval_mode 不传 = 不动那一维（后端裁决矩阵当前不消费它）。读不到文档或宿主
+   * 拒绝时抛错，由调用方映射成 wire 失败。
+   */
+  applySandboxMode(sandboxMode: string): Promise<void>
   /** 强制回宿主重读一次。装配时与外部改动后调用；失败保留上一次缓存（见 read 的注释）。 */
   refresh(): Promise<void>
 }
@@ -463,6 +477,33 @@ export function createSettingsFace(bridge: HostBridge, options: SettingsFaceOpti
     return { provider: row.id, model: row.model }
   }
 
+  /** 读不到快照时回落宿主默认档（config.rs 的 SandboxMode `#[default]` = ReadOnly）。 */
+  function sandboxMode(): string {
+    return snapshot?.sandboxMode ?? 'read_only'
+  }
+
+  function activeContextWindow(): number | undefined {
+    const selection = activeSelection()
+    if (selection.provider === '' || selection.model === '') return undefined
+    const row = snapshot?.providers.find(candidate => candidate.id === selection.provider)
+    const model = row?.models.find(candidate => candidate.id === selection.model)
+    return model !== undefined && model.contextWindow > 0 ? model.contextWindow : undefined
+  }
+
+  const applySandboxMode = async (mode: string): Promise<void> => {
+    await ensure()
+    if (snapshot === undefined) throw new Error('读不到宿主设置，无法切换挡位')
+    // 非法档位由宿主 save_settings 校验并报错（lib.rs 的 SANDBOX_MODE_NAMES），
+    // 这里不预判一份平行清单——两处清单迟早漂移，宿主那份才是事实来源。
+    await bridge.invoke('save_settings', {
+      base_url: snapshot.baseUrl,
+      model: snapshot.model,
+      workspace_root: snapshot.workspaceRoot,
+      sandbox_mode: mode,
+    })
+    await read()
+  }
+
   return {
     settings: {
       describe: async () => {
@@ -655,6 +696,9 @@ export function createSettingsFace(bridge: HostBridge, options: SettingsFaceOpti
       },
     },
     activeSelection,
+    sandboxMode,
+    activeContextWindow,
+    applySandboxMode,
     workspaceRoot: () => snapshot?.workspaceRoot ?? '',
     refresh: async () => {
       await read()

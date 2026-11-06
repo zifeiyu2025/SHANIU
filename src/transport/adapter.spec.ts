@@ -54,15 +54,28 @@ function scriptedBridge(
   settings: Record<string, unknown> = HOST_SETTINGS,
   archive: Record<string, unknown>[] = [],
   renameFailure?: unknown,
+  saveFailure?: unknown,
 ): ScriptedBridge {
   const calls: ScriptedBridge['calls'] = []
   const handlers = new Set<(event: AgentEvent) => void>()
   let counter = 0
+  // 宿主语义的关键一条：save_settings 落盘 config.toml，之后的 get_settings 回读新值。
+  // 测试桥按同一语义模拟（每份桥独立的克隆，避免测试间串味），挡位切换的投影推帧
+  // 才能测到"切换后 UI 显示新挡位"而不是停在旧值。
+  const state = structuredClone(settings)
   return {
     calls,
     async invoke<T>(command: string, args?: Record<string, unknown>): Promise<T> {
       calls.push({ command, args })
-      if (command === 'get_settings') return settings as T
+      if (command === 'get_settings') return state as T
+      if (command === 'save_settings') {
+        if (saveFailure !== undefined) throw saveFailure
+        state['baseUrl'] = args?.['base_url']
+        state['model'] = args?.['model']
+        state['workspaceRoot'] = args?.['workspace_root']
+        if (args?.['sandbox_mode'] !== undefined) state['sandboxMode'] = args['sandbox_mode']
+        return undefined as T
+      }
       if (command === 'create_session') return 'agent-new' as T
       if (command === 'send_task') return (args?.agentId ?? 'agent-new') as T
       if (command === 'load_session') return archive as T
@@ -160,7 +173,10 @@ describe('适配层把 EventMsg 流映射成 DSH 会话 journal', () => {
 
     const assistant = journal.find(event => event['type'] === 'assistant/message')?.['data'] as Record<string, unknown>
     expect((assistant['message'] as { content: unknown[] }).content).toEqual([{ type: 'text', text: '你好' }])
-    expect(assistant['usage']).toEqual({ inputTokens: 10, outputTokens: 4, cacheReadTokens: 2, cacheWriteTokens: 0, totalTokens: 16 })
+    // inputTokens 是**未缓存**输入（10 − 2 = 8）：上游 TokenUsage 语义里它是 uncached
+    // 桶（usage-projection.ts 的 bucketsFrom 直接拿它当 uncachedInputTokens），
+    // total = uncached + output + read。旧断言把全量 prompt 当 input，缓存算了两遍。
+    expect(assistant['usage']).toEqual({ inputTokens: 8, outputTokens: 4, cacheReadTokens: 2, cacheWriteTokens: 0, totalTokens: 14 })
     expect((journal.find(event => event['type'] === 'turn/end')?.['data'] as { reason: unknown }).reason)
       .toEqual({ kind: 'completed' })
 
@@ -864,6 +880,336 @@ describe('设置 / 凭据 / 目录三张面经 remote 可达', () => {
     await face.credentials['set']!('MINIMAX_API_KEY', 'sk-m')
     // 退订之后不该再被叫到，否则监听器会越积越多
     expect(seen).toEqual(['adapters'])
+    dispose()
+  })
+})
+
+describe('权限挡位与底部指标的数据面', () => {
+  interface PermissionTestFace {
+    permissionPresets: { catalog(): Promise<Record<string, unknown>> }
+    commands: { execute(sessionId: string, line: string, args?: readonly string[]): Promise<Record<string, unknown>> }
+    session: SessionFace & {
+      control(): AsyncGenerator<Record<string, unknown>>
+      updateQueue(request: Record<string, unknown>): Promise<Record<string, unknown>>
+    }
+  }
+
+  const faceOf2 = (remote: unknown): PermissionTestFace => remote as PermissionTestFace
+
+  it('挡位目录随宿主沙箱档反推默认，切换写 save_settings 并让快照/基线显示新挡位', async () => {
+    const bridge = scriptedBridge()
+    const { remote, dispose } = createAdapter({ bridge })
+    const face = faceOf2(remote)
+
+    // 目录：静态三挡（无实验档 auto），默认反推自宿主 sandboxMode（workspace_write）
+    const catalog = (await face.permissionPresets.catalog())['value'] as {
+      options: { value: string; name: string }[]
+      defaultOptions: { value: string }[]
+      defaultPreset: string
+    }
+    expect(catalog.options.map(option => option.value)).toEqual(['read-only', 'workspace-write', 'danger-full-access'])
+    expect(catalog.defaultOptions.map(option => option.value)).toEqual(['read-only', 'workspace-write', 'danger-full-access'])
+    expect(catalog.defaultPreset).toBe('workspace-write')
+
+    // 切挡前的快照基线：挡位投影 = 宿主当前档
+    await face.session.create({})
+    const before = face.session.follow({ address: { kind: 'session', sessionId: 'agent-new' } })
+    const snap1 = (await before.next()).value as { projections: { values: Record<string, unknown> } }
+    expect(snap1.projections.values['permissions']).toEqual({ currentValue: 'workspace-write' })
+    await before.return?.(undefined)
+
+    // 提交：/permission 命令 → save_settings，其余必填参数传宿主现值原样写回
+    const callsBefore = bridge.calls.length
+    const result = await face.commands.execute('agent-new', '/permission danger-full-access')
+    expect(result).toMatchObject({ ok: true, value: { matched: true } })
+    expect(bridge.calls.slice(callsBefore).find(call => call.command === 'save_settings')?.args)
+      .toEqual({ base_url: 'https://lc/v1', model: 'LongCat-2.5', workspace_root: 'W', sandbox_mode: 'danger_full_access' })
+
+    // 宿主落盘后 get_settings 回读新值：目录默认与重开快照都反映新挡位
+    const catalog2 = (await face.permissionPresets.catalog())['value'] as { defaultPreset: string }
+    expect(catalog2.defaultPreset).toBe('danger-full-access')
+    const after = face.session.follow({ address: { kind: 'session', sessionId: 'agent-new' } })
+    const snap2 = (await after.next()).value as { projections: { values: Record<string, unknown> } }
+    expect(snap2.projections.values['permissions']).toEqual({ currentValue: 'danger-full-access' })
+    await after.return?.(undefined)
+
+    // control 基线同样带挡位（客户端重连时不丢当前值）
+    const control = face.session.control()
+    const baseline = (await control.next()).value as {
+      value: { projections: Record<string, { values: Record<string, unknown> }> }
+    }
+    expect(baseline.value.projections['agent-new']?.values['permissions'])
+      .toEqual({ currentValue: 'danger-full-access' })
+    await control.return?.(undefined)
+    dispose()
+  })
+
+  it('commands.execute：非本命令的行与未知挡位都回未命中，不写宿主', async () => {
+    const bridge = scriptedBridge()
+    const { remote, dispose } = createAdapter({ bridge })
+    const face = faceOf2(remote)
+    // matched 判据是"返回值非 undefined"（session.ts）：未命中必须 ok:true + value undefined
+    const other = await face.commands.execute('agent-new', '/plan on')
+    expect(other).toMatchObject({ ok: true })
+    expect(other['value']).toBeUndefined()
+    const unknownPreset = await face.commands.execute('agent-new', '/permission auto')
+    expect(unknownPreset['value']).toBeUndefined()
+    const bare = await face.commands.execute('agent-new', '/permission')
+    expect(bare['value']).toBeUndefined()
+    expect(bridge.calls.some(call => call.command === 'save_settings')).toBe(false)
+    dispose()
+  })
+
+  it('挡位切换被宿主拒绝时按 {ok:false} 回给客户端，目录默认保持旧档', async () => {
+    // wire 契约：UI 的错误处理读 result.ok，穿透 rejection 会绕过它
+    const bridge = scriptedBridge(HOST_SETTINGS, [], undefined, '沙箱模式取值非法，可用：read_only / workspace_write / danger_full_access')
+    const { remote, dispose } = createAdapter({ bridge })
+    const face = faceOf2(remote)
+    const result = await face.commands.execute('agent-new', '/permission danger-full-access')
+    expect(result['ok']).toBe(false)
+    expect((result['error'] as { message: string }).message).toContain('沙箱模式取值非法')
+    const catalog = (await face.permissionPresets.catalog())['value'] as { defaultPreset: string }
+    expect(catalog.defaultPreset).toBe('workspace-write')
+    dispose()
+  })
+
+  it('底部指标：回合/步/墙钟折叠成 sessionStats，首个采样后用量与占用投影出现', async () => {
+    const bridge = scriptedBridge()
+    // 受控时钟：墙钟口径的断言（llm/ttft/decode）必须确定性，不赌事件处理耗时
+    let clock = 1_000_000
+    const { remote, dispose } = createAdapter({ bridge, now: () => clock })
+    const session = faceOf(remote).session
+    await session.prompt({ sessionId: 'agent-new', requestId: 'rpc-m1', content: [{ type: 'text', text: '指标' }] })
+    clock += 100
+    bridge.emit('agent-new', { type: 'agent_message_delta', delta: '正文' })
+    clock += 200
+    bridge.emit('agent-new', { type: 'token_usage', turn: 1, input_tokens: 10, cached_input_tokens: 2, output_tokens: 4 })
+    clock += 300
+    bridge.emit('agent-new', { type: 'turn_completed', turn: 1, reason: 'completed' })
+
+    const iterator = session.follow({ address: { kind: 'session', sessionId: 'agent-new' } })
+    const values = ((await iterator.next()).value as { projections: { values: Record<string, unknown> } }).projections.values
+    // llmMs = step/start → 消息落定（600）；ttftMs = 起点 → 首 delta（100）；
+    // decodeMs = 首 delta → 落定（500），decodeTokens 取该次采样的输出桶
+    expect(values['sessionStats']).toEqual({
+      turns: 1, steps: 1, llmMs: 600, toolMs: 0, ttftMs: 100, ttftSteps: 1, decodeMs: 500, decodeTokens: 4,
+    })
+    // 用量四桶：uncached = 10 − 2 = 8（缓存只算一次）
+    expect(values['tokenUsage']).toEqual({ uncachedInputTokens: 8, outputTokens: 4, cacheReadTokens: 2, cacheWriteTokens: 0 })
+    // 占用：分子 = prompt 侧全量（10），分母来自生效模型的 contextWindow
+    expect(values['contextPressure']).toEqual({ pressureTokens: 10, projectedTokens: 10, contextWindow: 128_000 })
+    await iterator.return?.(undefined)
+    dispose()
+  })
+
+  it('底部指标：工具墙钟按 callId 配对结算，没等到结果的调用不计时长', async () => {
+    const bridge = scriptedBridge()
+    let clock = 2_000_000
+    const { remote, dispose } = createAdapter({ bridge, now: () => clock })
+    const session = faceOf(remote).session
+    await session.prompt({ sessionId: 'agent-new', requestId: 'rpc-m2', content: [{ type: 'text', text: '跑工具' }] })
+    clock += 100
+    bridge.emit('agent-new', { type: 'tool_call_begin', call_id: 'c1', tool: 'unified_exec', args: {} })
+    clock += 700
+    bridge.emit('agent-new', { type: 'tool_call_end', call_id: 'c1', exit_code: 0, error: null, result: 'ok' })
+    clock += 100
+    bridge.emit('agent-new', { type: 'tool_call_begin', call_id: 'c2', tool: 'read_file', args: {} })
+    clock += 100
+    // c2 没等到 tool_call_end 就收口：漏算时长是诚实缺省，不编一个值
+    bridge.emit('agent-new', { type: 'turn_completed', turn: 1, reason: 'completed' })
+
+    const iterator = session.follow({ address: { kind: 'session', sessionId: 'agent-new' } })
+    const values = ((await iterator.next()).value as { projections: { values: Record<string, unknown> } }).projections.values
+    expect(values['sessionStats']).toEqual({
+      turns: 1, steps: 1, llmMs: 0, toolMs: 700, ttftMs: 0, ttftSteps: 0, decodeMs: 0, decodeTokens: 0,
+    })
+    // 没烧过 token：用量/占用投影不挂键，pill 与仪表按缺席隐藏
+    expect(values['tokenUsage']).toBeUndefined()
+    expect(values['contextPressure']).toBeUndefined()
+    await iterator.return?.(undefined)
+    dispose()
+  })
+
+  it('重开旧会话：回放折叠出回合/步计数，没有可信时刻与用量就不伪造', async () => {
+    const archive = [
+      { kind: 'message', role: 'user', text: '第一问' },
+      { kind: 'message', role: 'assistant', text: '答一' },
+      { kind: 'tool_call', call_id: 'c1', tool: 'read_file', arguments: '{}', output: 'ok\n[exit code: 0]' },
+      { kind: 'message', role: 'user', text: '第二问' },
+      { kind: 'message', role: 'assistant', text: '答二' },
+    ]
+    const bridge = scriptedBridge(undefined, archive)
+    const { remote, dispose } = createAdapter({ bridge })
+    const iterator = faceOf(remote).session.follow({ address: { kind: 'session', sessionId: 'agent-old' } })
+    const values = ((await iterator.next()).value as { projections: { values: Record<string, unknown> } }).projections.values
+    expect(values['sessionStats']).toEqual({
+      turns: 2, steps: 2, llmMs: 0, toolMs: 0, ttftMs: 0, ttftSteps: 0, decodeMs: 0, decodeTokens: 0,
+    })
+    expect(values['tokenUsage']).toBeUndefined()
+    expect(values['contextPressure']).toBeUndefined()
+    expect(values['permissions']).toEqual({ currentValue: 'workspace-write' })
+    await iterator.return?.(undefined)
+    dispose()
+  })
+})
+
+describe('Plan 芯片与客户端排队', () => {
+  interface QueueTestFace {
+    commands: { execute(sessionId: string, line: string): Promise<Record<string, unknown>> }
+    session: SessionFace & {
+      updateQueue(request: Record<string, unknown>): Promise<Record<string, unknown>>
+    }
+  }
+
+  const faceOf3 = (remote: unknown): QueueTestFace => remote as QueueTestFace
+
+  /** 开一次 follow 取投影值（用完即关，避免生成器挂住）。 */
+  async function projectionValuesOf(session: SessionFace, sessionId: string): Promise<Record<string, unknown>> {
+    const iterator = session.follow({ address: { kind: 'session', sessionId } })
+    const values = ((await iterator.next()).value as { projections: { values: Record<string, unknown> } }).projections.values
+    await iterator.return?.(undefined)
+    return values
+  }
+
+  it('Plan 芯片：enter/exit_plan_mode 按执行结果驱动 plan 投影，被拒的退出保持计划态', async () => {
+    const bridge = scriptedBridge()
+    const { remote, dispose } = createAdapter({ bridge })
+    const session = faceOf3(remote).session
+    await session.prompt({ sessionId: 'agent-new', requestId: 'rpc-p1', content: [{ type: 'text', text: '做个计划' }] })
+
+    // enter_plan_mode 免审批必执行 → 计划态开
+    bridge.emit('agent-new', { type: 'tool_call_begin', call_id: 'e1', tool: 'enter_plan_mode', args: {} })
+    bridge.emit('agent-new', { type: 'tool_call_end', call_id: 'e1', exit_code: 0, error: null, result: 'ok' })
+    expect(await projectionValuesOf(session, 'agent-new')).toMatchObject({ plan: { active: true, pending: false } })
+
+    // exit_plan_mode 被拒（审批卡点了拒绝）→ 保持计划态，与宿主 PlanState 一致
+    bridge.emit('agent-new', { type: 'tool_call_begin', call_id: 'x1', tool: 'exit_plan_mode', args: {} })
+    bridge.emit('agent-new', { type: 'tool_call_end', call_id: 'x1', exit_code: null, error: '用户拒绝', result: 'denied' })
+    expect(await projectionValuesOf(session, 'agent-new')).toMatchObject({ plan: { active: true } })
+
+    // 获批执行 → 退出，投影键缺席（芯片与 plan 占位都按缺席判读）
+    bridge.emit('agent-new', { type: 'tool_call_begin', call_id: 'x2', tool: 'exit_plan_mode', args: {} })
+    bridge.emit('agent-new', { type: 'tool_call_end', call_id: 'x2', exit_code: 0, error: null, result: 'ok' })
+    expect((await projectionValuesOf(session, 'agent-new'))['plan']).toBeUndefined()
+    dispose()
+  })
+
+  it('重开旧会话：计划态从档案重建——exit 有输出（获批）才算退出', async () => {
+    const plannedAndExited = [
+      { kind: 'message', role: 'user', text: '规划一下' },
+      { kind: 'tool_call', call_id: 'e1', tool: 'enter_plan_mode', arguments: '{}', output: '已进入计划模式' },
+      { kind: 'tool_call', call_id: 'x1', tool: 'exit_plan_mode', arguments: '{}', output: '计划已批准' },
+    ]
+    const exited = createAdapter({ bridge: scriptedBridge(undefined, plannedAndExited) })
+    const values1 = await projectionValuesOf(faceOf(exited.remote).session, 'agent-old')
+    expect(values1['plan']).toBeUndefined()
+    exited.dispose()
+
+    const stillPlanning = [
+      { kind: 'message', role: 'user', text: '规划一下' },
+      { kind: 'tool_call', call_id: 'e1', tool: 'enter_plan_mode', arguments: '{}', output: '已进入计划模式' },
+    ]
+    const planning = createAdapter({ bridge: scriptedBridge(undefined, stillPlanning) })
+    const values2 = await projectionValuesOf(faceOf(planning.remote).session, 'agent-old')
+    expect(values2['plan']).toEqual({ active: true, pending: false })
+    planning.dispose()
+  })
+
+  it('/plan off 给可行动指引（退出只能走审批卡），其余 /plan 变体照旧未命中', async () => {
+    const bridge = scriptedBridge()
+    const { remote, dispose } = createAdapter({ bridge })
+    const face = faceOf3(remote)
+    const off = await face.commands.execute('agent-new', '/plan off')
+    expect(off['ok']).toBe(false)
+    expect((off['error'] as { message: string }).message).toContain('审批卡')
+    const activate = await face.commands.execute('agent-new', '/plan')
+    expect(activate).toMatchObject({ ok: true })
+    expect(activate['value']).toBeUndefined()
+    dispose()
+  })
+
+  it('客户端排队：运行中提交进 inbox 投影（rpcId 对账），回合收口按序自动补发', async () => {
+    const bridge = scriptedBridge()
+    const { remote, dispose } = createAdapter({ bridge })
+    const session = faceOf3(remote).session
+    await session.prompt({ sessionId: 'agent-new', requestId: 'rpc-q1', content: [{ type: 'text', text: '第一条' }] })
+    // 运行中再提交：accepted 但不再调 send_task（缓存进队列）
+    const queued = await session.prompt({ sessionId: 'agent-new', requestId: 'rpc-q2', content: [{ type: 'text', text: '排队第二条' }] })
+    expect(queued).toMatchObject({ ok: true, value: { accepted: true } })
+    expect(bridge.calls.filter(call => call.command === 'send_task')).toHaveLength(1)
+
+    // 排队中的快照：inbox 行带原始 rpcId（QueueDock 行与回声对账的 join key）
+    const values = await projectionValuesOf(session, 'agent-new')
+    expect(values['inbox']).toEqual({
+      'next-turn': [{
+        id: expect.any(String), role: 'user',
+        content: [{ type: 'text', text: '排队第二条' }],
+        source: { kind: 'user', rpcId: 'rpc-q2' },
+      }],
+    })
+
+    // 收口 → 自动补发：send_task 第二次调用 + durable user/message 回填原 rpcId
+    bridge.emit('agent-new', { type: 'turn_completed', turn: 1, reason: 'completed' })
+    await vi.waitFor(async () => {
+      const paged = (await session.page({ sessionId: 'agent-new' }))['value'] as { records: { event: Record<string, unknown> }[] }
+      expect(eventsOf(paged).filter(event => event['type'] === 'user/message')).toHaveLength(2)
+    })
+    const paged = (await session.page({ sessionId: 'agent-new' }))['value'] as { records: { event: Record<string, unknown> }[] }
+    const second = eventsOf(paged).filter(event => event['type'] === 'user/message')[1]
+    expect((second?.['data'] as { source: { rpcId?: string } }).source.rpcId).toBe('rpc-q2')
+    expect(bridge.calls.filter(call => call.command === 'send_task')).toHaveLength(2)
+    expect(bridge.calls.filter(call => call.command === 'send_task')[1]?.args).toEqual({ task: '排队第二条', agentId: 'agent-new' })
+    // 队列清空：重开快照不再挂 inbox
+    expect((await projectionValuesOf(session, 'agent-new'))['inbox']).toBeUndefined()
+    dispose()
+  })
+
+  it('updateQueue：编辑/steer 改补发内容与顺序，移除发 spliced 事件退休回声，未知行如实拒绝', async () => {
+    const bridge = scriptedBridge()
+    const { remote, dispose } = createAdapter({ bridge })
+    const session = faceOf3(remote).session
+    await session.prompt({ sessionId: 'agent-new', requestId: 'rpc-q1', content: [{ type: 'text', text: '第一条' }] })
+    await session.prompt({ sessionId: 'agent-new', requestId: 'rpc-q2', content: [{ type: 'text', text: '第二条' }] })
+    await session.prompt({ sessionId: 'agent-new', requestId: 'rpc-q3', content: [{ type: 'text', text: '第三条' }] })
+
+    // 编辑排队的第二条（第二次排队 = shaniu-queued-1）：补发文本随之改变
+    const edited = await session.updateQueue({
+      sessionId: 'agent-new', itemId: 'shaniu-queued-1',
+      action: { kind: 'edit', content: [{ type: 'text', text: '改过的第二条' }] },
+    })
+    expect(edited).toMatchObject({ ok: true, value: { accepted: true } })
+    // steer 第三条（shaniu-queued-2）→ 移到队首（当前回合收口后第一个补发；行保持可见）
+    const steered = await session.updateQueue({ sessionId: 'agent-new', itemId: 'shaniu-queued-2', action: { kind: 'steer' } })
+    expect(steered).toMatchObject({ ok: true })
+    // 移除第二条 → journal 记 agent/inbox/spliced{outcome:canceled}，客户端据此退休回声行
+    const removed = await session.updateQueue({ sessionId: 'agent-new', itemId: 'shaniu-queued-1', action: { kind: 'remove' } })
+    expect(removed).toMatchObject({ ok: true })
+
+    // 未知行 / 空编辑：如实拒绝而不是静默成功（补发收口前做，排队项还都在）
+    const missing = await session.updateQueue({ sessionId: 'agent-new', itemId: 'nope', action: { kind: 'remove' } })
+    expect(missing['ok']).toBe(false)
+    expect((missing['error'] as { code: string }).code).toBe('session/queue-item-not-found')
+    const blank = await session.updateQueue({
+      sessionId: 'agent-new', itemId: 'shaniu-queued-2',
+      action: { kind: 'edit', content: [{ type: 'text', text: '   ' }] },
+    })
+    expect(blank['ok']).toBe(false)
+    expect((blank['error'] as { code: string }).code).toBe('gateway/bad-request')
+
+    bridge.emit('agent-new', { type: 'turn_completed', turn: 1, reason: 'completed' })
+    await vi.waitFor(() => {
+      expect(bridge.calls.filter(call => call.command === 'send_task')).toHaveLength(2)
+    })
+    // 补发的是 steer 到队首的第三条；被移除的第二条永远不会发出
+    expect(bridge.calls.filter(call => call.command === 'send_task')[1]?.args)
+      .toEqual({ task: '第三条', agentId: 'agent-new' })
+    const paged = (await session.page({ sessionId: 'agent-new' }))['value'] as { records: { event: Record<string, unknown> }[] }
+    const spliced = eventsOf(paged).find(event => event['type'] === 'agent/inbox/spliced')
+    expect(spliced).toBeDefined()
+    // 这条事件走客户端运行时会过的同一道 wire 闸
+    expect(() => assertSessionWireEvent(spliced!)).not.toThrow()
+    expect((spliced!['data'] as { outcome: string; removedCount: number }).outcome).toBe('canceled')
+    expect((spliced!['data'] as { removedCount: number }).removedCount).toBe(1)
     dispose()
   })
 })
