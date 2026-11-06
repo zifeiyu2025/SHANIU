@@ -55,7 +55,9 @@ pub fn system_instruction(workspace_root: &Path, sandbox: SandboxMode, plan_mode
         text.push_str(
             "\n\n## 当前状态：计划模式\n\
 你正处于计划模式：只有只读工具可用，写入与命令执行会失败。\n\
-请完成调研后用 exit_plan_mode 提交完整计划；计划获批前不要尝试修改文件。",
+请完成调研后用 exit_plan_mode 提交完整计划；计划获批前不要尝试修改文件。\n\
+todo_write 只用于计划获批后的实施跟踪；规划阶段的计划本体写进 exit_plan_mode，\
+不要用 todo_write 记录调研过程。",
         );
     }
     text
@@ -73,6 +75,9 @@ mod tests {
         assert!(text.contains("工作区写入"), "必须写明沙箱模式");
         // 常驻章节会说明"何时该进计划模式"，但非计划态不得声明已处于计划态
         assert!(!text.contains("当前状态：计划模式"), "非计划态不应出现计划态激活声明");
+        // 计划态 todo 引导只住在计划态分支：非计划态请求逐字节不受影响（评估
+        // 基线的 5 个任务不进计划态，这行永不可达——回归不适用的证据）
+        assert!(!text.contains("todo_write"), "非计划态不应出现 todo 引导");
     }
 
     #[test]
@@ -81,6 +86,12 @@ mod tests {
         assert!(text.contains("当前状态：计划模式"));
         assert!(text.contains("exit_plan_mode"));
         assert!(text.contains("只读"));
+        // 上游 plan-mode 规则的语义：todo 清单是获批后的实施跟踪器，计划本体在
+        // exit_plan_mode（packages/bundle/base/cordis.patch.yml 的 plan-mode 规则原文）
+        assert!(
+            text.contains("todo_write 只用于计划获批后的实施跟踪"),
+            "计划态必须引导 todo_write 的实施跟踪语义"
+        );
     }
 
     #[test]
