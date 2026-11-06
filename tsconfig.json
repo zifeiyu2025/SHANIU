@@ -403,12 +403,6 @@
       "@deepseek-ai/dsh-client-ui-action-cards/*": [
         "./node_modules/.cache/dsh-types-client/src/dsh/packages/experimental/client-ui-action-cards/src/*"
       ],
-      "@deepseek-ai/dsh-client-ui-agent-preset": [
-        "./node_modules/.cache/dsh-types-client/src/dsh/packages/client/ui-agent-preset/src/index.d.ts"
-      ],
-      "@deepseek-ai/dsh-client-ui-agent-preset/*": [
-        "./node_modules/.cache/dsh-types-client/src/dsh/packages/client/ui-agent-preset/src/*"
-      ],
       "@deepseek-ai/dsh-client-ui-approval": [
         "./node_modules/.cache/dsh-types-client/src/dsh/packages/client/ui-approval/src/index.d.ts"
       ],
@@ -522,12 +516,6 @@
       ],
       "@deepseek-ai/dsh-client-ui-settings/*": [
         "./node_modules/.cache/dsh-types-client/src/dsh/packages/client/ui-settings/src/*"
-      ],
-      "@deepseek-ai/dsh-client-ui-settings-plugin-inventory": [
-        "./node_modules/.cache/dsh-types-client/src/dsh/packages/client/ui-settings-plugin-inventory/src/index.d.ts"
-      ],
-      "@deepseek-ai/dsh-client-ui-settings-plugin-inventory/*": [
-        "./node_modules/.cache/dsh-types-client/src/dsh/packages/client/ui-settings-plugin-inventory/src/*"
       ],
       "@deepseek-ai/dsh-client-ui-sidebar": [
         "./node_modules/.cache/dsh-types-client/src/dsh/packages/client/ui-sidebar/src/index.d.ts"
@@ -1630,9 +1618,6 @@
       "@deepseek-ai/dsh-client-ui-action-cards/client": [
         "./node_modules/.cache/dsh-types-client/src/dsh/packages/experimental/client-ui-action-cards/src/client/index.d.ts"
       ],
-      "@deepseek-ai/dsh-client-ui-agent-preset/client": [
-        "./node_modules/.cache/dsh-types-client/src/dsh/packages/client/ui-agent-preset/src/client/index.d.ts"
-      ],
       "@deepseek-ai/dsh-client-ui-approval/client": [
         "./node_modules/.cache/dsh-types-client/src/dsh/packages/client/ui-approval/src/client/index.d.ts"
       ],
@@ -1686,9 +1671,6 @@
       ],
       "@deepseek-ai/dsh-client-ui-settings/client": [
         "./node_modules/.cache/dsh-types-client/src/dsh/packages/client/ui-settings/src/client/index.d.ts"
-      ],
-      "@deepseek-ai/dsh-client-ui-settings-plugin-inventory/client": [
-        "./node_modules/.cache/dsh-types-client/src/dsh/packages/client/ui-settings-plugin-inventory/src/client/index.d.ts"
       ],
       "@deepseek-ai/dsh-client-ui-sidebar/client": [
         "./node_modules/.cache/dsh-types-client/src/dsh/packages/client/ui-sidebar/src/client/index.d.ts"
