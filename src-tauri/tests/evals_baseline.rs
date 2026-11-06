@@ -345,6 +345,7 @@ async fn evals_baseline_v0() {
             .unwrap_or_else(|_| "https://api.deepseek.com/v1".into()),
         model: std::env::var("SHANIU_TEST_MODEL").unwrap_or_else(|_| "deepseek-flash".into()),
         reasoning_effort: None,
+            headers: Default::default(),
     };
     let backend = Arc::new(ResponsesBackend { provider: provider.clone(), api_key });
 
