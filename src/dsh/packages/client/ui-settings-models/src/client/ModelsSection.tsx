@@ -346,7 +346,6 @@ function Loaded({ injected, renderSlot }: { injected: ModelsSectionFace; renderS
     return (
       <div className={styles['section']}>
         <h2 className={styles['title']}>{t('title')}</h2>
-        <p className={styles['intro']}>{t('intro')}</p>
       </div>
     )
   }
@@ -413,7 +412,6 @@ function Loaded({ injected, renderSlot }: { injected: ModelsSectionFace; renderS
   return (
     <div className={styles['section']}>
       <h2 className={styles['title']}>{t('title')}</h2>
-      <p className={styles['intro']}>{t('intro')}</p>
       {!state.writable && state.status === 'ready' ? <p className={styles['notice']}>{t('readOnly')}</p> : null}
       {savedIdentity === undefined
         ? null

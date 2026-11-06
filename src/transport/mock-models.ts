@@ -87,21 +87,6 @@ const deepseekConfig = z.object({
   })),
 })
 
-/** 账号路由没有密钥引用，它走 provider 自身的鉴权链。 */
-const accountConfig = z.object({
-  baseURL: z.string(),
-  reasoningEffort: z.union(['off', 'low', 'high', 'max']),
-  defaultContextWindow: z.number().step(1).min(1).default(1_000_000),
-  maxTokens: z.number().step(1).min(1).default(256_000),
-  models: z.array(z.object({
-    id: z.string().required(),
-    name: z.string(),
-    description: z.string(),
-    contextWindow: z.number().step(1).min(1),
-    maxTokens: z.number().step(1).min(1),
-  })),
-})
-
 const envelope = (schema: { toJSON(): unknown }): JsonValue =>
   JSON.parse(JSON.stringify(schema.toJSON())) as JsonValue
 
@@ -218,12 +203,6 @@ export function createModelsMock(options: ModelsMockOptions = { emit: () => fals
       user: {},
       revision: 0,
     }],
-    ['llm-deepseek-account', {
-      schema: envelope(accountConfig),
-      base: { baseURL: 'https://api.deepseek.com', reasoningEffort: 'high', defaultContextWindow: 1_000_000, maxTokens: 256_000, models: DEEPSEEK_MODELS },
-      user: {},
-      revision: 0,
-    }],
     ['llm-pi-ai', {
       schema: envelope(piAiConfig),
       base: { providers: {} },
@@ -238,7 +217,7 @@ export function createModelsMock(options: ModelsMockOptions = { emit: () => fals
               {
                 id: 'mock-model-a', name: 'Mock Model A', description: 'mock 旗舰模型', contextWindow: 128_000, maxTokens: 8_192,
                 // 会推理的模型：档位就是目录里能选的那几行（Model B 故意不声明，用于对照"无推理档"的表现）
-                reasoningEfforts: { off: null, low: 'low', medium: 'medium', high: 'high' },
+                reasoningEfforts: { off: null, low: 'low', medium: 'medium', high: 'high', max: 'max' },
               },
               { id: 'mock-model-b', name: 'Mock Model B', description: 'mock 轻量模型', contextWindow: 64_000, maxTokens: 4_096 },
             ],
@@ -309,11 +288,6 @@ export function createModelsMock(options: ModelsMockOptions = { emit: () => fals
   /** 一个可路由的 provider 分组；目录项与席位分组由同一判定产生。 */
   const usableGroups = (): ModelProviderGroup[] => {
     const groups: ModelProviderGroup[] = []
-    const account = viewOf('llm-deepseek-account')
-    const accountModels = account === undefined ? undefined : at(account.value, ['models'])
-    if (Array.isArray(accountModels) && accountModels.length > 0) {
-      groups.push({ id: 'deepseek-account', name: 'DeepSeek Account', models: catalogModels(accountModels, DEEPSEEK_REASONING) })
-    }
     const deepseek = viewOf('llm-deepseek')
     if (deepseek !== undefined && keyReady(at(deepseek.value, ['apiKeyEnv']) as string | undefined)) {
       const models = at(deepseek.value, ['models'])
@@ -395,11 +369,6 @@ export function createModelsMock(options: ModelsMockOptions = { emit: () => fals
       },
       listConfigurableProviders: async () => {
         const directory: LlmConfigurableProvider[] = [
-          {
-            provider: 'deepseek-account', displayName: 'DeepSeek Account',
-            settingsNs: 'llm-deepseek-account', settingsPath: [],
-            nativeAuth: { env: [], oauth: true },
-          },
           {
             provider: 'deepseek', displayName: 'DeepSeek',
             settingsNs: 'llm-deepseek', settingsPath: [],

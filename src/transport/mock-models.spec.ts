@@ -34,7 +34,7 @@ describe('mock-models：设置页的可读基线', () => {
     const namespaces = described.value.namespaces.map(view => view.ns)
     // 页面：目录行 + 自定义添加；设置-常规：developer tools 与 welcome notice
     expect(namespaces).toEqual(expect.arrayContaining([
-      'llm-deepseek', 'llm-deepseek-account', 'llm-pi-ai', 'ui-settings', 'ui-settings-general',
+      'llm-deepseek', 'llm-pi-ai', 'ui-settings', 'ui-settings-general',
     ]))
     for (const view of described.value.namespaces) {
       expect(view.applies).toBe('live')
@@ -218,12 +218,11 @@ describe('mock-models：模型席位与设置页同源', () => {
     expect(group?.models.map(model => model.id)).toContain(catalog.value.default.model)
   })
 
-  it('账号目录项存在，页面据此保留「DeepSeek 账号」行', async () => {
+  it('账号提供商已彻底移除：设置目录与席位分组都不再有 deepseek-account', async () => {
+    const directory = await mock.llm.listConfigurableProviders()
+    expect(directory.ok && directory.value.some(entry => entry.provider === 'deepseek-account')).toBe(false)
     const catalog = await mock.session.modelCatalog()
-    expect(catalog.ok).toBe(true)
-    if (!catalog.ok) return
-    const account = catalog.value.groups.find(candidate => candidate.id === 'deepseek-account')
-    expect((account?.models.length ?? 0)).toBeGreaterThan(0)
+    expect(catalog.ok && catalog.value.groups.some(group => group.id === 'deepseek-account')).toBe(false)
   })
 
   it('discoverModels 走本地目录，不发任何网络请求', async () => {
@@ -262,16 +261,22 @@ describe('mock-models：模型的推理等级', () => {
 
   it('声明了 reasoningEfforts 的模型带档位，没声明的模型没有 reasoning', async () => {
     const reasoningModel = await modelOf('mock-provider', 'mock-model-a')
-    expect(reasoningModel?.reasoning?.efforts.map(effort => effort.id)).toEqual(['off', 'low', 'medium', 'high'])
+    expect(reasoningModel?.reasoning?.efforts.map(effort => effort.id)).toEqual(['off', 'low', 'medium', 'high', 'max'])
     expect(reasoningModel?.reasoning?.defaultEffort).toBe('high')
     const plainModel = await modelOf('mock-provider', 'mock-model-b')
     expect(plainModel?.reasoning).toBeUndefined()
   })
 
   it('出厂 DeepSeek 模型带上游硬编码的 off/low/high/max 档位', async () => {
-    const accountModel = await modelOf('deepseek-account', 'deepseek-v4-flash')
-    expect(accountModel?.reasoning?.efforts.map(effort => effort.id)).toEqual(['off', 'low', 'high', 'max'])
-    expect(accountModel?.reasoning?.defaultEffort).toBe('high')
+    // DeepSeek 分组要等密钥就绪才进目录，这里临时配上再收回，别把默认演示态改掉
+    await mock.credentials.set('DEEPSEEK_API_KEY', 'sk-test-only')
+    try {
+      const model = await modelOf('deepseek', 'deepseek-v4-flash')
+      expect(model?.reasoning?.efforts.map(effort => effort.id)).toEqual(['off', 'low', 'high', 'max'])
+      expect(model?.reasoning?.defaultEffort).toBe('high')
+    } finally {
+      await mock.credentials.unset('DEEPSEEK_API_KEY')
+    }
   })
 
   it('席位默认项带上有效档位；换模型后旧档不跟着串台', async () => {
