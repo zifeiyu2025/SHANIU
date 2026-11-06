@@ -338,7 +338,7 @@
         "./node_modules/.cache/dsh-types-client/src/dsh/packages/shell/bash-sandbox/src/*"
       ],
       "@deepseek-ai/dsh-brand": [
-        "./node_modules/.cache/dsh-types-client/src/dsh/packages/util/brand/src/index.d.ts"
+        "./node_modules/.cache/dsh-types-host/src/dsh/packages/util/brand/src/index.d.ts"
       ],
       "@deepseek-ai/dsh-brand/*": [
         "./node_modules/.cache/dsh-types-client/src/dsh/packages/util/brand/src/*"
@@ -1049,7 +1049,7 @@
         "./node_modules/.cache/dsh-types-client/src/dsh/packages/util/output-retention/src/*"
       ],
       "@deepseek-ai/dsh-package-manifest": [
-        "./node_modules/.cache/dsh-types-client/src/dsh/packages/util/package-manifest/src/index.d.ts"
+        "./node_modules/.cache/dsh-types-host/src/dsh/packages/util/package-manifest/src/index.d.ts"
       ],
       "@deepseek-ai/dsh-package-manifest/*": [
         "./node_modules/.cache/dsh-types-client/src/dsh/packages/util/package-manifest/src/*"
@@ -1139,7 +1139,7 @@
         "./node_modules/.cache/dsh-types-client/src/dsh/packages/schedule/schedule/src/*"
       ],
       "@deepseek-ai/dsh-scope": [
-        "./node_modules/.cache/dsh-types-client/src/dsh/packages/core/scope/src/index.d.ts"
+        "./node_modules/.cache/dsh-types-host/src/dsh/packages/core/scope/src/index.d.ts"
       ],
       "@deepseek-ai/dsh-scope/*": [
         "./node_modules/.cache/dsh-types-client/src/dsh/packages/core/scope/src/*"
@@ -1379,7 +1379,7 @@
         "./node_modules/.cache/dsh-types-client/src/dsh/packages/terminal/terminal/src/*"
       ],
       "@deepseek-ai/dsh-timeout": [
-        "./node_modules/.cache/dsh-types-client/src/dsh/packages/util/timeout/src/index.d.ts"
+        "./node_modules/.cache/dsh-types-host/src/dsh/packages/util/timeout/src/index.d.ts"
       ],
       "@deepseek-ai/dsh-timeout/*": [
         "./node_modules/.cache/dsh-types-client/src/dsh/packages/util/timeout/src/*"
@@ -1457,7 +1457,7 @@
         "./node_modules/.cache/dsh-types-client/src/dsh/packages/todo/tool-todo/src/*"
       ],
       "@deepseek-ai/dsh-typert-protocol": [
-        "./node_modules/.cache/dsh-types-client/src/dsh/packages/typert/protocol/src/index.d.ts"
+        "./node_modules/.cache/dsh-types-host/src/dsh/packages/typert/protocol/src/index.d.ts"
       ],
       "@deepseek-ai/dsh-typert-protocol/*": [
         "./node_modules/.cache/dsh-types-client/src/dsh/packages/typert/protocol/src/*"
@@ -1487,7 +1487,7 @@
         "./node_modules/.cache/dsh-types-client/src/dsh/packages/util/code-language/src/*"
       ],
       "@deepseek-ai/dsh-util-crypto": [
-        "./node_modules/.cache/dsh-types-client/src/dsh/packages/util/crypto/src/index.d.ts"
+        "./node_modules/.cache/dsh-types-host/src/dsh/packages/util/crypto/src/index.d.ts"
       ],
       "@deepseek-ai/dsh-util-crypto/*": [
         "./node_modules/.cache/dsh-types-client/src/dsh/packages/util/crypto/src/*"
@@ -1505,7 +1505,7 @@
         "./node_modules/.cache/dsh-types-client/src/dsh/packages/util/time/src/*"
       ],
       "@deepseek-ai/dsh-util-values": [
-        "./node_modules/.cache/dsh-types-client/src/dsh/packages/util/values/src/index.d.ts"
+        "./node_modules/.cache/dsh-types-host/src/dsh/packages/util/values/src/index.d.ts"
       ],
       "@deepseek-ai/dsh-util-values/*": [
         "./node_modules/.cache/dsh-types-client/src/dsh/packages/util/values/src/*"
@@ -1844,7 +1844,7 @@
         "./node_modules/.cache/dsh-types-client/src/dsh/packages/host/directory-picker/src/types.d.ts"
       ],
       "@deepseek-ai/dsh-host-plugin-inventory/types": [
-        "./node_modules/.cache/dsh-types-client/src/dsh/packages/host/plugin-inventory/src/types.d.ts"
+        "./node_modules/.cache/dsh-types-host/src/dsh/packages/host/plugin-inventory/src/types.d.ts"
       ],
       "@deepseek-ai/dsh-jobs/types": [
         "./node_modules/.cache/dsh-types-client/src/dsh/packages/jobs/jobs/src/types.d.ts"
@@ -1877,7 +1877,7 @@
         "./node_modules/.cache/dsh-types-client/src/dsh/packages/document/office-to-pdf/src/types.d.ts"
       ],
       "@deepseek-ai/dsh-package-manifest/types": [
-        "./node_modules/.cache/dsh-types-client/src/dsh/packages/util/package-manifest/src/types.d.ts"
+        "./node_modules/.cache/dsh-types-host/src/dsh/packages/util/package-manifest/src/types.d.ts"
       ],
       "@deepseek-ai/dsh-permission-presets/client": [
         "./node_modules/.cache/dsh-types-client/src/dsh/packages/interaction/permission-presets/src/client.d.ts"
@@ -1892,10 +1892,10 @@
         "./node_modules/.cache/dsh-types-client/src/dsh/packages/plan/plan-mode/src/types.d.ts"
       ],
       "@deepseek-ai/dsh-plugin-detail/types": [
-        "./node_modules/.cache/dsh-types-client/src/dsh/packages/util/plugin-detail/src/types.d.ts"
+        "./node_modules/.cache/dsh-types-host/src/dsh/packages/util/plugin-detail/src/types.d.ts"
       ],
       "@deepseek-ai/dsh-plugin-manager/types": [
-        "./node_modules/.cache/dsh-types-client/src/dsh/packages/boot/plugin-manager/src/types.d.ts"
+        "./node_modules/.cache/dsh-types-host/src/dsh/packages/boot/plugin-manager/src/types.d.ts"
       ],
       "@deepseek-ai/dsh-plugin-market/types": [
         "./node_modules/.cache/dsh-types-client/src/dsh/packages/boot/plugin-market/src/types.d.ts"
@@ -2012,7 +2012,7 @@
         "./node_modules/.cache/dsh-types-client/src/dsh/packages/todo/tool-todo/src/types.d.ts"
       ],
       "@deepseek-ai/dsh-typert-protocol/types": [
-        "./node_modules/.cache/dsh-types-client/src/dsh/packages/typert/protocol/src/types.d.ts"
+        "./node_modules/.cache/dsh-types-host/src/dsh/packages/typert/protocol/src/types.d.ts"
       ],
       "@deepseek-ai/dsh-typert-registry/client": [
         "./node_modules/.cache/dsh-types-client/src/dsh/packages/typert/registry/src/client/index.d.ts"

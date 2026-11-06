@@ -2641,7 +2641,8 @@
    "./src/dsh/scripts/types",
    "./node_modules/@types"
   ],
-  "outDir": "./node_modules/.cache/dsh-types-client"
+  "outDir": "./node_modules/.cache/dsh-types-client",
+  "rootDir": "./"
  },
  "include": [
   "./src/dsh/packages/api/gateway/src/client/index.ts",

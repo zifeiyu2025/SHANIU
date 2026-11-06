@@ -2608,7 +2608,8 @@
   "types": [
    "node"
   ],
-  "outDir": "./node_modules/.cache/dsh-types-vendor"
+  "outDir": "./node_modules/.cache/dsh-types-vendor",
+  "rootDir": "./"
  },
  "include": [
   "./src/dsh/vendor/cordis/src/context.ts",
