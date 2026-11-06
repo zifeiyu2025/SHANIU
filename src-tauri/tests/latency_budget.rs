@@ -267,3 +267,99 @@ async fn first_delta_latency_within_budget_on_real_endpoint() {
         "真实端点提交→首个可见反馈 P95 = {measured:?}，超出 3s 预算（首正文 {text_measured:?} 仅作参考，不参与门禁）"
     );
 }
+
+/// SH-018 的验收判据（docs/05：中断按钮 500ms 内停止）。
+///
+/// 这条一直只有文档里的数字、没有测量，和 FF-7 是同一类缺口。口径写死：
+/// - **起点** = 调用 `CancellationToken::cancel()` 的那一刻（用户按下停止键在后端的对应点）；
+/// - **终点** = `run_task` 返回，且事件流收到 `TurnCompleted { Cancelled }`。
+///
+/// 用**永不结束**的慢流桩：真实端点被取消时也是"流还在吐、连接被 drop"，
+/// 快速结束的脚本量不到取消传播路径，只会量到"任务本来就跑完了"。
+#[tokio::test]
+async fn cancellation_stops_within_half_second() {
+    const STOP_BUDGET: Duration = Duration::from_millis(500);
+    /// 每 900ms 吐一个增量、永不结束的流——间隔**故意大于 500ms 预算**：
+/// 取消只有在整段响应结束后才被检查的实现，这里必然要等到下一个增量才停，实测会超过预算；
+/// 只有把取消和取增量放在同一个 select 里（当前实现），才能在流中间立刻收手。
+    struct NeverEndingBackend;
+
+    #[async_trait::async_trait]
+    impl ModelBackend for NeverEndingBackend {
+        async fn stream(
+            &self,
+            _history: &[HistoryItem],
+            _tools: &[ToolDeclarationShim],
+            _instructions: &str,
+        ) -> Result<ModelStream, String> {
+            let items = futures::stream::unfold(0u32, |n| async move {
+                tokio::time::sleep(Duration::from_millis(900)).await;
+                Some((
+                    ModelStreamEvent::OutputTextDelta { delta: format!("片段{n}") },
+                    n + 1,
+                ))
+            });
+            Ok(Box::pin(items))
+        }
+    }
+
+    /// 只关心两件事：有没有收到终态、以及是哪个终态。
+    #[derive(Default)]
+    struct EndReason(Mutex<Option<&'static str>>);
+
+    impl EventSink for EndReason {
+        fn emit(&self, msg: &EventMsg) -> Result<(), String> {
+            if let EventMsg::TurnCompleted { reason, .. } = msg {
+                *self.0.lock().unwrap() = Some(match reason {
+                    shaniu_lib::events::TurnEndReason::Cancelled => "cancelled",
+                    shaniu_lib::events::TurnEndReason::Completed => "completed",
+                    shaniu_lib::events::TurnEndReason::Failed => "failed",
+                    shaniu_lib::events::TurnEndReason::BudgetExhausted => "budget_exhausted",
+                });
+            }
+            Ok(())
+        }
+    }
+
+    let end = Arc::new(EndReason::default());
+    let cancel = CancellationToken::new();
+    let agent = Arc::new(AgentLoop {
+        backend: Arc::new(NeverEndingBackend),
+        router: Arc::new(ToolRouter::new()),
+        broker: Arc::new(ApprovalBroker::new()),
+        plan_state: Arc::new(PlanState::new()),
+        workspace_root: std::env::temp_dir(),
+        max_turns: 8,
+        token_budget: 0,
+        policy: policy::SessionPolicy { approval: ApprovalMode::Ask, sandbox: SandboxMode::WorkspaceWrite },
+        rollout: None,
+        rollout_broke: std::sync::atomic::AtomicBool::new(false),
+    });
+    let sink: Arc<dyn EventSink> = end.clone();
+    let token = cancel.clone();
+    let running = tokio::spawn(async move { agent.run_task("一直吐流的任务", sink, token).await });
+
+    // 让流真正跑起来（至少吐过几个增量），否则量到的是"还没开始就停了"
+    tokio::time::sleep(Duration::from_millis(150)).await;
+    assert!(!running.is_finished(), "永不结束的流竟已跑完，说明取消传播路径根本没被走到");
+
+    let started = Instant::now();
+    cancel.cancel();
+    let summary = tokio::time::timeout(Duration::from_secs(5), running)
+        .await
+        .expect("取消后 5s 仍未返回：取消没有贯穿到模型流")
+        .expect("任务 panic");
+    let elapsed = started.elapsed();
+
+    println!("[SH-018] cancel() → run_task 返回 = {elapsed:?}（预算 {STOP_BUDGET:?}），终态={:?}", summary.reason);
+    assert!(
+        elapsed < STOP_BUDGET,
+        "按下停止到主循环返回用了 {elapsed:?}，超出 500ms 预算"
+    );
+    assert_eq!(summary.reason, shaniu_lib::events::TurnEndReason::Cancelled);
+    assert_eq!(
+        *end.0.lock().unwrap(),
+        Some("cancelled"),
+        "后端自己按 cancelled 收口了，但没广播出去——前端会一直转圈"
+    );
+}
