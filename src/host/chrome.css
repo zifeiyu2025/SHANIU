@@ -51,8 +51,11 @@
 
 .sn-caption-btn > svg,
 .sn-glyph-restore > svg {
-  width: 10px;
-  height: 10px;
+  /* 笔画在 16 格 viewBox 里只占 9 格（M3.5 8h9 等），盒子给 10px 会把可见标记
+     压成 5.6px、描边不足 1 物理像素。16px 盒子才是标记 9px、描边 1.1px，
+     对齐 Windows 11 原生标题字形（约 10px）。 */
+  width: 16px;
+  height: 16px;
   display: block;
 }
 
