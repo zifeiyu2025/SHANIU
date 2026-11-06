@@ -95,9 +95,6 @@ const DEEPSEEK_MODELS: JsonValue = [
   { id: 'deepseek-v4-pro', name: 'DeepSeek-V4-Pro', description: '', contextWindow: 1_000_000, maxTokens: 131_072 },
 ]
 
-/** 席位预置的那条本地路由：id 与模型名沿用既有验收面，避免接真数据后退化。 */
-const SEEDED_ROUTE = 'mock-provider'
-
 const isRecord = (value: unknown): value is Record<string, JsonValue> =>
   typeof value === 'object' && value !== null && !Array.isArray(value)
 
@@ -206,24 +203,9 @@ export function createModelsMock(options: ModelsMockOptions = { emit: () => fals
     ['llm-pi-ai', {
       schema: envelope(piAiConfig),
       base: { providers: {} },
-      user: {
-        providers: {
-          [SEEDED_ROUTE]: {
-            displayName: 'Mock Provider',
-            api: 'openai-responses',
-            baseURL: 'https://mock.invalid/v1',
-            apiKeyEnv: 'MOCK_PROVIDER_API_KEY',
-            models: [
-              {
-                id: 'mock-model-a', name: 'Mock Model A', description: 'mock 旗舰模型', contextWindow: 128_000, maxTokens: 8_192,
-                // 会推理的模型：档位就是目录里能选的那几行（Model B 故意不声明，用于对照"无推理档"的表现）
-                reasoningEfforts: { off: null, low: 'low', medium: 'medium', high: 'high', max: 'max' },
-              },
-              { id: 'mock-model-b', name: 'Mock Model B', description: 'mock 轻量模型', contextWindow: 64_000, maxTokens: 4_096 },
-            ],
-          },
-        },
-      },
+      // 出厂没有任何自定义服务商：设置-模型只列官方 DeepSeek 行（未配密钥），
+      // 自定义路由由用户在「添加模型提供商」里现场写入（与真实写路径同一份文档）。
+      user: {},
       revision: 0,
     }],
     ['ui-settings', {

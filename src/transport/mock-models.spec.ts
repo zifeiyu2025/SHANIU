@@ -20,13 +20,33 @@ async function viewOf(mock: ModelsMock, ns: string) {
   return view
 }
 
-/** 出厂不配密钥；需要走 mock-provider 的用例临时配上，结束后收回，保持默认演示态。 */
-async function withProviderConfigured<T>(mock: ModelsMock, run: () => Promise<T>): Promise<T> {
-  await mock.credentials.set('MOCK_PROVIDER_API_KEY', 'mock-local-key')
+/** 一个自定义添加卡片会写入的手声明 profile（acme-1 会推理，acme-2 不声明，用于对照）。 */
+const acmeProfile = {
+  displayName: 'Acme Gateway',
+  apiKeyEnv: 'ACME_API_KEY',
+  api: 'openai-responses',
+  baseURL: 'https://acme.invalid/v1',
+  models: [
+    {
+      id: 'acme-1', name: 'Acme 1', contextWindow: 128_000,
+      reasoningEfforts: { off: null, low: 'low', medium: 'medium', high: 'high', max: 'max' },
+    },
+    { id: 'acme-2', name: 'Acme 2', contextWindow: 64_000, reasoningEfforts: false },
+  ],
+}
+
+/** 出厂没有自定义服务商：需要自定义路由的用例走界面同款写路径现场添加，再配密钥。 */
+async function withCustomProvider<T>(mock: ModelsMock, run: () => Promise<T>): Promise<T> {
+  const view = await viewOf(mock, 'llm-pi-ai')
+  const written = await mock.settings.mutate(
+    'llm-pi-ai', [{ op: 'set', path: ['providers', 'acme'], value: acmeProfile }], view.revision,
+  )
+  if (!written.ok) throw new Error(`写入自定义服务商失败：${written.error.message}`)
+  await mock.credentials.set('ACME_API_KEY', 'sk-mock')
   try {
     return await run()
   } finally {
-    await mock.credentials.unset('MOCK_PROVIDER_API_KEY')
+    await mock.credentials.unset('ACME_API_KEY')
   }
 }
 
@@ -67,6 +87,13 @@ describe('mock-models：设置页的可读基线', () => {
     expect(levels).toEqual(expect.arrayContaining(['off', 'low', 'medium', 'high']))
   })
 
+  it('出厂没有自定义服务商：设置页只有官方 DeepSeek 一行', async () => {
+    const view = await viewOf(mock, 'llm-pi-ai')
+    expect(schema.getPath(view.value, ['providers'])).toEqual({})
+    const declared = await mock.llm.listConfigurableProviders()
+    expect(declared.ok && declared.value.map(entry => entry.provider)).toEqual(['deepseek'])
+  })
+
   it('预置的 DeepSeek 行有密钥引用但没有密钥（页面据此画红点）', async () => {
     const view = await viewOf(mock, 'llm-deepseek')
     expect(schema.getPath(view.value, ['apiKeyEnv'])).toBe('DEEPSEEK_API_KEY')
@@ -76,15 +103,6 @@ describe('mock-models：设置页的可读基线', () => {
     expect(described.value.DEEPSEEK_API_KEY?.configured).toBe(false)
   })
 })
-
-/** 一个自定义添加卡片会写入的手声明 profile。 */
-const acmeProfile = {
-  displayName: 'Acme Gateway',
-  apiKeyEnv: 'ACME_API_KEY',
-  api: 'openai-responses',
-  baseURL: 'https://acme.invalid/v1',
-  models: [{ id: 'acme-1', name: 'Acme 1', contextWindow: 128_000 }],
-}
 
 describe('mock-models：添加服务商这条写路径', () => {
   let mock: ModelsMock
@@ -229,7 +247,8 @@ describe('mock-models：模型席位与设置页同源', () => {
   })
 
   it('席位默认项始终落在目录里，避免既有选择退化', async () => {
-    await withProviderConfigured(mock, async () => {
+    await withCustomProvider(mock, async () => {
+      await mock.session.selectModel({ provider: 'acme', model: 'acme-1' })
       const catalog = await mock.session.modelCatalog()
       expect(catalog.ok).toBe(true)
       if (!catalog.ok) return
@@ -257,12 +276,12 @@ describe('mock-models：模型席位与设置页同源', () => {
   })
 
   it('listProviders 只报可路由的路由', async () => {
-    await withProviderConfigured(mock, async () => {
+    await withCustomProvider(mock, async () => {
       const providers = await mock.llm.listProviders()
       expect(providers.ok).toBe(true)
       if (!providers.ok) return
       const ids = providers.value.map(provider => provider.id)
-      expect(ids).toContain('mock-provider')
+      expect(ids).toContain('acme')
       expect(ids).not.toContain('deepseek')
     })
   })
@@ -282,11 +301,11 @@ describe('mock-models：模型的推理等级', () => {
   }
 
   it('声明了 reasoningEfforts 的模型带档位，没声明的模型没有 reasoning', async () => {
-    await withProviderConfigured(mock, async () => {
-      const reasoningModel = await modelOf('mock-provider', 'mock-model-a')
+    await withCustomProvider(mock, async () => {
+      const reasoningModel = await modelOf('acme', 'acme-1')
       expect(reasoningModel?.reasoning?.efforts.map(effort => effort.id)).toEqual(['off', 'low', 'medium', 'high', 'max'])
       expect(reasoningModel?.reasoning?.defaultEffort).toBe('high')
-      const plainModel = await modelOf('mock-provider', 'mock-model-b')
+      const plainModel = await modelOf('acme', 'acme-2')
       expect(plainModel?.reasoning).toBeUndefined()
     })
   })
@@ -304,22 +323,22 @@ describe('mock-models：模型的推理等级', () => {
   })
 
   it('席位默认项带上有效档位；换模型后旧档不跟着串台', async () => {
-    await withProviderConfigured(mock, async () => {
-      await mock.session.selectModel({ provider: 'mock-provider', model: 'mock-model-a', reasoningEffort: 'low' })
+    await withCustomProvider(mock, async () => {
+      await mock.session.selectModel({ provider: 'acme', model: 'acme-1', reasoningEffort: 'low' })
       const kept = await mock.session.modelCatalog()
-      expect(kept.ok && kept.value.default).toMatchObject({ model: 'mock-model-a', reasoningEffort: 'low' })
+      expect(kept.ok && kept.value.default).toMatchObject({ model: 'acme-1', reasoningEffort: 'low' })
 
-      // mock-model-b 没有推理档：旧档必须作废，而不是把 'low' 带过去
-      await mock.session.selectModel({ provider: 'mock-provider', model: 'mock-model-b' })
+      // acme-2 没有推理档：旧档必须作废，而不是把 'low' 带过去
+      await mock.session.selectModel({ provider: 'acme', model: 'acme-2' })
       const switched = await mock.session.modelCatalog()
-      expect(switched.ok && switched.value.default).toMatchObject({ model: 'mock-model-b' })
+      expect(switched.ok && switched.value.default).toMatchObject({ model: 'acme-2' })
       expect(switched.ok && switched.value.default.reasoningEffort).toBeUndefined()
     })
   })
 
   it('给不支持该档的模型强塞 effort 时回落到它自己的默认档', async () => {
-    await withProviderConfigured(mock, async () => {
-      await mock.session.selectModel({ provider: 'mock-provider', model: 'mock-model-a', reasoningEffort: 'xhigh' })
+    await withCustomProvider(mock, async () => {
+      await mock.session.selectModel({ provider: 'acme', model: 'acme-1', reasoningEffort: 'xhigh' })
       const catalog = await mock.session.modelCatalog()
       expect(catalog.ok && catalog.value.default.reasoningEffort).toBe('high')
     })

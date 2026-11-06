@@ -333,6 +333,12 @@ function startMockTurn(sessionId: string, requestId: string | undefined, text: s
     }
 
     const attemptId = `mock-attempt-${sessionId}-${journal.revision + 1}`
+    // 回答来源如实取目录：优先用席位的当前选择，没选则退到第一条可路由路由的首个模型
+    const modelSource = catalog.ok
+      ? (catalog.value.default.provider !== ''
+        ? { provider: catalog.value.default.provider, model: catalog.value.default.model }
+        : { provider: catalog.value.groups[0]?.id ?? '', model: catalog.value.groups[0]?.models[0]?.id ?? '' })
+      : { provider: '', model: '' }
     const pushStream = (frame: Record<string, unknown>): void => {
       journal.revision += 1
       journal.frames.push({ type: 'assistant-stream', frame: { ...frame, attemptId, revision: journal.revision } })
@@ -350,7 +356,7 @@ function startMockTurn(sessionId: string, requestId: string | undefined, text: s
         id: `mock-assistant-${journal.seq + 1}`,
         role: 'assistant',
         content: [{ type: 'text', text: DEMO_REPLY }],
-        source: { kind: 'model', provider: 'mock-provider', model: 'mock-model-a' },
+        source: { kind: 'model', provider: modelSource.provider, model: modelSource.model },
       },
       stream: [],
       // 三个桶齐全时必须满足 total = input + output + read + write
