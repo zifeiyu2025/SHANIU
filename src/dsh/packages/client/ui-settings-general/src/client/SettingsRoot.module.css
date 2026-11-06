@@ -6,6 +6,9 @@
   gap: 8px;
   width: 100%;
   margin: 4px 0;
+  /* SHANIU（用户要求，偏离上游的左对齐全宽行）：触发器紧凑化并右对齐，
+     连接/更新指示器随行，⚙ 靠右缘。 */
+  justify-content: flex-end;
 }
 
 .triggerRow.railRow {
@@ -13,16 +16,19 @@
   margin: 8px 0 10px;
 }
 
+/* SHANIU：宽栏与折叠栏共用 36×36 图标形态（几何与 .trigger.rail 一致），
+   文字标签隐藏（aria-label/Tooltip 保留可访问性）。 */
 .trigger {
-  flex: 1;
+  flex: none;
   min-width: 0;
   display: flex;
   align-items: center;
-  gap: var(--dsh-sidebar-label-gap);
-  width: auto;
-  height: 42px;
+  justify-content: center;
+  gap: 0;
+  width: 36px;
+  height: 36px;
   margin: 0;
-  padding: 0 calc(var(--dsh-sidebar-row-padding) - var(--dsh-sidebar-paint-inset));
+  padding: 0;
   box-sizing: border-box;
   border: none;
   border-radius: var(--dsw-radius-md);
@@ -58,8 +64,9 @@
 }
 
 .triggerLabel {
-  overflow: hidden;
-  white-space: nowrap;
+  /* SHANIU（用户要求）：图标化后宽栏不再显示文字标签（可访问性由
+     aria-label 与 Tooltip 承担）。 */
+  display: none;
 }
 
 /* Full-viewport layer (figma Mask 501:29946 #000@24%): mask tokens match the

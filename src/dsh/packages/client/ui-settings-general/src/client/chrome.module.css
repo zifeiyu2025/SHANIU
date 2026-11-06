@@ -1,7 +1,8 @@
 /* Trigger row label (the shell's button provides layout/colors; the label
- * only guards against overflow during the sidebar collapse crossfade). */
+ * only guards against overflow during the sidebar collapse crossfade).
+ * SHANIU（用户要求）：宽栏触发器图标化，文字标签不再渲染——可访问性由
+ * 按钮 aria-label 与 Tooltip 承担。 */
 
 .triggerLabel {
-  overflow: hidden;
-  white-space: nowrap;
+  display: none;
 }
