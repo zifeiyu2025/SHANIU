@@ -5,6 +5,7 @@ pub mod config;
 pub mod compaction;
 pub mod events;
 pub mod model_client;
+pub mod model_discovery;
 pub mod sandbox;
 pub mod permission;
 pub mod rollout;
@@ -407,6 +408,8 @@ fn get_settings(app: tauri::AppHandle) -> Result<serde_json::Value, String> {
             })).collect::<Vec<_>>(),
             // 席位选中的推理档位（档位名；空 = 服务商默认）
             "reasoningEffort": p.reasoning_effort,
+            // 自定义请求头（SH-097）：设置页可编辑的部署头，原样回显
+            "headers": p.headers,
         }));
     }
     let active = cfg.effective_model();
@@ -709,6 +712,7 @@ pub fn run() {
             get_settings,
             save_settings,
             save_providers,
+            model_discovery::discover_models,
             delete_api_key,
             open_in_explorer,
             pick_folder,
