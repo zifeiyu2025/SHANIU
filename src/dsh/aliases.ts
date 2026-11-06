@@ -111,8 +111,6 @@ export const dshAliases: { find: RegExp; replacement: string }[] = [
   { find: /^@deepseek-ai\/dsh-client-ui-input-trigger\/(.*)$/, replacement: '/src/dsh/packages/client/ui-input-trigger/src/$1' },
   { find: /^@deepseek-ai\/dsh-client-ui-layout$/, replacement: '/src/dsh/packages/client/ui-layout/src/index.ts' },
   { find: /^@deepseek-ai\/dsh-client-ui-layout\/(.*)$/, replacement: '/src/dsh/packages/client/ui-layout/src/$1' },
-  { find: /^@deepseek-ai\/dsh-client-ui-message-feedback$/, replacement: '/src/dsh/packages/client/ui-message-feedback/src/index.ts' },
-  { find: /^@deepseek-ai\/dsh-client-ui-message-feedback\/(.*)$/, replacement: '/src/dsh/packages/client/ui-message-feedback/src/$1' },
   { find: /^@deepseek-ai\/dsh-client-ui-model-selection$/, replacement: '/src/dsh/packages/client/ui-model-selection/src/index.ts' },
   { find: /^@deepseek-ai\/dsh-client-ui-model-selection\/(.*)$/, replacement: '/src/dsh/packages/client/ui-model-selection/src/$1' },
   { find: /^@deepseek-ai\/dsh-client-ui-permission-presets$/, replacement: '/src/dsh/packages/client/ui-permission-presets/src/index.ts' },

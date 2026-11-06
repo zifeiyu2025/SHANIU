@@ -468,12 +468,6 @@
    "@deepseek-ai/dsh-client-ui-layout/*": [
     "./src/dsh/packages/client/ui-layout/src/*"
    ],
-   "@deepseek-ai/dsh-client-ui-message-feedback": [
-    "./src/dsh/packages/client/ui-message-feedback/src/index.ts"
-   ],
-   "@deepseek-ai/dsh-client-ui-message-feedback/*": [
-    "./src/dsh/packages/client/ui-message-feedback/src/*"
-   ],
    "@deepseek-ai/dsh-client-ui-model-selection": [
     "./src/dsh/packages/client/ui-model-selection/src/index.ts"
    ],
@@ -1689,9 +1683,6 @@
    "@deepseek-ai/dsh-client-ui-layout/client": [
     "./src/dsh/packages/client/ui-layout/src/client/index.ts"
    ],
-   "@deepseek-ai/dsh-client-ui-message-feedback/client": [
-    "./src/dsh/packages/client/ui-message-feedback/src/client/index.ts"
-   ],
    "@deepseek-ai/dsh-client-ui-model-selection/client": [
     "./src/dsh/packages/client/ui-model-selection/src/client/index.ts"
    ],
@@ -1754,9 +1745,6 @@
    ],
    "@deepseek-ai/dsh-client-ui-workspace/client": [
     "./src/dsh/packages/client/ui-workspace/src/client/index.ts"
-   ],
-   "@deepseek-ai/dsh-command-feedback/types": [
-    "./src/dsh/packages/feedback/command-feedback/src/types.ts"
    ],
    "@deepseek-ai/dsh-commands/types": [
     "./src/dsh/packages/interaction/commands/src/types.ts"
@@ -1862,9 +1850,6 @@
    ],
    "@deepseek-ai/dsh-mcp-manager/types": [
     "./src/dsh/packages/mcp/mcp-manager/src/types.ts"
-   ],
-   "@deepseek-ai/dsh-message-feedback/types": [
-    "./src/dsh/packages/feedback/message-feedback/src/types.ts"
    ],
    "@deepseek-ai/dsh-native-command/types": [
     "./src/dsh/packages/util/native-command/src/types.ts"
@@ -2176,9 +2161,6 @@
     "./src/transport/shims/remote-module.ts"
    ],
    "@deepseek-ai/dsh-client-ui-layout/remote": [
-    "./src/transport/shims/remote-module.ts"
-   ],
-   "@deepseek-ai/dsh-client-ui-message-feedback/remote": [
     "./src/transport/shims/remote-module.ts"
    ],
    "@deepseek-ai/dsh-client-ui-model-selection/remote": [
@@ -3116,18 +3098,6 @@
   "./src/dsh/packages/client/ui-layout/src/client/shortcut-locales.ts",
   "./src/dsh/packages/client/ui-layout/src/client/stores.ts",
   "./src/dsh/packages/client/ui-layout/src/client/theme-presenter.ts",
-  "./src/dsh/packages/client/ui-message-feedback/src/client/FeedbackDialog.module.css",
-  "./src/dsh/packages/client/ui-message-feedback/src/client/FeedbackDialog.tsx",
-  "./src/dsh/packages/client/ui-message-feedback/src/client/MessageFeedbackActions.module.css",
-  "./src/dsh/packages/client/ui-message-feedback/src/client/MessageFeedbackActions.tsx",
-  "./src/dsh/packages/client/ui-message-feedback/src/client/controller.ts",
-  "./src/dsh/packages/client/ui-message-feedback/src/client/dialog.ts",
-  "./src/dsh/packages/client/ui-message-feedback/src/client/index.ts",
-  "./src/dsh/packages/client/ui-message-feedback/src/client/locales.ts",
-  "./src/dsh/packages/client/ui-message-feedback/src/client/slots.ts",
-  "./src/dsh/packages/client/ui-message-feedback/src/client/surface.ts",
-  "./src/dsh/packages/client/ui-message-feedback/src/css-modules.d.ts",
-  "./src/dsh/packages/client/ui-message-feedback/src/index.ts",
   "./src/dsh/packages/client/ui-model-selection/src/client/ModelSelect.module.css",
   "./src/dsh/packages/client/ui-model-selection/src/client/ModelSelect.tsx",
   "./src/dsh/packages/client/ui-model-selection/src/client/catalog.ts",
@@ -3874,8 +3844,6 @@
   "./src/dsh/packages/typert/protocol/src/remote-error.ts",
   "./src/dsh/packages/typert/protocol/src/remote-info.ts",
   "./src/dsh/packages/typert/protocol/src/types.ts",
-  "./src/dsh/packages/feedback/command-feedback/src/types.ts",
-  "./src/dsh/packages/feedback/message-feedback/src/types.ts",
   "./src/dsh/packages/workflow/workflow/src/types.ts",
   "./src/dsh/packages/workflow/tool-workflow/src/types.ts",
   "./src/dsh/packages/util/brand/src/index.ts",
