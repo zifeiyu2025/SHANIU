@@ -419,6 +419,21 @@ fn open_in_explorer(path: String) -> Result<(), String> {
         .map_err(|e| format!("打开文件管理器失败: {e}"))
 }
 
+/// 「添加工作区」的系统目录选择：弹原生「选择文件夹」对话框。
+///
+/// 用户取消返回 None；选中返回绝对路径。异步命令运行在非主线程，阻塞式选择器
+/// 在这里等待答复，主线程保持可渲染（插件文档要求不得在主线程阻塞调用）。
+#[tauri::command]
+async fn pick_folder(app: tauri::AppHandle) -> Option<String> {
+    use tauri_plugin_dialog::DialogExt;
+    app.dialog()
+        .file()
+        .set_title("选择工作区目录")
+        .blocking_pick_folder()
+        .and_then(|path| path.into_path().ok())
+        .map(|path| path.to_string_lossy().into_owned())
+}
+
 /// 从托盘恢复主窗口：取消最小化 + 显示 + 聚焦。
 fn show_main_window(app: &tauri::AppHandle) {
     if let Some(window) = app.get_webview_window("main") {
@@ -450,6 +465,7 @@ pub fn run() {
         });
 
     tauri::Builder::default()
+        .plugin(tauri_plugin_dialog::init())
         .manage(AppState::new(app_config, config_path, dirs.data_root.clone()))
         .invoke_handler(tauri::generate_handler![
             dev_ping,
@@ -464,7 +480,8 @@ pub fn run() {
             has_api_key,
             get_settings,
             save_settings,
-            open_in_explorer
+            open_in_explorer,
+            pick_folder
         ])
         .on_window_event(|window, event| {
             // 关闭 = 隐藏到系统托盘（不退出）；真正退出只走托盘菜单「退出」

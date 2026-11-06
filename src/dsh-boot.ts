@@ -11,6 +11,8 @@ import { apply as themeApply, inject as themeInject } from '@deepseek-ai/dsh-cli
 import { apply as layoutApply, inject as layoutInject } from '@deepseek-ai/dsh-client-ui-layout/client'
 import { apply as uiSessionApply, inject as uiSessionInject } from '@deepseek-ai/dsh-client-ui-session/client'
 import { apply as uiWorkspaceApply, inject as uiWorkspaceInject } from '@deepseek-ai/dsh-client-ui-workspace/client'
+import { apply as directoryPickerBrowseApply, inject as directoryPickerBrowseInject } from '@deepseek-ai/dsh-client-ui-directory-picker-browse/client'
+import { apply as directoryPickerNativeApply, inject as directoryPickerNativeInject } from '@deepseek-ai/dsh-client-ui-directory-picker-native/client'
 import { apply as uiSidebarApply, inject as uiSidebarInject } from '@deepseek-ai/dsh-client-ui-sidebar/client'
 import { apply as uiSidebarRightApply, inject as uiSidebarRightInject } from '@deepseek-ai/dsh-client-ui-sidebar-right/client'
 import { apply as uiSidebarFilesApply, inject as uiSidebarFilesInject } from '@deepseek-ai/dsh-client-ui-sidebar-files/client'
@@ -128,6 +130,10 @@ export async function bootShaniu(container: HTMLElement): Promise<BootHandle> {
     { inject: uiCommandsInject, apply: uiCommandsApply },
     { inject: workspaceControllerInject, apply: workspaceControllerApply },
     { inject: uiWorkspaceInject, apply: uiWorkspaceApply },
+    // 目录选择：桌面壳弹系统「选择文件夹」对话框；纯浏览器没有系统对话框，退回应用内浏览
+    usingTauriBackend()
+      ? { inject: directoryPickerNativeInject, apply: directoryPickerNativeApply }
+      : { inject: directoryPickerBrowseInject, apply: directoryPickerBrowseApply },
     { inject: uiConversationInject, apply: uiConversationApply },
     { inject: uiSidebarRightInject, apply: uiSidebarRightApply },
     { inject: uiSidebarFilesInject, apply: uiSidebarFilesApply },

@@ -570,6 +570,7 @@ function pushWorkspaceFrame(id: string): void {
 }
 
 const OK = <T>(value: T) => ({ ok: true as const, value })
+const FAIL = (code: string, message: string) => ({ ok: false as const, error: { code, message } })
 
 /** `remote.permissionPresets`：进程级目录（与上游 PermissionCatalog 同形）。 */
 function mockPermissionPresetsNamespace(): unknown {
@@ -662,6 +663,78 @@ function mockWorkspaceFilesNamespace(): unknown {
   }
 }
 
+/**
+ * 目录选择器的 mock 目录树：只建目录（选择器只列目录），键为归一后的绝对路径。
+ * 浏览与新建都写这份表，新建出来的目录随后能真的列出来。
+ */
+const MOCK_DIRECTORY_TREE = new Map<string, string[]>([
+  [HOME_PATH, ['docs', 'evals', 'scripts', 'src', 'src-tauri']],
+  [`${HOME_PATH}\\docs`, []],
+  [`${HOME_PATH}\\evals`, []],
+  [`${HOME_PATH}\\scripts`, []],
+  [`${HOME_PATH}\\src`, ['brand', 'dsh', 'header-actions', 'host', 'model-config', 'transport']],
+  [`${HOME_PATH}\\src\\brand`, []],
+  [`${HOME_PATH}\\src\\dsh`, ['packages', 'vendor']],
+  [`${HOME_PATH}\\src\\header-actions`, []],
+  [`${HOME_PATH}\\src\\host`, []],
+  [`${HOME_PATH}\\src\\model-config`, []],
+  [`${HOME_PATH}\\src\\transport`, []],
+  [`${HOME_PATH}\\src-tauri`, ['src']],
+])
+
+/** 目录路径归一：统一反斜杠、去掉尾部分隔符。 */
+function normalizeDirectoryPath(path: string): string {
+  const unified = path.replace(/\//g, '\\').replace(/\\+$/, '')
+  return unified.length === 0 ? HOME_PATH : unified
+}
+
+/** 面包屑：根（home，显示完整路径）→ 每一级子目录。 */
+function directoryCrumbs(path: string): { name: string; path: string; hidden: boolean }[] {
+  const crumbs = [{ name: HOME_PATH, path: HOME_PATH, hidden: false }]
+  if (path === HOME_PATH) return crumbs
+  let current = HOME_PATH
+  for (const segment of path.slice(HOME_PATH.length).split('\\').filter(Boolean)) {
+    current = `${current}\\${segment}`
+    crumbs.push({ name: segment, path: current, hidden: segment.startsWith('.') })
+  }
+  return crumbs
+}
+
+/** mock 的 `remote.directoryPicker` 命名空间：应用内目录浏览的选择原语。 */
+function mockDirectoryPickerNamespace(): unknown {
+  const listing = (path: string) => {
+    const names = MOCK_DIRECTORY_TREE.get(path)
+    if (names === undefined) return FAIL('directory-picker/unreadable', `mock 没有这个目录：${path}`)
+    return OK({
+      path,
+      home: HOME_PATH,
+      crumbs: directoryCrumbs(path),
+      entries: names.map(name => ({ name, path: `${path}\\${name}`, hidden: name.startsWith('.') })),
+      truncated: false,
+    })
+  }
+  return {
+    // 系统「选择文件夹」：桌面壳经 Tauri 命令弹原生对话框；纯浏览器没有系统对话框，
+    // 返回 null（等同取消）——浏览器态由 browse 占用者接管，不会走到这里。
+    pick: async () => {
+      if (!('__TAURI_INTERNALS__' in window)) return OK(null)
+      const { invoke } = await import('@tauri-apps/api/core')
+      return OK(await invoke<string | null>('pick_folder'))
+    },
+    list: async (path?: string) => listing(normalizeDirectoryPath(path ?? HOME_PATH)),
+    createDirectory: async (path: string, name: string) => {
+      const parent = normalizeDirectoryPath(path)
+      const siblings = MOCK_DIRECTORY_TREE.get(parent)
+      if (siblings === undefined) return FAIL('directory-picker/unreadable', `mock 没有这个目录：${parent}`)
+      const target = `${parent}\\${name}`
+      if (MOCK_DIRECTORY_TREE.has(target)) return FAIL('directory-picker/exists', `目录已存在：${target}`)
+      MOCK_DIRECTORY_TREE.set(parent, [...siblings, name].sort((a, b) => a.localeCompare(b)))
+      MOCK_DIRECTORY_TREE.set(target, [])
+      return OK(target)
+    },
+  }
+}
+
 /** 尚未 mock 的命名空间维持显式抛错面（按界面迭代逐个补）。 */
 function mockNamespace(name: string): unknown {
   const thrower = () => {
@@ -703,6 +776,8 @@ function buildMockRemote(): unknown {
   const namespaces = new Map<string, unknown>([
     ['workspace', mockWorkspaceNamespace()],
     ['workspaceFiles', mockWorkspaceFilesNamespace()],
+    // 「添加工作区」对话框的浏览原语（应用内目录树）
+    ['directoryPicker', mockDirectoryPickerNamespace()],
     ['session', mockSessionNamespace()],
     // 模型设置页的三张面：由同一份 mock-models 事实源应答（见 mock-models.ts）
     ['llm', MODELS.llm],

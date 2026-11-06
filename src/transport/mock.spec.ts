@@ -24,7 +24,32 @@ interface CredentialFace {
   unset(ref: string): Promise<unknown>
 }
 
-const remote = mockRemote() as { session: SessionFace; credentials: CredentialFace }
+type MockResult<T> = { ok: true; value: T } | { ok: false; error: { code: string; message: string } }
+
+interface DirectoryEntry {
+  name: string
+  path: string
+  hidden: boolean
+}
+
+interface DirectoryListing {
+  path: string
+  home: string
+  crumbs: DirectoryEntry[]
+  entries: DirectoryEntry[]
+  truncated: boolean
+}
+
+interface DirectoryPickerFace {
+  list(path?: string): Promise<MockResult<DirectoryListing>>
+  createDirectory(path: string, name: string): Promise<MockResult<string>>
+}
+
+const remote = mockRemote() as {
+  session: SessionFace
+  credentials: CredentialFace
+  directoryPicker: DirectoryPickerFace
+}
 
 /**
  * 回放一个会话的 journal，直到已提交 `turnEnds` 个回合为止；
@@ -87,5 +112,42 @@ describe('mock 回合剧本与模型配置状态一致', () => {
     } finally {
       await remote.credentials.unset('DEEPSEEK_API_KEY')
     }
+  })
+})
+
+describe('mock 目录选择器', () => {
+  it('列主目录：面包屑从 home 起，条目按名排序且路径由宿主拼好', async () => {
+    const result = await remote.directoryPicker.list()
+    if (!result.ok) throw new Error(`list 失败：${result.error.message}`)
+    const listing = result.value
+
+    expect(listing.path).toBe(listing.home)
+    expect(listing.crumbs).toEqual([{ name: listing.home, path: listing.home, hidden: false }])
+    expect(listing.entries.map(entry => entry.name)).toEqual([...listing.entries.map(entry => entry.name)].sort())
+    expect(listing.entries.find(entry => entry.name === 'src')?.path).toBe(`${listing.home}\\src`)
+  })
+
+  it('列子目录：面包含缀出 home → 子目录，尾部斜杠不影响结果', async () => {
+    const home = await remote.directoryPicker.list()
+    if (!home.ok) throw new Error('list 失败')
+    const nested = await remote.directoryPicker.list(`${home.value.path}\\src\\`)
+    if (!nested.ok) throw new Error(`list 失败：${nested.error.message}`)
+
+    expect(nested.value.path).toBe(`${home.value.home}\\src`)
+    expect(nested.value.crumbs.map(crumb => crumb.name)).toEqual([home.value.home, 'src'])
+  })
+
+  it('新建目录立即可列；重名按 exists 拒绝', async () => {
+    const home = await remote.directoryPicker.list()
+    if (!home.ok) throw new Error('list 失败')
+    const created = await remote.directoryPicker.createDirectory(home.value.path, 'mock-new-dir')
+    expect(created).toEqual({ ok: true, value: `${home.value.home}\\mock-new-dir` })
+
+    const after = await remote.directoryPicker.list(home.value.path)
+    if (!after.ok) throw new Error('list 失败')
+    expect(after.value.entries.map(entry => entry.name)).toContain('mock-new-dir')
+
+    const duplicate = await remote.directoryPicker.createDirectory(home.value.path, 'mock-new-dir')
+    expect(duplicate.ok ? 'unexpected ok' : duplicate.error.code).toBe('directory-picker/exists')
   })
 })
