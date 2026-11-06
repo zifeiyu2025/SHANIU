@@ -285,11 +285,19 @@ fn build_agent_with(
     writer: Option<Arc<rollout::RolloutWriter>>,
 ) -> Result<(agent_loop::AgentLoop, tokio_util::sync::CancellationToken), String> {
     let cfg = state.config();
-    let provider = model_client::provider::ProviderConfig::from_model_config(&cfg.model);
+    // 生效端点由配置层解析（active 服务商命中 → 那家；否则回落 [model]）。
+    // 这里不再自己写死 provider 字符串：写死就等于多服务商列表里换了一家、
+    // 密钥却仍从同一个文件读。
+    let active = cfg.effective_model();
+    let provider = model_client::provider::ProviderConfig {
+        provider: active.provider.clone(),
+        base_url: active.base_url.clone(),
+        model: active.model.clone(),
+    };
     let secret = config::SecretStore::new(&state.config_root());
     let api_key = secret
-        .load_key("openai-responses")?
-        .ok_or("未配置 API Key，请先在设置中保存")?;
+        .load_key(&active.secret_name)?
+        .ok_or_else(|| format!("未配置 {} 的 API Key，请先在设置中保存", active.id))?;
 
     let cancel = tokio_util::sync::CancellationToken::new();
     if !state.begin_task(cancel.clone()) {
@@ -350,20 +358,75 @@ fn has_api_key(app: tauri::AppHandle, provider: String) -> Result<bool, String> 
 fn get_settings(app: tauri::AppHandle) -> Result<serde_json::Value, String> {
     let state = app.state::<AppState>();
     let cfg = state.config();
-    let has_key = config::SecretStore::new(&state.config_root())
-        .load_key("openai-responses")
-        .map(|k| k.is_some())?;
+    let secret = config::SecretStore::new(&state.config_root());
+    // 逐服务商报告"是否已配 Key"：界面只问生效那家的话，切换按钮就会在一个根本没密钥的
+    // 服务商上显示可用，第一次发送才失败——失败点离原因越远越难归因。
+    let mut profiles = Vec::with_capacity(cfg.providers.len());
+    for p in &cfg.providers {
+        profiles.push(serde_json::json!({
+            "id": p.id,
+            "label": p.label,
+            "provider": p.provider,
+            "baseUrl": p.base_url,
+            "model": p.model,
+            "secretRef": p.secret_name(),
+            "hasApiKey": secret.load_key(&p.secret_name())?.is_some(),
+        }));
+    }
+    let active = cfg.effective_model();
     Ok(serde_json::json!({
-        "baseUrl": cfg.model.base_url,
-        "model": cfg.model.model,
+        "baseUrl": active.base_url,
+        "model": active.model,
         "maxTurns": cfg.model.max_turns,
         "workspaceRoot": state.workspace_root().to_string_lossy(),
-        "hasApiKey": has_key,
+        "hasApiKey": secret.load_key(&active.secret_name)?.is_some(),
         // 安全面两档的回显。序列化直接走 serde（枚举本身是 snake_case），
         // 不在这里手写字符串——手写就会与 config.toml 里的写法漂移成两套名字。
         "sandboxMode": serde_json::to_value(cfg.sandbox.mode).map_err(|e| e.to_string())?,
         "approvalMode": serde_json::to_value(cfg.approval.mode).map_err(|e| e.to_string())?,
+        // 生效档的协议族 id 与服务商文档（多服务商口径，04 §4）
+        "activeProvider": if cfg.active_provider.is_empty() { active.id.clone() } else { cfg.active_provider.clone() },
+        "providerRevision": cfg.provider_revision,
+        "providers": profiles,
     }))
+}
+
+/// 写服务商文档（04 §4 `[[providers]]`）。
+///
+/// 整份文档一次写入而不是逐条 op：设置页的草稿本来就是"整张表"，拆成增量只会让
+/// 半途失败留下一个混合状态——改坏一半的服务商列表比整份不写更难恢复。
+/// `expected_revision` 传了就做乐观锁比对；不匹配必须报错而不是覆盖，否则两个人
+/// 分别改两家会互相吞掉对方的那一家。
+#[tauri::command]
+fn save_providers(
+    app: tauri::AppHandle,
+    providers: Vec<config::ProviderProfile>,
+    active_provider: String,
+    expected_revision: Option<u64>,
+) -> Result<u64, String> {
+    let state = app.state::<AppState>();
+    config::AppConfig::validate_providers(&providers, &active_provider)?;
+    let mut cfg: AppConfig = state.config();
+    if let Some(expected) = expected_revision {
+        if expected != cfg.provider_revision {
+            return Err(format!(
+                "服务商文档已被改动（期望修订 {expected}，实际 {}），请重新读取后再写",
+                cfg.provider_revision
+            ));
+        }
+    }
+    cfg.providers = providers;
+    cfg.active_provider = active_provider;
+    cfg.provider_revision = cfg.provider_revision.saturating_add(1);
+    state.update_config(cfg)?;
+    Ok(state.config().provider_revision)
+}
+
+/// 删除某家的密钥（设置页"清除 Key"）。文件不存在不算错误——界面要的就是"没配"。
+#[tauri::command]
+fn delete_api_key(app: tauri::AppHandle, provider: String) -> Result<(), String> {
+    let state = app.state::<AppState>();
+    config::SecretStore::new(&state.config_root()).delete_key(&provider)
 }
 
 /// 报错时列给用户的合法档位名。它必须与 `config.rs` 的枚举同源——
@@ -384,8 +447,23 @@ fn save_settings(
 ) -> Result<(), String> {
     let state = app.state::<AppState>();
     let mut cfg: AppConfig = state.config();
-    cfg.model.base_url = base_url.trim_end_matches('/').to_string();
-    cfg.model.model = model;
+    // 多服务商时改的是**生效那一家**，不是 [model]：[model] 只是没有列表时的回落，
+    // 两处都写就会出现"用户改了模型、跑起来还是旧端点"。
+    if cfg.active_provider.is_empty() {
+        cfg.model.base_url = base_url.trim_end_matches('/').to_string();
+        cfg.model.model = model;
+    } else {
+        let target = cfg.active_provider.clone();
+        if let Some(profile) = cfg.providers.iter_mut().find(|p| p.id == target) {
+            profile.base_url = base_url.trim_end_matches('/').to_string();
+            profile.model = model;
+        } else {
+            // active 指不到任何一家是文档已经坏了的状态（validate 在写入时把关，
+            // 走到这里只可能是手工编辑了 config.toml）。这里必须报错而不是"改了
+            // [model]"——静默改回落段会让用户以为改的是当前服务商。
+            return Err(format!("active_provider 指不到任何服务商：{target}"));
+        }
+    }
     cfg.workspace.root = workspace_root;
     // 安全面两档：None = 不改，所以旧调用形态（不传这两个键）行为完全不变。
     // 非法值必须报错而不是静默保留旧值——"点了保存却没生效、界面还显示旧档位"是安全
@@ -399,11 +477,15 @@ fn save_settings(
         cfg.approval.mode = serde_json::from_value(serde_json::Value::String(mode))
             .map_err(|_| format!("审批模式取值非法，可用：{}", APPROVAL_MODE_NAMES))?;
     }
+    // 写入文件名必须与读取路径同源（生效档的 secret_name）：这里再写死一个
+    // "openai-responses"，多服务商下就是"存进去读不到"的另一副面孔。
+    // 必须在 update_config 之前取——cfg 会被它移走。
+    let secret_name = cfg.effective_model().secret_name;
     state.update_config(cfg)?;
     if let Some(key) = api_key {
         let key = key.trim().to_string();
         if !key.is_empty() {
-            config::SecretStore::new(&state.config_root()).store_key("openai-responses", &key)?;
+            config::SecretStore::new(&state.config_root()).store_key(&secret_name, &key)?;
         }
     }
     Ok(())
@@ -577,6 +659,8 @@ pub fn run() {
             has_api_key,
             get_settings,
             save_settings,
+            save_providers,
+            delete_api_key,
             open_in_explorer,
             pick_folder,
             get_product_dirs,

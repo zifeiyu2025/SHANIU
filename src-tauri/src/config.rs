@@ -42,6 +42,134 @@ pub struct AppConfig {
     pub approval: ApprovalConfig,
     pub workspace: WorkspaceConfig,
     pub agent: AgentConfig,
+    /// 可选的服务商列表（04 §4 `[[providers]]`）。**为空就是旧行为**：生效档直接取
+    /// `[model]` 段。这是 additive 扩展而不是替换——已有 config.toml 不改一个字也能跑，
+    /// 而逼用户迁移配置文件等于让升级即失效。
+    pub providers: Vec<ProviderProfile>,
+    /// 当前生效的服务商 id；空或指不到任何一项时同样回落 `[model]`。
+    pub active_provider: String,
+    /// 服务商文档的修订号（设置页乐观锁的比对基准），每次写入 +1。
+    pub provider_revision: u64,
+}
+
+/// 一家可切换的服务商（04 §4 `[[providers]]` 的一行）。
+///
+/// `secret_ref` 是 DPAPI 里的密钥文件名，同时兼作设置页的凭据 ref：
+/// 两侧共用同一个字符串，避免"界面显示已配 Key、后端读的是另一个文件"。
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(default)]
+pub struct ProviderProfile {
+    /// 稳定标识；席位与设置页都按它寻址，也用作 secret_ref 缺省时的派生依据。
+    pub id: String,
+    /// 展示名。
+    pub label: String,
+    /// 协议族：`openai-responses` | `openai-chat`。
+    pub provider: String,
+    pub base_url: String,
+    pub model: String,
+    /// 密钥存放名（DPAPI 文件名 / 设置页 ref）。空 = 按 id 派生。
+    pub secret_ref: String,
+}
+
+impl Default for ProviderProfile {
+    fn default() -> Self {
+        Self {
+            id: String::new(),
+            label: String::new(),
+            provider: "openai-chat".into(),
+            base_url: String::new(),
+            model: String::new(),
+            secret_ref: String::new(),
+        }
+    }
+}
+
+impl ProviderProfile {
+    /// 密钥文件名：显式给了就用给的，否则按 id 派生。派生规则与设置页一致
+    /// （大写、非字母数字换成下划线、`_API_KEY` 后缀），所以界面和后端不会
+    /// 各自算出一个不同的名字。
+    pub fn secret_name(&self) -> String {
+        if !self.secret_ref.trim().is_empty() {
+            return self.secret_ref.trim().to_string();
+        }
+        let derived = self
+            .id
+            .to_uppercase()
+            .chars()
+            .map(|c| if c.is_ascii_alphanumeric() { c } else { '_' })
+            .collect::<String>();
+        format!("{derived}_API_KEY")
+    }
+}
+
+/// 一次运行真正使用的模型端点。
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ResolvedModel {
+    pub id: String,
+    pub provider: String,
+    pub base_url: String,
+    pub model: String,
+    pub max_turns: u32,
+    /// 密钥文件名。回落路径上等于 `[model].provider`，
+    /// 这样升级前存的那份 DPAPI 密钥仍然读得回来。
+    pub secret_name: String,
+}
+
+impl AppConfig {
+    /// 生效端点：`active_provider` 命中列表就用那家，否则回落 `[model]`。
+    ///
+    /// 回落**不是**容错降级，而是文档规定的兼容姿态：只配了 `[model]` 的安装
+    /// 必须和不配列表时行为逐字一致。
+    pub fn effective_model(&self) -> ResolvedModel {
+        match self.providers.iter().find(|p| p.id == self.active_provider) {
+            Some(p) => ResolvedModel {
+                id: p.id.clone(),
+                provider: p.provider.clone(),
+                base_url: p.base_url.clone(),
+                model: p.model.clone(),
+                max_turns: self.model.max_turns,
+                secret_name: p.secret_name(),
+            },
+            None => ResolvedModel {
+                id: self.model.provider.clone(),
+                provider: self.model.provider.clone(),
+                base_url: self.model.base_url.clone(),
+                model: self.model.model.clone(),
+                max_turns: self.model.max_turns,
+                secret_name: self.model.provider.clone(),
+            },
+        }
+    }
+
+    /// 校验服务商文档：id 非空且唯一、active 要么空要么命中。
+    /// 报错而不是静默修——静默丢掉一个 id 会让用户以为已经配好，实际那家根本不存在。
+    pub fn validate_providers(providers: &[ProviderProfile], active: &str) -> Result<(), String> {
+        let mut seen: Vec<&str> = Vec::with_capacity(providers.len());
+        for p in providers {
+            if p.id.trim().is_empty() {
+                return Err("服务商缺 id：id 既是席位寻址用的键，也是密钥文件名派生依据".into());
+            }
+            if seen.contains(&p.id.as_str()) {
+                return Err(format!("服务商 id 重复：{}", p.id));
+            }
+            seen.push(p.id.as_str());
+            // 密钥名要过 DPAPI 文件名的 sanitize。那里是**剔除**非法字符而不是报错，
+            // 所以名字被改动必须在这里就拦下：一旦静默改写，设置页按原名报告"已配 Key"、
+            // 后端按改名后的文件读，第一次运行就变成"配了却说没配"。
+            let name = p.secret_name();
+            let sanitized = SecretStore::sanitize_provider(&name)?;
+            if sanitized != name {
+                return Err(format!(
+                    "服务商 {} 的密钥名 {name} 含非法字符，会被清洗成 {sanitized}——请直接用一个合法名字",
+                    p.id
+                ));
+            }
+        }
+        if !active.is_empty() && !providers.iter().any(|p| p.id == active) {
+            return Err(format!("active_provider 指不到任何服务商：{active}"));
+        }
+        Ok(())
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
@@ -724,5 +852,107 @@ mod tests {
         let b = new_session_id(2);
         assert!(a.starts_with("sess-") && b.starts_with("sess-"));
         assert_ne!(a, b);
+    }
+}
+
+#[cfg(test)]
+mod provider_tests {
+    use super::*;
+
+    fn profile(id: &str, base: &str, model: &str) -> ProviderProfile {
+        ProviderProfile {
+            id: id.into(),
+            label: id.into(),
+            provider: "openai-chat".into(),
+            base_url: base.into(),
+            model: model.into(),
+            secret_ref: String::new(),
+        }
+    }
+
+    /// 旧 config.toml（没有 `[[providers]]`）必须与"不启用列表"逐字等价：
+    /// 升级不该让已经配好的端点和已经存下的密钥突然失效。
+    #[test]
+    fn config_without_providers_falls_back_to_model_section() {
+        let raw = "[model]\nprovider = \"openai-chat\"\nbase_url = \"https://a/v1\"\nmodel = \"m1\"\nmax_turns = 7\n";
+        let cfg: AppConfig = toml::from_str(raw).expect("旧格式配置必须能解析");
+        assert!(cfg.providers.is_empty());
+        let active = cfg.effective_model();
+        assert_eq!((active.provider.as_str(), active.base_url.as_str(), active.model.as_str()), ("openai-chat", "https://a/v1", "m1"));
+        assert_eq!(active.max_turns, 7);
+        // 回落路径的密钥名沿用 [model].provider——这正是改动前 build_agent 读的那个文件
+        assert_eq!(active.secret_name, "openai-chat");
+    }
+
+    #[test]
+    fn active_profile_wins_over_model_section() {
+        let mut cfg = AppConfig::default();
+        cfg.model.base_url = "https://stale/v1".into();
+        cfg.model.model = "stale".into();
+        cfg.providers = vec![profile("longcat", "https://lc/v1", "LongCat-2.5"), profile("deepseek", "https://ds/v1", "deepseek-chat")];
+        cfg.active_provider = "deepseek".into();
+        let active = cfg.effective_model();
+        assert_eq!((active.id.as_str(), active.base_url.as_str(), active.model.as_str()), ("deepseek", "https://ds/v1", "deepseek-chat"));
+        assert_eq!(active.secret_name, "DEEPSEEK_API_KEY", "密钥名必须按生效档派生，否则切了服务商还在读同一份密钥");
+    }
+
+    #[test]
+    fn unknown_active_provider_falls_back_instead_of_erroring_at_runtime() {
+        // 手工编辑过的 config.toml 可能把 active 指向不存在的 id。运行期回落到 [model]
+        // 而不是 panic：读配置失败会让整个应用起不来，而回落至少还能用旧端点。
+        // 写入路径则由 validate 拦住（下一条测试）。
+        let mut cfg = AppConfig::default();
+        cfg.model.model = "fallback".into();
+        cfg.providers = vec![profile("longcat", "https://lc/v1", "LongCat-2.5")];
+        cfg.active_provider = "ghost".into();
+        assert_eq!(cfg.effective_model().model, "fallback");
+        assert!(AppConfig::validate_providers(&cfg.providers, &cfg.active_provider).is_err());
+    }
+
+    #[test]
+    fn provider_document_validation_rejects_empty_duplicate_and_bad_secret_names() {
+        assert!(AppConfig::validate_providers(&[profile("", "b", "m")], "").is_err());
+        let dup = vec![profile("same", "b1", "m1"), profile("same", "b2", "m2")];
+        let err = AppConfig::validate_providers(&dup, "").unwrap_err();
+        assert!(err.contains("重复"), "{err}");
+
+        // id 里的路径分隔符在派生阶段就被换成下划线，所以派生名本身是安全的：
+        // 这种情况必须放行，否则正常用户改个带空格的 id 就写不进去。
+        let derived_evil = vec![profile(r"..\secrets\evil", "b", "m")];
+        assert!(AppConfig::validate_providers(&derived_evil, "").is_ok());
+        assert_eq!(derived_evil[0].secret_name(), "___SECRETS_EVIL_API_KEY");
+
+        // 显式给了一个会被 sanitize **静默改写**的名字才是真危险：设置页按原名报
+        // "已配 Key"，后端按改写后的文件读，第一次运行就变成"配了却说没配"。
+        let mut explicit = profile("longcat", "b", "m");
+        explicit.secret_ref = r"..\evil".into();
+        let err = AppConfig::validate_providers(&[explicit], "").unwrap_err();
+        assert!(err.contains("非法字符"), "{err}");
+        assert!(AppConfig::validate_providers(&[profile("longcat", "b", "m")], "longcat").is_ok());
+    }
+
+    #[test]
+    fn secret_name_prefers_explicit_ref_and_derives_otherwise() {
+        let mut p = profile("minimax-cn", "b", "m");
+        assert_eq!(p.secret_name(), "MINIMAX_CN_API_KEY", "派生规则要与设置页的 deriveKeyRef 同形");
+        p.secret_ref = "MY_KEY".into();
+        assert_eq!(p.secret_name(), "MY_KEY");
+        p.secret_ref = "  ".into();
+        assert_eq!(p.secret_name(), "MINIMAX_CN_API_KEY", "全空白等于没给，不能存出一个空文件名");
+    }
+
+    #[test]
+    fn provider_document_round_trips_through_toml() {
+        let cfg = AppConfig {
+            providers: vec![profile("longcat", "https://lc/v1", "LongCat-2.5")],
+            active_provider: "longcat".into(),
+            provider_revision: 3,
+            ..Default::default()
+        };
+        let path = std::env::temp_dir().join(format!("shaniu-providers-{}.toml", std::process::id()));
+        cfg.save(&path).unwrap();
+        let back: AppConfig = toml::from_str(&std::fs::read_to_string(&path).unwrap()).unwrap();
+        assert_eq!(back, cfg, "服务商文档必须原样往返：半途丢字段就等于用户配的 Key 名变了");
+        std::fs::remove_file(&path).ok();
     }
 }
