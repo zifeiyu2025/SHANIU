@@ -77,6 +77,8 @@ interface SettingsSnapshot {
   readonly workspaceTitle?: string
   /** 默认工作区删除标记（[workspace].hidden）。缺字段 = 未删除。 */
   readonly workspaceHidden?: boolean
+  /** 工作区展示顺序（SH-111，[workspace].order）：空/缺 = 未拖拽过，按派生序。 */
+  readonly workspaceOrder?: readonly string[]
 }
 
 /** `save_providers` 写入的一行：04 §4 的落盘名。Tauri 只转顶层参数名，嵌套结构体按 serde 名走。 */
@@ -133,6 +135,8 @@ export interface SettingsFace {
   workspaceTitle(): string
   /** 默认工作区是否已被删除（`[workspace].hidden`）：true = 不进工作区清单。 */
   workspaceHidden(): boolean
+  /** 存过的工作区展示顺序（SH-111）：空 = 未拖拽过，调用方按派生序排。 */
+  workspaceOrder(): readonly string[]
   /** 安全场当前沙箱档（`get_settings` 的 sandboxMode：read_only / workspace_write / danger_full_access）。 */
   sandboxMode(): string
   /** 额外工作区注册表（SH-099）：默认工作区不在其中，face 自己拼 [workspace].root 项。 */
@@ -1000,6 +1004,7 @@ export function createSettingsFace(bridge: HostBridge, options: SettingsFaceOpti
       return title !== undefined && title !== '' ? title : 'default-workspace'
     },
     workspaceHidden: () => snapshot?.workspaceHidden === true,
+    workspaceOrder: () => snapshot?.workspaceOrder ?? [],
     refresh: async () => {
       await read()
     },

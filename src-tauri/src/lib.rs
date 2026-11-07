@@ -513,6 +513,88 @@ pub fn apply_workspace_delete(
     Ok(next)
 }
 
+/// 注册表的派生顺序（SH-111）：可见默认项居首，其后 `[[workspaces]]` 数组序。
+pub fn workspace_registry_ids(cfg: &config::AppConfig) -> Vec<String> {
+    let mut ids = Vec::new();
+    if !cfg.workspace.hidden {
+        ids.push(DEFAULT_WORKSPACE_ID.to_string());
+    }
+    ids.extend(cfg.workspaces.iter().map(|ws| ws.id.clone()));
+    ids
+}
+
+/// 当前生效顺序：`[workspace].order` 里仍在注册表的 id 按序优先（手写重复只认首次），
+/// 未列出的按派生序补尾——与客户端 `installOrder` 的 rank 兜底同向。
+pub fn workspace_order(cfg: &config::AppConfig) -> Vec<String> {
+    let registry = workspace_registry_ids(cfg);
+    let mut ordered: Vec<String> = Vec::new();
+    for id in &cfg.workspace.order {
+        if registry.contains(id) && !ordered.contains(id) {
+            ordered.push(id.clone());
+        }
+    }
+    for id in registry {
+        if !ordered.contains(&id) {
+            ordered.push(id);
+        }
+    }
+    ordered
+}
+
+/// DOM-insertBefore 式移动（SH-111，上游 `registry.insertBefore` 逐条同构）：
+/// 锚点省略 = 追加末尾；锚点即自身 = 原序返回；id 或锚点不在注册表 = not-found
+/// （上游 `WorkspaceOrderInvalidError` 经 commands.ts 映射成 `workspace/not-found`）。
+pub fn apply_workspace_order(
+    cfg: &config::AppConfig,
+    workspace_id: &str,
+    before_workspace_id: Option<&str>,
+) -> Result<Vec<String>, WorkspaceOpError> {
+    let registry = workspace_registry_ids(cfg);
+    let id = workspace_id.trim();
+    if !registry.iter().any(|candidate| candidate == id) {
+        return Err(WorkspaceOpError::NotFound(format!("工作区不存在：{id}")));
+    }
+    let current = workspace_order(cfg);
+    if let Some(before) = before_workspace_id {
+        if !registry.iter().any(|candidate| candidate == before) {
+            return Err(WorkspaceOpError::NotFound(format!("工作区不存在：{before}")));
+        }
+        if before == id {
+            return Ok(current);
+        }
+    }
+    let without: Vec<String> = current.into_iter().filter(|candidate| candidate != id).collect();
+    let at = match before_workspace_id {
+        Some(before) => without.iter().position(|candidate| candidate == before).unwrap_or(without.len()),
+        None => without.len(),
+    };
+    let mut next = without[..at].to_vec();
+    next.push(id.to_string());
+    next.extend_from_slice(&without[at..]);
+    Ok(next)
+}
+
+/// 工作区拖拽排序持久化（SH-111）：顺序落 `[workspace].order`，回值 = **完整**
+/// 注册表顺序（上游 `WorkspaceOrderValue` 契约）。默认项与别家一样可移动——
+/// 上游 registry 顺序任意，恒置头部是单工作区时代的遗留。
+#[tauri::command]
+fn insert_workspace_before(
+    app: tauri::AppHandle,
+    workspace_id: String,
+    before_workspace_id: Option<String>,
+) -> Result<serde_json::Value, WorkspaceOpError> {
+    let state = app.state::<AppState>();
+    let cfg = state.config();
+    let order = apply_workspace_order(&cfg, &workspace_id, before_workspace_id.as_deref())?;
+    // 顺序没变就不写盘（上游 sameIds 短路同口径）
+    if order != cfg.workspace.order {
+        let mut next = cfg.clone();
+        next.workspace.order = order.clone();
+        state.update_config(next).map_err(WorkspaceOpError::Rejected)?;
+    }
+    Ok(serde_json::json!({ "workspaceIds": order }))
+}
+
 fn workspace_view_of(state: &AppState, id: &str, path: &str, title: &str) -> serde_json::Value {
     let rows = rollout::list(&state.data_root().join(rollout::ROLLOUT_DIR));
     let mine: Vec<String> = rows
@@ -530,10 +612,22 @@ fn workspace_view_of(state: &AppState, id: &str, path: &str, title: &str) -> ser
     })
 }
 
-/// 注册新工作区（SH-099）：路径必须已存在且是目录；同一路径幂等返回已有项
-/// （上游 created:false 同口径）。id 由宿主生成，title 缺省 = 目录名。
-/// 与默认工作区同路径的幂等注册兼作复活入口：hidden 过的默认项在这里恢复
-/// 显示，标题重置为首启拼写（上游重新 create = 全新注册）。
+/// 注册表与会话 cwd 共用的规范拼写（SH-110 随批修复）：canonicalize 解析符号链接
+/// 与相对段后，再还原 Windows `\\?\` verbatim 前缀（复用 SH-085 的 shell_usable）。
+/// 不还原的话注册项存 verbatim、默认根存普通拼写：同一目录两种字符串，会话按
+/// cwd 字符串归属会错组，侧栏 tooltip 也会露出 `\\?\`。比较与落盘同用本函数。
+fn canonical_workspace_path(path: &std::path::Path) -> Option<String> {
+    path.canonicalize()
+        .ok()
+        .map(|p| tool_router::shell_usable(&p).to_string_lossy().to_string())
+}
+
+/// 注册工作区（SH-099）：路径必须已存在且是目录。与**可见**默认项或已注册项
+/// 同路径 = 幂等返回那一家（上游 created:false 同口径）；id 由宿主生成，
+/// title 缺省 = 目录名。被删除过的默认项（`hidden`）不复活，而是走全新注册拿
+/// 新 id（SH-110）——上游 `ClientWorkspaceModel.removedIds` 的不变式是「宿主 id
+/// 永不复用」，复用固定 `default-workspace` 会让同会话内的 upsert 与 baseline
+/// 全被静默丢弃。
 #[tauri::command]
 fn create_workspace(
     app: tauri::AppHandle,
@@ -549,29 +643,18 @@ fn create_workspace(
             "工作区路径 {raw} 不是目录"
         )));
     }
-    let canonical_str = canonical.to_string_lossy().to_string();
+    let canonical_str = tool_router::shell_usable(&canonical).to_string_lossy().to_string();
     let cfg = state.config();
-    if canonical_str == state.workspace_root().canonicalize().unwrap_or_default().to_string_lossy() {
-        // 与默认工作区同一路径：幂等返回默认项；被删除过的默认项在此复活
-        if cfg.workspace.hidden {
-            let mut next = cfg.clone();
-            next.workspace.hidden = false;
-            next.workspace.title.clear();
-            state
-                .update_config(next)
-                .map_err(WorkspaceOpError::Rejected)?;
-        }
-        let cfg = state.config();
+    if !cfg.workspace.hidden
+        && canonical_workspace_path(&state.workspace_root()).as_deref() == Some(canonical_str.as_str())
+    {
         return Ok(serde_json::json!({
             "workspace": workspace_view_of(&state, DEFAULT_WORKSPACE_ID, state.workspace_root().display().to_string().as_str(), &default_workspace_title(&cfg)),
             "created": false,
         }));
     }
     if let Some(existing) = cfg.workspaces.iter().find(|ws| {
-        std::path::Path::new(&ws.path)
-            .canonicalize()
-            .map(|p| p.to_string_lossy() == canonical_str)
-            .unwrap_or(false)
+        canonical_workspace_path(std::path::Path::new(&ws.path)).as_deref() == Some(canonical_str.as_str())
     }) {
         return Ok(serde_json::json!({
             "workspace": workspace_view_of(&state, &existing.id, &existing.path, &existing.display_title()),
@@ -712,7 +795,7 @@ fn create_session(
             if !root.is_dir() {
                 return Err(format!("工作区路径不存在或不是目录: {path}"));
             }
-            root.canonicalize().unwrap_or(root)
+            root.canonicalize().map(|p| tool_router::shell_usable(&p)).unwrap_or(root)
         }
         None => state.workspace_root(),
     };
@@ -917,6 +1000,8 @@ fn get_settings(app: tauri::AppHandle) -> Result<serde_json::Value, String> {
         // 默认工作区的标题基线与删除标记（2026-11-07 对齐上游可改可删语义）
         "workspaceTitle": default_workspace_title(&cfg),
         "workspaceHidden": cfg.workspace.hidden,
+        // 工作区展示顺序（SH-111）：空 = 未拖拽过，face 按派生序排
+        "workspaceOrder": cfg.workspace.order,
     }))
 }
 
@@ -1341,6 +1426,7 @@ pub fn run() {
             create_workspace,
             rename_workspace,
             delete_workspace,
+            insert_workspace_before,
             cancel_task,
             approve,
             store_api_key,
@@ -1417,6 +1503,7 @@ mod session_projection_tests {
                 root: String::from("D:\\ws\\root"),
                 title: String::from(default_title),
                 hidden,
+                order: Vec::new(),
             },
             workspaces: vec![
                 config::WorkspaceProfile { id: String::from("ws-1"), path: String::from("D:\\ws\\one"), title: String::from("一号") },
@@ -1466,12 +1553,94 @@ mod session_projection_tests {
         let next = super::apply_workspace_delete(&workspace_cfg("主力", false), super::DEFAULT_WORKSPACE_ID)
             .expect("默认工作区可删除");
         assert!(next.workspace.hidden);
-        assert!(next.workspace.title.is_empty(), "复活时按全新注册重置标题");
+        assert!(next.workspace.title.is_empty(), "标题一并重置：重新添加是全新注册");
         assert_eq!(next.workspaces.len(), 2, "额外工作区不受影响");
         // 额外项删除与 not-found 口径
         let next = super::apply_workspace_delete(&workspace_cfg("", false), "ws-1").expect("额外项可删除");
         assert_eq!(next.workspaces.len(), 1);
         assert!(super::apply_workspace_delete(&workspace_cfg("", false), "ws-x").is_err());
+    }
+
+    #[test]
+    fn workspace_order_derives_from_registry_then_honors_the_stored_list() {
+        // 未拖拽过：可见默认项居首 + [[workspaces]] 数组序
+        assert_eq!(
+            super::workspace_order(&workspace_cfg("", false)),
+            vec!["default-workspace", "ws-1", "ws-2"],
+        );
+        // 默认项被删除（hidden）就不进顺序——上游 deleteKnown 不清 defaultWorkspaceId，
+        // 但实体已摘，顺序里也不该有它
+        assert_eq!(super::workspace_order(&workspace_cfg("", true)), vec!["ws-1", "ws-2"]);
+        // 存过的顺序是权威：未知 id 丢弃、手写重复只认首次、新注册未列出的补尾
+        let mut cfg = workspace_cfg("", false);
+        cfg.workspace.order = vec!["ws-2".into(), "ws-gone".into(), "ws-2".into()];
+        assert_eq!(super::workspace_order(&cfg), vec!["ws-2", "default-workspace", "ws-1"]);
+        cfg.workspaces.push(config::WorkspaceProfile {
+            id: "ws-3".into(), path: "D:\\ws\\three".into(), title: String::new(),
+        });
+        assert_eq!(super::workspace_order(&cfg), vec!["ws-2", "default-workspace", "ws-1", "ws-3"]);
+    }
+
+    #[test]
+    fn workspace_order_move_matches_upstream_insert_before_edges() {
+        let cfg = workspace_cfg("", false);
+        // 带锚点：落在锚点之前
+        assert_eq!(
+            super::apply_workspace_order(&cfg, "ws-2", Some("default-workspace")).unwrap(),
+            vec!["ws-2", "default-workspace", "ws-1"],
+        );
+        // 锚点省略 = 追加末尾
+        assert_eq!(
+            super::apply_workspace_order(&cfg, "default-workspace", None).unwrap(),
+            vec!["ws-1", "ws-2", "default-workspace"],
+        );
+        // 锚点即自身 = 原序返回（上游同口径，不写盘）
+        assert_eq!(
+            super::apply_workspace_order(&cfg, "ws-1", Some("ws-1")).unwrap(),
+            super::workspace_order(&cfg),
+        );
+        // 默认项与别家一样可移动：恒置头部是单工作区时代的遗留
+        assert_eq!(
+            super::apply_workspace_order(&cfg, "default-workspace", Some("ws-2")).unwrap(),
+            vec!["ws-1", "default-workspace", "ws-2"],
+        );
+        // 被移动的 id 或锚点不在注册表 → not-found（上游 WorkspaceOrderInvalidError
+        // 经 commands.ts 映射成 workspace/not-found）
+        assert!(super::apply_workspace_order(&cfg, "ws-x", None).is_err());
+        assert!(super::apply_workspace_order(&cfg, "ws-1", Some("ws-x")).is_err());
+        // hidden 的默认项不在注册表，移动它同样 not-found
+        assert!(super::apply_workspace_order(&workspace_cfg("", true), "default-workspace", None).is_err());
+    }
+
+    #[test]
+    fn stored_order_survives_a_move_of_another_entry() {
+        // 拖过一次之后再来一次：新移动基于**存过的**顺序，不是回落派生序
+        let mut cfg = workspace_cfg("", false);
+        cfg.workspace.order = super::apply_workspace_order(&cfg, "ws-2", Some("default-workspace")).unwrap();
+        assert_eq!(
+            super::apply_workspace_order(&cfg, "ws-1", Some("ws-2")).unwrap(),
+            vec!["ws-1", "ws-2", "default-workspace"],
+        );
+    }
+
+    #[test]
+    fn canonical_workspace_path_strips_the_windows_verbatim_prefix() {
+        // SH-110 随批：注册表/会话 cwd/界面显示共用普通拼写。canonicalize 在
+        // Windows 上必产 \\?\ 前缀，不还原就会同一目录两种字符串（会话错组 +
+        // tooltip 露出 verbatim）。不存在的路径如实回 None，不猜拼写。
+        let root = std::env::temp_dir().join(format!("shaniu-cwp-{}", ulid::Ulid::generate()));
+        let nested = root.join("子目录");
+        std::fs::create_dir_all(&nested).expect("临时目录可建");
+        let resolved = super::canonical_workspace_path(&nested).expect("存在的路径可规范");
+        assert_eq!(resolved, nested.display().to_string());
+        assert!(!resolved.starts_with(r"\\?\"), "落盘拼写不得带 verbatim 前缀");
+        // 相对段与符号链接语义由 canonicalize 承担：.. 归一到同一拼写
+        assert_eq!(
+            super::canonical_workspace_path(&nested.join("..").join("子目录")),
+            Some(resolved),
+        );
+        assert_eq!(super::canonical_workspace_path(&root.join("不存在")), None);
+        std::fs::remove_dir_all(&root).ok();
     }
 
     fn msg(role: Role, text: &str) -> RolloutItem {

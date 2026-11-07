@@ -100,7 +100,10 @@ function createFrameQueue<T>() {
     },
   }
 }
-const workspaceFrames = createFrameQueue<{ readonly type: 'upsert'; readonly workspace: WorkspaceView }>()
+const workspaceFrames = createFrameQueue<
+  | { readonly type: 'upsert'; readonly workspace: WorkspaceView }
+  | { readonly type: 'order'; readonly workspaceIds: readonly string[] }
+>()
 
 /**
  * 广播式帧通道：控制流每个订阅者都要看到同一份变化（单消费者队列会把帧分给其中一条流）。
@@ -982,7 +985,22 @@ function mockWorkspaceNamespace(): unknown {
     // 上游语义：注册表为空且无任何持久化/归档会话时才创建；mock 里默认工作区已存在，直接回它
     initializeDefault: async () => OK({ workspace: workspaceView(DEFAULT_WORKSPACE_ID) }),
     delete: async () => OK({}),
-    insertBefore: async () => OK({ workspaceIds: [...WORKSPACES.keys()] }),
+    // 拖拽排序在 mock 态也要真生效：Map 的迭代序就是注册表序，重建它并推 order 帧
+    // （回成功却不重排 = 假动作，与「出厂不伪造数据」口径冲突）
+    insertBefore: async (input: { workspaceId: string; beforeWorkspaceId?: string }) => {
+      const id = input.workspaceId
+      const before = input.beforeWorkspaceId
+      if (!WORKSPACES.has(id)) return FAIL('workspace/not-found', `工作区 ${id} 不存在`)
+      if (before !== undefined && !WORKSPACES.has(before)) return FAIL('workspace/not-found', `工作区 ${before} 不存在`)
+      const without = [...WORKSPACES.keys()].filter(candidate => candidate !== id)
+      const at = before === undefined ? without.length : without.indexOf(before)
+      const workspaceIds = [...without.slice(0, at), id, ...without.slice(at)]
+      const entries = workspaceIds.map(key => [key, WORKSPACES.get(key)!] as const)
+      WORKSPACES.clear()
+      for (const [key, value] of entries) WORKSPACES.set(key, value)
+      workspaceFrames.push({ type: 'order', workspaceIds })
+      return OK({ workspaceIds })
+    },
     archiveSession: async () => OK({ archivedSessionIds: [] }),
     unarchiveSession: async () => OK({ archivedSessionIds: [] }),
     pinSession: async () => OK({ pinnedSessionIds: [...WORKSPACES.values()].flatMap(workspace => workspace.sessionIds) }),

@@ -1632,11 +1632,9 @@ export function createAdapter(options: AdapterOptions): { remote: unknown; dispo
   }
 
   /**
-   * 工作区面：宿主只有一个工作区 = `config.toml` 的 `[workspace].root`。
-   *
-   * 只读成员给真状态（一个工作区、无归档、无置顶），会改状态的成员一律显式未接线：
-   * 后端没有多工作区注册表，"添加工作区"若返回成功就等于在界面上造出一个
-   * 运行时根本不会用的目录。多工作区与归档/置顶分属 SH-099/SH-100。
+   * 工作区面（SH-099/100/110/111/112）：注册表 = 可见默认项（`[workspace].root`
+   * 派生，id 固定）+ 宿主 `[[workspaces]]`，顺序由 `[workspace].order` 决定。
+   * 会改状态的成员全部接到宿主命令；宿主吃不下的按 wire 错误码如实拒绝。
    */
   const HOST_WORKSPACE_ID = 'default-workspace'
   const workspaceLog = new FrameLog()
@@ -1659,16 +1657,32 @@ export function createAdapter(options: AdapterOptions): { remote: unknown; dispo
   /**
    * 工作区注册表（SH-099）：默认工作区来自 [workspace].root（id 固定），额外
    * 工作区来自宿主 `[[workspaces]]`（face.refresh 后随快照读取）。默认项与上游
-   * registry 项同构：标题可改（落 [workspace].title，2026-11-07），可删除
-   * （[workspace].hidden 标记——摘出清单、目录与会话保留，重新添加同路径复活）。
+   * registry 项同构：标题可改（落 [workspace].title），可删除（[workspace].hidden
+   * 标记——摘出清单、目录与会话保留）。**删除后不复活**：重新添加同路径由宿主
+   * 全新注册成新 id（SH-110，上游 `removedIds` 不变式要求 id 永不复用）。
+   *
+   * 顺序（SH-111）：存过的 `[workspace].order` 是权威，未列出的按注册表序补尾。
+   * 与宿主 `workspace_order` 是同一份规则的两面——两侧漂移会让拖完重启顺序跳变。
    */
   interface RegisteredWorkspace { readonly id: string; readonly path: string; readonly title: string }
-  const registeredWorkspaces = (): RegisteredWorkspace[] => [
-    ...face.workspaceHidden()
-      ? []
-      : [{ id: HOST_WORKSPACE_ID, path: face.workspaceRoot(), title: face.workspaceTitle() }],
-    ...face.workspaces(),
-  ]
+  const registeredWorkspaces = (): RegisteredWorkspace[] => {
+    const registry: RegisteredWorkspace[] = [
+      ...face.workspaceHidden()
+        ? []
+        : [{ id: HOST_WORKSPACE_ID, path: face.workspaceRoot(), title: face.workspaceTitle() }],
+      ...face.workspaces(),
+    ]
+    const seen = new Set<string>()
+    const ranked: RegisteredWorkspace[] = []
+    for (const id of face.workspaceOrder()) {
+      const ws = registry.find(candidate => candidate.id === id)
+      if (ws !== undefined && !seen.has(id)) {
+        seen.add(id)
+        ranked.push(ws)
+      }
+    }
+    return [...ranked, ...registry.filter(ws => !seen.has(ws.id))]
+  }
 
   /**
    * 一个工作区的视图。`sessionIds` 按 SH-100 的手动顺序排（侧车序 ∩ 本工作区现存，
@@ -1714,6 +1728,8 @@ export function createAdapter(options: AdapterOptions): { remote: unknown; dispo
   interface WorkspaceOpContext {
     readonly sessionId?: string
     readonly beforeSessionId?: string
+    /** 工作区级操作的目标 id：给了它，not-found 走 workspace/not-found 而不是会话级。 */
+    readonly workspaceId?: string
   }
   const workspaceOpFailure = (
     reason: unknown,
@@ -1733,10 +1749,17 @@ export function createAdapter(options: AdapterOptions): { remote: unknown; dispo
           }),
         }
       case 'not-found':
-        return {
-          ok: false,
-          error: new RemoteError('session/not-found', message, { sessionId: asSessionId(context.sessionId ?? '') }),
-        }
+        // 上游 commands.ts：工作区级 WorkspaceOrderInvalidError → workspace/not-found
+        // （details 只要 workspaceId）；会话级才是 session/not-found
+        return context.workspaceId !== undefined
+          ? {
+            ok: false,
+            error: new RemoteError('workspace/not-found', message, { workspaceId: asWorkspaceId(context.workspaceId) }),
+          }
+          : {
+            ok: false,
+            error: new RemoteError('session/not-found', message, { sessionId: asSessionId(context.sessionId ?? '') }),
+          }
       case 'pin-archived':
         return { ok: false, error: new RemoteError('gateway/bad-request', message, {}) }
       case 'move-invalid':
@@ -1789,11 +1812,34 @@ export function createAdapter(options: AdapterOptions): { remote: unknown; dispo
     },
     initializeDefault: async () => {
       await face.refresh()
+      // 上游 registry.initializeDefault：`defaultWorkspaceId` 标记还在但实体已删
+      // → 返回 undefined（deleteKnown 不清标记）。SHANIU 的 hidden 就是那个「删过」
+      // 的事实，所以**不复活**。契约是 `WorkspaceValue | undefined`——裸 undefined，
+      // 不是 `{workspace: undefined}`：后者让 ClientWorkspaceModel.upsert(undefined)
+      // 抛 TypeError，被 navigation 兜底成「默认工作区初始化失败」toast（SH-112）。
+      if (face.workspaceHidden()) return OK(undefined)
       const flags = await readWorkspaceFlags()
-      return OK({ workspace: (await allWorkspaceViews(flags))[0] })
+      const views = await allWorkspaceViews(flags)
+      // 顺序可被拖拽改（SH-111），默认项不一定在 [0]：按 id 找，找不到 = 无默认项
+      const view = views.find(item => item['workspaceId'] === HOST_WORKSPACE_ID)
+      return view === undefined ? OK(undefined) : OK({ workspace: view })
     },
-    // 单工作区只有一种合法顺序，回写真顺序而不是抛错：这是状态读取，不是变更成功
-    insertBefore: async () => OK({ workspaceIds: [HOST_WORKSPACE_ID] }),
+    /** 工作区拖拽排序（SH-111）：宿主存完整顺序，回值 = 完整顺序 + 推 order 帧。 */
+    insertBefore: async (request: { workspaceId?: string; beforeWorkspaceId?: string } = {}) => {
+      const workspaceId = request.workspaceId ?? ''
+      try {
+        const value = await bridge.invoke<{ workspaceIds: string[] }>('insert_workspace_before', {
+          workspaceId,
+          ...(request.beforeWorkspaceId === undefined ? {} : { beforeWorkspaceId: request.beforeWorkspaceId }),
+        })
+        // 宿主刚写过 config：face 缓存跟上，后续 baseline/视图才按新顺序排
+        await face.refresh()
+        workspaceLog.append({ type: 'order', workspaceIds: value.workspaceIds })
+        return OK({ workspaceIds: value.workspaceIds })
+      } catch (reason) {
+        return workspaceOpFailure(reason, { workspaceId })
+      }
+    },
     /** 注册新工作区（SH-099）：路径来自目录选择流；幂等重复注册 created:false。 */
     create: async (request: { path?: string } = {}) => {
       try {
@@ -1821,7 +1867,7 @@ export function createAdapter(options: AdapterOptions): { remote: unknown; dispo
         if (workspace !== undefined) workspaceLog.append({ type: 'upsert', workspace })
         return OK(value)
       } catch (reason) {
-        return workspaceOpFailure(reason, {})
+        return workspaceOpFailure(reason, { workspaceId: request.workspaceId ?? '' })
       }
     },
     delete: async (request: { workspaceId?: string } = {}) => {
@@ -1832,7 +1878,7 @@ export function createAdapter(options: AdapterOptions): { remote: unknown; dispo
         workspaceLog.append({ type: 'remove', workspaceId: request.workspaceId ?? '' })
         return OK({ removed: request.workspaceId ?? '' })
       } catch (reason) {
-        return workspaceOpFailure(reason, {})
+        return workspaceOpFailure(reason, { workspaceId: request.workspaceId ?? '' })
       }
     },
     archiveSession: async (request: { sessionId?: string; stopActivity?: boolean } = {}) => {

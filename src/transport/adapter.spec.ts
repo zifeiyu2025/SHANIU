@@ -6,6 +6,7 @@
  */
 import { describe, expect, it, vi } from 'vitest'
 import { assertSessionWireEvent } from '../dsh/packages/api/session-controller/src/client/session-wire-event.ts'
+import { ClientWorkspaceModel } from '../dsh/packages/api/workspace-controller/src/client/model.ts'
 import { createAdapter } from './adapter'
 import { registerExportTrigger } from './command-triggers'
 import type { HostBridge } from './tauri'
@@ -191,18 +192,48 @@ function scriptedBridge(
       }
       if (command === 'create_workspace') {
         const path = String(args?.path ?? '')
-        if (path === String(state['workspaceRoot'] ?? '')) {
-          // 同根路径幂等注册：被删除过的默认项在此复活（上游 created:false 同口径）
-          state['workspaceHidden'] = false
+        const rows = (state['workspaces'] as { id: string; path: string; title: string }[] | undefined) ?? []
+        const view = (workspaceId: string, wsPath: string, title: string): Record<string, unknown> => ({
+          workspaceId, path: wsPath, title, sessionIds: [], createdAt: '', updatedAt: '',
+        })
+        // 与**可见**默认项同路径 = 幂等；hidden 的默认项不复活，走全新注册拿新 id
+        // （SH-110：上游 removedIds 不变式要求宿主 id 永不复用）
+        if (state['workspaceHidden'] !== true && path === String(state['workspaceRoot'] ?? '')) {
+          const stored = state['workspaceTitle']
           return {
             created: false,
-            workspace: { workspaceId: 'default-workspace', path, title: 'default-workspace', sessionIds: [], createdAt: '', updatedAt: '' },
+            workspace: view('default-workspace', path, stored !== undefined && String(stored) !== '' ? String(stored) : 'default-workspace'),
           } as T
         }
-        const rows = (state['workspaces'] as { id: string; path: string; title: string }[] | undefined) ?? []
-        const workspace = { workspaceId: `ws-${rows.length + 1}`, path, title: '新目录', sessionIds: [], createdAt: '', updatedAt: '' }
-        state['workspaces'] = [...rows, workspace]
-        return { created: true, workspace } as T
+        const existing = rows.find(candidate => candidate.path === path)
+        if (existing !== undefined) return { created: false, workspace: view(existing.id, existing.path, existing.title) } as T
+        const id = `ws-${rows.length + 1}`
+        // get_settings 的 workspaces 行是 {id,path,title}（config 形状），不是 wire 视图
+        // 形状——替身写错键名会让 face.workspaces() 读出 id:undefined，baseline 静默退化
+        state['workspaces'] = [...rows, { id, path, title: '新目录' }]
+        return { created: true, workspace: view(id, path, '新目录') } as T
+      }
+      // SH-111：顺序落 [workspace].order，回值 = 完整注册表顺序（上游 insertBefore 同构）
+      if (command === 'insert_workspace_before') {
+        const id = String(args?.workspaceId ?? '')
+        const before = args?.['beforeWorkspaceId'] === undefined ? undefined : String(args?.['beforeWorkspaceId'])
+        const registry = [
+          ...(state['workspaceHidden'] === true ? [] : ['default-workspace']),
+          ...((state['workspaces'] as { id: string }[] | undefined) ?? []).map(row => row.id),
+        ]
+        if (!registry.includes(id)) throw { code: 'not-found', message: `工作区不存在：${id}` }
+        if (before !== undefined && !registry.includes(before)) throw { code: 'not-found', message: `工作区不存在：${before}` }
+        const stored = (state['workspaceOrder'] as string[] | undefined) ?? []
+        const current = [
+          ...stored.filter(candidate => registry.includes(candidate)),
+          ...registry.filter(candidate => !stored.includes(candidate)),
+        ]
+        if (before === id) return { workspaceIds: current } as T
+        const without = current.filter(candidate => candidate !== id)
+        const at = before === undefined ? without.length : without.indexOf(before)
+        const next = [...without.slice(0, at), id, ...without.slice(at)]
+        state['workspaceOrder'] = next
+        return { workspaceIds: next } as T
       }
       return undefined as T
     },
@@ -1895,6 +1926,8 @@ describe('workspace 注册表对齐上游：默认项可改可删（2026-11-07�
       create(request: { path?: string }): Promise<Record<string, unknown>>
       rename(request: { workspaceId?: string; title?: string }): Promise<Record<string, unknown>>
       delete(request: { workspaceId?: string }): Promise<Record<string, unknown>>
+      insertBefore(request: { workspaceId?: string; beforeWorkspaceId?: string }): Promise<Record<string, unknown>>
+      initializeDefault(): Promise<Record<string, unknown>>
     }
   }
   const faceOfRegistry = (remote: unknown): WorkspaceRegistryFace => remote as WorkspaceRegistryFace
@@ -1955,18 +1988,120 @@ describe('workspace 注册表对齐上游：默认项可改可删（2026-11-07�
     dispose()
   })
 
-  it('同根路径再注册：默认项复活（created:false），标题重置为首启拼写', async () => {
-    const bridge = scriptedBridge({ ...HOST_SETTINGS, workspaceHidden: true })
+  /**
+   * 驱动**真实 vendored 客户端模型**（SH-110/112 的验收要求穿透这一层）：
+   * `removedIds` 不变式与 `initializeDefault` 的 undefined 判定都在它里面，
+   * 只断言 adapter 回值测不到「回声被静默丢弃」这类真机缺陷。
+   */
+  interface LooseWorkspaceModel {
+    initializeDefault(): Promise<{ ok: boolean; value?: { workspace: Record<string, unknown> } }>
+    create(input: { path: string }): Promise<{ ok: boolean; value: { created: boolean; workspace: Record<string, unknown> } }>
+    delete(id: string): Promise<{ ok: boolean }>
+    insertBefore(id: string, before?: string): Promise<{ ok: boolean; value: { workspaceIds: string[] } }>
+    replaceBaseline(value: { items: Record<string, unknown>[]; archivedSessionIds: string[]; pinnedSessionIds: string[] }): void
+    getSnapshot(): { items: { workspaceId: string; path: string }[] }
+  }
+  const modelOf = (remote: unknown): LooseWorkspaceModel =>
+    new ClientWorkspaceModel(
+      faceOfRegistry(remote).workspace as unknown as ConstructorParameters<typeof ClientWorkspaceModel>[0],
+    ) as unknown as LooseWorkspaceModel
+
+  it('删除默认项后同路径重新添加：全新 id 穿透 removedIds，回声与基线都可见（SH-110）', async () => {
+    const bridge = scriptedBridge({ ...HOST_SETTINGS, workspaces: [] })
+    const { remote, dispose } = createAdapter({ bridge })
+    const model = modelOf(remote)
+    await model.initializeDefault()
+    expect(model.getSnapshot().items.map(item => item.workspaceId)).toEqual(['default-workspace'])
+    await model.delete('default-workspace')
+    expect(model.getSnapshot().items).toEqual([])
+    // 同路径重新添加：宿主全新注册（created:true + 新 id），不复用被删的固定 id
+    const created = await model.create({ path: 'W' })
+    expect(created.ok).toBe(true)
+    expect(created.value.created).toBe(true)
+    const revived = model.getSnapshot().items
+    expect(revived).toHaveLength(1)
+    expect(revived[0]?.workspaceId).not.toBe('default-workspace')
+    expect(revived[0]?.path).toBe('W')
+    // 基线同样不能被 removedIds 丢弃（换代/重开窗口走的是这条路）
+    const iterator = faceOfRegistry(remote).workspace.follow()
+    const items = await baselineOf(iterator)
+    model.replaceBaseline({ items, archivedSessionIds: [], pinnedSessionIds: [] })
+    expect(model.getSnapshot().items.map(item => item.workspaceId)).toEqual([revived[0]?.workspaceId])
+    await iterator.return?.(undefined)
+    dispose()
+  })
+
+  it('空注册表重启：initializeDefault 回裸 undefined，vendored model 不抛 TypeError（SH-112）', async () => {
+    const bridge = scriptedBridge({ ...HOST_SETTINGS, workspaceHidden: true, workspaces: [] })
+    const { remote, dispose } = createAdapter({ bridge })
+    const model = modelOf(remote)
+    // 旧实现回 {workspace: undefined}：model 判 value !== undefined 成立 →
+    // upsert(undefined) 抛 TypeError → navigation 兜底成「默认工作区初始化失败」
+    const result = await model.initializeDefault()
+    expect(result.ok).toBe(true)
+    expect(result.value).toBeUndefined()
+    expect(model.getSnapshot().items).toEqual([])
+    // hidden 是用户显式删除的事实，启动不复活（上游 deleteKnown 不清 defaultWorkspaceId，
+    // 实体已删 → initializeDefault 恒 undefined）
+    expect(bridge.calls.some(call => call.command === 'create_workspace')).toBe(false)
+    dispose()
+  })
+
+  it('默认项可见时 initializeDefault 按 id 找它，不取顺序首项（SH-111 排序后仍成立）', async () => {
+    const bridge = scriptedBridge({
+      ...HOST_SETTINGS,
+      workspaces: [{ id: 'ws-a', path: 'A', title: 'A' }],
+      workspaceOrder: ['ws-a', 'default-workspace'],
+    })
+    const { remote, dispose } = createAdapter({ bridge })
+    const result = await faceOfRegistry(remote).workspace.initializeDefault()
+    expect(result['ok']).toBe(true)
+    expect((result['value'] as { workspace: { workspaceId: string } }).workspace.workspaceId).toBe('default-workspace')
+    dispose()
+  })
+
+  it('拖拽排序：回值=完整顺序、推 order 帧、重启基线与客户端模型都按新顺序（SH-111）', async () => {
+    const bridge = scriptedBridge({
+      ...HOST_SETTINGS,
+      workspaces: [{ id: 'ws-a', path: 'A', title: 'A' }, { id: 'ws-b', path: 'B', title: 'B' }],
+    })
     const { remote, dispose } = createAdapter({ bridge })
     const face = faceOfRegistry(remote)
-    const result = await face.workspace.create({ path: 'W' })
-    expect(result['ok']).toBe(true)
-    expect((result['value'] as { created: boolean }).created).toBe(false)
     const iterator = face.workspace.follow()
-    const items = await baselineOf(iterator)
-    expect(items[0]?.['workspaceId']).toBe('default-workspace')
-    expect(items[0]?.['title']).toBe('default-workspace')
+    const baseline = await baselineOf(iterator)
+    expect(baseline.map(item => item['workspaceId'])).toEqual(['default-workspace', 'ws-a', 'ws-b'])
+    const model = modelOf(remote)
+    // 模型先装上基线才有 items 可排（installOrder 排的是已投影的行）
+    model.replaceBaseline({ items: baseline, archivedSessionIds: [], pinnedSessionIds: [] })
+    const moved = await model.insertBefore('ws-b', 'default-workspace')
+    expect(moved.ok).toBe(true)
+    expect(moved.value.workspaceIds).toEqual(['ws-b', 'default-workspace', 'ws-a'])
+    // 客户端模型装上 Host 确认的完整顺序（不是只有被移动那一家）
+    expect(model.getSnapshot().items.map(item => item.workspaceId)).toEqual(['ws-b', 'default-workspace', 'ws-a'])
+    const frame = (await iterator.next()).value as { type: string; workspaceIds: string[] }
+    expect(frame.type).toBe('order')
+    expect(frame.workspaceIds).toEqual(['ws-b', 'default-workspace', 'ws-a'])
     await iterator.return?.(undefined)
+    // 重启 = 新 adapter 读同一份宿主文档：顺序持久，不回落 config 数组序
+    const restarted = createAdapter({ bridge })
+    const second = faceOfRegistry(restarted.remote).workspace.follow()
+    expect((await baselineOf(second)).map(item => item['workspaceId'])).toEqual(['ws-b', 'default-workspace', 'ws-a'])
+    await second.return?.(undefined)
+    restarted.dispose()
+    dispose()
+  })
+
+  it('拖拽排序的非法锚点按 workspace/not-found 回显，details 带 workspaceId（SH-111）', async () => {
+    const bridge = scriptedBridge({ ...HOST_SETTINGS, workspaces: [{ id: 'ws-a', path: 'A', title: 'A' }] })
+    const { remote, dispose } = createAdapter({ bridge })
+    const face = faceOfRegistry(remote)
+    const result = await face.workspace.insertBefore({ workspaceId: 'ws-a', beforeWorkspaceId: 'ws-gone' })
+    expect(result['ok']).toBe(false)
+    const error = result['error'] as { code: string; details: Record<string, unknown> }
+    expect(error.code).toBe('workspace/not-found')
+    expect(error.details['workspaceId']).toBe('ws-a')
+    // 失败不写宿主顺序
+    expect(bridge.calls.filter(call => call.command === 'insert_workspace_before')).toHaveLength(1)
     dispose()
   })
 })

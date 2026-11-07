@@ -538,9 +538,16 @@ pub struct WorkspaceConfig {
     pub title: String,
     /// 默认工作区的删除标记（上游 registry delete 同构）：true = 不进工作区清单，
     /// 目录与会话档案全保留（会话显示在「未分组」）。`[workspace].root` 是运行期
-    /// 依赖的全局根，物理删除等于停用 Agent 操作目录，所以落标记而不是删字段；
-    /// 重新添加同一路径即复活（上游重新 create = 全新注册，标题一并重置）。
+    /// 依赖的全局根，物理删除等于停用 Agent 操作目录，所以落标记而不是删字段。
+    /// 标记**不因重新添加同路径而清除**——上游 `deleteKnown` 同样不清
+    /// `defaultWorkspaceId`，重新添加走全新注册（新 id），启动初始化也不复活它。
     pub hidden: bool,
+    /// 工作区展示顺序（SH-111，上游 registry `state.workspaceIds` 的等价物）：
+    /// 完整 id 列表，含 `default-workspace`。空 = 未拖拽过，按派生序
+    /// （默认项若可见则居首，其后 `[[workspaces]]` 数组序）。写过之后本字段是
+    /// 权威顺序：已不在注册表的 id 丢弃，新注册未列出的 id 按派生序补尾。
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub order: Vec<String>,
 }
 
 /// 解析出的数据目录（§9.3：解析结果写入日志第一行）。
