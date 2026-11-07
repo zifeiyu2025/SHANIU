@@ -29,6 +29,7 @@ import { apply as uiTrajectoryApply, inject as uiTrajectoryInject } from '@deeps
 import { apply as uiUserQuestionsApply, inject as uiUserQuestionsInject } from '@deepseek-ai/dsh-client-ui-user-questions/client'
 import { apply as uiModelSelectionApply, inject as uiModelSelectionInject } from '@deepseek-ai/dsh-client-ui-model-selection/client'
 import { apply as uiPlanApply, inject as uiPlanInject } from '@deepseek-ai/dsh-client-ui-plan/client'
+import { apply as uiGoalApply, inject as uiGoalInject } from '@deepseek-ai/dsh-client-ui-goal/client'
 import { apply as uiPermissionApply, inject as uiPermissionInject } from '@deepseek-ai/dsh-client-ui-permission-presets/client'
 import { apply as uiDeliverablesApply, inject as uiDeliverablesInject } from '@deepseek-ai/dsh-client-ui-deliverables/client'
 import { apply as uiAttachmentApply, inject as uiAttachmentInject } from '@deepseek-ai/dsh-client-ui-attachment/client'
@@ -159,7 +160,7 @@ export async function bootShaniu(container: HTMLElement): Promise<BootHandle> {
         return typeof scoped?.scope === 'function' ? scoped.scope(sessionId) : undefined
       },
     })
-    const covered = ['session', 'workspace', 'workspaceFiles', 'fileReferences', 'sessionReferenceResolver', 'skills', 'toolResults', 'settings', 'llm', 'credentials', 'commands', 'permissionPresets', 'subagents', 'pluginInventory', 'pluginManager', 'pluginRegistryProbe', 'schedule']
+    const covered = ['session', 'workspace', 'workspaceFiles', 'fileReferences', 'sessionReferenceResolver', 'skills', 'goals', 'toolResults', 'settings', 'llm', 'credentials', 'commands', 'permissionPresets', 'subagents', 'pluginInventory', 'pluginManager', 'pluginRegistryProbe', 'schedule']
     root.provide('remote', adapter.remote)
     // 适配层已接管的名字不再被 stub 覆盖：后注册的 stub 会让"消息流能跑、
     // 设置页永远抛错"，而抛错看起来像后端坏了，不像接线接反了。
@@ -261,6 +262,9 @@ export async function bootShaniu(container: HTMLElement): Promise<BootHandle> {
     { inject: uiUserQuestionsInject, apply: uiUserQuestionsApply },
     { inject: uiModelSelectionInject, apply: uiModelSelectionApply },
     { inject: uiPlanInject, apply: uiPlanApply },
+    // 目标条（SH-088）：输入卡 dock 的 GoalBar + `/goal` 用户文本引用；
+    // 数据面是 transport 的 remote.goals 与 goal 投影/activation 事件帧。
+    { inject: uiGoalInject, apply: uiGoalApply },
     { inject: uiPermissionInject, apply: uiPermissionApply },
     { inject: uiDeliverablesInject, apply: uiDeliverablesApply },
     { inject: uiAttachmentInject, apply: uiAttachmentApply },

@@ -39,6 +39,9 @@ import type { FileReferenceCandidate } from '@deepseek-ai/dsh-file-reference/typ
 import type { SessionReferenceMentionCandidate } from '@deepseek-ai/dsh-session-reference/types'
 import type { SkillEntry } from '@deepseek-ai/dsh-api-session-controller/types'
 import type { CompactionCheckpointSource } from '@deepseek-ai/dsh-compaction/checkpoint'
+import type {
+  CreateGoalRequest, CreateGoalResult, EditGoalRequest, GoalRef, GoalView,
+} from '@deepseek-ai/dsh-goal/client'
 
 declare module '@deepseek-ai/dsh-llm' {
   interface MessageSourceMap {
@@ -127,11 +130,22 @@ interface SkillsRemote {
   list(request: { readonly sessionId: SessionId }, signal?: AbortSignal): Promise<RemoteResult<{ readonly skills: readonly SkillEntry[] }>>
 }
 
+/** 会话目标（SH-088）：与上游 GoalService 的 Remote 面同形；`get` 无目标返回 undefined。 */
+interface GoalsRemote {
+  get(sessionId: SessionId): Promise<RemoteResult<GoalView | undefined>>
+  create(sessionId: SessionId, request: CreateGoalRequest): Promise<RemoteResult<CreateGoalResult>>
+  edit(sessionId: SessionId, ref: GoalRef, request: EditGoalRequest): Promise<RemoteResult<GoalView>>
+  pause(sessionId: SessionId, ref: GoalRef): Promise<RemoteResult<GoalView>>
+  resume(sessionId: SessionId, ref: GoalRef): Promise<RemoteResult<GoalView>>
+  clear(sessionId: SessionId, ref: GoalRef): Promise<RemoteResult<GoalRef>>
+}
+
 export interface RemoteNamespaces {
   readonly session: SessionRemote
   readonly fileReferences: FileReferencesRemote
   readonly sessionReferenceResolver: SessionReferenceResolverRemote
   readonly skills: SkillsRemote
+  readonly goals: GoalsRemote
   readonly settings: SettingsRemote
   readonly credentials: CredentialsRemote
   readonly llm: LlmRemote

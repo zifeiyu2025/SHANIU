@@ -75,6 +75,9 @@ function scriptedBridge(
   const workspaceFlags = { archived: [] as string[], pinned: [] as string[], order: [] as string[] }
   // SH-115：进程级 PlanState 的替身（set/get 共用同一份布尔，模拟宿主持久态）
   let planActive = false
+  // SH-088：目标 durable 投影的替身（revision CAS 语义对齐 goals.rs）
+  let goalState: Record<string, unknown> | null = null
+  let goalSeq = 0
   // 宿主语义的关键一条：save_settings 落盘 config.toml，之后的 get_settings 回读新值。
   // 测试桥按同一语义模拟（每份桥独立的克隆，避免测试间串味），挡位切换的投影推帧
   // 才能测到"切换后 UI 显示新挡位"而不是停在旧值。
@@ -102,6 +105,61 @@ function scriptedBridge(
       if (command === 'compact_session') {
         if (compactHandler === undefined) return null as T
         return compactHandler(args) as T
+      }
+      // SH-088：目标 store 的宿主替身——与 goals.rs 同语义：稳定 id、单调 revision、
+      // 所有写操作做 CAS；activation 不在宿主，只回 durable 投影。
+      if (command === 'goal_get') return goalState as T
+      if (command === 'goal_create') {
+        const phase = (goalState?.['goal'] as Record<string, unknown> | undefined)?.['phase']
+        if (phase !== undefined && phase !== 'complete') {
+          throw { code: 'GOAL_ALREADY_EXISTS', message: '已有进行中的目标' }
+        }
+        const objective = String(args?.['objective'] ?? '').trim()
+        if (objective === '') throw { code: 'GOAL_INVALID_OBJECTIVE', message: '目标内容不能为空' }
+        const maxGoalRounds = Number(args?.['maxGoalRounds'] ?? 256)
+        if (!Number.isInteger(maxGoalRounds) || maxGoalRounds <= 0) {
+          throw { code: 'GOAL_INVALID_MAX_ROUNDS', message: 'maxGoalRounds 必须是正整数' }
+        }
+        goalSeq += 1
+        goalState = {
+          goal: { id: `goal-${goalSeq}`, revision: 1, objective, phase: 'active', maxGoalRounds },
+          roundsStarted: 0, createdAt: goalSeq, updatedAt: goalSeq,
+        }
+        return structuredClone(goalState) as T
+      }
+      if (command === 'goal_edit' || command === 'goal_pause' || command === 'goal_resume' || command === 'goal_clear') {
+        const goal = goalState?.['goal'] as Record<string, unknown> | undefined
+        if (goal === undefined) throw { code: 'GOAL_NOT_FOUND', message: '当前没有目标' }
+        if (args?.['goalId'] !== goal['id'] || args?.['revision'] !== goal['revision']) {
+          throw { code: 'GOAL_STALE_REVISION', message: '目标已被更新，请重读后再试' }
+        }
+        if (command === 'goal_clear') {
+          const tombstone = { id: goal['id'], revision: Number(goal['revision']) + 1 }
+          goalState = null
+          return tombstone as T
+        }
+        const next: Record<string, unknown> = { ...goal, revision: Number(goal['revision']) + 1 }
+        if (command === 'goal_edit') {
+          if (args?.['objective'] === undefined && args?.['maxGoalRounds'] === undefined) {
+            throw { code: 'GOAL_INVALID_EDIT', message: '目标编辑至少需要 objective 或 maxGoalRounds' }
+          }
+          if (args?.['objective'] !== undefined) {
+            const objective = String(args['objective']).trim()
+            if (objective === '') throw { code: 'GOAL_INVALID_OBJECTIVE', message: '目标内容不能为空' }
+            next['objective'] = objective
+          }
+          if (args?.['maxGoalRounds'] !== undefined) next['maxGoalRounds'] = args['maxGoalRounds']
+        } else if (command === 'goal_pause') {
+          if (goal['phase'] !== 'active') throw { code: 'GOAL_INVALID_TRANSITION', message: '只有 active 目标可以暂停' }
+          next['phase'] = 'paused'
+        } else {
+          if (goal['phase'] !== 'paused' && goal['phase'] !== 'blocked' && goal['phase'] !== 'active') {
+            throw { code: 'GOAL_INVALID_TRANSITION', message: '该阶段不能恢复' }
+          }
+          next['phase'] = 'active'
+        }
+        goalState = { ...goalState, goal: next }
+        return structuredClone(goalState) as T
       }
       if (command === 'save_settings') {
         if (saveFailure !== undefined) throw saveFailure
@@ -1737,16 +1795,122 @@ describe('Plan 芯片与客户端排队', () => {
     dispose()
   })
 
-  it('命令目录：四条宿主命令带第一方 definitionId（菜单行与中文别名据此渲染）', async () => {
+  it('命令目录：五条宿主命令带第一方 definitionId（菜单行与中文别名据此渲染）', async () => {
     const bridge = scriptedBridge()
     const { remote, dispose } = createAdapter({ bridge })
     const face = faceOf3(remote)
     expect((await face.commands.list('agent-new'))['value']).toEqual([
       { definitionId: '@deepseek-ai/dsh-command-compact', name: 'compact', description: 'Compact older conversation history' },
       { definitionId: '@deepseek-ai/dsh-plan-mode', name: 'plan', description: 'Enter or leave plan mode', input: { hint: '[off|message]', attachments: false } },
+      { definitionId: '@deepseek-ai/dsh-command-goal', name: 'goal', description: 'Set or view the goal for a long-running task', input: { hint: '[<objective>|clear|edit <objective>|pause|resume]', attachments: false } },
       { definitionId: '@deepseek-ai/dsh-permission-presets', name: 'permission', description: 'Switch the permission preset (sandbox mode + approval policy)', input: { hint: '<preset>' } },
       { definitionId: '@deepseek-ai/dsh-session-log-export', name: 'export', description: 'Download this Session log as a ZIP archive' },
     ])
+    dispose()
+  })
+
+  it('/goal：创建/查看/暂停/恢复/编辑/清除，非法语法与重复创建报上游口径错误', async () => {
+    const bridge = scriptedBridge()
+    const { remote, dispose } = createAdapter({ bridge })
+    const face = faceOf3(remote)
+    const textOf = (result: Record<string, unknown>) =>
+      (result as { value: { result: { text: string } } }).value.result.text
+    const kindOf = (result: Record<string, unknown>) =>
+      (result as { value: { result: { kind: string } } }).value.result.kind
+
+    // 空目录：bare 命令教用法
+    expect(textOf(await face.commands.execute('agent-new', '/goal'))).toContain('No goal is currently set.')
+    expect(kindOf(await face.commands.execute('agent-new', '/goal'))).toBe('success')
+
+    // 创建
+    const created = await face.commands.execute('agent-new', '/goal 把 SH-088 修绿')
+    expect(kindOf(created)).toBe('success')
+    expect(textOf(created)).toContain('Goal created')
+    expect(textOf(created)).toContain('Objective: 把 SH-088 修绿')
+    expect(textOf(created)).toContain('Rounds: 0/256')
+
+    // 已有进行中的目标：拒绝重复创建（不覆盖）
+    const duplicate = await face.commands.execute('agent-new', '/goal 再开一个')
+    expect(kindOf(duplicate)).toBe('error')
+    expect(textOf(duplicate)).toContain('A goal is already active.')
+
+    expect(textOf(await face.commands.execute('agent-new', '/goal pause'))).toContain('Goal paused')
+    expect(textOf(await face.commands.execute('agent-new', '/goal resume'))).toContain('Goal resumed')
+    expect(textOf(await face.commands.execute('agent-new', '/goal edit 换成新目标'))).toContain('Goal updated')
+    expect(textOf(await face.commands.execute('agent-new', '/goal edit 换成新目标'))).toContain('Objective: 换成新目标')
+
+    const bareEdit = await face.commands.execute('agent-new', '/goal edit')
+    expect(kindOf(bareEdit)).toBe('error')
+    expect(textOf(bareEdit)).toContain('Goal editing requires a replacement objective.')
+
+    expect(textOf(await face.commands.execute('agent-new', '/goal clear'))).toBe('Goal cleared.')
+    expect(textOf(await face.commands.execute('agent-new', '/goal clear'))).toBe('No goal to clear.')
+    dispose()
+  })
+
+  it('remote.goals：create/get/pause/resume/edit/clear 与 activation 边沿、CAS 拒绝', async () => {
+    const bridge = scriptedBridge()
+    const { remote, dispose } = createAdapter({ bridge })
+    const face = remote as unknown as {
+      goals: {
+        get(sessionId: string): Promise<Record<string, unknown>>
+        create(sessionId: string, request: Record<string, unknown>): Promise<Record<string, unknown>>
+        edit(sessionId: string, ref: Record<string, unknown>, request: Record<string, unknown>): Promise<Record<string, unknown>>
+        pause(sessionId: string, ref: Record<string, unknown>): Promise<Record<string, unknown>>
+        resume(sessionId: string, ref: Record<string, unknown>): Promise<Record<string, unknown>>
+        clear(sessionId: string, ref: Record<string, unknown>): Promise<Record<string, unknown>>
+      }
+      $on(event: string, listener: (event: Record<string, unknown>) => void): () => void
+    }
+    const activations: Record<string, unknown>[] = []
+    const off = face.$on('goal/activation-changed', event => { activations.push(event) })
+
+    expect(await face.goals.get('agent-new')).toMatchObject({ ok: true, value: undefined })
+
+    expect(await face.goals.create('agent-new', { objective: '把 SH-088 修绿' })).toMatchObject({
+      ok: true, value: { ref: { id: 'goal-1', revision: 1 } },
+    })
+    expect(activations.at(-1)).toMatchObject({
+      sessionId: 'agent-new', goal: { id: 'goal-1', revision: 1, activation: 'armed' },
+    })
+    expect(await face.goals.get('agent-new')).toMatchObject({
+      ok: true,
+      value: {
+        id: 'goal-1', revision: 1, objective: '把 SH-088 修绿', phase: 'active',
+        activation: 'armed', roundsStarted: 0, maxGoalRounds: 256,
+      },
+    })
+
+    // 旧 revision 被宿主 CAS 拒绝，进程内 activation 不动
+    expect(await face.goals.pause('agent-new', { id: 'goal-1', revision: 99 })).toMatchObject({
+      ok: false, error: { code: 'GOAL_STALE_REVISION' },
+    })
+    expect((await face.goals.get('agent-new')) as { value: { activation: string } }).toMatchObject({
+      value: { activation: 'armed' },
+    })
+
+    expect(await face.goals.pause('agent-new', { id: 'goal-1', revision: 1 })).toMatchObject({
+      ok: true, value: { phase: 'paused', revision: 2, activation: 'disarmed' },
+    })
+    expect(activations.at(-1)).toMatchObject({ sessionId: 'agent-new', goal: { activation: 'disarmed' } })
+
+    expect(await face.goals.resume('agent-new', { id: 'goal-1', revision: 2 })).toMatchObject({
+      ok: true, value: { phase: 'active', revision: 3, activation: 'armed' },
+    })
+
+    // edit 不产生 activation 边沿（上游语义）
+    const beforeEdit = activations.length
+    expect(await face.goals.edit('agent-new', { id: 'goal-1', revision: 3 }, { objective: '换一个目标', maxGoalRounds: 8 })).toMatchObject({
+      ok: true, value: { objective: '换一个目标', maxGoalRounds: 8, revision: 4, activation: 'armed' },
+    })
+    expect(activations).toHaveLength(beforeEdit)
+
+    expect(await face.goals.clear('agent-new', { id: 'goal-1', revision: 4 })).toMatchObject({
+      ok: true, value: { id: 'goal-1', revision: 5 },
+    })
+    expect(activations.at(-1)).toEqual({ sessionId: 'agent-new' })
+    expect(await face.goals.get('agent-new')).toMatchObject({ ok: true, value: undefined })
+    off()
     dispose()
   })
 

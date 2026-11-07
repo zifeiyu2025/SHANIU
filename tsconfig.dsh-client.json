@@ -519,6 +519,12 @@
    "@deepseek-ai/dsh-client-ui-permission-presets/client": [
     "./src/dsh/packages/client/ui-permission-presets/src/client/index.ts"
    ],
+   "@deepseek-ai/dsh-client-ui-goal": [
+    "./src/dsh/packages/client/ui-goal/src/index.ts"
+   ],
+   "@deepseek-ai/dsh-client-ui-goal/*": [
+    "./src/dsh/packages/client/ui-goal/src/*"
+   ],
    "@deepseek-ai/dsh-client-ui-plan": [
     "./src/dsh/packages/client/ui-plan/src/index.ts"
    ],
@@ -1736,6 +1742,9 @@
    ],
    "@deepseek-ai/dsh-client-ui-model-selection/client": [
     "./src/dsh/packages/client/ui-model-selection/src/client/index.ts"
+   ],
+   "@deepseek-ai/dsh-client-ui-goal/client": [
+    "./src/dsh/packages/client/ui-goal/src/client/index.ts"
    ],
    "@deepseek-ai/dsh-client-ui-plan/client": [
     "./src/dsh/packages/client/ui-plan/src/client/index.ts"
@@ -3215,6 +3224,19 @@
   "./src/dsh/packages/client/ui-permission-presets/src/client/settings-store.ts",
   "./src/dsh/packages/client/ui-permission-presets/src/css-modules.d.ts",
   "./src/dsh/packages/client/ui-permission-presets/src/index.ts",
+  "./src/dsh/packages/client/ui-goal/src/client/GoalBar.module.css",
+  "./src/dsh/packages/client/ui-goal/src/client/GoalBar.tsx",
+  "./src/dsh/packages/client/ui-goal/src/client/GoalCommandInputView.module.css",
+  "./src/dsh/packages/client/ui-goal/src/client/GoalCommandInputView.tsx",
+  "./src/dsh/packages/client/ui-goal/src/client/GoalCommandReference.tsx",
+  "./src/dsh/packages/client/ui-goal/src/client/activation-source.ts",
+  "./src/dsh/packages/client/ui-goal/src/client/goal-command-input.ts",
+  "./src/dsh/packages/client/ui-goal/src/client/index.ts",
+  "./src/dsh/packages/client/ui-goal/src/client/locales.ts",
+  "./src/dsh/packages/client/ui-goal/src/client/slots.ts",
+  "./src/dsh/packages/client/ui-goal/src/client/user-text-rules.ts",
+  "./src/dsh/packages/client/ui-goal/src/css-modules.d.ts",
+  "./src/dsh/packages/client/ui-goal/src/index.ts",
   "./src/dsh/packages/client/ui-plan/src/client/PlanCard.tsx",
   "./src/dsh/packages/client/ui-plan/src/client/PlanModeControl.module.css",
   "./src/dsh/packages/client/ui-plan/src/client/PlanModeControl.tsx",

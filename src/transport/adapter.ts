@@ -74,6 +74,43 @@ interface SearchHitWire {
   readonly snippet: string
 }
 
+/**
+ * 目标域的 wire 形状（SH-088），与 vendored `@deepseek-ai/dsh-goal/client` 的
+ * `GoalSnapshot` / `GoalProjection` / `GoalView` 逐字段同形。宿主持久层
+ * （`src-tauri/src/goals.rs`）只产出 durable 部分；`activation` 是进程内状态，
+ * 由适配层叠加（上游同样不持久化）。
+ */
+type GoalPhase = 'active' | 'paused' | 'blocked' | 'complete'
+type GoalActivation = 'armed' | 'disarmed'
+
+interface GoalSnapshotWire {
+  readonly id: string
+  readonly revision: number
+  readonly objective: string
+  readonly phase: GoalPhase
+  readonly blockedReason?: { readonly code: string; readonly message: string }
+  readonly maxGoalRounds: number
+}
+
+interface GoalProjectionWire {
+  readonly goal: GoalSnapshotWire
+  readonly roundsStarted: number
+  readonly createdAt: number
+  readonly updatedAt: number
+}
+
+interface GoalViewWire extends GoalSnapshotWire {
+  readonly roundsStarted: number
+  readonly createdAt: number
+  readonly updatedAt: number
+  readonly activation: GoalActivation
+}
+
+interface GoalRefWire {
+  readonly id: string
+  readonly revision: number
+}
+
 /** 客户端排队的一条待发消息（回合进行中的提交；回合收口后按序自动补发）。 */
 interface QueuedSubmission {
   /** inbox 行与 updateQueue 的 itemId（上游 = UserMessage.id）。 */
@@ -493,6 +530,14 @@ export function createAdapter(options: AdapterOptions): { remote: unknown; dispo
   let planActive = false
   /** 排队消息的 id 序列（inbox 行身份）。 */
   let queueSeq = 0
+  /**
+   * 目标域（SH-088）：durable 投影从宿主持久层读（`goal_get`），进程内 activation
+   * 与上游一致只活在适配层内存里（armed/disarmed，永不落盘）。`goalLoaded` 区分
+   * "还没读过"与"读过、确实没有目标"，避免每次快照都付一次 IPC。
+   */
+  const goalCache = new Map<string, GoalProjectionWire | null>()
+  const goalLoaded = new Set<string>()
+  const goalActivations = new Map<string, GoalActivation>()
 
   /**
    * 子代理泳道登记表（SH-109）。后端没有子会话——子代理是 agent_loop task，事件经
@@ -556,6 +601,171 @@ export function createAdapter(options: AdapterOptions): { remote: unknown; dispo
     titles.set(sessionId, title)
     projectionSeq += 1
     projectionLog.append({ type: 'projection', sessionId, seq: projectionSeq, changes: [{ key: 'title', val: title }] })
+  }
+
+  // ---- 目标域（SH-088）：durable 投影 + 进程内 activation ----
+
+  /** 进程内续跑许可；缺省 disarmed（与上游 runtimeState 的初始值一致）。 */
+  const goalActivationOf = (sessionId: string): GoalActivation => goalActivations.get(sessionId) ?? 'disarmed'
+
+  /** 读宿主 durable 目标；读失败按"没有目标"判读（不伪造一个空目标）。 */
+  const loadGoal = async (sessionId: string): Promise<GoalProjectionWire | null> => {
+    if (goalLoaded.has(sessionId)) return goalCache.get(sessionId) ?? null
+    try {
+      const projection = await bridge.invoke<GoalProjectionWire | null>('goal_get', { sessionId })
+      goalCache.set(sessionId, projection)
+      goalLoaded.add(sessionId)
+      return projection
+    } catch {
+      return null
+    }
+  }
+
+  /** 目标投影整值推帧；clear 交显式 null，客户端据此收起目标条。 */
+  const pushGoalFrame = (sessionId: string, projection: GoalProjectionWire | null): void => {
+    goalCache.set(sessionId, projection)
+    goalLoaded.add(sessionId)
+    projectionSeq += 1
+    projectionLog.append({
+      type: 'projection', sessionId, seq: projectionSeq,
+      changes: [{ key: 'goal', val: projection }],
+    })
+  }
+
+  /** 进程内 activation 边沿：只有真的变化才派发（上游 setActivation 同口径）。 */
+  const pushGoalActivation = (
+    sessionId: string,
+    projection: GoalProjectionWire | null,
+    activation: GoalActivation,
+  ): void => {
+    if (goalActivationOf(sessionId) === activation) return
+    goalActivations.set(sessionId, activation)
+    dispatch('goal/activation-changed', {
+      sessionId,
+      ...(projection === null
+        ? {}
+        : { goal: { id: projection.goal.id, revision: projection.goal.revision, activation } }),
+    })
+  }
+
+  /** 宿主目标错误 → RemoteResult 失败（code 与上游 GoalErrorCode 同名）。 */
+  const goalFailure = (reason: unknown) => {
+    const raw = (reason ?? {}) as { code?: unknown; message?: unknown }
+    const code = typeof raw.code === 'string' ? raw.code : 'gateway/internal'
+    const message = typeof raw.message === 'string' ? raw.message : String(reason)
+    return { ok: false as const, error: new RemoteError(code as never, message, {} as never) }
+  }
+
+  /** durable 投影 + 进程内 activation → wire 的 GoalView。 */
+  const goalViewOf = (sessionId: string, projection: GoalProjectionWire): GoalViewWire => ({
+    ...projection.goal,
+    roundsStarted: projection.roundsStarted,
+    createdAt: projection.createdAt,
+    updatedAt: projection.updatedAt,
+    activation: goalActivationOf(sessionId),
+  })
+
+  /**
+   * 目标写操作共用收尾链：先落宿主 durable，再推投影帧，最后按上游口径推 activation
+   * 边沿（create/resume → armed，pause/clear → disarmed，edit 保持）。
+   */
+  const commitGoal = async (
+    sessionId: string,
+    call: () => Promise<GoalProjectionWire>,
+    activation: GoalActivation | 'keep',
+  ): Promise<GoalProjectionWire> => {
+    const projection = await call()
+    pushGoalFrame(sessionId, projection)
+    const next = activation === 'keep' ? goalActivationOf(sessionId) : activation
+    pushGoalActivation(sessionId, projection, next)
+    return projection
+  }
+
+  /** 命令面（`/goal`）与 Remote 面共用的目标动词；两边不许各写一份。 */
+  const goalActions = {
+    read: (sessionId: string): Promise<GoalProjectionWire | null> => loadGoal(sessionId),
+    create: (sessionId: string, request: { objective: string; maxGoalRounds?: number }) =>
+      commitGoal(sessionId, () => bridge.invoke<GoalProjectionWire>('goal_create', {
+        sessionId,
+        objective: request.objective,
+        ...(request.maxGoalRounds === undefined ? {} : { maxGoalRounds: request.maxGoalRounds }),
+      }), 'armed'),
+    edit: (sessionId: string, ref: GoalRefWire, request: { objective?: string; maxGoalRounds?: number }) =>
+      commitGoal(sessionId, () => bridge.invoke<GoalProjectionWire>('goal_edit', {
+        sessionId,
+        goalId: ref.id,
+        revision: ref.revision,
+        ...(request.objective === undefined ? {} : { objective: request.objective }),
+        ...(request.maxGoalRounds === undefined ? {} : { maxGoalRounds: request.maxGoalRounds }),
+      }), 'keep'),
+    pause: (sessionId: string, ref: GoalRefWire) =>
+      commitGoal(sessionId, () => bridge.invoke<GoalProjectionWire>('goal_pause', {
+        sessionId, goalId: ref.id, revision: ref.revision,
+      }), 'disarmed'),
+    resume: (sessionId: string, ref: GoalRefWire) =>
+      commitGoal(sessionId, () => bridge.invoke<GoalProjectionWire>('goal_resume', {
+        sessionId, goalId: ref.id, revision: ref.revision,
+      }), 'armed'),
+    clear: async (sessionId: string, ref: GoalRefWire): Promise<GoalRefWire> => {
+      const tombstone = await bridge.invoke<GoalRefWire>('goal_clear', {
+        sessionId, goalId: ref.id, revision: ref.revision,
+      })
+      pushGoalFrame(sessionId, null)
+      pushGoalActivation(sessionId, null, 'disarmed')
+      return tombstone
+    },
+  }
+
+  /**
+   * 目标域 Remote 面（SH-088）：`ui-goal` 的 get/create/edit/pause/resume/clear。
+   * `get` 与上游一样返回当前视图或 `undefined`（没有目标不是错误）；写操作把宿主
+   * 的结构化错误码原样带回（`GOAL_STALE_REVISION` 等）。
+   */
+  const goalsNamespace = {
+    get: async (sessionId: string) => {
+      try {
+        const projection = await goalActions.read(sessionId)
+        return OK(projection === null ? undefined : goalViewOf(sessionId, projection))
+      } catch (reason) {
+        return goalFailure(reason)
+      }
+    },
+    create: async (sessionId: string, request: { objective: string; maxGoalRounds?: number }) => {
+      try {
+        const projection = await goalActions.create(sessionId, request)
+        return OK({ ref: { id: projection.goal.id, revision: projection.goal.revision } })
+      } catch (reason) {
+        return goalFailure(reason)
+      }
+    },
+    edit: async (sessionId: string, ref: GoalRefWire, request: { objective?: string; maxGoalRounds?: number }) => {
+      try {
+        return OK(goalViewOf(sessionId, await goalActions.edit(sessionId, ref, request)))
+      } catch (reason) {
+        return goalFailure(reason)
+      }
+    },
+    pause: async (sessionId: string, ref: GoalRefWire) => {
+      try {
+        return OK(goalViewOf(sessionId, await goalActions.pause(sessionId, ref)))
+      } catch (reason) {
+        return goalFailure(reason)
+      }
+    },
+    resume: async (sessionId: string, ref: GoalRefWire) => {
+      try {
+        return OK(goalViewOf(sessionId, await goalActions.resume(sessionId, ref)))
+      } catch (reason) {
+        return goalFailure(reason)
+      }
+    },
+    clear: async (sessionId: string, ref: GoalRefWire) => {
+      try {
+        return OK(await goalActions.clear(sessionId, ref))
+      } catch (reason) {
+        return goalFailure(reason)
+      }
+    },
   }
 
   const currentModelSelection = (): Record<string, unknown> => ({
@@ -909,6 +1119,8 @@ export function createAdapter(options: AdapterOptions): { remote: unknown; dispo
       values: {
         modelSelection: currentModelSelection(), title: null, permissions: permissionsProjection(),
         ...(planProjectionValues()),
+        // 新会话不可能已有目标；显式 null 让客户端进入"无目标"态而不是加载态。
+        goal: null,
       },
     },
     assistantStream: { revision: 0 },
@@ -1626,6 +1838,8 @@ export function createAdapter(options: AdapterOptions): { remote: unknown; dispo
               ...metricsProjectionsOf(replayed),
               // 泳道位：父会话挂 subagentCatalog、泳道挂 subagentTiming（缺席=无数据）。
               ...subagentProjectionsOf(sessionId),
+              // 目标投影：重开旧会话时从宿主持久层读回当前目标（没有则 null）。
+              goal: await loadGoal(sessionId),
             },
           },
           assistantStream: { revision: replayed.revision },
@@ -1668,6 +1882,8 @@ export function createAdapter(options: AdapterOptions): { remote: unknown; dispo
             ...metricsProjectionsOf(journal),
             // 泳道位：父会话挂 subagentCatalog、泳道挂 subagentTiming（缺席=无数据）。
             ...subagentProjectionsOf(sessionId),
+            // 目标投影：每次快照都带上当前 durable 目标（没有则 null）。
+            goal: await loadGoal(sessionId),
           },
         },
         // 客户端总是带 assistantStream:true 打开，缺这个基线即 gateway/internal。
@@ -1699,6 +1915,10 @@ export function createAdapter(options: AdapterOptions): { remote: unknown; dispo
     control: async function* (signal?: AbortSignal): AsyncGenerator<Record<string, unknown>> {
       await face.refresh()
       const from = projectionLog.length
+      // 目标值来自宿主持久层（异步读），先把所有会话的目标读齐再产基线。
+      const goalById = new Map(await Promise.all(
+        [...journals.keys()].map(async id => [id, await loadGoal(id)] as const),
+      ))
       yield {
         type: 'baseline',
         value: {
@@ -1716,6 +1936,7 @@ export function createAdapter(options: AdapterOptions): { remote: unknown; dispo
               ...metricsProjectionsOf(journal),
               // 泳道位：父会话挂 subagentCatalog、泳道挂 subagentTiming（缺席=无数据）。
               ...subagentProjectionsOf(id),
+              goal: goalById.get(id) ?? null,
             },
           }])),
         },
@@ -2338,6 +2559,13 @@ export function createAdapter(options: AdapterOptions): { remote: unknown; dispo
       input: { hint: '[off|message]', attachments: false },
     },
     {
+      definitionId: CommandDefinitionId('@deepseek-ai/dsh-command-goal'),
+      name: 'goal',
+      description: 'Set or view the goal for a long-running task',
+      // 上游允许附件随目标提交；桌面壳没有把附件编入目标轮的通道，如实声明不接受。
+      input: { hint: '[<objective>|clear|edit <objective>|pause|resume]', attachments: false },
+    },
+    {
       definitionId: CommandDefinitionId('@deepseek-ai/dsh-permission-presets'),
       name: 'permission',
       description: 'Switch the permission preset (sandbox mode + approval policy)',
@@ -2464,6 +2692,97 @@ export function createAdapter(options: AdapterOptions): { remote: unknown; dispo
         }
         pushCommandDone(sessionId, run.commandId, result)
         return OK({ result })
+      }
+
+      // ---- /goal：目标条的人类入口（SH-088）----
+      // 语法与文案对齐上游 `command-goal`：show / create / edit / pause / resume / clear。
+      // 附件面如实声明不支持（descriptor attachments=false），不假装把附件送进目标轮。
+      if (/^\/goal\b/.test(input)) {
+        const raw = input.replace(/^\/goal\b/, '').trim()
+        const usage = 'Usage: /goal [<objective>|clear|edit <objective>|pause|resume]'
+        const run = pushCommandRun(sessionId, 'goal', raw)
+        const done = (result: { kind: 'success' | 'error'; text: string }) => {
+          pushCommandDone(sessionId, run.commandId, result)
+          return OK({ result })
+        }
+        const report = (title: string, view: GoalViewWire): string => {
+          const blocker = view.phase === 'blocked' && view.blockedReason !== undefined
+            ? [`Blocker: ${view.blockedReason.code}: ${view.blockedReason.message}`]
+            : []
+          const commands = view.phase === 'active'
+            ? (view.activation === 'armed'
+              ? '/goal edit <objective>, /goal pause, /goal clear'
+              : '/goal edit <objective>, /goal resume, /goal clear')
+            : view.phase === 'complete'
+              ? '/goal <objective>, /goal clear'
+              : '/goal edit <objective>, /goal resume, /goal clear'
+          return [
+            title,
+            `Status: ${view.phase}`,
+            ...blocker,
+            `Objective: ${view.objective}`,
+            `Rounds: ${view.roundsStarted}/${view.maxGoalRounds}`,
+            `Activation: ${view.activation}`,
+            '',
+            `Commands: ${commands}`,
+          ].join('\n')
+        }
+        try {
+          const current = await goalActions.read(sessionId)
+          const ref = current === null ? undefined : { id: current.goal.id, revision: current.goal.revision }
+
+          if (raw === '') {
+            return done(current === null
+              ? { kind: 'success', text: `No goal is currently set.\n${usage}` }
+              : { kind: 'success', text: report('Goal', goalViewOf(sessionId, current)) })
+          }
+          if (raw.toLowerCase() === 'clear') {
+            if (ref === undefined) return done({ kind: 'success', text: 'No goal to clear.' })
+            await goalActions.clear(sessionId, ref)
+            return done({ kind: 'success', text: 'Goal cleared.' })
+          }
+          if (raw.toLowerCase() === 'pause') {
+            if (ref === undefined) {
+              return done({ kind: 'error', text: `No goal is currently set; /goal pause requires one. ${usage}` })
+            }
+            return done({ kind: 'success', text: report('Goal paused', goalViewOf(sessionId, await goalActions.pause(sessionId, ref))) })
+          }
+          if (raw.toLowerCase() === 'resume') {
+            if (ref === undefined) {
+              return done({ kind: 'error', text: `No goal is currently set; /goal resume requires one. ${usage}` })
+            }
+            return done({ kind: 'success', text: report('Goal resumed', goalViewOf(sessionId, await goalActions.resume(sessionId, ref))) })
+          }
+          if (raw.toLowerCase() === 'edit') {
+            return done({ kind: 'error', text: `Goal editing requires a replacement objective.\n${usage}` })
+          }
+          if (/^edit(?=\s)/iu.test(raw)) {
+            const objective = raw.slice(4).trim()
+            if (current !== null && current.goal.phase === 'complete') {
+              const created = await goalActions.create(sessionId, { objective })
+              return done({ kind: 'success', text: report('Goal created', goalViewOf(sessionId, created)) })
+            }
+            if (ref === undefined) {
+              return done({ kind: 'error', text: `No goal is currently set; /goal edit requires one. ${usage}` })
+            }
+            const edited = await goalActions.edit(sessionId, ref, { objective })
+            return done({ kind: 'success', text: report('Goal updated', goalViewOf(sessionId, edited)) })
+          }
+
+          if (current !== null && current.goal.phase !== 'complete') {
+            return done({
+              kind: 'error',
+              text: `A goal is already ${current.goal.phase}. Use /goal edit <objective> to change it or /goal clear before replacing it.`,
+            })
+          }
+          const created = await goalActions.create(sessionId, { objective: raw })
+          return done({ kind: 'success', text: report('Goal created', goalViewOf(sessionId, created)) })
+        } catch {
+          return done({
+            kind: 'error',
+            text: 'The goal command is not valid for the current state. Run /goal to view available commands.',
+          })
+        }
       }
 
       // ---- /permission：挡位切换（SH-105 既有实现，文案对齐上游 permission-presets）----
@@ -2750,6 +3069,7 @@ export function createAdapter(options: AdapterOptions): { remote: unknown; dispo
     ['fileReferences', fileReferencesNamespace],
     ['sessionReferenceResolver', sessionReferenceResolverNamespace],
     ['skills', skillsNamespace],
+    ['goals', goalsNamespace],
     ['directoryPicker', directoryPickerNamespace],
     ['toolResults', toolResultsNamespace],
     ['settings', settingsNamespace],

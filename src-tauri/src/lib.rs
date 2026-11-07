@@ -9,6 +9,7 @@ pub mod events;
 pub mod file_actions;
 pub mod file_references;
 pub mod gateway;
+pub mod goals;
 pub mod model_client;
 pub mod model_discovery;
 pub mod open_in_app;
@@ -1549,7 +1550,13 @@ pub fn run() {
             open_in_app::open_workspace_path,
             file_references::list_file_references,
             session_reference::list_session_references,
-            skills::list_skills
+            skills::list_skills,
+            goals::goal_get,
+            goals::goal_create,
+            goals::goal_edit,
+            goals::goal_pause,
+            goals::goal_resume,
+            goals::goal_clear
         ])
         .on_window_event(|window, event| {
             // 关闭 = 隐藏到系统托盘（不退出）；真正退出只走托盘菜单「退出」

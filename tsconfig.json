@@ -502,6 +502,12 @@
    "@deepseek-ai/dsh-client-ui-permission-presets/client": [
     "./node_modules/.cache/dsh-types-client/src/dsh/packages/client/ui-permission-presets/src/client/index.d.ts"
    ],
+   "@deepseek-ai/dsh-client-ui-goal": [
+    "./node_modules/.cache/dsh-types-client/src/dsh/packages/client/ui-goal/src/index.d.ts"
+   ],
+   "@deepseek-ai/dsh-client-ui-goal/*": [
+    "./node_modules/.cache/dsh-types-client/src/dsh/packages/client/ui-goal/src/*"
+   ],
    "@deepseek-ai/dsh-client-ui-plan": [
     "./node_modules/.cache/dsh-types-client/src/dsh/packages/client/ui-plan/src/index.d.ts"
    ],
@@ -1746,6 +1752,9 @@
    ],
    "@deepseek-ai/dsh-client-ui-model-selection/client": [
     "./node_modules/.cache/dsh-types-client/src/dsh/packages/client/ui-model-selection/src/client/index.d.ts"
+   ],
+   "@deepseek-ai/dsh-client-ui-goal/client": [
+    "./node_modules/.cache/dsh-types-client/src/dsh/packages/client/ui-goal/src/client/index.d.ts"
    ],
    "@deepseek-ai/dsh-client-ui-plan/client": [
     "./node_modules/.cache/dsh-types-client/src/dsh/packages/client/ui-plan/src/client/index.d.ts"
