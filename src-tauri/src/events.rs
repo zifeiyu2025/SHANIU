@@ -212,6 +212,11 @@ pub enum EventMsg {
         child_id: String,
         sender_id: String,
         text: String,
+        /// additive（FF-2）：UI 注入时带上客户端铸造的 rpc id，泳道据此把
+        /// `source` 写成 `user + rpcId`，客户端撤销自己的乐观回显（上游
+        /// `BrowserPromptSource`）；模型侧 steering 不带，落 `agent-message`。
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        rpc_id: Option<String>,
     },
 }
 

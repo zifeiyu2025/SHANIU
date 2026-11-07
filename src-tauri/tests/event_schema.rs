@@ -68,7 +68,7 @@ fn all_variants() -> Vec<EventMsg> {
         EventMsg::SubagentExited { child_id: "01JCHILD".into(), status: SubagentExitStatus::Done, summary: "结论".into() },
         EventMsg::SubagentExited { child_id: "01JCHILD".into(), status: SubagentExitStatus::Failed, summary: "失败".into() },
         EventMsg::SubagentExited { child_id: "01JCHILD".into(), status: SubagentExitStatus::Cancelled, summary: "已取消".into() },
-        EventMsg::SubagentMessage { child_id: "01JCHILD".into(), sender_id: "root".into(), text: "请改看 transport".into() },
+        EventMsg::SubagentMessage { child_id: "01JCHILD".into(), sender_id: "root".into(), text: "请改看 transport".into(), rpc_id: Some("rpc-9".into()) },
     ];
     // 编译期穷举证明（SH-078）：无通配臂 match，EventMsg 新增变体而不更新上面的 vec 时编译失败；
     // vec 更新后 tag 集合随之扩大，EXPECTED_TAGS 不同步则标签集测试必红——双向闭环。

@@ -20,11 +20,14 @@
  * - agent name 合法性（上游 names.ts 的 NAME_PATTERN，transport 层不进 host
  *   编译域，本地复制）。
  *
- * EventMsg 协议面（`subagent_spawned` 等三个新消息）不在本模块——FF-2 镜像以
- * Rust `events.rs` 为源，TS 单侧加变体会打红镜像检查，归 SH-053 与 Rust 同批。
+ * EventMsg 协议面（`subagent_spawned`/`subagent_exited`/`subagent_message`）由 Rust
+ * `events.rs` 定义、`types.ts` 镜像（FF-2 双向门禁）；本模块只负责把这三个消息
+ * **翻译成上游的持久事实**（catalog v3 / descriptor v3 / relay 与 settled 两种
+ * user/message source），翻译规则单点在此，mock 与 adapter 共用。
  */
 import type { SessionId } from '@deepseek-ai/dsh-session/types'
 import type { SubagentCatalogEntry, SubagentTimingProjection } from '@deepseek-ai/dsh-subagent/client'
+import type { SubagentExitStatus } from './types'
 
 export type { SubagentCatalogEntry, SubagentTimingProjection }
 
@@ -148,4 +151,73 @@ export function timingProjectionOf(state: SubagentTimingState | undefined): Suba
   if (state === undefined) return undefined
   if (state.settledMs === 0 && state.active === undefined && !state.descriptorSeen) return undefined
   return timingView(state)
+}
+
+// ---- SH-053：后端生命周期事件 → 上游持久事实的翻译（单点，mock 与 adapter 共用）----
+
+/** 宿主只有一个执行引擎，descriptor 的 provider 用固定标识（上游是 ctx.subagents 的 provider 名）。 */
+export const LANE_PROVIDER = 'shaniu'
+
+/** spawn 元数据 → 父 journal 的 catalog v3 事件 data。 */
+export function catalogV3Of(childId: string, createdAt: number, label: string, name: string): SubagentCatalogEventData {
+  return { version: 3, childId: laneIdOf(childId), childCreatedAt: createdAt, mode: 'continuable', label, name }
+}
+
+/** spawn 元数据 → 子 journal 的 descriptor v3 事件 data（continuable 必带 label）。 */
+export function descriptorOf(label: string): SubagentDescriptorEventData {
+  return { version: 3, mode: 'continuable', provider: LANE_PROVIDER, label }
+}
+
+/**
+ * 终态 → 上游结算通知的 stopReason 词汇。ui-chat 的 `turn-trigger.ts` 只认
+ * completed/aborted/error/max-tokens/refusal，直接塞 done/failed/cancelled 会落到
+ * `message.trigger.subagent.unknown`（标题变成"未知结束"）。
+ */
+export function stopReasonOf(status: SubagentExitStatus): 'completed' | 'aborted' | 'error' {
+  return status === 'done' ? 'completed' : status === 'cancelled' ? 'aborted' : 'error'
+}
+
+/** steering 注入的 user/message source（上游 continuation-messages.ts 的 AgentMessageSource）。 */
+export function relaySourceOf(senderSessionId: string): { kind: 'agent-message'; form: 'relay'; senderSessionId: string } {
+  return { kind: 'agent-message', form: 'relay', senderSessionId }
+}
+
+const SETTLED_VERB: Record<SubagentExitStatus, string> = {
+  done: '已完成，不会再继续工作',
+  cancelled: '在完成前被停止',
+  failed: '在完成前失败',
+}
+
+/**
+ * 子代理收口 → 父 journal 的结算通知（上游 `createSettlementMessage` 的同构物：
+ * 一句状态摘要 + 收尾消息正文，source 带 stopReason 供 UI 取本地化标题）。
+ *
+ * 与上游的差别（有意）：这条通知**只呈现给用户**，不注入父代理上下文——SHANIU 的
+ * 父代理已经通过 `wait_agent` 拿到 ExitSummary，再注入一份就是重复上下文。
+ */
+export function settledNoticeOf(
+  childId: string,
+  name: string,
+  status: SubagentExitStatus,
+  summary: string,
+): {
+  content: { type: 'text'; text: string }[]
+  source: { kind: 'subagent-settled'; form: 'notice'; summary: string; stopReason: string; senderSessionId: string }
+} {
+  const headline = `子代理 ${name} ${SETTLED_VERB[status]}。`
+  const closing = summary.trim() === '' ? '它没有留下收尾消息。' : summary
+  return {
+    content: [
+      { type: 'text', text: headline },
+      { type: 'text', text: '它的收尾消息：' },
+      { type: 'text', text: closing },
+    ],
+    source: {
+      kind: 'subagent-settled',
+      form: 'notice',
+      summary: headline,
+      stopReason: stopReasonOf(status),
+      senderSessionId: childId,
+    },
+  }
 }

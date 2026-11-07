@@ -152,6 +152,15 @@ pub enum SpawnError {
     HistoryUnavailable { agent_id: String },
 }
 
+/// steering 注入的拒绝理由（类型化：命令面据此映射上游错误码，不靠文案匹配）。
+#[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
+pub enum SteerError {
+    #[error("未知子代理: {agent_id}")]
+    UnknownAgent { agent_id: String },
+    #[error("子代理已结束，无法注入消息: {agent_id}")]
+    Exited { agent_id: String },
+}
+
 /// 注册表对外快照（命令面/测试用）。时间为相对创建时刻的毫秒数。
 #[derive(Debug, Clone, PartialEq)]
 pub struct AgentSnapshot {
@@ -374,15 +383,18 @@ impl SubagentRegistry {
         agent_id
     }
 
-    /// 向未结束的子代理注入一条 steering 消息；结束/未知都 fail-closed。
-    pub fn send_message(&self, agent_id: &str, message: &str) -> Result<(), String> {
+    /// 向未结束的子代理注入一条 steering 消息；结束/未知都 fail-closed（类型化拒绝）。
+    ///
+    /// `rpc_id` 只在 UI 发起注入时带：泳道据此把消息 source 写成 `user + rpcId`，
+    /// 客户端撤销乐观回显；工具/父代理注入为 `None`，落 `agent-message`。
+    pub fn send_message(&self, agent_id: &str, message: &str, rpc_id: Option<&str>) -> Result<(), SteerError> {
         let (inbox, sink, sender_id) = {
             let inner = self.lock();
-            let entry = inner
-                .get(agent_id)
-                .ok_or_else(|| format!("未知子代理: {agent_id}"))?;
+            let entry = inner.get(agent_id).ok_or_else(|| SteerError::UnknownAgent {
+                agent_id: agent_id.to_string(),
+            })?;
             if entry.status == AgentStatus::Exited {
-                return Err(format!("子代理已结束，无法注入消息: {agent_id}"));
+                return Err(SteerError::Exited { agent_id: agent_id.to_string() });
             }
             (entry.inbox.clone(), entry.sink.clone(), entry.parent_id.clone())
         };
@@ -397,6 +409,7 @@ impl SubagentRegistry {
                 child_id: agent_id.to_string(),
                 sender_id,
                 text: message.to_string(),
+                rpc_id: rpc_id.map(str::to_string),
             },
         );
         Ok(())
@@ -931,7 +944,7 @@ mod tests {
         tokio::time::timeout(Duration::from_secs(2), started.notified())
             .await
             .expect("子代理应进入采样");
-        registry.send_message(&id, "请优先检查 X").expect("运行中应可注入");
+        registry.send_message(&id, "请优先检查 X", None).expect("运行中应可注入");
         gate.notify_one();
 
         let exit = registry.wait_exit(&id, Duration::from_secs(3)).await.expect("应结束");
@@ -950,7 +963,7 @@ mod tests {
     #[tokio::test]
     async fn messages_to_unknown_or_exited_agents_are_rejected() {
         let registry = Arc::new(SubagentRegistry::new(DEFAULT_MAX_CONCURRENT));
-        assert!(registry.send_message("no-such-agent", "hi").is_err());
+        assert!(registry.send_message("no-such-agent", "hi", None).is_err());
 
         let engine = engine(vec![vec![ModelStreamEvent::Completed {
             usage: Usage { input_tokens: 1, cached_input_tokens: None, output_tokens: 1 },
@@ -958,7 +971,7 @@ mod tests {
         let scope = root_scope();
         let id = registry.spawn(engine, &scope, "短任务", None).expect("派生应成功");
         registry.wait_exit(&id, Duration::from_secs(3)).await.expect("应结束");
-        assert!(registry.send_message(&id, "hi").is_err(), "已结束的代理不得再收消息");
+        assert!(registry.send_message(&id, "hi", None).is_err(), "已结束的代理不得再收消息");
     }
 
     /// resume_agent：已退出代理的历史被新代理沿用，并追加续跑指令。

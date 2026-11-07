@@ -92,7 +92,7 @@ impl AgentOrchestrator for RegistryOrchestrator {
     }
 
     fn send_message(&self, agent_id: &str, message: &str) -> Result<(), String> {
-        self.registry.send_message(agent_id, message)
+        self.registry.send_message(agent_id, message, None).map_err(|error| error.to_string())
     }
 }
 

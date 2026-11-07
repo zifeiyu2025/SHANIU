@@ -27,6 +27,9 @@ pub struct AppState {
     pub plan_state: Arc<PlanState>,
     /// 进程级后台作业注册表（SH-089）：跨任务保留，进程退出即清空。
     pub jobs: Arc<crate::jobs::JobRegistry>,
+    /// 活动任务的子代理注册表（SH-053 批 3）：UI steering/中断的命令面入口。
+    /// 与任务同生命周期——`end_task` 清空，避免把消息投进已收口的僵尸任务。
+    active_subagents: Mutex<Option<Arc<crate::subagent_registry::SubagentRegistry>>>,
 }
 
 impl AppState {
@@ -40,6 +43,7 @@ impl AppState {
             broker: Arc::new(ApprovalBroker::new()),
             plan_state: Arc::new(PlanState::new()),
             jobs: Arc::new(crate::jobs::JobRegistry::new()),
+            active_subagents: Mutex::new(None),
         }
     }
 
@@ -104,6 +108,17 @@ impl AppState {
     /// 结束活动任务（任务收口时调用）。
     pub fn end_task(&self) {
         *self.active_task.lock().expect("active_task 锁中毒") = None;
+        *self.active_subagents.lock().expect("active_subagents 锁中毒") = None;
+    }
+
+    /// 挂载活动任务的子代理注册表（任务启动、begin_task 成功后调用）。
+    pub fn set_subagents(&self, registry: Option<Arc<crate::subagent_registry::SubagentRegistry>>) {
+        *self.active_subagents.lock().expect("active_subagents 锁中毒") = registry;
+    }
+
+    /// 活动任务的子代理注册表（None = 空闲，steering 不可投递）。
+    pub fn subagents(&self) -> Option<Arc<crate::subagent_registry::SubagentRegistry>> {
+        self.active_subagents.lock().expect("active_subagents 锁中毒").clone()
     }
 
     /// 正在跑任务的会话 id（None = 空闲）。
@@ -182,6 +197,18 @@ mod tests {
         assert!(!s.has_active_task());
         assert_eq!(s.active_agent(), None);
         assert!(!s.cancel_active());
+    }
+
+    #[test]
+    fn subagent_registry_lives_only_for_the_active_task() {
+        let s = state();
+        assert!(s.subagents().is_none(), "空闲态没有可 steering 的注册表");
+        let registry = Arc::new(crate::subagent_registry::SubagentRegistry::new(2));
+        assert!(s.begin_task("sess-1", CancellationToken::new()));
+        s.set_subagents(Some(registry.clone()));
+        assert!(Arc::ptr_eq(&s.subagents().expect("任务期应能取到注册表"), &registry));
+        s.end_task();
+        assert!(s.subagents().is_none(), "任务收口必须释放注册表，否则 steering 会投进僵尸任务");
     }
 
     #[test]

@@ -2643,18 +2643,266 @@ describe('子代理泳道（SH-109）：AgentEvent 信封的 agent_id 路由', (
     dispose()
   })
 
-  it('remote.subagents 桌面真实态按上游错误码显式拒绝，不伪造受理', async () => {
+})
+
+describe('子代理生命周期事件接泳道（SH-053 批 2）', () => {
+  interface ControlFace {
+    session: SessionFace & {
+      control(): AsyncGenerator<{ value: { projections: Record<string, { values: Record<string, unknown> }> } }>
+    }
+  }
+  const spawned = {
+    type: 'subagent_spawned',
+    child_id: 'lane-a',
+    task: '探索 transport 边界\n第二行背景说明',
+    name: 'worker-1',
+    label: '探索 transport 边界',
+    created_at_ms: 1_760_000_000_000,
+  } as const
+
+  const followLane = (session: ControlFace['session'], childSessionId = 'lane-a', mode = 'continuable') =>
+    session.follow({ address: { kind: 'subagent', parentSessionId: 'agent-new', childSessionId, mode } })
+
+  it('spawned：父落 catalog v3、子落 descriptor v3 与任务消息，泳道运行态点亮', async () => {
     const bridge = scriptedBridge()
     const { remote, dispose } = createAdapter({ bridge })
+    const session = faceOf(remote).session as ControlFace['session']
+    const statuses: [string, boolean][] = []
+    ;(remote as unknown as { $on(event: string, listener: (...args: never[]) => unknown): () => void })
+      .$on('api-session/status', (id: string, running: boolean) => { statuses.push([id, running]); return Promise.resolve('') })
+
+    bridge.emit('agent-new', { type: 'turn_started', turn: 1 })
+    bridge.emit('agent-new', spawned, 'lane-a')
+    bridge.emit('agent-new', { type: 'turn_started', turn: 1 }, 'lane-a')
+    bridge.emit('agent-new', { type: 'agent_message_delta', delta: '开始探索' }, 'lane-a')
+
+    const parent = session.follow({ address: { kind: 'session', sessionId: 'agent-new' } })
+    const parentEvents = eventsOf((await parent.next()).value as Record<string, unknown>)
+    expect(parentEvents.map(event => event['type'])).toEqual(['turn/start', 'step/start', 'subagent/catalog'])
+    expect(parentEvents.at(-1)?.['data']).toEqual({
+      version: 3, childId: 'lane-a', childCreatedAt: 1_760_000_000_000,
+      mode: 'continuable', label: '探索 transport 边界', name: 'worker-1',
+    })
+    parentEvents.forEach(event => expect(() => assertSessionWireEvent(event)).not.toThrow())
+
+    const lane = followLane(session)
+    const laneEvents = eventsOf((await lane.next()).value as Record<string, unknown>)
+    expect(laneEvents.map(event => event['type'])).toEqual([
+      'subagent/descriptor', 'turn/start', 'step/start', 'user/message',
+    ])
+    expect(laneEvents[0]?.['data']).toMatchObject({ version: 3, mode: 'continuable', label: '探索 transport 边界' })
+    // 任务全文进泳道（不是 label 摘要）：子代理看到的与用户点开泳道看到的是同一份
+    expect(laneEvents[3]?.['data']).toMatchObject({
+      role: 'user', content: [{ type: 'text', text: '探索 transport 边界\n第二行背景说明' }],
+    })
+    laneEvents.forEach(event => expect(() => assertSessionWireEvent(event)).not.toThrow())
+    expect(statuses.filter(([id]) => id === 'lane-a')).toEqual([['lane-a', true]])
+
+    const control = session.control()
+    const baseline = (await control.next()).value
+    expect(baseline.value.projections['agent-new']?.values['subagentCatalog']).toEqual([
+      { id: 'lane-a', createdAt: 1_760_000_000_000, mode: 'continuable', label: '探索 transport 边界', name: 'worker-1' },
+    ])
+    // descriptor 已到达 → timing 有投影（settledMs 从 0 起算，active 区间开着）
+    expect(baseline.value.projections['lane-a']?.values['subagentTiming']).toMatchObject({ settledMs: 0 })
+    await control.return?.(undefined)
+    await lane.return?.(undefined)
+    await parent.return?.(undefined)
+    dispose()
+  })
+
+  it.each([['done', 'completed'], ['cancelled', 'aborted'], ['failed', 'error']] as const)(
+    'exited(%s)：父会话落结算通知，stopReason 映射成上游词汇 %s',
+    async (status, stopReason) => {
+      const bridge = scriptedBridge()
+      const { remote, dispose } = createAdapter({ bridge })
+      const session = faceOf(remote).session as ControlFace['session']
+      const statuses: [string, boolean][] = []
+      ;(remote as unknown as { $on(event: string, listener: (...args: never[]) => unknown): () => void })
+        .$on('api-session/status', (id: string, running: boolean) => { statuses.push([id, running]); return Promise.resolve('') })
+
+      bridge.emit('agent-new', { type: 'turn_started', turn: 1 })
+      bridge.emit('agent-new', spawned, 'lane-a')
+      bridge.emit('agent-new', { type: 'subagent_exited', child_id: 'lane-a', status, summary: '结论：边界清晰' }, 'lane-a')
+
+      const parent = session.follow({ address: { kind: 'session', sessionId: 'agent-new' } })
+      const parentEvents = eventsOf((await parent.next()).value as Record<string, unknown>)
+      const notice = parentEvents.at(-1)
+      expect(notice?.['type']).toBe('user/message')
+      expect(notice?.['data']).toMatchObject({
+        role: 'user',
+        source: { kind: 'subagent-settled', form: 'notice', stopReason, senderSessionId: 'lane-a' },
+      })
+      const content = (notice?.['data'] as { content: { type: string; text?: string }[] }).content
+      expect(content.some(part => part.type === 'text' && part.text === '结论：边界清晰')).toBe(true)
+      parentEvents.forEach(event => expect(() => assertSessionWireEvent(event)).not.toThrow())
+      // 排队阶段就被取消的子代理没有 turn_completed，运行态仍必须由 exited 收回
+      expect(statuses.at(-1)).toEqual(['lane-a', false])
+      await parent.return?.(undefined)
+      dispose()
+    },
+  )
+
+  it('message：steering 落子泳道 user/message（relay 来源），父 journal 不被污染', async () => {
+    const bridge = scriptedBridge()
+    const { remote, dispose } = createAdapter({ bridge })
+    const session = faceOf(remote).session as ControlFace['session']
+    bridge.emit('agent-new', { type: 'turn_started', turn: 1 })
+    bridge.emit('agent-new', spawned, 'lane-a')
+    bridge.emit('agent-new', { type: 'turn_started', turn: 1 }, 'lane-a')
+    bridge.emit('agent-new', { type: 'subagent_message', child_id: 'lane-a', sender_id: 'root', text: '请改看 ws-bridge' }, 'lane-a')
+
+    const lane = followLane(session)
+    const laneEvents = eventsOf((await lane.next()).value as Record<string, unknown>)
+    const steering = laneEvents.at(-1)
+    expect(steering?.['type']).toBe('user/message')
+    expect(steering?.['data']).toMatchObject({
+      role: 'user',
+      content: [{ type: 'text', text: '请改看 ws-bridge' }],
+      source: { kind: 'agent-message', form: 'relay', senderSessionId: 'root' },
+    })
+    laneEvents.forEach(event => expect(() => assertSessionWireEvent(event)).not.toThrow())
+
+    const parent = session.follow({ address: { kind: 'session', sessionId: 'agent-new' } })
+    const parentEvents = eventsOf((await parent.next()).value as Record<string, unknown>)
+    expect(JSON.stringify(parentEvents)).not.toContain('请改看 ws-bridge')
+    await lane.return?.(undefined)
+    await parent.return?.(undefined)
+    dispose()
+  })
+
+  it('审批卡 reason 带来源泳道名与任务摘要（上游契约无 subject 字段，不改 vendored）', async () => {
+    const bridge = scriptedBridge()
+    const { remote, dispose } = createAdapter({ bridge })
+    const seen: Record<string, unknown>[] = []
+    faceOf(remote).$on('approval/request', async (request: Record<string, unknown>) => {
+      seen.push(request)
+      return 'allowed-once'
+    })
+    bridge.emit('agent-new', spawned, 'lane-a')
+    bridge.emit('agent-new', {
+      type: 'exec_approval_request', request_id: 'r-l1', tool: 'apply_patch', args: { path: 'a.txt' }, risk: 'write_in_workspace',
+    }, 'lane-a')
+    await vi.waitFor(() => { expect(seen).toHaveLength(1) })
+    const reason = seen[0]!['reason'] as string
+    expect(reason).toContain('worker-1')
+    expect(reason).toContain('探索 transport 边界')
+    expect(reason).toContain('apply_patch')
+    dispose()
+  })
+
+  it('活动先于 spawned 到达：目录仍只有一行，元数据到达后升级为 continuable', async () => {
+    const bridge = scriptedBridge()
+    const { remote, dispose } = createAdapter({ bridge })
+    const session = faceOf(remote).session as ControlFace['session']
+    // 乱序兜底：先见到活动（懒建 v1 unknown），再拿到 spawn 元数据
+    bridge.emit('agent-new', { type: 'turn_started', turn: 1 }, 'lane-a')
+    bridge.emit('agent-new', spawned, 'lane-a')
+
+    const control = session.control()
+    const baseline = (await control.next()).value
+    const catalog = baseline.value.projections['agent-new']?.values['subagentCatalog'] as unknown[]
+    expect(catalog).toHaveLength(1)
+    expect(catalog[0]).toMatchObject({ id: 'lane-a', mode: 'continuable', name: 'worker-1' })
+    await control.return?.(undefined)
+    dispose()
+  })
+
+  it('remote.subagents.prompt 接真：文本投递带 rpcId，宿主类型化错误映射成上游错误码', async () => {
+    const bridge = scriptedBridge()
+    const hostCalls: { command: string; args: Record<string, unknown> | undefined }[] = []
+    let hostFailure: { code: string } | undefined
+    const wrapped = {
+      ...bridge,
+      invoke: async <T>(command: string, args?: Record<string, unknown>): Promise<T> => {
+        if (command === 'send_subagent_message' || command === 'interrupt_subagent') {
+          hostCalls.push({ command, args })
+          if (hostFailure !== undefined) throw hostFailure
+          return (command === 'send_subagent_message' ? 'msg-1' : true) as T
+        }
+        return bridge.invoke<T>(command, args)
+      },
+    }
+    const { remote, dispose } = createAdapter({ bridge: wrapped as typeof bridge })
     const subagents = (remote as unknown as {
       subagents: {
-        prompt(request: Record<string, unknown>): Promise<never>
-        interruptByUser(childSessionId: string): Promise<never>
+        prompt(request: Record<string, unknown>): Promise<{ ok: boolean; value?: { messageId: string }; error?: { code: string } }>
+        interruptByUser(childSessionId: string): Promise<{ ok: boolean; value?: { accepted: boolean }; error?: { code: string } }>
       }
     }).subagents
-    await expect(subagents.prompt({ childSessionId: 'lane-a', requestId: 'r1', delivery: 'queue', content: [] }))
-      .rejects.toThrow('SH-053')
-    await expect(subagents.interruptByUser('lane-a')).rejects.toThrow('SH-053')
+
+    const accepted = await subagents.prompt({
+      requestId: 'rpc-9', childSessionId: 'lane-a', delivery: 'steer', content: [{ type: 'text', text: '请改看 ws-bridge' }],
+    })
+    expect(accepted.ok).toBe(true)
+    expect(accepted.value).toEqual({ messageId: 'msg-1' })
+    expect(hostCalls[0]).toEqual({
+      command: 'send_subagent_message',
+      args: { agentId: 'lane-a', message: '请改看 ws-bridge', rpcId: 'rpc-9' },
+    })
+
+    // 文件部分：上游客户端就在路由层拒绝，宿主面同口径（不假装能传附件）
+    const file = await subagents.prompt({ childSessionId: 'lane-a', content: [{ type: 'file', path: 'a.txt' }] })
+    expect(file.ok).toBe(false)
+    expect(file.error?.code).toBe('subagent/attachment-invalid')
+
+    const empty = await subagents.prompt({ childSessionId: 'lane-a', content: [{ type: 'text', text: '  ' }] })
+    expect(empty.ok).toBe(false)
+    expect(empty.error?.code).toBe('gateway/bad-request')
+
+    hostFailure = { code: 'subagent/not-resumable' }
+    const exited = await subagents.prompt({ childSessionId: 'lane-a', content: [{ type: 'text', text: '继续' }] })
+    expect(exited.ok).toBe(false)
+    expect(exited.error?.code).toBe('subagent/not-resumable')
+
+    hostFailure = { code: 'subagent/delivery-unavailable' }
+    const idle = await subagents.prompt({ childSessionId: 'lane-a', content: [{ type: 'text', text: '继续' }] })
+    expect(idle.ok).toBe(false)
+    expect(idle.error?.code).toBe('subagent/delivery-unavailable')
+
+    // 上游语义：absent/idle/已完成的中断一律受理为 no-op，不弹假错误
+    hostFailure = undefined
+    const interrupted = await subagents.interruptByUser('lane-a')
+    expect(interrupted.ok).toBe(true)
+    expect(interrupted.value).toEqual({ accepted: true })
+    expect(hostCalls.at(-1)).toEqual({ command: 'interrupt_subagent', args: { agentId: 'lane-a' } })
+
+    const unknown = await subagents.interruptByUser('lane-zzz')
+    expect(unknown.ok).toBe(true)
+
+    // 唯一的中断失败：没有活动任务（没有可投递的注册表）
+    hostFailure = { code: 'subagent/delivery-unavailable' }
+    const idleTask = await subagents.interruptByUser('lane-a')
+    expect(idleTask.ok).toBe(false)
+    expect(idleTask.error?.code).toBe('subagent/delivery-unavailable')
+    dispose()
+  })
+
+  it('UI steering 的回显撤销：带 rpc_id 的注入落 user source，模型注入落 relay source', async () => {
+    const bridge = scriptedBridge()
+    const { remote, dispose } = createAdapter({ bridge })
+    const session = faceOf(remote).session as ControlFace['session']
+    bridge.emit('agent-new', spawned, 'lane-a')
+    bridge.emit('agent-new', { type: 'turn_started', turn: 1 }, 'lane-a')
+    bridge.emit('agent-new', {
+      type: 'subagent_message', child_id: 'lane-a', sender_id: 'user', text: '用户中途改问题', rpc_id: 'rpc-9',
+    }, 'lane-a')
+    bridge.emit('agent-new', { type: 'subagent_message', child_id: 'lane-a', sender_id: 'root', text: '父代理引导' }, 'lane-a')
+
+    const lane = followLane(session)
+    const laneEvents = eventsOf((await lane.next()).value as Record<string, unknown>)
+    const messages = laneEvents.filter(event => event['type'] === 'user/message')
+    expect(messages).toHaveLength(3) // 任务行 + 两条 steering
+    expect(messages[1]?.['data']).toMatchObject({
+      content: [{ type: 'text', text: '用户中途改问题' }],
+      source: { kind: 'user', rpcId: 'rpc-9' },
+    })
+    expect(messages[2]?.['data']).toMatchObject({
+      content: [{ type: 'text', text: '父代理引导' }],
+      source: { kind: 'agent-message', form: 'relay', senderSessionId: 'root' },
+    })
+    messages.forEach(event => expect(() => assertSessionWireEvent(event)).not.toThrow())
+    await lane.return?.(undefined)
     dispose()
   })
 })

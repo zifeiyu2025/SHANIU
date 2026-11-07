@@ -32,8 +32,9 @@ import { CommandDefinitionId } from '@deepseek-ai/dsh-commands/brand'
 import type { CommandDescriptor } from '@deepseek-ai/dsh-commands/types'
 import { requestExport } from './command-triggers'
 import {
-  catalogEntryOf, foldTimingEvent, initTimingState, laneIdOf, timingProjectionOf,
-  type SubagentCatalogEntry, type SubagentTimingState,
+  catalogEntryOf, catalogV3Of, descriptorOf, foldTimingEvent, initTimingState, laneIdOf,
+  relaySourceOf, settledNoticeOf, timingProjectionOf,
+  type SubagentCatalogEntry, type SubagentCatalogEventData, type SubagentTimingState,
 } from './subagent-wire'
 import type { AgentEvent, EventMsg } from './types'
 import type { HostBridge } from './tauri'
@@ -547,14 +548,21 @@ export function createAdapter(options: AdapterOptions): { remote: unknown; dispo
    *
    * 懒建口径：见到该 agent 的第一条事件才登记——"transport 亲眼见过它在干活"，
    * catalog 事件写 v1 `mode:'unknown'`（上游 v3 不允许 unknown，诚实标注"没拿到
-   * spawn 元数据"；元数据要等 SH-053 的 `SubagentSpawned` 消息，届时升级 v3
-   * continuable）。泳道行在侧栏/目录树的出现由 session-controller 的 projectList
+   * spawn 元数据"）。正常路径下 `subagent_spawned` 先于任何活动到达，走
+   * `registerSpawned` 直接建 v3 continuable；懒建只是乱序/旧档案的兜底。
+   * 泳道行在侧栏/目录树的出现由 session-controller 的 projectList
    * 消费 `subagentCatalog` 投影自动完成，UI 零改动。
    */
   interface AgentLane {
     readonly parentId: string
-    /** transport 首次见到该 agent 的时刻（懒建时刻，不是后端 spawn 时刻——如实标注）。 */
-    readonly createdAt: number
+    /** 父 catalog 的当前事实：懒建为 v1 unknown，拿到 spawn 元数据后升级 v3 continuable。 */
+    catalog: SubagentCatalogEventData
+    /** 是否已往父 journal 写过 catalog 事件——上游 fold 是 append-only，写第二条会多出一行。 */
+    catalogWritten: boolean
+    /** 泳道名 / 展示标签 / 任务全文（spawn 元数据；懒建时缺席，不猜）。 */
+    name?: string
+    label?: string
+    task?: string
     /** 泳道 timing 折叠（subagentTiming 投影的数据源，语义照上游 projection.ts）。 */
     timing: SubagentTimingState
   }
@@ -832,11 +840,9 @@ export function createAdapter(options: AdapterOptions): { remote: unknown; dispo
   /** 父会话的 `subagentCatalog` 投影值：没有登记泳道就缺席（不伪造空目录）。 */
   const catalogProjectionOf = (parentId: string): SubagentCatalogEntry[] | undefined => {
     const entries: SubagentCatalogEntry[] = []
-    for (const [laneId, lane] of agents) {
+    for (const lane of agents.values()) {
       if (lane.parentId !== parentId) continue
-      entries.push(catalogEntryOf({
-        version: 1, childId: laneIdOf(laneId), childCreatedAt: lane.createdAt, mode: 'unknown',
-      }))
+      entries.push(catalogEntryOf(lane.catalog))
     }
     return entries.length === 0 ? undefined : entries
   }
@@ -858,10 +864,11 @@ export function createAdapter(options: AdapterOptions): { remote: unknown; dispo
    */
   const ensureLane = (parentId: string, agentId: string): void => {
     if (agents.has(agentId)) return
-    agents.set(agentId, { parentId, createdAt: now(), timing: initTimingState() })
-    pushEvent(journalOf(parentId), 'subagent/catalog', {
+    const catalog: SubagentCatalogEventData = {
       version: 1, childId: laneIdOf(agentId), childCreatedAt: now(), mode: 'unknown',
-    })
+    }
+    agents.set(agentId, { parentId, catalog, catalogWritten: true, timing: initTimingState() })
+    pushEvent(journalOf(parentId), 'subagent/catalog', catalog)
     pushCatalogFrame(parentId)
   }
 
@@ -870,7 +877,7 @@ export function createAdapter(options: AdapterOptions): { remote: unknown; dispo
    * 时长由 UI 实时钟读（`activityDuration` 对 running 泳道取 now），`active.through`
    * 只在"回合中断在半路"的收口展示里用到，逐 delta 推帧是纯浪费。
    */
-  const foldLaneTiming = (laneId: string, eventType: 'turn/start' | 'turn/end' | 'advance', reasonKind?: string): void => {
+  const foldLaneTiming = (laneId: string, eventType: 'turn/start' | 'turn/end' | 'advance' | 'subagent/descriptor', reasonKind?: string): void => {
     const lane = agents.get(laneId)
     if (lane === undefined) return
     lane.timing = foldTimingEvent(lane.timing, eventType, now(), reasonKind)
@@ -896,6 +903,49 @@ export function createAdapter(options: AdapterOptions): { remote: unknown; dispo
     }
     const catalog = catalogProjectionOf(sessionId)
     return catalog === undefined ? {} : { subagentCatalog: catalog }
+  }
+
+  /**
+   * spawn 元数据到达（SH-053）：建/升级泳道为 v3 continuable，父 journal 落 catalog、
+   * 子 journal 落 descriptor 与任务全文，并点亮运行态。
+   *
+   * 上游 catalog fold 是 **append-only**（`catalog.ts` 的 appendChunkedList，不按 childId
+   * 去重），所以已经懒建写过 v1 的泳道只升级内存事实 + 推投影帧，不追加第二条 catalog
+   * ——否则目录树会多出一行。后端保证 spawned 先于子代理任何活动，这条兜底只在乱序时走到。
+   */
+  const registerSpawned = (parentId: string, msg: Extract<EventMsg, { type: 'subagent_spawned' }>): void => {
+    const laneId = msg.child_id
+    const lane: AgentLane = agents.get(laneId)
+      ?? { parentId, catalog: catalogV3Of(laneId, msg.created_at_ms, msg.label, msg.name), catalogWritten: false, timing: initTimingState() }
+    lane.catalog = catalogV3Of(laneId, msg.created_at_ms, msg.label, msg.name)
+    lane.name = msg.name
+    lane.label = msg.label
+    lane.task = msg.task
+    agents.set(laneId, lane)
+
+    if (!lane.catalogWritten) {
+      pushEvent(journalOf(parentId), 'subagent/catalog', lane.catalog)
+      lane.catalogWritten = true
+    }
+    pushCatalogFrame(parentId)
+
+    const journal = journalOf(laneId)
+    pushEvent(journal, 'subagent/descriptor', descriptorOf(msg.label))
+    foldLaneTiming(laneId, 'subagent/descriptor')
+    // 回合在这里开（与 submitPromptNow 同序）：任务行必须落在回合内，否则回合头不显示用时。
+    // 后端随后的第一条 turn_started 因 taskOpen 已真而成为空操作，timing 由这里折叠。
+    if (!journal.taskOpen) openTask(journal)
+    dispatch('api-session/status', laneId, true)
+    pushTurnStart(laneId, journal)
+    pushEvent(journal, 'step/start', { turn: journal.turn, step: journal.step })
+    beginStepMetrics(journal)
+    foldLaneTiming(laneId, 'turn/start')
+    pushEvent(journal, 'user/message', {
+      id: `shaniu-lane-task-${journal.seq + 1}`,
+      role: 'user',
+      content: [{ type: 'text', text: msg.task }],
+      source: relaySourceOf(parentId),
+    }, { surfaceOp: 'append' })
   }
 
   // ---- 底部指标的折叠动作（字段语义照上游 session-stats；时间取事件到达时刻）----
@@ -1383,7 +1433,14 @@ export function createAdapter(options: AdapterOptions): { remote: unknown; dispo
     // 卡片把 reason 当描述文本。`args`/`risk` 不在声明里，直接塞进去会被无声忽略——
     // 表现就是卡片只写"要执行工具"而不说执行什么，所以把它们并进 reason。
     const preview = JSON.stringify(msg.args)
-    const reason = `风险 ${msg.risk}：${msg.tool} ${preview.length > 160 ? `${preview.slice(0, 160)}…` : preview}`
+    // 来源代理与任务摘要：上游 ApprovalPresentationRequest 只有 toolName/callId/reason/
+    // displayReason（**没有 subject 字段**），塞新键会被无声忽略，所以并进 reason——
+    // 这是不改 vendored 源码又能让用户看清"哪个子代理要干什么"的唯一落点。
+    const lane = agents.get(sessionId)
+    const origin = lane === undefined
+      ? ''
+      : `子代理 ${lane.name ?? sessionId}（${lane.label ?? lane.task ?? sessionId}）：`
+    const reason = `${origin}风险 ${msg.risk}：${msg.tool} ${preview.length > 160 ? `${preview.slice(0, 160)}…` : preview}`
     let decision = 'deny'
     try {
       const outcome = await listener.call(approvalScope?.(sessionId), {
@@ -1412,6 +1469,11 @@ export function createAdapter(options: AdapterOptions): { remote: unknown; dispo
       ? event.agent_id
       : undefined
     const sessionId = laneId ?? event.session_id
+    if (msg.type === 'subagent_spawned') {
+      // 元数据先于活动到达：直接建 v3 泳道，不落 unknown 的懒建中间态（catalog 是 append-only）。
+      registerSpawned(event.session_id, msg)
+      return
+    }
     if (laneId !== undefined) ensureLane(event.session_id, laneId)
     // 泳道 timing 的 advance 折叠：delta/tool/usage 等事件推进 active.through（不推帧，
     // 见 foldLaneTiming 注记）；回合开合在各自 case 里折叠。
@@ -1575,6 +1637,39 @@ export function createAdapter(options: AdapterOptions): { remote: unknown; dispo
         // 闸随任务协程收口释放（晚于本事件）：排队消息在这里按序补发，对短时拒绝重试。
         void drainQueues()
         return
+      case 'subagent_exited': {
+        // 结算通知落**父** journal（上游 createSettlementMessage 的位置）：用户在父会话里
+        // 看到"哪个子代理、怎么结束、收尾说了什么"，泳道自身由 turn_completed 收口。
+        const lane = agents.get(msg.child_id)
+        const parentId = lane?.parentId ?? event.session_id
+        const parentJournal = journalOf(parentId)
+        const notice = settledNoticeOf(msg.child_id, lane?.name ?? msg.child_id, msg.status, msg.summary)
+        pushEvent(parentJournal, 'user/message', {
+          id: `shaniu-settled-${msg.child_id}-${parentJournal.seq + 1}`,
+          role: 'user',
+          content: notice.content,
+          source: notice.source,
+        }, { surfaceOp: 'append' })
+        // 排队阶段就被取消的子代理没有 turn_completed，运行态仍必须在这里收回，
+        // 否则目录树徽标与泳道 Stop 按钮永远停在运行中。
+        dispatch('api-session/status', msg.child_id, false)
+        return
+      }
+      case 'subagent_message': {
+        // steering 落**子**泳道的 user/message：UI 注入带 rpc_id（source=user+rpcId，
+        // 客户端据此撤销乐观回显），工具/父代理注入落 agent-message/relay。
+        // 父 journal 不被污染——泳道点开才看得到中途改了什么。
+        const laneJournal = journalOf(msg.child_id)
+        pushEvent(laneJournal, 'user/message', {
+          id: msg.rpc_id ?? `shaniu-steer-${msg.child_id}-${laneJournal.seq + 1}`,
+          role: 'user',
+          content: [{ type: 'text', text: msg.text }],
+          source: msg.rpc_id === undefined || msg.rpc_id === null
+            ? relaySourceOf(msg.sender_id)
+            : { kind: 'user' as const, rpcId: msg.rpc_id },
+        }, { surfaceOp: 'append' })
+        return
+      }
       case 'error':
         // 全局错误不终结回合（回合终结只认 turn_completed）：这里只定稿已有的流，
         // 错误文案由随后的 turn_completed 呈现，避免在此造出一个假回合。
@@ -2860,20 +2955,68 @@ export function createAdapter(options: AdapterOptions): { remote: unknown; dispo
   }
 
   /**
-   * `remote.subagents`（SH-109）：泳道子会话的 prompt / interruptByUser 面。会话
-   * 控制器对 addressed 子会话硬性路由到这两个方法（`sessions/session.ts` 的 prompt
-   * 与 Stop 路径），适配层必须提供命名空间面。桌面真实态在 SH-053 交付前没有子代理
-   * 注入/逐个中断面——按上游错误码显式拒绝，不伪造受理；懒建泳道（unknown 模式）的
-   * composer 本来就是只读的，正常路径到不了这里。
+   * `remote.subagents`（SH-109 / SH-053）：泳道子会话的 prompt / interruptByUser 面。
+   * 会话控制器对 addressed 子会话硬性路由到这两个方法（`sessions/session.ts` 的 prompt
+   * 与 Stop 路径），适配层必须提供命名空间面。
+   *
+   * 语义照上游（`subagent/src/index.ts`）：prompt 只收文本（图片需要附件仓储，宿主没有
+   * → `subagent/attachment-invalid`），requestId 随消息回传成 `source.rpcId` 供客户端
+   * 撤销乐观回显；interruptByUser 对 absent/idle/已完成一律受理为 no-op。
+   *
+   * 偏差（已在 docs/05 SH-053 卡注）：宿主只有 inbox 语义——两种 delivery 都投进
+   * 子代理的下一个采样迭代，不是流内 steer；子代理退出后不能经此续聊（回
+   * `subagent/not-resumable`，续跑走 `resume_agent` 工具）。
    */
+  interface SubagentPromptRequestWire {
+    readonly requestId?: string
+    readonly childSessionId?: string
+    readonly delivery?: 'queue' | 'steer'
+    readonly content?: readonly { readonly type: string; readonly text?: string }[]
+    readonly clientTimeZone?: string
+  }
+
+  /** 宿主类型化错误 → 上游 RemoteError（code 原样透传，不靠文案匹配）。 */
+  const subagentErrorOf = (reason: unknown, childSessionId: string): RemoteError => {
+    const raw = (reason ?? {}) as { code?: string; message?: string }
+    const code = typeof raw.code === 'string' ? raw.code : 'gateway/internal'
+    const message = typeof raw.message === 'string' ? raw.message : String(reason)
+    return new RemoteError(code as never, message, { childSessionId } as never)
+  }
+
   const subagentsNamespace = {
-    prompt: async (request: { childSessionId?: string } = {}) => {
-      throw new RemoteError('subagent/delivery-unavailable', '子代理 steering 待后端 M5 交付（docs/05 SH-053）', {
-        childSessionId: laneIdOf(request.childSessionId ?? ''),
-      })
+    prompt: async (request: SubagentPromptRequestWire = {}) => {
+      const childSessionId = laneIdOf(request.childSessionId ?? '')
+      const parts = request.content ?? []
+      if (parts.some(part => part.type !== 'text')) {
+        return {
+          ok: false as const,
+          error: new RemoteError('subagent/attachment-invalid', '宿主没有附件仓储，子代理只接受文本消息', {
+            childSessionId,
+          } as never),
+        }
+      }
+      const text = parts.map(part => part.text ?? '').join('\n').trim()
+      if (text === '') {
+        return { ok: false as const, error: new RemoteError('gateway/bad-request', '消息不能为空', {} as never) }
+      }
+      try {
+        const messageId = await bridge.invoke<string>('send_subagent_message', {
+          agentId: childSessionId,
+          message: text,
+          rpcId: request.requestId,
+        })
+        return OK({ messageId })
+      } catch (reason) {
+        return { ok: false as const, error: subagentErrorOf(reason, childSessionId) }
+      }
     },
-    interruptByUser: async () => {
-      throw new RemoteError('gateway/internal', '子代理逐个中断待后端 M5 交付（docs/05 SH-053）', {})
+    interruptByUser: async (childSessionId: string) => {
+      try {
+        await bridge.invoke<boolean>('interrupt_subagent', { agentId: laneIdOf(childSessionId) })
+        return OK({ accepted: true as const })
+      } catch (reason) {
+        return { ok: false as const, error: subagentErrorOf(reason, laneIdOf(childSessionId)) }
+      }
     },
   }
 

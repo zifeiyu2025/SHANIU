@@ -23,7 +23,7 @@ export type EventMsg =
   | { type: 'token_usage'; turn: number; input_tokens: number; cached_input_tokens?: number | null; output_tokens: number }
   | { type: 'subagent_spawned'; child_id: string; task: string; name: string; label: string; created_at_ms: number }
   | { type: 'subagent_exited'; child_id: string; status: SubagentExitStatus; summary: string }
-  | { type: 'subagent_message'; child_id: string; sender_id: string; text: string };
+  | { type: 'subagent_message'; child_id: string; sender_id: string; text: string; rpc_id?: string | null };
 
 export interface AgentEvent {
   event_id: string;

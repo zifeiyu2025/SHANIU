@@ -71,8 +71,10 @@ fn send_task(app: tauri::AppHandle, task: String, agent_id: Option<String>) -> R
             session_title::spawn_generation(app.clone(), new_id.clone(), task.clone());
             let sink: Arc<dyn events::EventSink> =
                 Arc::new(events::TauriEventSink::root(app.clone(), new_id.clone()).with_journal(Arc::new(event_journal::FileEventJournal::new(app.state::<AppState>().data_root().join(config::SESSIONS_DIR)))).with_broadcast(app.state::<gateway::GatewayHub>().broadcast_sender()));
+            // 注册表在任务启动时挂到 AppState：UI 的 steering/中断命令面要摸到活体注册表。
+            let orchestrator = build_orchestrator(agent.clone());
+            app.state::<AppState>().set_subagents(Some(orchestrator.registry().clone()));
             tauri::async_runtime::spawn(async move {
-                let orchestrator = build_orchestrator(agent.clone());
                 let _ = agent
                     .run_task_with_orchestrator(&task, sink, cancel, Some(orchestrator))
                     .await;
@@ -127,8 +129,9 @@ fn continue_session(
     let sink: Arc<dyn events::EventSink> = Arc::new(events::TauriEventSink::root(app.clone(), agent_id).with_journal(Arc::new(event_journal::FileEventJournal::new(app.state::<AppState>().data_root().join(config::SESSIONS_DIR)))).with_broadcast(app.state::<gateway::GatewayHub>().broadcast_sender()));
     // spawn 的 future 必须是 'static：借用的 app 只能换成 owned 句柄再 move 进去。
     let app_handle = app.clone();
+    let orchestrator = build_orchestrator(agent.clone());
+    app.state::<AppState>().set_subagents(Some(orchestrator.registry().clone()));
     tauri::async_runtime::spawn(async move {
-        let orchestrator = build_orchestrator(agent.clone());
         let _ = agent
             .run_with_history_and_orchestrator(history, persisted, sink, cancel, Some(orchestrator))
             .await;
@@ -963,11 +966,73 @@ fn new_session_writer(
 /// 「代理持有自身」的引用环。
 fn build_orchestrator(
     engine: Arc<agent_loop::AgentLoop>,
-) -> Arc<dyn tool_router::orchestration::AgentOrchestrator> {
+) -> Arc<subagent_registry::orchestrator::RegistryOrchestrator> {
     let registry = Arc::new(subagent_registry::SubagentRegistry::new(
         subagent_registry::DEFAULT_MAX_CONCURRENT,
     ));
     Arc::new(subagent_registry::orchestrator::RegistryOrchestrator::new(registry, engine))
+}
+
+/// 子代理命令面的类型化错误（SH-053 批 3）：code 用上游 `remote.subagents` 的错误码，
+/// 前端据此抛 RemoteError，不靠文案匹配。
+#[derive(Debug, Clone, serde::Serialize, thiserror::Error)]
+#[serde(tag = "code")]
+pub enum SubagentCommandError {
+    #[error("当前没有运行中的任务，子代理 steering 不可投递")]
+    #[serde(rename = "subagent/delivery-unavailable")]
+    DeliveryUnavailable,
+    #[error("子代理不在本任务注册表中或已结束，不能续聊")]
+    #[serde(rename = "subagent/not-resumable")]
+    NotResumable,
+    #[error("请求参数非法")]
+    #[serde(rename = "gateway/bad-request")]
+    BadRequest,
+}
+
+impl From<subagent_registry::SteerError> for SubagentCommandError {
+    fn from(_: subagent_registry::SteerError) -> Self {
+        Self::NotResumable
+    }
+}
+
+/// 向运行中的子代理注入 steering（`remote.subagents.prompt` 的宿主面）。
+/// 返回 messageId 供前端撤乐观回显；注入在子代理下一个采样迭代生效（SHANIU 的
+/// inbox 语义，非流内 steer——偏差已在 docs/05 卡注声明）。
+/// `rpc_id` 是客户端铸造的 requestId，随事件回传，泳道据此把 source 写成 user+rpcId。
+#[tauri::command]
+fn send_subagent_message(
+    app: tauri::AppHandle,
+    agent_id: String,
+    message: String,
+    rpc_id: Option<String>,
+) -> Result<String, SubagentCommandError> {
+    if message.trim().is_empty() {
+        return Err(SubagentCommandError::NotResumable);
+    }
+    let registry = app
+        .state::<AppState>()
+        .subagents()
+        .ok_or(SubagentCommandError::DeliveryUnavailable)?;
+    registry.send_message(&agent_id, &message, rpc_id.as_deref())?;
+    Ok(ulid::Ulid::generate().to_string())
+}
+
+/// 中断一个子代理（`remote.subagents.interruptByUser` 的宿主面）。
+///
+/// 语义照上游：absent/idle/已完成的目标都是**受理成功的 no-op**，只有空 id 是
+/// bad-request（`subagent/src/index.ts` 的 interruptByUser 注释）。UI 的 Stop 按钮
+/// 因此不会因为"子代理刚好收口"弹一个假错误。
+#[tauri::command]
+fn interrupt_subagent(app: tauri::AppHandle, agent_id: String) -> Result<bool, SubagentCommandError> {
+    if agent_id.trim().is_empty() {
+        return Err(SubagentCommandError::BadRequest);
+    }
+    let registry = app
+        .state::<AppState>()
+        .subagents()
+        .ok_or(SubagentCommandError::DeliveryUnavailable)?;
+    registry.cancel(&agent_id);
+    Ok(true)
 }
 
 fn build_agent_with(
@@ -1540,6 +1605,8 @@ pub fn run() {
             insert_workspace_before,
             cancel_task,
             approve,
+            send_subagent_message,
+            interrupt_subagent,
             store_api_key,
             has_api_key,
             get_settings,

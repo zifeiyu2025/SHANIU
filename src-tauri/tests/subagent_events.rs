@@ -214,13 +214,13 @@ async fn steering_is_broadcast_into_the_child_lane() {
     let id = registry
         .spawn(engine(vec![]), &root_scope(cancel.clone(), sink), "长任务", None)
         .expect("派生");
-    registry.send_message(&id, "请改看 src/transport").expect("运行中可注入");
+    registry.send_message(&id, "请改看 src/transport", None).expect("运行中可注入");
 
     let events = recorded(&log);
     let message = events
         .iter()
         .find_map(|r| match &r.msg {
-            EventMsg::SubagentMessage { child_id, sender_id, text } => Some((r, child_id, sender_id, text)),
+            EventMsg::SubagentMessage { child_id, sender_id, text, .. } => Some((r, child_id, sender_id, text)),
             _ => None,
         })
         .expect("注入必须广播 subagent_message，否则泳道里看不到 steering");
@@ -254,8 +254,33 @@ async fn steering_to_an_exited_child_is_rejected_without_an_event() {
     registry.wait_exit(&id, Duration::from_secs(5)).await.expect("应跑完");
     let before = recorded(&log).len();
 
-    assert!(registry.send_message(&id, "迟到的引导").is_err(), "已结束子代理必须 fail-closed");
+    assert!(registry.send_message(&id, "迟到的引导", None).is_err(), "已结束子代理必须 fail-closed");
     assert_eq!(recorded(&log).len(), before, "拒绝路径不得广播任何事件");
+}
+
+/// SH-053 批 3：steering 的拒绝理由必须是**类型**，命令面才能映射成上游错误码
+/// （`subagent/not-resumable` / `subagent/delivery-unavailable`），不靠文案匹配。
+#[tokio::test]
+async fn steering_rejections_are_typed_for_the_command_face() {
+    use shaniu_lib::subagent_registry::SteerError;
+
+    let (sink, _log) = RecordingSink::root();
+    let registry = Arc::new(SubagentRegistry::new(2));
+    assert_eq!(
+        registry.send_message("01UNKNOWN", "引导", None),
+        Err(SteerError::UnknownAgent { agent_id: "01UNKNOWN".into() }),
+        "不在注册表里的 id 必须归 UnknownAgent（泳道已随进程消失）"
+    );
+
+    let id = registry
+        .spawn(engine(vec![completed_turn("结论")]), &root_scope(CancellationToken::new(), sink), "任务", None)
+        .expect("派生");
+    registry.wait_exit(&id, Duration::from_secs(5)).await.expect("应跑完");
+    assert_eq!(
+        registry.send_message(&id, "迟到的引导", None),
+        Err(SteerError::Exited { agent_id: id.clone() }),
+        "已结束的子代理必须归 Exited（前端据此回 not-resumable，而不是假装受理）"
+    );
 }
 
 /// FF-104：新增变体是 additive——旧事件的载荷键集合一个都不能多/少。
