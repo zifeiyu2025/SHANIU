@@ -163,6 +163,19 @@ pub trait ToolExecutor: Send + Sync {
 
 // ============================== 注册表 ==============================
 
+/// 注册失败原因（docs/02 §3.1.3 B-R3/B-R4）。
+///
+/// 动态注册面（MCP）必须用 [`ToolRouter::try_register`] / [`ToolRouter::try_register_all`]：
+/// 名称冲突返回错误而不是覆盖，未提交前不改动注册表。
+#[derive(Debug, thiserror::Error, PartialEq, Eq)]
+pub enum RegisterError {
+    #[error("工具名不能为空")]
+    EmptyName,
+    /// 已存在同名工具，或仅大小写不同的同名工具（避免模型/路由选错对象）。
+    #[error("工具名冲突: {0}（已存在同名或仅大小写不同的工具）")]
+    Duplicate(String),
+}
+
 #[derive(Default)]
 pub struct ToolRouter {
     tools: HashMap<String, Arc<dyn ToolExecutor>>,
@@ -173,8 +186,48 @@ impl ToolRouter {
         Self::default()
     }
 
+    /// 内置工具注册入口。命名冲突属于编程错误（内置清单是静态的），
+    /// 因此这里 fail-fast 而不是静默覆盖——静默覆盖在动态注册面就是工具冒充入口。
+    /// 动态注册（MCP）一律用 [`try_register`](Self::try_register)。
     pub fn register(&mut self, executor: Arc<dyn ToolExecutor>) {
-        self.tools.insert(executor.spec().name.clone(), executor);
+        let name = executor.spec().name.clone();
+        if let Err(e) = self.try_register(executor) {
+            panic!("内置工具注册失败（{name}）: {e}");
+        }
+    }
+
+    /// 单条注册：名称冲突返回错误，失败时注册表保持原样。
+    pub fn try_register(&mut self, executor: Arc<dyn ToolExecutor>) -> Result<(), RegisterError> {
+        let name = executor.spec().name.clone();
+        let existing: Vec<&str> = self.tools.keys().map(String::as_str).collect();
+        check_name(&name, &existing)?;
+        self.tools.insert(name, executor);
+        Ok(())
+    }
+
+    /// 事务化批量注册：先全量校验（含批次内互相冲突），全部通过才一次性提交。
+    /// 任一失败 → 一个都不注册，调用方无需回滚半套工具（B-R3）。
+    pub fn try_register_all(
+        &mut self,
+        executors: Vec<Arc<dyn ToolExecutor>>,
+    ) -> Result<(), RegisterError> {
+        {
+            let mut seen: Vec<&str> = self.tools.keys().map(String::as_str).collect();
+            for executor in &executors {
+                let name = executor.spec().name.as_str();
+                check_name(name, &seen)?;
+                seen.push(name);
+            }
+        }
+        for executor in executors {
+            self.tools.insert(executor.spec().name.clone(), executor);
+        }
+        Ok(())
+    }
+
+    /// 注销工具（MCP 服务器断开/清单删除时使用）。返回被移除的执行器。
+    pub fn remove(&mut self, name: &str) -> Option<Arc<dyn ToolExecutor>> {
+        self.tools.remove(name)
     }
 
     pub fn get(&self, name: &str) -> Option<&Arc<dyn ToolExecutor>> {
@@ -222,6 +275,17 @@ impl ToolRouter {
             .ok_or_else(|| ToolError::InvalidArgs(format!("未知工具: {name}")))?;
         executor.execute(args, ctx).await
     }
+}
+
+/// 名称合法性检查：非空 + 不与既有名称（或仅 ASCII 大小写不同）冲突。
+fn check_name(name: &str, existing: &[&str]) -> Result<(), RegisterError> {
+    if name.trim().is_empty() {
+        return Err(RegisterError::EmptyName);
+    }
+    if existing.iter().any(|e| e.eq_ignore_ascii_case(name)) {
+        return Err(RegisterError::Duplicate(name.to_string()));
+    }
+    Ok(())
 }
 
 // ============================== 工作区路径边界（共享助手） ==============================
@@ -400,6 +464,122 @@ mod tests {
         assert_eq!(specs.len(), 1);
         assert_eq!(specs[0].name, "noop");
         assert_eq!(router.declarations()[0].name, "noop");
+    }
+
+    // ---------------- 注册表事务化契约（docs/02 §3.1.3 B-R3/B-R4） ----------------
+
+    struct StubTool {
+        spec: ToolSpec,
+        output: &'static str,
+    }
+
+    #[async_trait]
+    impl ToolExecutor for StubTool {
+        fn spec(&self) -> &ToolSpec {
+            &self.spec
+        }
+        async fn execute(&self, _a: Value, _c: &ToolContext) -> Result<ToolOutput, ToolError> {
+            Ok(ToolOutput::ok(self.output))
+        }
+    }
+
+    fn stub(name: &str, output: &'static str) -> Arc<dyn ToolExecutor> {
+        Arc::new(StubTool {
+            spec: ToolSpec::new(name, "stub", serde_json::json!({"type":"object"})),
+            output,
+        })
+    }
+
+    #[tokio::test]
+    async fn try_register_rejects_duplicate_and_keeps_original() {
+        let mut router = ToolRouter::new();
+        router.try_register(stub("noop", "original")).unwrap();
+        let err = router.try_register(stub("noop", "hijacked")).unwrap_err();
+        assert_eq!(err, RegisterError::Duplicate("noop".into()));
+        // 冲突不得覆盖：原执行器仍在且行为未变
+        let out = router
+            .execute("noop", serde_json::json!({}), &test_context(Path::new(".")))
+            .await
+            .unwrap();
+        assert_eq!(out.output, "original");
+    }
+
+    #[test]
+    fn try_register_rejects_case_insensitive_duplicate() {
+        let mut router = ToolRouter::new();
+        router.try_register(stub("unified_exec", "builtin")).unwrap();
+        let err = router.try_register(stub("Unified_Exec", "evil")).unwrap_err();
+        assert_eq!(err, RegisterError::Duplicate("Unified_Exec".into()));
+        assert!(router.get("Unified_Exec").is_none());
+    }
+
+    #[test]
+    fn try_register_rejects_empty_name() {
+        let mut router = ToolRouter::new();
+        let err = router.try_register(stub("   ", "x")).unwrap_err();
+        assert_eq!(err, RegisterError::EmptyName);
+        assert!(router.specs().is_empty());
+    }
+
+    #[test]
+    fn try_register_all_is_atomic() {
+        let mut router = ToolRouter::new();
+        router.try_register(stub("exists", "keep")).unwrap();
+        // 批次里第二条与既有工具冲突 → 整批不提交，第一条也不能留下
+        let err = router
+            .try_register_all(vec![stub("fresh", "a"), stub("exists", "b")])
+            .unwrap_err();
+        assert_eq!(err, RegisterError::Duplicate("exists".into()));
+        assert!(router.get("fresh").is_none(), "失败批次不得留下半套工具");
+        assert_eq!(router.specs().len(), 1);
+    }
+
+    #[test]
+    fn try_register_all_rejects_intra_batch_duplicate() {
+        let mut router = ToolRouter::new();
+        let err = router
+            .try_register_all(vec![stub("dup", "a"), stub("dup", "b")])
+            .unwrap_err();
+        assert_eq!(err, RegisterError::Duplicate("dup".into()));
+        assert!(router.specs().is_empty());
+    }
+
+    #[test]
+    fn try_register_all_commits_when_clean() {
+        let mut router = ToolRouter::new();
+        router
+            .try_register_all(vec![stub("a", "1"), stub("b", "2")])
+            .unwrap();
+        let names: Vec<String> = router.specs().into_iter().map(|s| s.name).collect();
+        assert_eq!(names, vec!["a".to_string(), "b".to_string()]);
+    }
+
+    #[tokio::test]
+    async fn remove_unregisters_tool() {
+        let mut router = ToolRouter::new();
+        router.try_register(stub("noop", "done")).unwrap();
+        assert!(router.remove("noop").is_some());
+        assert!(router.remove("noop").is_none());
+        let err = router
+            .execute("noop", serde_json::json!({}), &test_context(Path::new(".")))
+            .await
+            .unwrap_err();
+        assert!(matches!(err, ToolError::InvalidArgs(_)));
+    }
+
+    #[test]
+    fn builtin_tools_never_use_mcp_prefix() {
+        // B-R1：`mcp__` 前缀是 MCP 分发名的专属命名空间，内置工具不得占用，
+        // 否则恶意 server 可借前缀冒充内置工具。
+        let mut router = ToolRouter::new();
+        crate::tools::register_builtin(&mut router, Arc::new(PlanState::new()));
+        for spec in router.specs() {
+            assert!(
+                !spec.name.starts_with("mcp__"),
+                "内置工具名不得以 mcp__ 开头: {}",
+                spec.name
+            );
+        }
     }
 
     // resolve_in_workspace 的行为契约
