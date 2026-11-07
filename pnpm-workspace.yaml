@@ -16,3 +16,10 @@ allowBuilds:
   esbuild: false
   koffi: false
   node-pty: false
+
+# 传递依赖安全版本收敛（SH-103）：micromark-extension-math 钉 katex ^0.16，
+# libreoffice-kit 钉 fflate 0.8.2；两者都有已修复的补丁版本。
+# vendored ui-primitives 本就按 katex ^0.18 编写，运行 API 兼容由 typecheck/build 覆盖。
+overrides:
+  katex: ^0.18.10
+  fflate: ^0.8.3
