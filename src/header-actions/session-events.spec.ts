@@ -1,0 +1,85 @@
+import { describe, expect, it } from 'vitest'
+import { sessionEntriesToEvents } from './session-events'
+
+/** 取出某类事件，便于按类型断言（不关心其余字段）。 */
+function ofType(events: ReturnType<typeof sessionEntriesToEvents>, type: string): Record<string, unknown>[] {
+  return events.filter(event => (event as { type: string }).type === type) as never
+}
+
+describe('档案条目 → 逻辑事件', () => {
+  it('每个用户消息开一个新回合，编号递增，末尾收口', () => {
+    const events = sessionEntriesToEvents([
+      { kind: 'message', role: 'user', text: '第一条' },
+      { kind: 'message', role: 'assistant', text: '回复一' },
+      { kind: 'message', role: 'user', text: '第二条' },
+      { kind: 'message', role: 'assistant', text: '回复二' },
+    ], '标题')
+
+    const starts = ofType(events, 'turn/start')
+    expect(starts.map(event => (event.data as { turn: number }).turn)).toEqual([1, 2])
+    const ends = ofType(events, 'turn/end')
+    expect(ends.map(event => (event.data as { turn: number }).turn)).toEqual([1, 2])
+    // 末尾一定有收口：formatter 靠 turn/end 结束当前回合
+    expect((events.at(-1) as { type: string }).type).toBe('turn/end')
+  })
+
+  it('工具调用与结果成对展开，callId 保持一致', () => {
+    const events = sessionEntriesToEvents([
+      { kind: 'message', role: 'user', text: '跑个命令' },
+      { kind: 'tool_call', call_id: 'call-1', tool: 'unified_exec', arguments: '{"cmd":"ls"}', output: 'a.ts' },
+    ], '标题')
+
+    const call = ofType(events, 'tool/call')[0]?.data as Record<string, unknown>
+    const result = ofType(events, 'tool/result')[0]?.data as Record<string, unknown>
+    expect(call.callId).toBe('call-1')
+    expect(call.name).toBe('unified_exec')
+    expect(call.arguments).toBe('{"cmd":"ls"}')
+    // formatter 用 `data.message.toolCallId` 回填，两处必须同源，否则结果会变成 "unknown" 卡片
+    expect((result.message as { toolCallId: string }).toolCallId).toBe('call-1')
+  })
+
+  it('没有输出的工具调用只发 call，不伪造空 result', () => {
+    const events = sessionEntriesToEvents([
+      { kind: 'message', role: 'user', text: '取消掉' },
+      { kind: 'tool_call', call_id: 'call-2', tool: 'unified_exec', arguments: '{}' },
+    ], '标题')
+    expect(ofType(events, 'tool/call')).toHaveLength(1)
+    expect(ofType(events, 'tool/result')).toHaveLength(0)
+  })
+
+  it('reasoning 不进事件（上游 formatter 明确省略思考内容）', () => {
+    const events = sessionEntriesToEvents([
+      { kind: 'message', role: 'user', text: '问' },
+      { kind: 'message', role: 'assistant', text: '答', reasoning: '这段思考不该出现' },
+    ], '标题')
+    const serialized = JSON.stringify(events)
+    expect(serialized).not.toContain('这段思考不该出现')
+  })
+
+  it('system 消息被跳过，用户与助手之外的 role 不产生消息事件', () => {
+    const events = sessionEntriesToEvents([
+      { kind: 'message', role: 'system', text: '系统提示' },
+      { kind: 'message', role: 'user', text: '问' },
+      { kind: 'message', role: 'assistant', text: '答' },
+    ], '标题')
+    expect(ofType(events, 'user/message')).toHaveLength(1)
+    expect(ofType(events, 'assistant/message')).toHaveLength(1)
+    expect(JSON.stringify(events)).not.toContain('系统提示')
+  })
+
+  it('seq 单调递增，标题事件在首位', () => {
+    const events = sessionEntriesToEvents([
+      { kind: 'message', role: 'user', text: '问' },
+      { kind: 'message', role: 'assistant', text: '答' },
+    ], '标题')
+    expect((events[0] as { type: string }).type).toBe('session/title')
+    const seqs = events.map(event => (event as { seq: number }).seq)
+    expect(seqs).toEqual(seqs.map((_, index) => index + 1))
+  })
+
+  it('空档案只产标题事件，不产空回合', () => {
+    const events = sessionEntriesToEvents([], '空')
+    expect(events).toHaveLength(1)
+    expect((events[0] as { type: string }).type).toBe('session/title')
+  })
+})

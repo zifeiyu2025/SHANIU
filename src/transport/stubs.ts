@@ -31,7 +31,10 @@ export function stubRemoteNamespace(name: string): unknown {
  * 核销进度（适配层接管情况见 `transport/adapter.ts` 与 `transport/settings-face.ts`，
  * 逐项对应 docs/05 卡号）：
  * - `session` —— 已由适配层接管（SH-017 第一步：消息流、工具卡、终端输出、中断、
- *   审批请求转译）。同会话内的分页游标对齐与历史回放仍缺，分属 SH-094/SH-033。
+ *   审批请求转译）；`session.search` 由 SH-113 接宿主 SQLite FTS5 派生索引（正文/工具
+ *   输出片段 + hasMore 收窄提示；wire 为 query-only，没有续页），SH-040 未接线清单中的
+ *   `session.search` 项已归属此卡核销。
+ *   同会话内的分页游标对齐与历史回放仍缺，分属 SH-094/SH-033。
  * - `toolResults` —— 已由适配层接管（`watch` 从本进程的 journal 取那条
  *   `tool/result` 的 message；本进程没观察过的会话如实报 `available:false`，
  *   不从档案猜一份结果）。后端没有工具输出的增量事件，所以值只在落定时交一帧。

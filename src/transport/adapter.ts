@@ -20,10 +20,14 @@
  * - 审批：走 typert 事件面（`approval/request`），不是 journal 事件。
  */
 import { RemoteError } from '@deepseek-ai/dsh-typert-protocol'
+import type { SettingsPathOpView } from '@deepseek-ai/dsh-settings/types'
 import type { SessionId } from '@deepseek-ai/dsh-session/types'
 import type { WorkspaceId } from '@deepseek-ai/dsh-workspace/types'
 import type { MessageId } from '@deepseek-ai/dsh-llm'
 import { createSettingsFace } from './settings-face'
+import {
+  PERMISSION_PRESET_OPTIONS, presetOfSandbox, sandboxOfPreset,
+} from './permission-presets'
 import {
   catalogEntryOf, foldTimingEvent, initTimingState, laneIdOf, timingProjectionOf,
   type SubagentCatalogEntry, type SubagentTimingState,
@@ -42,41 +46,29 @@ const FAIL = (message: string) =>
 const asSessionId = (id: string) => id as unknown as SessionId
 const asWorkspaceId = (id: string) => id as unknown as WorkspaceId
 
-/**
- * DSH 一维权限挡位 ↔ 宿主 `sandbox.mode` 的映射（产品拍板，2026-11-07）。
- *
- * 宿主的安全面是 `sandbox.mode × approval.mode` 两维，但裁决矩阵（permission/policy.rs
- * 的 decide）当前只消费沙箱维，所以挡位只映射沙箱档、approval_mode 不动。目录不含
- * 上游实验档 `auto`：它是 danger-full-access × ask 的组合，在"裁决不看 approval"的
- * 宿主里与完全权限行为相同，挂出来是一枚假挡位。挡位语义是**全局**的（写 config.toml，
- * 不随会话走）：agent_loop 在任务启动时固化 SessionPolicy，进行中回合不受切换影响。
- */
-const PRESET_TO_SANDBOX: Record<string, string> = {
-  'read-only': 'read_only',
-  'workspace-write': 'workspace_write',
-  'danger-full-access': 'danger_full_access',
-}
-const SANDBOX_TO_PRESET: Record<string, string> = Object.fromEntries(
-  Object.entries(PRESET_TO_SANDBOX).map(([preset, mode]) => [mode, preset]),
-)
-
-/** 挡位选项的静态目录（形状照上游 PermissionCatalog.options；name 给机器值走界面词典）。 */
-const PERMISSION_PRESET_OPTIONS = Object.keys(PRESET_TO_SANDBOX).map(value => ({
-  value,
-  name: value,
-  description: value === 'read-only'
-    ? '只读查看，不产生任何写入'
-    : value === 'workspace-write'
-      ? '仅在工作区内读写'
-      : '不受工作区边界限制',
-}))
-
 /** 上游 token-meter 的用量四桶（usage-projection.ts bucketsFrom 的 wire 形状）。 */
 interface TokenBuckets {
   readonly uncachedInputTokens: number
   readonly outputTokens: number
   readonly cacheReadTokens: number
   readonly cacheWriteTokens: number
+}
+
+/**
+ * 宿主 `search_sessions` 的返回（SH-113）：与 vendored `session.search` wire
+ * 一一对应——`items` 只有 `sessionId` + `snippet`，`hasMore` 是「命中会话数超过
+ * 宿主固定上限、请收窄查询」提示（`slots.ts:280`），**不是**分页/续页信号。
+ * DSH 客户端没有 Show more 请求、不传 cursor/limit，故命令面也只有 `{query}`。
+ */
+interface SearchPageWire {
+  readonly items: readonly { sessionId: string; snippet: string }[]
+  readonly hasMore: boolean
+}
+
+/** `session.search` wire 的一条命中（与 vendored `SessionSearchResultItem` 同形）。 */
+interface SearchHitWire {
+  readonly sessionId: string
+  readonly snippet: string
 }
 
 /** 客户端排队的一条待发消息（回合进行中的提交；回合收口后按序自动补发）。 */
@@ -131,12 +123,27 @@ class FrameLog {
     for (const wake of this.waiters.splice(0)) wake()
   }
 
-  /** 从 `from` 起把已入队的条目全部交出，追平后挂起等新帧。 */
-  async *tail(from: number): AsyncGenerator<Record<string, unknown>> {
+  /**
+   * 从 `from` 起把已入队的条目全部交出，追平后挂起等新帧。
+   *
+   * `signal` 中止时立刻返回：消费者关流（`return()` / `dispose()`）时生成器正挂起在
+   * 等待帧上，没有这道闸就永远收不到 return——真机表现是"关掉会话再打开，新流开不起来
+   * 或旧流一直挂着"，比丢帧难归因得多。
+   */
+  async *tail(from: number, signal?: AbortSignal): AsyncGenerator<Record<string, unknown>> {
+    // 用函数读中止态：await 之后 signal 的状态可能已变，直接读布尔会让类型收窄
+    // 认为"它永远是 false"。
+    const closed = (): boolean => signal?.aborted === true
     let index = from
     for (;;) {
       while (index < this.entries.length) yield this.entries[index++]
-      await new Promise<void>(resolve => this.waiters.push(resolve))
+      if (closed()) return
+      await new Promise<void>(resolve => {
+        const wake = (): void => { resolve() }
+        this.waiters.push(wake)
+        signal?.addEventListener('abort', wake, { once: true })
+      })
+      if (closed()) return
     }
   }
 
@@ -348,8 +355,9 @@ export function createAdapter(options: AdapterOptions): { remote: unknown; dispo
   /**
    * `permissions` 投影（{currentValue}）：挡位全局共享，所有会话读同一份宿主沙箱档。
    * 快照里给不出映射（快照读失败回落 read_only）也照实给——UI 的芯片要有一个确定态。
+   * 反推复用 `./permission-presets` 的同一张表，与设置页 `permission` 域的读视图同源。
    */
-  const currentPermission = (): string => SANDBOX_TO_PRESET[face.sandboxMode()] ?? 'read-only'
+  const currentPermission = (): string => presetOfSandbox(face.sandboxMode())
   const permissionsProjection = (): Record<string, unknown> => ({ currentValue: currentPermission() })
 
   /** 挡位切换成功后向所有已知会话广播一帧（值来自刚刷新的 face，照 selectModel 的广播方式）。 */
@@ -1307,7 +1315,7 @@ export function createAdapter(options: AdapterOptions): { remote: unknown; dispo
       await bridge.invoke('cancel_task', { sessionId: request.sessionId })
       return OK({ accepted: true })
     },
-    follow: async function* (request: unknown): AsyncGenerator<Record<string, unknown>> {
+    follow: async function* (request: unknown, signal?: AbortSignal): AsyncGenerator<Record<string, unknown>> {
       const sessionId = addressOf(request)
       if (sessionId === undefined) {
         yield emptySnapshot('', now())
@@ -1366,7 +1374,7 @@ export function createAdapter(options: AdapterOptions): { remote: unknown; dispo
           },
           assistantStream: { revision: replayed.revision },
         }
-        for await (const frame of replayed.log.tail(from)) yield frame
+        for await (const frame of replayed.log.tail(from, signal)) yield frame
         return
       }
       // 下标在同步块里一次捕获：cursor / revision / records 必须描述同一时刻，
@@ -1404,9 +1412,9 @@ export function createAdapter(options: AdapterOptions): { remote: unknown; dispo
         // 客户端总是带 assistantStream:true 打开，缺这个基线即 gateway/internal。
         assistantStream: { revision: baseline.revision },
       }
-      for await (const frame of journal.log.tail(from)) yield frame
+      for await (const frame of journal.log.tail(from, signal)) yield frame
     },
-    control: async function* (): AsyncGenerator<Record<string, unknown>> {
+    control: async function* (signal?: AbortSignal): AsyncGenerator<Record<string, unknown>> {
       await face.refresh()
       const from = projectionLog.length
       yield {
@@ -1430,8 +1438,10 @@ export function createAdapter(options: AdapterOptions): { remote: unknown; dispo
           }])),
         },
       }
-      // 基线之后必须持续产帧：流一结束客户端按 carrier 错误重连。
-      for await (const frame of projectionLog.tail(from)) yield frame
+      // 基线之后必须持续产帧：流一结束客户端按 carrier 错误重连。`signal` 一路传进
+      // tail——客户端 teardown 时 `await control.dispose()` 要能落地，不能挂在
+      // 「等下一帧」的 await 上（与 session.follow 同一类悬挂）。
+      for await (const frame of projectionLog.tail(from, signal)) yield frame
     },
     page: async (request: { sessionId?: string; throughSeq?: number } = {}) => {
       const journal = request.sessionId === undefined ? undefined : journals.get(request.sessionId)
@@ -1443,7 +1453,37 @@ export function createAdapter(options: AdapterOptions): { remote: unknown; dispo
       return OK({ records, hasMore: false, cursor: records.length === 0 ? -1 : through })
     },
     projections: async () => OK(null),
-    search: async () => OK({ items: [], hasMore: false }),
+    search: async (request: { query?: string } = {}) => {
+      const query = (typeof request.query === 'string' ? request.query : '').trim()
+      // 空/纯空白按上游语义回空表（WorkspaceBrowser 自己也会短路空 query），
+      // 且不该为它付宿主 SQLite 打开成本。
+      if (query === '') return OK({ items: [], hasMore: false })
+      try {
+        // DSH wire 只送 {query}：没有 cursor、没有 limit，宿主也不做续页。
+        const page = await bridge.invoke<SearchPageWire>('search_sessions', { query })
+        const items: SearchHitWire[] = []
+        const seen = new Set<string>()
+        // 宿主已按 sessionId 去重只给最强命中；这里再兜一层，避免前端
+        // contentBySession 静默丢掉重复条目。
+        for (const hit of Array.isArray(page?.items) ? page.items : []) {
+          if (typeof hit?.sessionId !== 'string' || hit.sessionId === '' || seen.has(hit.sessionId)) continue
+          seen.add(hit.sessionId)
+          items.push({
+            sessionId: hit.sessionId,
+            snippet: typeof hit?.snippet === 'string' ? hit.snippet : String(hit?.snippet ?? ''),
+          })
+        }
+        // hasMore 只驱动 UI 一行「结果较多，请收窄查询」提示，不是分页信号。
+        return OK({ items, hasMore: page?.hasMore === true })
+      } catch (reason) {
+        // wire 契约：失败以 {ok:false} 回给客户端，不是 rejection。宿主给的是
+        // {code,message}（session_query::SearchError 的序列化形状）；索引/查询/档案
+        // 读失败一律如实回显，不返回空表冒充"没搜到"。
+        const failure = reason as { code?: unknown; message?: unknown }
+        const message = typeof failure?.message === 'string' ? failure.message : String(reason)
+        return FAIL(message)
+      }
+    },
     modelCatalog: async () => face.session.modelCatalog(),
     selectModel: async (request: { sessionId?: string; provider?: string; model?: string; reasoningEffort?: string }) => {
       const selected = await face.session.selectModel({
@@ -1723,7 +1763,7 @@ export function createAdapter(options: AdapterOptions): { remote: unknown; dispo
   }
 
   const workspaceNamespace = {
-    follow: async function* (): AsyncGenerator<Record<string, unknown>> {
+    follow: async function* (signal?: AbortSignal): AsyncGenerator<Record<string, unknown>> {
       await face.refresh()
       const flags = await readWorkspaceFlags()
       const from = workspaceLog.length
@@ -1731,7 +1771,8 @@ export function createAdapter(options: AdapterOptions): { remote: unknown; dispo
         type: 'baseline',
         value: { items: await allWorkspaceViews(flags), archivedSessionIds: flags.archivedSessionIds, pinnedSessionIds: flags.pinnedSessionIds },
       }
-      for await (const frame of workspaceLog.tail(from)) yield frame
+      // 同 control：signal 传进 tail，客户端 teardown 的 `dispose()` 才能落地。
+      for await (const frame of workspaceLog.tail(from, signal)) yield frame
     },
     initializeDefault: async () => {
       await face.refresh()
@@ -1851,7 +1892,7 @@ export function createAdapter(options: AdapterOptions): { remote: unknown; dispo
    */
   const toolResultsNamespace = {
     watch: async function* (
-      request: { sessionId?: string; seq?: number } = {}, _signal?: AbortSignal,
+      request: { sessionId?: string; seq?: number } = {}, signal?: AbortSignal,
     ): AsyncGenerator<Record<string, unknown>> {
       const journal = request.sessionId === undefined ? undefined : journals.get(request.sessionId)
       const seq = request.seq ?? -1
@@ -1869,7 +1910,7 @@ export function createAdapter(options: AdapterOptions): { remote: unknown; dispo
         return
       }
       yield { available: false }
-      for await (const entry of journal.log.tail(journal.log.length)) {
+      for await (const entry of journal.log.tail(journal.log.length, signal)) {
         const event = entry['event'] as Record<string, unknown> | undefined
         if (event === undefined || event.type !== 'tool/result' || event.seq !== seq) continue
         yield { available: true, value: (event.data as Record<string, unknown>).message ?? null }
@@ -1917,7 +1958,7 @@ export function createAdapter(options: AdapterOptions): { remote: unknown; dispo
       }
       const match = /^\/permission\s+([a-z][a-z-]*)\s*$/.exec(line.trim())
       if (match === null) return OK(undefined)
-      const sandbox = PRESET_TO_SANDBOX[match[1]!]
+      const sandbox = sandboxOfPreset(match[1]!)
       if (sandbox === undefined) return OK(undefined)
       try {
         await face.applySandboxMode(sandbox)
@@ -1927,6 +1968,10 @@ export function createAdapter(options: AdapterOptions): { remote: unknown; dispo
         return FAIL(reason instanceof Error ? reason.message : String(reason))
       }
       pushPermissionToAll()
+      // 与设置页写挡位走**同一条**收尾链（修订 +1 + `settings/document-updated` 广播）：
+      // 少了这次广播，设置页的 describe 缓存不失效——芯片切完再打开设置，权限行还显示
+      // 上一档（真机 E-06）。`pushPermissionToAll` 只喂对话页芯片，替不了这一条。
+      face.commitPermissionPreset()
       return OK({ matched: true })
     },
   }
@@ -1964,12 +2009,27 @@ export function createAdapter(options: AdapterOptions): { remote: unknown; dispo
     },
   }
 
+  /**
+   * `remote.settings` 面：设置面本体直连，唯一例外是 `permission` 域写入成功后补一帧
+   * 挡位投影。设置页的挡位行写的是宿主 `[sandbox] mode`，而对话页的挡位芯片读的是
+   * 会话 `permissions` 投影——两条链不共享状态。少了这一帧，用户在设置页改完档回到
+   * 对话页，芯片上还是旧档（`/permission` 命令路径本来就推，两条写面必须行为一致）。
+   */
+  const settingsNamespace = {
+    describe: (): ReturnType<typeof face.settings.describe> => face.settings.describe(),
+    mutate: async (ns: string, ops: readonly SettingsPathOpView[], expectedRevision?: number) => {
+      const result = await face.settings.mutate(ns, ops, expectedRevision)
+      if (result.ok && ns === 'permission') pushPermissionToAll()
+      return result
+    },
+  }
+
   const namespaces = new Map<string, unknown>([
     ['session', sessionNamespace],
     ['workspace', workspaceNamespace],
     ['directoryPicker', directoryPickerNamespace],
     ['toolResults', toolResultsNamespace],
-    ['settings', face.settings],
+    ['settings', settingsNamespace],
     ['llm', face.llm],
     ['credentials', face.credentials],
     ['permissionPresets', permissionPresetsNamespace],
@@ -1999,12 +2059,28 @@ export function createAdapter(options: AdapterOptions): { remote: unknown; dispo
     },
     $emit: () => false,
     $call: () => Promise.reject(new Error('adapter(remote).$call: 该调用面尚未接线')),
-    $stream: (streamOptions: { open: (signal?: AbortSignal) => AsyncIterable<unknown> }) => {
+    $stream: (streamOptions: { name?: string; open: (signal: AbortSignal) => AsyncIterable<unknown> }) => {
       let iterator: AsyncIterator<unknown> | null = null
       let generation = 0
+      const streamName = streamOptions.name ?? 'remote stream'
+      /**
+       * 当前物理代次的中止开关。关流/换代必须能**打断挂起中的生成器**——生成器挂在
+       * 「等下一帧」上的时候，`return()` 要等它自己醒来才生效（见 `FrameLog.tail` 的
+       * signal 闸）。没有这个开关，`dispose()` 就永远不落地。
+       */
+      let generationAbort: AbortController | undefined
       const ensure = (): void => {
         // 惰性开启：journal 流的 initialRequest 要到首次迭代才就位。
-        if (iterator === null) iterator = (streamOptions.open())[Symbol.asyncIterator]()
+        if (iterator !== null) return
+        generationAbort = new AbortController()
+        iterator = (streamOptions.open(generationAbort.signal))[Symbol.asyncIterator]()
+      }
+      const closeGeneration = (reason: string): void => {
+        generationAbort?.abort(new Error(reason))
+        generationAbort = undefined
+        const current = iterator
+        iterator = null
+        void current?.return?.(undefined)
       }
       return {
         [Symbol.asyncIterator]: () => ({
@@ -2015,19 +2091,16 @@ export function createAdapter(options: AdapterOptions): { remote: unknown; dispo
             return { done: false as const, value: { generation, value: result.value, accept: () => {} } }
           },
           return: async () => {
-            await iterator?.return?.(undefined)
-            iterator = null
+            closeGeneration(`${streamName} consumer closed`)
             return { done: true as const, value: undefined as never }
           },
         }),
         restart: () => {
           generation += 1
-          void iterator?.return?.(undefined)
-          iterator = null
+          closeGeneration(`${streamName} generation restarted`)
         },
         dispose: async () => {
-          await iterator?.return?.(undefined)
-          iterator = null
+          closeGeneration(`${streamName} disposed`)
         },
       }
     },

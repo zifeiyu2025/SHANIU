@@ -19,6 +19,9 @@ import type { LlmConfigurableProvider, LlmDiscoveredModel, LlmModelDiscoveryRequ
 import type { ModelCatalog, ModelCatalogFailure, ModelProviderGroup, ModelSelection } from '@deepseek-ai/dsh-api-session-controller/types'
 import type { SettingsDescribeValue, SettingsNamespaceView, SettingsPathOpView } from '@deepseek-ai/dsh-settings/types'
 import type { JsonValue } from '@deepseek-ai/dsh-util-values'
+import {
+  PERMISSION_PRESETS, PRESET_TO_SANDBOX, presetOfSandbox,
+} from './permission-presets'
 import { PROVIDER_CATALOG } from './provider-catalog'
 import type { HostBridge } from './tauri'
 
@@ -146,6 +149,16 @@ export interface SettingsFace {
    * 拒绝时抛错，由调用方映射成 wire 失败。
    */
   applySandboxMode(sandboxMode: string): Promise<void>
+  /**
+   * 挡位写入成功后的**唯一**收尾链：`permissionRevision += 1` → 广播
+   * `settings/document-updated('permission', rev)` → 返回写后视图。
+   *
+   * 两条写挡位的路径（设置页 `mutate('permission', …)` 与适配层的 `/permission <preset>`
+   * 命令）必须都走它：各写一份收尾迟早漂，而漏掉 emit 的表现是"另一张面缓存不失效"
+   * （真机 E-06：芯片切完再开设置，权限行还是上一档）。`pushPermissionToAll()` 不在这里——
+   * 那是会话投影，只有适配层握着 journals。
+   */
+  commitPermissionPreset(): SettingsNamespaceView
   /** 强制回宿主重读一次。装配时与外部改动后调用；失败保留上一次缓存（见 read 的注释）。 */
   refresh(): Promise<void>
 }
@@ -211,6 +224,14 @@ const piAiSchema = z.object({
 const envelope = (schema: { toJSON(): unknown }): JsonValue => JSON.parse(JSON.stringify(schema.toJSON())) as JsonValue
 const PI_SCHEMA = envelope(piAiSchema)
 const GENERAL_SCHEMA = envelope(z.object({ welcomeNoticeVersion: z.string() }))
+/**
+ * `permission` 域的 schema（SH-105 补修）：DSH 的权限设置行与 `/permission` 芯片
+ * 都只写一个字段 `defaultPreset`。枚举取全集表 `PERMISSION_PRESETS`——界面按它
+ * 渲染下拉，写面按它校验，两侧不会各有一份档位清单。
+ */
+const PERMISSION_SCHEMA = envelope(z.object({
+  defaultPreset: z.union(PERMISSION_PRESETS as unknown as string[]),
+}))
 
 const isRecord = (value: unknown): value is Record<string, JsonValue> =>
   typeof value === 'object' && value !== null && !Array.isArray(value)
@@ -252,6 +273,12 @@ export function createSettingsFace(bridge: HostBridge, options: SettingsFaceOpti
   /** `ui-settings-general` 的用户层只在进程内留存，理由见 viewGeneral 的注释。 */
   let generalUser: JsonValue = {}
   let generalRevision = 0
+  /**
+   * `permission` 域的修订号：每成功写入一次 +1。DSH 的设置行把它原样回传作
+   * `expectedRevision`，对不上就说明这次点击拿的是旧视图（例如另一个窗口刚改过档），
+   * 按 conflict 让界面重读，而不是把人家的改动盖掉。
+   */
+  let permissionRevision = 0
 
   const read = async (): Promise<SettingsSnapshot | undefined> => {
     try {
@@ -360,6 +387,27 @@ export function createSettingsFace(bridge: HostBridge, options: SettingsFaceOpti
     applies: 'live',
     secrets: [],
     revision: generalRevision,
+  })
+
+  /**
+   * `permission` 域的读视图（SH-105 补修）：DSH 的权限设置行（ui-permission-presets
+   * 的 `PermissionRow`）**先从 describe 的命名空间清单里找 `ns === 'permission'`**，
+   * 找不到就静默不写（`settings-store.ts:109-116` 的 `select` 直接 return）——这正是
+   * "挡位点了没反应、连报错都没有"的根因之一。
+   *
+   * `value.defaultPreset` 反推自宿主当前沙箱档（`presetOfSandbox`，与芯片目录、
+   * `/permission` 命令共用同一张映射表），所以重启后这里显示的就是 config.toml 里
+   * 真实生效的那一档，不是一份客户端记忆。
+   */
+  const viewOfPermission = (): SettingsNamespaceView => ({
+    // DSH 给这个域注册了专用设置行（PermissionRow），不需要再按 schema 自动生成页面。
+    autoGenerate: false,
+    ns: 'permission',
+    schema: PERMISSION_SCHEMA,
+    value: { defaultPreset: presetOfSandbox(sandboxMode()) },
+    applies: 'live',
+    secrets: [],
+    revision: permissionRevision,
   })
 
   /** 视图里的一行 profile → 文档行。不认识的内容一律抛 Refusal，不静默降级。 */
@@ -616,13 +664,83 @@ export function createSettingsFace(bridge: HostBridge, options: SettingsFaceOpti
     if (snapshot === undefined) throw new Error('读不到宿主设置，无法切换挡位')
     // 非法档位由宿主 save_settings 校验并报错（lib.rs 的 SANDBOX_MODE_NAMES），
     // 这里不预判一份平行清单——两处清单迟早漂移，宿主那份才是事实来源。
+    //
+    // 键名必须是 **camelCase**：宿主那侧是裸 `#[tauri::command] fn save_settings(base_url: String, …)`
+    // （lib.rs，没有 `rename_all`），Tauri 2 按默认规则把 Rust 形参名映射成 JS 侧的
+    // camelCase——传 snake_case 就是"出现未知键 + 缺必填键"，宿主直接拒单：
+    // `invalid args 'baseUrl' for command 'save_settings': … missing required key baseUrl`。
+    // 注意这条规则只作用于**顶层参数名**；`save_providers` 的 `providers` 数组元素在
+    // serde 结构体里，仍按 serde 定义走 snake_case（04 §1.3），两处不能"统一"。
     await bridge.invoke('save_settings', {
-      base_url: snapshot.baseUrl,
+      baseUrl: snapshot.baseUrl,
       model: snapshot.model,
-      workspace_root: snapshot.workspaceRoot,
-      sandbox_mode: mode,
+      workspaceRoot: snapshot.workspaceRoot,
+      sandboxMode: mode,
     })
     await read()
+  }
+
+  /**
+   * 挡位写入成功后的唯一收尾链（两条写路径共用，见 {@link SettingsFace.commitPermissionPreset}）。
+   * 修订号 +1 → 广播 → 返回**写后**视图（`applySandboxMode` 已经重读过快照，
+   * 所以这里的 `defaultPreset` 是宿主回显的档，不是我们记的愿望）。
+   */
+  const commitPreset = (): SettingsNamespaceView => {
+    permissionRevision += 1
+    options.emit('settings/document-updated', 'permission', permissionRevision)
+    return viewOfPermission()
+  }
+
+  /**
+   * `permission` 域的写面（SH-105 补修）：DSH 的权限设置行发来的唯一一种写入是
+   * `[{ op: 'set', path: ['defaultPreset'], value: <preset> }]`。其余形状一律如实拒绝
+   * 并给原因——静默收下的用户可见表现与"点了没反应"完全一样，是最难归因的那种失败。
+   *
+   * 落点复用 {@link applySandboxMode}：宿主 `[sandbox] mode` 是唯一事实源，写完顺手
+   * 重读快照，所以本次应答里的 `value.defaultPreset` 已经是宿主回显的新档（不是我们
+   * 自己记的那份愿望）。
+   */
+  const mutatePermission = async (
+    ops: readonly SettingsPathOpView[],
+    expectedRevision: number | undefined,
+  ): Promise<FaceResult<SettingsNamespaceView>> => {
+    const ns = 'permission'
+    await ensure()
+    if (snapshot === undefined) {
+      return refused(new RemoteError('settings/rejected', '读不到宿主设置，未写入权限挡位', { ns }))
+    }
+    if (expectedRevision !== undefined && expectedRevision !== permissionRevision) {
+      return refused(new RemoteError('settings/conflict', '权限挡位已被改动，请重新读取后再写', {
+        ns, expected: expectedRevision, actual: permissionRevision,
+      }))
+    }
+    if (ops.length !== 1) {
+      return refused(new RemoteError('settings/rejected', `权限域一次只接受一个写入，收到 ${ops.length} 个`, { ns }))
+    }
+    const op = ops[0]!
+    if (op.op !== 'set') {
+      return refused(new RemoteError('settings/rejected', '权限域没有可删除的键，只能把挡位设为某一档', { ns }))
+    }
+    if (op.path.length !== 1 || op.path[0] !== 'defaultPreset') {
+      const where = op.path.length === 0 ? '(空路径)' : op.path.join('.')
+      return refused(new RemoteError('settings/rejected', `权限域只有一个可写字段 defaultPreset，收到 ${where}`, { ns }))
+    }
+    const preset = typeof op.value === 'string' ? op.value : ''
+    const sandbox = PRESET_TO_SANDBOX[preset]
+    if (sandbox === undefined) {
+      return refused(new RemoteError('settings/rejected',
+        `未知权限挡位 ${typeof op.value === 'string' ? op.value : JSON.stringify(op.value)}（可用：${PERMISSION_PRESETS.join(' / ')}）`, { ns }))
+    }
+    try {
+      await applySandboxMode(sandbox)
+    } catch (reason) {
+      // 宿主拒绝（非法档、写盘失败）原样回显：伪装成"成功但没变"会让用户以为
+      // 是自己没点中，而真正的失败原因已经丢了。
+      const message = reason instanceof Error ? reason.message : String(reason)
+      return refused(new RemoteError('settings/rejected', message, { ns }))
+    }
+    // 收尾只此一条（见 commitPreset）：/permission 命令那条路径也调它，两条路径不许各写一份。
+    return ok(commitPreset())
   }
 
   return {
@@ -635,7 +753,9 @@ export function createSettingsFace(bridge: HostBridge, options: SettingsFaceOpti
           writable: snapshot !== undefined,
           // 宿主没有"打开配置文件"这条命令，如实报没有文档（界面只据此隐掉按钮）。
           hasDocument: false,
-          namespaces: [viewOfPi(), viewOfGeneral()],
+          // `permission` 必须在这里出现：DSH 的权限设置行先按 ns 找视图，找不到就
+          // 静默不写（settings-store.ts:109-116），连一句错误都给不出来。
+          namespaces: [viewOfPi(), viewOfGeneral(), viewOfPermission()],
         })
       },
       mutate: async (ns, ops, expectedRevision) => {
@@ -645,6 +765,10 @@ export function createSettingsFace(bridge: HostBridge, options: SettingsFaceOpti
           options.emit('settings/document-updated', ns, generalRevision)
           return ok(viewOfGeneral())
         }
+        // 权限挡位（SH-105 补修）：DSH 的权限设置行走这条写面。缺了这条分支时旧代码
+        // 会落到下面那句 `SHANIU 没有 permission 这个配置域`——界面把这句话显示在
+        // 设置行里，用户看到的就是"切不动，还有一个看不懂的错"。
+        if (ns === 'permission') return mutatePermission(ops, expectedRevision)
         if (ns !== 'llm-pi-ai') {
           return refused(new RemoteError('settings/rejected', `SHANIU 没有 ${ns} 这个配置域`, { ns }))
         }
@@ -869,6 +993,7 @@ export function createSettingsFace(bridge: HostBridge, options: SettingsFaceOpti
     workspaces: (): readonly { id: string; path: string; title: string }[] => snapshot?.workspaces ?? [],
     activeContextWindow,
     applySandboxMode,
+    commitPermissionPreset: commitPreset,
     workspaceRoot: () => snapshot?.workspaceRoot ?? '',
     workspaceTitle: () => {
       const title = snapshot?.workspaceTitle

@@ -55,6 +55,8 @@ function scriptedBridge(
   archive: Record<string, unknown>[] = [],
   renameFailure?: unknown,
   saveFailure?: unknown,
+  /** SH-113：`search_sessions` 的宿主替身（可 throw {code,message} 模拟类型化错误）。 */
+  searchHandler?: (args: Record<string, unknown> | undefined) => unknown,
 ): ScriptedBridge {
   const calls: ScriptedBridge['calls'] = []
   const handlers = new Set<(event: AgentEvent) => void>()
@@ -72,15 +74,23 @@ function scriptedBridge(
       if (command === 'get_settings') return state as T
       if (command === 'save_settings') {
         if (saveFailure !== undefined) throw saveFailure
-        state['baseUrl'] = args?.['base_url']
+        // 键名必须是 camelCase：宿主是裸 `#[tauri::command] fn save_settings(base_url, …)`
+        // （lib.rs 无 rename_all），Tauri 默认把形参映射成 camelCase。这里读 snake_case
+        // 就等于替宿主"宽容"了一次真机上的拒单（D-08 的挡位全失效）。
+        state['baseUrl'] = args?.['baseUrl']
         state['model'] = args?.['model']
-        state['workspaceRoot'] = args?.['workspace_root']
-        if (args?.['sandbox_mode'] !== undefined) state['sandboxMode'] = args['sandbox_mode']
+        state['workspaceRoot'] = args?.['workspaceRoot']
+        if (args?.['sandboxMode'] !== undefined) state['sandboxMode'] = args['sandboxMode']
         return undefined as T
       }
       if (command === 'create_session') return 'agent-new' as T
       if (command === 'send_task') return (args?.agentId ?? 'agent-new') as T
       if (command === 'load_session') return archive as T
+      // SH-113：宿主 FTS5 派生索引的替身；缺省给一个诚实的空页，不伪造命中。
+      if (command === 'search_sessions') {
+        if (searchHandler === undefined) return { items: [], hasMore: false } as T
+        return searchHandler(args) as T
+      }
       if (command === 'list_sessions') {
         return [{ agentId: 'agent-new', updatedAt: 1, title: '首条任务', workspaceRoot: 'W' }] as T
       }
@@ -218,6 +228,7 @@ interface SessionFace {
   selectModel(request: Record<string, unknown>): Promise<Record<string, unknown>>
   rename(request?: Record<string, unknown>): Promise<Record<string, unknown>>
   attachment(): Promise<never>
+  search(request?: Record<string, unknown>): Promise<Record<string, unknown>>
 }
 
 interface RemoteFace {
@@ -341,6 +352,71 @@ describe('适配层把 EventMsg 流映射成 DSH 会话 journal', () => {
     expect(attemptIds[0]).not.toBe(attemptIds[3])
 
     await iterator.return?.(undefined)
+    dispose()
+  })
+
+  it('会话流可被中断：follow 挂起等帧时 abort 立刻结束，$stream.dispose 不再悬挂', async () => {
+    const bridge = scriptedBridge()
+    const { remote, dispose } = createAdapter({ bridge })
+    const loose = remote as unknown as {
+      session: { follow(request: unknown, signal?: AbortSignal): AsyncGenerator<Record<string, unknown>> }
+      $stream(options: { name?: string; open: (signal: AbortSignal) => AsyncIterable<unknown> }): {
+        [Symbol.asyncIterator](): AsyncIterator<Record<string, unknown>>
+        dispose(): Promise<void>
+      }
+    }
+    const request = { address: { kind: 'session', sessionId: 'agent-new' }, assistantStream: true }
+
+    // ① follow 拿到快照后挂起等帧：abort 必须让它立刻 done。生成器若永远挂在
+    //    「等下一帧」的 await 上，消费者的 return()/dispose() 就永远不落地
+    //    （真机表现：关掉会话再打开，旧流悬着、新内容再也进不来）。
+    const abort = new AbortController()
+    const iterator = loose.session.follow(request, abort.signal)
+    await iterator.next()
+    const pending = iterator.next()
+    abort.abort(new Error('closed'))
+    expect((await pending).done).toBe(true)
+
+    // ② $stream：dispose 必须落地，不能挂在一个永不醒来的生成器上
+    const stream = loose.$stream({ name: 'probe', open: signal => loose.session.follow(request, signal) })
+    const consumer = stream[Symbol.asyncIterator]()
+    await consumer.next()
+    const outcome = await Promise.race([
+      stream.dispose().then(() => 'settled' as const),
+      new Promise<'hung'>(resolve => setTimeout(() => resolve('hung'), 1000)),
+    ])
+    expect(outcome).toBe('settled')
+    dispose()
+  })
+
+  it('工作区/投影流同样可中断：workspace.follow 与 session.control 的 dispose 都能落地', async () => {
+    const bridge = scriptedBridge()
+    const { remote, dispose } = createAdapter({ bridge })
+    const loose = remote as unknown as {
+      workspace: { follow(signal?: AbortSignal): AsyncGenerator<Record<string, unknown>> }
+      session: { control(signal?: AbortSignal): AsyncGenerator<Record<string, unknown>> }
+      $stream(options: { name?: string; open: (signal: AbortSignal) => AsyncIterable<unknown> }): {
+        [Symbol.asyncIterator](): AsyncIterator<Record<string, unknown>>
+        dispose(): Promise<void>
+      }
+    }
+    // 这两条在客户端是**进程级**流（workspace-controller / session-controller 的 control
+    // 各开一条，只随 Context 拆除而 dispose）。拆不动就会挂住 teardown：dev 热更新与
+    // 退出时旧生成器一直悬在「等下一帧」，越积越多。
+    const streams: [string, (signal: AbortSignal) => AsyncIterable<unknown>][] = [
+      ['workspace.follow', signal => loose.workspace.follow(signal)],
+      ['session.control', signal => loose.session.control(signal)],
+    ]
+    for (const [label, open] of streams) {
+      const stream = loose.$stream({ name: label, open })
+      const consumer = stream[Symbol.asyncIterator]()
+      await consumer.next()
+      const outcome = await Promise.race([
+        stream.dispose().then(() => 'settled' as const),
+        new Promise<'hung'>(resolve => setTimeout(() => resolve('hung'), 1000)),
+      ])
+      expect(outcome, label).toBe('settled')
+    }
     dispose()
   })
 
@@ -978,6 +1054,11 @@ describe('权限挡位与底部指标的数据面', () => {
   interface PermissionTestFace {
     permissionPresets: { catalog(): Promise<Record<string, unknown>> }
     commands: { execute(sessionId: string, line: string, args?: readonly string[]): Promise<Record<string, unknown>> }
+    $on(event: string, listener: (...args: unknown[]) => unknown): () => void
+    settings: {
+      describe(): Promise<Record<string, unknown>>
+      mutate(ns: string, ops: Record<string, unknown>[], expectedRevision?: number): Promise<Record<string, unknown>>
+    }
     session: SessionFace & {
       control(): AsyncGenerator<Record<string, unknown>>
       updateQueue(request: Record<string, unknown>): Promise<Record<string, unknown>>
@@ -1008,12 +1089,15 @@ describe('权限挡位与底部指标的数据面', () => {
     expect(snap1.projections.values['permissions']).toEqual({ currentValue: 'workspace-write' })
     await before.return?.(undefined)
 
-    // 提交：/permission 命令 → save_settings，其余必填参数传宿主现值原样写回
+    // 提交：/permission 命令 → save_settings，其余必填参数传宿主现值原样写回。
+    // 顶层键是 camelCase（Tauri 形参映射；D-08 真机错误正是拿到了 snake_case）
     const callsBefore = bridge.calls.length
     const result = await face.commands.execute('agent-new', '/permission danger-full-access')
     expect(result).toMatchObject({ ok: true, value: { matched: true } })
     expect(bridge.calls.slice(callsBefore).find(call => call.command === 'save_settings')?.args)
-      .toEqual({ base_url: 'https://lc/v1', model: 'LongCat-2.5', workspace_root: 'W', sandbox_mode: 'danger_full_access' })
+      .toEqual({
+        baseUrl: 'https://lc/v1', model: 'LongCat-2.5', workspaceRoot: 'W', sandboxMode: 'danger_full_access',
+      })
 
     // 宿主落盘后 get_settings 回读新值：目录默认与重开快照都反映新挡位
     const catalog2 = (await face.permissionPresets.catalog())['value'] as { defaultPreset: string }
@@ -1060,6 +1144,76 @@ describe('权限挡位与底部指标的数据面', () => {
     expect((result['error'] as { message: string }).message).toContain('沙箱模式取值非法')
     const catalog = (await face.permissionPresets.catalog())['value'] as { defaultPreset: string }
     expect(catalog.defaultPreset).toBe('workspace-write')
+    dispose()
+  })
+
+  it('设置页写 defaultPreset（settings 面的 permission 域）同样推 permissions 投影', async () => {
+    const bridge = scriptedBridge()
+    const { remote, dispose } = createAdapter({ bridge })
+    const face = faceOf2(remote)
+    await face.session.create({})
+    const control = face.session.control()
+    const baseline = (await control.next()).value as {
+      value: { projections: Record<string, { values: Record<string, unknown> }> }
+    }
+    expect(baseline.value.projections['agent-new']?.values['permissions']).toEqual({ currentValue: 'workspace-write' })
+
+    // 设置页的挡位行走的就是这条写面：describe 找 permission 域 → mutate 写 defaultPreset
+    const described = (await face.settings.describe())['value'] as {
+      namespaces: { ns: string; revision: number; value: Record<string, unknown> }[]
+    }
+    const permission = described.namespaces.find(ns => ns['ns'] === 'permission')!
+    expect(permission.value).toEqual({ defaultPreset: 'workspace-write' })
+    const result = await face.settings.mutate(
+      'permission',
+      [{ op: 'set', path: ['defaultPreset'], value: 'read-only' }],
+      permission.revision,
+    )
+    expect(result['ok']).toBe(true)
+    expect(bridge.calls.find(call => call.command === 'save_settings')?.args)
+      .toMatchObject({ sandboxMode: 'read_only' })
+
+    // 两条写面（/permission 命令与设置行）必须给出同一种确认：一帧 permissions 投影。
+    // 少了这一帧，用户在设置页改完档，回到对话页芯片上还是旧档。
+    const frame = (await control.next()).value as { changes: { key: string; val: unknown }[] }
+    expect(frame.changes).toEqual([{ key: 'permissions', val: { currentValue: 'read-only' } }])
+    await control.return?.(undefined)
+    dispose()
+  })
+
+  it('芯片与设置页写挡位走同一条收尾链：/permission 也让 describe 的 permission 视图前进', async () => {
+    const bridge = scriptedBridge()
+    const { remote, dispose } = createAdapter({ bridge })
+    const face = faceOf2(remote)
+    const emitted: unknown[][] = []
+    face.$on('settings/document-updated', (...args: unknown[]) => { emitted.push(args) })
+
+    const permissionView = async (): Promise<{ value: Record<string, unknown>; revision: number }> => {
+      const described = (await face.settings.describe())['value'] as {
+        namespaces: { ns: string; value: Record<string, unknown>; revision: number }[]
+      }
+      const found = described.namespaces.find(entry => entry['ns'] === 'permission')!
+      return { value: found.value, revision: found.revision }
+    }
+    // 设置页先读一次并缓存（真机 E-06 的起点：缓存里是上一档）
+    expect(await permissionView()).toEqual({ value: { defaultPreset: 'workspace-write' }, revision: 0 })
+
+    // ① 芯片路径：/permission 命令。收尾必须广播 + 推进修订号——设置页的 describe 缓存
+    //    只认这条通知重读，缺了它就是"芯片变了、开设置还是旧档"
+    const viaCommand = await face.commands.execute('agent-new', '/permission read-only')
+    expect(viaCommand).toMatchObject({ ok: true, value: { matched: true } })
+    expect(emitted).toContainEqual(['permission', 1])
+    expect(await permissionView()).toEqual({ value: { defaultPreset: 'read-only' }, revision: 1 })
+
+    // ② 设置页路径：mutate。两条路径的最终视图与修订号节奏完全一致
+    const viaSettings = await face.settings.mutate('permission', [
+      { op: 'set', path: ['defaultPreset'], value: 'danger-full-access' },
+    ], 1)
+    expect(viaSettings['ok']).toBe(true)
+    const afterMutate = await permissionView()
+    expect(afterMutate).toEqual({ value: { defaultPreset: 'danger-full-access' }, revision: 2 })
+    expect(viaSettings['value']).toMatchObject(afterMutate)
+    expect(emitted).toEqual([['permission', 1], ['permission', 2]])
     dispose()
   })
 
@@ -1775,6 +1929,88 @@ describe('子代理泳道（SH-109）：AgentEvent 信封的 agent_id 路由', (
     await expect(subagents.prompt({ childSessionId: 'lane-a', requestId: 'r1', delivery: 'queue', content: [] }))
       .rejects.toThrow('SH-053')
     await expect(subagents.interruptByUser('lane-a')).rejects.toThrow('SH-053')
+    dispose()
+  })
+})
+
+describe('session.search 接宿主 FTS5 派生索引（SH-113，wire query-only）', () => {
+  it('成功映射成 wire 形状：只传 {query}，按 sessionId 去重，hasMore 原样透传', async () => {
+    const bridge = scriptedBridge(HOST_SETTINGS, [], undefined, undefined, () => ({
+      items: [
+        { sessionId: 's1', snippet: '中文短语片段' },
+        { sessionId: 's2', snippet: '另一段正文' },
+        { sessionId: 's1', snippet: '重复会话该被丢掉' },
+      ],
+      hasMore: true,
+    }))
+    const { remote, dispose } = createAdapter({ bridge })
+    const result = await faceOf(remote).session.search({ query: '中文短语' })
+    expect(result['ok']).toBe(true)
+    const value = result['value'] as { items: { sessionId: string; snippet: string }[]; hasMore: boolean }
+    expect(value.items.map(item => item.sessionId)).toEqual(['s1', 's2'])
+    expect(value.items[0]?.snippet).toBe('中文短语片段')
+    // hasMore 只是「结果较多，请收窄查询」提示，适配层不据此发起续页。
+    expect(value.hasMore).toBe(true)
+    const calls = bridge.calls.filter(call => call.command === 'search_sessions')
+    expect(calls).toHaveLength(1)
+    expect(calls[0]?.args).toEqual({ query: '中文短语' })
+    dispose()
+  })
+
+  it('宿主索引/档案失败按 wire 契约回 {ok:false}，不让 rejection 穿透', async () => {
+    const failing = scriptedBridge(HOST_SETTINGS, [], undefined, undefined, () => {
+      throw { code: 'index-failed', message: '索引打不开' }
+    })
+    const { remote, dispose } = createAdapter({ bridge: failing })
+    const result = await faceOf(remote).session.search({ query: '中文' })
+    expect(result['ok']).toBe(false)
+    const error = result['error'] as { message?: string } | undefined
+    expect(error?.message).toContain('索引打不开')
+    // 只发一次：不静默重试、不返回空表冒充"没搜到"。
+    expect(failing.calls.filter(call => call.command === 'search_sessions')).toHaveLength(1)
+    dispose()
+
+    const archiveFailure = scriptedBridge(HOST_SETTINGS, [], undefined, undefined, () => {
+      throw { code: 'archive-read-failed', message: '会话档案读不回' }
+    })
+    const { remote: remote2, dispose: dispose2 } = createAdapter({ bridge: archiveFailure })
+    const result2 = await faceOf(remote2).session.search({ query: '中文' })
+    expect(result2['ok']).toBe(false)
+    const error2 = result2['error'] as { message?: string } | undefined
+    expect(error2?.message).toContain('会话档案读不回')
+    dispose2()
+  })
+
+  it('空/纯空白查询按上游回空表，不调宿主', async () => {
+    const bridge = scriptedBridge()
+    const { remote, dispose } = createAdapter({ bridge })
+    const session = faceOf(remote).session
+    for (const request of [{ query: '' }, { query: '   ' }, {}]) {
+      const result = await session.search(request)
+      expect(result['ok']).toBe(true)
+      const value = result['value'] as { items: unknown[]; hasMore: boolean }
+      expect(value.items).toEqual([])
+      expect(value.hasMore).toBe(false)
+    }
+    expect(bridge.calls.filter(call => call.command === 'search_sessions')).toHaveLength(0)
+    dispose()
+  })
+
+  it('hasMore 不是续页：同名 query 再搜也只带 {query}，不触发 Show more 请求', async () => {
+    const bridge = scriptedBridge(HOST_SETTINGS, [], undefined, undefined, () => ({
+      items: [{ sessionId: 's1', snippet: '片段' }], hasMore: true,
+    }))
+    const { remote, dispose } = createAdapter({ bridge })
+    const session = faceOf(remote).session
+    const first = await session.search({ query: '中文' })
+    const second = await session.search({ query: '中文' })
+    const calls = bridge.calls.filter(call => call.command === 'search_sessions')
+    expect(calls).toHaveLength(2)
+    expect(calls.map(call => call.args)).toEqual([{ query: '中文' }, { query: '中文' }])
+    const firstValue = first['value'] as { items: unknown[]; hasMore: boolean }
+    const secondValue = second['value'] as { items: unknown[]; hasMore: boolean }
+    expect(secondValue.items).toEqual(firstValue.items)
+    expect(secondValue.hasMore).toBe(true)
     dispose()
   })
 })

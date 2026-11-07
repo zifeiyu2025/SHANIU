@@ -1259,7 +1259,7 @@
     "./node_modules/.cache/dsh-types-client/src/dsh/packages/session/session-stats/src/*"
    ],
    "@deepseek-ai/dsh-session-title": [
-    "./node_modules/.cache/dsh-types-client/src/dsh/packages/session/session-title/src/index.d.ts"
+    "./node_modules/.cache/dsh-types-client/src/dsh/packages/session/session-title/src/types.d.ts"
    ],
    "@deepseek-ai/dsh-session-title/*": [
     "./node_modules/.cache/dsh-types-client/src/dsh/packages/session/session-title/src/*"

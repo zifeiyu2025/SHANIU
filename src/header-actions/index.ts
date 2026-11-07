@@ -6,20 +6,41 @@
  * - 更多操作：ui-conversation 的头部已经内建了 `contextMenu.button`（label「更多操作」），
  *   但只有 `sessionHeader` 目标存在菜单贡献时才渲染；这里补贡献，按钮随即出现。
  *
- * 两处都走上游既有接缝，不改任何移植源码。
+ * **SH-114 批 1**：「复制为 Markdown」不再用本地临时实现（`session-markdown.ts` 已退役），
+ * 改为挂上游 `session-log-export` 的 `SessionMarkdownCopyController`——同一份
+ * `formatSessionMarkdown`、同一套 CopyToast 与并发规则。上游那条路依赖 host 的
+ * `session.markdown` HTTP 路由，桌面壳没有 HTTP 面，所以用**构造注入的 fetcher**
+ * 换成 `load_session` + 本地渲染（见 `export-markdown.ts`），不改任何移植源码。
  */
 import type { Context } from '@deepseek-ai/cordis'
 import type { SessionId } from '@deepseek-ai/dsh-session/types'
 import type {} from '@deepseek-ai/dsh-client-ui-renderer/client'
 import type {} from '@deepseek-ai/dsh-client-ui-conversation/client'
 import type {} from '@deepseek-ai/dsh-client-ui-context-menu/client'
+import type {} from '@deepseek-ai/dsh-client-ui-layout/client'
+import { SessionMarkdownCopyController } from '../dsh/packages/session-query/session-log-export/src/client/copy-controller'
+import {
+  SessionMarkdownCopyToast, type SessionMarkdownCopyToastInjected,
+} from '../dsh/packages/session-query/session-log-export/src/client/CopyToast'
+import {
+  en as exportEn, NS as EXPORT_NS, zh as exportZh, type SessionLogDownloadKey,
+} from '../dsh/packages/session-query/session-log-export/src/client/locales'
+import { tauriBridge } from '../transport/tauri'
+import { writeClipboardText } from '../host/clipboard'
 import { ExplorerButton, OPEN_LOCAL_COMMAND } from './ExplorerButton'
 import { openInSystemExplorer } from './open-workspace'
-import { sessionToMarkdown } from './session-markdown'
+import { exportMarkdownFetcher } from './export-markdown'
 import { en, NS, zh } from './locales'
 
 /** 必需服务：槽位、词典、菜单、快捷键、会话与对话视图。 */
 export const inject = ['slots', 'locale', 'contextMenus', 'shortcuts', 'sessions', 'uiConversation']
+
+declare module '@deepseek-ai/dsh-client-ui-slots' {
+  interface LocaleNamespaceMap {
+    /** 导出反馈（复制 toast / 下载对话框）的词典命名空间，由上游 `session-log-export` 定义。 */
+    'session-log-download': SessionLogDownloadKey
+  }
+}
 
 declare module '@deepseek-ai/dsh-client-ui-context-menu/client' {
   interface ContextMenuTargetMap {
@@ -34,6 +55,7 @@ declare module '@deepseek-ai/dsh-client-ui-context-menu/client' {
  */
 export function apply(ctx: Context): void {
   ctx.effect(() => ctx.locale.register(NS, { zh, en }), 'shaniu-header: dictionaries')
+  ctx.effect(() => ctx.locale.register(EXPORT_NS, { zh: exportZh, en: exportEn }), 'shaniu-header: export dictionaries')
   const t = ctx.locale.bind(NS)
 
   // 直接打开当前会话的工作区目录；浏览器 dev 环境没有这个能力，保持静默
@@ -78,12 +100,39 @@ export function apply(ctx: Context): void {
     }),
   }, ExplorerButton))
 
-  // Markdown 取自 Chat 视图已经落定的节点，与界面所见同源
-  const sessionMarkdown = (sessionId: SessionId): string => {
-    const title = ctx.sessions.list.getSnapshot().byId[sessionId]?.displayTitle ?? sessionId
-    const snapshot = ctx.uiConversation.binding(sessionId).target('chat').getSnapshot()
-    return sessionToMarkdown(title, snapshot === undefined ? [] : snapshot.legacy.nodes)
-  }
+  // 会话标题取自列表快照（与侧栏同一来源）；冷会话也有条目，取不到才回落 id。
+  const titleOf = (sessionId: string): string =>
+    ctx.sessions.list.getSnapshot().byId[sessionId as SessionId]?.displayTitle ?? sessionId
+
+  const copyController = new SessionMarkdownCopyController(
+    exportMarkdownFetcher(tauriBridge(), titleOf),
+    {
+      // 桌面壳不用 deferred write：文本要经 `load_session` 异步取，而
+      // `ClipboardItem` 的延迟写依赖点击激活窗口，长导出会越过激活期；宿主
+      // `write_clipboard_text` 是同步落系统剪贴板的，更稳且与粘贴读取同源。
+      supportsDeferredWrite: () => false,
+      writeDeferred: async () => {},
+      writeText: async (text: string) => {
+        try {
+          await writeClipboardText(text)
+          return true
+        } catch {
+          return false
+        }
+      },
+    },
+  )
+  ctx.effect(() => async () => { await copyController.dispose() }, 'shaniu-header: markdown copy lifecycle')
+
+  ctx.slots.inject('shell.overlay', () => ctx.slots.register({
+    name: 'shell.overlay',
+    id: 'shaniu-session-copy-toast',
+    locale: EXPORT_NS,
+    inject: (): SessionMarkdownCopyToastInjected => ({
+      hooks: { sessionMarkdownCopy: copyController.store },
+      dismiss: () => { copyController.dismiss() },
+    }),
+  }, SessionMarkdownCopyToast))
 
   ctx.effect(() => ctx.contextMenus.register({
     id: 'shaniu.session-header',
@@ -95,7 +144,8 @@ export function apply(ctx: Context): void {
         label: t('menu.copyMarkdown'),
         icon: { key: 'workspace.copy' },
         failureLabel: t('menu.copyFailed'),
-        run: async () => { await navigator.clipboard.writeText(sessionMarkdown(sessionId)) },
+        // controller 把失败转成 toast 通知，不在这里抛；与上游菜单同一用法。
+        run: () => copyController.copy(sessionId),
       },
       {
         id: 'copy-id',
@@ -103,7 +153,7 @@ export function apply(ctx: Context): void {
         icon: { key: 'workspace.copy' },
         separatorBefore: true,
         failureLabel: t('menu.copyFailed'),
-        run: async () => { await navigator.clipboard.writeText(sessionId) },
+        run: async () => { await writeClipboardText(sessionId) },
       },
     ],
   }), 'shaniu-header: more menu')

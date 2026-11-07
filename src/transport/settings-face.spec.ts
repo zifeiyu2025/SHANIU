@@ -19,6 +19,8 @@ interface FakeHost {
   revision: number
   active: string
   failRead: boolean
+  /** 宿主 `[sandbox] mode` 的替身状态：`save_settings` 会改它，`get_settings` 按它回显。 */
+  sandboxMode: string
   /** discover_models 桩：设了错误就抛，否则回固定清单。 */
   discoverError: string | undefined
   rows(): Row[]
@@ -38,11 +40,52 @@ interface Row {
   models: { id: string; name: string; context_window: number; max_tokens: number; input: string[]; reasoning_efforts?: Record<string, string> }[]
 }
 
+/**
+ * Tauri 2 的**参数名映射契约**（SH-105 挡位全失效的真根因）：宿主那侧是裸
+ * `#[tauri::command] fn save_settings(base_url: String, …)`（`lib.rs`，没有 `rename_all`），
+ * Tauri 默认把 Rust 形参名映射成 JS 侧的 **camelCase**。传 snake_case = 出现未知键 +
+ * 缺必填键，宿主直接拒单：
+ * `invalid args \`baseUrl\` for command \`save_settings\`: command save_settings missing required key baseUrl`。
+ *
+ * 这条规则**只作用于顶层参数名**：`save_providers` 的 `providers` 数组元素在 serde 结构体里，
+ * 仍按 serde 定义走 snake_case（04 §1.3）——两处不能"统一"。
+ *
+ * 替身按同形报错，因为"只断言调用发生了"的假桥会让这类集成层缺陷一路绿到真机
+ * （挡位层就是这样 192 例全绿、`config.toml` 却一次都没写进去）。
+ */
+const CAMEL_COMMAND_ARGS: Record<string, readonly string[]> = {
+  save_settings: ['baseUrl', 'model', 'workspaceRoot'],
+  save_providers: ['providers', 'activeProvider', 'expectedRevision'],
+}
+
+function assertCommandArgs(command: string, args: Record<string, unknown> | undefined): void {
+  const required = CAMEL_COMMAND_ARGS[command]
+  if (required === undefined) return
+  const given = args ?? {}
+  for (const key of Object.keys(given)) {
+    if (key.includes('_')) {
+      throw new Error(`invalid args \`${key}\` for command \`${command}\`: unknown key (Tauri maps parameters to camelCase)`)
+    }
+  }
+  for (const key of required) {
+    if (!(key in given)) {
+      throw new Error(`invalid args \`${key}\` for command \`${command}\`: command ${command} missing required key ${key}`)
+    }
+  }
+}
+
 function fakeHost(rows: Row[] = []): FakeHost {
   const calls: FakeHost['calls'] = []
   const emitted: FakeHost['emitted'] = []
   const keys = new Set<string>()
-  const state = { revision: 0, active: '', failRead: false, rows, discoverError: undefined as string | undefined }
+  const state = {
+    revision: 0,
+    active: '',
+    failRead: false,
+    sandboxMode: 'workspace_write',
+    rows,
+    discoverError: undefined as string | undefined,
+  }
   const host: FakeHost = {
     calls,
     emitted,
@@ -52,12 +95,16 @@ function fakeHost(rows: Row[] = []): FakeHost {
     set active(value) { state.active = value },
     get failRead() { return state.failRead },
     set failRead(value) { state.failRead = value },
+    get sandboxMode() { return state.sandboxMode },
+    set sandboxMode(value) { state.sandboxMode = value },
     get discoverError() { return state.discoverError },
     set discoverError(value) { state.discoverError = value },
     rows: () => state.rows,
     bridge: {
       async invoke<T>(command: string, args?: Record<string, unknown>): Promise<T> {
         calls.push({ command, args })
+        // 先按 Tauri 的参数名规则校验：snake_case 顶层键或缺必填键一律拒单
+        assertCommandArgs(command, args)
         if (command === 'get_settings') {
           if (state.failRead) throw new Error('宿主忙')
           const active = state.rows[0]
@@ -67,7 +114,7 @@ function fakeHost(rows: Row[] = []): FakeHost {
             maxTurns: 32,
             workspaceRoot: 'W',
             hasApiKey: active !== undefined && keys.has(active.secret_ref),
-            sandboxMode: 'workspace_write',
+            sandboxMode: state.sandboxMode,
             approvalMode: 'ask',
             activeProvider: state.active,
             providerRevision: state.revision,
@@ -107,6 +154,11 @@ function fakeHost(rows: Row[] = []): FakeHost {
           state.active = args?.activeProvider as string
           state.revision += 1
           return state.revision as T
+        }
+        if (command === 'save_settings') {
+          // 宿主 `save_settings` 的替身：只改沙箱档（其余必填参数由 face 从快照原样写回）
+          state.sandboxMode = String(args?.sandboxMode ?? state.sandboxMode)
+          return undefined as T
         }
         if (command === 'has_api_key') return keys.has(args?.provider as string) as T
         if (command === 'store_api_key') {
@@ -555,6 +607,126 @@ describe('settings 面：写路径', () => {
     expect((result['value'] as { revision: number }).revision).toBe(1)
     expect((result['value'] as { value: Record<string, unknown> }).value['welcomeNoticeVersion']).toBe('2026-09-28.1')
     expect(host.calls.some(call => call.command === 'save_providers')).toBe(false)
+  })
+})
+
+describe('权限挡位域（permission 命名空间，SH-105 补修）', () => {
+  /** describe 里的 permission 视图。 */
+  const permissionOf = async (face: LooseFace): Promise<Record<string, any>> => {
+    const described = (await face.settings.describe())['value'] as { namespaces: Record<string, any>[] }
+    return described.namespaces.find(ns => ns['ns'] === 'permission')!
+  }
+
+  it('describe 暴露 permission 命名空间：defaultPreset 反推自宿主沙箱档，schema 声明三档', async () => {
+    const host = fakeHost([LONGCAT])
+    host.sandboxMode = 'danger_full_access'
+    const view = await permissionOf(faceOf(host))
+    // 缺这个命名空间时 DSH 的挡位行会静默不写（settings-store.ts:109-116），
+    // 连一句错误都显示不出来——这正是"点芯片没反应"的根因之一。
+    expect(view).toBeDefined()
+    expect(view['value']).toEqual({ defaultPreset: 'danger-full-access' })
+    expect(view['applies']).toBe('live')
+    expect(view['secrets']).toEqual([])
+    expect(view['revision']).toBe(0)
+    // schema 的枚举必须覆盖全集：界面按它渲染下拉，缺一档就少一个可选项
+    const schema = JSON.stringify(view['schema'])
+    for (const preset of ['read-only', 'workspace-write', 'danger-full-access']) {
+      expect(schema, preset).toContain(preset)
+    }
+  })
+
+  it('认不出的沙箱档回落最小档，不猜一个更宽松的档位', async () => {
+    const host = fakeHost([LONGCAT])
+    host.sandboxMode = 'some-future-mode'
+    const view = await permissionOf(faceOf(host))
+    expect(view['value']).toEqual({ defaultPreset: 'read-only' })
+  })
+
+  it('写 defaultPreset：落宿主 [sandbox] mode、刷新快照、修订号 +1 并广播', async () => {
+    const host = fakeHost([LONGCAT])
+    host.sandboxMode = 'read_only'
+    const face = faceOf(host)
+    const result = await face.settings.mutate('permission', [
+      { op: 'set', path: ['defaultPreset'], value: 'workspace-write' },
+    ], 0)
+    expect(result['ok']).toBe(true)
+    // 唯一的落点是宿主的 [sandbox] mode（save_settings），不是前端自己记一份。
+    // 键名必须是 camelCase（Tauri 形参映射）：写 `base_url`/`workspace_root`/`sandbox_mode`
+    // 会得到 `missing required key baseUrl`，宿主一次都不会落盘（D-08 的真机错误）。
+    const write = host.calls.find(call => call.command === 'save_settings')
+    expect(Object.keys(write?.args ?? {}).filter(key => key.includes('_'))).toEqual([])
+    expect(write?.args).toEqual({
+      baseUrl: 'https://api.longcat.chat/openai/v1',
+      model: 'LongCat-2.5',
+      workspaceRoot: 'W',
+      sandboxMode: 'workspace_write',
+    })
+    // 应答里的值来自写后重读的宿主快照（回弹给界面的是真实生效档）
+    expect((result['value'] as { value: { defaultPreset: string } }).value.defaultPreset).toBe('workspace-write')
+    expect((result['value'] as { revision: number }).revision).toBe(1)
+    expect(host.emitted).toEqual([{ name: 'settings/document-updated', args: ['permission', 1] }])
+    // 下一次 describe 的修订号也要跟上，否则界面第二次点击会被自己的旧修订号挡成 conflict
+    expect((await permissionOf(face))['revision']).toBe(1)
+    expect((await permissionOf(face))['value']).toEqual({ defaultPreset: 'workspace-write' })
+  })
+
+  it('save_providers 顶层 camelCase、providers 元素内部仍是 snake_case（顶层转、元素内不转）', async () => {
+    const host = fakeHost([LONGCAT])
+    const result = await faceOf(host).settings.mutate('llm-pi-ai', [{
+      op: 'set',
+      path: ['providers', 'minimax'],
+      value: profileValue({
+        models: [{ id: 'MiniMax-M2', name: 'MiniMax M2', contextWindow: 200_000, maxTokens: 8_192, input: ['text'] }],
+      }),
+    }], 0)
+    expect(result['ok']).toBe(true)
+    const args = host.calls.find(call => call.command === 'save_providers')!.args!
+    // 顶层：Tauri 只映射命令形参名
+    expect(Object.keys(args).sort()).toEqual(['activeProvider', 'expectedRevision', 'providers'])
+    // 元素内部：serde 结构体字段，落盘名保持 snake_case（04 §1.3）。
+    // "顺手统一成 camelCase"会把文档写坏——这条断言就是拦这个的。
+    const row = (args['providers'] as Record<string, unknown>[])[1]!
+    expect(Object.keys(row).sort()).toEqual([
+      'base_url', 'id', 'label', 'model', 'models', 'provider', 'reasoning_effort', 'secret_ref',
+    ])
+    expect((row['models'] as Record<string, unknown>[])[0]).toMatchObject({
+      context_window: 200_000, max_tokens: 8_192,
+    })
+  })
+
+  it('修订号对不上报 conflict 并停在写宿主之前', async () => {
+    const host = fakeHost([LONGCAT])
+    const result = await faceOf(host).settings.mutate('permission', [
+      { op: 'set', path: ['defaultPreset'], value: 'read-only' },
+    ], 9)
+    expect(result['ok']).toBe(false)
+    expect((result['error'] as { code: string }).code).toBe('settings/conflict')
+    expect((result['error'] as { details: unknown }).details).toMatchObject({ ns: 'permission', expected: 9, actual: 0 })
+    expect(host.calls.some(call => call.command === 'save_settings')).toBe(false)
+  })
+
+  it('未知挡位、未知路径、删除与多 op 一律如实拒绝，绝不静默忽略', async () => {
+    const host = fakeHost([LONGCAT])
+    const face = faceOf(host)
+    const cases: [string, Record<string, unknown>[], string][] = [
+      ['上游实验档 auto 不在目录里', [{ op: 'set', path: ['defaultPreset'], value: 'auto' }], '未知权限挡位'],
+      ['非字符串挡位', [{ op: 'set', path: ['defaultPreset'], value: 3 }], '未知权限挡位'],
+      ['未知字段', [{ op: 'set', path: ['approvalMode'], value: 'never' }], 'defaultPreset'],
+      ['删除语义', [{ op: 'unset', path: ['defaultPreset'] }], '只能把挡位设为某一档'],
+      ['多 op', [
+        { op: 'set', path: ['defaultPreset'], value: 'read-only' },
+        { op: 'set', path: ['defaultPreset'], value: 'danger-full-access' },
+      ], '一次只接受一个写入'],
+    ]
+    for (const [label, ops, keyword] of cases) {
+      const result = await face.settings.mutate('permission', ops, 0)
+      expect(result['ok'], label).toBe(false)
+      expect((result['error'] as { code: string }).code, label).toBe('settings/rejected')
+      expect((result['error'] as Error).message, label).toContain(keyword)
+    }
+    // 一条都不该落到宿主写面：拒绝就是拒绝，不是"写一半"
+    expect(host.calls.some(call => call.command === 'save_settings')).toBe(false)
+    expect(host.emitted).toEqual([])
   })
 })
 
