@@ -1708,6 +1708,15 @@
    "@deepseek-ai/dsh-host-open-in-app/shared": [
     "./node_modules/.cache/dsh-types-client/src/dsh/packages/host/open-in-app/src/shared.d.ts"
    ],
+   "@deepseek-ai/dsh-client-ui-reference": [
+    "./node_modules/.cache/dsh-types-client/src/dsh/packages/client/ui-reference/src/index.d.ts"
+   ],
+   "@deepseek-ai/dsh-client-ui-reference/*": [
+    "./node_modules/.cache/dsh-types-client/src/dsh/packages/client/ui-reference/src/*"
+   ],
+   "@deepseek-ai/dsh-client-ui-reference/client": [
+    "./node_modules/.cache/dsh-types-client/src/dsh/packages/client/ui-reference/src/client/index.d.ts"
+   ],
    "@deepseek-ai/dsh-client-ui-input-trigger/client": [
     "./node_modules/.cache/dsh-types-client/src/dsh/packages/client/ui-input-trigger/src/client/index.d.ts"
    ],

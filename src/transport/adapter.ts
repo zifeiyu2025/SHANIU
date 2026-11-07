@@ -2364,10 +2364,34 @@ export function createAdapter(options: AdapterOptions): { remote: unknown; dispo
     },
   }
 
+  /**
+   * `@file` 候选（SH-090 批 1）：路径-only 候选，模型自己用 read_file/list_dir 取材。
+   * 作用域由宿主按会话档案的 workspace_root 决定，客户端只交查询文本。
+   */
+  const fileReferencesNamespace = {
+    list: async (sessionId: string, query: string) => {
+      try {
+        return OK(await bridge.invoke<Array<Record<string, unknown>>>('list_file_references', { sessionId, query }))
+      } catch (reason) {
+        return FAIL((reason as { message?: string } | undefined)?.message ?? '无法列出文件引用候选')
+      }
+    },
+  }
+  /**
+   * 会话引用候选：SH-090 批 1 只接文件引用。会话引用需要「发送时校验 + 捕获被引用会话
+   * 上下文」的宿主面（上游 session-reference 的 pre-step 语义），尚未实现；这里如实给出
+   * 空候选，让 `@` 菜单保留文件组而不是伪造会话行。
+   */
+  const sessionReferenceResolverNamespace = {
+    candidates: async () => OK([]),
+  }
+
   const namespaces = new Map<string, unknown>([
     ['session', sessionNamespace],
     ['workspace', workspaceNamespace],
     ['workspaceFiles', workspaceFilesNamespace],
+    ['fileReferences', fileReferencesNamespace],
+    ['sessionReferenceResolver', sessionReferenceResolverNamespace],
     ['directoryPicker', directoryPickerNamespace],
     ['toolResults', toolResultsNamespace],
     ['settings', settingsNamespace],

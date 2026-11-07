@@ -33,6 +33,9 @@ pub fn system_instruction(workspace_root: &Path, sandbox: SandboxMode, plan_mode
 当前工作区：{workspace}\n\
 所有相对路径都相对该目录解析；不要读写工作区之外的路径。\n\
 沙箱模式：{}\n\n\
+## 文件引用\n\
+用户消息里以 @ 开头的 token 是显式路径引用：相对路径从工作区根解析，`@\"...\"` 表示含空格的路径。\n\
+以 `/` 结尾的是目录：需要时用 list_dir 列出；否则是文件：需要内容时用 read_file 读取，读取前不要声称看过内容。\n\n\
 ## 工具使用规则\n\
 - 动手前先用 read_file / list_dir / search 了解现状，不要凭猜测修改文件。\n\
 - 修改文件一律用 apply_patch（结构化补丁）；不要用 unified_exec 重定向写文件。\n\

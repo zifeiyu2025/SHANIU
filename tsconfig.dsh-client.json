@@ -468,6 +468,12 @@
    "@deepseek-ai/dsh-client-ui-open-in-app/*": [
     "./src/dsh/packages/client/ui-open-in-app/src/*"
    ],
+   "@deepseek-ai/dsh-client-ui-reference": [
+    "./src/dsh/packages/client/ui-reference/src/index.ts"
+   ],
+   "@deepseek-ai/dsh-client-ui-reference/*": [
+    "./src/dsh/packages/client/ui-reference/src/*"
+   ],
    "@deepseek-ai/dsh-host-open-in-app": [
     "./src/dsh/packages/host/open-in-app/src/index.ts"
    ],
@@ -1697,6 +1703,9 @@
    ],
    "@deepseek-ai/dsh-client-ui-open-in-app/client": [
     "./src/dsh/packages/client/ui-open-in-app/src/client/index.ts"
+   ],
+   "@deepseek-ai/dsh-client-ui-reference/client": [
+    "./src/dsh/packages/client/ui-reference/src/client/index.ts"
    ],
    "@deepseek-ai/dsh-client-ui-input-trigger/client": [
     "./src/dsh/packages/client/ui-input-trigger/src/client/index.ts"
@@ -3130,6 +3139,11 @@
   "./src/dsh/packages/client/ui-open-in-app/src/client/session-open-with.ts",
   "./src/dsh/packages/client/ui-open-in-app/src/css-modules.d.ts",
   "./src/dsh/packages/client/ui-open-in-app/src/index.ts",
+  "./src/dsh/packages/client/ui-reference/src/client/FileReference.tsx",
+  "./src/dsh/packages/client/ui-reference/src/client/index.ts",
+  "./src/dsh/packages/client/ui-reference/src/client/locales.ts",
+  "./src/dsh/packages/client/ui-reference/src/client/user-text-rules.ts",
+  "./src/dsh/packages/client/ui-reference/src/index.ts",
   "./src/dsh/packages/host/open-in-app/src/shared.ts",
   "./src/dsh/packages/client/ui-input-trigger/src/client/MenuView.module.css",
   "./src/dsh/packages/client/ui-input-trigger/src/client/MenuView.tsx",

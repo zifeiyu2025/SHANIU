@@ -63,6 +63,7 @@ $allow = @{
     'workspace_files' = @('tool_router', 'rollout', 'app_state')                                 # E30（SH-092 UI 预览读：shell_usable 复用 + 档案首行取会话根；config 属 infra 全局放行）
     'file_actions'    = @()                                                          # E31（SH-092 批 2 原生另存为：base64 解码 + 保存对话框，零业务依赖）
     'open_in_app'     = @()                                                          # E32（SH-092 批 3 open-in-app：注册表关联 + ShellExecute，零业务依赖）
+    'file_references' = @('workspace_files', 'app_state')                             # E33（SH-090 批 1 @file 候选：复用会话根解析 + tauri::State 取句柄）
 }
 # rollout 已落地（SH-030）：它只借用 model_client 的 HistoryItem 作为条目载荷，
 # 不反向依赖循环或工具层——档案是被读写的对象，不是参与者。

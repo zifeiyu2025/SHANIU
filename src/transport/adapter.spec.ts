@@ -82,7 +82,7 @@ function scriptedBridge(
     async invoke<T>(command: string, args?: Record<string, unknown>): Promise<T> {
       calls.push({ command, args })
       if (command === 'get_settings') return state as T
-      if (command === 'workspace_path_applications' || command === 'open_workspace_path') {
+      if (command === 'workspace_path_applications' || command === 'open_workspace_path' || command === 'list_file_references') {
         if (openHandler === undefined) return (command === 'open_workspace_path' ? undefined : []) as T
         return openHandler(command, args) as T
       }
@@ -2388,6 +2388,34 @@ describe('session.search 接宿主 FTS5 派生索引（SH-113，wire query-only�
     const revealCalls = bridge.calls.filter(call => call.command === 'open_workspace_path')
     expect(revealCalls.at(-1)?.args).toEqual({ path: 'C:/ws/a.ts', action: 'reveal' })
     expect(revealCalls.at(-1)?.args && Object.keys(revealCalls.at(-1)!.args!)).not.toContain('application')
+    dispose()
+  })
+
+  it('SH-090 @file 候选：命令参数 camelCase、结果透传、会话候选如实空表', async () => {
+    const candidates = [{ path: 'src/main.ts', kind: 'file' }, { path: 'src', kind: 'directory' }]
+    const bridge = scriptedBridge(HOST_SETTINGS, [], undefined, undefined, undefined, undefined, undefined,
+      command => (command === 'list_file_references' ? candidates : undefined))
+    const { remote, dispose } = createAdapter({ bridge })
+    const files = (faceOf(remote) as unknown as Record<string, Record<string, (...a: unknown[]) => Promise<Record<string, unknown>>>>).fileReferences
+    const listed = await files['list']!('sess-1', 'main')
+    expect(listed['value']).toEqual(candidates)
+    const call = bridge.calls.find(item => item.command === 'list_file_references')
+    expect(call?.args).toEqual({ sessionId: 'sess-1', query: 'main' })
+    expect(Object.keys(call?.args ?? {}).some(key => key.includes('_'))).toBe(false)
+    const resolver = (faceOf(remote) as unknown as Record<string, Record<string, (...a: unknown[]) => Promise<Record<string, unknown>>>>).sessionReferenceResolver
+    const sessions = await resolver['candidates']!('sess-1', 'x')
+    expect(sessions['value']).toEqual([])
+    dispose()
+  })
+
+  it('SH-090 @file 候选：宿主失败回 {ok:false} 而不是空表冒充没搜到', async () => {
+    const bridge = scriptedBridge(HOST_SETTINGS, [], undefined, undefined, undefined, undefined, undefined,
+      () => { throw { message: '目录不可读' } })
+    const { remote, dispose } = createAdapter({ bridge })
+    const files = (faceOf(remote) as unknown as Record<string, Record<string, (...a: unknown[]) => Promise<Record<string, unknown>>>>).fileReferences
+    const failed = await files['list']!('sess-1', 'main')
+    expect(failed['ok']).toBe(false)
+    expect((failed['error'] as { message: string }).message).toContain('目录不可读')
     dispose()
   })
 

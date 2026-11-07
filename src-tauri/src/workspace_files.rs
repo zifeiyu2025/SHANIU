@@ -139,7 +139,7 @@ impl FileOpError {
 /// .workspace_root` 才是建档时固化的事实，也正是 `continue_session` 给工具沙箱用的同一个值。
 /// 档案不存在或该字段为空 → 回落全局默认根：新会话在写下第一行档案之前就绑在全局根上，
 /// 与 `create_session` 的口径一致，不是猜。
-fn session_root(state: &AppState, session_id: &str) -> PathBuf {
+pub(crate) fn session_root(state: &AppState, session_id: &str) -> PathBuf {
     // 档案名只接受 id 字符集：`../` 之类会把路径拼出 rollouts 目录（只影响回落值也不该放行）。
     if session_id.is_empty() || !session_id.chars().all(|c| c.is_ascii_alphanumeric() || c == '-' || c == '_') {
         return state.workspace_root();

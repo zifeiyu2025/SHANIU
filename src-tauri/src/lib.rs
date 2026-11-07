@@ -5,6 +5,7 @@ pub mod config;
 pub mod compaction;
 pub mod events;
 pub mod file_actions;
+pub mod file_references;
 pub mod model_client;
 pub mod model_discovery;
 pub mod open_in_app;
@@ -1458,7 +1459,8 @@ pub fn run() {
             open_in_app::open_in_app_catalog,
             open_in_app::open_in_app_launch,
             open_in_app::workspace_path_applications,
-            open_in_app::open_workspace_path
+            open_in_app::open_workspace_path,
+            file_references::list_file_references
         ])
         .on_window_event(|window, event| {
             // 关闭 = 隐藏到系统托盘（不退出）；真正退出只走托盘菜单「退出」

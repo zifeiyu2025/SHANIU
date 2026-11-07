@@ -35,6 +35,8 @@ import type { EncodedFileUploadRequest, FileUploadValue } from '@deepseek-ai/dsh
 import type { ProductEvent } from '../../dsh/packages/client/product-analytics/src/events'
 import type { OfficeToPdfPriority, RenderedDocumentBytes, OfficeToPdfGeneration } from '@deepseek-ai/dsh-office-to-pdf/types'
 import type { SessionRemote } from './session-remote'
+import type { FileReferenceCandidate } from '@deepseek-ai/dsh-file-reference/types'
+import type { SessionReferenceMentionCandidate } from '@deepseek-ai/dsh-session-reference/types'
 import type { CompactionCheckpointSource } from '@deepseek-ai/dsh-compaction/checkpoint'
 
 declare module '@deepseek-ai/dsh-llm' {
@@ -111,8 +113,18 @@ interface ScheduleRemote {
   edit(request: Schedule.ScheduleEditRequest, signal?: AbortSignal): Promise<RemoteResult<Schedule.ScheduleEditResult>>
 }
 
+interface FileReferencesRemote {
+  list(sessionId: SessionId, query: string, signal?: AbortSignal): Promise<RemoteResult<FileReferenceCandidate[]>>
+}
+
+interface SessionReferenceResolverRemote {
+  candidates(sessionId: SessionId, query: string, signal?: AbortSignal): Promise<RemoteResult<SessionReferenceMentionCandidate[]>>
+}
+
 export interface RemoteNamespaces {
   readonly session: SessionRemote
+  readonly fileReferences: FileReferencesRemote
+  readonly sessionReferenceResolver: SessionReferenceResolverRemote
   readonly settings: SettingsRemote
   readonly credentials: CredentialsRemote
   readonly llm: LlmRemote
