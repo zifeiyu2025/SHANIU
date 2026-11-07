@@ -4,6 +4,7 @@ pub mod app_state;
 pub mod config;
 pub mod compaction;
 pub mod events;
+pub mod file_actions;
 pub mod model_client;
 pub mod model_discovery;
 pub mod sandbox;
@@ -1451,7 +1452,8 @@ pub fn run() {
             workspace_files::workspace_file_stat,
             workspace_files::workspace_file_read,
             workspace_files::workspace_file_read_bytes,
-            workspace_files::workspace_file_list
+            workspace_files::workspace_file_list,
+            file_actions::save_file_bytes
         ])
         .on_window_event(|window, event| {
             // 关闭 = 隐藏到系统托盘（不退出）；真正退出只走托盘菜单「退出」

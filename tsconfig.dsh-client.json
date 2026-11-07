@@ -456,6 +456,12 @@
    "@deepseek-ai/dsh-client-ui-file-drag/*": [
     "./src/dsh/packages/client/ui-file-drag/src/*"
    ],
+   "@deepseek-ai/dsh-client-ui-file-actions": [
+    "./src/dsh/packages/client/ui-file-actions/src/index.ts"
+   ],
+   "@deepseek-ai/dsh-client-ui-file-actions/*": [
+    "./src/dsh/packages/client/ui-file-actions/src/*"
+   ],
    "@deepseek-ai/dsh-client-ui-input-trigger": [
     "./src/dsh/packages/client/ui-input-trigger/src/index.ts"
    ],
@@ -1673,6 +1679,9 @@
    ],
    "@deepseek-ai/dsh-client-ui-file-drag/client": [
     "./src/dsh/packages/client/ui-file-drag/src/client/index.ts"
+   ],
+   "@deepseek-ai/dsh-client-ui-file-actions/client": [
+    "./src/dsh/packages/client/ui-file-actions/src/client/index.ts"
    ],
    "@deepseek-ai/dsh-client-ui-input-trigger/client": [
     "./src/dsh/packages/client/ui-input-trigger/src/client/index.ts"
@@ -3081,6 +3090,13 @@
   "./src/dsh/packages/client/ui-file-drag/src/client/index.ts",
   "./src/dsh/packages/client/ui-file-drag/src/client/locales.ts",
   "./src/dsh/packages/client/ui-file-drag/src/client/transfers.ts",
+  "./src/dsh/packages/client/ui-file-actions/src/client/context-menus.tsx",
+  "./src/dsh/packages/client/ui-file-actions/src/client/files.ts",
+  "./src/dsh/packages/client/ui-file-actions/src/client/index.ts",
+  "./src/dsh/packages/client/ui-file-actions/src/client/locales.ts",
+  "./src/dsh/packages/client/ui-file-actions/src/css-modules.d.ts",
+  "./src/dsh/packages/client/ui-file-actions/src/index.ts",
+  "./src/dsh/packages/client/ui-file-actions/src/types.ts",
   "./src/dsh/packages/client/ui-input-trigger/src/client/MenuView.module.css",
   "./src/dsh/packages/client/ui-input-trigger/src/client/MenuView.tsx",
   "./src/dsh/packages/client/ui-input-trigger/src/client/contract.ts",

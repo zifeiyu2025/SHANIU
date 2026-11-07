@@ -1687,6 +1687,15 @@
    "@deepseek-ai/dsh-client-ui-file-drag/client": [
     "./node_modules/.cache/dsh-types-client/src/dsh/packages/client/ui-file-drag/src/client/index.d.ts"
    ],
+   "@deepseek-ai/dsh-client-ui-file-actions": [
+    "./node_modules/.cache/dsh-types-client/src/dsh/packages/client/ui-file-actions/src/index.d.ts"
+   ],
+   "@deepseek-ai/dsh-client-ui-file-actions/*": [
+    "./node_modules/.cache/dsh-types-client/src/dsh/packages/client/ui-file-actions/src/*"
+   ],
+   "@deepseek-ai/dsh-client-ui-file-actions/client": [
+    "./node_modules/.cache/dsh-types-client/src/dsh/packages/client/ui-file-actions/src/client/index.d.ts"
+   ],
    "@deepseek-ai/dsh-client-ui-input-trigger/client": [
     "./node_modules/.cache/dsh-types-client/src/dsh/packages/client/ui-input-trigger/src/client/index.d.ts"
    ],

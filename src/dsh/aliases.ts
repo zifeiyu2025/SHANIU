@@ -107,6 +107,8 @@ export const dshAliases: { find: RegExp; replacement: string }[] = [
   { find: /^@deepseek-ai\/dsh-client-ui-dockkit\/(.*)$/, replacement: '/src/dsh/packages/client/ui-dockkit/src/$1' },
   { find: /^@deepseek-ai\/dsh-client-ui-file-drag$/, replacement: '/src/dsh/packages/client/ui-file-drag/src/index.ts' },
   { find: /^@deepseek-ai\/dsh-client-ui-file-drag\/(.*)$/, replacement: '/src/dsh/packages/client/ui-file-drag/src/$1' },
+  { find: /^@deepseek-ai\/dsh-client-ui-file-actions$/, replacement: '/src/dsh/packages/client/ui-file-actions/src/index.ts' },
+  { find: /^@deepseek-ai\/dsh-client-ui-file-actions\/(.*)$/, replacement: '/src/dsh/packages/client/ui-file-actions/src/$1' },
   { find: /^@deepseek-ai\/dsh-client-ui-input-trigger$/, replacement: '/src/dsh/packages/client/ui-input-trigger/src/index.ts' },
   { find: /^@deepseek-ai\/dsh-client-ui-input-trigger\/(.*)$/, replacement: '/src/dsh/packages/client/ui-input-trigger/src/$1' },
   { find: /^@deepseek-ai\/dsh-client-ui-layout$/, replacement: '/src/dsh/packages/client/ui-layout/src/index.ts' },

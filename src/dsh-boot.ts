@@ -36,6 +36,8 @@ import { apply as uiPluginManagerApply, inject as uiPluginManagerInject } from '
 import { apply as uiScheduleApply, inject as uiScheduleInject } from '@deepseek-ai/dsh-client-ui-schedule/client'
 import { apply as uiContextMenuApply, inject as uiContextMenuInject } from '@deepseek-ai/dsh-client-ui-context-menu/client'
 import { apply as uiFileDragApply, inject as uiFileDragInject } from '@deepseek-ai/dsh-client-ui-file-drag/client'
+import { apply as uiFileActionsApply, inject as uiFileActionsInject } from '@deepseek-ai/dsh-client-ui-file-actions/client'
+import { installDesktopFileActions } from './file-actions/desktop-bridge'
 import { apply as uiInputTriggerApply, inject as uiInputTriggerInject } from '@deepseek-ai/dsh-client-ui-input-trigger/client'
 import { apply as uiCommandsApply, inject as uiCommandsInject } from '@deepseek-ai/dsh-client-ui-commands/client'
 import { apply as fileUploadApply, inject as fileUploadInject } from '@deepseek-ai/dsh-client-file-upload/client'
@@ -127,6 +129,9 @@ export async function bootShaniu(container: HTMLElement): Promise<BootHandle> {
 
   // 宿主侧服务：适配层（桌面真实后端）、mock（浏览器联调）或 stub（等待接线的核销清单）
   if (realData) {
+    // 原始文件动作的桌面适配面（SH-092 批 2）：上游 ui-file-actions 从这里取
+    // `dshDesktop.fileActions`；保存目标只由命令内部的原生对话框产生。
+    installDesktopFileActions(tauriBridge())
     // 默认工作区基线必须在挂载前写入；家目录给 connection 基线缩写路径用
     const { homeDir } = await applyProductWorkspacePath()
     adapter = createAdapter({
@@ -194,6 +199,9 @@ export async function bootShaniu(container: HTMLElement): Promise<BootHandle> {
     { inject: fileUploadInject, apply: fileUploadApply },
     { inject: sessionControllerInject, apply: sessionControllerApply },
     { inject: uiFileDragInject, apply: uiFileDragApply },
+    // 原始文件动作（SH-092 批 2）：下载/另存为/复制图片。桌面适配面是
+    // 原生保存对话框（路径只由用户手势产生），浏览器态退回 anchor 下载。
+    { inject: uiFileActionsInject, apply: uiFileActionsApply },
     { inject: uiContextMenuInject, apply: uiContextMenuApply },
     { inject: uiInputTriggerInject, apply: uiInputTriggerApply },
     { inject: uiCommandsInject, apply: uiCommandsApply },
