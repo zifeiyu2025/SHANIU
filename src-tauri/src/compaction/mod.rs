@@ -118,6 +118,42 @@ pub fn plan_if_needed(observed_tokens: usize, items: &[HistoryItem], budget: usi
     Some(Target { range_start: 0, range_end: split })
 }
 
+/// 手动压缩（`/compact`，SH-115）的目标规划：与 [`plan_if_needed`] 同一条尾部保留
+/// 算法，但**不看预算阈值**——用户显式要求压缩就是要现在压，哪怕当前用量还低。
+/// 预算仍决定保留多少（budget=0 时只留最后一条：预算关闭说明用户不想要自动压缩，
+/// 但手动命令的语义不变）。
+///
+/// 与 [`plan_if_needed`] 的另两点差异：
+/// - 少于两条返回 `None`（没有可压的，调用方回 "No compactable history yet."）；
+///   不像自动路径那样退化压最旧一条——唯一一条就是任务本身，压掉它没有意义。
+/// - 全部装进保留额度时（split==0）钳到 1：手动命令既然发出了，至少压掉最旧一条，
+///   与 [`plan_if_needed`] 的退化口径一致，而不是空转返回"没压任何东西"。
+pub fn plan_manual(items: &[HistoryItem], budget: usize) -> Option<Target> {
+    if items.len() < 2 {
+        return None;
+    }
+    let keep_allowance = if budget == 0 {
+        0
+    } else {
+        budget.saturating_mul(KEEP_RATIO_PERCENT) / 100
+    };
+    let mut kept = 0usize;
+    let mut split = items.len();
+    for index in (0..items.len()).rev() {
+        let cost = item_tokens(&items[index]);
+        if kept + cost > keep_allowance {
+            split = index + 1;
+            break;
+        }
+        kept += cost;
+        split = index;
+    }
+    if split >= items.len() {
+        split = items.len() - 1;
+    }
+    Some(Target { range_start: 0, range_end: split.max(1) })
+}
+
 /// 构造总结请求：被压区间的全部条目 + 末尾一条总结指令。
 ///
 /// 只送被压区间而不是整段历史：保留段马上还要原样用，把它再喂一遍只会让这次
@@ -272,5 +308,44 @@ mod tests {
         // 空摘要写进锚点 = 那段历史被替换成"什么都没有"，是静默丢上下文
         assert!(extract_summary("   \n ").is_err());
         assert_eq!(extract_summary(" 摘要正文 ").unwrap(), "摘要正文");
+    }
+
+    // ============================== plan_manual（SH-115）==============================
+
+    #[test]
+    fn manual_plan_compacts_even_under_budget() {
+        // 自动判据按预算说不压（plan_if_needed → None）；手动命令仍要给出目标
+        let items = vec![msg(Role::User, "第一条"), msg(Role::Assistant, "第二条")];
+        assert_eq!(plan_if_needed(0, &items, 1_000_000), None);
+        let target = plan_manual(&items, 1_000_000).expect("手动压缩不受阈值拦截");
+        // 保留段装得下全部 → 钳到"至少留最后一条"
+        assert_eq!(target, Target { range_start: 0, range_end: 1 });
+    }
+
+    #[test]
+    fn manual_plan_without_budget_keeps_only_the_last_item() {
+        let items = vec![
+            msg(Role::User, "一"),
+            msg(Role::User, "二"),
+            msg(Role::User, "三"),
+        ];
+        let target = plan_manual(&items, 0).expect("budget=0 只影响保留额度，不否决手动压缩");
+        assert_eq!(target, Target { range_start: 0, range_end: 2 });
+    }
+
+    #[test]
+    fn manual_plan_respects_keep_allowance_when_budget_is_tight() {
+        // 每条约 25_000 token（10 万字节）；budget 40_000 → 保留额度 12_000，
+        // 一条都装不下 → split 落在第 0 次超限处，但钳到至少留最后一条
+        let big = "x".repeat(100_000);
+        let items: Vec<HistoryItem> = (0..4).map(|_| msg(Role::User, &big)).collect();
+        let target = plan_manual(&items, 40_000).expect("存在可压区间");
+        assert_eq!(target, Target { range_start: 0, range_end: 3 });
+    }
+
+    #[test]
+    fn manual_plan_needs_at_least_two_items() {
+        assert_eq!(plan_manual(&[msg(Role::User, "唯一一条")], 0), None);
+        assert_eq!(plan_manual(&[], 0), None);
     }
 }

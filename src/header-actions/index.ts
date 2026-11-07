@@ -17,11 +17,9 @@
  * 「保存对话框 + Rust 写 ZIP」（见 `export-zip.ts`）。菜单因此是三入口：
  * 复制为 Markdown / 下载会话日志 / 复制会话 ID。
  *
- * **`/export` 命令未接**：上游那条命令注册在 **host 插件**（`session-log-export/src/index.ts`
- * 的 `apply`，inject `['commands', 'connection']`），桌面壳没有 host 命令注册表，
- * 前端 `ui-commands` 的 `commands.execute` 只认 `/permission`、`/plan off` 两条。
- * 这里不伪造一个"看起来能跑"的 `/export`——菜单入口已经覆盖同一动作，
- * 缺口记在 docs/05 完成注里。
+ * **`/export` 命令（SH-115）**：与菜单入口共享同一个 `SessionLogDownloadController`
+ * 实例——命令面（adapter 的 `remote.commands.execute`）经 `transport/command-triggers`
+ * 的触发总线调到这里，零第二条导出链。菜单没装配（插件未启动）时命令如实报错。
  */
 import type { Context } from '@deepseek-ai/cordis'
 import type { SessionId } from '@deepseek-ai/dsh-session/types'
@@ -44,6 +42,7 @@ import {
   en as exportEn, NS as EXPORT_NS, zh as exportZh, type SessionLogDownloadKey,
 } from '../dsh/packages/session-query/session-log-export/src/client/locales'
 import { tauriBridge } from '../transport/tauri'
+import { registerExportTrigger } from '../transport/command-triggers'
 import { writeClipboardText } from '../host/clipboard'
 import { ExplorerButton, OPEN_LOCAL_COMMAND } from './ExplorerButton'
 import { openInSystemExplorer } from './open-workspace'
@@ -153,6 +152,11 @@ export function apply(ctx: Context): void {
     }),
   )
   ctx.effect(() => async () => { await downloadController.dispose() }, 'shaniu-header: zip download lifecycle')
+
+  // SH-115：/export 命令共用这条下载链（触发总线见 transport/command-triggers.ts）。
+  // 插件卸载时注销，命令面在无执行者时报"导出面不可用"而不是触达已 dispose 的控制器。
+  ctx.effect(() => registerExportTrigger((sessionId) => { void downloadController.download(sessionId) }),
+    'shaniu-header: /export trigger wiring')
 
   // 菜单图标：上游把这组 key 注册在自己的 client 插件里，SHANIU 没挂它的 apply，
   // 所以在这里补同一个 key——菜单项只认 key，图标实现放哪不影响文案与行为。

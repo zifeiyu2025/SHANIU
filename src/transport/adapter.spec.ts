@@ -7,6 +7,7 @@
 import { describe, expect, it, vi } from 'vitest'
 import { assertSessionWireEvent } from '../dsh/packages/api/session-controller/src/client/session-wire-event.ts'
 import { createAdapter } from './adapter'
+import { registerExportTrigger } from './command-triggers'
 import type { HostBridge } from './tauri'
 import type { AgentEvent, EventMsg } from './types'
 
@@ -57,12 +58,16 @@ function scriptedBridge(
   saveFailure?: unknown,
   /** SH-113：`search_sessions` 的宿主替身（可 throw {code,message} 模拟类型化错误）。 */
   searchHandler?: (args: Record<string, unknown> | undefined) => unknown,
+  /** SH-115：`compact_session` 的宿主替身（null = 没有可压历史；可 throw 模拟失败）。 */
+  compactHandler?: (args: Record<string, unknown> | undefined) => unknown,
 ): ScriptedBridge {
   const calls: ScriptedBridge['calls'] = []
   const handlers = new Set<(event: AgentEvent) => void>()
   let counter = 0
   // SH-100 的侧车状态（每份桥独立克隆，避免测试间串味）
   const workspaceFlags = { archived: [] as string[], pinned: [] as string[], order: [] as string[] }
+  // SH-115：进程级 PlanState 的替身（set/get 共用同一份布尔，模拟宿主持久态）
+  let planActive = false
   // 宿主语义的关键一条：save_settings 落盘 config.toml，之后的 get_settings 回读新值。
   // 测试桥按同一语义模拟（每份桥独立的克隆，避免测试间串味），挡位切换的投影推帧
   // 才能测到"切换后 UI 显示新挡位"而不是停在旧值。
@@ -72,6 +77,16 @@ function scriptedBridge(
     async invoke<T>(command: string, args?: Record<string, unknown>): Promise<T> {
       calls.push({ command, args })
       if (command === 'get_settings') return state as T
+      // SH-115：计划态命令面的替身
+      if (command === 'set_plan_mode') {
+        planActive = args?.['active'] === true
+        return planActive as T
+      }
+      if (command === 'get_plan_mode') return planActive as T
+      if (command === 'compact_session') {
+        if (compactHandler === undefined) return null as T
+        return compactHandler(args) as T
+      }
       if (command === 'save_settings') {
         if (saveFailure !== undefined) throw saveFailure
         // 键名必须是 camelCase：宿主是裸 `#[tauri::command] fn save_settings(base_url, …)`
@@ -1093,7 +1108,8 @@ describe('权限挡位与底部指标的数据面', () => {
     // 顶层键是 camelCase（Tauri 形参映射；D-08 真机错误正是拿到了 snake_case）
     const callsBefore = bridge.calls.length
     const result = await face.commands.execute('agent-new', '/permission danger-full-access')
-    expect(result).toMatchObject({ ok: true, value: { matched: true } })
+    // SH-115 起结果走 CommandResult 契约（value.result），与上游宿主命令同形状
+    expect(result).toMatchObject({ ok: true, value: { result: { kind: 'success', text: 'preset danger-full-access' } } })
     expect(bridge.calls.slice(callsBefore).find(call => call.command === 'save_settings')?.args)
       .toEqual({
         baseUrl: 'https://lc/v1', model: 'LongCat-2.5', workspaceRoot: 'W', sandboxMode: 'danger_full_access',
@@ -1118,30 +1134,41 @@ describe('权限挡位与底部指标的数据面', () => {
     dispose()
   })
 
-  it('commands.execute：非本命令的行与未知挡位都回未命中，不写宿主', async () => {
+  it('commands.execute：真正未命中的行回 undefined；/permission 的 bare 与未知挡位按上游语义回 CommandResult', async () => {
     const bridge = scriptedBridge()
     const { remote, dispose } = createAdapter({ bridge })
     const face = faceOf2(remote)
     // matched 判据是"返回值非 undefined"（session.ts）：未命中必须 ok:true + value undefined
-    const other = await face.commands.execute('agent-new', '/plan on')
+    const other = await face.commands.execute('agent-new', '/nonexistent')
     expect(other).toMatchObject({ ok: true })
     expect(other['value']).toBeUndefined()
+    // 未知挡位：上游语义是"命中但 handler 报错"（CommandResult error），不是未命中
     const unknownPreset = await face.commands.execute('agent-new', '/permission auto')
-    expect(unknownPreset['value']).toBeUndefined()
+    expect(unknownPreset).toMatchObject({
+      ok: true,
+      value: { result: { kind: 'error', text: expect.stringContaining('unknown preset "auto"') } },
+    })
+    // bare：回当前挡位与可用清单（上游 permission-presets 同款文案）
     const bare = await face.commands.execute('agent-new', '/permission')
-    expect(bare['value']).toBeUndefined()
+    expect(bare).toMatchObject({
+      ok: true,
+      value: { result: { kind: 'success', text: expect.stringContaining('current preset') } },
+    })
     expect(bridge.calls.some(call => call.command === 'save_settings')).toBe(false)
     dispose()
   })
 
-  it('挡位切换被宿主拒绝时按 {ok:false} 回给客户端，目录默认保持旧档', async () => {
-    // wire 契约：UI 的错误处理读 result.ok，穿透 rejection 会绕过它
+  it('挡位切换被宿主拒绝时回 CommandResult error（命中命令、草稿保留），目录默认保持旧档', async () => {
+    // SH-115 起对齐上游：handler 失败 = CommandResult error（composer 读 result.kind
+    // 保留草稿），transport 层的 {ok:false} 留给"调用本身被拒"的场合
     const bridge = scriptedBridge(HOST_SETTINGS, [], undefined, '沙箱模式取值非法，可用：read_only / workspace_write / danger_full_access')
     const { remote, dispose } = createAdapter({ bridge })
     const face = faceOf2(remote)
     const result = await face.commands.execute('agent-new', '/permission danger-full-access')
-    expect(result['ok']).toBe(false)
-    expect((result['error'] as { message: string }).message).toContain('沙箱模式取值非法')
+    expect(result).toMatchObject({
+      ok: true,
+      value: { result: { kind: 'error', text: expect.stringContaining('沙箱模式取值非法') } },
+    })
     const catalog = (await face.permissionPresets.catalog())['value'] as { defaultPreset: string }
     expect(catalog.defaultPreset).toBe('workspace-write')
     dispose()
@@ -1201,7 +1228,7 @@ describe('权限挡位与底部指标的数据面', () => {
     // ① 芯片路径：/permission 命令。收尾必须广播 + 推进修订号——设置页的 describe 缓存
     //    只认这条通知重读，缺了它就是"芯片变了、开设置还是旧档"
     const viaCommand = await face.commands.execute('agent-new', '/permission read-only')
-    expect(viaCommand).toMatchObject({ ok: true, value: { matched: true } })
+    expect(viaCommand).toMatchObject({ ok: true, value: { result: { kind: 'success', text: 'preset read-only' } } })
     expect(emitted).toContainEqual(['permission', 1])
     expect(await permissionView()).toEqual({ value: { defaultPreset: 'read-only' }, revision: 1 })
 
@@ -1299,7 +1326,10 @@ describe('权限挡位与底部指标的数据面', () => {
 
 describe('Plan 芯片与客户端排队', () => {
   interface QueueTestFace {
-    commands: { execute(sessionId: string, line: string): Promise<Record<string, unknown>> }
+    commands: {
+      execute(sessionId: string, line: string): Promise<Record<string, unknown>>
+      list(sessionId: string): Promise<Record<string, unknown>>
+    }
     session: SessionFace & {
       updateQueue(request: Record<string, unknown>): Promise<Record<string, unknown>>
     }
@@ -1359,16 +1389,140 @@ describe('Plan 芯片与客户端排队', () => {
     planning.dispose()
   })
 
-  it('/plan off 给可行动指引（退出只能走审批卡），其余 /plan 变体照旧未命中', async () => {
+  it('/plan 真实进出计划态（SH-115：宿主 set_plan_mode 面），run/done 事件随行', async () => {
     const bridge = scriptedBridge()
     const { remote, dispose } = createAdapter({ bridge })
     const face = faceOf3(remote)
-    const off = await face.commands.execute('agent-new', '/plan off')
-    expect(off['ok']).toBe(false)
-    expect((off['error'] as { message: string }).message).toContain('审批卡')
+    const session = face.session
+
+    // bare /plan：进入 + 投影随行
     const activate = await face.commands.execute('agent-new', '/plan')
-    expect(activate).toMatchObject({ ok: true })
-    expect(activate['value']).toBeUndefined()
+    expect(activate).toMatchObject({ ok: true, value: { result: { kind: 'success', text: 'Plan mode on. Use /plan off to leave.' } } })
+    expect(await projectionValuesOf(session, 'agent-new')).toMatchObject({ plan: { active: true, pending: false } })
+    // 宿主替身确实被置位（进程级状态，与工具路径同源）
+    expect(bridge.calls.some(call => call.command === 'set_plan_mode' && call.args?.['active'] === true)).toBe(true)
+
+    // /plan off：真实退出（替换 SH-106 期间的"指引"方案，对齐上游 PlanChip 退出路径）
+    const off = await face.commands.execute('agent-new', '/plan off')
+    expect(off).toMatchObject({ ok: true, value: { result: { kind: 'success', text: 'Plan mode off.' } } })
+    expect((await projectionValuesOf(session, 'agent-new'))['plan']).toBeUndefined()
+
+    // 生命周期事件成对出现在活动 journal（仅活态；落档缺口已在卡上声明）
+    const iterator = session.follow({ address: { kind: 'session', sessionId: 'agent-new' } })
+    const events = eventsOf((await iterator.next()).value as Record<string, unknown>)
+    await iterator.return?.(undefined)
+    const runs = events.filter(event => event['type'] === 'command/run') as { data: Record<string, unknown> }[]
+    const dones = events.filter(event => event['type'] === 'command/done') as { data: Record<string, unknown> }[]
+    expect(runs.map(event => event.data['name'])).toEqual(['plan', 'plan'])
+    expect(dones.map(event => event.data['text'])).toEqual(['Plan mode on. Use /plan off to leave.', 'Plan mode off.'])
+    dispose()
+  })
+
+  it('/plan <message>：空闲态进入计划态并提交消息；运行中如实拒绝注入', async () => {
+    const bridge = scriptedBridge()
+    const { remote, dispose } = createAdapter({ bridge })
+    const face = faceOf3(remote)
+    const session = face.session
+
+    // 空闲态：进入计划态 + 消息走与用户输入相同的提交链（send_task + 回合事件）
+    const withMessage = await face.commands.execute('agent-new', '/plan 先调研再动手')
+    expect(withMessage).toMatchObject({ ok: true, value: { result: { kind: 'success' } } })
+    expect(bridge.calls.some(call => call.command === 'send_task' && call.args?.['task'] === '先调研再动手')).toBe(true)
+    expect(await projectionValuesOf(session, 'agent-new')).toMatchObject({ plan: { active: true } })
+
+    // 运行中：没有注入面（SH-053），报错让草稿留在输入框，不伪造受理
+    const busy = await face.commands.execute('agent-new', '/plan 再补一条')
+    expect(busy).toMatchObject({ ok: true, value: { result: { kind: 'error', text: expect.stringContaining('SH-053') } } })
+    dispose()
+  })
+
+  it('/compact：成功推 run + 摘要 user 消息 + done；无可压历史与失败各回各的文案', async () => {
+    const bridge = scriptedBridge(undefined, undefined, undefined, undefined, undefined, () => ({
+      summary: '五段式交接摘要',
+      shadowedItems: 12,
+      shadowedTokens: 3456,
+    }))
+    const { remote, dispose } = createAdapter({ bridge })
+    const face = faceOf3(remote)
+    const session = face.session
+
+    const ok = await face.commands.execute('agent-new', '/compact')
+    expect(ok).toMatchObject({
+      ok: true,
+      value: { result: { kind: 'success', text: 'Compacted 12 history items (~3456 tokens).' } },
+    })
+
+    const iterator = session.follow({ address: { kind: 'session', sessionId: 'agent-new' } })
+    const events = eventsOf((await iterator.next()).value as Record<string, unknown>)
+    await iterator.return?.(undefined)
+    const types = events.map(event => event['type'])
+    expect(types).toContain('command/run')
+    expect(types).toContain('command/done')
+    const summary = events.filter(event => event['type'] === 'user/message').at(-1) as { data: { content: { text: string }[] } }
+    expect(summary.data.content[0]!['text']).toBe('五段式交接摘要')
+
+    // 带参数：上游 USAGE 文案原样拒绝
+    const usage = await face.commands.execute('agent-new', '/compact 现在')
+    expect(usage).toMatchObject({ ok: true, value: { result: { kind: 'error', text: 'Usage: /compact (no arguments)' } } })
+
+    // 宿主失败：错误文本如实回传（含宿主原因），不吞成"没搜到历史"
+    const failingBridge = scriptedBridge(undefined, undefined, undefined, undefined, undefined, () => {
+      throw '压缩总结流失败: 端点 500'
+    })
+    const failing = createAdapter({ bridge: failingBridge })
+    const fail = await faceOf3(failing.remote).commands.execute('agent-new', '/compact')
+    expect(fail).toMatchObject({ ok: true, value: { result: { kind: 'error', text: '压缩总结流失败: 端点 500' } } })
+    failing.dispose()
+    dispose()
+  })
+
+  it('/export：触发 header-actions 注册的下载链；未装配时如实报错', async () => {
+    const bridge = scriptedBridge()
+    const { remote, dispose } = createAdapter({ bridge })
+    const face = faceOf3(remote)
+
+    // 未注册执行者（header-actions 尚未装配）：不伪造"已请求"
+    const missing = await face.commands.execute('agent-new', '/export')
+    expect(missing).toMatchObject({ ok: true, value: { result: { kind: 'error', text: expect.stringContaining('not available') } } })
+
+    // 注册后：命中执行者并带上会话 id
+    const seen: string[] = []
+    const unregister = registerExportTrigger((sessionId) => { seen.push(sessionId) })
+    const ok = await face.commands.execute('agent-new', '/export')
+    expect(ok).toMatchObject({ ok: true, value: { result: { kind: 'success', text: 'Session log download requested.' } } })
+    expect(seen).toEqual(['agent-new'])
+    unregister()
+    dispose()
+  })
+
+  it('命令目录：四条宿主命令带第一方 definitionId（菜单行与中文别名据此渲染）', async () => {
+    const bridge = scriptedBridge()
+    const { remote, dispose } = createAdapter({ bridge })
+    const face = faceOf3(remote)
+    expect((await face.commands.list('agent-new'))['value']).toEqual([
+      { definitionId: '@deepseek-ai/dsh-command-compact', name: 'compact', description: 'Compact older conversation history' },
+      { definitionId: '@deepseek-ai/dsh-plan-mode', name: 'plan', description: 'Enter or leave plan mode', input: { hint: '[off|message]', attachments: false } },
+      { definitionId: '@deepseek-ai/dsh-permission-presets', name: 'permission', description: 'Switch the permission preset (sandbox mode + approval policy)', input: { hint: '<preset>' } },
+      { definitionId: '@deepseek-ai/dsh-session-log-export', name: 'export', description: 'Download this Session log as a ZIP archive' },
+    ])
+    dispose()
+  })
+
+  it('/permission：bare 回当前挡位与可用清单，未知挡位按上游文案报错', async () => {
+    const bridge = scriptedBridge()
+    const { remote, dispose } = createAdapter({ bridge })
+    const face = faceOf3(remote)
+    const bare = await face.commands.execute('agent-new', '/permission')
+    expect(bare).toMatchObject({
+      ok: true,
+      value: { result: { kind: 'success', text: expect.stringContaining('current preset') } },
+    })
+    expect((bare as { value: { result: { text: string } } }).value.result.text).toContain('read-only')
+    const unknown = await face.commands.execute('agent-new', '/permission yolo')
+    expect(unknown).toMatchObject({
+      ok: true,
+      value: { result: { kind: 'error', text: 'unknown preset "yolo" (available: read-only, workspace-write, danger-full-access)' } },
+    })
     dispose()
   })
 

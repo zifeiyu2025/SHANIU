@@ -26,8 +26,11 @@ import type { WorkspaceId } from '@deepseek-ai/dsh-workspace/types'
 import type { MessageId } from '@deepseek-ai/dsh-llm'
 import { createSettingsFace } from './settings-face'
 import {
-  PERMISSION_PRESET_OPTIONS, presetOfSandbox, sandboxOfPreset,
+  PERMISSION_PRESETS, PERMISSION_PRESET_OPTIONS, presetOfSandbox, sandboxOfPreset,
 } from './permission-presets'
+import { CommandDefinitionId } from '@deepseek-ai/dsh-commands/brand'
+import type { CommandDescriptor } from '@deepseek-ai/dsh-commands/types'
+import { requestExport } from './command-triggers'
 import {
   catalogEntryOf, foldTimingEvent, initTimingState, laneIdOf, timingProjectionOf,
   type SubagentCatalogEntry, type SubagentTimingState,
@@ -1159,6 +1162,33 @@ export function createAdapter(options: AdapterOptions): { remote: unknown; dispo
     return address?.kind === 'session' ? address.sessionId : address?.childSessionId
   }
 
+  /**
+   * 立即提交一条任务并开回合（`session.prompt` 的"非排队"路径本体）。SH-115 抽出：
+   * `/plan <message>` 的上游语义是"进入计划态并把消息交给模型开始只读调研"（plan-mode
+   * host 插件的 handler 里 `agent.steer(createUserMessage(...))`），桌面壳没有运行中
+   * 注入面（SH-053），空闲态下等价动作就是走这条与用户输入完全相同的提交链。
+   */
+  const submitPromptNow = async (sessionId: string | undefined, text: string, rpcId?: string): Promise<void> => {
+    const agentId = await bridge.invoke<string>('send_task', { task: text, agentId: sessionId })
+    const journal = journalOf(agentId)
+    if (!titles.has(agentId)) pushTitle(agentId, text.trim().slice(0, 12) || '新会话')
+    // 回合在这里开，不等后端的第一条事件：输入行必须落在回合内，
+    // 而 send_task 已经返回 agent_id，说明后端确实接下了这个任务。
+    if (!journal.taskOpen) openTask(journal)
+    dispatch('api-session/status', agentId, true)
+    pushTurnStart(agentId, journal)
+    pushEvent(journal, 'step/start', { turn: journal.turn, step: journal.step })
+    beginStepMetrics(journal)
+    // rpcId 必须等于 prompt 的 requestId：客户端据此撤掉本地乐观回显（session.ts 的
+    // observeSubmissionMessage），否则同一条消息会出现两遍。
+    pushEvent(journal, 'user/message', {
+      id: `shaniu-user-${journal.seq + 1}`,
+      role: 'user',
+      content: [{ type: 'text', text }],
+      source: { kind: 'user', ...(rpcId === undefined ? {} : { rpcId }) },
+    }, { surfaceOp: 'append' })
+  }
+
   const sessionNamespace = {
     list: async () => {
       const rows = await bridge
@@ -1289,24 +1319,7 @@ export function createAdapter(options: AdapterOptions): { remote: unknown; dispo
           return OK({ accepted: true })
         }
       }
-      const agentId = await bridge.invoke<string>('send_task', { task: text, agentId: request.sessionId })
-      const journal = journalOf(agentId)
-      if (!titles.has(agentId)) pushTitle(agentId, text.trim().slice(0, 12) || '新会话')
-      // 回合在这里开，不等后端的第一条事件：输入行必须落在回合内，
-      // 而 send_task 已经返回 agent_id，说明后端确实接下了这个任务。
-      if (!journal.taskOpen) openTask(journal)
-      dispatch('api-session/status', agentId, true)
-      pushTurnStart(agentId, journal)
-      pushEvent(journal, 'step/start', { turn: journal.turn, step: journal.step })
-      beginStepMetrics(journal)
-      // rpcId 必须等于 prompt 的 requestId：客户端据此撤掉本地乐观回显（session.ts 的
-      // observeSubmissionMessage），否则同一条消息会出现两遍。
-      pushEvent(journal, 'user/message', {
-        id: `shaniu-user-${journal.seq + 1}`,
-        role: 'user',
-        content: [{ type: 'text', text }],
-        source: { kind: 'user', ...(request.requestId === undefined ? {} : { rpcId: request.requestId }) },
-      }, { surfaceOp: 'append' })
+      submitPromptNow(request.sessionId, text, request.requestId)
       return OK({ accepted: true })
     },
     cancel: async (request: { sessionId?: string } = {}) => {
@@ -1939,40 +1952,215 @@ export function createAdapter(options: AdapterOptions): { remote: unknown; dispo
     },
   }
 
+  // ---- 宿主命令面（SH-115）----
+
   /**
-   * `remote.commands`：`/permission <preset>`（挡位芯片的提交路径）与 `/plan off`
-   * （PlanChip 退出 → 指引审批卡，见上）。返回值非 undefined 即"命中命令"（session.ts
-   * 的 matched 判据）；未命中/非本命令的行一律 OK(undefined)，命令生命周期记录属
-   * 上游宿主职责，宿主没有命令日志面就不伪造。`list` 给空目录："+"菜单据此恢复到
-   * 客户端贡献行（附件/模型入口），而不是骨架屏闪一下就自动关闭。
+   * 宿主命令目录：`/` 菜单行的数据源。只列**真实可执行**的命令——goal/feedback/file
+   * 没有宿主语义（goal/feedback 的宿主插件不存在、file 依赖未接线的附件面），不上
+   * 目录（不伪造可点但跑不通的行）；model/file 的菜单行由 vendored 客户端包自己
+   * 贡献（modelDirectories / 附件面），不归这张表。文案一律上游原文——菜单行的
+   * 本地化 label/描述/图标由 vendored presentation 按 definitionId 自动取 ui-commands
+   * 词典（`description.compact` 等），这里不需要也无法复刻。
+   * `plan` 的 `attachments: false` 与上游不同（上游 true）：上游把附件转交模型，
+   * 我们没有附件面，如实声明不接受。
+   */
+  const HOST_COMMAND_DESCRIPTORS: readonly CommandDescriptor[] = [
+    {
+      definitionId: CommandDefinitionId('@deepseek-ai/dsh-command-compact'),
+      name: 'compact',
+      description: 'Compact older conversation history',
+    },
+    {
+      definitionId: CommandDefinitionId('@deepseek-ai/dsh-plan-mode'),
+      name: 'plan',
+      description: 'Enter or leave plan mode',
+      input: { hint: '[off|message]', attachments: false },
+    },
+    {
+      definitionId: CommandDefinitionId('@deepseek-ai/dsh-permission-presets'),
+      name: 'permission',
+      description: 'Switch the permission preset (sandbox mode + approval policy)',
+      input: { hint: '<preset>' },
+    },
+    {
+      definitionId: CommandDefinitionId('@deepseek-ai/dsh-session-log-export'),
+      name: 'export',
+      description: 'Download this Session log as a ZIP archive',
+    },
+  ]
+
+  /** 上游宿主执行器会把 run/done 写进会话日志渲染成流节点；桌面壳没有命令日志面，
+   *  以 pushEvent 把同一对事件推进活动 journal（仅活态、不落档案——重启后节点消失
+   *  而命令效果持久，这个不对称如实存在，与"没有日志面就不伪造"同一口径）。 */
+  const pushCommandRun = (sessionId: string, name: string, args: string): { commandId: string } => {
+    const journal = journalOf(sessionId)
+    const commandId = `shaniu-cmd-${journal.seq + 1}`
+    pushEvent(journal, 'command/run', {
+      commandId,
+      name,
+      ...(args === '' ? {} : { args }),
+      source: { kind: 'user' },
+    })
+    return { commandId }
+  }
+
+  const pushCommandDone = (
+    sessionId: string,
+    commandId: string,
+    result: { kind: 'success' | 'error'; text: string },
+  ): void => {
+    pushEvent(journalOf(sessionId), 'command/done', { commandId, kind: result.kind, text: result.text })
+  }
+
+  /**
+   * `remote.commands`（SH-115）：`list` 供 `/` 菜单与输入触发器解析（含中文别名
+   * 计划/压缩/权限/导出，vendored `resolveCommand` 现成），`execute` 真执行。
+   * 返回值契约：value 非 undefined 即"命中命令"（session.ts 的 matched 判据），
+   * `value.result` 是 CommandResult——ui-commands 据此发本地 `command/executed`，
+   * PlanChip 的退出路径只看 value 是否为 undefined。未命中行一律 OK(undefined)。
    */
   const commandsNamespace = {
-    list: async () => OK([]),
-    execute: async (_sessionId: string, line: string, _args: readonly unknown[] = []) => {
-      // /plan off（PlanChip 的退出路径）：宿主 PlanState 只认 exit_plan_mode 工具执行，
-      // 前端没有真实退出手段——按业界成熟口径给可行动指引（退出 = 在「计划评审」
-      // 审批卡上批准），不伪造一次退出。其余 /plan 变体（激活/带消息）没有对应宿主
-      // 语义，照旧未命中。
-      if (/^\/plan\s+off\s*$/.test(line.trim())) {
-        return FAIL('计划态由「计划评审」审批卡退出：助手调用 exit_plan_mode 时对话流会出现审批卡，批准即退出。')
+    list: async () => OK(HOST_COMMAND_DESCRIPTORS),
+    execute: async (sessionId: string, line: string, _args: readonly unknown[] = []): Promise<
+      | { ok: true; value: { result: { kind: 'success' | 'error'; text: string } } }
+      | { ok: true; value: undefined }
+      | { ok: false; error: RemoteError }
+    > => {
+      const input = line.trim()
+
+      // ---- /plan：进入/退出计划态（真实退出，替换 SH-106 期间的"指引"方案）----
+      // 上游 handler（plan-mode host 插件）逐字对齐：off → 置假；带消息 → 进入并把
+      // 消息交给模型；bare → 进入。PlanState 进程级全局，工具路径（enter/exit_
+      // plan_mode）与命令路径写同一份状态，芯片投影经 setPlanActive 即时随行。
+      if (/^\/plan\b/.test(input)) {
+        const message = input.replace(/^\/plan\b/, '').trim()
+        if (message === 'off') {
+          const run = pushCommandRun(sessionId, 'plan', 'off')
+          const active = await bridge.invoke<boolean>('set_plan_mode', { active: false })
+          setPlanActive(active)
+          const result = { kind: 'success' as const, text: 'Plan mode off.' }
+          pushCommandDone(sessionId, run.commandId, result)
+          return OK({ result })
+        }
+        const run = pushCommandRun(sessionId, 'plan', message)
+        const active = await bridge.invoke<boolean>('set_plan_mode', { active: true })
+        setPlanActive(active)
+        if (message !== '') {
+          const busy = journals.get(sessionId)
+          if (busy?.taskOpen === true) {
+            // 运行中提交本该走上游的 steer（运行中注入）；桌面壳没有注入面（SH-053），
+            // 如实报错让草稿留在输入框，用户可以停下任务后重发。
+            const result = {
+              kind: 'error' as const,
+              text: '已进入计划态，但运行中的会话暂不能接收这条消息（steering 待 SH-053）；停止任务后可直接发送。',
+            }
+            pushCommandDone(sessionId, run.commandId, result)
+            return OK({ result })
+          }
+          await submitPromptNow(sessionId, message)
+        }
+        const result = {
+          kind: 'success' as const,
+          text: 'Plan mode on. Use /plan off to leave.',
+        }
+        pushCommandDone(sessionId, run.commandId, result)
+        return OK({ result })
       }
-      const match = /^\/permission\s+([a-z][a-z-]*)\s*$/.exec(line.trim())
-      if (match === null) return OK(undefined)
-      const sandbox = sandboxOfPreset(match[1]!)
-      if (sandbox === undefined) return OK(undefined)
-      try {
-        await face.applySandboxMode(sandbox)
-      } catch (reason) {
-        // wire 契约：失败以 {ok:false} 回给客户端，不是 rejection——UI 的错误处理
-        // 读 result.ok，穿透的 rejection 会绕过它（挡位芯片收不到失败原因）。
-        return FAIL(reason instanceof Error ? reason.message : String(reason))
+
+      // ---- /compact：回合外按需压缩（SH-115）----
+      if (/^\/compact\b/.test(input)) {
+        if (input !== '/compact') {
+          const result = { kind: 'error' as const, text: 'Usage: /compact (no arguments)' }
+          const run = pushCommandRun(sessionId, 'compact', input.slice('/compact'.length).trim())
+          pushCommandDone(sessionId, run.commandId, result)
+          return OK({ result })
+        }
+        const run = pushCommandRun(sessionId, 'compact', '')
+        let result: { kind: 'success' | 'error'; text: string }
+        try {
+          const outcome = await bridge.invoke<{ summary: string; shadowedItems: number; shadowedTokens: number } | null>(
+            'compact_session', { agentId: sessionId },
+          )
+          if (outcome === null) {
+            result = { kind: 'success', text: 'No compactable history yet.' }
+          } else {
+            // 摘要正文推一条 user 消息：重开/回放时档案锚点本来就投影成 user 消息
+            // （lib.rs project_entries），活态推同形状，两边渲染一致。
+            const journal = journalOf(sessionId)
+            pushEvent(journal, 'user/message', {
+              id: `shaniu-compact-${journal.seq + 1}`,
+              role: 'user',
+              content: [{ type: 'text', text: outcome.summary }],
+              source: { kind: 'user' },
+            }, { surfaceOp: 'append' })
+            result = {
+              kind: 'success',
+              text: `Compacted ${outcome.shadowedItems} history items (~${outcome.shadowedTokens} tokens).`,
+            }
+          }
+        } catch (reason) {
+          result = { kind: 'error', text: reason instanceof Error ? reason.message : String(reason) }
+        }
+        pushCommandDone(sessionId, run.commandId, result)
+        return OK({ result })
       }
-      pushPermissionToAll()
-      // 与设置页写挡位走**同一条**收尾链（修订 +1 + `settings/document-updated` 广播）：
-      // 少了这次广播，设置页的 describe 缓存不失效——芯片切完再打开设置，权限行还显示
-      // 上一档（真机 E-06）。`pushPermissionToAll` 只喂对话页芯片，替不了这一条。
-      face.commitPermissionPreset()
-      return OK({ matched: true })
+
+      // ---- /permission：挡位切换（SH-105 既有实现，文案对齐上游 permission-presets）----
+      const permissionMatch = /^\/permission\s*([a-z][a-z-]*)?\s*$/.exec(input)
+      if (permissionMatch !== null) {
+        const run = pushCommandRun(sessionId, 'permission', permissionMatch[1] ?? '')
+        let result: { kind: 'success' | 'error'; text: string }
+        const requested = permissionMatch[1]
+        if (requested === undefined) {
+          result = {
+            kind: 'success',
+            text: `current preset ${currentPermission()} (available: ${PERMISSION_PRESETS.join(', ')})`,
+          }
+        } else {
+          const sandbox = sandboxOfPreset(requested)
+          if (sandbox === undefined) {
+            result = {
+              kind: 'error',
+              text: `unknown preset "${requested}" (available: ${PERMISSION_PRESETS.join(', ')})`,
+            }
+          } else {
+            try {
+              await face.applySandboxMode(sandbox)
+              result = { kind: 'success', text: `preset ${requested}` }
+            } catch (reason) {
+              // wire 契约：失败以 result.error 回给客户端，不是 rejection——UI 的错误
+              // 处理读 result.ok，穿透的 rejection 会绕过它（挡位芯片收不到失败原因）。
+              result = { kind: 'error', text: reason instanceof Error ? reason.message : String(reason) }
+            }
+          }
+        }
+        if (result.kind === 'success' && requested !== undefined) {
+          pushPermissionToAll()
+          // 与设置页写挡位走**同一条**收尾链（修订 +1 + `settings/document-updated`
+          // 广播）：少了这次广播，设置页的 describe 缓存不失效——芯片切完再打开设置，
+          // 权限行还显示上一档（真机 E-06）。
+          face.commitPermissionPreset()
+        }
+        pushCommandDone(sessionId, run.commandId, result)
+        return OK({ result })
+      }
+
+      // ---- /export：发起会话日志 ZIP 下载（执行者在 header-actions，SH-114 批 2）----
+      if (/^\/export\b/.test(input)) {
+        const run = pushCommandRun(sessionId, 'export', input.slice('/export'.length).trim())
+        let result: { kind: 'success' | 'error'; text: string }
+        if (input !== '/export') {
+          result = { kind: 'error', text: 'The /export command does not accept arguments.' }
+        } else if (requestExport(asSessionId(sessionId))) {
+          result = { kind: 'success', text: 'Session log download requested.' }
+        } else {
+          result = { kind: 'error', text: 'The export surface is not available in this build.' }
+        }
+        pushCommandDone(sessionId, run.commandId, result)
+        return OK({ result })
+      }
+
+      return OK(undefined)
     },
   }
 

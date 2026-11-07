@@ -9,6 +9,7 @@ pub mod model_discovery;
 pub mod sandbox;
 pub mod permission;
 pub mod rollout;
+pub mod session_compact;
 pub mod session_export;
 pub mod session_query;
 pub mod session_title;
@@ -1142,6 +1143,71 @@ fn export_session_log(
     session_export::write_zip(std::path::Path::new(&dest), &entries)
 }
 
+/// SH-115：`/plan` 命令的宿主面——直接置位/清位进程级 PlanState。
+///
+/// 上游 `/plan` 注册在 host 插件（`plan-mode/src/index.ts`，inject `['commands']`），
+/// 语义就是「直接改计划态」而不是走模型工具：`/plan off` 由 PlanChip 的退出路径
+/// 调用（`ui-plan/client/index.ts` 的 `exitPlanMode`），`/plan` 进入后模型在**下一轮**
+/// 只见只读工具。SHANIU 的 `PlanState` 挂在 `AppState`（进程级、跨任务持久），与
+/// 工具路径（`enter_plan_mode`/`exit_plan_mode`）写同一份状态，两条入口天然一致。
+/// 返回置位后的状态，前端据此推 `plan` 投影（芯片随行）。
+#[tauri::command]
+fn set_plan_mode(app: tauri::AppHandle, active: bool) -> bool {
+    let state = app.state::<AppState>();
+    if active {
+        state.plan_state.activate();
+    } else {
+        state.plan_state.deactivate();
+    }
+    state.plan_state.is_active()
+}
+
+/// SH-115：计划态查询面。补 SH-106 已知缺口（适配层重启丢 plan 态而宿主持久，
+/// 宿主无查询面）——前端跟随/重开 会话时据此重建投影，芯片不再依赖"本轮恰好有
+/// enter/exit 工具执行事件"才亮。
+#[tauri::command]
+fn get_plan_mode(app: tauri::AppHandle) -> bool {
+    app.state::<AppState>().plan_state.is_active()
+}
+
+/// SH-115：`/compact` 的宿主面——回合外按需压缩。
+///
+/// 复用 SH-032 的锚点格式与回放语义（`rollout::resume`），总结请求是对齐
+/// `session_title` 形态的独立辅助请求（`session_compact::compact_now`）。**运行中
+/// 会话拒绝**：回合内的自动压缩与这里的锚点写如果并发，两份锚点的区间会互相
+/// 指错（区间语义建立在"锚点按记录顺序、对当时重放长度生效"上）——单任务闸下
+/// 守住"目标会话不是活动任务"即可。
+#[tauri::command]
+async fn compact_session(app: tauri::AppHandle, agent_id: String) -> Result<Option<session_compact::CompactOutcome>, String> {
+    let state = app.state::<AppState>();
+    if state.active_agent().as_deref() == Some(agent_id.as_str()) {
+        return Err("会话正在运行：请等当前任务结束（或停止它）再压缩".into());
+    }
+    let cfg = state.config();
+    let active = cfg.effective_model();
+    // 辅助请求不启用推理档（与标题生成同一裁决：档位属于主回合的采样质量选择，
+    // 辅助请求要快与省）；自定义请求头照带（部署头是端点级的）。
+    let provider = model_client::provider::ProviderConfig {
+        provider: active.provider.clone(),
+        base_url: active.base_url.clone(),
+        model: active.model.clone(),
+        reasoning_effort: None,
+        headers: active.headers.clone(),
+    };
+    let api_key = crate::config::SecretStore::new(&state.config_root())
+        .load_key(&active.secret_name)
+        .map_err(|e| format!("读取密钥失败: {e}"))?
+        .ok_or_else(|| "未配置 API 密钥，无法生成摘要".to_string())?;
+    let budget = cfg.agent.token_budget;
+    let path = state
+        .data_root()
+        .join(rollout::ROLLOUT_DIR)
+        .join(format!("{agent_id}.jsonl"));
+    let resumed = rollout::resume::resume(&path).map_err(|e| format!("档案读不回: {e}"))?;
+    // state 的借用止于上面最后一次取值（NLL），不跨下面的 await 点。
+    session_compact::compact_now(&provider, &api_key, &resumed, budget).await
+}
+
 /// 产品目录视图：前端用它把默认工作区基线落到宿主解析出的 `<数据根>\Workspace`。
 #[tauri::command]
 fn get_product_dirs() -> config::ProductDirsView {
@@ -1289,6 +1355,9 @@ pub fn run() {
             export_probe,
             pick_save_file,
             export_session_log,
+            compact_session,
+            get_plan_mode,
+            set_plan_mode,
             get_product_dirs,
             read_clipboard_text,
             write_clipboard_text
