@@ -1429,6 +1429,9 @@ pub fn run() {
     if let Err(e) = config::ensure_product_dirs(&dirs) {
         eprintln!("[SHANIU] 产品目录创建失败（数据目录不可写？）: {e}");
     }
+    // PRR 缺口补齐（docs/01 §9.3）：panic 先落本地 crash\ 报告（脱敏、不上报），
+    // 再交给原 hook 保留 stderr 行为。安装早于日志初始化，日志起不来也能留证据。
+    config::install_crash_hook(dirs.data_root.join(config::CRASH_DIR));
     // 日志初始化必须早于一切 tracing:: 事件；guard 存活期 = 进程存活期
     let _log_guard = match config::init_logging(&dirs.data_root) {
         Ok(guard) => Some(guard),

@@ -10,6 +10,7 @@
 use std::fs;
 use std::io;
 use std::path::{Path, PathBuf};
+use std::sync::atomic::AtomicU64;
 use std::sync::{OnceLock, RwLock};
 use std::time::{SystemTime, UNIX_EPOCH};
 
@@ -872,6 +873,74 @@ fn patterns() -> &'static [Pattern] {
     })
 }
 
+/// 崩溃报告序号：同一毫秒内两次 panic 也不互相覆盖。
+static CRASH_SEQ: AtomicU64 = AtomicU64::new(0);
+
+/// 崩溃路径专用的 best-effort 脱敏：注册表锁被 panic 持有时退化为纯模式脱敏，
+/// 绝不在 panic hook 里再次阻塞（那会把"崩溃退出"变成"卡死"）。
+fn redact_for_crash(text: &str) -> String {
+    let mut out = text.to_string();
+    if let Ok(reg) = SECRET_REGISTRY.try_read() {
+        for secret in reg.iter() {
+            if out.contains(secret.as_str()) {
+                out = out.replace(secret.as_str(), REDACTED);
+            }
+        }
+    }
+    for p in patterns() {
+        out = p.re.replace_all(&out, p.template).into_owned();
+    }
+    out
+}
+
+/// 写一份本地崩溃报告到 `<data_root>\crash\panic-<ts>-<pid>-<seq>.log`。
+/// **只写本地、不上报**（docs/01 §9.3「待用户确认后才可上报」）；正文过脱敏。
+pub fn write_crash_report(
+    crash_dir: &Path,
+    message: &str,
+    location: &str,
+    thread: &str,
+) -> Result<PathBuf, String> {
+    fs::create_dir_all(crash_dir).map_err(|e| format!("创建 crash 目录失败: {e}"))?;
+    let stamp = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|d| d.as_millis())
+        .unwrap_or(0);
+    let seq = CRASH_SEQ.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    let path = crash_dir.join(format!("panic-{stamp}-{}-{seq}.log", std::process::id()));
+    let body = format!(
+        "time_unix_ms={stamp}\nthread={thread}\nlocation={location}\nmessage={}\n",
+        redact_for_crash(message)
+    );
+    fs::write(&path, body).map_err(|e| format!("写崩溃报告失败（{}）: {e}", path.display()))?;
+    Ok(path)
+}
+
+/// 安装进程级 panic hook：先落一份本地崩溃报告，再交给原 hook（保留 stderr 行为）。
+/// 报告内容不进入日志/提示词，也不上传；失败静默（崩溃路径不能再抛）。
+pub fn install_crash_hook(crash_dir: PathBuf) {
+    let previous = std::panic::take_hook();
+    std::panic::set_hook(Box::new(move |info| {
+        let message = if let Some(text) = info.payload().downcast_ref::<&str>() {
+            (*text).to_string()
+        } else if let Some(text) = info.payload().downcast_ref::<String>() {
+            text.clone()
+        } else {
+            "<non-string panic payload>".to_string()
+        };
+        let location = info
+            .location()
+            .map(|l| format!("{}:{}:{}", l.file(), l.line(), l.column()))
+            .unwrap_or_else(|| "<unknown>".to_string());
+        let thread = std::thread::current()
+            .name()
+            .unwrap_or("<unnamed>")
+            .to_string();
+        let _ = write_crash_report(&crash_dir, &message, &location, &thread);
+        previous(info);
+    }));
+}
+
 /// 对任意将要落盘的文本做统一脱敏：先整串替换已登记密钥，再按模式擦掉形似密钥的串。
 /// logs 与 rollouts 的所有写入都必须经过这里（docs/01 §438「落盘前统一过脱敏过滤器」）。
 pub fn redact(text: &str) -> String {
@@ -1547,5 +1616,28 @@ mod provider_tests {
         let mut ok = profile("longcat", "b", "m1");
         ok.headers = [("X-Gateway-Sign".to_string(), String::new())].into_iter().collect();
         assert!(AppConfig::validate_providers(&[ok], "").is_ok());
+    }
+
+    #[test]
+    fn crash_report_is_redacted_and_unique() {
+        let dir = std::env::temp_dir().join(format!("shaniu-crash-{}", std::process::id()));
+        register_secret("opaque-crash-secret-abc");
+        let first = write_crash_report(
+            &dir,
+            "boom sk-abcdefgh12345678 opaque-crash-secret-abc",
+            "src-tauri/src/lib.rs:42:7",
+            "worker",
+        )
+        .expect("写崩溃报告");
+        let text = fs::read_to_string(&first).expect("读崩溃报告");
+        assert!(text.contains("location=src-tauri/src/lib.rs:42:7"));
+        assert!(text.contains("thread=worker"));
+        assert!(text.contains(REDACTED));
+        assert!(!text.contains("sk-abcdefgh12345678"), "模式脱敏必须生效");
+        assert!(!text.contains("opaque-crash-secret-abc"), "登记密钥必须整串替换");
+
+        let second = write_crash_report(&dir, "second", "loc", "main").expect("第二份");
+        assert_ne!(first, second, "同一毫秒的两次 panic 也不能互相覆盖");
+        fs::remove_dir_all(&dir).ok();
     }
 }
