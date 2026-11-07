@@ -7,13 +7,36 @@
 
 use std::sync::Arc;
 
+use serde::{Deserialize, Serialize};
 use tokio_util::sync::CancellationToken;
 
-use crate::model_client::{HistoryItem, Role};
+use crate::model_client::{HistoryItem, Role, Usage};
 use crate::rollout::RolloutWriter;
 
 /// 子代理允许的最大嵌套深度（docs/02 §2.3 决策：硬限 2 = root(0) + 子(1)）。
 pub const MAX_AGENT_DEPTH: u32 = 1;
+
+/// 单个代理实例的累计用量（docs/02 §2.1 ExitSummary 的 `token_usage` 来源）。
+///
+/// 与预算共账（SH-055）区分：这里只统计「本实例实际消耗」，不做树级合计与硬顶判定；
+/// 父子汇总由注册表/编排层负责。
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct TokenTotals {
+    pub input_tokens: u64,
+    pub cached_input_tokens: u64,
+    pub output_tokens: u64,
+}
+
+impl TokenTotals {
+    /// 累加一次模型响应上报的用量。端点不报 usage 时保持 0，不猜估算值。
+    pub fn absorb(&mut self, usage: &Usage) {
+        self.input_tokens += u64::from(usage.input_tokens);
+        if let Some(cached) = usage.cached_input_tokens {
+            self.cached_input_tokens += u64::from(cached);
+        }
+        self.output_tokens += u64::from(usage.output_tokens);
+    }
+}
 
 pub struct AgentInstance {
     /// 全局唯一 id；root 代理固定为 `root`（docs/02 §2.1）。
@@ -32,6 +55,8 @@ pub struct AgentInstance {
     pub rollout: Option<Arc<RolloutWriter>>,
     /// 后台作业属主（SH-089）。None 时沿用 `AgentLoop` 的会话 id。
     pub session_id: Option<String>,
+    /// 本实例累计 token 用量（ExitSummary 的 `token_usage`，见 `TokenTotals`）。
+    pub usage: TokenTotals,
 }
 
 impl AgentInstance {
@@ -46,6 +71,7 @@ impl AgentInstance {
             history,
             rollout: None,
             session_id: None,
+            usage: TokenTotals::default(),
         }
     }
 
@@ -70,6 +96,7 @@ impl AgentInstance {
             history,
             rollout: None,
             session_id: None,
+            usage: TokenTotals::default(),
         }
     }
 

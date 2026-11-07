@@ -23,6 +23,7 @@ pub mod session_query;
 pub mod session_reference;
 pub mod session_title;
 pub mod skills;
+pub mod subagent_registry;
 pub mod tool_router;
 pub mod tools;
 pub mod workspace_files;

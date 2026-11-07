@@ -27,7 +27,7 @@ use crate::permission::{policy, ApprovalBroker};
 use crate::tool_router::{PlanState, ToolContext, ToolRouter};
 
 pub use budget::TurnBudget;
-pub use instance::{AgentInstance, MAX_AGENT_DEPTH};
+pub use instance::{AgentInstance, TokenTotals, MAX_AGENT_DEPTH};
 
 // ============================== 模型后端抽象 ==============================
 
@@ -286,7 +286,7 @@ impl AgentLoop {
         sink: Arc<dyn crate::events::EventSink>,
     ) -> TurnSummary {
         // 只解构本函数要用的字段：身份/深度留给注册表与后续工具上下文（SH-051）。
-        let AgentInstance { cancel, history, recorded, rollout, session_id, .. } = instance;
+        let AgentInstance { cancel, history, recorded, rollout, session_id, usage: totals, .. } = instance;
         let cancel = &*cancel;
         let history = &mut *history;
         let recorded = &mut *recorded;
@@ -428,6 +428,8 @@ impl AgentLoop {
                 }
             }
             if let Some(u) = usage {
+                // 实例级累计（ExitSummary 的 token_usage）；树级共账见 SH-055。
+                totals.absorb(&u);
                 observed_input_tokens = usize::try_from(u.input_tokens).unwrap_or(usize::MAX);
                 emit(&sink, EventMsg::TokenUsage {
                     turn,

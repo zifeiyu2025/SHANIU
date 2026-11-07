@@ -45,9 +45,9 @@ $OutputEncoding = [System.Text.UTF8Encoding]::new($false)
 # 只有共享基础设施 config、events，而它们由下方 $infraModules 全局放行，故表内无需再列，
 # 顺手补进去只会造成冗余。要给这些模块新增业务依赖，必须先改 §2.3.1，再写进这里。
 $allow = @{
-    'agent_loop'   = @('model_client', 'tool_router', 'permission', 'rollout', 'compaction', 'session_reference', 'skills')  # E02–E04、E06、E23、E35、E40
-    'tool_router'  = @('model_client', 'tools')                                 # E08、E11
-    'tools'        = @('tool_router', 'sandbox', 'permission', 'skills')          # E12–E14、E41
+    'agent_loop'   = @('model_client', 'tool_router', 'permission', 'rollout', 'compaction', 'session_reference', 'skills', 'jobs')  # E02–E04、E06、E23、E35、E40、E43
+    'tool_router'  = @('model_client', 'tools', 'jobs')                          # E08、E11、E43
+    'tools'        = @('tool_router', 'sandbox', 'permission', 'skills', 'jobs')  # E12–E14、E41、E43
     'permission'   = @()
     'sandbox'      = @()
     'model_client' = @()
@@ -69,6 +69,9 @@ $allow = @{
     'gateway'         = @('event_journal')                                           # E37（SH-094 批 2 loopback WS gateway：续播复用 event_journal::read_after；events/config 属 infra 全局放行）
     'attachments'     = @()                                                          # E38（SH-116 批 1 会话附件暂存：base64/ULID/元数据只依赖 std 库，零业务依赖）
     'skills'          = @('model_client', 'workspace_files', 'app_state')            # E39（SH-091 技能系统：HistoryItem 同源 + 会话根解析 + State 句柄；config 属 infra 全局放行）
+    'subagent_registry' = @('agent_loop', 'rollout')                                  # E42（SH-051 子代理注册表：复用 run_instance/AgentInstance + 每代理档案写入器）
+    'jobs'            = @('app_state')                                                # E43（SH-089 后台作业注册表：从装配层取注册表句柄）
+    'goals'           = @('app_state')                                                # E44（SH-088 会话目标持久层：从装配层取数据根）
 }
 # rollout 已落地（SH-030）：它只借用 model_client 的 HistoryItem 作为条目载荷，
 # 不反向依赖循环或工具层——档案是被读写的对象，不是参与者。
