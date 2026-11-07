@@ -16,12 +16,13 @@ use std::task::{Context, Poll};
 use std::time::{Duration, Instant};
 
 use futures::Stream;
-use shaniu_lib::agent_loop::{AgentInstance, AgentLoop, ModelBackend, ModelStream, ToolDeclarationShim};
+use shaniu_lib::agent_loop::{AgentLoop, ModelBackend, ModelStream, ToolDeclarationShim};
 use shaniu_lib::config::{ApprovalMode, SandboxMode};
 use shaniu_lib::events::{EventMsg, EventSink, TurnEndReason};
 use shaniu_lib::model_client::{HistoryItem, ModelStreamEvent};
 use shaniu_lib::permission::{policy, ApprovalBroker};
 use shaniu_lib::subagent_registry::{ExitStatus, SubagentRegistry};
+use shaniu_lib::tool_router::orchestration::AgentScope;
 use shaniu_lib::tool_router::{PlanState, ToolRouter};
 use tokio_util::sync::CancellationToken;
 
@@ -100,16 +101,9 @@ fn engine(live: Arc<AtomicUsize>) -> Arc<AgentLoop> {
     })
 }
 
-fn root_agent() -> AgentInstance {
-    AgentInstance::root(
-        vec![HistoryItem::Message {
-            role: shaniu_lib::model_client::Role::User,
-            text: "父任务".into(),
-            reasoning: None,
-        }],
-        0,
-        CancellationToken::new(),
-    )
+/// 父代理身份（SH-052 起 spawn 收 AgentScope 而不是 AgentInstance）。
+fn root_scope(cancel: CancellationToken, sink: Arc<dyn EventSink>) -> AgentScope {
+    AgentScope { agent_id: "root".into(), parent_id: None, depth: 0, cancel, sink }
 }
 
 async fn wait_until(what: &str, timeout: Duration, mut predicate: impl FnMut() -> bool) {
@@ -126,15 +120,15 @@ async fn parent_cancellation_kills_every_child_within_half_second() {
     let live = Arc::new(AtomicUsize::new(0));
     let engine = engine(live.clone());
     let registry = Arc::new(SubagentRegistry::new(4));
-    let root = root_agent();
+    let root_cancel = CancellationToken::new();
     let sink_a = Arc::new(CancelledSink::default());
     let sink_b = Arc::new(CancelledSink::default());
 
     let a = registry
-        .spawn(engine.clone(), &root, "子任务 A", sink_a.clone(), None)
+        .spawn(engine.clone(), &root_scope(root_cancel.clone(), sink_a.clone()), "子任务 A", None)
         .expect("派生子代理 A");
     let b = registry
-        .spawn(engine, &root, "子任务 B", sink_b.clone(), None)
+        .spawn(engine, &root_scope(root_cancel.clone(), sink_b.clone()), "子任务 B", None)
         .expect("派生子代理 B");
 
     // 先确认两条模型流真的建立了：否则下面测到的是「还没开始就取消」。
@@ -142,7 +136,7 @@ async fn parent_cancellation_kills_every_child_within_half_second() {
     assert_eq!(registry.running_count(), 2);
 
     let started = Instant::now();
-    root.cancel.cancel();
+    root_cancel.cancel();
 
     let exit_a = registry
         .wait_exit(&a, Duration::from_secs(3))
@@ -178,12 +172,12 @@ async fn parent_cancellation_kills_every_child_within_half_second() {
 async fn dropping_the_registry_aborts_running_children() {
     let live = Arc::new(AtomicUsize::new(0));
     let engine = engine(live.clone());
-    let root = root_agent();
+    let root_cancel = CancellationToken::new();
     let sink = Arc::new(CancelledSink::default());
     {
         let registry = Arc::new(SubagentRegistry::new(2));
         registry
-            .spawn(engine, &root, "长任务", sink, None)
+            .spawn(engine, &root_scope(root_cancel.clone(), sink), "长任务", None)
             .expect("派生子代理");
         wait_until("子代理流建立", Duration::from_secs(3), || live.load(Ordering::SeqCst) == 1).await;
         // registry 在这里离开作用域：Drop 取消令牌并 abort 任务。
@@ -194,7 +188,7 @@ async fn dropping_the_registry_aborts_running_children() {
     })
     .await;
     // 父令牌从未取消，说明关闭来自 Drop 而非级联——证明僵尸清理路径真的生效。
-    assert!(!root.cancel.is_cancelled());
+    assert!(!root_cancel.is_cancelled());
 }
 
 /// 取消一个子代理不得牵连兄弟（令牌树只在父→子方向传播）。
@@ -203,12 +197,13 @@ async fn cancelling_one_child_keeps_its_sibling_alive() {
     let live = Arc::new(AtomicUsize::new(0));
     let engine = engine(live.clone());
     let registry = Arc::new(SubagentRegistry::new(4));
-    let root = root_agent();
+    let root_cancel = CancellationToken::new();
+    let scope = || root_scope(root_cancel.clone(), Arc::new(CancelledSink::default()));
     let a = registry
-        .spawn(engine.clone(), &root, "A", Arc::new(CancelledSink::default()), None)
+        .spawn(engine.clone(), &scope(), "A", None)
         .expect("派生 A");
     let b = registry
-        .spawn(engine, &root, "B", Arc::new(CancelledSink::default()), None)
+        .spawn(engine, &scope(), "B", None)
         .expect("派生 B");
     wait_until("两条流建立", Duration::from_secs(3), || live.load(Ordering::SeqCst) == 2).await;
 
@@ -217,7 +212,7 @@ async fn cancelling_one_child_keeps_its_sibling_alive() {
     wait_until("A 的流关闭", Duration::from_secs(1), || live.load(Ordering::SeqCst) == 1).await;
     assert_eq!(registry.running_count(), 1);
 
-    root.cancel.cancel();
+    root_cancel.cancel();
     registry.wait_exit(&b, Duration::from_secs(2)).await.expect("B 应结束");
     wait_until("全部关闭", Duration::from_secs(2), || live.load(Ordering::SeqCst) == 0).await;
 }

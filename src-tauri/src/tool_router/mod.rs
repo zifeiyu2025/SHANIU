@@ -4,6 +4,7 @@
 //! 执行逻辑在各 `tools/*` 模块；风险分级与审批在 M2 permission 模块接入
 //! （届时 execute 前置裁决，本模块保持纯分发）。
 
+pub mod orchestration;
 pub mod spec;
 
 use std::collections::HashMap;
@@ -96,6 +97,10 @@ pub struct ToolContext {
     pub session_id: Option<String>,
     /// 进程级作业注册表：`run_in_background` 与 job 工具从这里读写。
     pub jobs: Option<Arc<crate::jobs::JobRegistry>>,
+    /// 调用者身份（SH-052）：root 或子代理；None = 无代理上下文的测试路径。
+    pub scope: Option<orchestration::AgentScope>,
+    /// 编排能力（SH-052）：只有 depth=0 的 root 实例注入；子代理为 None。
+    pub orchestrator: Option<Arc<dyn orchestration::AgentOrchestrator>>,
 }
 
 impl ToolContext {
@@ -114,7 +119,27 @@ impl ToolContext {
             sandbox,
             session_id: None,
             jobs: None,
+            scope: None,
+            orchestrator: None,
         }
+    }
+
+    /// 只注入代理身份（子代理路径）：用于深度门控，不提供编排能力。
+    pub fn with_scope(mut self, scope: orchestration::AgentScope) -> Self {
+        self.scope = Some(scope);
+        self
+    }
+
+    /// 注入代理身份与编排能力（SH-052，仅 root）。两者要么同时给，要么都不给：
+    /// 只有 scope 没有 orchestrator 时，编排工具必然失败，不如在声明层就隐藏。
+    pub fn with_orchestration(
+        mut self,
+        scope: orchestration::AgentScope,
+        orchestrator: Arc<dyn orchestration::AgentOrchestrator>,
+    ) -> Self {
+        self.scope = Some(scope);
+        self.orchestrator = Some(orchestrator);
+        self
     }
 
     /// 注入会话与作业注册表（agent_loop 在每个 turn 的工具上下文上调用）。
@@ -176,6 +201,20 @@ impl ToolRouter {
     ) -> Result<ToolOutput, ToolError> {
         if ctx.cancel.is_cancelled() {
             return Err(ToolError::Cancelled);
+        }
+        // 第二层深度门控（ADR-101/FF-106）：即使模型伪造工具名，子代理也无法调用编排工具。
+        // 第一层在 `agent_loop::declarations_for`——模型根本看不到这些声明。
+        if let Some(scope) = &ctx.scope {
+            if scope.depth > 0 && orchestration::is_agent_tool(name) {
+                return Err(ToolError::InvalidArgs(format!(
+                    "当前代理深度 {} 不允许调用编排工具 {name}（只有 root 可以 spawn）",
+                    scope.depth
+                )));
+            }
+        } else if orchestration::is_agent_tool(name) {
+            return Err(ToolError::InvalidArgs(format!(
+                "没有代理上下文，无法调用编排工具 {name}"
+            )));
         }
         let executor = self
             .tools

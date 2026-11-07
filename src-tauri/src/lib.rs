@@ -72,7 +72,10 @@ fn send_task(app: tauri::AppHandle, task: String, agent_id: Option<String>) -> R
             let sink: Arc<dyn events::EventSink> =
                 Arc::new(events::TauriEventSink::root(app.clone(), new_id.clone()).with_journal(Arc::new(event_journal::FileEventJournal::new(app.state::<AppState>().data_root().join(config::SESSIONS_DIR)))).with_broadcast(app.state::<gateway::GatewayHub>().broadcast_sender()));
             tauri::async_runtime::spawn(async move {
-                let _ = agent.run_task(&task, sink, cancel).await;
+                let orchestrator = build_orchestrator(agent.clone());
+                let _ = agent
+                    .run_task_with_orchestrator(&task, sink, cancel, Some(orchestrator))
+                    .await;
                 app.state::<AppState>().end_task();
             });
             Ok(new_id)
@@ -125,7 +128,10 @@ fn continue_session(
     // spawn 的 future 必须是 'static：借用的 app 只能换成 owned 句柄再 move 进去。
     let app_handle = app.clone();
     tauri::async_runtime::spawn(async move {
-        let _ = agent.run_with_history(history, persisted, sink, cancel).await;
+        let orchestrator = build_orchestrator(agent.clone());
+        let _ = agent
+            .run_with_history_and_orchestrator(history, persisted, sink, cancel, Some(orchestrator))
+            .await;
         app_handle.state::<AppState>().end_task();
     });
     Ok(())
@@ -913,7 +919,7 @@ fn create_session(
 fn build_new_session(
     state: &AppState,
     workspace_root: &Path,
-) -> Result<(agent_loop::AgentLoop, tokio_util::sync::CancellationToken, String), String> {
+) -> Result<(Arc<agent_loop::AgentLoop>, tokio_util::sync::CancellationToken, String), String> {
     let (writer, agent_id) = new_session_writer(state, workspace_root, None)?;
     let (agent, cancel) = build_agent_with(state, &agent_id, workspace_root.to_path_buf(), Some(writer))?;
     Ok((agent, cancel, agent_id))
@@ -950,12 +956,26 @@ fn new_session_writer(
     Ok((writer, agent_id))
 }
 
+/// 装配本任务的编排能力（SH-052）：注册表随任务创建、随任务释放。
+///
+/// 注册表只在任务生命周期内存活是刻意的：root 收口时 Drop 会取消并 abort 任何
+/// 仍未结束的子代理（R102 防僵尸）。叶子子代理不注入 orchestrator，因此不会有
+/// 「代理持有自身」的引用环。
+fn build_orchestrator(
+    engine: Arc<agent_loop::AgentLoop>,
+) -> Arc<dyn tool_router::orchestration::AgentOrchestrator> {
+    let registry = Arc::new(subagent_registry::SubagentRegistry::new(
+        subagent_registry::DEFAULT_MAX_CONCURRENT,
+    ));
+    Arc::new(subagent_registry::orchestrator::RegistryOrchestrator::new(registry, engine))
+}
+
 fn build_agent_with(
     state: &AppState,
     agent_id: &str,
     workspace_root: PathBuf,
     writer: Option<Arc<rollout::RolloutWriter>>,
-) -> Result<(agent_loop::AgentLoop, tokio_util::sync::CancellationToken), String> {
+) -> Result<(Arc<agent_loop::AgentLoop>, tokio_util::sync::CancellationToken), String> {
     let cfg = state.config();
     // 生效端点由配置层解析（active 服务商命中 → 那家；否则回落 [model]）。
     // 这里不再自己写死 provider 字符串：写死就等于多服务商列表里换了一家、
@@ -986,7 +1006,7 @@ fn build_agent_with(
         writer,
     )
     .with_jobs(agent_id.to_string(), state.jobs.clone());
-    Ok((agent, cancel))
+    Ok((Arc::new(agent), cancel))
 }
 
 /// 取消当前任务。

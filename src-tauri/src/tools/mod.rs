@@ -7,6 +7,7 @@
 pub mod apply_patch;
 pub mod fs_read;
 pub mod job_tools;
+pub mod orchestrate;
 pub mod plan;
 pub mod skill;
 pub mod todo;
@@ -28,5 +29,8 @@ pub fn register_builtin(router: &mut ToolRouter, plan_state: Arc<PlanState>) {
     router.register(Arc::new(job_tools::JobOutput::new()));
     router.register(Arc::new(job_tools::JobList::new()));
     router.register(Arc::new(job_tools::JobKill::new()));
+    // SH-052：编排四工具始终注册（可见性由 agent_loop 声明层按深度/能力过滤），
+    // 这样分发层的第二道门控也能对「模型伪造工具名」生效。
+    orchestrate::register(router);
     plan::register(router, plan_state);
 }

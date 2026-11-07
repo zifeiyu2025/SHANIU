@@ -251,8 +251,19 @@ impl AgentLoop {
         sink: Arc<dyn crate::events::EventSink>,
         cancel: CancellationToken,
     ) -> TurnSummary {
+        self.run_task_with_orchestrator(task, sink, cancel, None).await
+    }
+
+    /// SH-052：root 任务带编排能力启动；子代理与既有调用走 [`Self::run_task`]（None）。
+    pub async fn run_task_with_orchestrator(
+        &self,
+        task: &str,
+        sink: Arc<dyn crate::events::EventSink>,
+        cancel: CancellationToken,
+        orchestrator: Option<Arc<dyn crate::tool_router::orchestration::AgentOrchestrator>>,
+    ) -> TurnSummary {
         let history = vec![HistoryItem::Message { role: Role::User, text: task.to_string(), reasoning: None }];
-        self.run_with_history(history, 0, sink, cancel).await
+        self.run_with_history_and_orchestrator(history, 0, sink, cancel, orchestrator).await
     }
 
     /// 从既有历史续跑（SH-031 resume/fork）。
@@ -270,9 +281,20 @@ impl AgentLoop {
         sink: Arc<dyn crate::events::EventSink>,
         cancel: CancellationToken,
     ) -> TurnSummary {
+        self.run_with_history_and_orchestrator(history, persisted, sink, cancel, None).await
+    }
+
+    pub async fn run_with_history_and_orchestrator(
+        &self,
+        history: Vec<HistoryItem>,
+        persisted: usize,
+        sink: Arc<dyn crate::events::EventSink>,
+        cancel: CancellationToken,
+        orchestrator: Option<Arc<dyn crate::tool_router::orchestration::AgentOrchestrator>>,
+    ) -> TurnSummary {
         let mut instance = AgentInstance::root(history, persisted, cancel);
         instance.rollout = self.rollout.clone();
-        self.run_instance(&mut instance, sink).await
+        self.run_instance_with_orchestrator(&mut instance, sink, orchestrator).await
     }
 
     /// 在一个代理实例上执行完整任务（SH-050）。
@@ -285,6 +307,25 @@ impl AgentLoop {
         instance: &mut AgentInstance,
         sink: Arc<dyn crate::events::EventSink>,
     ) -> TurnSummary {
+        self.run_instance_with_orchestrator(instance, sink, None).await
+    }
+
+    /// SH-052：带编排能力的实例执行入口（root 注入，子代理为 None）。
+    pub async fn run_instance_with_orchestrator(
+        &self,
+        instance: &mut AgentInstance,
+        sink: Arc<dyn crate::events::EventSink>,
+        orchestrator: Option<Arc<dyn crate::tool_router::orchestration::AgentOrchestrator>>,
+    ) -> TurnSummary {
+        // 工具上下文需要的身份快照（此刻 instance 尚未被可变解构）。
+        let scope = crate::tool_router::orchestration::AgentScope {
+            agent_id: instance.agent_id.clone(),
+            parent_id: instance.parent_id.clone(),
+            depth: instance.depth,
+            cancel: instance.cancel.clone(),
+            sink: sink.clone(),
+        };
+        let inbox = instance.inbox.clone();
         // 只解构本函数要用的字段：身份/深度留给注册表与后续工具上下文（SH-051）。
         let AgentInstance { cancel, history, recorded, rollout, session_id, usage: totals, .. } = instance;
         let cancel = &*cancel;
@@ -312,6 +353,16 @@ impl AgentLoop {
             last_turn = turn;
             emit(&sink, EventMsg::TurnStarted { turn });
 
+            // SH-052：父代理经 send_agent_message 注入的 steering 消息在采样前排空，
+            // 作为普通 user 消息进入本轮上下文。不新造事件类型：它本来就是用户侧输入。
+            let steering: Vec<String> = {
+                let mut inbox = inbox.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
+                std::mem::take(&mut *inbox)
+            };
+            for text in steering {
+                history.push(HistoryItem::Message { role: Role::User, text, reasoning: None });
+            }
+
             // 1) 采样（流式）：取消 → drop 流 = 断开连接
             // 系统提示每轮重算（docs/04 §6.1 不变量③）：计划态与沙箱模式变化必须反映到模型
             let instructions = prompt::system_instruction(
@@ -325,6 +376,8 @@ impl AgentLoop {
                 &self.router,
                 self.plan_state.is_active(),
                 has_model_skills,
+                scope.depth,
+                orchestrator.is_some(),
             );
 
             // 2.5) 采样前检查 token 预算（ADR-001：「每轮采样前检查 token 预算触发 compaction」）。
@@ -557,7 +610,14 @@ impl AgentLoop {
                     sink.clone(),
                     self.policy.sandbox,
                 )
-                .with_jobs(session_id.clone(), self.jobs.clone());
+                .with_jobs(session_id.clone(), self.jobs.clone())
+                .with_scope(scope.clone());
+                // 只有 root（depth=0）拿到编排能力；子代理沿用 scope 但无 orchestrator，
+                // 分发层会拒绝它调用编排工具（第二层深度门控）。
+                let tool_ctx = match &orchestrator {
+                    Some(orchestrator) => tool_ctx.with_orchestration(scope.clone(), orchestrator.clone()),
+                    None => tool_ctx,
+                };
                 let result = self.router.execute(name, args_val, &tool_ctx).await;
                 let output_text = match &result {
                     Ok(out) => {
@@ -628,10 +688,17 @@ fn declarations_for(
     router: &ToolRouter,
     plan_active: bool,
     has_model_skills: bool,
+    depth: u32,
+    has_orchestrator: bool,
 ) -> Vec<crate::model_client::ToolDeclaration> {
     let mut all = router.declarations();
     if !has_model_skills {
         all.retain(|declaration| declaration.name != "skill");
+    }
+    // ADR-101 / FF-106 第一层：子代理的 ToolSpec 里不含编排工具；
+    // 没有 orchestrator 的装配（测试/子代理）也不声明，避免模型看到不可用的能力。
+    if depth >= MAX_AGENT_DEPTH || !has_orchestrator {
+        all.retain(|declaration| !crate::tool_router::orchestration::is_agent_tool(&declaration.name));
     }
     if !plan_active {
         return all;
@@ -1138,7 +1205,7 @@ mod tests {
         crate::tools::register_builtin(&mut router, Arc::new(PlanState::new()));
 
         let names = |plan: bool| -> Vec<String> {
-            declarations_for(&router, plan, true).into_iter().map(|d| d.name).collect()
+            declarations_for(&router, plan, true, 0, false).into_iter().map(|d| d.name).collect()
         };
         let planned = names(true);
         assert!(planned.contains(&"read_file".to_string()));

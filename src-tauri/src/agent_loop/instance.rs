@@ -5,7 +5,7 @@
 //! 作业属主。把这些从 `AgentLoop` 里拆出来，子代理才可能在同一个引擎上并行运行而不共享
 //! 任何可变状态。
 
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
 
 use serde::{Deserialize, Serialize};
 use tokio_util::sync::CancellationToken;
@@ -57,6 +57,9 @@ pub struct AgentInstance {
     pub session_id: Option<String>,
     /// 本实例累计 token 用量（ExitSummary 的 `token_usage`，见 `TokenTotals`）。
     pub usage: TokenTotals,
+    /// 父代理经 `send_agent_message` 注入的 steering 消息（SH-052）。
+    /// 每轮采样前由 `run_instance` 排空并追加为 user 消息；注册表持同一 Arc 用于写入。
+    pub inbox: Arc<Mutex<Vec<String>>>,
 }
 
 impl AgentInstance {
@@ -72,6 +75,7 @@ impl AgentInstance {
             rollout: None,
             session_id: None,
             usage: TokenTotals::default(),
+            inbox: Arc::new(Mutex::new(Vec::new())),
         }
     }
 
@@ -97,7 +101,14 @@ impl AgentInstance {
             rollout: None,
             session_id: None,
             usage: TokenTotals::default(),
+            inbox: Arc::new(Mutex::new(Vec::new())),
         }
+    }
+
+    /// 排空并返回尚未消费的 steering 消息（每轮采样前调用）。
+    pub fn drain_messages(&self) -> Vec<String> {
+        let mut inbox = self.inbox.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
+        std::mem::take(&mut *inbox)
     }
 
     /// 深度上的 spawn 资格：只有 root 能继续分叉（ADR-101 硬限）。

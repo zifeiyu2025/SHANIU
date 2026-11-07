@@ -6,9 +6,13 @@
 //! - **取消级联**：子令牌由父令牌 `child_token()` 派生，父取消即级联，不需要逐层通知；
 //! - **并发上限**：超出上限的子代理排队（`waiting`），不发起模型请求；
 //! - **结果收口**：执行结束把 [`ExitSummary`] 存进注册表，供 `wait_agent` 取用（SH-052）。
+//! - **编排入口**（SH-052）：[`orchestrator::RegistryOrchestrator`] 实现
+//!   `tool_router::orchestration::AgentOrchestrator`，由组合根注入 root 的工具上下文。
 //!
 //! 不负责：模型调用与工具执行（复用 `AgentLoop::run_instance`）、事件协议包装
 //! （SH-053 的 `AgentEvent{agent_id}`）、档案引用（SH-056）、预算共账（SH-055）。
+
+pub mod orchestrator;
 
 use std::collections::BTreeMap;
 use std::sync::{Arc, Mutex, MutexGuard, Weak};
@@ -18,9 +22,11 @@ use serde::{Deserialize, Serialize};
 use tokio::sync::{Notify, OwnedSemaphorePermit, Semaphore};
 use tokio_util::sync::CancellationToken;
 
-use crate::agent_loop::{AgentInstance, AgentLoop, TokenTotals};
+use crate::agent_loop::{AgentInstance, AgentLoop, TokenTotals, MAX_AGENT_DEPTH};
 use crate::events::{EventSink, TurnEndReason};
+use crate::model_client::{HistoryItem, Role};
 use crate::rollout::RolloutWriter;
+use crate::tool_router::orchestration::AgentScope;
 
 /// 并发上限默认值（docs/02 §2.3：默认 4）。
 pub const DEFAULT_MAX_CONCURRENT: usize = 4;
@@ -143,6 +149,12 @@ pub enum SpawnError {
     ParentCancelled,
     #[error("子代理任务描述为空")]
     EmptyTask,
+    #[error("未知子代理: {agent_id}")]
+    UnknownAgent { agent_id: String },
+    #[error("子代理 {agent_id} 尚未结束，不能 resume")]
+    NotExited { agent_id: String },
+    #[error("子代理 {agent_id} 没有可恢复的历史（可能已随进程清理）")]
+    HistoryUnavailable { agent_id: String },
 }
 
 /// 注册表对外快照（命令面/测试用）。时间为相对创建时刻的毫秒数。
@@ -165,6 +177,10 @@ struct Entry {
     created_at: Instant,
     exit: Option<ExitSummary>,
     cancel: CancellationToken,
+    /// 子代理的 steering 信箱（与 `AgentInstance::inbox` 同一 Arc）。
+    inbox: Arc<Mutex<Vec<String>>>,
+    /// 结束时的完整历史（`resume_agent` 的内存来源；SH-056 再升级为 rollout 重放）。
+    history: Option<Vec<HistoryItem>>,
     done: Arc<Notify>,
     handle: Option<tokio::task::JoinHandle<()>>,
 }
@@ -208,46 +224,96 @@ impl SubagentRegistry {
     pub fn spawn(
         self: &Arc<Self>,
         engine: Arc<AgentLoop>,
-        parent: &AgentInstance,
+        parent: &AgentScope,
         task: impl Into<String>,
-        sink: Arc<dyn EventSink>,
         rollout: Option<Arc<RolloutWriter>>,
     ) -> Result<String, SpawnError> {
         let task = task.into();
-        if task.trim().is_empty() {
-            return Err(SpawnError::EmptyTask);
-        }
-        if !parent.can_spawn() {
-            return Err(SpawnError::DepthExceeded { depth: parent.depth });
-        }
-        if parent.cancel.is_cancelled() {
-            return Err(SpawnError::ParentCancelled);
-        }
-
+        validate_parent(parent, &task)?;
         let agent_id = ulid::Ulid::generate().to_string();
         // 级联的来源就在这一行：父令牌取消时，这个子令牌自动进入取消态。
         let cancel = parent.cancel.child_token();
-        let mut instance = AgentInstance::child(&agent_id, &parent.agent_id, &task, cancel.clone());
+        let mut instance = AgentInstance::child(&agent_id, &parent.agent_id, &task, cancel);
         instance.rollout = rollout;
+        let sink = child_sink(parent, &agent_id);
+        Ok(self.start_run(engine, instance, task, sink))
+    }
+
+    /// 从已退出子代理的内存历史恢复出一个**新**子代理（docs/02 §2.2 `resume_agent`）。
+    ///
+    /// 诚实声明：历史来源是进程内 `Entry.history`，不是 rollout 重放——进程重启后不可恢复。
+    /// 每代理档案在 SH-056 落地后再升级；在此之前不假装支持跨进程 resume。
+    pub fn resume(
+        self: &Arc<Self>,
+        engine: Arc<AgentLoop>,
+        parent: &AgentScope,
+        source_agent_id: &str,
+        task: Option<&str>,
+        rollout: Option<Arc<RolloutWriter>>,
+    ) -> Result<String, SpawnError> {
+        let task = task
+            .map(str::trim)
+            .filter(|text| !text.is_empty())
+            .unwrap_or("请接着上次未完成的部分继续工作，并给出结论。")
+            .to_string();
+        validate_parent(parent, &task)?;
+        let (status, history) = {
+            let inner = self.lock();
+            let entry = inner.get(source_agent_id).ok_or_else(|| SpawnError::UnknownAgent {
+                agent_id: source_agent_id.to_string(),
+            })?;
+            (entry.status, entry.history.clone())
+        };
+        if status != AgentStatus::Exited {
+            return Err(SpawnError::NotExited { agent_id: source_agent_id.to_string() });
+        }
+        let history = history.ok_or_else(|| SpawnError::HistoryUnavailable {
+            agent_id: source_agent_id.to_string(),
+        })?;
+
+        let agent_id = ulid::Ulid::generate().to_string();
+        let cancel = parent.cancel.child_token();
+        let mut instance = AgentInstance::child(&agent_id, &parent.agent_id, &task, cancel);
+        // 沿用旧历史 + 一条续跑指令；recorded 保持 0：新代理尚无自己的档案，
+        // 落盘时从头写一遍才不会漏掉恢复出来的上下文。
+        instance.history = history;
+        instance.history.push(HistoryItem::Message { role: Role::User, text: task.clone(), reasoning: None });
+        instance.rollout = rollout;
+        let sink = child_sink(parent, &agent_id);
+        Ok(self.start_run(engine, instance, task, sink))
+    }
+
+    /// 登记 + 调度 + 收口。调用方已完成全部 fail-closed 校验。
+    fn start_run(
+        self: &Arc<Self>,
+        engine: Arc<AgentLoop>,
+        mut instance: AgentInstance,
+        task: String,
+        sink: Arc<dyn EventSink>,
+    ) -> String {
+        let agent_id = instance.agent_id.clone();
+        let parent_id = instance.parent_id.clone().unwrap_or_default();
+        let depth = instance.depth;
+        let cancel = instance.cancel.clone();
+        let inbox = instance.inbox.clone();
 
         let done = Arc::new(Notify::new());
-        {
-            let mut inner = self.lock();
-            inner.insert(
-                agent_id.clone(),
-                Entry {
-                    parent_id: parent.agent_id.clone(),
-                    depth: instance.depth,
-                    task: task.clone(),
-                    status: AgentStatus::Spawning,
-                    created_at: Instant::now(),
-                    exit: None,
-                    cancel: cancel.clone(),
-                    done: done.clone(),
-                    handle: None,
-                },
-            );
-        }
+        self.lock().insert(
+            agent_id.clone(),
+            Entry {
+                parent_id,
+                depth,
+                task,
+                status: AgentStatus::Spawning,
+                created_at: Instant::now(),
+                exit: None,
+                cancel: cancel.clone(),
+                inbox,
+                history: None,
+                done: done.clone(),
+                handle: None,
+            },
+        );
 
         let weak = Arc::downgrade(self);
         let slots = self.slots.clone();
@@ -260,13 +326,13 @@ impl SubagentRegistry {
             // 突然开始烧 token。
             let permit: OwnedSemaphorePermit = tokio::select! {
                 _ = queued_cancel.cancelled() => {
-                    finish(&weak, &task_id, &task_done, ExitSummary::cancelled("已取消（尚未开始运行）。"));
+                    finish(&weak, &task_id, &task_done, ExitSummary::cancelled("已取消（尚未开始运行）。"), None);
                     return;
                 }
                 permit = slots.acquire_owned() => match permit {
                     Ok(permit) => permit,
                     Err(_) => {
-                        finish(&weak, &task_id, &task_done, ExitSummary::cancelled("子代理调度器已关闭。"));
+                        finish(&weak, &task_id, &task_done, ExitSummary::cancelled("子代理调度器已关闭。"), None);
                         return;
                     }
                 },
@@ -278,9 +344,11 @@ impl SubagentRegistry {
                 instance.last_assistant_text(),
                 instance.usage,
             );
+            // 历史必须在收口前快照：finish 之后等待方可能立即 resume。
+            let history = instance.history.clone();
             // 先释放槽位再收口：等结果的一方可能立刻派生下一批子代理。
             drop(permit);
-            finish(&weak, &task_id, &task_done, exit);
+            finish(&weak, &task_id, &task_done, exit, Some(history));
         });
 
         let mut inner = self.lock();
@@ -290,7 +358,29 @@ impl SubagentRegistry {
             // 理论上不可达（登记在 spawn 前完成）；真出现就放弃这个任务，不留无主句柄。
             handle.abort();
         }
-        Ok(agent_id)
+        agent_id
+    }
+
+    /// 向未结束的子代理注入一条 steering 消息；结束/未知都 fail-closed。
+    pub fn send_message(&self, agent_id: &str, message: &str) -> Result<(), String> {
+        let inner = self.lock();
+        let entry = inner
+            .get(agent_id)
+            .ok_or_else(|| format!("未知子代理: {agent_id}"))?;
+        if entry.status == AgentStatus::Exited {
+            return Err(format!("子代理已结束，无法注入消息: {agent_id}"));
+        }
+        entry
+            .inbox
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .push(message.to_string());
+        Ok(())
+    }
+
+    /// 已退出子代理的内存历史（`resume` 的数据源）。
+    pub fn history_of(&self, agent_id: &str) -> Option<Vec<HistoryItem>> {
+        self.lock().get(agent_id).and_then(|entry| entry.history.clone())
     }
 
     /// 当前快照（按 ULID 即创建时间升序）。
@@ -399,12 +489,42 @@ fn set_status(weak: &Weak<SubagentRegistry>, agent_id: &str, status: AgentStatus
     }
 }
 
-fn finish(weak: &Weak<SubagentRegistry>, agent_id: &str, done: &Notify, exit: ExitSummary) {
+/// 派生/恢复共用的父侧 fail-closed 校验（任一不满足都不得登记）。
+fn validate_parent(parent: &AgentScope, task: &str) -> Result<(), SpawnError> {
+    if task.trim().is_empty() {
+        return Err(SpawnError::EmptyTask);
+    }
+    if parent.depth >= MAX_AGENT_DEPTH {
+        return Err(SpawnError::DepthExceeded { depth: parent.depth });
+    }
+    if parent.cancel.is_cancelled() {
+        return Err(SpawnError::ParentCancelled);
+    }
+    Ok(())
+}
+
+/// 子代理事件必须带自己的身份（ADR-104）：出口不支持 scoped 时退回父出口，
+/// 而不是丢事件——前端宁可看到错误归属，也不能看不到子代理的进展。
+fn child_sink(parent: &AgentScope, agent_id: &str) -> Arc<dyn EventSink> {
+    parent
+        .sink
+        .scoped(agent_id, Some(&parent.agent_id))
+        .unwrap_or_else(|| parent.sink.clone())
+}
+
+fn finish(
+    weak: &Weak<SubagentRegistry>,
+    agent_id: &str,
+    done: &Notify,
+    exit: ExitSummary,
+    history: Option<Vec<HistoryItem>>,
+) {
     if let Some(registry) = weak.upgrade() {
         let mut inner = registry.lock();
         if let Some(entry) = inner.get_mut(agent_id) {
             entry.status = AgentStatus::Exited;
             entry.exit = Some(exit.capped());
+            entry.history = history;
         }
     }
     done.notify_waiters();
@@ -476,16 +596,18 @@ mod tests {
         })
     }
 
-    fn root() -> AgentInstance {
-        AgentInstance::root(
-            vec![HistoryItem::Message {
-                role: crate::model_client::Role::User,
-                text: "root-task".into(),
-                reasoning: None,
-            }],
-            0,
-            CancellationToken::new(),
-        )
+    fn root_scope() -> AgentScope {
+        AgentScope {
+            agent_id: "root".into(),
+            parent_id: None,
+            depth: 0,
+            cancel: CancellationToken::new(),
+            sink: Arc::new(DiscardSink),
+        }
+    }
+
+    fn child_scope() -> AgentScope {
+        AgentScope { agent_id: "child-1".into(), parent_id: Some("root".into()), depth: 1, ..root_scope() }
     }
 
     async fn wait_status(registry: &SubagentRegistry, expected: AgentStatus, timeout: Duration) {
@@ -513,9 +635,9 @@ mod tests {
                 usage: Usage { input_tokens: 11, cached_input_tokens: Some(3), output_tokens: 7 },
             },
         ]]);
-        let root = root();
+        let scope = root_scope();
         let id = registry
-            .spawn(engine, &root, "探索仓库", Arc::new(DiscardSink), None)
+            .spawn(engine, &scope, "探索仓库", None)
             .expect("派生应成功");
 
         let exit = registry.wait_exit(&id, Duration::from_secs(3)).await.expect("子代理应在超时前结束");
@@ -535,9 +657,9 @@ mod tests {
     #[tokio::test]
     async fn child_agent_cannot_spawn_grandchildren() {
         let registry = Arc::new(SubagentRegistry::new(DEFAULT_MAX_CONCURRENT));
-        let child = AgentInstance::child("child-1", "root", "子任务", CancellationToken::new());
+        let child = child_scope();
         let error = registry
-            .spawn(engine(vec![]), &child, "孙任务", Arc::new(DiscardSink), None)
+            .spawn(engine(vec![]), &child, "孙任务", None)
             .expect_err("深度 1 不得再派生子代理");
         assert_eq!(error, SpawnError::DepthExceeded { depth: 1 });
         assert!(registry.snapshot().is_empty(), "拒绝必须在登记前发生");
@@ -546,24 +668,16 @@ mod tests {
     #[tokio::test]
     async fn empty_task_and_cancelled_parent_are_rejected_before_registration() {
         let registry = Arc::new(SubagentRegistry::new(DEFAULT_MAX_CONCURRENT));
-        let root = root();
+        let scope = root_scope();
         assert_eq!(
-            registry.spawn(engine(vec![]), &root, "   ", Arc::new(DiscardSink), None),
+            registry.spawn(engine(vec![]), &scope, "   ", None),
             Err(SpawnError::EmptyTask)
         );
 
-        let cancelled_root = AgentInstance::root(
-            vec![HistoryItem::Message {
-                role: crate::model_client::Role::User,
-                text: "root-task".into(),
-                reasoning: None,
-            }],
-            0,
-            CancellationToken::new(),
-        );
-        cancelled_root.cancel.cancel();
+        let cancelled_scope = root_scope();
+        cancelled_scope.cancel.cancel();
         assert_eq!(
-            registry.spawn(engine(vec![]), &cancelled_root, "任务", Arc::new(DiscardSink), None),
+            registry.spawn(engine(vec![]), &cancelled_scope, "任务", None),
             Err(SpawnError::ParentCancelled)
         );
         assert!(registry.snapshot().is_empty());
@@ -574,14 +688,14 @@ mod tests {
     async fn concurrency_cap_queues_extra_agents_until_a_slot_frees() {
         let registry = Arc::new(SubagentRegistry::new(1));
         let engine = engine(vec![]);
-        let root = root();
+        let scope = root_scope();
         let first = registry
-            .spawn(engine.clone(), &root, "长任务 A", Arc::new(DiscardSink), None)
+            .spawn(engine.clone(), &scope, "长任务 A", None)
             .expect("A 应成功");
         wait_status(&registry, AgentStatus::Running, Duration::from_secs(2)).await;
 
         let second = registry
-            .spawn(engine, &root, "长任务 B", Arc::new(DiscardSink), None)
+            .spawn(engine, &scope, "长任务 B", None)
             .expect("B 应成功");
         wait_status(&registry, AgentStatus::Waiting, Duration::from_secs(2)).await;
         assert_eq!(registry.status_of(&first), Some(AgentStatus::Running));
@@ -605,9 +719,9 @@ mod tests {
     async fn cancelling_one_child_leaves_the_other_running() {
         let registry = Arc::new(SubagentRegistry::new(DEFAULT_MAX_CONCURRENT));
         let engine = engine(vec![]);
-        let root = root();
-        let a = registry.spawn(engine.clone(), &root, "A", Arc::new(DiscardSink), None).unwrap();
-        let b = registry.spawn(engine, &root, "B", Arc::new(DiscardSink), None).unwrap();
+        let scope = root_scope();
+        let a = registry.spawn(engine.clone(), &scope, "A", None).unwrap();
+        let b = registry.spawn(engine, &scope, "B", None).unwrap();
         wait_status(&registry, AgentStatus::Running, Duration::from_secs(2)).await;
         assert_eq!(registry.running_count(), 2);
 
@@ -654,12 +768,180 @@ mod tests {
             })
         };
         let engine = engine(vec![vec![tool_call("c1")], vec![tool_call("c2")]]);
-        let root = root();
+        let scope = root_scope();
         let id = registry
-            .spawn(engine, &root, "永远要工具的子任务", Arc::new(DiscardSink), None)
+            .spawn(engine, &scope, "永远要工具的子任务", None)
             .expect("派生应成功");
         let exit = registry.wait_exit(&id, Duration::from_secs(3)).await.expect("应结束");
         assert_eq!(exit.status, ExitStatus::Failed);
         assert!(exit.summary.contains("失败"), "无文本时须给出显式失败说明: {}", exit.summary);
+    }
+
+    /// send_agent_message：运行中的子代理必须在本轮采样前收到 steering 消息。
+    /// 用闸门把第一次采样卡住，确保注入发生在「已开始运行」之后——否则测的是
+    /// 「消息碰巧排在任务前面」，证明不了运行中注入这条路径。
+    #[tokio::test]
+    async fn steering_message_reaches_running_child_before_next_sample() {
+        struct GateBackend {
+            inner: ScriptedBackend,
+            started: Arc<Notify>,
+            gate: Arc<Notify>,
+            /// 只卡第一次采样：注入发生在第一轮进行中，消息应在下一轮进入上下文。
+            gated: std::sync::atomic::AtomicBool,
+        }
+
+        #[async_trait::async_trait]
+        impl ModelBackend for GateBackend {
+            async fn stream(
+                &self,
+                history: &[HistoryItem],
+                tools: &[crate::model_client::ToolDeclaration],
+                instructions: &str,
+            ) -> Result<ModelStream, String> {
+                if !self.gated.swap(true, std::sync::atomic::Ordering::SeqCst) {
+                    self.started.notify_one();
+                    self.gate.notified().await;
+                }
+                self.inner.stream(history, tools, instructions).await
+            }
+        }
+
+        let started = Arc::new(Notify::new());
+        let gate = Arc::new(Notify::new());
+        let engine = Arc::new(AgentLoop {
+            backend: Arc::new(GateBackend {
+                inner: ScriptedBackend::new(vec![
+                    // 第一轮必须产生工具调用，否则循环在第一轮就结束，没有「下一次采样」。
+                    vec![
+                        ModelStreamEvent::OutputItem(crate::model_client::ResponseItem::FunctionCall {
+                            name: "read_file".into(),
+                            arguments: r#"{"path":"x"}"#.into(),
+                            call_id: "c1".into(),
+                        }),
+                        ModelStreamEvent::Completed {
+                            usage: Usage { input_tokens: 1, cached_input_tokens: None, output_tokens: 1 },
+                        },
+                    ],
+                    vec![
+                        ModelStreamEvent::OutputTextDelta { delta: "完成".into() },
+                        ModelStreamEvent::Completed {
+                            usage: Usage { input_tokens: 1, cached_input_tokens: None, output_tokens: 1 },
+                        },
+                    ],
+                ]),
+                started: started.clone(),
+                gate: gate.clone(),
+                gated: std::sync::atomic::AtomicBool::new(false),
+            }),
+            router: Arc::new(ToolRouter::new()),
+            broker: Arc::new(ApprovalBroker::new()),
+            plan_state: Arc::new(PlanState::new()),
+            workspace_root: std::env::temp_dir(),
+            max_turns: 2,
+            token_budget: 0,
+            policy: policy::SessionPolicy {
+                approval: ApprovalMode::Ask,
+                sandbox: SandboxMode::WorkspaceWrite,
+            },
+            rollout: None,
+            rollout_broke: std::sync::atomic::AtomicBool::new(false),
+            session_id: None,
+            jobs: None,
+        });
+        let registry = Arc::new(SubagentRegistry::new(DEFAULT_MAX_CONCURRENT));
+        let scope = root_scope();
+        let id = registry.spawn(engine, &scope, "长任务", None).expect("派生应成功");
+
+        tokio::time::timeout(Duration::from_secs(2), started.notified())
+            .await
+            .expect("子代理应进入采样");
+        registry.send_message(&id, "请优先检查 X").expect("运行中应可注入");
+        gate.notify_one();
+
+        let exit = registry.wait_exit(&id, Duration::from_secs(3)).await.expect("应结束");
+        assert_eq!(exit.status, ExitStatus::Done);
+        let history = registry.history_of(&id).expect("结束时应保存历史");
+        assert!(
+            history.iter().any(|item| matches!(
+                item,
+                HistoryItem::Message { text, .. } if text == "请优先检查 X"
+            )),
+            "steering 消息必须进入子代理上下文: {history:?}"
+        );
+    }
+
+    /// send_agent_message 的 fail-closed 分支：未知 id 与已结束代理都拒绝。
+    #[tokio::test]
+    async fn messages_to_unknown_or_exited_agents_are_rejected() {
+        let registry = Arc::new(SubagentRegistry::new(DEFAULT_MAX_CONCURRENT));
+        assert!(registry.send_message("no-such-agent", "hi").is_err());
+
+        let engine = engine(vec![vec![ModelStreamEvent::Completed {
+            usage: Usage { input_tokens: 1, cached_input_tokens: None, output_tokens: 1 },
+        }]]);
+        let scope = root_scope();
+        let id = registry.spawn(engine, &scope, "短任务", None).expect("派生应成功");
+        registry.wait_exit(&id, Duration::from_secs(3)).await.expect("应结束");
+        assert!(registry.send_message(&id, "hi").is_err(), "已结束的代理不得再收消息");
+    }
+
+    /// resume_agent：已退出代理的历史被新代理沿用，并追加续跑指令。
+    #[tokio::test]
+    async fn resume_reuses_exited_history_and_appends_instruction() {
+        let registry = Arc::new(SubagentRegistry::new(DEFAULT_MAX_CONCURRENT));
+        let engine = engine(vec![
+            vec![
+                ModelStreamEvent::OutputTextDelta { delta: "第一轮结论".into() },
+                ModelStreamEvent::Completed {
+                    usage: Usage { input_tokens: 2, cached_input_tokens: None, output_tokens: 2 },
+                },
+            ],
+            vec![
+                ModelStreamEvent::OutputTextDelta { delta: "第二轮结论".into() },
+                ModelStreamEvent::Completed {
+                    usage: Usage { input_tokens: 3, cached_input_tokens: None, output_tokens: 3 },
+                },
+            ],
+        ]);
+        let scope = root_scope();
+        let first = registry.spawn(engine.clone(), &scope, "初版任务", None).expect("派生应成功");
+        let first_exit = registry.wait_exit(&first, Duration::from_secs(3)).await.expect("应结束");
+        assert_eq!(first_exit.summary, "第一轮结论");
+
+        let resumed = registry
+            .resume(engine, &scope, &first, Some("继续检查边界"), None)
+            .expect("resume 应成功");
+        assert_ne!(resumed, first, "resume 必须产生新身份，不能复活旧条目");
+        let exit = registry.wait_exit(&resumed, Duration::from_secs(3)).await.expect("应结束");
+        assert_eq!(exit.summary, "第二轮结论");
+        let history = registry.history_of(&resumed).expect("应保存历史");
+        assert!(history.iter().any(|item| matches!(
+            item,
+            HistoryItem::Message { text, .. } if text == "第一轮结论"
+        )), "恢复后的历史必须包含旧结论");
+        assert!(history.iter().any(|item| matches!(
+            item,
+            HistoryItem::Message { text, .. } if text == "继续检查边界"
+        )), "续跑指令必须进入历史");
+    }
+
+    /// resume 的 fail-closed：未知 id、未结束、无历史都不得产生半成品条目。
+    #[tokio::test]
+    async fn resume_rejections_leave_registry_unchanged() {
+        let registry = Arc::new(SubagentRegistry::new(DEFAULT_MAX_CONCURRENT));
+        let scope = root_scope();
+        assert_eq!(
+            registry.resume(engine(vec![]), &scope, "no-such-agent", None, None),
+            Err(SpawnError::UnknownAgent { agent_id: "no-such-agent".into() })
+        );
+
+        let running = registry.spawn(engine(vec![]), &scope, "长任务", None).expect("派生应成功");
+        assert_eq!(
+            registry.resume(engine(vec![]), &scope, &running, None, None),
+            Err(SpawnError::NotExited { agent_id: running.clone() })
+        );
+        assert_eq!(registry.snapshot().len(), 1, "被拒的 resume 不得登记新条目");
+        registry.cancel_all();
+        registry.wait_exit(&running, Duration::from_secs(2)).await.expect("应结束");
     }
 }

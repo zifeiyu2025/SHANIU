@@ -163,6 +163,14 @@ pub enum EventMsg {
 /// 事件出口抽象：agent_loop 及各模块经此广播（便于测试注入与 M1 复用）。
 pub trait EventSink: Send + Sync {
     fn emit(&self, msg: &EventMsg) -> Result<(), String>;
+
+    /// 以某个子代理身份复制一个出口（docs/02 ADR-104 的 `agent_id` 归属）。
+    ///
+    /// 默认返回 `None`：纯测试/无信封的出口没有代理身份概念，调用方应退回原出口。
+    /// 只有真正构造 `AgentEvent` 的出口（TauriEventSink）才需要实现它。
+    fn scoped(&self, _agent_id: &str, _parent_id: Option<&str>) -> Option<Arc<dyn EventSink>> {
+        None
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
@@ -184,8 +192,10 @@ pub trait EventJournal: Send + Sync {
 
 static EVENT_IDS: Mutex<ulid::Generator> = Mutex::new(ulid::Generator::new());
 
-fn emit_root_event(
+fn emit_agent_event(
     session_id: &str,
+    agent_id: &str,
+    parent_id: Option<&str>,
     msg: &EventMsg,
     publish: impl FnOnce(&AgentEvent) -> Result<(), String>,
 ) -> Result<(), String> {
@@ -197,8 +207,8 @@ fn emit_root_event(
     publish(&AgentEvent {
         event_id: event_id.to_string(),
         session_id: session_id.to_owned(),
-        agent_id: "root".into(),
-        parent_id: None,
+        agent_id: agent_id.to_owned(),
+        parent_id: parent_id.map(str::to_owned),
         ts_ms,
         msg: msg.clone(),
     })
@@ -207,6 +217,9 @@ fn emit_root_event(
 pub struct TauriEventSink {
     app: tauri::AppHandle,
     session_id: String,
+    /// 事件归属（ADR-104）：root 为 `"root"`，子代理为注册表分配的 id。
+    agent_id: String,
+    parent_id: Option<String>,
     /// SH-094 批 1：注入的事件信封持久化缝。None = 不落盘（测试/无目录启动）。
     journal: Option<Arc<dyn EventJournal>>,
     /// SH-094 批 2：注入的 WS gateway 广播发送端（依赖倒置——events 不引用 gateway 模块，
@@ -216,7 +229,17 @@ pub struct TauriEventSink {
 
 impl TauriEventSink {
     pub fn root(app: tauri::AppHandle, session_id: String) -> Self {
-        Self { app, session_id, journal: None, broadcast: None }
+        Self { app, session_id, agent_id: "root".into(), parent_id: None, journal: None, broadcast: None }
+    }
+
+    /// 子代理出口：同一会话、同一持久化/广播缝，只改事件归属。
+    pub fn scoped(
+        app: tauri::AppHandle,
+        session_id: String,
+        agent_id: impl Into<String>,
+        parent_id: Option<String>,
+    ) -> Self {
+        Self { app, session_id, agent_id: agent_id.into(), parent_id, journal: None, broadcast: None }
     }
 
     /// 注入持久化实现：信封逐条落盘；广播仍是主通道，日志失败只告警不中断回合。
@@ -233,8 +256,20 @@ impl TauriEventSink {
 }
 
 impl EventSink for TauriEventSink {
+    fn scoped(&self, agent_id: &str, parent_id: Option<&str>) -> Option<Arc<dyn EventSink>> {
+        let mut sink = TauriEventSink::scoped(
+            self.app.clone(),
+            self.session_id.clone(),
+            agent_id,
+            parent_id.map(str::to_owned),
+        );
+        sink.journal = self.journal.clone();
+        sink.broadcast = self.broadcast.clone();
+        Some(Arc::new(sink))
+    }
+
     fn emit(&self, msg: &EventMsg) -> Result<(), String> {
-        emit_root_event(&self.session_id, msg, |event| {
+        emit_agent_event(&self.session_id, &self.agent_id, self.parent_id.as_deref(), msg, |event| {
             // 先落盘再广播：收到事件的客户端按 event_id 续播时，日志里一定已有它。
             if let Some(journal) = &self.journal {
                 if let Err(error) = journal.append(event) {
@@ -279,7 +314,7 @@ mod envelope_tests {
     fn root_event_keeps_session_payload_and_timestamp() {
         let msg = EventMsg::ReasoningDelta { delta: "推理片段".into() };
         let before = SystemTime::now().duration_since(UNIX_EPOCH).unwrap().as_millis() as u64;
-        emit_root_event("session-a", &msg, |event| {
+        emit_agent_event("session-a", "root", None, &msg, |event| {
             assert_eq!(event.session_id, "session-a");
             assert_eq!(event.agent_id, "root");
             assert_eq!(event.parent_id, None);
@@ -292,10 +327,24 @@ mod envelope_tests {
     }
 
     #[test]
+    fn scoped_events_carry_agent_identity_without_changing_payload() {
+        let msg = EventMsg::AgentMessageDelta { delta: "子代理片段".into() };
+        emit_agent_event("session-a", "01AGENT", Some("root"), &msg, |event| {
+            assert_eq!(event.session_id, "session-a");
+            assert_eq!(event.agent_id, "01AGENT");
+            assert_eq!(event.parent_id.as_deref(), Some("root"));
+            // 归属只加在信封上，载荷原样保留——旧消费方（FF-104）仍能读 msg。
+            assert_eq!(event.msg, msg);
+            Ok(())
+        })
+        .unwrap();
+    }
+
+    #[test]
     fn ids_remain_ordered_across_sessions_and_resumed_tasks() {
         let mut ids = Vec::new();
         for session in ["first", "second", "first"] {
-            emit_root_event(session, &EventMsg::TurnStarted { turn: 1 }, |event| {
+            emit_agent_event(session, "root", None, &EventMsg::TurnStarted { turn: 1 }, |event| {
                 assert_eq!(event.session_id, session);
                 ids.push(event.event_id.clone());
                 Ok(())
@@ -316,7 +365,7 @@ mod envelope_tests {
                     barrier.wait();
                     let session_id = format!("session-{worker}");
                     for index in 0..64 {
-                        emit_root_event(&session_id, &EventMsg::AgentMessageDelta { delta: index.to_string() }, |event| {
+                        emit_agent_event(&session_id, "root", None, &EventMsg::AgentMessageDelta { delta: index.to_string() }, |event| {
                             received.lock().unwrap().push(event.clone());
                             Ok(())
                         }).unwrap();
@@ -341,12 +390,12 @@ mod envelope_tests {
     fn publish_failure_propagates_without_poisoning_the_next_event() {
         let mut failed_id = String::new();
         let msg = EventMsg::Error { message: "测试错误".into() };
-        let result = emit_root_event("session-a", &msg, |event| {
+        let result = emit_agent_event("session-a", "root", None, &msg, |event| {
             failed_id = event.event_id.clone();
             Err("传输不可用".into())
         });
         assert_eq!(result, Err("传输不可用".into()));
-        emit_root_event("session-a", &msg, |event| {
+        emit_agent_event("session-a", "root", None, &msg, |event| {
             assert!(event.event_id > failed_id);
             Ok(())
         }).unwrap();

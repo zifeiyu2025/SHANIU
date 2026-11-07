@@ -36,6 +36,10 @@ pub fn risk_of(tool_name: &str) -> RiskLevel {
         "skill" => RiskLevel::Read,
         "apply_patch" => RiskLevel::WriteInWorkspace,
         "unified_exec" => RiskLevel::Execute,
+        // SH-052 编排四工具（docs/02 §2.2 风险分级）：派生/恢复/注入消息会改变
+        // 子代理行为面，按写入档审批；wait_agent 只读结果，不审批（否则每等一次都要点一下）。
+        "spawn_agent" | "resume_agent" | "send_agent_message" => RiskLevel::WriteInWorkspace,
+        "wait_agent" => RiskLevel::Read,
         // Plan Mode：进入免确认（read 档）；退出必须用户评审（ADR-003）
         "enter_plan_mode" => RiskLevel::Read,
         "exit_plan_mode" => RiskLevel::PlanReview,
@@ -98,6 +102,12 @@ mod tests {
         assert_eq!(decide(RiskLevel::WriteInWorkspace, ApprovalMode::AutoReadOnly, SandboxMode::WorkspaceWrite, false), Decision::Prompt);
         assert_eq!(decide(RiskLevel::WriteInWorkspace, ApprovalMode::Ask, SandboxMode::DangerFullAccess, false), Decision::Allow);
         assert_eq!(risk_of("apply_patch"), RiskLevel::WriteInWorkspace);
+        // SH-052（docs/02 §2.2）：编排工具不能吃未知工具的 destructive 默认档，
+        // 否则每个子代理派生都要人工点一次；wait_agent 只读结果，直接放行。
+        for tool in ["spawn_agent", "resume_agent", "send_agent_message"] {
+            assert_eq!(risk_of(tool), RiskLevel::WriteInWorkspace, "{tool}");
+        }
+        assert_eq!(risk_of("wait_agent"), RiskLevel::Read);
     }
 
     #[test]
