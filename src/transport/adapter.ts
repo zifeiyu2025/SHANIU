@@ -1766,6 +1766,16 @@ export function createAdapter(options: AdapterOptions): { remote: unknown; dispo
   }
 
   /**
+   * 反查子代理的归属会话（SH-056 批 2）。宿主侧是遍历事件档案的 IO 扫描；
+   * 失败时如实返回 null（警告留痕），调用方据此决定抛原始错误还是交空态。
+   */
+  const ownerSessionOf = async (agentId: string): Promise<string | null> =>
+    bridge.invoke<string | null>('session_of_agent', { agentId }).catch((reason: unknown) => {
+      console.warn('[SHANIU] 子代理归属反查失败：泳道无法直达恢复', reason)
+      return null
+    })
+
+  /**
    * 档案重建后的首个快照与后续帧（`follow` 的两条入口共用）。
    *
    * 必须在取 `from` 之前完成泳道回放：结算通知会追加进父 journal，晚取会把它们
@@ -2009,25 +2019,26 @@ export function createAdapter(options: AdapterOptions): { remote: unknown; dispo
       bridge.observeEvents?.(sessionId)
       let journal = journals.get(sessionId)
       if (journal === undefined) {
-        // 没在当前进程里观察过：能从档案重建就重建（SH-033 的"打开旧会话"），
-        // 重建不出内容才交空快照。档案读不回是硬错误——静默交空态会让用户以为
-        // 会话没了，而实际只是宿主读失败。
-        const replayed = await rebuildFromArchive(sessionId)
+        // 没在当前进程里观察过：能从档案重建就重建（SH-033 的"打开旧会话"）。
+        // 宿主对"档案不存在"是**抛错**而不是空表（load_session 的诚实失败），
+        // 子代理正好走这一支——先记下错误，反查不到归属再把原始错误抛回去。
+        let replayed: Journal | undefined
+        let failure: unknown
+        try {
+          replayed = await rebuildFromArchive(sessionId)
+        } catch (error: unknown) {
+          failure = error
+        }
         if (replayed !== undefined) {
           yield* followReplayed(sessionId, replayed, signal)
           return
         }
         // 重启后直接打开泳道（SH-056 批 2）：子代理没有自己的 rollout 档案，
-        // `load_session(child)` 必然为空；它的全部事件记在父会话的事件档案里。
-        // 反查归属会话 → 重建父整树 → 泳道 journal 由 `replayLanes` 经同一
-        // `onEvent` 建出来，然后落到下面的实时快照分支（它带 activeAttempt 基线，
-        // 比档案快照更能处理"档案断在流中途"的泳道）。
-        const ownerId = await bridge
-          .invoke<string | null>('session_of_agent', { agentId: sessionId })
-          .catch((reason: unknown) => {
-            console.warn('[SHANIU] 子代理归属反查失败：泳道无法直达恢复', reason)
-            return null
-          })
+        // 它的全部事件记在父会话的事件档案里。反查归属会话 → 重建父整树 →
+        // 泳道 journal 由 `replayLanes` 经同一 `onEvent` 建出来，然后落到下面的
+        // 实时快照分支（它带 activeAttempt 基线，比档案快照更能处理"档案断在流
+        // 中途"的泳道）。
+        const ownerId = await ownerSessionOf(sessionId)
         if (ownerId !== null && ownerId !== sessionId) {
           // 子代理事件经父会话频道广播（gateway 按信封 `session_id` 分发）：只订阅
           // 泳道 id 收不到任何帧，这里把父会话一并补订阅。
@@ -2038,6 +2049,8 @@ export function createAdapter(options: AdapterOptions): { remote: unknown; dispo
           journal = journals.get(sessionId)
         }
         if (journal === undefined) {
+          // 真实会话的档案读失败仍是硬错误：不静默交空态让用户以为会话没了。
+          if (failure !== undefined) throw failure
           traceFollow(sessionId, 'end-empty')
           yield emptySnapshot(sessionId, now())
           return

@@ -187,10 +187,11 @@ function scriptedBridge(
       if (command === 'send_task') return (args?.agentId ?? 'agent-new') as T
       if (command === 'load_session') {
         // SH-056 批 2：给了事件档案就以它判断"该会话有没有自己的 rollout"——
-        // 子代理没有独立档案（读回空表），父会话有（它落了 agent_id='root' 的事件）。
+        // 子代理没有独立档案，宿主对缺失档案是抛错（不是空表），替身照做；
+        // 父会话落了 agent_id='root' 的事件，正常返回档案。
         const agentId = String(args?.['agentId'] ?? '')
         if (journal !== undefined && !journal.some(row => row.session_id === agentId && row.agent_id === 'root')) {
-          return [] as T
+          throw { code: 'ARCHIVE_UNAVAILABLE', message: `档案读不回: rollout 目录不可用: ${agentId}.jsonl` }
         }
         return archive as T
       }
@@ -3035,6 +3036,11 @@ describe('子代理生命周期事件接泳道（SH-053 批 2）', () => {
     const baseline = (await control.next()).value
     const timing = baseline.value.projections['lane-a']?.values['subagentTiming'] as { settledMs?: number }
     expect(timing.settledMs).toBe(450)
+
+    // 反查也找不到时必须把原始档案错误抛回去：读失败不能降级成"这个会话是空的"。
+    const ghost = followLane(session, 'ghost-lane')
+    await expect(ghost.next()).rejects.toMatchObject({ code: 'ARCHIVE_UNAVAILABLE' })
+    await ghost.return?.(undefined)
     await control.return?.(undefined)
     await lane.return?.(undefined)
     dispose()
