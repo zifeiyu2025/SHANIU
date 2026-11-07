@@ -635,7 +635,11 @@ mod tests {
         let _ = temp.write("docs/img.png", "px");
         let base = temp.root.join("docs").join("page.html");
         let resolved = with_base_file(&temp.root, "img.png", Some(base.to_str().unwrap()));
-        assert_eq!(PathBuf::from(&resolved), temp.root.join("docs").join("img.png"));
+        // 用 canonical 形态比较：CI 的 TEMP 可能是 8.3 短名（RUNNER~1），字符串比较会误报。
+        assert_eq!(
+            std::fs::canonicalize(&resolved).expect("解析结果可再规范"),
+            std::fs::canonicalize(temp.root.join("docs").join("img.png")).expect("目标可规范"),
+        );
         // baseFile 落在根外时不展开：让后续边界检查照旧拒掉
         let foreign = std::env::temp_dir().join("shaniu-foreign-base.html");
         let untouched = with_base_file(&temp.root, "x.png", Some(foreign.to_str().unwrap()));

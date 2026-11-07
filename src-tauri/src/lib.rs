@@ -1648,7 +1648,12 @@ mod session_projection_tests {
         let nested = root.join("子目录");
         std::fs::create_dir_all(&nested).expect("临时目录可建");
         let resolved = super::canonical_workspace_path(&nested).expect("存在的路径可规范");
-        assert_eq!(resolved, nested.display().to_string());
+        // 断言用 canonical 形态比较：CI runner 的 TEMP 可能以 8.3 短名（RUNNER~1）给出，
+        // 直接比字符串会把「短名 vs 长名」误判成功能缺陷。
+        assert_eq!(
+            std::fs::canonicalize(&resolved).expect("解析结果可再规范"),
+            nested.canonicalize().expect("临时目录可规范"),
+        );
         assert!(!resolved.starts_with(r"\\?\"), "落盘拼写不得带 verbatim 前缀");
         // 相对段与符号链接语义由 canonicalize 承担：.. 归一到同一拼写
         assert_eq!(
