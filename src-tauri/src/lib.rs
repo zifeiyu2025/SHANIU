@@ -20,6 +20,7 @@ pub mod session_export;
 pub mod session_query;
 pub mod session_reference;
 pub mod session_title;
+pub mod skills;
 pub mod tool_router;
 pub mod tools;
 pub mod workspace_files;
@@ -1547,7 +1548,8 @@ pub fn run() {
             open_in_app::workspace_path_applications,
             open_in_app::open_workspace_path,
             file_references::list_file_references,
-            session_reference::list_session_references
+            session_reference::list_session_references,
+            skills::list_skills
         ])
         .on_window_event(|window, event| {
             // 关闭 = 隐藏到系统托盘（不退出）；真正退出只走托盘菜单「退出」

@@ -259,6 +259,12 @@ impl AgentLoop {
             let _ = sink.emit(&msg);
         };
 
+        // SH-091：技能目录在每次任务开始时发现一次。目录为空时系统提示不加技能段，
+        // 且不向模型声明 `skill` 工具——避免无技能工作区的 token 开销与假能力。
+        let skill_summaries = crate::skills::discover(&self.workspace_root);
+        let skill_catalog = crate::skills::catalog_lines(&skill_summaries, 500);
+        let has_model_skills = skill_summaries.iter().any(|skill| skill.model_invocable);
+
         'outer: for turn in 1..=self.max_turns {
             last_turn = turn;
             emit(&sink, EventMsg::TurnStarted { turn });
@@ -269,9 +275,14 @@ impl AgentLoop {
                 &self.workspace_root,
                 self.policy.sandbox,
                 self.plan_state.is_active(),
+                &skill_catalog,
             );
             // 计划态下只向模型声明只读工具 + exit_plan_mode（ADR-003 双层防御第一层）
-            let declarations = declarations_for(&self.router, self.plan_state.is_active());
+            let declarations = declarations_for(
+                &self.router,
+                self.plan_state.is_active(),
+                has_model_skills,
+            );
 
             // 2.5) 采样前检查 token 预算（ADR-001：「每轮采样前检查 token 预算触发 compaction」）。
             // 位置必须在采样之前：压缩的产物要对本轮请求可见才有意义，放轮末等于压了个寂寞
@@ -312,8 +323,16 @@ impl AgentLoop {
                     break 'outer;
                 }
             };
-            let request_history: &[HistoryItem] = expanded.as_deref().unwrap_or(&history);
-            let mut stream = match self.backend.stream(request_history, &declarations, &instructions).await {
+            // 2.8) 用户 `/name` 技能触发（SH-091）：只扫描原始历史末尾的用户消息，
+            // 避免把会话引用展开注入的上下文当成用户手势。技能正文最后追加，
+            // 离模型回答最近（与上游“背景在前、要执行的物料在后”一致）。
+            let skill_injections = crate::skills::injections(&history, &self.workspace_root);
+            let mut request_history: Vec<HistoryItem> =
+                expanded.unwrap_or_else(|| history.clone());
+            if !skill_injections.is_empty() {
+                request_history.extend(skill_injections);
+            }
+            let mut stream = match self.backend.stream(&request_history, &declarations, &instructions).await {
                 Ok(s) => s,
                 Err(e) => {
                     emit(&sink, EventMsg::Error { message: e });
@@ -556,8 +575,18 @@ impl AgentLoop {
 
 /// 本轮向模型声明的工具集合（ADR-003 计划态只读的第一层防御）：
 /// 计划态下仅保留只读工具与 `exit_plan_mode`，写入/执行工具对模型不可见。
-fn declarations_for(router: &ToolRouter, plan_active: bool) -> Vec<crate::model_client::ToolDeclaration> {
-    let all = router.declarations();
+///
+/// SH-091：没有任何 model-invocable 技能时，`skill` 工具不声明。工具仍注册在
+/// 路由里（执行路径与审批测试照常），但模型看不到它，也就不会对空目录发起无效调用。
+fn declarations_for(
+    router: &ToolRouter,
+    plan_active: bool,
+    has_model_skills: bool,
+) -> Vec<crate::model_client::ToolDeclaration> {
+    let mut all = router.declarations();
+    if !has_model_skills {
+        all.retain(|declaration| declaration.name != "skill");
+    }
     if !plan_active {
         return all;
     }
@@ -1059,7 +1088,7 @@ mod tests {
         crate::tools::register_builtin(&mut router, Arc::new(PlanState::new()));
 
         let names = |plan: bool| -> Vec<String> {
-            declarations_for(&router, plan).into_iter().map(|d| d.name).collect()
+            declarations_for(&router, plan, true).into_iter().map(|d| d.name).collect()
         };
         let planned = names(true);
         assert!(planned.contains(&"read_file".to_string()));

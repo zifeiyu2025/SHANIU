@@ -32,6 +32,8 @@ pub fn risk_of(tool_name: &str) -> RiskLevel {
         // todo_write（SH-108）：会话内任务清单，不触碰工作区，上游同名工具从不审批；
         // Read 档让它进计划态白名单（计划态列 todo 是上游规划工作流的形态）。
         "todo_write" => RiskLevel::Read,
+        // skill：SH-091 只读取本地 SKILL.md 正文，不写不执行；后续动作仍逐次审批。
+        "skill" => RiskLevel::Read,
         "apply_patch" => RiskLevel::WriteInWorkspace,
         "unified_exec" => RiskLevel::Execute,
         // Plan Mode：进入免确认（read 档）；退出必须用户评审（ADR-003）

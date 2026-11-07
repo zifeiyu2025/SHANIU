@@ -7,6 +7,7 @@
 pub mod apply_patch;
 pub mod fs_read;
 pub mod plan;
+pub mod skill;
 pub mod todo;
 pub mod unified_exec;
 
@@ -22,5 +23,6 @@ pub fn register_builtin(router: &mut ToolRouter, plan_state: Arc<PlanState>) {
     router.register(Arc::new(unified_exec::UnifiedExec::new()));
     router.register(Arc::new(apply_patch::ApplyPatch::new()));
     router.register(Arc::new(todo::TodoWrite::default()));
+    router.register(Arc::new(skill::SkillTool::new()));
     plan::register(router, plan_state);
 }

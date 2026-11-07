@@ -21,6 +21,9 @@ serde_json = "1"
 ulid = "3"
 base64 = "0.22"                    # SH-092：UI 预览字节窗口过 IPC（MIT/Apache-2.0，lock 里已有同版本）
 toml = "1.2"
+# SH-091 技能系统：解析 SKILL.md YAML frontmatter（上游 skill-filesystem 用 yaml）。
+# MIT/Apache-2.0；仓库此前无 YAML crate，避免手写解析器。
+serde_yaml_ng = "0.10"
 # M1 模型客户端（§6 已确认）：HTTP/SSE 与流处理
 reqwest = { version = "0.12", features = ["stream", "json"] }
 eventsource-stream = "0.2"

@@ -25,7 +25,15 @@ fn sandbox_clause(mode: SandboxMode) -> &'static str {
 }
 
 /// 构造系统提示词。`plan_mode` 为真时追加只读计划态约束。
-pub fn system_instruction(workspace_root: &Path, sandbox: SandboxMode, plan_mode: bool) -> String {
+///
+/// `skill_catalog` 是模型可见技能的目录行（`- \`name\`: description`）。为空时整段
+/// 省略——没有技能的工作区不应承担目录 token，也不应暗示存在 `skill` 工具。
+pub fn system_instruction(
+    workspace_root: &Path,
+    sandbox: SandboxMode,
+    plan_mode: bool,
+    skill_catalog: &[String],
+) -> String {
     let workspace = workspace_root.display();
     let mut text = format!(
         "你是 SHANIU，运行在 Windows 桌面的本地编码 Agent。你通过工具直接操作文件与命令来完成用户任务。\n\n\
@@ -54,6 +62,24 @@ pub fn system_instruction(workspace_root: &Path, sandbox: SandboxMode, plan_mode
         sandbox_clause(sandbox)
     );
 
+    if !skill_catalog.is_empty() {
+        text.push_str(
+            "\n\n## 技能\n\
+本会话可用以下技能（仅摘要）：\n\
+<available_skills>\n",
+        );
+        for line in skill_catalog {
+            text.push_str(line);
+            text.push('\n');
+        }
+        text.push_str(
+            "</available_skills>\n\
+当用户点名某技能，或任务明显匹配技能描述时，先调用 skill 工具加载该技能的完整说明再行动。\n\
+技能目录只有摘要；加载前不要臆测或遵循技能正文。\n\
+用户也可能直接用 /name 触发技能；此时会话中会出现 <skill_content> 块，直接遵循，不要再对该技能调用 skill 工具。",
+        );
+    }
+
     if plan_mode {
         text.push_str(
             "\n\n## 当前状态：计划模式\n\
@@ -73,7 +99,7 @@ mod tests {
 
     #[test]
     fn includes_workspace_and_sandbox_mode() {
-        let text = system_instruction(&PathBuf::from(r"D:\ws\demo"), SandboxMode::WorkspaceWrite, false);
+        let text = system_instruction(&PathBuf::from(r"D:\ws\demo"), SandboxMode::WorkspaceWrite, false, &[]);
         assert!(text.contains(r"D:\ws\demo"), "必须写明工作区路径");
         assert!(text.contains("工作区写入"), "必须写明沙箱模式");
         // 常驻章节会说明"何时该进计划模式"，但非计划态不得声明已处于计划态
@@ -81,11 +107,23 @@ mod tests {
         // 计划态 todo 引导只住在计划态分支：非计划态请求逐字节不受影响（评估
         // 基线的 5 个任务不进计划态，这行永不可达——回归不适用的证据）
         assert!(!text.contains("todo_write"), "非计划态不应出现 todo 引导");
+        // 无技能时整段省略：不占 token，也不暗示存在 skill 工具
+        assert!(!text.contains("## 技能"), "无技能时不应注入技能段");
+    }
+
+    #[test]
+    fn skill_catalog_is_injected_only_when_present() {
+        let catalog = vec!["- `pdf`: 处理 PDF".to_string()];
+        let text = system_instruction(&PathBuf::from("D:/ws"), SandboxMode::WorkspaceWrite, false, &catalog);
+        assert!(text.contains("## 技能"));
+        assert!(text.contains("<available_skills>"));
+        assert!(text.contains("- `pdf`: 处理 PDF"));
+        assert!(text.contains("先调用 skill 工具"));
     }
 
     #[test]
     fn plan_mode_adds_readonly_clause() {
-        let text = system_instruction(&PathBuf::from("D:/ws"), SandboxMode::ReadOnly, true);
+        let text = system_instruction(&PathBuf::from("D:/ws"), SandboxMode::ReadOnly, true, &[]);
         assert!(text.contains("当前状态：计划模式"));
         assert!(text.contains("exit_plan_mode"));
         assert!(text.contains("只读"));
@@ -100,7 +138,7 @@ mod tests {
     #[test]
     fn workspace_write_clause_does_not_overclaim_isolation() {
         // SH-019 实测：受限令牌不做文件系统级隔离，措辞不得宣称越界写入被拒
-        let text = system_instruction(&PathBuf::from("D:/ws"), SandboxMode::WorkspaceWrite, false);
+        let text = system_instruction(&PathBuf::from("D:/ws"), SandboxMode::WorkspaceWrite, false, &[]);
         assert!(
             !text.contains("工作区外写入与网络默认被拒绝"),
             "不得向模型宣称未实现的文件系统隔离（会诱发越界尝试）"
@@ -111,7 +149,7 @@ mod tests {
     #[test]
     fn never_mentions_secret_material() {
         // 提示词由运行上下文拼装，不含任何密钥占位（AGENTS.md §3）
-        let text = system_instruction(&PathBuf::from("D:/ws"), SandboxMode::DangerFullAccess, false);
+        let text = system_instruction(&PathBuf::from("D:/ws"), SandboxMode::DangerFullAccess, false, &[]);
         assert!(!text.to_lowercase().contains("api_key"));
         assert!(!text.contains("sk-"));
     }
