@@ -1605,11 +1605,15 @@ export function createAdapter(options: AdapterOptions): { remote: unknown; dispo
 
   /**
    * 工作区注册表（SH-099）：默认工作区来自 [workspace].root（id 固定），额外
-   * 工作区来自宿主 `[[workspaces]]`（face.refresh 后随快照读取）。
+   * 工作区来自宿主 `[[workspaces]]`（face.refresh 后随快照读取）。默认项与上游
+   * registry 项同构：标题可改（落 [workspace].title，2026-11-07），可删除
+   * （[workspace].hidden 标记——摘出清单、目录与会话保留，重新添加同路径复活）。
    */
   interface RegisteredWorkspace { readonly id: string; readonly path: string; readonly title: string }
   const registeredWorkspaces = (): RegisteredWorkspace[] => [
-    { id: HOST_WORKSPACE_ID, path: face.workspaceRoot(), title: HOST_WORKSPACE_ID },
+    ...face.workspaceHidden()
+      ? []
+      : [{ id: HOST_WORKSPACE_ID, path: face.workspaceRoot(), title: face.workspaceTitle() }],
     ...face.workspaces(),
   ]
 
@@ -1740,6 +1744,9 @@ export function createAdapter(options: AdapterOptions): { remote: unknown; dispo
     create: async (request: { path?: string } = {}) => {
       try {
         const value = await bridge.invoke<Record<string, unknown>>('create_workspace', { path: request.path ?? '' })
+        // 宿主刚写过 config（新注册或默认项复活）：face 的缓存快照必须跟上，
+        // 否则后续 allWorkspaceViews 的注册表还是旧的
+        await face.refresh()
         await readWorkspaceFlags()
         const workspace = value['workspace'] as Record<string, unknown> | undefined
         if (workspace !== undefined) workspaceLog.append({ type: 'upsert', workspace })
@@ -1754,6 +1761,8 @@ export function createAdapter(options: AdapterOptions): { remote: unknown; dispo
           workspaceId: request.workspaceId ?? '',
           title: request.title ?? '',
         })
+        // 宿主刚写过 config：face 缓存跟上（默认项标题落在 [workspace].title）
+        await face.refresh()
         const workspace = value['workspace'] as Record<string, unknown> | undefined
         if (workspace !== undefined) workspaceLog.append({ type: 'upsert', workspace })
         return OK(value)
@@ -1764,6 +1773,8 @@ export function createAdapter(options: AdapterOptions): { remote: unknown; dispo
     delete: async (request: { workspaceId?: string } = {}) => {
       try {
         await bridge.invoke<Record<string, unknown>>('delete_workspace', { workspaceId: request.workspaceId ?? '' })
+        // 宿主刚写过 config（额外项摘除或默认项落 hidden）：face 缓存跟上
+        await face.refresh()
         workspaceLog.append({ type: 'remove', workspaceId: request.workspaceId ?? '' })
         return OK({ removed: request.workspaceId ?? '' })
       } catch (reason) {

@@ -61,18 +61,12 @@ pub struct AppConfig {
 
 /// 一家额外工作区（SH-099）。`id` 由宿主生成（ULID）；`title` 缺省 = 路径目录名
 /// （上游 defaultWorkspaceTitle 同口径）。
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(default)]
 pub struct WorkspaceProfile {
     pub id: String,
     pub path: String,
     pub title: String,
-}
-
-impl Default for WorkspaceProfile {
-    fn default() -> Self {
-        Self { id: String::new(), path: String::new(), title: String::new() }
-    }
 }
 
 impl WorkspaceProfile {
@@ -537,6 +531,16 @@ pub enum ApprovalMode {
 pub struct WorkspaceConfig {
     /// 工作区根目录；空 = 用户主目录（%USERPROFILE%）。
     pub root: String,
+    /// 默认工作区的显示名（上游 registry 的可写 title 同构）：空 = 上游首启拼写
+    /// `default-workspace`，前端 `workspaceDisplayTitle` 据此渲染成「默认工作区」；
+    /// 改过名 = 用户写的标题逐字显示。改回（或重新注册成）`default-workspace`
+    /// 就回到本地化名——与上游的自动标题判定同一份规则。
+    pub title: String,
+    /// 默认工作区的删除标记（上游 registry delete 同构）：true = 不进工作区清单，
+    /// 目录与会话档案全保留（会话显示在「未分组」）。`[workspace].root` 是运行期
+    /// 依赖的全局根，物理删除等于停用 Agent 操作目录，所以落标记而不是删字段；
+    /// 重新添加同一路径即复活（上游重新 create = 全新注册，标题一并重置）。
+    pub hidden: bool,
 }
 
 /// 解析出的数据目录（§9.3：解析结果写入日志第一行）。

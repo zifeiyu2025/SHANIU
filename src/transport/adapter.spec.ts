@@ -132,6 +132,53 @@ function scriptedBridge(
         else workspaceFlags.order.splice(workspaceFlags.order.indexOf(before), 0, id)
         return { sessionOrder: [...workspaceFlags.order] } as T
       }
+      // SH-099 对齐上游（2026-11-07）的宿主替身：默认项的 title/hidden 落
+      // [workspace]，额外项落 [[workspaces]] 行——与 lib.rs 的 config 落点同构。
+      if (command === 'rename_workspace') {
+        const id = String(args?.workspaceId ?? '')
+        const title = String(args?.title ?? '').trim()
+        if (title === '') throw { code: 'bad-request', message: '工作区名不能为空' }
+        const view = (workspaceId: string, path: string, workspaceTitle: string): Record<string, unknown> => ({
+          workspaceId, path, title: workspaceTitle, sessionIds: [], createdAt: '', updatedAt: '',
+        })
+        if (id === 'default-workspace') {
+          state['workspaceTitle'] = title
+          const stored = state['workspaceTitle']
+          return { workspace: view(id, String(state['workspaceRoot'] ?? ''), stored !== undefined && String(stored) !== '' ? String(stored) : 'default-workspace') } as T
+        }
+        const rows = (state['workspaces'] as { id: string; path: string; title: string }[] | undefined) ?? []
+        const row = rows.find(candidate => candidate.id === id)
+        if (row === undefined) throw { code: 'not-found', message: `工作区不存在：${id}` }
+        row.title = title
+        return { workspace: view(id, row.path, title) } as T
+      }
+      if (command === 'delete_workspace') {
+        const id = String(args?.workspaceId ?? '')
+        if (id === 'default-workspace') {
+          state['workspaceHidden'] = true
+          state['workspaceTitle'] = ''
+          return { removed: id } as T
+        }
+        const rows = (state['workspaces'] as { id: string }[] | undefined) ?? []
+        if (!rows.some(candidate => candidate.id === id)) throw { code: 'not-found', message: `工作区不存在：${id}` }
+        state['workspaces'] = rows.filter(candidate => candidate.id !== id)
+        return { removed: id } as T
+      }
+      if (command === 'create_workspace') {
+        const path = String(args?.path ?? '')
+        if (path === String(state['workspaceRoot'] ?? '')) {
+          // 同根路径幂等注册：被删除过的默认项在此复活（上游 created:false 同口径）
+          state['workspaceHidden'] = false
+          return {
+            created: false,
+            workspace: { workspaceId: 'default-workspace', path, title: 'default-workspace', sessionIds: [], createdAt: '', updatedAt: '' },
+          } as T
+        }
+        const rows = (state['workspaces'] as { id: string; path: string; title: string }[] | undefined) ?? []
+        const workspace = { workspaceId: `ws-${rows.length + 1}`, path, title: '新目录', sessionIds: [], createdAt: '', updatedAt: '' }
+        state['workspaces'] = [...rows, workspace]
+        return { created: true, workspace } as T
+      }
       return undefined as T
     },
     listenEvents(handler) {
@@ -1527,6 +1574,90 @@ describe('workspace 面：归档/置顶/手动排序（SH-100）', () => {
     const baseline = ((await iterator.next()).value as { value: Record<string, unknown> }).value
     expect(baseline['archivedSessionIds']).toEqual([])
     expect(baseline['pinnedSessionIds']).toEqual([])
+    await iterator.return?.(undefined)
+    dispose()
+  })
+})
+
+describe('workspace 注册表对齐上游：默认项可改可删（2026-11-07）', () => {
+  /** 注册表面（create/rename/delete/follow）的窄声明。 */
+  interface WorkspaceRegistryFace {
+    workspace: {
+      follow(): AsyncGenerator<Record<string, unknown>>
+      create(request: { path?: string }): Promise<Record<string, unknown>>
+      rename(request: { workspaceId?: string; title?: string }): Promise<Record<string, unknown>>
+      delete(request: { workspaceId?: string }): Promise<Record<string, unknown>>
+    }
+  }
+  const faceOfRegistry = (remote: unknown): WorkspaceRegistryFace => remote as WorkspaceRegistryFace
+
+  const baselineOf = async (iterator: AsyncGenerator<Record<string, unknown>>): Promise<Record<string, unknown>[]> => {
+    const frame = (await iterator.next()).value as { value: { items?: Record<string, unknown>[] } }
+    return frame.value['items'] ?? []
+  }
+
+  it('baseline 默认项标题来自 [workspace].title（上游 registry 可写 title 同构）', async () => {
+    const bridge = scriptedBridge({ ...HOST_SETTINGS, workspaceTitle: '主力', workspaces: [{ id: 'ws-x', path: 'X', title: 'X' }] })
+    const { remote, dispose } = createAdapter({ bridge })
+    const iterator = faceOfRegistry(remote).workspace.follow()
+    const items = await baselineOf(iterator)
+    expect(items[0]?.['workspaceId']).toBe('default-workspace')
+    expect(items[0]?.['title']).toBe('主力')
+    await iterator.return?.(undefined)
+    dispose()
+  })
+
+  it('改默认项名：upsert 帧带新标题；重启基线从 [workspace].title 同源读出', async () => {
+    const bridge = scriptedBridge()
+    const { remote, dispose } = createAdapter({ bridge })
+    const face = faceOfRegistry(remote)
+    const iterator = face.workspace.follow()
+    await iterator.next()
+    const result = await face.workspace.rename({ workspaceId: 'default-workspace', title: '主力' })
+    expect(result['ok']).toBe(true)
+    const frame = (await iterator.next()).value as { type: string; workspace: { title: string } }
+    expect(frame.type).toBe('upsert')
+    expect(frame.workspace['title']).toBe('主力')
+    await iterator.return?.(undefined)
+    // 基线重拉：标题基线随 config（face.refresh 后）而不是旧缓存
+    const second = faceOfRegistry(remote).workspace.follow()
+    const items = await baselineOf(second)
+    expect(items[0]?.['title']).toBe('主力')
+    await second.return?.(undefined)
+    dispose()
+  })
+
+  it('删除默认项：remove 帧推给前端，重启基线不再含默认项', async () => {
+    const bridge = scriptedBridge({ ...HOST_SETTINGS, workspaces: [{ id: 'ws-x', path: 'X', title: 'X' }] })
+    const { remote, dispose } = createAdapter({ bridge })
+    const face = faceOfRegistry(remote)
+    const iterator = face.workspace.follow()
+    const items = await baselineOf(iterator)
+    expect(items.map(item => item['workspaceId'])).toEqual(['default-workspace', 'ws-x'])
+    const result = await face.workspace.delete({ workspaceId: 'default-workspace' })
+    expect(result['ok']).toBe(true)
+    const frame = (await iterator.next()).value as { type: string; workspaceId: string }
+    expect(frame.type).toBe('remove')
+    expect(frame.workspaceId).toBe('default-workspace')
+    await iterator.return?.(undefined)
+    const second = faceOfRegistry(remote).workspace.follow()
+    const rebaseline = await baselineOf(second)
+    expect(rebaseline.map(item => item['workspaceId'])).toEqual(['ws-x'])
+    await second.return?.(undefined)
+    dispose()
+  })
+
+  it('同根路径再注册：默认项复活（created:false），标题重置为首启拼写', async () => {
+    const bridge = scriptedBridge({ ...HOST_SETTINGS, workspaceHidden: true })
+    const { remote, dispose } = createAdapter({ bridge })
+    const face = faceOfRegistry(remote)
+    const result = await face.workspace.create({ path: 'W' })
+    expect(result['ok']).toBe(true)
+    expect((result['value'] as { created: boolean }).created).toBe(false)
+    const iterator = face.workspace.follow()
+    const items = await baselineOf(iterator)
+    expect(items[0]?.['workspaceId']).toBe('default-workspace')
+    expect(items[0]?.['title']).toBe('default-workspace')
     await iterator.return?.(undefined)
     dispose()
   })

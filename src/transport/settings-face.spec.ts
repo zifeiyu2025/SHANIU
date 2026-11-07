@@ -211,6 +211,34 @@ function profileValue(overrides: Record<string, unknown> = {}): Record<string, u
   }
 }
 
+describe('默认工作区标题/删除标记（上游 registry 可改可删语义的 face 侧）', () => {
+  /** 只回一份固定快照的桥：workspace 基线字段的透传测试不关心服务商文档。 */
+  const snapshotFace = (snapshot: Record<string, unknown>) => {
+    const bridge: HostBridge = {
+      async invoke<T>(command: string): Promise<T> {
+        if (command === 'get_settings') return snapshot as T
+        throw new Error(`unexpected command: ${command}`)
+      },
+      listenEvents: () => () => {},
+    }
+    return createSettingsFace(bridge, { emit: () => {} })
+  }
+
+  it('宿主回显 workspaceTitle/workspaceHidden 时原样透传', async () => {
+    const face = snapshotFace({ workspaceRoot: 'W', workspaceTitle: '主力', workspaceHidden: true })
+    await face.refresh()
+    expect(face.workspaceTitle()).toBe('主力')
+    expect(face.workspaceHidden()).toBe(true)
+  })
+
+  it('旧文档缺字段：标题回落上游首启拼写、删除标记回落未删除', async () => {
+    const face = snapshotFace({ workspaceRoot: 'W' })
+    await face.refresh()
+    expect(face.workspaceTitle()).toBe('default-workspace')
+    expect(face.workspaceHidden()).toBe(false)
+  })
+})
+
 describe('settings 面：读视图', () => {
   it('服务商放在 user 层而不是 base 层', async () => {
     const host = fakeHost([LONGCAT])

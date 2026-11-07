@@ -67,6 +67,13 @@ interface SettingsSnapshot {
   readonly providers: readonly HostProviderRow[]
   /** 额外工作区注册表（SH-099）：默认工作区不在其中（来自 [workspace].root）。 */
   readonly workspaces: readonly { id: string; path: string; title: string }[]
+  /**
+   * 默认工作区的标题基线（[workspace].title；宿主已解析回落拼写
+   * `default-workspace`）。旧文档缺字段 = undefined，accessor 回落同一拼写。
+   */
+  readonly workspaceTitle?: string
+  /** 默认工作区删除标记（[workspace].hidden）。缺字段 = 未删除。 */
+  readonly workspaceHidden?: boolean
 }
 
 /** `save_providers` 写入的一行：04 §4 的落盘名。Tauri 只转顶层参数名，嵌套结构体按 serde 名走。 */
@@ -115,6 +122,14 @@ export interface SettingsFace {
   activeSelection(): ModelSelection
   /** 宿主当前工作区根（`[workspace].root`）；读不到文档时是空串。 */
   workspaceRoot(): string
+  /**
+   * 默认工作区的标题基线：上游 registry 语义下它是可写 title，宿主落
+   * `[workspace].title`；空/缺 = 上游首启拼写 `default-workspace`（前端
+   * `workspaceDisplayTitle` 渲染成「默认工作区」）。
+   */
+  workspaceTitle(): string
+  /** 默认工作区是否已被删除（`[workspace].hidden`）：true = 不进工作区清单。 */
+  workspaceHidden(): boolean
   /** 安全场当前沙箱档（`get_settings` 的 sandboxMode：read_only / workspace_write / danger_full_access）。 */
   sandboxMode(): string
   /** 额外工作区注册表（SH-099）：默认工作区不在其中，face 自己拼 [workspace].root 项。 */
@@ -855,6 +870,11 @@ export function createSettingsFace(bridge: HostBridge, options: SettingsFaceOpti
     activeContextWindow,
     applySandboxMode,
     workspaceRoot: () => snapshot?.workspaceRoot ?? '',
+    workspaceTitle: () => {
+      const title = snapshot?.workspaceTitle
+      return title !== undefined && title !== '' ? title : 'default-workspace'
+    },
+    workspaceHidden: () => snapshot?.workspaceHidden === true,
     refresh: async () => {
       await read()
     },

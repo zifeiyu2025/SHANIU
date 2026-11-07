@@ -410,6 +410,89 @@ fn insert_session_before(
 /// 默认工作区的 workspaceId（face 同款常量；配置根派生，不进 [[workspaces]]）。
 pub const DEFAULT_WORKSPACE_ID: &str = "default-workspace";
 
+/// 默认工作区的标题基线：`[workspace].title` 非空 = 用户标题，否则上游首启拼写
+/// `default-workspace`（前端 `workspaceDisplayTitle` 据此渲染成「默认工作区」）。
+/// 上游语义：registry 里它就是一个可写 title 的普通项，这里只把落点换成
+/// `[workspace].title` 而不是 `[[workspaces]]` 行。
+pub fn default_workspace_title(cfg: &config::AppConfig) -> String {
+    let title = cfg.workspace.title.trim();
+    if title.is_empty() {
+        DEFAULT_WORKSPACE_ID.to_string()
+    } else {
+        title.to_string()
+    }
+}
+
+/// 改名（SH-099）：只写 title，路径不动；与其它工作区（含默认项的标题基线）
+/// 重名拒绝。纯函数——命令壳负责持久化与视图回显。
+pub fn apply_workspace_rename(
+    cfg: &config::AppConfig,
+    workspace_id: &str,
+    title: &str,
+) -> Result<config::AppConfig, WorkspaceOpError> {
+    let id = workspace_id.trim();
+    let title = title.trim();
+    if title.is_empty() {
+        return Err(WorkspaceOpError::BadRequest("工作区名不能为空".into()));
+    }
+    let mut next = cfg.clone();
+    if id == DEFAULT_WORKSPACE_ID {
+        // 上游同构：默认工作区改名与别家一样生效，落 [workspace].title。
+        if cfg
+            .workspaces
+            .iter()
+            .any(|ws| ws.display_title() == title)
+        {
+            return Err(WorkspaceOpError::NameConflict(format!(
+                "已有名为 {title} 的工作区，换一个名字"
+            )));
+        }
+        next.workspace.title = title.to_string();
+        return Ok(next);
+    }
+    if !cfg.workspaces.iter().any(|ws| ws.id == id) {
+        return Err(WorkspaceOpError::NotFound(format!("工作区不存在：{id}")));
+    }
+    // 重名比对含默认项：默认项的标题基线也算一家。
+    if cfg
+        .workspaces
+        .iter()
+        .any(|ws| ws.id != id && ws.display_title() == title)
+        || default_workspace_title(cfg) == title
+    {
+        return Err(WorkspaceOpError::NameConflict(format!(
+            "已有名为 {title} 的工作区，换一个名字"
+        )));
+    }
+    if let Some(ws) = next.workspaces.iter_mut().find(|ws| ws.id == id) {
+        ws.title = title.to_string();
+    }
+    Ok(next)
+}
+
+/// 删除注册（SH-099）：只摘注册，目录与会话档案全保留——会话在侧栏落到
+/// 「未分组」（上游同口径）。默认项是 `[workspace].root` 的注册形态，物理删除
+/// 等于停用全局默认根，所以落 hidden 标记并重置标题；效果与上游 registry
+/// 摘除一致，重新添加同一路径即复活。纯函数。
+pub fn apply_workspace_delete(
+    cfg: &config::AppConfig,
+    workspace_id: &str,
+) -> Result<config::AppConfig, WorkspaceOpError> {
+    let id = workspace_id.trim();
+    let mut next = cfg.clone();
+    if id == DEFAULT_WORKSPACE_ID {
+        next.workspace.hidden = true;
+        next.workspace.title.clear();
+        return Ok(next);
+    }
+    let before = next.workspaces.len();
+    next.workspaces.retain(|ws| ws.id != id);
+    if next.workspaces.len() == before {
+        return Err(WorkspaceOpError::NotFound(format!("工作区不存在：{id}")));
+    }
+    Ok(next)
+}
+
 fn workspace_view_of(state: &AppState, id: &str, path: &str, title: &str) -> serde_json::Value {
     let rows = rollout::list(&state.data_root().join(rollout::ROLLOUT_DIR));
     let mine: Vec<String> = rows
@@ -417,19 +500,20 @@ fn workspace_view_of(state: &AppState, id: &str, path: &str, title: &str) -> ser
         .filter(|row| row.workspace_root == path)
         .map(|row| row.agent_id)
         .collect();
-    let latest = mine.len();
     serde_json::json!({
         "workspaceId": id,
         "path": path,
         "title": title,
         "sessionIds": mine,
         "createdAt": "",
-        "updatedAt": if latest == 0 { "" } else { "" },
+        "updatedAt": "",
     })
 }
 
 /// 注册新工作区（SH-099）：路径必须已存在且是目录；同一路径幂等返回已有项
 /// （上游 created:false 同口径）。id 由宿主生成，title 缺省 = 目录名。
+/// 与默认工作区同路径的幂等注册兼作复活入口：hidden 过的默认项在这里恢复
+/// 显示，标题重置为首启拼写（上游重新 create = 全新注册）。
 #[tauri::command]
 fn create_workspace(
     app: tauri::AppHandle,
@@ -448,9 +532,18 @@ fn create_workspace(
     let canonical_str = canonical.to_string_lossy().to_string();
     let cfg = state.config();
     if canonical_str == state.workspace_root().canonicalize().unwrap_or_default().to_string_lossy() {
-        // 与默认工作区同一路径：幂等返回默认项
+        // 与默认工作区同一路径：幂等返回默认项；被删除过的默认项在此复活
+        if cfg.workspace.hidden {
+            let mut next = cfg.clone();
+            next.workspace.hidden = false;
+            next.workspace.title.clear();
+            state
+                .update_config(next)
+                .map_err(WorkspaceOpError::Rejected)?;
+        }
+        let cfg = state.config();
         return Ok(serde_json::json!({
-            "workspace": workspace_view_of(&state, DEFAULT_WORKSPACE_ID, state.workspace_root().display().to_string().as_str(), DEFAULT_WORKSPACE_ID),
+            "workspace": workspace_view_of(&state, DEFAULT_WORKSPACE_ID, state.workspace_root().display().to_string().as_str(), &default_workspace_title(&cfg)),
             "created": false,
         }));
     }
@@ -488,9 +581,8 @@ fn create_workspace(
     }))
 }
 
-/// 改工作区显示名（SH-099）：只写 title，路径不动；与其它家重名拒绝。
-/// 默认工作区显示名由前端按 id 特判渲染，不支持改名（SHANIU 的默认项是
-/// [workspace].root 派生，没有可写的 title 字段）。
+/// 改工作区显示名（SH-099 / 2026-11-07 对齐上游）：只写 title，路径不动；与其它家
+/// （含默认项标题基线）重名拒绝。校验与应用在 [`apply_workspace_rename`]（纯函数）。
 #[tauri::command]
 fn rename_workspace(
     app: tauri::AppHandle,
@@ -498,47 +590,30 @@ fn rename_workspace(
     title: String,
 ) -> Result<serde_json::Value, WorkspaceOpError> {
     let state = app.state::<AppState>();
-    let id = workspace_id.trim().to_string();
-    let title = title.trim().to_string();
-    if id == DEFAULT_WORKSPACE_ID {
-        return Err(WorkspaceOpError::BadRequest(
-            "默认工作区的显示名固定为「默认工作区」，不支持改名".into(),
-        ));
-    }
-    if title.is_empty() {
-        return Err(WorkspaceOpError::BadRequest("工作区名不能为空".into()));
-    }
-    let cfg = state.config();
-    let target = cfg
-        .workspaces
-        .iter()
-        .find(|ws| ws.id == id)
-        .ok_or_else(|| WorkspaceOpError::NotFound(format!("工作区不存在：{id}")))?;
-    if cfg
-        .workspaces
-        .iter()
-        .any(|ws| ws.id != id && ws.display_title() == title)
-    {
-        return Err(WorkspaceOpError::NameConflict(format!(
-            "已有名为 {title} 的工作区，换一个名字"
-        )));
-    }
-    let mut next = cfg.clone();
-    if let Some(ws) = next.workspaces.iter_mut().find(|ws| ws.id == id) {
-        ws.title = title.clone();
-    }
-    let _ = target;
+    let next = apply_workspace_rename(&state.config(), &workspace_id, &title)?;
     state.update_config(next).map_err(WorkspaceOpError::Rejected)?;
-    let updated = state.config().workspace_by_id(&id).cloned();
-    let ws = updated.ok_or_else(|| WorkspaceOpError::Rejected("改名后读不回工作区".into()))?;
+    let cfg = state.config();
+    let id = workspace_id.trim();
+    let (ws_id, path, ws_title) = if id == DEFAULT_WORKSPACE_ID {
+        (
+            DEFAULT_WORKSPACE_ID.to_string(),
+            state.workspace_root().display().to_string(),
+            default_workspace_title(&cfg),
+        )
+    } else {
+        let ws = cfg
+            .workspace_by_id(id)
+            .ok_or_else(|| WorkspaceOpError::Rejected("改名后读不回工作区".into()))?;
+        (ws.id.clone(), ws.path.clone(), ws.display_title())
+    };
     Ok(serde_json::json!({
-        "workspace": workspace_view_of(&state, &ws.id, &ws.path, &ws.display_title()),
+        "workspace": workspace_view_of(&state, &ws_id, &path, &ws_title),
     }))
 }
 
-/// 删除工作区注册（SH-099）：只删注册，目录与会话档案全保留——会话在侧栏
-/// 落到「未分组」（上游同口径）。默认工作区拒绝（它来自 [workspace].root，
-/// 删注册等于停用全局默认根）。
+/// 删除工作区注册（SH-099 / 2026-11-07 对齐上游）：只删注册，目录与会话档案全保留
+/// ——会话在侧栏落到「未分组」（上游同口径）。默认项落 `[workspace].hidden` 标记
+/// （`[workspace].root` 不能物理删）；摘除逻辑在 [`apply_workspace_delete`]（纯函数）。
 #[tauri::command]
 fn delete_workspace(
     app: tauri::AppHandle,
@@ -546,17 +621,7 @@ fn delete_workspace(
 ) -> Result<serde_json::Value, WorkspaceOpError> {
     let state = app.state::<AppState>();
     let id = workspace_id.trim().to_string();
-    if id == DEFAULT_WORKSPACE_ID {
-        return Err(WorkspaceOpError::BadRequest(
-            "默认工作区不可删除：它是 [workspace].root 的注册形态".into(),
-        ));
-    }
-    let mut next = state.config();
-    let before = next.workspaces.len();
-    next.workspaces.retain(|ws| ws.id != id);
-    if next.workspaces.len() == before {
-        return Err(WorkspaceOpError::NotFound(format!("工作区不存在：{id}")));
-    }
+    let next = apply_workspace_delete(&state.config(), &id)?;
     state.update_config(next).map_err(WorkspaceOpError::Rejected)?;
     Ok(serde_json::json!({ "removed": id }))
 }
@@ -829,6 +894,9 @@ fn get_settings(app: tauri::AppHandle) -> Result<serde_json::Value, String> {
             "path": ws.path,
             "title": ws.display_title(),
         })).collect::<Vec<_>>(),
+        // 默认工作区的标题基线与删除标记（2026-11-07 对齐上游可改可删语义）
+        "workspaceTitle": default_workspace_title(&cfg),
+        "workspaceHidden": cfg.workspace.hidden,
     }))
 }
 
@@ -1178,6 +1246,70 @@ mod session_projection_tests {
     use crate::config;
     use crate::model_client::{HistoryItem, Role};
     use crate::rollout::{ConfigSnapshot, RolloutItem};
+
+    /// 一份带默认项标题与两家额外工作区的配置（工作区改名/删除纯函数的公共底座）。
+    fn workspace_cfg(default_title: &str, hidden: bool) -> config::AppConfig {
+        config::AppConfig {
+            workspace: config::WorkspaceConfig {
+                root: String::from("D:\\ws\\root"),
+                title: String::from(default_title),
+                hidden,
+            },
+            workspaces: vec![
+                config::WorkspaceProfile { id: String::from("ws-1"), path: String::from("D:\\ws\\one"), title: String::from("一号") },
+                config::WorkspaceProfile { id: String::from("ws-2"), path: String::from("D:\\ws\\two"), title: String::new() },
+            ],
+            ..Default::default()
+        }
+    }
+
+    #[test]
+    fn default_workspace_title_falls_back_to_upstream_spelling() {
+        // [workspace].title 空 = 上游首启拼写，前端据此渲染「默认工作区」
+        assert_eq!(super::default_workspace_title(&workspace_cfg("", false)), super::DEFAULT_WORKSPACE_ID);
+        assert_eq!(super::default_workspace_title(&workspace_cfg("  ", false)), super::DEFAULT_WORKSPACE_ID);
+        assert_eq!(super::default_workspace_title(&workspace_cfg("主力", false)), "主力");
+    }
+
+    #[test]
+    fn default_workspace_rename_writes_title_and_conflicts_like_a_regular_entry() {
+        // 上游同构：默认项改名与别家一样生效，落 [workspace].title
+        let next = super::apply_workspace_rename(&workspace_cfg("", false), super::DEFAULT_WORKSPACE_ID, " 主力 ")
+            .expect("默认工作区可改名");
+        assert_eq!(next.workspace.title, "主力");
+        assert!(!next.workspace.hidden);
+        // 空名拒绝（上游 non-blank title 同口径）
+        assert!(super::apply_workspace_rename(&workspace_cfg("", false), super::DEFAULT_WORKSPACE_ID, "  ").is_err());
+        // 与额外工作区重名拒绝
+        assert!(super::apply_workspace_rename(&workspace_cfg("", false), super::DEFAULT_WORKSPACE_ID, "一号").is_err());
+    }
+
+    #[test]
+    fn extra_workspace_rename_conflicts_with_default_title_baseline() {
+        // 默认项标题基线也算一家：改名撞上要拒绝
+        assert!(super::apply_workspace_rename(&workspace_cfg("主力", false), "ws-1", "主力").is_err());
+        assert!(super::apply_workspace_rename(&workspace_cfg("", false), "ws-1", "default-workspace").is_err());
+        // 正常改名保留路径，只写 title
+        let next = super::apply_workspace_rename(&workspace_cfg("", false), "ws-1", "二号").expect("改名生效");
+        assert_eq!(next.workspaces[0].title, "二号");
+        assert_eq!(next.workspaces[0].path, "D:\\ws\\one");
+        // 不存在的工作区如实报 not-found
+        assert!(super::apply_workspace_rename(&workspace_cfg("", false), "ws-x", "随便").is_err());
+    }
+
+    #[test]
+    fn deleting_default_workspace_hides_it_and_reset_happens_on_adopt() {
+        // 上游同构：删除只摘注册（目录与会话保留），额外项直接移除
+        let next = super::apply_workspace_delete(&workspace_cfg("主力", false), super::DEFAULT_WORKSPACE_ID)
+            .expect("默认工作区可删除");
+        assert!(next.workspace.hidden);
+        assert!(next.workspace.title.is_empty(), "复活时按全新注册重置标题");
+        assert_eq!(next.workspaces.len(), 2, "额外工作区不受影响");
+        // 额外项删除与 not-found 口径
+        let next = super::apply_workspace_delete(&workspace_cfg("", false), "ws-1").expect("额外项可删除");
+        assert_eq!(next.workspaces.len(), 1);
+        assert!(super::apply_workspace_delete(&workspace_cfg("", false), "ws-x").is_err());
+    }
 
     fn msg(role: Role, text: &str) -> RolloutItem {
         RolloutItem::ResponseItem {

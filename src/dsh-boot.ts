@@ -62,6 +62,7 @@ import {
 import { apply as brandApply, inject as brandInject } from './brand'
 import { apply as headerActionsApply, inject as headerActionsInject } from './header-actions'
 import { apply as modelConfigApply, inject as modelConfigInject } from './model-config'
+import { apply as workspaceMenuApply, inject as workspaceMenuInject } from './workspace-menu'
 
 export interface BootHandle {
   readonly ctx: Context
@@ -206,6 +207,8 @@ export async function bootShaniu(container: HTMLElement): Promise<BootHandle> {
     { inject: brandInject, apply: brandApply },
     { inject: headerActionsInject, apply: headerActionsApply },
     { inject: modelConfigInject, apply: modelConfigApply },
+    // 工作区行菜单的「在文件夹显示」项（上游 ui-open-in-app 的 workspace 序位补齐）
+    { inject: workspaceMenuInject, apply: workspaceMenuApply },
     { inject: uiSettingsGeneralInject, apply: uiSettingsGeneralApply },
     { inject: uiSettingsModelsInject, apply: uiSettingsModelsApply },
     { inject: uiChatInject, apply: uiChatApply },

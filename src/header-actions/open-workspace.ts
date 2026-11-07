@@ -1,7 +1,7 @@
 /** 系统文件管理器桥接：只有 Tauri 宿主能真的打开目录。 */
 
 /** 与 main.tsx 装窗口控制层同一判定：页面里有没有 Tauri 的内部对象。 */
-function inTauri(): boolean {
+export function inTauri(): boolean {
   return '__TAURI_INTERNALS__' in window
 }
 
