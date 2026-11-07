@@ -420,6 +420,12 @@
    "@deepseek-ai/dsh-client-ui-context-menu/*": [
     "./src/dsh/packages/client/ui-context-menu/src/*"
    ],
+   "@deepseek-ai/dsh-client-ui-entry-customization": [
+    "./src/dsh/packages/client/ui-entry-customization/src/index.ts"
+   ],
+   "@deepseek-ai/dsh-client-ui-entry-customization/*": [
+    "./src/dsh/packages/client/ui-entry-customization/src/*"
+   ],
    "@deepseek-ai/dsh-client-ui-conversation": [
     "./src/dsh/packages/client/ui-conversation/src/index.ts"
    ],
@@ -1682,6 +1688,9 @@
    ],
    "@deepseek-ai/dsh-client-ui-context-menu/client": [
     "./src/dsh/packages/client/ui-context-menu/src/client/index.ts"
+   ],
+   "@deepseek-ai/dsh-client-ui-entry-customization/client": [
+    "./src/dsh/packages/client/ui-entry-customization/src/client/index.ts"
    ],
    "@deepseek-ai/dsh-client-ui-conversation/client": [
     "./src/dsh/packages/client/ui-conversation/src/client/index.ts"
@@ -2953,6 +2962,11 @@
   "./src/dsh/packages/client/ui-context-menu/src/client/View.tsx",
   "./src/dsh/packages/client/ui-context-menu/src/client/external-trigger.ts",
   "./src/dsh/packages/client/ui-context-menu/src/client/index.ts",
+  "./src/dsh/packages/client/ui-entry-customization/src/index.ts",
+  "./src/dsh/packages/client/ui-entry-customization/src/css-modules.d.ts",
+  "./src/dsh/packages/client/ui-entry-customization/src/client/index.ts",
+  "./src/dsh/packages/client/ui-entry-customization/src/client/EntryMenuContent.tsx",
+  "./src/dsh/packages/client/ui-entry-customization/src/client/locales.ts",
   "./src/dsh/packages/client/ui-context-menu/src/client/locales.ts",
   "./src/dsh/packages/client/ui-context-menu/src/client/registry.ts",
   "./src/dsh/packages/client/ui-context-menu/src/client/store.ts",

@@ -236,6 +236,30 @@ const GENERAL_SCHEMA = envelope(z.object({ welcomeNoticeVersion: z.string() }))
 const PERMISSION_SCHEMA = envelope(z.object({
   defaultPreset: z.union(PERMISSION_PRESETS as unknown as string[]),
 }))
+/**
+ * `ui-settings` 域（DSH 的 developer tools 偏好）：上游 schema 是
+ * `{ enabled: boolean }`，新装默认 **true**（显示轨迹/代码视图等诊断界面）。
+ * SHANIU 之前这个域缺失，导致设置页「显示代码工作视图」一保存就报错、轨迹页签
+ * 也被 client 端的 developerTools 开关隐藏。
+ */
+const UI_SETTINGS_SCHEMA = envelope(z.object({ enabled: z.boolean() }))
+/** 纯客户端显示偏好：用 localStorage 跨重启保留，不写宿主 config.toml。 */
+const DEVELOPER_TOOLS_STORAGE_KEY = 'shaniu.developer-tools.enabled'
+const readDeveloperTools = (): boolean => {
+  try {
+    return globalThis.localStorage?.getItem(DEVELOPER_TOOLS_STORAGE_KEY) !== 'false'
+  } catch {
+    // 隐私模式/禁存储：按上游默认开启，Toggle 仍在本次进程内生效。
+    return true
+  }
+}
+const writeDeveloperTools = (enabled: boolean): void => {
+  try {
+    globalThis.localStorage?.setItem(DEVELOPER_TOOLS_STORAGE_KEY, enabled ? 'true' : 'false')
+  } catch {
+    // 写不进去只影响跨重启保留，不把一次成功切换报成失败。
+  }
+}
 
 const isRecord = (value: unknown): value is Record<string, JsonValue> =>
   typeof value === 'object' && value !== null && !Array.isArray(value)
@@ -283,6 +307,9 @@ export function createSettingsFace(bridge: HostBridge, options: SettingsFaceOpti
    * 按 conflict 让界面重读，而不是把人家的改动盖掉。
    */
   let permissionRevision = 0
+  /** 客户端显示偏好（ui-settings 域）：跨重启从 localStorage 读，默认开启。 */
+  let developerToolsEnabled = readDeveloperTools()
+  let developerToolsRevision = 0
 
   const read = async (): Promise<SettingsSnapshot | undefined> => {
     try {
@@ -391,6 +418,19 @@ export function createSettingsFace(bridge: HostBridge, options: SettingsFaceOpti
     applies: 'live',
     secrets: [],
     revision: generalRevision,
+  })
+
+  const viewOfUiSettings = (): SettingsNamespaceView => ({
+    autoGenerate: true,
+    ns: 'ui-settings',
+    schema: UI_SETTINGS_SCHEMA,
+    // 上游新装默认开启；用户关掉后再从 localStorage 回读 false。
+    base: { enabled: true },
+    user: { enabled: developerToolsEnabled },
+    value: { enabled: developerToolsEnabled },
+    applies: 'live',
+    secrets: [],
+    revision: developerToolsRevision,
   })
 
   /**
@@ -759,7 +799,7 @@ export function createSettingsFace(bridge: HostBridge, options: SettingsFaceOpti
           hasDocument: false,
           // `permission` 必须在这里出现：DSH 的权限设置行先按 ns 找视图，找不到就
           // 静默不写（settings-store.ts:109-116），连一句错误都给不出来。
-          namespaces: [viewOfPi(), viewOfGeneral(), viewOfPermission()],
+          namespaces: [viewOfPi(), viewOfGeneral(), viewOfUiSettings(), viewOfPermission()],
         })
       },
       mutate: async (ns, ops, expectedRevision) => {
@@ -768,6 +808,26 @@ export function createSettingsFace(bridge: HostBridge, options: SettingsFaceOpti
           generalRevision += 1
           options.emit('settings/document-updated', ns, generalRevision)
           return ok(viewOfGeneral())
+        }
+        // developer tools（ui-settings）：设置页只有 `set enabled=<boolean>` 一种写。
+        // 这是个纯客户端显示偏好，落 localStorage；其余形状如实拒绝。
+        if (ns === 'ui-settings') {
+          if (expectedRevision !== undefined && expectedRevision !== developerToolsRevision) {
+            return refused(new RemoteError('settings/conflict', '显示代码工作视图已被改动，请重新读取后再写', {
+              ns, expected: expectedRevision, actual: developerToolsRevision,
+            }))
+          }
+          const next = applyOps({ enabled: developerToolsEnabled }, ops)
+          const enabled = isRecord(next) ? next['enabled'] : undefined
+          const unknown = isRecord(next) ? Object.keys(next).filter(key => key !== 'enabled') : []
+          if (typeof enabled !== 'boolean' || unknown.length > 0) {
+            return refused(new RemoteError('settings/rejected', '显示代码工作视图只接受 set enabled=<boolean>', { ns }))
+          }
+          developerToolsEnabled = enabled
+          writeDeveloperTools(enabled)
+          developerToolsRevision += 1
+          options.emit('settings/document-updated', ns, developerToolsRevision)
+          return ok(viewOfUiSettings())
         }
         // 权限挡位（SH-105 补修）：DSH 的权限设置行走这条写面。缺了这条分支时旧代码
         // 会落到下面那句 `SHANIU 没有 permission 这个配置域`——界面把这句话显示在

@@ -433,6 +433,12 @@
    "@deepseek-ai/dsh-client-ui-context-menu/*": [
     "./node_modules/.cache/dsh-types-client/src/dsh/packages/client/ui-context-menu/src/*"
    ],
+   "@deepseek-ai/dsh-client-ui-entry-customization": [
+    "./node_modules/.cache/dsh-types-client/src/dsh/packages/client/ui-entry-customization/src/index.d.ts"
+   ],
+   "@deepseek-ai/dsh-client-ui-entry-customization/*": [
+    "./node_modules/.cache/dsh-types-client/src/dsh/packages/client/ui-entry-customization/src/*"
+   ],
    "@deepseek-ai/dsh-client-ui-conversation": [
     "./node_modules/.cache/dsh-types-client/src/dsh/packages/client/ui-conversation/src/index.d.ts"
    ],
@@ -1671,6 +1677,9 @@
    ],
    "@deepseek-ai/dsh-client-ui-context-menu/client": [
     "./node_modules/.cache/dsh-types-client/src/dsh/packages/client/ui-context-menu/src/client/index.d.ts"
+   ],
+   "@deepseek-ai/dsh-client-ui-entry-customization/client": [
+    "./node_modules/.cache/dsh-types-client/src/dsh/packages/client/ui-entry-customization/src/client/index.d.ts"
    ],
    "@deepseek-ai/dsh-client-ui-conversation/client": [
     "./node_modules/.cache/dsh-types-client/src/dsh/packages/client/ui-conversation/src/client/index.d.ts"

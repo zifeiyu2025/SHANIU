@@ -43,6 +43,7 @@ import { installDesktopFileActions } from './file-actions/desktop-bridge'
 import { installOpenInAppRoutes } from './open-in-app/route-fetch'
 import { apply as uiInputTriggerApply, inject as uiInputTriggerInject } from '@deepseek-ai/dsh-client-ui-input-trigger/client'
 import { apply as uiCommandsApply, inject as uiCommandsInject } from '@deepseek-ai/dsh-client-ui-commands/client'
+import { apply as uiEntryCustomizationApply, inject as uiEntryCustomizationInject } from '@deepseek-ai/dsh-client-ui-entry-customization/client'
 import { apply as fileUploadApply, inject as fileUploadInject } from '@deepseek-ai/dsh-client-file-upload/client'
 import { apply as resourcesApply, inject as resourcesInject } from '@deepseek-ai/dsh-client-resources/client'
 import { apply as workspaceFilesProviderApply, inject as workspaceFilesProviderInject } from '@deepseek-ai/dsh-api-workspace-files/client'
@@ -220,6 +221,10 @@ export async function bootShaniu(container: HTMLElement): Promise<BootHandle> {
     { inject: uiCommandsInject, apply: uiCommandsApply },
     { inject: workspaceControllerInject, apply: workspaceControllerApply },
     { inject: uiWorkspaceInject, apply: uiWorkspaceApply },
+    // 会话 View / 左栏 / 右栏 More 菜单（SH-093，上游 ui-entry-customization 源码不改）。
+    // `创建你的插件` 用的是 Creator 预设的草稿；SHANIU 没有 agent preset，`agentPreset`
+    // 会被适配层忽略，只保留"新建空白会话 + 待审阅草稿"这一半语义（已在 05 声明）。
+    { inject: uiEntryCustomizationInject, apply: uiEntryCustomizationApply },
     // 目录选择：桌面壳弹系统「选择文件夹」对话框；纯浏览器没有系统对话框，退回应用内浏览
     usingTauriBackend()
       ? { inject: directoryPickerNativeInject, apply: directoryPickerNativeApply }
@@ -274,6 +279,10 @@ export async function bootShaniu(container: HTMLElement): Promise<BootHandle> {
   const uiRenderer = root.get('uiRenderer')
   if (uiRenderer === undefined) throw new Error('dsh-boot: uiRenderer 服务未就位')
   const unmount = uiRenderer.mount(container)
+  // 开发期诊断：真机排查槽位/视图注册（例如"会话头 More 不出现"）时读根 Context。
+  if (import.meta.env.DEV) {
+    ;(globalThis as Record<string, unknown>).__SHANIU_BOOT_CTX__ = root
+  }
 
   return {
     ctx: root,

@@ -590,12 +590,40 @@ describe('settings 面：写路径', () => {
     expect(catalog2.groups[0]!.models[0]!.reasoning?.defaultEffort).toBeUndefined()
   })
 
-  it('未接线的配置域直接拒绝，不返回一个能写但没人读的空文档', async () => {
+  it('developer tools 域（ui-settings）：默认开启、可切换、跨实例回读，未知形状拒绝', async () => {
+    localStorage.clear()
     const host = fakeHost([LONGCAT])
-    const result = await faceOf(host).settings.mutate('ui-settings', [{ op: 'set', path: ['enabled'], value: true }], 0)
-    expect(result['ok']).toBe(false)
-    expect((result['error'] as { code: string }).code).toBe('settings/rejected')
-    expect(host.calls.some(call => call.command === 'save_providers')).toBe(false)
+    const face = faceOf(host)
+    const described = (await face.settings.describe())['value'] as { namespaces: Record<string, any>[] }
+    const initial = described.namespaces.find(ns => ns['ns'] === 'ui-settings')!
+    expect(initial.value).toEqual({ enabled: true })
+    expect(initial.revision).toBe(0)
+
+    const off = await face.settings.mutate('ui-settings', [{ op: 'set', path: ['enabled'], value: false }], 0)
+    expect(off['ok']).toBe(true)
+    expect((off['value'] as { value: { enabled: boolean } }).value).toEqual({ enabled: false })
+    expect((off['value'] as { revision: number }).revision).toBe(1)
+
+    // 纯客户端偏好落 localStorage：新实例（等价重启）读回 false
+    const reloaded = faceOf(fakeHost([LONGCAT]))
+    const describedAgain = (await reloaded.settings.describe())['value'] as { namespaces: Record<string, any>[] }
+    expect(describedAgain.namespaces.find(ns => ns['ns'] === 'ui-settings')!.value).toEqual({ enabled: false })
+
+    // 修订号对不上按 conflict 停在写之前
+    const conflict = await face.settings.mutate('ui-settings', [{ op: 'set', path: ['enabled'], value: true }], 0)
+    expect(conflict['ok']).toBe(false)
+    expect((conflict['error'] as { code: string }).code).toBe('settings/conflict')
+
+    // 未知路径 / 非 boolean 一律拒绝，不静默收下
+    for (const ops of [
+      [{ op: 'set', path: ['other'], value: true }],
+      [{ op: 'set', path: ['enabled'], value: 'yes' }],
+    ]) {
+      const result = await face.settings.mutate('ui-settings', ops)
+      expect(result['ok']).toBe(false)
+      expect((result['error'] as { code: string }).code).toBe('settings/rejected')
+    }
+    localStorage.clear()
   })
 
   it('首屏说明的确认写在 general 域，不动服务商文档', async () => {
