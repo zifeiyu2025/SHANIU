@@ -2447,3 +2447,26 @@ describe('session.search 接宿主 FTS5 派生索引（SH-113，wire query-only�
     dispose()
   })
 })
+
+describe('SH-040 只读空态命名空间（插件 / 自动化任务）', () => {
+  it('插件不可管理、任务目录为空、写面显式拒绝', async () => {
+    const bridge = scriptedBridge()
+    const { remote, dispose } = createAdapter({ bridge })
+    const face = faceOf(remote) as unknown as Record<string, Record<string, (...args: unknown[]) => Promise<Record<string, unknown>>>>
+    const inventory = await face.pluginInventory!['list']!()
+    expect(inventory['value']).toEqual({ managementAvailable: false })
+    const manager = await face.pluginManager!['listBundles']!()
+    expect(manager['ok']).toBe(false)
+    expect((manager['error'] as { code: string }).code).toBe('plugin-manager/unavailable')
+    const probe = await face.pluginRegistryProbe!['fastest']!()
+    expect(probe['ok']).toBe(false)
+    const catalog = await face.schedule!['catalog']!()
+    expect(catalog['value']).toEqual([])
+    const list = await face.schedule!['list']!()
+    expect((list['value'] as { items: unknown[] }).items).toEqual([])
+    const created = await face.schedule!['create']!({})
+    expect(created['ok']).toBe(false)
+    expect((created['error'] as { code: string }).code).toBe('schedule/unavailable')
+    dispose()
+  })
+})

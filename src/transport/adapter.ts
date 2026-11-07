@@ -2392,6 +2392,42 @@ export function createAdapter(options: AdapterOptions): { remote: unknown; dispo
     },
   }
 
+  /**
+   * SH-040 核销：桌面壳没有插件管理宿主面。面板按宿主真话渲染「不可管理」空态，
+   * 而不是让一次探测把整页打成错误页。
+   */
+  const pluginInventoryNamespace = {
+    list: async () => OK({ managementAvailable: false }),
+  }
+  /** 插件管理的读写面一律如实拒绝（面板在 managementAvailable=false 时不会走到这里）。 */
+  const failWith = (code: string, message: string) =>
+    ({ ok: false as const, error: new RemoteError(code as never, message, {} as never) })
+  const unavailablePluginManager = async () =>
+    failWith('plugin-manager/unavailable', '桌面壳不提供插件管理（插件面板为只读空态）')
+  const pluginManagerNamespace = new Proxy({}, {
+    get: (_target, method) => (typeof method === 'symbol' ? undefined : unavailablePluginManager),
+  })
+  const pluginRegistryProbeNamespace = {
+    fastest: async () => failWith('plugin-registry/unavailable', '桌面壳不提供插件源探测'),
+  }
+  /**
+   * SH-040 核销：自动化任务没有宿主调度面。目录/历史/额度给**空结果**让面板渲染
+   * 空态；创建/编辑/运行等写面显式拒绝，不为「排期」伪造成功。
+   */
+  const scheduleUnavailable = async () =>
+    failWith('schedule/unavailable', '桌面壳不提供自动化任务写入（面板为只读空态）')
+  const scheduleNamespace = {
+    catalog: async () => OK([]),
+    history: async () => OK({ items: [], hasMore: false }),
+    deliveryLimits: async () => OK({}),
+    list: async () => OK({ items: [], shown: 0, total: 0, limit: 100, offset: 0 }),
+    view: async () => OK({}),
+    create: scheduleUnavailable,
+    edit: scheduleUnavailable,
+    run: scheduleUnavailable,
+    deleteInactive: scheduleUnavailable,
+  }
+
   const namespaces = new Map<string, unknown>([
     ['session', sessionNamespace],
     ['workspace', workspaceNamespace],
@@ -2406,6 +2442,10 @@ export function createAdapter(options: AdapterOptions): { remote: unknown; dispo
     ['permissionPresets', permissionPresetsNamespace],
     ['commands', commandsNamespace],
     ['subagents', subagentsNamespace],
+    ['pluginInventory', pluginInventoryNamespace],
+    ['pluginManager', pluginManagerNamespace],
+    ['pluginRegistryProbe', pluginRegistryProbeNamespace],
+    ['schedule', scheduleNamespace],
   ])
 
   const remote: unknown = new Proxy({

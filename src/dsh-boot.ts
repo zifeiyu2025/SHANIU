@@ -149,7 +149,7 @@ export async function bootShaniu(container: HTMLElement): Promise<BootHandle> {
         return typeof scoped?.scope === 'function' ? scoped.scope(sessionId) : undefined
       },
     })
-    const covered = ['session', 'workspace', 'workspaceFiles', 'fileReferences', 'sessionReferenceResolver', 'toolResults', 'settings', 'llm', 'credentials', 'commands', 'permissionPresets', 'subagents']
+    const covered = ['session', 'workspace', 'workspaceFiles', 'fileReferences', 'sessionReferenceResolver', 'toolResults', 'settings', 'llm', 'credentials', 'commands', 'permissionPresets', 'subagents', 'pluginInventory', 'pluginManager', 'pluginRegistryProbe', 'schedule']
     root.provide('remote', adapter.remote)
     // 适配层已接管的名字不再被 stub 覆盖：后注册的 stub 会让"消息流能跑、
     // 设置页永远抛错"，而抛错看起来像后端坏了，不像接线接反了。
