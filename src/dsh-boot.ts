@@ -39,6 +39,7 @@ import { apply as uiFileDragApply, inject as uiFileDragInject } from '@deepseek-
 import { apply as uiFileActionsApply, inject as uiFileActionsInject } from '@deepseek-ai/dsh-client-ui-file-actions/client'
 import { apply as uiOpenInAppApply, inject as uiOpenInAppInject } from '@deepseek-ai/dsh-client-ui-open-in-app/client'
 import { apply as uiReferenceApply, inject as uiReferenceInject } from '@deepseek-ai/dsh-client-ui-reference/client'
+import { apply as uiSkillApply, inject as uiSkillInject } from '@deepseek-ai/dsh-client-ui-skill/client'
 import { installDesktopFileActions } from './file-actions/desktop-bridge'
 import { installAttachmentUploadFetch } from './transport/attachment-upload'
 import { installOpenInAppRoutes } from './open-in-app/route-fetch'
@@ -158,7 +159,7 @@ export async function bootShaniu(container: HTMLElement): Promise<BootHandle> {
         return typeof scoped?.scope === 'function' ? scoped.scope(sessionId) : undefined
       },
     })
-    const covered = ['session', 'workspace', 'workspaceFiles', 'fileReferences', 'sessionReferenceResolver', 'toolResults', 'settings', 'llm', 'credentials', 'commands', 'permissionPresets', 'subagents', 'pluginInventory', 'pluginManager', 'pluginRegistryProbe', 'schedule']
+    const covered = ['session', 'workspace', 'workspaceFiles', 'fileReferences', 'sessionReferenceResolver', 'skills', 'toolResults', 'settings', 'llm', 'credentials', 'commands', 'permissionPresets', 'subagents', 'pluginInventory', 'pluginManager', 'pluginRegistryProbe', 'schedule']
     root.provide('remote', adapter.remote)
     // 适配层已接管的名字不再被 stub 覆盖：后注册的 stub 会让"消息流能跑、
     // 设置页永远抛错"，而抛错看起来像后端坏了，不像接线接反了。
@@ -220,6 +221,8 @@ export async function bootShaniu(container: HTMLElement): Promise<BootHandle> {
     { inject: uiOpenInAppInject, apply: uiOpenInAppApply },
     // @ 文件/会话引用（SH-090 批 1：文件候选接真，会话候选如实空表）。
     { inject: uiReferenceInject, apply: uiReferenceApply },
+    // / 技能触发 + skill 工具行（SH-091）。
+    { inject: uiSkillInject, apply: uiSkillApply },
     { inject: uiContextMenuInject, apply: uiContextMenuApply },
     { inject: uiInputTriggerInject, apply: uiInputTriggerApply },
     { inject: uiCommandsInject, apply: uiCommandsApply },

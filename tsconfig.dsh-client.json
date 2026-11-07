@@ -480,6 +480,12 @@
    "@deepseek-ai/dsh-client-ui-reference/*": [
     "./src/dsh/packages/client/ui-reference/src/*"
    ],
+   "@deepseek-ai/dsh-client-ui-skill": [
+    "./src/dsh/packages/client/ui-skill/src/index.ts"
+   ],
+   "@deepseek-ai/dsh-client-ui-skill/*": [
+    "./src/dsh/packages/client/ui-skill/src/*"
+   ],
    "@deepseek-ai/dsh-host-open-in-app": [
     "./src/dsh/packages/host/open-in-app/src/index.ts"
    ],
@@ -1715,6 +1721,9 @@
    ],
    "@deepseek-ai/dsh-client-ui-reference/client": [
     "./src/dsh/packages/client/ui-reference/src/client/index.ts"
+   ],
+   "@deepseek-ai/dsh-client-ui-skill/client": [
+    "./src/dsh/packages/client/ui-skill/src/client/index.ts"
    ],
    "@deepseek-ai/dsh-client-ui-input-trigger/client": [
     "./src/dsh/packages/client/ui-input-trigger/src/client/index.ts"
@@ -3158,6 +3167,13 @@
   "./src/dsh/packages/client/ui-reference/src/client/locales.ts",
   "./src/dsh/packages/client/ui-reference/src/client/user-text-rules.ts",
   "./src/dsh/packages/client/ui-reference/src/index.ts",
+  "./src/dsh/packages/client/ui-skill/src/client/SkillReference.tsx",
+  "./src/dsh/packages/client/ui-skill/src/client/SkillRow.tsx",
+  "./src/dsh/packages/client/ui-skill/src/client/index.ts",
+  "./src/dsh/packages/client/ui-skill/src/client/locales.ts",
+  "./src/dsh/packages/client/ui-skill/src/client/user-text-rules.ts",
+  "./src/dsh/packages/client/ui-skill/src/css-modules.d.ts",
+  "./src/dsh/packages/client/ui-skill/src/index.ts",
   "./src/dsh/packages/host/open-in-app/src/shared.ts",
   "./src/dsh/packages/client/ui-input-trigger/src/client/MenuView.module.css",
   "./src/dsh/packages/client/ui-input-trigger/src/client/MenuView.tsx",

@@ -37,6 +37,7 @@ import type { OfficeToPdfPriority, RenderedDocumentBytes, OfficeToPdfGeneration 
 import type { SessionRemote } from './session-remote'
 import type { FileReferenceCandidate } from '@deepseek-ai/dsh-file-reference/types'
 import type { SessionReferenceMentionCandidate } from '@deepseek-ai/dsh-session-reference/types'
+import type { SkillEntry } from '@deepseek-ai/dsh-api-session-controller/types'
 import type { CompactionCheckpointSource } from '@deepseek-ai/dsh-compaction/checkpoint'
 
 declare module '@deepseek-ai/dsh-llm' {
@@ -121,10 +122,16 @@ interface SessionReferenceResolverRemote {
   candidates(sessionId: SessionId, query: string, signal?: AbortSignal): Promise<RemoteResult<SessionReferenceMentionCandidate[]>>
 }
 
+/** 技能目录（SH-091）：与上游 `remote.skills.list` 同形，只列 user-invocable 摘要。 */
+interface SkillsRemote {
+  list(request: { readonly sessionId: SessionId }, signal?: AbortSignal): Promise<RemoteResult<{ readonly skills: readonly SkillEntry[] }>>
+}
+
 export interface RemoteNamespaces {
   readonly session: SessionRemote
   readonly fileReferences: FileReferencesRemote
   readonly sessionReferenceResolver: SessionReferenceResolverRemote
+  readonly skills: SkillsRemote
   readonly settings: SettingsRemote
   readonly credentials: CredentialsRemote
   readonly llm: LlmRemote

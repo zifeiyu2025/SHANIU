@@ -2725,12 +2725,31 @@ export function createAdapter(options: AdapterOptions): { remote: unknown; dispo
     deleteInactive: scheduleUnavailable,
   }
 
+  /**
+   * 技能目录（SH-091）：宿主按会话档案的 workspace_root 发现 SKILL.md，只返回
+   * user-invocable 摘要；`/name` 的正文注入在 agent_loop 请求副本里完成。
+   */
+  const skillsNamespace = {
+    list: async (request: { sessionId: string }) => {
+      try {
+        return OK({
+          skills: await bridge.invoke<Array<Record<string, unknown>>>('list_skills', {
+            sessionId: request.sessionId,
+          }),
+        })
+      } catch (reason) {
+        return FAIL((reason as { message?: string } | undefined)?.message ?? '无法列出技能目录')
+      }
+    },
+  }
+
   const namespaces = new Map<string, unknown>([
     ['session', sessionNamespace],
     ['workspace', workspaceNamespace],
     ['workspaceFiles', workspaceFilesNamespace],
     ['fileReferences', fileReferencesNamespace],
     ['sessionReferenceResolver', sessionReferenceResolverNamespace],
+    ['skills', skillsNamespace],
     ['directoryPicker', directoryPickerNamespace],
     ['toolResults', toolResultsNamespace],
     ['settings', settingsNamespace],

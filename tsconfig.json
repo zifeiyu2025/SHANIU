@@ -1726,6 +1726,15 @@
    "@deepseek-ai/dsh-client-ui-reference/client": [
     "./node_modules/.cache/dsh-types-client/src/dsh/packages/client/ui-reference/src/client/index.d.ts"
    ],
+   "@deepseek-ai/dsh-client-ui-skill": [
+    "./node_modules/.cache/dsh-types-client/src/dsh/packages/client/ui-skill/src/index.d.ts"
+   ],
+   "@deepseek-ai/dsh-client-ui-skill/*": [
+    "./node_modules/.cache/dsh-types-client/src/dsh/packages/client/ui-skill/src/*"
+   ],
+   "@deepseek-ai/dsh-client-ui-skill/client": [
+    "./node_modules/.cache/dsh-types-client/src/dsh/packages/client/ui-skill/src/client/index.d.ts"
+   ],
    "@deepseek-ai/dsh-client-ui-input-trigger/client": [
     "./node_modules/.cache/dsh-types-client/src/dsh/packages/client/ui-input-trigger/src/client/index.d.ts"
    ],

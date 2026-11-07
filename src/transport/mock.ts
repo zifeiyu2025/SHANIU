@@ -928,6 +928,30 @@ function mockPermissionPresetsNamespace(): unknown {
 }
 
 /**
+ * `remote.skills`：演示态技能目录（SH-091）。宿主实现按会话 workspace_root 发现
+ * `SKILL.md`，mock 给两条固定摘要，保证 `/` 菜单有技能行、`/name` 芯片可演示。
+ */
+function mockSkillsNamespace(): unknown {
+  return {
+    list: async (_request: { sessionId: string }) => OK({
+      skills: [
+        {
+          name: 'demo-skill',
+          description: '演示技能：说明 mock 模式下 `/demo-skill` 会注入一段技能正文',
+          whenToUse: '需要验证技能触发链路时',
+          modelInvocable: true,
+        },
+        {
+          name: 'demo-hidden',
+          description: '演示技能：只对用户可见，模型目录不列出',
+          modelInvocable: false,
+        },
+      ],
+    }),
+  }
+}
+
+/**
  * `remote.commands`：目前只需要 `/permission <preset>` 这一条。
  * 返回值非 undefined 即"命中命令"（SessionFace.command 据此给出 matched）。
  */
@@ -1207,6 +1231,8 @@ function buildMockRemote(): unknown {
     // 权限挡位：进程目录 + `/permission` 命令写回
     ['permissionPresets', mockPermissionPresetsNamespace()],
     ['commands', mockCommandsNamespace()],
+    // 技能目录（SH-091）：`/` 菜单技能行 + `/name` 芯片的演示数据源
+    ['skills', mockSkillsNamespace()],
     // 子代理泳道（SH-109）：泳道子会话的 prompt/interruptByUser 面（演示语义）
     ['subagents', mockSubagentsNamespace()],
   ])
@@ -1285,7 +1311,7 @@ export function mockRemote(): unknown {
 const NAMESPACES = [
   'session', 'commands', 'toolResults', 'userQuestions', 'workspace', 'workspaceFiles',
   'directoryPicker', 'job', 'terminal', 'settings', 'subagents', 'modelSelection',
-  'credentials', 'llm', 'permissionPresets',
+  'credentials', 'llm', 'permissionPresets', 'skills',
   'pluginManager', 'pluginInventory', 'pluginRegistryProbe', 'schedule',
 ] as const
 
