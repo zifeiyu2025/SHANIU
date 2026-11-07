@@ -497,7 +497,10 @@ function unimplemented(name: string, milestone: string): Promise<never> {
 export function createAdapter(options: AdapterOptions): { remote: unknown; dispose(): void } {
   const { bridge } = options
   const approvalScope = options.approvalScope
-  const now = options.now ?? ((): number => Date.now())
+  // 回放旧事件时临时指向档案信封里的 `ts_ms`：泳道的时序/时长若取回放墙钟，
+  // 重启后的数字会全部趋零，与实时不一致。回放是同步块，不会串到实时事件上。
+  let replayClock: number | undefined
+  const now = options.now ?? ((): number => replayClock ?? Date.now())
   const journals = new Map<string, Journal>()
   const titles = new Map<string, string>()
   /**
@@ -1687,6 +1690,49 @@ export function createAdapter(options: AdapterOptions): { remote: unknown; dispo
     }
   }
 
+  /**
+   * 整树回放（SH-056 批 1）：宿主的父会话事件档案按 `agent_id` 记全了子代理事件，
+   * 重开旧会话时把子代理事件再走一遍**与实时相同**的 [`onEvent`] 路由，泳道的
+   * catalog / descriptor / 任务全文 / 正文 / 工具卡 / 收口就按档案重建出来。
+   *
+   * 三条刻意口径：
+   * - **父事件跳过**：父时间线已由 rollout 档案重建（事件档案没有用户消息），两边
+   *   都放会重复渲染；
+   * - **时间取事件信封的 `ts_ms`**：见 `replayClock`，否则泳道时长全部趋零；
+   * - **结算通知由 `subagent_exited` 重新合成**：落点在同一条父 journal 的末尾，
+   *   而不是实时路径的原位——rollout 条目没有时间戳，无法可靠插回原位（docs/05
+   *   SH-056 已声明该偏差）。
+   *
+   * 事件档案读失败只降级为"泳道不重建"，不把整个会话打成打不开：父时间线仍然从
+   * rollout 档案重建，失败原因留在控制台，避免把可用的主视图一起罚掉。
+   */
+  const replayLanes = async (sessionId: string): Promise<void> => {
+    let after: string | undefined
+    for (;;) {
+      const page = await bridge.invoke<{ events: AgentEvent[]; has_more: boolean }>('read_session_events', {
+        sessionId,
+        ...(after === undefined ? {} : { afterEventId: after }),
+        limit: 500,
+      }).catch((reason: unknown) => {
+        console.warn('[SHANIU] 子代理事件回放失败：泳道无法从档案重建', reason)
+        return undefined
+      })
+      if (page === undefined) return
+      for (const event of page.events) {
+        if (event.agent_id === '' || event.agent_id === 'root' || event.agent_id === event.session_id) continue
+        replayClock = event.ts_ms
+        try {
+          onEvent(event)
+        } finally {
+          replayClock = undefined
+        }
+      }
+      const next = page.events.at(-1)?.event_id
+      if (!page.has_more || next === undefined || next === after) return
+      after = next
+    }
+  }
+
   const addressOf = (request: unknown): string | undefined => {
     const address = (request as { address?: { kind?: string; sessionId?: string; childSessionId?: string } } | undefined)?.address
     return address?.kind === 'session' ? address.sessionId : address?.childSessionId
@@ -1910,6 +1956,9 @@ export function createAdapter(options: AdapterOptions): { remote: unknown; dispo
             pushTitle(sessionId, text.trim().slice(0, 12) || '新会话')
           }
         }
+        // 泳道从父会话的事件档案按 agent_id 折叠重建（SH-056 批 1）。必须早于
+        // `from` 取值：结算通知会追加进父 journal，晚取会把它们排除在快照外。
+        await replayLanes(sessionId)
         const from = replayed.log.length
         traceFollow(sessionId, 'snapshot-replayed', { from, revision: replayed.revision, records: replayed.log.eventsUpTo(from).length })
         yield {

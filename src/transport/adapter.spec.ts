@@ -49,7 +49,7 @@ const HOST_SETTINGS = {
 
 interface ScriptedBridge extends HostBridge {
   readonly calls: { command: string; args: Record<string, unknown> | undefined }[]
-  emit(sessionId: string, msg: EventMsg, agentId?: string): void
+  emit(sessionId: string, msg: EventMsg, agentId?: string, tsMs?: number): void
 }
 
 function scriptedBridge(
@@ -69,6 +69,9 @@ function scriptedBridge(
   attachmentRead?: (args: Record<string, unknown> | undefined) => unknown,
   /** SH-089：`job_list`/`job_read`/`job_kill` 的宿主替身（throw {code,message} = 类型化失败）。 */
   jobHandler?: (command: string, args: Record<string, unknown> | undefined) => unknown,
+  /** SH-056：宿主父会话事件档案的替身；给了就把 emit 的事件按行累积并支持
+   *  `read_session_events` 分页，用来模拟"进程重启后从档案重建泳道"。 */
+  journal?: AgentEvent[],
 ): ScriptedBridge {
   const calls: ScriptedBridge['calls'] = []
   const handlers = new Set<(event: AgentEvent) => void>()
@@ -183,6 +186,16 @@ function scriptedBridge(
       if (command === 'create_session') return 'agent-new' as T
       if (command === 'send_task') return (args?.agentId ?? 'agent-new') as T
       if (command === 'load_session') return archive as T
+      // SH-056：事件档案分页读（宿主 read_session_events 的替身，语义同 read_after）。
+      if (command === 'read_session_events') {
+        if (journal === undefined) return undefined as T
+        const rows = journal.filter(row => row.session_id === String(args?.['sessionId'] ?? ''))
+        const after = args?.['afterEventId'] === undefined ? undefined : String(args?.['afterEventId'])
+        const start = after === undefined ? 0 : rows.findIndex(row => row.event_id === after) + 1
+        const limit = Number(args?.['limit'] ?? 500)
+        const events = rows.slice(start, start + limit)
+        return { events, has_more: start + events.length < rows.length } as T
+      }
       // SH-116 批 1：附件读回替身；缺省给一个小的文本文件。
       if (command === 'read_attachment') {
         if (attachmentRead !== undefined) return attachmentRead(args) as T
@@ -327,16 +340,17 @@ function scriptedBridge(
       handlers.add(handler)
       return () => handlers.delete(handler)
     },
-    emit(sessionId, msg, agentId = 'root') {
+    emit(sessionId, msg, agentId = 'root', tsMs = 1_700_000_000_000) {
       counter += 1
       const event: AgentEvent = {
         event_id: `01J00000000000000000000${String(counter).padStart(2, '0')}`,
         session_id: sessionId,
         agent_id: agentId,
         parent_id: agentId === 'root' ? null : 'root',
-        ts_ms: 1_700_000_000_000,
+        ts_ms: tsMs,
         msg,
       }
+      journal?.push(event)
       for (const handler of handlers) handler(event)
     },
   }
@@ -2903,6 +2917,59 @@ describe('子代理生命周期事件接泳道（SH-053 批 2）', () => {
     })
     messages.forEach(event => expect(() => assertSessionWireEvent(event)).not.toThrow())
     await lane.return?.(undefined)
+    dispose()
+  })
+
+  it('整树回放：重启后 follow 父会话，泳道从事件档案重建且时序取事件时间', async () => {
+    // 宿主事件档案：实时链路把子代理事件按 agent_id 落进父会话档案（SH-053 已落盘）。
+    const journal: AgentEvent[] = []
+    const bridge = scriptedBridge(
+      undefined,
+      [
+        { kind: 'message', role: 'user', text: '并行调研两个边界' },
+        { kind: 'message', role: 'assistant', text: '汇总：17 + 42' },
+      ],
+      undefined, undefined, undefined, undefined, undefined, undefined, undefined, undefined, journal,
+    )
+    let ts = 1_760_000_000_000
+    const tick = (ms: number): number => (ts += ms)
+    bridge.emit('agent-new', { type: 'turn_started', turn: 1 }, 'root', tick(0))
+    bridge.emit('agent-new', spawned, 'lane-a', tick(120))
+    bridge.emit('agent-new', { type: 'turn_started', turn: 1 }, 'lane-a', tick(30))
+    bridge.emit('agent-new', { type: 'agent_message_delta', delta: '17' }, 'lane-a', tick(400))
+    bridge.emit('agent-new', { type: 'turn_completed', turn: 1, reason: 'completed' }, 'lane-a', tick(20))
+    bridge.emit('agent-new', { type: 'subagent_exited', child_id: 'lane-a', status: 'done', summary: '边界：17' }, 'lane-a', tick(10))
+
+    // 进程重启：新适配层实例，内存 journal 全空，只剩宿主档案
+    const { remote, dispose } = createAdapter({ bridge })
+    const session = faceOf(remote).session as ControlFace['session']
+    const parent = session.follow({ address: { kind: 'session', sessionId: 'agent-new' } })
+    const parentEvents = eventsOf((await parent.next()).value as Record<string, unknown>)
+    // 结算通知由 subagent_exited 重新合成，而不是在重启后消失
+    expect(parentEvents.at(-1)?.['type']).toBe('user/message')
+    expect((parentEvents.at(-1)?.['data'] as { source?: unknown }).source).toMatchObject({
+      kind: 'subagent-settled', stopReason: 'completed', senderSessionId: 'lane-a',
+    })
+
+    const lane = followLane(session)
+    const laneEvents = eventsOf((await lane.next()).value as Record<string, unknown>)
+    expect(laneEvents[0]?.['type']).toBe('subagent/descriptor')
+    expect(laneEvents[0]?.['data']).toMatchObject({ version: 3, label: '探索 transport 边界' })
+    expect(laneEvents.filter(event => event['type'] === 'user/message')[0]?.['data']).toMatchObject({
+      content: [{ type: 'text', text: '探索 transport 边界\n第二行背景说明' }],
+    })
+    expect(laneEvents.filter(event => event['type'] === 'assistant/message').at(-1)?.['data']).toMatchObject({
+      message: { content: [{ type: 'text', text: '17' }] },
+    })
+    // 时序取档案信封的 ts_ms：spawn(120) → turn_completed(570) = 450ms；
+    // 若回放误用墙钟，这里会是 0（docs/05 SH-056 的验收点之一）。
+    const control = session.control()
+    const baseline = (await control.next()).value
+    const timing = baseline.value.projections['lane-a']?.values['subagentTiming'] as { settledMs?: number }
+    expect(timing.settledMs).toBe(450)
+    await control.return?.(undefined)
+    await lane.return?.(undefined)
+    await parent.return?.(undefined)
     dispose()
   })
 })
