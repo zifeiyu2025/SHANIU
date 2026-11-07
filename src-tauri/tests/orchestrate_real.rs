@@ -10,7 +10,6 @@
 //! `SHANIU_TEST_API_KEY=... cargo test --test orchestrate_real -- --ignored --nocapture`
 
 use std::sync::{Arc, Mutex};
-use std::time::Duration;
 
 use shaniu_lib::agent_loop::{AgentInstance, AgentLoop, ResponsesBackend};
 use shaniu_lib::config::{ApprovalMode, SandboxMode};
@@ -137,6 +136,50 @@ async fn root_spawns_two_real_children_and_collects_their_answers() {
         "root 自己的事件必须仍在"
     );
 
-    // 给子代理任务留出收口时间（wait_agent 已等待，这里只是兜底观察）。
-    tokio::time::sleep(Duration::from_millis(50)).await;
+    // SH-053：真实模型派生出的每个子代理都必须广播泳道元数据与收口事件，
+    // 否则前端只能懒建成 v1 unknown（无名字、无结算通知）。
+    let mut lane_names = Vec::new();
+    for id in &ids {
+        let spawned = events
+            .iter()
+            .find_map(|(agent_id, msg)| match msg {
+                EventMsg::SubagentSpawned { child_id, name, label, created_at_ms, .. } if child_id == id => {
+                    Some((agent_id.clone(), name.clone(), label.clone(), *created_at_ms))
+                }
+                _ => None,
+            })
+            .unwrap_or_else(|| panic!("子代理 {id} 缺少 subagent_spawned 事件"));
+        assert_eq!(spawned.0, *id, "spawned 必须归属子代理自己");
+        assert!(is_lane_name(&spawned.1), "非法泳道名 {:?}", spawned.1);
+        assert!(!spawned.2.is_empty(), "label 不能为空（catalog v3 必填）");
+        assert!(spawned.3 > 1_700_000_000_000, "created_at_ms 必须是墙钟毫秒");
+        lane_names.push(spawned.1.clone());
+
+        let exited = events
+            .iter()
+            .find_map(|(agent_id, msg)| match msg {
+                EventMsg::SubagentExited { child_id, status, summary } if child_id == id => {
+                    Some((agent_id.clone(), *status, summary.clone()))
+                }
+                _ => None,
+            })
+            .unwrap_or_else(|| panic!("子代理 {id} 缺少 subagent_exited 事件"));
+        assert_eq!(exited.0, *id);
+        assert_eq!(exited.1, shaniu_lib::events::SubagentExitStatus::Done);
+        assert!(exited.2.contains("17") || exited.2.contains("42"), "结算摘要应带真实产出: {}", exited.2);
+        println!("[orchestrate-e2e] 泳道 {} name={} label={}", id, spawned.1, spawned.2);
+    }
+    lane_names.sort();
+    lane_names.dedup();
+    assert_eq!(lane_names.len(), 2, "两个真实子代理的泳道名必须互不相同");
+}
+
+/// 上游 names.ts 的 NAME_PATTERN（`lead` 为根代理保留）。
+fn is_lane_name(value: &str) -> bool {
+    let mut chars = value.chars();
+    let first = chars.next();
+    value.len() <= 32
+        && first.is_some_and(|c| c.is_ascii_lowercase())
+        && chars.all(|c| c.is_ascii_lowercase() || c.is_ascii_digit() || c == '-')
+        && value != "lead"
 }

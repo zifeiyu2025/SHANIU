@@ -11,11 +11,11 @@
 
 use serde::Serialize;
 use shaniu_lib::events::{
-    AgentEvent, ApprovalDecision, EventMsg, IoChannel, RiskLevel, ToolCallResult, TurnEndReason,
+    AgentEvent, ApprovalDecision, EventMsg, IoChannel, RiskLevel, SubagentExitStatus, ToolCallResult, TurnEndReason,
 };
 
 /// 与 src/transport/types.ts 的 type 判别值逐一对应。
-const EXPECTED_TAGS: [&str; 13] = [
+const EXPECTED_TAGS: [&str; 16] = [
     "turn_started",
     "turn_completed",
     "agent_message_delta",
@@ -29,6 +29,9 @@ const EXPECTED_TAGS: [&str; 13] = [
     "turn_diff",
     "error",
     "token_usage",
+    "subagent_spawned",
+    "subagent_exited",
+    "subagent_message",
 ];
 
 fn all_variants() -> Vec<EventMsg> {
@@ -53,6 +56,19 @@ fn all_variants() -> Vec<EventMsg> {
         EventMsg::TurnDiff { files: vec!["a.rs".into()] },
         EventMsg::Error { message: "boom".into() },
         EventMsg::TokenUsage { turn: 1, input_tokens: 10, cached_input_tokens: Some(4), output_tokens: 20 },
+        // SH-053：三个 additive 子代理事件。exited 的三个终态都要进清单，
+        // 否则 status 的某个变体可能从未被序列化验证过。
+        EventMsg::SubagentSpawned {
+            child_id: "01JCHILD".into(),
+            task: "探索仓库".into(),
+            name: "worker-1".into(),
+            label: "探索仓库".into(),
+            created_at_ms: 1_760_000_000_000,
+        },
+        EventMsg::SubagentExited { child_id: "01JCHILD".into(), status: SubagentExitStatus::Done, summary: "结论".into() },
+        EventMsg::SubagentExited { child_id: "01JCHILD".into(), status: SubagentExitStatus::Failed, summary: "失败".into() },
+        EventMsg::SubagentExited { child_id: "01JCHILD".into(), status: SubagentExitStatus::Cancelled, summary: "已取消".into() },
+        EventMsg::SubagentMessage { child_id: "01JCHILD".into(), sender_id: "root".into(), text: "请改看 transport".into() },
     ];
     // 编译期穷举证明（SH-078）：无通配臂 match，EventMsg 新增变体而不更新上面的 vec 时编译失败；
     // vec 更新后 tag 集合随之扩大，EXPECTED_TAGS 不同步则标签集测试必红——双向闭环。
@@ -70,7 +86,10 @@ fn all_variants() -> Vec<EventMsg> {
             | EventMsg::PlanDelta { .. }
             | EventMsg::TurnDiff { .. }
             | EventMsg::Error { .. }
-            | EventMsg::TokenUsage { .. } => {}
+            | EventMsg::TokenUsage { .. }
+            | EventMsg::SubagentSpawned { .. }
+            | EventMsg::SubagentExited { .. }
+            | EventMsg::SubagentMessage { .. } => {}
         }
     }
     variants
@@ -340,6 +359,7 @@ fn every_enum_variant_is_mirrored_in_frontend_types() {
     assert_union_covers("ApprovalDecision", ApprovalDecision::all_variants());
     assert_union_covers("IoChannel", IoChannel::all_variants());
     assert_union_covers("TurnEndReason", TurnEndReason::all_variants());
+    assert_union_covers("SubagentExitStatus", SubagentExitStatus::all_variants());
 }
 
 /// SH-079：EventMsg tag 与前端镜像**机械绑定**（此前 EXPECTED_TAGS 与 types.ts 无人校验关联）。

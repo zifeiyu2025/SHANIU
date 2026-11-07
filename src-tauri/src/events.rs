@@ -124,6 +124,28 @@ impl ToolCallResult {
     }
 }
 
+/// 子代理终态（SH-053，docs/02 §2.1：done / failed / cancelled）。
+///
+/// 定义在协议层而不是 `subagent_registry`：它要跨事件线到前端，而 `events` 是共享
+/// 基础设施、不得反向依赖业务模块（FF-1）。注册表以 `pub use ... as ExitStatus`
+/// 复用同一份定义，避免两份枚举漂移（同 `PlanState` 迁入共享内核的先例）。
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum SubagentExitStatus {
+    Done,
+    Failed,
+    Cancelled,
+}
+
+impl SubagentExitStatus {
+    /// FF-2 单一事实源（SH-078）：无通配臂 match = 加变体不更新清单就编译失败。
+    pub fn all_variants() -> &'static [Self] {
+        match Self::Done {
+            Self::Done | Self::Failed | Self::Cancelled => &[Self::Done, Self::Failed, Self::Cancelled],
+        }
+    }
+}
+
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(tag = "type", rename_all = "snake_case")]
 pub enum EventMsg {
@@ -157,6 +179,39 @@ pub enum EventMsg {
         #[serde(default)]
         cached_input_tokens: Option<u32>,
         output_tokens: u32,
+    },
+    /// 子代理派生（SH-053，additive，docs/04 §1.2 预留位）。
+    ///
+    /// 字段按上游 DSH 的持久事实对齐：`name`/`label`/`created_at_ms` 供父 journal 的
+    /// `subagent/catalog` v3（`packages/subagent/subagent/src/catalog.ts`），`task` 全文
+    /// 供子泳道首条 user 消息与审批卡摘要。归属走 `AgentEvent` 信封（ADR-104），
+    /// 载荷不重复 parent_id。上游预留的 `profile`/`allowed_tools` 不带：前者恒为
+    /// worker、后者尚未实现（SH-054），恒定值与死字段不进协议。
+    SubagentSpawned {
+        child_id: String,
+        task: String,
+        name: String,
+        label: String,
+        created_at_ms: u64,
+    },
+    /// 子代理收口（SH-053，additive）。`status` + `summary` 与上游结算通知
+    /// `{summary, stopReason}`（`continuation-messages.ts`）同构；ExitSummary 的
+    /// `artifacts` 恒空、`token_usage` 已由子泳道自己的 `token_usage` 事件承载，
+    /// 故不进载荷（也避免 events 依赖 registry 的 ExitSummary 类型）。
+    SubagentExited {
+        child_id: String,
+        status: SubagentExitStatus,
+        summary: String,
+    },
+    /// 向子代理注入 steering（SH-053，additive）。上游把注入落为**子会话**的
+    /// `user/message`，用 `source.senderSessionId` 表达来源，故这里带 `sender_id`。
+    /// docs/04 预留的 `direction: to_child/from_child` 只实现 to_child 半支：
+    /// 子代理正文已按 agent_id 信封逐 delta 到达泳道，再发一份 from_child 摘要
+    /// 就是第二真相源。`preview` 升级为 `text` 全文——泳道要重建完整 user 消息。
+    SubagentMessage {
+        child_id: String,
+        sender_id: String,
+        text: String,
     },
 }
 

@@ -23,7 +23,7 @@ use tokio::sync::{Notify, OwnedSemaphorePermit, Semaphore};
 use tokio_util::sync::CancellationToken;
 
 use crate::agent_loop::{AgentInstance, AgentLoop, TokenTotals, MAX_AGENT_DEPTH};
-use crate::events::{EventSink, TurnEndReason};
+use crate::events::{EventMsg, EventSink, TurnEndReason};
 use crate::model_client::{HistoryItem, Role};
 use crate::rollout::RolloutWriter;
 use crate::tool_router::orchestration::AgentScope;
@@ -53,14 +53,9 @@ pub enum AgentStatus {
     Exited,
 }
 
-/// 子代理终态（docs/02 §2.1：done / failed / cancelled）。
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(rename_all = "snake_case")]
-pub enum ExitStatus {
-    Done,
-    Failed,
-    Cancelled,
-}
+/// 子代理终态：协议层定义（`events::SubagentExitStatus`），此处复用同一份，
+/// 不另立枚举——它要经 `subagent_exited` 事件跨线到前端（SH-053）。
+pub use crate::events::SubagentExitStatus as ExitStatus;
 
 /// 子代理结束摘要：父代理经 `wait_agent` 拿到的唯一结果通道（ADR-102）。
 ///
@@ -173,12 +168,16 @@ struct Entry {
     parent_id: String,
     depth: u32,
     task: String,
+    /// 泳道名（上游 catalog v3 的 `name`）：兄弟间唯一，派生时定下不再改。
+    name: String,
     status: AgentStatus,
     created_at: Instant,
     exit: Option<ExitSummary>,
     cancel: CancellationToken,
     /// 子代理的 steering 信箱（与 `AgentInstance::inbox` 同一 Arc）。
     inbox: Arc<Mutex<Vec<String>>>,
+    /// 子代理身份的事件出口（ADR-104）：生命周期与 steering 事件都从这里发。
+    sink: Arc<dyn EventSink>,
     /// 结束时的完整历史（`resume_agent` 的内存来源；SH-056 再升级为 rollout 重放）。
     history: Option<Vec<HistoryItem>>,
     done: Arc<Notify>,
@@ -298,21 +297,35 @@ impl SubagentRegistry {
         let inbox = instance.inbox.clone();
 
         let done = Arc::new(Notify::new());
-        self.lock().insert(
-            agent_id.clone(),
-            Entry {
-                parent_id,
-                depth,
-                task,
-                status: AgentStatus::Spawning,
-                created_at: Instant::now(),
-                exit: None,
-                cancel: cancel.clone(),
-                inbox,
-                history: None,
-                done: done.clone(),
-                handle: None,
-            },
+        let created_at_ms = wall_clock_ms();
+        let label = lane_label(&task);
+        let name = {
+            let mut inner = self.lock();
+            let name = next_lane_name(&inner, &parent_id);
+            inner.insert(
+                agent_id.clone(),
+                Entry {
+                    parent_id,
+                    depth,
+                    task: task.clone(),
+                    name: name.clone(),
+                    status: AgentStatus::Spawning,
+                    created_at: Instant::now(),
+                    exit: None,
+                    cancel: cancel.clone(),
+                    inbox,
+                    sink: sink.clone(),
+                    history: None,
+                    done: done.clone(),
+                    handle: None,
+                },
+            );
+            name
+        };
+        // 锁外广播：出口要做落盘/WS/IPC 三个 I/O，持注册表锁发事件会挡住兄弟派生。
+        emit(
+            &sink,
+            EventMsg::SubagentSpawned { child_id: agent_id.clone(), task, name, label, created_at_ms },
         );
 
         let weak = Arc::downgrade(self);
@@ -363,18 +376,29 @@ impl SubagentRegistry {
 
     /// 向未结束的子代理注入一条 steering 消息；结束/未知都 fail-closed。
     pub fn send_message(&self, agent_id: &str, message: &str) -> Result<(), String> {
-        let inner = self.lock();
-        let entry = inner
-            .get(agent_id)
-            .ok_or_else(|| format!("未知子代理: {agent_id}"))?;
-        if entry.status == AgentStatus::Exited {
-            return Err(format!("子代理已结束，无法注入消息: {agent_id}"));
-        }
-        entry
-            .inbox
+        let (inbox, sink, sender_id) = {
+            let inner = self.lock();
+            let entry = inner
+                .get(agent_id)
+                .ok_or_else(|| format!("未知子代理: {agent_id}"))?;
+            if entry.status == AgentStatus::Exited {
+                return Err(format!("子代理已结束，无法注入消息: {agent_id}"));
+            }
+            (entry.inbox.clone(), entry.sink.clone(), entry.parent_id.clone())
+        };
+        inbox
             .lock()
             .unwrap_or_else(|poisoned| poisoned.into_inner())
             .push(message.to_string());
+        // 注入已生效，事件只是通知：广播失败不回滚投递（与 agent_loop 的事件口径一致）。
+        emit(
+            &sink,
+            EventMsg::SubagentMessage {
+                child_id: agent_id.to_string(),
+                sender_id,
+                text: message.to_string(),
+            },
+        );
         Ok(())
     }
 
@@ -519,15 +543,67 @@ fn finish(
     exit: ExitSummary,
     history: Option<Vec<HistoryItem>>,
 ) {
+    let mut broadcast = None;
     if let Some(registry) = weak.upgrade() {
         let mut inner = registry.lock();
         if let Some(entry) = inner.get_mut(agent_id) {
             entry.status = AgentStatus::Exited;
-            entry.exit = Some(exit.capped());
+            let exit = exit.capped();
+            broadcast = Some((entry.sink.clone(), exit.status, exit.summary.clone()));
+            entry.exit = Some(exit);
             entry.history = history;
         }
     }
+    if let Some((sink, status, summary)) = broadcast {
+        // 先广播再唤醒等待方：父代理拿到 ExitSummary 时，前端泳道已经收口。
+        emit(&sink, EventMsg::SubagentExited { child_id: agent_id.to_string(), status, summary });
+    }
     done.notify_waiters();
+}
+
+/// 事件广播失败只告警：子代理的执行结果已经落进注册表，不能因为通知失败而丢结果。
+fn emit(sink: &Arc<dyn EventSink>, msg: EventMsg) {
+    if let Err(error) = sink.emit(&msg) {
+        tracing::warn!("子代理事件广播失败（执行结果不受影响）: {error}");
+    }
+}
+
+fn wall_clock_ms() -> u64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|elapsed| elapsed.as_millis() as u64)
+        .unwrap_or(0)
+}
+
+/// 泳道展示标签：task 首行，按字符截到 60（上游 catalog v3 的 `label` 是人读标题，
+/// 不是任务全文；全文另有 `task` 字段承载）。
+fn lane_label(task: &str) -> String {
+    const MAX_CHARS: usize = 60;
+    let first_line = task.lines().next().unwrap_or("").trim();
+    let chars: Vec<char> = first_line.chars().collect();
+    if chars.len() <= MAX_CHARS {
+        return first_line.to_string();
+    }
+    format!("{}…", chars[..MAX_CHARS].iter().collect::<String>())
+}
+
+/// 兄弟间唯一的泳道名（上游 names.ts：name 是模型可寻址标识，重名会串树）。
+/// SHANIU 用 agent_id 寻址，name 只作 UI 标识，因此由注册表按兄弟序派生，
+/// 不让模型自选——少一个校验/冲突面，也不必改 ToolSpec。
+fn next_lane_name(inner: &BTreeMap<String, Entry>, parent_id: &str) -> String {
+    let siblings: Vec<&str> = inner
+        .values()
+        .filter(|entry| entry.parent_id == parent_id)
+        .map(|entry| entry.name.as_str())
+        .collect();
+    let mut index = siblings.len() + 1;
+    loop {
+        let candidate = format!("worker-{index}");
+        if !siblings.iter().any(|name| *name == candidate) {
+            return candidate;
+        }
+        index += 1;
+    }
 }
 
 #[cfg(test)]

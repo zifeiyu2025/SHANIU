@@ -3,6 +3,7 @@ export type IoChannel = 'stdout' | 'stderr';
 export type RiskLevel = 'read' | 'write_in_workspace' | 'execute' | 'destructive' | 'plan_review';
 export type ApprovalDecision = 'allow' | 'deny' | 'allow_always';
 export type ToolCallResult = 'ok' | 'error' | 'cancelled' | 'denied';
+export type SubagentExitStatus = 'done' | 'failed' | 'cancelled';
 
 export type JsonValue = null | boolean | number | string | JsonValue[] | { [key: string]: JsonValue };
 
@@ -19,7 +20,10 @@ export type EventMsg =
   | { type: 'plan_delta'; delta: string }
   | { type: 'turn_diff'; files: string[] }
   | { type: 'error'; message: string }
-  | { type: 'token_usage'; turn: number; input_tokens: number; cached_input_tokens?: number | null; output_tokens: number };
+  | { type: 'token_usage'; turn: number; input_tokens: number; cached_input_tokens?: number | null; output_tokens: number }
+  | { type: 'subagent_spawned'; child_id: string; task: string; name: string; label: string; created_at_ms: number }
+  | { type: 'subagent_exited'; child_id: string; status: SubagentExitStatus; summary: string }
+  | { type: 'subagent_message'; child_id: string; sender_id: string; text: string };
 
 export interface AgentEvent {
   event_id: string;
