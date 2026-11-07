@@ -2820,6 +2820,31 @@ describe('子代理生命周期事件接泳道（SH-053 批 2）', () => {
     dispose()
   })
 
+  it('审批来源优先取事件字段：泳道未建立时也能标明是哪个子代理要权限（ADR-103）', async () => {
+    const bridge = scriptedBridge()
+    const { remote, dispose } = createAdapter({ bridge })
+    const seen: Record<string, unknown>[] = []
+    faceOf(remote).$on('approval/request', async (request: Record<string, unknown>) => {
+      seen.push(request)
+      return 'rejected'
+    })
+    // 关键：没有先发 spawned——泳道元数据不存在，只能靠事件自带的 agent_id/task_summary。
+    bridge.emit('agent-new', {
+      type: 'exec_approval_request',
+      request_id: 'r-l2',
+      tool: 'unified_exec',
+      args: { command: 'ls' },
+      risk: 'execute',
+      agent_id: 'child-x',
+      task_summary: '统计仓库文件数',
+    })
+    await vi.waitFor(() => { expect(seen).toHaveLength(1) })
+    const reason = seen[0]!['reason'] as string
+    expect(reason).toContain('child-x')
+    expect(reason).toContain('统计仓库文件数')
+    dispose()
+  })
+
   it('活动先于 spawned 到达：目录仍只有一行，元数据到达后升级为 continuable', async () => {
     const bridge = scriptedBridge()
     const { remote, dispose } = createAdapter({ bridge })

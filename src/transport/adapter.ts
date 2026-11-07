@@ -1436,13 +1436,16 @@ export function createAdapter(options: AdapterOptions): { remote: unknown; dispo
     // 卡片把 reason 当描述文本。`args`/`risk` 不在声明里，直接塞进去会被无声忽略——
     // 表现就是卡片只写"要执行工具"而不说执行什么，所以把它们并进 reason。
     const preview = JSON.stringify(msg.args)
-    // 来源代理与任务摘要：上游 ApprovalPresentationRequest 只有 toolName/callId/reason/
-    // displayReason（**没有 subject 字段**），塞新键会被无声忽略，所以并进 reason——
-    // 这是不改 vendored 源码又能让用户看清"哪个子代理要干什么"的唯一落点。
+    // 来源代理与任务摘要：优先用后端事件里的权威字段（ADR-103）；
+    // 泳道元数据只在事件没带字段时兜底。泳道未建立时反推必然失败——那正是
+    // "子代理的审批显示在父时间线上、却看不出是谁在要权限"的根因。
     const lane = agents.get(sessionId)
-    const origin = lane === undefined
+    const childId = msg.agent_id !== undefined && msg.agent_id !== 'root' ? msg.agent_id : undefined
+    const originName = lane?.name ?? childId
+    const originTask = msg.task_summary ?? lane?.label ?? lane?.task
+    const origin = originName === undefined
       ? ''
-      : `子代理 ${lane.name ?? sessionId}（${lane.label ?? lane.task ?? sessionId}）：`
+      : `子代理 ${originName}${originTask === undefined ? '' : `（${originTask}）`}：`
     const reason = `${origin}风险 ${msg.risk}：${msg.tool} ${preview.length > 160 ? `${preview.slice(0, 160)}…` : preview}`
     let decision = 'deny'
     try {

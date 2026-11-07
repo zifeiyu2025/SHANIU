@@ -38,10 +38,19 @@ impl AgentOrchestrator for RegistryOrchestrator {
         parent: &AgentScope,
         task: &str,
         budget_tokens: Option<u64>,
+        profile: Option<&str>,
+        allowed_tools: Option<&[String]>,
     ) -> Result<String, String> {
         // 每代理 rollout 在 SH-056 落地；当前子代理不落盘（诚实降级，见 docs/05 SH-052）。
         self.registry
-            .spawn_with_budget(self.engine.clone(), parent, task, None, budget_tokens)
+            .spawn_with_constraints(
+                self.engine.clone(),
+                parent,
+                task,
+                None,
+                budget_tokens,
+                crate::subagent_registry::SpawnNarrowing { profile, allowed_tools },
+            )
             .map_err(|error| error.to_string())
     }
 

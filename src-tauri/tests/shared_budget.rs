@@ -118,6 +118,7 @@ fn root_scope(cancel: CancellationToken) -> AgentScope {
         depth: 0,
         cancel,
         sink: Arc::new(DiscardSink),
+        allowed_tools: None,
     }
 }
 

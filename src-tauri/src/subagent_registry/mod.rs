@@ -150,6 +150,10 @@ pub enum SpawnError {
     NotExited { agent_id: String },
     #[error("子代理 {agent_id} 没有可恢复的历史（可能已随进程清理）")]
     HistoryUnavailable { agent_id: String },
+    #[error("未知子代理 profile: {profile}（当前支持 worker / explorer）")]
+    UnknownProfile { profile: String },
+    #[error("allowed_tools 含未注册的工具: {tool}（拼错会静默收窄成空集，直接拒绝更诚实）")]
+    UnknownTool { tool: String },
 }
 
 /// steering 注入的拒绝理由（类型化：命令面据此映射上游错误码，不靠文案匹配）。
@@ -187,6 +191,9 @@ struct Entry {
     inbox: Arc<Mutex<Vec<String>>>,
     /// 子代理身份的事件出口（ADR-104）：生命周期与 steering 事件都从这里发。
     sink: Arc<dyn EventSink>,
+    /// 本子代理的有效工具白名单（SH-054）：派生时定下，`resume` 必须沿用，
+    /// 否则「结束 → resume」会成为一条绕过收窄的提权路径。
+    allowed_tools: Option<crate::permission::ToolAllowlist>,
     /// 结束时的完整历史（`resume_agent` 的内存来源；SH-056 再升级为 rollout 重放）。
     history: Option<Vec<HistoryItem>>,
     done: Arc<Notify>,
@@ -249,8 +256,36 @@ impl SubagentRegistry {
         rollout: Option<Arc<RolloutWriter>>,
         budget_tokens: Option<u64>,
     ) -> Result<String, SpawnError> {
+        self.spawn_with_constraints(
+            engine,
+            parent,
+            task,
+            rollout,
+            budget_tokens,
+            SpawnNarrowing::default(),
+        )
+    }
+
+    /// 带权限收窄参数的派生（SH-054，ADR-103）。
+    ///
+    /// 有效工具集 = `min(父代理, profile, allowed_tools)`：
+    /// 1. profile 给出该预设的工具集（worker = 全量，explorer = 只读档）；
+    /// 2. `allowed_tools` 再收窄一层；
+    /// 3. 最后与父代理的有效集取交集——父代理已被收窄的能力不会在子代理处放大。
+    ///
+    /// 全部收窄都在登记前完成：任何一项不合法都 fail-closed，不产生半成品条目。
+    pub fn spawn_with_constraints(
+        self: &Arc<Self>,
+        engine: Arc<AgentLoop>,
+        parent: &AgentScope,
+        task: impl Into<String>,
+        rollout: Option<Arc<RolloutWriter>>,
+        budget_tokens: Option<u64>,
+        narrowing: SpawnNarrowing<'_>,
+    ) -> Result<String, SpawnError> {
         let task = task.into();
         validate_parent(parent, &task)?;
+        let effective = effective_allowlist(&engine, parent, narrowing)?;
         let agent_id = ulid::Ulid::generate().to_string();
         // 级联的来源就在这一行：父令牌取消时，这个子令牌自动进入取消态。
         let cancel = parent.cancel.child_token();
@@ -258,8 +293,10 @@ impl SubagentRegistry {
         instance.rollout = rollout;
         // 预算共账（SH-055）：子代理挂引擎树账本；传了 budget_tokens 就再收窄一层。
         instance.budget = engine.tree_budget.derive(budget_tokens, None);
+        // 权限只降不升（SH-054）：把交点固化到实例上，执行期只读。
+        instance.allowed_tools = effective.clone();
         let sink = child_sink(parent, &agent_id);
-        Ok(self.start_run(engine, instance, task, sink))
+        Ok(self.start_run(engine, instance, task, sink, effective))
     }
 
     /// 从已退出子代理的内存历史恢复出一个**新**子代理（docs/02 §2.2 `resume_agent`）。
@@ -280,12 +317,12 @@ impl SubagentRegistry {
             .unwrap_or("请接着上次未完成的部分继续工作，并给出结论。")
             .to_string();
         validate_parent(parent, &task)?;
-        let (status, history) = {
+        let (status, history, inherited_tools) = {
             let inner = self.lock();
             let entry = inner.get(source_agent_id).ok_or_else(|| SpawnError::UnknownAgent {
                 agent_id: source_agent_id.to_string(),
             })?;
-            (entry.status, entry.history.clone())
+            (entry.status, entry.history.clone(), entry.allowed_tools.clone())
         };
         if status != AgentStatus::Exited {
             return Err(SpawnError::NotExited { agent_id: source_agent_id.to_string() });
@@ -293,6 +330,11 @@ impl SubagentRegistry {
         let history = history.ok_or_else(|| SpawnError::HistoryUnavailable {
             agent_id: source_agent_id.to_string(),
         })?;
+        // 续跑不得提权：沿用原实例的收窄结果，并与父代理再次取交集。
+        let effective = crate::permission::policy::intersect_allowlist(
+            parent.allowed_tools.as_ref(),
+            inherited_tools.as_ref(),
+        );
 
         let agent_id = ulid::Ulid::generate().to_string();
         let cancel = parent.cancel.child_token();
@@ -302,10 +344,11 @@ impl SubagentRegistry {
         instance.history = history;
         instance.history.push(HistoryItem::Message { role: Role::User, text: task.clone(), reasoning: None });
         instance.rollout = rollout;
+        instance.allowed_tools = effective.clone();
         // 续跑同样计入同一棵树（SH-055）。
         instance.budget = engine.tree_budget.child();
         let sink = child_sink(parent, &agent_id);
-        Ok(self.start_run(engine, instance, task, sink))
+        Ok(self.start_run(engine, instance, task, sink, effective))
     }
 
     /// 登记 + 调度 + 收口。调用方已完成全部 fail-closed 校验。
@@ -315,6 +358,7 @@ impl SubagentRegistry {
         mut instance: AgentInstance,
         task: String,
         sink: Arc<dyn EventSink>,
+        allowed_tools: Option<crate::permission::ToolAllowlist>,
     ) -> String {
         let agent_id = instance.agent_id.clone();
         let parent_id = instance.parent_id.clone().unwrap_or_default();
@@ -341,6 +385,7 @@ impl SubagentRegistry {
                     cancel: cancel.clone(),
                     inbox,
                     sink: sink.clone(),
+                    allowed_tools,
                     history: None,
                     done: done.clone(),
                     handle: None,
@@ -557,6 +602,58 @@ fn validate_parent(parent: &AgentScope, task: &str) -> Result<(), SpawnError> {
     Ok(())
 }
 
+/// 派生的权限收窄声明（ADR-103）：profile 预设 + 显式工具白名单。
+///
+/// 两者都只能减不能加；集中成一个结构体是为了让「派生时带了哪些收窄」
+/// 在签名上就是一件事，而不是散在参数列表里靠位置记忆。
+#[derive(Debug, Clone, Copy, Default)]
+pub struct SpawnNarrowing<'a> {
+    pub profile: Option<&'a str>,
+    pub allowed_tools: Option<&'a [String]>,
+}
+
+/// min(父策略, profile, allowed_tools) 的唯一落点（SH-054，ADR-103）。
+///
+/// 三步都是收窄操作，顺序不影响结果，但都必须在派生**之前**完成：
+/// 任何一步不合法都拒绝登记，不能先建出代理再回头补救。
+fn effective_allowlist(
+    engine: &AgentLoop,
+    parent: &AgentScope,
+    narrowing: SpawnNarrowing<'_>,
+) -> Result<Option<crate::permission::ToolAllowlist>, SpawnError> {
+    // profile：预设的能力集。worker = 全量（None），explorer = 只读档。
+    let profile_tools = match narrowing.profile {
+        None | Some("worker") => None,
+        Some("explorer") => Some(crate::permission::policy::readonly_allowlist(
+            engine.router.specs().into_iter().map(|spec| spec.name),
+        )),
+        Some(other) => return Err(SpawnError::UnknownProfile { profile: other.to_string() }),
+    };
+    // 显式 allowed_tools：只接受路由里真实存在的工具名（拼错静默成空集比直接拒绝更难查）。
+    let requested_tools = match narrowing.allowed_tools {
+        None => None,
+        Some(names) => {
+            let mut set = std::collections::HashSet::new();
+            for name in names {
+                let name = name.trim();
+                if name.is_empty() || engine.router.get(name).is_none() {
+                    return Err(SpawnError::UnknownTool { tool: name.to_string() });
+                }
+                set.insert(name.to_string());
+            }
+            Some(Arc::new(set))
+        }
+    };
+    let declared = crate::permission::policy::intersect_allowlist(
+        profile_tools.as_ref(),
+        requested_tools.as_ref(),
+    );
+    Ok(crate::permission::policy::intersect_allowlist(
+        parent.allowed_tools.as_ref(),
+        declared.as_ref(),
+    ))
+}
+
 /// 子代理事件必须带自己的身份（ADR-104）：出口不支持 scoped 时退回父出口，
 /// 而不是丢事件——前端宁可看到错误归属，也不能看不到子代理的进展。
 fn child_sink(parent: &AgentScope, agent_id: &str) -> Arc<dyn EventSink> {
@@ -710,6 +807,7 @@ mod tests {
             depth: 0,
             cancel: CancellationToken::new(),
             sink: Arc::new(DiscardSink),
+            allowed_tools: None,
         }
     }
 

@@ -22,9 +22,11 @@ pub fn is_agent_tool(name: &str) -> bool {
     AGENT_TOOL_NAMES.contains(&name)
 }
 
-/// 工具执行时「谁在调用」：身份、父边、深度、取消令牌、事件出口。
+/// 工具执行时「谁在调用」：身份、父边、深度、取消令牌、事件出口、有效工具白名单。
 ///
 /// 由 `agent_loop::run_instance` 从 `AgentInstance` 构造；工具与编排实现都只读它。
+/// `allowed_tools` 是「只降不升」的父侧输入：派生子代理时与子侧声明取交集，
+/// 保证父代理已被收窄的能力不会在子代理处被放大。
 #[derive(Clone)]
 pub struct AgentScope {
     pub agent_id: String,
@@ -32,6 +34,7 @@ pub struct AgentScope {
     pub depth: u32,
     pub cancel: CancellationToken,
     pub sink: Arc<dyn EventSink>,
+    pub allowed_tools: Option<crate::permission::ToolAllowlist>,
 }
 
 /// 子代理终态投影（`pending` = 超时仍未结束，docs/02 §2.2「超时不杀代理」）。
@@ -70,11 +73,15 @@ pub trait AgentOrchestrator: Send + Sync {
     ///
     /// `budget_tokens` = 该子树自己的 token 上限（`spawn_agent.budget_tokens`）：
     /// 它不会放宽全树预算，只能在全树之内进一步收窄。
+    /// `profile` / `allowed_tools` 是权限收窄输入（ADR-103）：实现必须按
+    /// `min(父策略, profile, allowed_tools)` 求交集，任何路径都不得放大权限。
     async fn spawn_agent(
         &self,
         parent: &AgentScope,
         task: &str,
         budget_tokens: Option<u64>,
+        profile: Option<&str>,
+        allowed_tools: Option<&[String]>,
     ) -> Result<String, String>;
 
     /// 从一个已退出子代理的历史恢复继续工作；`task` 为 None 时用默认续跑指令。

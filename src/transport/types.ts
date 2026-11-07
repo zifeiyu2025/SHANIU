@@ -15,7 +15,7 @@ export type EventMsg =
   | { type: 'tool_call_begin'; call_id: string; tool: string; args: JsonValue }
   | { type: 'tool_call_output_delta'; call_id: string; channel: IoChannel; delta: string }
   | { type: 'tool_call_end'; call_id: string; exit_code: number | null; error: string | null; result?: ToolCallResult | null }
-  | { type: 'exec_approval_request'; request_id: string; tool: string; args: JsonValue; risk: RiskLevel }
+  | { type: 'exec_approval_request'; request_id: string; tool: string; args: JsonValue; risk: RiskLevel; agent_id?: string; task_summary?: string }
   | { type: 'exec_approval_resolved'; request_id: string; decision: ApprovalDecision }
   | { type: 'plan_delta'; delta: string }
   | { type: 'turn_diff'; files: string[] }

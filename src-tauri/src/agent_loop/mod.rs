@@ -332,16 +332,35 @@ impl AgentLoop {
             depth: instance.depth,
             cancel: instance.cancel.clone(),
             sink: sink.clone(),
+            // 父侧有效工具集（SH-054）：派生时与子侧声明取交集，防止提权。
+            allowed_tools: instance.allowed_tools.clone(),
         };
         let inbox = instance.inbox.clone();
         // 树级预算句柄（SH-055）：与 root/子代理共享同一本账，解构前先取出来。
         let budget = instance.budget.clone();
         // 只解构本函数要用的字段：身份/深度留给注册表与后续工具上下文（SH-051）。
-        let AgentInstance { cancel, history, recorded, rollout, session_id, usage: totals, .. } = instance;
+        // `allowed_tools`/`task`（SH-054）是审批冒泡与权限合成的输入，执行期只读。
+        let AgentInstance {
+            cancel,
+            history,
+            recorded,
+            rollout,
+            session_id,
+            usage: totals,
+            allowed_tools,
+            task,
+            ..
+        } = instance;
         let cancel = &*cancel;
         let history = &mut *history;
         let recorded = &mut *recorded;
         let rollout = &*rollout;
+        // 每次工具门禁都要的代理身份（ADR-103）：白名单 + 审批来源。
+        let gate_subject = crate::permission::GateSubject {
+            agent_id: &scope.agent_id,
+            task_summary: task.as_deref(),
+            allowed_tools: allowed_tools.as_ref(),
+        };
         // 实例没指定作业属主时沿用引擎的会话 id（root 的既有行为）。
         let session_id = session_id.clone().or_else(|| self.session_id.clone());
         let mut reason = TurnEndReasonLocal::Completed;
@@ -407,6 +426,7 @@ impl AgentLoop {
                 has_model_skills,
                 scope.depth,
                 orchestrator.is_some(),
+                allowed_tools.as_ref(),
             );
 
             // 2.5) 采样前检查 token 预算（ADR-001：「每轮采样前检查 token 预算触发 compaction」）。
@@ -605,7 +625,14 @@ impl AgentLoop {
                     serde_json::from_str(arguments).unwrap_or(serde_json::Value::String(arguments.clone()));
                 match self
                     .broker
-                    .gate(name, &args_val, call_id, self.policy, &sink, cancel)
+                    .gate(
+                        name,
+                        &args_val,
+                        call_id,
+                        self.policy,
+                        gate_subject,
+                        crate::permission::GateEnv { sink: &sink, cancel },
+                    )
                     .await
                 {
                     crate::permission::GateOutcome::Allowed => {}
@@ -619,6 +646,20 @@ impl AgentLoop {
                         history.push(HistoryItem::FunctionCallOutput {
                             call_id: call_id.clone(),
                             output: "用户拒绝了该工具调用".into(),
+                        });
+                        continue;
+                    }
+                    crate::permission::GateOutcome::Forbidden => {
+                        // 策略拒绝与用户拒绝分开回填：模型应换策略，而不是重试等审批。
+                        emit(&sink, EventMsg::ToolCallEnd {
+                            call_id: call_id.clone(),
+                            exit_code: None,
+                            error: Some("策略拒绝：当前代理无权使用该工具".into()),
+                            result: Some(ToolCallResult::Denied),
+                        });
+                        history.push(HistoryItem::FunctionCallOutput {
+                            call_id: call_id.clone(),
+                            output: "该工具不在当前代理的有效工具集内（权限只降不升），不会通过审批获得；请改用可用工具或在结果中说明限制".into(),
                         });
                         continue;
                     }
@@ -721,10 +762,16 @@ fn declarations_for(
     has_model_skills: bool,
     depth: u32,
     has_orchestrator: bool,
+    allowed_tools: Option<&crate::permission::ToolAllowlist>,
 ) -> Vec<crate::model_client::ToolDeclaration> {
     let mut all = router.declarations();
     if !has_model_skills {
         all.retain(|declaration| declaration.name != "skill");
+    }
+    // SH-054 / ADR-103 第一层：被收窄掉的工具不向模型声明。
+    // 这是"模型看不到就不会调用"的防线；执行期还有 gate 的同一份白名单兜底。
+    if let Some(allowlist) = allowed_tools {
+        all.retain(|declaration| allowlist.contains(&declaration.name));
     }
     // ADR-101 / FF-106 第一层：子代理的 ToolSpec 里不含编排工具；
     // 没有 orchestrator 的装配（测试/子代理）也不声明，避免模型看到不可用的能力。
@@ -1264,7 +1311,7 @@ mod tests {
         crate::tools::register_builtin(&mut router, Arc::new(PlanState::new()));
 
         let names = |plan: bool| -> Vec<String> {
-            declarations_for(&router, plan, true, 0, false).into_iter().map(|d| d.name).collect()
+            declarations_for(&router, plan, true, 0, false, None).into_iter().map(|d| d.name).collect()
         };
         let planned = names(true);
         assert!(planned.contains(&"read_file".to_string()));

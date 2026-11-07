@@ -7,8 +7,49 @@
 //! - execute：只读沙箱拒绝（ADR-002：只读禁止命令执行）；本会话记住过则放行；否则询问；
 //! - destructive：每次必问（永不记忆）。
 
+use std::collections::HashSet;
+use std::sync::Arc;
+
 use crate::config::{ApprovalMode, SandboxMode};
 use crate::events::RiskLevel;
+
+/// 代理级工具白名单（ADR-103「权限只降不升」）。
+///
+/// `None` = 没有额外限制（root 的形态）；`Some` = 显式收窄到这些工具。
+/// 收窄在三个执行点同时生效：模型声明、审批门禁、编排派生。
+pub type ToolAllowlist = Arc<HashSet<String>>;
+
+/// 两个白名单取交集：任何一侧的收窄都不能被另一侧抹掉。
+///
+/// `None` 代表「该侧无限制」，因此 `(None, x)` 的结果就是 `x`。
+/// 这是 min(父策略, 子代理声明) 的唯一实现——把它做成纯函数，
+/// 派生路径（spawn/resume/profile）才不会各写一份略有出入的合并逻辑。
+pub fn intersect_allowlist(
+    parent: Option<&ToolAllowlist>,
+    child: Option<&ToolAllowlist>,
+) -> Option<ToolAllowlist> {
+    match (parent, child) {
+        (None, None) => None,
+        (Some(parent), None) => Some(parent.clone()),
+        (None, Some(child)) => Some(child.clone()),
+        (Some(parent), Some(child)) => {
+            Some(Arc::new(parent.intersection(child.as_ref()).cloned().collect()))
+        }
+    }
+}
+
+/// 只读工具集（`profile=explorer`）：按风险分级从**路由的真实工具表**里取 Read 档。
+///
+/// 不在 profile 里硬编码名单：新增只读工具会自动落入 explorer，新增写入/执行工具
+/// 也不会因为忘改名单被 explorer 意外拿到——名单与风险分级共用同一份事实源。
+pub fn readonly_allowlist(tool_names: impl IntoIterator<Item = String>) -> ToolAllowlist {
+    Arc::new(
+        tool_names
+            .into_iter()
+            .filter(|name| risk_of(name) == RiskLevel::Read)
+            .collect(),
+    )
+}
 
 /// 裁决结果。
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -151,5 +192,30 @@ mod tests {
         assert!(!plan_mode_allows("apply_patch"));
         assert!(!plan_mode_allows("unified_exec"));
         assert!(!plan_mode_allows("enter_plan_mode"));
+    }
+
+    #[test]
+    fn allowlist_intersection_only_narrows() {
+        let parent: ToolAllowlist = Arc::new(
+            ["read_file", "unified_exec"].iter().map(|name| name.to_string()).collect(),
+        );
+        let child: ToolAllowlist = Arc::new(
+            ["read_file", "apply_patch"].iter().map(|name| name.to_string()).collect(),
+        );
+        let both = intersect_allowlist(Some(&parent), Some(&child)).expect("两侧都有收窄");
+        assert_eq!(both.as_ref(), &HashSet::from(["read_file".to_string()]));
+        assert_eq!(intersect_allowlist(Some(&parent), None).unwrap(), parent);
+        assert_eq!(intersect_allowlist(None, Some(&child)).unwrap(), child);
+        assert!(intersect_allowlist(None, None).is_none());
+
+        // explorer 的只读档由风险分级推导：执行/写入工具不得进入
+        let readonly = readonly_allowlist(
+            ["read_file", "unified_exec", "apply_patch"]
+                .iter()
+                .map(|name| name.to_string()),
+        );
+        assert!(readonly.contains("read_file"));
+        assert!(!readonly.contains("unified_exec"));
+        assert!(!readonly.contains("apply_patch"));
     }
 }

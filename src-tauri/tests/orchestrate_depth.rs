@@ -62,6 +62,8 @@ impl AgentOrchestrator for NoopOrchestrator {
         _parent: &AgentScope,
         _task: &str,
         _budget_tokens: Option<u64>,
+        _profile: Option<&str>,
+        _allowed_tools: Option<&[String]>,
     ) -> Result<String, String> {
         Err("本测试不派生子代理".into())
     }
@@ -118,6 +120,7 @@ fn scope(depth: u32) -> AgentScope {
         depth,
         cancel: CancellationToken::new(),
         sink: Arc::new(DiscardSink),
+        allowed_tools: None,
     }
 }
 

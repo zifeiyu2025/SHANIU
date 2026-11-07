@@ -104,7 +104,7 @@ fn engine(live: Arc<AtomicUsize>) -> Arc<AgentLoop> {
 
 /// 父代理身份（SH-052 起 spawn 收 AgentScope 而不是 AgentInstance）。
 fn root_scope(cancel: CancellationToken, sink: Arc<dyn EventSink>) -> AgentScope {
-    AgentScope { agent_id: "root".into(), parent_id: None, depth: 0, cancel, sink }
+    AgentScope { agent_id: "root".into(), parent_id: None, depth: 0, cancel, sink, allowed_tools: None }
 }
 
 async fn wait_until(what: &str, timeout: Duration, mut predicate: impl FnMut() -> bool) {

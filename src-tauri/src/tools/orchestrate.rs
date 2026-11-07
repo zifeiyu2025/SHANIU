@@ -64,9 +64,9 @@ impl SpawnAgent {
                     "type": "object",
                     "properties": {
                         "task": { "type": "string", "description": "子任务描述；子代理不继承当前会话历史，背景必须写全" },
-                        "profile": { "type": "string", "description": "可选预设；当前仅支持 worker（完整工具集）" },
+                        "profile": { "type": "string", "description": "可选预设：worker（完整工具集）或 explorer（只读工具集）" },
                         "budget_tokens": { "type": "integer", "description": "该子树自己的 token 上限（须 > 0）；不影响全树预算，只能在全树之内进一步收窄" },
-                        "allowed_tools": { "type": "array", "items": { "type": "string" }, "description": "预留给 SH-054 权限合成；当前不支持，传入会失败" }
+                        "allowed_tools": { "type": "array", "items": { "type": "string" }, "description": "把子代理可用工具收窄到这些名字（只能减不能加）；与 profile、父代理有效集取交集" }
                     },
                     "required": ["task"]
                 }),
@@ -89,26 +89,26 @@ impl ToolExecutor for SpawnAgent {
         if args.task.trim().is_empty() {
             return Err(ToolError::InvalidArgs("task 不能为空".into()));
         }
-        // 权限只降不升（ADR-103）：尚未实现的收窄参数必须拒绝，不能静默给出完整权限。
-        if args.allowed_tools.as_ref().is_some_and(|tools| !tools.is_empty()) {
-            return Err(ToolError::InvalidArgs(
-                "allowed_tools 需要权限合成（SH-054），当前不支持；请在 task 中限定范围或在子代理内自行约束".into(),
-            ));
+        // 权限只降不升（ADR-103）：profile/allowed_tools 只用于收窄，求交集在
+        // 编排实现（registry）里完成——工具层不做「看起来更宽松」的默认解释。
+        if let Some(profile) = args.profile.as_deref() {
+            if profile.trim().is_empty() {
+                return Err(ToolError::InvalidArgs("profile 为空；省略该字段表示 worker".into()));
+            }
         }
         if args.budget_tokens == Some(0) {
             return Err(ToolError::InvalidArgs(
                 "budget_tokens 必须大于 0；不限额就省略该字段".into(),
             ));
         }
-        if let Some(profile) = args.profile.as_deref() {
-            if profile != "worker" {
-                return Err(ToolError::InvalidArgs(format!(
-                    "profile {profile} 尚未实现：explorer 需要按 profile 收窄工具集（后续卡片）；当前只支持 worker"
-                )));
-            }
-        }
         let agent_id = orchestrator(ctx)?
-            .spawn_agent(scope(ctx)?, args.task.trim(), args.budget_tokens)
+            .spawn_agent(
+                scope(ctx)?,
+                args.task.trim(),
+                args.budget_tokens,
+                args.profile.as_deref(),
+                args.allowed_tools.as_deref(),
+            )
             .await
             .map_err(ToolError::Execution)?;
         Ok(ToolOutput::ok(
@@ -341,6 +341,8 @@ mod tests {
     struct StubOrchestrator {
         spawned: Mutex<Vec<String>>,
         budgets: Mutex<Vec<Option<u64>>>,
+        profiles: Mutex<Vec<Option<String>>>,
+        allowlists: Mutex<Vec<Option<Vec<String>>>>,
         resumed: Mutex<Vec<(String, Option<String>)>>,
         messages: Mutex<Vec<(String, String)>>,
     }
@@ -352,9 +354,13 @@ mod tests {
             _parent: &AgentScope,
             task: &str,
             budget_tokens: Option<u64>,
+            profile: Option<&str>,
+            allowed_tools: Option<&[String]>,
         ) -> Result<String, String> {
             self.spawned.lock().unwrap().push(task.to_string());
             self.budgets.lock().unwrap().push(budget_tokens);
+            self.profiles.lock().unwrap().push(profile.map(str::to_string));
+            self.allowlists.lock().unwrap().push(allowed_tools.map(<[String]>::to_vec));
             Ok("child-1".into())
         }
 
@@ -400,6 +406,7 @@ mod tests {
             depth: 0,
             cancel: tokio_util::sync::CancellationToken::new(),
             sink: Arc::new(DiscardSink),
+            allowed_tools: None,
         };
         ToolContext::new(
             std::env::temp_dir(),
@@ -419,9 +426,8 @@ mod tests {
 
         for args in [
             serde_json::json!({ "task": "   " }),
-            serde_json::json!({ "task": "x", "allowed_tools": ["read_file"] }),
             serde_json::json!({ "task": "x", "budget_tokens": 0 }),
-            serde_json::json!({ "task": "x", "profile": "explorer" }),
+            serde_json::json!({ "task": "x", "profile": "   " }),
             serde_json::json!({ "task": "x", "unknown": 1 }),
         ] {
             assert!(
@@ -439,6 +445,20 @@ mod tests {
         assert_eq!(*stub.spawned.lock().unwrap(), vec!["探索仓库".to_string()]);
         // 预算必须原样交给编排层，不能在工具层被吞掉。
         assert_eq!(*stub.budgets.lock().unwrap(), vec![Some(2000)]);
+
+        // SH-054：profile / allowed_tools 原样下传，交集由编排实现统一计算。
+        let _ = tool
+            .execute(
+                serde_json::json!({ "task": "只读探索", "profile": "explorer", "allowed_tools": ["read_file"] }),
+                &ctx,
+            )
+            .await
+            .expect("收窄参数应被接受");
+        assert_eq!(*stub.profiles.lock().unwrap(), vec![None, Some("explorer".to_string())]);
+        assert_eq!(
+            *stub.allowlists.lock().unwrap(),
+            vec![None, Some(vec!["read_file".to_string()])]
+        );
     }
 
     #[tokio::test]
@@ -521,6 +541,7 @@ mod tests {
                 depth: 0,
                 cancel: tokio_util::sync::CancellationToken::new(),
                 sink: Arc::new(DiscardSink),
+                allowed_tools: None,
             },
             stub,
         );

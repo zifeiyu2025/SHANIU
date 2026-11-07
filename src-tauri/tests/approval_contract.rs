@@ -299,8 +299,8 @@ async fn destructive_allow_always_is_not_remembered() {
                         approval: ApprovalMode::Ask,
                         sandbox: SandboxMode::WorkspaceWrite,
                     },
-                    &sink,
-                    &cancel,
+                    shaniu_lib::permission::GateSubject::root("root"),
+                    shaniu_lib::permission::GateEnv { sink: &sink, cancel: &cancel },
                 )
                 .await
         }

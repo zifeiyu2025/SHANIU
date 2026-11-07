@@ -111,7 +111,7 @@ fn completed_turn(text: &str) -> Vec<ModelStreamEvent> {
 }
 
 fn root_scope(cancel: CancellationToken, sink: Arc<dyn EventSink>) -> AgentScope {
-    AgentScope { agent_id: "root".into(), parent_id: None, depth: 0, cancel, sink }
+    AgentScope { agent_id: "root".into(), parent_id: None, depth: 0, cancel, sink, allowed_tools: None }
 }
 
 /// 上游 names.ts 的 NAME_PATTERN（catalog v3 的 name 必须合法，`lead` 为根保留）。

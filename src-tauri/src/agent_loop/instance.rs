@@ -11,6 +11,7 @@ use serde::{Deserialize, Serialize};
 use tokio_util::sync::CancellationToken;
 
 use crate::model_client::{HistoryItem, Role, Usage};
+use crate::permission::policy::ToolAllowlist;
 use crate::rollout::RolloutWriter;
 
 use super::budget::TreeBudget;
@@ -65,6 +66,14 @@ pub struct AgentInstance {
     /// 本实例的树级预算句柄（SH-055）。root 由引擎注入，子代理在派生时克隆父句柄，
     /// 因此全树同一本账；默认不限额，避免测试与三方调用被迫先配预算。
     pub budget: TreeBudget,
+    /// 本代理的有效工具白名单（SH-054，ADR-103「权限只降不升」）。
+    /// `None` = 无额外限制（root）。子代理在派生时由注册表按
+    /// `min(父策略, profile, allowed_tools)` 计算后写入，执行期只读。
+    pub allowed_tools: Option<ToolAllowlist>,
+    /// 派生子代理的任务摘要（approval 冒泡用）；root 为 None。
+    /// 与 `history[0]` 的用户消息同源，但独立保存——history 会被压缩/回放改写，
+    /// 而审批请求始终需要一个稳定的人类可读来源说明。
+    pub task: Option<String>,
 }
 
 impl AgentInstance {
@@ -82,6 +91,8 @@ impl AgentInstance {
             usage: TokenTotals::default(),
             inbox: Arc::new(Mutex::new(Vec::new())),
             budget: TreeBudget::unlimited(),
+            allowed_tools: None,
+            task: None,
         }
     }
 
@@ -109,6 +120,8 @@ impl AgentInstance {
             usage: TokenTotals::default(),
             inbox: Arc::new(Mutex::new(Vec::new())),
             budget: TreeBudget::unlimited(),
+            allowed_tools: None,
+            task: Some(task.to_string()),
         }
     }
 

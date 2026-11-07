@@ -50,7 +50,16 @@ fn all_variants() -> Vec<EventMsg> {
             error: Some("用户拒绝".into()),
             result: Some(ToolCallResult::Denied),
         },
-        EventMsg::ExecApprovalRequest { request_id: "r1".into(), tool: "unified_exec".into(), args: serde_json::json!({}), risk: RiskLevel::Destructive },
+        EventMsg::ExecApprovalRequest { request_id: "r1".into(), tool: "unified_exec".into(), args: serde_json::json!({}), risk: RiskLevel::Destructive, agent_id: None, task_summary: None },
+        // SH-054：审批冒泡的 additive 字段（子代理来源）也必须进快照
+        EventMsg::ExecApprovalRequest {
+            request_id: "r2".into(),
+            tool: "unified_exec".into(),
+            args: serde_json::json!({"cmd": "ls"}),
+            risk: RiskLevel::Execute,
+            agent_id: Some("01JCHILD".into()),
+            task_summary: Some("统计仓库文件数".into()),
+        },
         EventMsg::ExecApprovalResolved { request_id: "r1".into(), decision: ApprovalDecision::Deny },
         EventMsg::PlanDelta { delta: "step 1".into() },
         EventMsg::TurnDiff { files: vec!["a.rs".into()] },

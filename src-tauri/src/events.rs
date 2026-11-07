@@ -167,7 +167,19 @@ pub enum EventMsg {
         #[serde(default, skip_serializing_if = "Option::is_none")]
         result: Option<ToolCallResult>,
     },
-    ExecApprovalRequest { request_id: String, tool: String, args: serde_json::Value, risk: RiskLevel },
+    ExecApprovalRequest {
+        request_id: String,
+        tool: String,
+        args: serde_json::Value,
+        risk: RiskLevel,
+        /// 审批冒泡（ADR-103）：谁在要权限。additive（FF-2）：旧消费端无感知。
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        agent_id: Option<String>,
+        /// 该代理的任务摘要；root 为 None。让用户在统一审批 UI 上分得清
+        /// 「哪个子代理为了哪件事要权限」，而不是只有一个工具名。
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        task_summary: Option<String>,
+    },
     ExecApprovalResolved { request_id: String, decision: ApprovalDecision },
     PlanDelta { delta: String },
     TurnDiff { files: Vec<String> },
