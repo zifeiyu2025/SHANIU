@@ -9,6 +9,7 @@
 //! 每个任务 = 若干 turn；turn 内无工具调用即任务完成（completed）。
 
 pub mod budget;
+pub mod instance;
 pub mod prompt;
 
 use std::path::PathBuf;
@@ -26,6 +27,7 @@ use crate::permission::{policy, ApprovalBroker};
 use crate::tool_router::{PlanState, ToolContext, ToolRouter};
 
 pub use budget::TurnBudget;
+pub use instance::{AgentInstance, MAX_AGENT_DEPTH};
 
 // ============================== 模型后端抽象 ==============================
 
@@ -84,11 +86,14 @@ pub struct AgentLoop {
     pub token_budget: usize,
     pub policy: policy::SessionPolicy,
     /// 会话档案写入器（SH-030）。None = 本次运行不落盘（测试与无目录启动用）。
+    /// 这是 `run_with_history` 构造 root 实例时的默认值；`run_instance` 以实例自带的
+    /// 写入器为准，子代理因此能各写各的档案（SH-050）。
     pub rollout: Option<Arc<crate::rollout::RolloutWriter>>,
     /// 落盘失败只播报一次：磁盘满时每条历史都报一遍会把事件流刷满，却没有任何新信息。
     /// 与其余字段一样公开——`AgentLoop` 是纯数据结构，测试与装配层都按字面量构造它。
     pub rollout_broke: std::sync::atomic::AtomicBool,
     /// 会话 id（SH-089）：后台作业的属主；装配层通过 `with_jobs` 注入。
+    /// 实例没自带 `session_id` 时沿用它，root 的既有行为不变。
     pub session_id: Option<String>,
     /// 进程级作业注册表（SH-089）。
     pub jobs: Option<Arc<crate::jobs::JobRegistry>>,
@@ -112,11 +117,12 @@ impl AgentLoop {
     /// 静默降级会让用户以为"会话有存档、可以 resume"，而实际没有。
     fn flush_history(
         &self,
+        rollout: &Option<Arc<crate::rollout::RolloutWriter>>,
         sink: &Arc<dyn crate::events::EventSink>,
         history: &[HistoryItem],
         recorded: &mut usize,
     ) {
-        let Some(writer) = &self.rollout else { *recorded = history.len(); return };
+        let Some(writer) = rollout else { *recorded = history.len(); return };
         for item in &history[*recorded..] {
             let entry = crate::rollout::RolloutItem::ResponseItem { item: item.clone() };
             if let Err(e) = writer.append(&entry) {
@@ -147,6 +153,7 @@ impl AgentLoop {
     ///    直接 panic，而且是只在长会话跑到第 N 轮才炸的那种 panic。
     async fn compact_in_place(
         &self,
+        rollout: &Option<Arc<crate::rollout::RolloutWriter>>,
         history: &mut Vec<HistoryItem>,
         recorded: &mut usize,
         target: crate::compaction::Target,
@@ -177,7 +184,7 @@ impl AgentLoop {
         }
         let summary = crate::compaction::extract_summary(&summary)?;
 
-        if let Some(writer) = &self.rollout {
+        if let Some(writer) = rollout {
             // 写失败在这里静默是刻意的：见上面第 2 点。
             let _ = writer.append(&crate::rollout::RolloutItem::Compacted {
                 range_start: target.range_start,
@@ -258,15 +265,34 @@ impl AgentLoop {
     /// 这里刻意不再"修"历史——静默补配对会掩盖档案损坏，而档案损坏必须由上层显式处理。
     pub async fn run_with_history(
         &self,
-        mut history: Vec<HistoryItem>,
+        history: Vec<HistoryItem>,
         persisted: usize,
         sink: Arc<dyn crate::events::EventSink>,
         cancel: CancellationToken,
     ) -> TurnSummary {
-        // 已落盘的历史条数（SH-030）：每轮结束时补写尾部，崩溃只丢当前轮。
-        // 续跑时从调用方给的起点开始，避免把旧历史再写一遍；上限锁死在历史长度，
-        // 传大了也不会越过档案真实拥有的条目数。
-        let mut recorded = persisted.min(history.len());
+        let mut instance = AgentInstance::root(history, persisted, cancel);
+        instance.rollout = self.rollout.clone();
+        self.run_instance(&mut instance, sink).await
+    }
+
+    /// 在一个代理实例上执行完整任务（SH-050）。
+    ///
+    /// root 与子代理都走这里：`self` 是共享执行引擎（后端/路由/审批/沙箱/预算），
+    /// `instance` 携带本代理独有的可变状态。执行结束后 `instance.history` 是完整历史、
+    /// `instance.recorded` 是已落盘游标——子代理的 ExitSummary 与 resume 都从这里取。
+    pub async fn run_instance(
+        &self,
+        instance: &mut AgentInstance,
+        sink: Arc<dyn crate::events::EventSink>,
+    ) -> TurnSummary {
+        // 只解构本函数要用的字段：身份/深度留给注册表与后续工具上下文（SH-051）。
+        let AgentInstance { cancel, history, recorded, rollout, session_id, .. } = instance;
+        let cancel = &*cancel;
+        let history = &mut *history;
+        let recorded = &mut *recorded;
+        let rollout = &*rollout;
+        // 实例没指定作业属主时沿用引擎的会话 id（root 的既有行为）。
+        let session_id = session_id.clone().or_else(|| self.session_id.clone());
         let mut reason = TurnEndReasonLocal::Completed;
         let mut last_turn = 0u32;
         // 最近一次端点报回的上下文规模，作为压缩判据的观测侧（SH-032）。
@@ -306,11 +332,11 @@ impl AgentLoop {
             // ——那一轮的上下文照样发出去，溢出照旧。
             if let Some(target) = crate::compaction::plan_if_needed(
                 observed_input_tokens,
-                &history,
+                history,
                 self.token_budget,
             ) {
                 if let Err(message) = self
-                    .compact_in_place(&mut history, &mut recorded, target, &instructions, &cancel)
+                    .compact_in_place(rollout, history, recorded, target, &instructions, cancel)
                     .await
                 {
                     emit(&sink, EventMsg::Error { message });
@@ -321,12 +347,12 @@ impl AgentLoop {
 
             // 2.7) 会话引用展开（SH-090 批 2）：只作用于本步请求副本，档案与展示历史不动。
             // 轮次内的后续采样末尾不是 user 消息，不会重复展开。
-            let expanded = match self.rollout.as_ref() {
+            let expanded = match rollout.as_ref() {
                 Some(writer) => {
                     let dir = writer.path().parent().map(std::path::Path::to_path_buf);
                     let id = writer.path().file_stem().map(|stem| stem.to_string_lossy().into_owned());
                     match (dir, id) {
-                        (Some(dir), Some(id)) => crate::session_reference::prepare_request(&history, &dir, &id),
+                        (Some(dir), Some(id)) => crate::session_reference::prepare_request(history, &dir, &id),
                         _ => Ok(None),
                     }
                 }
@@ -343,7 +369,7 @@ impl AgentLoop {
             // 2.8) 用户 `/name` 技能触发（SH-091）：只扫描原始历史末尾的用户消息，
             // 避免把会话引用展开注入的上下文当成用户手势。技能正文最后追加，
             // 离模型回答最近（与上游“背景在前、要执行的物料在后”一致）。
-            let skill_injections = crate::skills::injections(&history, &self.workspace_root);
+            let skill_injections = crate::skills::injections(history, &self.workspace_root);
             let mut request_history: Vec<HistoryItem> =
                 expanded.unwrap_or_else(|| history.clone());
             if !skill_injections.is_empty() {
@@ -493,7 +519,7 @@ impl AgentLoop {
                     serde_json::from_str(arguments).unwrap_or(serde_json::Value::String(arguments.clone()));
                 match self
                     .broker
-                    .gate(name, &args_val, call_id, self.policy, &sink, &cancel)
+                    .gate(name, &args_val, call_id, self.policy, &sink, cancel)
                     .await
                 {
                     crate::permission::GateOutcome::Allowed => {}
@@ -529,7 +555,7 @@ impl AgentLoop {
                     sink.clone(),
                     self.policy.sandbox,
                 )
-                .with_jobs(self.session_id.clone(), self.jobs.clone());
+                .with_jobs(session_id.clone(), self.jobs.clone());
                 let result = self.router.execute(name, args_val, &tool_ctx).await;
                 let output_text = match &result {
                     Ok(out) => {
@@ -572,11 +598,11 @@ impl AgentLoop {
                 });
             }
             // 轮末落盘：崩溃只丢当前轮，之前各轮的档案已经 flush 到位
-            self.flush_history(&sink, &history, &mut recorded);
+            self.flush_history(rollout, &sink, history, recorded);
         }
 
         // 覆盖所有 break 路径（取消/失败/预算耗尽）——它们都从这里收口
-        self.flush_history(&sink, &history, &mut recorded);
+        self.flush_history(rollout, &sink, history, recorded);
 
         emit(&sink, EventMsg::TurnCompleted {
             turn: last_turn,
@@ -1298,5 +1324,119 @@ mod tests {
             _ => panic!("第二条应是引用上下文"),
         }
         std::fs::remove_dir_all(&dir).ok();
+    }
+
+    // ---- SH-050：AgentInstance（root 与子代理共用同一执行引擎）----
+
+    fn assistant_text(items: &[HistoryItem]) -> String {
+        items
+            .iter()
+            .filter_map(|item| match item {
+                HistoryItem::Message { role: Role::Assistant, text, .. } => Some(text.as_str()),
+                _ => None,
+            })
+            .collect::<Vec<_>>()
+            .join("")
+    }
+
+    fn user_text(items: &[HistoryItem]) -> String {
+        items
+            .iter()
+            .filter_map(|item| match item {
+                HistoryItem::Message { role: Role::User, text, .. } => Some(text.as_str()),
+                _ => None,
+            })
+            .collect::<Vec<_>>()
+            .join("")
+    }
+
+    /// root 与子代理跑在同一个 `AgentLoop` 上，但历史/身份/深度互不串。
+    #[tokio::test]
+    async fn root_and_child_instances_share_the_engine_but_not_state() {
+        let (agent, store, _cancel, _broker) = make_loop(vec![
+            vec![ModelStreamEvent::OutputTextDelta { delta: "answer-a".into() }, usage_ev()],
+            vec![ModelStreamEvent::OutputTextDelta { delta: "answer-b".into() }, usage_ev()],
+        ]);
+        let agent = Arc::new(agent);
+        let mut root = AgentInstance::root(
+            vec![HistoryItem::Message { role: Role::User, text: "root-task".into(), reasoning: None }],
+            0,
+            CancellationToken::new(),
+        );
+        let mut child = AgentInstance::child("agent-1", "root", "child-task", CancellationToken::new());
+
+        let sink: Arc<dyn crate::events::EventSink> = Arc::new(CapturingSink(store.clone()));
+        let (root_summary, child_summary) = tokio::join!(
+            agent.run_instance(&mut root, sink.clone()),
+            agent.run_instance(&mut child, sink),
+        );
+
+        assert_eq!(root_summary.reason, TurnEndReason::Completed);
+        assert_eq!(child_summary.reason, TurnEndReason::Completed);
+        // 同一引擎各跑一轮：两次 turn_started，而不是在共享历史里跑了两轮。
+        let started = store
+            .lock()
+            .unwrap()
+            .iter()
+            .filter(|event| matches!(event, EventMsg::TurnStarted { .. }))
+            .count();
+        assert_eq!(started, 2);
+
+        // 两条脚本响应的分配顺序取决于并发调度，断言的是"各自只拿到一条、且不相交"。
+        let root_answer = assistant_text(&root.history);
+        let child_answer = assistant_text(&child.history);
+        assert_ne!(root_answer, child_answer);
+        assert_eq!(
+            [root_answer.as_str(), child_answer.as_str()].iter().copied().collect::<std::collections::BTreeSet<_>>(),
+            ["answer-a", "answer-b"].into_iter().collect::<std::collections::BTreeSet<_>>(),
+        );
+        // 子代理不继承父历史（ADR-102）：它只有 spawn 的 task 描述。
+        assert_eq!(user_text(&child.history), "child-task");
+        assert_eq!(user_text(&root.history), "root-task");
+
+        // 身份与深度：只有 root 能继续分叉（ADR-101 硬限）。
+        assert_eq!((root.agent_id.as_str(), root.depth), ("root", 0));
+        assert_eq!(
+            (child.agent_id.as_str(), child.parent_id.as_deref(), child.depth),
+            ("agent-1", Some("root"), 1),
+        );
+        assert!(root.can_spawn());
+        assert!(!child.can_spawn());
+    }
+
+    /// 取消子是实例级的：取消子代理不会打断同一引擎上的 root。
+    #[tokio::test]
+    async fn cancelling_a_child_leaves_the_root_running() {
+        let (agent, store, _cancel, _broker) = make_loop(vec![
+            // 子代理：空脚本 = 永不产出的事件流；root：正常完成。
+            vec![],
+            vec![ModelStreamEvent::OutputTextDelta { delta: "root-ok".into() }, usage_ev()],
+        ]);
+        let agent = Arc::new(agent);
+        let child_cancel = CancellationToken::new();
+        let handle = tokio::spawn({
+            let agent = agent.clone();
+            let mut child = AgentInstance::child("agent-1", "root", "阻塞任务", child_cancel.clone());
+            let sink: Arc<dyn crate::events::EventSink> = Arc::new(CapturingSink(store.clone()));
+            async move {
+                let summary = agent.run_instance(&mut child, sink).await;
+                (summary, child)
+            }
+        });
+        tokio::task::yield_now().await;
+        child_cancel.cancel();
+        let (child_summary, child) = handle.await.expect("子代理任务不应 panic");
+        assert_eq!(child_summary.reason, TurnEndReason::Cancelled);
+        // 取消的轮次不追加 assistant 消息，实例历史停在 task 那一条。
+        assert_eq!(child.history.len(), 1);
+
+        let mut root = AgentInstance::root(
+            vec![HistoryItem::Message { role: Role::User, text: "root-task".into(), reasoning: None }],
+            0,
+            CancellationToken::new(),
+        );
+        let root_summary = agent.run_instance(&mut root, Arc::new(CapturingSink(store))).await;
+        assert_eq!(root_summary.reason, TurnEndReason::Completed);
+        assert_eq!(root.last_assistant_text(), Some("root-ok"));
     }
 }
