@@ -65,6 +65,8 @@ function scriptedBridge(
   fileHandler?: (command: string, args: Record<string, unknown> | undefined) => unknown,
   /** SH-092 批 3：open-in-app 的 `workspace_path_applications`/`open_workspace_path` 替身。 */
   openHandler?: (command: string, args: Record<string, unknown> | undefined) => unknown,
+  /** SH-116：`read_attachment` 替身（缺省回一个文本文件）。 */
+  attachmentRead?: (args: Record<string, unknown> | undefined) => unknown,
 ): ScriptedBridge {
   const calls: ScriptedBridge['calls'] = []
   const handlers = new Set<(event: AgentEvent) => void>()
@@ -115,6 +117,11 @@ function scriptedBridge(
       if (command === 'create_session') return 'agent-new' as T
       if (command === 'send_task') return (args?.agentId ?? 'agent-new') as T
       if (command === 'load_session') return archive as T
+      // SH-116 批 1：附件读回替身；缺省给一个小的文本文件。
+      if (command === 'read_attachment') {
+        if (attachmentRead !== undefined) return attachmentRead(args) as T
+        return { name: 'notes.txt', mediaType: 'text/plain', bytes: 5, data: btoa('hello'), truncated: false } as T
+      }
       // SH-113：宿主 FTS5 派生索引的替身；缺省给一个诚实的空页，不伪造命中。
       if (command === 'search_sessions') {
         if (searchHandler === undefined) return { items: [], hasMore: false } as T
@@ -299,6 +306,64 @@ interface RemoteFace {
 function faceOf(remote: unknown): RemoteFace {
   return remote as RemoteFace
 }
+
+describe('SH-116 批 1：附件 prompt 拼装', () => {
+  it('文本文件经 read_attachment 内联为 attachment 块，正文与用户文本一起进任务', async () => {
+    const bridge = scriptedBridge()
+    const { remote, dispose } = createAdapter({ bridge })
+    const session = faceOf(remote).session
+    const result = await session.prompt({
+      sessionId: 'agent-new',
+      requestId: 'rpc-attach',
+      content: [{ type: 'file', receiptId: 'r1' }, { type: 'text', text: '总结这个文件' }],
+    })
+    expect(result['ok']).toBe(true)
+    const task = String(bridge.calls.find(call => call.command === 'send_task')?.args?.['task'] ?? '')
+    expect(task).toContain('**附件 `notes.txt`**（text/plain，5 字节）')
+    expect(task).toContain('hello')
+    expect(task).toContain('总结这个文件')
+    dispose()
+  })
+
+  it('二进制附件只给占位，不把字节塞进提示词', async () => {
+    const bridge = scriptedBridge(undefined, [], undefined, undefined, undefined, undefined, undefined, undefined, () => ({
+      name: 'doc.pdf', mediaType: 'application/pdf', bytes: 99, data: btoa('%PDF'), truncated: false,
+    }))
+    const { remote, dispose } = createAdapter({ bridge })
+    const result = await faceOf(remote).session.prompt({
+      sessionId: 'agent-new',
+      content: [{ type: 'file', receiptId: 'r2' }],
+    })
+    expect(result['ok']).toBe(true)
+    const task = String(bridge.calls.find(call => call.command === 'send_task')?.args?.['task'] ?? '')
+    expect(task).toContain('**附件 `doc.pdf`**（application/pdf，99 字节）（未内联字节）')
+    expect(task).not.toContain('%PDF')
+    dispose()
+  })
+
+  it('缺回执/读回失败显式失败，绝不静默丢附件', async () => {
+    const noReceipt = scriptedBridge()
+    const noReceiptAdapter = createAdapter({ bridge: noReceipt })
+    const first = await faceOf(noReceiptAdapter.remote).session.prompt({
+      sessionId: 'agent-new',
+      content: [{ type: 'file' }],
+    })
+    expect(first['ok']).toBe(false)
+    expect((first['error'] as Error).message).toContain('回执')
+
+    const broken = scriptedBridge(undefined, [], undefined, undefined, undefined, undefined, undefined, undefined, () => {
+      throw new Error('附件不存在')
+    })
+    const brokenAdapter = createAdapter({ bridge: broken })
+    const second = await faceOf(brokenAdapter.remote).session.prompt({
+      sessionId: 'agent-new',
+      content: [{ type: 'file', receiptId: 'gone' }],
+    })
+    expect(second['ok']).toBe(false)
+    expect((second['error'] as Error).message).toContain('读取附件失败')
+    expect(broken.calls.some(call => call.command === 'send_task')).toBe(false)
+  })
+})
 
 const ENVELOPE_KEYS = ['type', 'seq', 'time', 'data', 'ignorable', 'surfaceOp', 'sourceEventSeqs']
 const SURFACE_TYPES = ['user/message', 'assistant/message', 'tool/result']

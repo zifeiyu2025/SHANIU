@@ -40,6 +40,7 @@ import { apply as uiFileActionsApply, inject as uiFileActionsInject } from '@dee
 import { apply as uiOpenInAppApply, inject as uiOpenInAppInject } from '@deepseek-ai/dsh-client-ui-open-in-app/client'
 import { apply as uiReferenceApply, inject as uiReferenceInject } from '@deepseek-ai/dsh-client-ui-reference/client'
 import { installDesktopFileActions } from './file-actions/desktop-bridge'
+import { installAttachmentUploadFetch } from './transport/attachment-upload'
 import { installOpenInAppRoutes } from './open-in-app/route-fetch'
 import { apply as uiInputTriggerApply, inject as uiInputTriggerInject } from '@deepseek-ai/dsh-client-ui-input-trigger/client'
 import { apply as uiCommandsApply, inject as uiCommandsInject } from '@deepseek-ai/dsh-client-ui-commands/client'
@@ -140,6 +141,9 @@ export async function bootShaniu(container: HTMLElement): Promise<BootHandle> {
     // open-in-app 的三条 Host HTTP 路由（SH-092 批 3）接到 Tauri 命令；vendored
     // ui-open-in-app 只经全局 fetch 访问相对路径，源码无需改动。
     installOpenInAppRoutes(tauriBridge())
+    // 附件上传（SH-116 批 1）：file-upload 的 fetch 钩子接到 `upload_attachment`。
+    // 必须在 fileUpload 插件构造前注入（本分支早于 features 挂载）。
+    installAttachmentUploadFetch()
     // 默认工作区基线必须在挂载前写入；家目录给 connection 基线缩写路径用
     const { homeDir } = await applyProductWorkspacePath()
     adapter = createAdapter({

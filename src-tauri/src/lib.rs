@@ -1,6 +1,7 @@
 // pub 供集成测试（src-tauri/tests/）作为契约面使用
 pub mod agent_loop;
 pub mod app_state;
+pub mod attachments;
 pub mod config;
 pub mod compaction;
 pub mod event_journal;
@@ -181,6 +182,39 @@ fn gateway_info(app: tauri::AppHandle) -> Result<GatewayInfo, String> {
         return Err("WebSocket gateway 尚未绑定端口".into());
     }
     Ok(GatewayInfo { port, token: hub.token().to_string() })
+}
+
+/// 暂存一份会话附件（SH-116 批 1，桌面壳文件上传的宿主面）。
+/// 数据落在 `<data_root>\attachments\<session>\`，不写 rollout；回执只在本会话有效。
+#[tauri::command]
+fn upload_attachment(
+    app: tauri::AppHandle,
+    session_id: String,
+    name: String,
+    media_type: String,
+    data: String,
+    width: Option<u32>,
+    height: Option<u32>,
+) -> Result<attachments::StoredAttachment, String> {
+    let state = app.state::<AppState>();
+    attachments::store(&state.data_root(), &session_id, &name, &media_type, &data, width, height)
+}
+
+/// 读回附件字节窗口（prompt 拼装用）；只接受本会话暂存过的回执。
+#[tauri::command]
+fn read_attachment(
+    app: tauri::AppHandle,
+    session_id: String,
+    receipt_id: String,
+    max_bytes: Option<usize>,
+) -> Result<attachments::AttachmentRead, String> {
+    let state = app.state::<AppState>();
+    attachments::read(
+        &state.data_root(),
+        &session_id,
+        &receipt_id,
+        max_bytes.unwrap_or(attachments::DEFAULT_READ_BYTES),
+    )
 }
 
 /// 打开一个会话所需的历史条目。
@@ -1499,6 +1533,8 @@ pub fn run() {
             get_product_dirs,
             read_session_events,
             gateway_info,
+            upload_attachment,
+            read_attachment,
             read_clipboard_text,
             write_clipboard_text,
             workspace_files::workspace_file_stat,

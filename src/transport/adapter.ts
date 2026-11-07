@@ -81,6 +81,8 @@ interface QueuedSubmission {
   /** 客户端提交身份；补发落 durable user/message 时回填 source.rpcId，客户端据此退休回声。 */
   readonly requestId: string
   text: string
+  /** 用户气泡展示文本（不含附件块）；缺省回落到 text。 */
+  displayText?: string
 }
 
 /**
@@ -238,6 +240,112 @@ interface Journal {
 type SessionEntry =
   | { kind: 'message'; role: string; text: string; reasoning?: string }
   | { kind: 'tool_call'; call_id: string; tool: string; arguments: string; output?: string }
+
+/**
+ * 会话附件在 prompt 里的落地形状（SH-116 批 1）：宿主只暂存文件字节，模型侧
+ * 以 `<attachment>` 文本块接收；文本按 128 KiB 窗口内联（截断标注），二进制只给
+ * 占位。图片上传在 fetch 钩子处显式拒绝，这里的 image 分支只处理历史/内联形态。
+ */
+interface PromptAttachmentPart {
+  readonly type: string
+  readonly text?: string
+  readonly receiptId?: string
+  readonly name?: string
+  readonly mediaType?: string
+}
+
+interface AttachmentReadWire {
+  readonly name: string
+  readonly mediaType: string
+  readonly bytes: number
+  readonly data: string
+  readonly truncated: boolean
+}
+
+const TEXTUAL_MEDIA = /^(?:text\/)|^(?:application\/(?:json|xml|x-yaml|yaml|toml|sql|x-sh|x-httpd-php))/i
+const TEXTUAL_EXT = /\.(?:txt|md|markdown|json|jsonl|toml|yaml|yml|rs|ts|tsx|js|jsx|mjs|cjs|py|go|java|kt|c|cc|cpp|h|hpp|cs|css|html|htm|xml|sh|bash|ps1|sql|csv|tsv|log|ini|cfg|conf)$/i
+const ATTACHMENT_READ_BYTES = 128 * 1024
+
+function markdownFence(body: string): string {
+  let longest = 0
+  for (const match of body.matchAll(/`+/g)) longest = Math.max(longest, match[0].length)
+  return '`'.repeat(Math.max(3, longest + 1))
+}
+
+function base64ToText(data: string): string {
+  const binary = atob(data)
+  const bytes = Uint8Array.from(binary, char => char.charCodeAt(0))
+  return new TextDecoder().decode(bytes)
+}
+
+/**
+ * 附件在任务文本里的展示形态：Markdown 标题 + 代码栅栏。模型能明确看到文件名/
+ * 类型/字节数；档案回放时用户气泡也不至于露出原始 XML 标签（批 1 的已知偏差）。
+ */
+function attachmentBlock(name: string, mediaType: string, bytes: number, body?: string, truncated = false): string {
+  const safeName = name.replaceAll('`', "'").replaceAll('\n', ' ')
+  const head = `**附件 \`${safeName}\`**（${mediaType}，${bytes} 字节${truncated ? '，已截断' : ''}）`
+  if (body === undefined) return `${head}（未内联字节）`
+  const fence = markdownFence(body)
+  return `${head}\n${fence}text\n${body}\n${fence}`
+}
+
+/**
+ * 把 DSH prompt 的 content parts 拼成交给宿主的文本：文件回执经 `read_attachment`
+ * 读回，文本内联、二进制占位；无法解析的形态显式失败，不静默丢附件。
+ */
+async function composePromptText(
+  bridge: HostBridge,
+  sessionId: string | undefined,
+  content: readonly PromptAttachmentPart[] | undefined,
+): Promise<{ ok: true; text: string; displayText: string } | { ok: false; error: string }> {
+  let text = ''
+  let displayText = ''
+  let afterAttachment = false
+  const append = (block: string): void => {
+    afterAttachment = true
+    text += text === '' ? block : `\n\n${block}`
+  }
+  for (const part of content ?? []) {
+    if (part.type === 'text') {
+      const chunk = part.text ?? ''
+      if (afterAttachment && chunk !== '') text += '\\n\\n'
+      afterAttachment = false
+      text += chunk
+      displayText += chunk
+      continue
+    }
+    if (part.type === 'image') {
+      // 内联图片（无回执）目前只到占位：桌面模型链路还不消费图片字节。
+      append(attachmentBlock(part.name ?? 'image', part.mediaType ?? 'image/*', 0))
+      continue
+    }
+    if (part.type !== 'file') {
+      return { ok: false, error: `不支持的附件类型：${part.type}` }
+    }
+    if (sessionId === undefined) return { ok: false, error: '附件需要先创建会话再发送' }
+    if (part.receiptId === undefined) {
+      return { ok: false, error: '附件尚未上传完成：缺少回执 id' }
+    }
+    let read: AttachmentReadWire
+    try {
+      read = await bridge.invoke<AttachmentReadWire>('read_attachment', {
+        sessionId,
+        receiptId: part.receiptId,
+        maxBytes: ATTACHMENT_READ_BYTES,
+      })
+    } catch (reason) {
+      const message = reason instanceof Error ? reason.message : String(reason)
+      return { ok: false, error: `读取附件失败：${message}` }
+    }
+    if (TEXTUAL_MEDIA.test(read.mediaType) || TEXTUAL_EXT.test(read.name)) {
+      append(attachmentBlock(read.name, read.mediaType, read.bytes, base64ToText(read.data), read.truncated))
+    } else {
+      append(attachmentBlock(read.name, read.mediaType, read.bytes))
+    }
+  }
+  return { ok: true, text, displayText }
+}
 
 export interface AdapterOptions {
   readonly bridge: HostBridge
@@ -666,7 +774,8 @@ export function createAdapter(options: AdapterOptions): { remote: unknown; dispo
 
   /** 把一条排队消息真正发出去并开回合（与 prompt 同一事件序列；rpcId 回填原始请求身份）。 */
   const launchQueuedTurn = (sessionId: string, journal: Journal, item: QueuedSubmission): void => {
-    if (!titles.has(sessionId)) pushTitle(sessionId, item.text.trim().slice(0, 12) || '新会话')
+    const shown = item.displayText ?? item.text
+    if (!titles.has(sessionId)) pushTitle(sessionId, shown.trim().slice(0, 12) || '新会话')
     journal.queue = journal.queue.filter(candidate => candidate.id !== item.id)
     pushInboxFrame(sessionId, journal)
     if (!journal.taskOpen) openTask(journal)
@@ -676,7 +785,7 @@ export function createAdapter(options: AdapterOptions): { remote: unknown; dispo
     pushEvent(journal, 'user/message', {
       id: `shaniu-user-${journal.seq + 1}`,
       role: 'user',
-      content: [{ type: 'text', text: item.text }],
+      content: [{ type: 'text', text: shown }],
       source: { kind: 'user', rpcId: item.requestId },
     }, { surfaceOp: 'append' })
     dispatch('api-session/status', sessionId, true)
@@ -1205,10 +1314,11 @@ export function createAdapter(options: AdapterOptions): { remote: unknown; dispo
    * host 插件的 handler 里 `agent.steer(createUserMessage(...))`），桌面壳没有运行中
    * 注入面（SH-053），空闲态下等价动作就是走这条与用户输入完全相同的提交链。
    */
-  const submitPromptNow = async (sessionId: string | undefined, text: string, rpcId?: string): Promise<void> => {
+  const submitPromptNow = async (sessionId: string | undefined, text: string, rpcId?: string, displayText?: string): Promise<void> => {
     const agentId = await bridge.invoke<string>('send_task', { task: text, agentId: sessionId })
     const journal = journalOf(agentId)
-    if (!titles.has(agentId)) pushTitle(agentId, text.trim().slice(0, 12) || '新会话')
+    const shown = displayText ?? text
+    if (!titles.has(agentId)) pushTitle(agentId, shown.trim().slice(0, 12) || '新会话')
     // 回合在这里开，不等后端的第一条事件：输入行必须落在回合内，
     // 而 send_task 已经返回 agent_id，说明后端确实接下了这个任务。
     if (!journal.taskOpen) openTask(journal)
@@ -1221,7 +1331,7 @@ export function createAdapter(options: AdapterOptions): { remote: unknown; dispo
     pushEvent(journal, 'user/message', {
       id: `shaniu-user-${journal.seq + 1}`,
       role: 'user',
-      content: [{ type: 'text', text }],
+      content: [{ type: 'text', text: shown }],
       source: { kind: 'user', ...(rpcId === undefined ? {} : { rpcId }) },
     }, { surfaceOp: 'append' })
   }
@@ -1343,8 +1453,10 @@ export function createAdapter(options: AdapterOptions): { remote: unknown; dispo
       }
       return OK({ sessionId: agentId })
     },
-    prompt: async (request: { sessionId?: string; requestId?: string; content?: readonly { type: string; text?: string }[] }) => {
-      const text = (request.content ?? []).filter(part => part.type === 'text').map(part => part.text ?? '').join('')
+    prompt: async (request: { sessionId?: string; requestId?: string; content?: readonly PromptAttachmentPart[] }) => {
+      const composed = await composePromptText(bridge, request.sessionId, request.content)
+      if (!composed.ok) return FAIL(composed.error)
+      const text = composed.text
       // 本会话回合进行中 → 客户端排队（上游宿主 durable inbox 的前端等价物）：
       // 登记进队列 + 推 inbox 投影行（QueueDock 出行、可编辑/移除），回合收口后按序
       // 自动补发。跨会话撞全局单任务闸仍走原路报错（队列只管本会话的收口补发）。
@@ -1361,7 +1473,7 @@ export function createAdapter(options: AdapterOptions): { remote: unknown; dispo
           return OK({ accepted: true })
         }
       }
-      submitPromptNow(request.sessionId, text, request.requestId)
+      submitPromptNow(request.sessionId, text, request.requestId, composed.displayText)
       return OK({ accepted: true })
     },
     cancel: async (request: { sessionId?: string } = {}) => {
@@ -1686,6 +1798,7 @@ export function createAdapter(options: AdapterOptions): { remote: unknown; dispo
             }
           }
           item.text = text
+          item.displayText = text
           pushInboxFrame(request.sessionId!, journal)
           return OK({ accepted: true })
         }
