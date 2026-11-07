@@ -282,7 +282,16 @@ impl AppConfig {
                 // 查表规则（off 空值不发、未声明不发）不该散进每个请求构造点。
                 let level = p.reasoning_effort.trim();
                 let reasoning_effort = if level.is_empty() {
-                    None
+                    // 初始默认（用户拍板，2026-11-07）：没选择过档位时回落声明的
+                    // `high`，与席位 catalog 的 defaultEffort 预选同一规则；模型没
+                    // 声明 high（或其 wire 值为空）就维持不发，不发明一个档位。
+                    // 显式选过 off 的（reasoning_effort = "off"）不进这一支。
+                    p.models
+                        .iter()
+                        .find(|m| m.id == p.model)
+                        .and_then(|m| m.reasoning_efforts.get("high"))
+                        .filter(|wire| !wire.is_empty())
+                        .cloned()
                 } else {
                     p.models
                         .iter()
@@ -1436,9 +1445,19 @@ mod provider_tests {
         cfg.providers = vec![listed.clone()];
         assert_eq!(cfg.effective_model().reasoning_effort, None);
 
-        // 未选（空）→ 不发
+        // 未选（空）→ 初始默认回落声明的 high（用户拍板 2026-11-07）
         listed.reasoning_effort = String::new();
-        cfg.providers = vec![listed];
+        cfg.providers = vec![listed.clone()];
+        assert_eq!(cfg.effective_model().reasoning_effort.as_deref(), Some("high"));
+
+        // 声明里没有 high → 初始默认无从谈起，维持不发
+        let mut partial = profile("longcat", "https://lc/v1", "LongCat-2.5");
+        partial.models = vec![{
+            let mut r = row("LongCat-2.5");
+            r.reasoning_efforts = [("low".to_string(), "low".to_string())].into_iter().collect();
+            r
+        }];
+        cfg.providers = vec![partial];
         assert_eq!(cfg.effective_model().reasoning_effort, None);
     }
 

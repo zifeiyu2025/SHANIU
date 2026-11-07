@@ -184,6 +184,22 @@ const LONGCAT_WITH_EFFORTS: Row = {
   }],
 }
 
+/** 声明了推理档位但从未选择过（初始态）：reasoning_effort 为空。 */
+const LONGCAT_EFFORTS_UNSELECTED: Row = {
+  ...LONGCAT_WITH_EFFORTS,
+  reasoning_effort: '',
+}
+
+/** 声明了推理档位但没有 high 档（初始默认无从谈起）。 */
+const LONGCAT_EFFORTS_NO_HIGH: Row = {
+  ...LONGCAT,
+  reasoning_effort: '',
+  models: [{
+    id: 'LongCat-2.5', name: 'LongCat 2.5', context_window: 128_000, max_tokens: 8_192, input: ['text'],
+    reasoning_efforts: { off: '', low: 'low' },
+  }],
+}
+
 function profileValue(overrides: Record<string, unknown> = {}): Record<string, unknown> {
   return {
     displayName: 'MiniMax',
@@ -471,6 +487,27 @@ describe('settings 面：写路径', () => {
     expect((keep['value'] as { selected: { reasoningEffort?: string } }).selected.reasoningEffort).toBe('low')
     const resaved = host.calls.filter(call => call.command === 'save_providers').at(-1)?.args as { providers: { reasoning_effort: string }[] }
     expect(resaved.providers[0]!.reasoning_effort).toBe('low')
+  })
+
+  it('初始档位默认（用户拍板 2026-11-07）：未选择过时席位预选声明的 high，与请求侧回落同规则', async () => {
+    // 未选择（reasoning_effort 空）+ 声明了 high → defaultEffort 预选 high
+    const host = fakeHost([LONGCAT_EFFORTS_UNSELECTED])
+    host.active = 'longcat'
+    const face = faceOf(host)
+    await face.credentials.set('LONGCAT_API_KEY', 'k')
+    const catalog = (await face.session.modelCatalog())['value'] as {
+      groups: { models: { reasoning?: { defaultEffort?: string } }[] }[]
+    }
+    expect(catalog.groups[0]!.models[0]!.reasoning?.defaultEffort).toBe('high')
+
+    // 声明里没有 high → 不给 defaultEffort（席位维持无预选），不发明档位
+    const withoutHigh = fakeHost([LONGCAT_EFFORTS_NO_HIGH])
+    withoutHigh.active = 'longcat'
+    const face2 = faceOf(withoutHigh)
+    await face2.credentials.set('LONGCAT_API_KEY', 'k')
+    const catalog2 = (await face2.session.modelCatalog())['value'] as {
+      groups: { models: { reasoning?: { defaultEffort?: string } }[] }[] }
+    expect(catalog2.groups[0]!.models[0]!.reasoning?.defaultEffort).toBeUndefined()
   })
 
   it('未接线的配置域直接拒绝，不返回一个能写但没人读的空文档', async () => {

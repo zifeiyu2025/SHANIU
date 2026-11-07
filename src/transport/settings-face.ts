@@ -528,14 +528,21 @@ export function createSettingsFace(bridge: HostBridge, options: SettingsFaceOpti
         const out: Record<string, unknown> = { id: String(model.id ?? ''), name: String(model.name ?? model.id ?? '') }
         // 声明了推理档位的模型把可选档带给席位（SH-096）：下拉按 efforts 列档、
         // 按 defaultEffort 预选；未声明的模型不出档位（席位的既有判据）。
+        // 初始默认（用户拍板，2026-11-07）：没选择过档位时预选声明的 high——
+        // 与后端 effective_model 的请求侧回落同一规则（config.rs），两侧不漂移；
+        // 模型没声明 high（或其 wire 值为空）就不给 defaultEffort，不发明档位。
         const declared = row.models.find(candidate => candidate.id === out.id)?.reasoningEfforts
         if (declared !== undefined && Object.keys(declared).length > 0) {
           const efforts = THINKING_LEVELS.filter(level => level in declared)
             .map(level => ({ id: level, name: level }))
           const selected = row.reasoningEffort ?? ''
+          const highDeclared = declared['high'] !== undefined && declared['high'].trim() !== ''
+          const defaultEffort = selected !== '' && selected in declared
+            ? selected
+            : highDeclared ? 'high' : undefined
           out.reasoning = {
             efforts,
-            ...(selected !== '' && selected in declared ? { defaultEffort: selected } : {}),
+            ...(defaultEffort !== undefined ? { defaultEffort } : {}),
           }
         }
         return out
