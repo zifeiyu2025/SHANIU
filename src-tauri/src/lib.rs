@@ -9,6 +9,7 @@ pub mod model_discovery;
 pub mod sandbox;
 pub mod permission;
 pub mod rollout;
+pub mod session_query;
 pub mod session_title;
 pub mod tool_router;
 pub mod tools;
@@ -232,6 +233,23 @@ fn load_session(app: tauri::AppHandle, agent_id: String) -> Result<Vec<SessionEn
         .join(format!("{agent_id}.jsonl"));
     let archive = rollout::read(&path).map_err(|e| format!("档案读不回: {e}"))?;
     Ok(project_entries(&archive.items))
+}
+
+/// 会话全文搜索（SH-113）：宿主侧 SQLite FTS5 派生索引。
+///
+/// 入参按 vendored wire 只有 `{query}`（DSH `session.search` 不送 cursor/limit，
+/// 宿主不做续页）；返回 `{items: [{sessionId, snippet}], hasMore}`，其中 `hasMore`
+/// 表示「命中会话数超过宿主固定上限 20，请收窄查询」，只驱动 UI 一行提示。
+/// 宿主按 sessionId 去重、每会话只给最强命中的一条纯文本 snippet。索引落在
+/// `<data_root>/cache/`，对 rollout 档案**只读零写入**；打开/查询/档案读失败一律
+/// 给类型化 [`session_query::SearchError`]，绝不返回空表冒充"没搜到"。
+#[tauri::command]
+fn search_sessions(
+    app: tauri::AppHandle,
+    query: String,
+) -> Result<session_query::SearchPage, session_query::SearchError> {
+    let state = app.state::<AppState>();
+    session_query::search(&state.data_root(), &query)
 }
 
 /// 归档/置顶/排序操作的类型化错误（SH-100）：`code` 给前端按类映射 wire 错误码
@@ -1173,6 +1191,7 @@ pub fn run() {
             resume_session,
             list_sessions,
             load_session,
+            search_sessions,
             fork_session,
             rename_session,
             archive_session,

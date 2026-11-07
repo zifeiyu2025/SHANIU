@@ -44,6 +44,10 @@ tokio = { version = "1", features = ["macros", "rt", "process", "io-util", "time
 tracing = "0.1"
 tracing-subscriber = "0.3"
 tracing-appender = "0.2"
+# SH-113 会话全文搜索：宿主侧 SQLite FTS5 派生索引（独立可丢弃的只读派生库）。
+# `bundled` 让 libsqlite3-sys 编译 SQLite amalgamation 并带 -DSQLITE_ENABLE_FTS5
+# （rusqlite 没有独立 fts5 feature，unicode61 tokenizer 是 FTS5 内置）。MIT 许可。
+rusqlite = { version = "0.37", features = ["bundled"] }
 # DPAPI（config.rs 密钥存取，§6 已确认方案）：微软官方 Win32 绑定，最小 feature 面
 # M2-c 沙箱：RestrictedToken（Security）+ JobObject + 进程创建（Threading）
 windows = { version = "0.62", features = [
