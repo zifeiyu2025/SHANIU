@@ -20,11 +20,15 @@ function ApprovalFlow(props: FactoryComponentPropsOf<'conversation.approval.card
   const detail = props.callId === undefined ? null : props.renderSlot('conversation.approval.detail', { callId: props.callId })
   const [answered, setAnswered] = useState(false)
   const waiting = useRef(false)
+  // SH-025 / ADR-003：审批卡默认焦点在「拒绝」。上游卡片没有自动聚焦（Enter=允许），
+  // 对高风险操作不是安全默认；焦点落在拒绝上后 Enter 也只拒绝，Tab 才能移到允许。
+  const rejectRef = useRef<HTMLButtonElement | null>(null)
   const active = useRef(true)
   const composing = useRef(false)
   const compositionEnded = useRef(false)
   useEffect(() => {
     active.current = true
+    rejectRef.current?.focus()
     return () => { active.current = false }
   }, [])
   const answer = (send: () => Promise<void>): void => {
@@ -77,7 +81,7 @@ function ApprovalFlow(props: FactoryComponentPropsOf<'conversation.approval.card
           {detail !== null && <div className={css.command}>{detail}</div>}
         </div>
         <div className={css.actionRow}>
-          <Button variant="outline" className={css.reject} disabled={answered} onClick={() => { answer(onReject) }}>
+          <Button ref={rejectRef} variant="outline" className={css.reject} disabled={answered} onClick={() => { answer(onReject) }}>
             {t('reject')}
           </Button>
           <Button variant={onAlways === undefined ? 'primary' : 'outline'} disabled={answered} onClick={() => { answer(onAllow) }}>

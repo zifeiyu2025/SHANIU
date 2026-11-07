@@ -87,11 +87,10 @@ impl ApprovalBroker {
         });
         let outcome = tokio::select! {
             resp = rx => match resp {
-                // allow_always 仅 execute 级记忆（ADR-003：destructive 永不记忆）
-                Ok(d @ ApprovalDecision::Allow) => {
-                    self.remember_if_execute(tool, risk);
-                    GateOutcome::from(d)
-                }
+                // 允许一次 = 只放行这一次，**不记忆**。ADR-003 的"本会话记住"只由
+                // AllowAlways 触发；把 Allow 也写进 remembered_execute 会让用户点一次
+                // 「允许一次」后，同进程后续 execute 全部静默放行（真机复测发现）。
+                Ok(ApprovalDecision::Allow) => GateOutcome::Allowed,
                 Ok(d @ ApprovalDecision::AllowAlways) => {
                     self.remember_if_execute(tool, risk);
                     GateOutcome::from(d)
@@ -224,6 +223,49 @@ mod tests {
             .gate("unified_exec", &args(), "c4", policy::SessionPolicy { approval: ApprovalMode::Ask, sandbox: SandboxMode::WorkspaceWrite }, &sink, &cancel)
             .await;
         assert_eq!(out, GateOutcome::Allowed);
+    }
+
+    #[tokio::test]
+    async fn allow_once_does_not_remember_execute() {
+        let broker = Arc::new(ApprovalBroker::new());
+        let cancel = CancellationToken::new();
+        let sink = sink();
+        // 第一次 execute：允许一次
+        let b = broker.clone();
+        let s = sink.clone();
+        let c1 = cancel.clone();
+        let gate1 = tokio::spawn(async move {
+            b.gate("unified_exec", &args(), "c6", policy::SessionPolicy { approval: ApprovalMode::Ask, sandbox: SandboxMode::WorkspaceWrite }, &s, &c1).await
+        });
+        let mut first_prompted = false;
+        for _ in 0..200 {
+            if broker.has_pending("appr-c6") {
+                first_prompted = true;
+                assert!(broker.resolve("appr-c6", ApprovalDecision::Allow));
+                break;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+        }
+        assert!(first_prompted, "第一次 execute 必须挂起等审批");
+        assert_eq!(gate1.await.unwrap(), GateOutcome::Allowed);
+        // 第二次 execute 必须重新询问：Allow 不得写入 remembered_execute
+        let b = broker.clone();
+        let s2 = sink.clone();
+        let c2 = cancel.clone();
+        let gate2 = tokio::spawn(async move {
+            b.gate("unified_exec", &args(), "c7", policy::SessionPolicy { approval: ApprovalMode::Ask, sandbox: SandboxMode::WorkspaceWrite }, &s2, &c2).await
+        });
+        let mut prompted = false;
+        for _ in 0..200 {
+            if broker.has_pending("appr-c7") {
+                prompted = true;
+                assert!(broker.resolve("appr-c7", ApprovalDecision::Deny));
+                break;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+        }
+        assert!(prompted, "「允许一次」不得记忆 execute：第二次必须挂起等审批");
+        assert_eq!(gate2.await.unwrap(), GateOutcome::Denied);
     }
 
     #[tokio::test]
