@@ -3,6 +3,7 @@ pub mod agent_loop;
 pub mod app_state;
 pub mod config;
 pub mod compaction;
+pub mod event_journal;
 pub mod events;
 pub mod file_actions;
 pub mod file_references;
@@ -63,7 +64,7 @@ fn send_task(app: tauri::AppHandle, task: String, agent_id: Option<String>) -> R
             // 不阻塞主回合；失败/关开关/没密钥都静默保持截断 fallback。
             session_title::spawn_generation(app.clone(), new_id.clone(), task.clone());
             let sink: Arc<dyn events::EventSink> =
-                Arc::new(events::TauriEventSink::root(app.clone(), new_id.clone()));
+                Arc::new(events::TauriEventSink::root(app.clone(), new_id.clone()).with_journal(Arc::new(event_journal::FileEventJournal::new(app.state::<AppState>().data_root().join(config::SESSIONS_DIR)))));
             tauri::async_runtime::spawn(async move {
                 let _ = agent.run_task(&task, sink, cancel).await;
                 app.state::<AppState>().end_task();
@@ -114,7 +115,7 @@ fn continue_session(
         if session_workspace.as_os_str().is_empty() { state.workspace_root() } else { session_workspace },
         Some(Arc::new(writer)),
     )?;
-    let sink: Arc<dyn events::EventSink> = Arc::new(events::TauriEventSink::root(app.clone(), agent_id));
+    let sink: Arc<dyn events::EventSink> = Arc::new(events::TauriEventSink::root(app.clone(), agent_id).with_journal(Arc::new(event_journal::FileEventJournal::new(app.state::<AppState>().data_root().join(config::SESSIONS_DIR)))));
     // spawn 的 future 必须是 'static：借用的 app 只能换成 owned 句柄再 move 进去。
     let app_handle = app.clone();
     tauri::async_runtime::spawn(async move {
@@ -142,6 +143,25 @@ fn resume_session(app: tauri::AppHandle, agent_id: String, task: String) -> Resu
 fn list_sessions(app: tauri::AppHandle) -> Vec<rollout::SessionSummary> {
     let state = app.state::<AppState>();
     rollout::list(&state.data_root().join(rollout::ROLLOUT_DIR))
+}
+
+/// 读一页会话事件信封（SH-094 批 1）：`after_event_id` 之后、最多 `limit` 条。
+///
+/// 这是续播的原语：客户端重连后带最后一条 `event_id` 再取，`has_more` 为真时继续。
+#[tauri::command]
+fn read_session_events(
+    app: tauri::AppHandle,
+    session_id: String,
+    after_event_id: Option<String>,
+    limit: Option<usize>,
+) -> Result<event_journal::EventPage, String> {
+    let state = app.state::<AppState>();
+    event_journal::read_after(
+        &state.data_root().join(config::SESSIONS_DIR),
+        &session_id,
+        after_event_id.as_deref(),
+        limit.unwrap_or(event_journal::DEFAULT_LIMIT),
+    )
 }
 
 /// 打开一个会话所需的历史条目。
@@ -1450,6 +1470,7 @@ pub fn run() {
             get_plan_mode,
             set_plan_mode,
             get_product_dirs,
+            read_session_events,
             read_clipboard_text,
             write_clipboard_text,
             workspace_files::workspace_file_stat,

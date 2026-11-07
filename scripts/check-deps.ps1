@@ -65,6 +65,7 @@ $allow = @{
     'open_in_app'     = @()                                                          # E32（SH-092 批 3 open-in-app：注册表关联 + ShellExecute，零业务依赖）
     'file_references' = @('workspace_files', 'app_state')                             # E33（SH-090 批 1 @file 候选：复用会话根解析 + tauri::State 取句柄）
     'session_reference' = @('model_client', 'rollout', 'workspace_files', 'app_state') # E34（SH-090 批 2 会话引用：历史项类型 + 读被引用档案 + 会话根 + State 句柄）
+    'event_journal'   = @()                                                          # E36（SH-094 批 1 可续播事件日志：只追加/游标读 AgentEvent；events 属 infra 全局放行，零业务依赖）
 }
 # rollout 已落地（SH-030）：它只借用 model_client 的 HistoryItem 作为条目载荷，
 # 不反向依赖循环或工具层——档案是被读写的对象，不是参与者。

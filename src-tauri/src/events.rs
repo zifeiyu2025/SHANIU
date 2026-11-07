@@ -4,7 +4,7 @@
 //! 新增事件类型或新增 `Option` 字段；字段命名 snake_case，与 `src/transport/types.ts` 镜像。
 //! 修改本文件必须同步前端镜像并更新 `tests/event_schema.rs`。
 
-use std::sync::Mutex;
+use std::sync::{Arc, Mutex};
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use serde::{Deserialize, Serialize};
@@ -174,6 +174,13 @@ pub struct AgentEvent {
     pub msg: EventMsg,
 }
 
+/// 事件信封持久化缝（SH-094 批 1，依赖倒置）。`events` 是共享基础设施，不反向依赖
+/// 具体日志模块；组合根把 `event_journal` 的实现注入 `TauriEventSink`，由此断开
+/// `events ↔ event_journal` 环（FF-1：events 自身只能依赖 config/events）。
+pub trait EventJournal: Send + Sync {
+    fn append(&self, event: &AgentEvent) -> Result<(), String>;
+}
+
 static EVENT_IDS: Mutex<ulid::Generator> = Mutex::new(ulid::Generator::new());
 
 fn emit_root_event(
@@ -199,17 +206,31 @@ fn emit_root_event(
 pub struct TauriEventSink {
     app: tauri::AppHandle,
     session_id: String,
+    /// SH-094 批 1：注入的事件信封持久化缝。None = 不落盘（测试/无目录启动）。
+    journal: Option<Arc<dyn EventJournal>>,
 }
 
 impl TauriEventSink {
     pub fn root(app: tauri::AppHandle, session_id: String) -> Self {
-        Self { app, session_id }
+        Self { app, session_id, journal: None }
+    }
+
+    /// 注入持久化实现：信封逐条落盘；广播仍是主通道，日志失败只告警不中断回合。
+    pub fn with_journal(mut self, journal: Arc<dyn EventJournal>) -> Self {
+        self.journal = Some(journal);
+        self
     }
 }
 
 impl EventSink for TauriEventSink {
     fn emit(&self, msg: &EventMsg) -> Result<(), String> {
         emit_root_event(&self.session_id, msg, |event| {
+            // 先落盘再广播：收到事件的客户端按 event_id 续播时，日志里一定已有它。
+            if let Some(journal) = &self.journal {
+                if let Err(error) = journal.append(event) {
+                    tracing::warn!("事件日志写入失败（广播继续）: {error}");
+                }
+            }
             self.app.emit(EVENT_CHANNEL, event).map_err(|e| format!("事件广播失败: {e}"))
         })
     }
