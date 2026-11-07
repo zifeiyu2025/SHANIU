@@ -11,6 +11,17 @@
  * `formatSessionMarkdown`、同一套 CopyToast 与并发规则。上游那条路依赖 host 的
  * `session.markdown` HTTP 路由，桌面壳没有 HTTP 面，所以用**构造注入的 fetcher**
  * 换成 `load_session` + 本地渲染（见 `export-markdown.ts`），不改任何移植源码。
+ *
+ * **SH-114 批 2**：「下载会话日志」同理挂上游 `SessionLogDownloadController` +
+ * `SessionLogDownloadDialog`——HEAD 探活换成 `export_probe`，`save` 换成
+ * 「保存对话框 + Rust 写 ZIP」（见 `export-zip.ts`）。菜单因此是三入口：
+ * 复制为 Markdown / 下载会话日志 / 复制会话 ID。
+ *
+ * **`/export` 命令未接**：上游那条命令注册在 **host 插件**（`session-log-export/src/index.ts`
+ * 的 `apply`，inject `['commands', 'connection']`），桌面壳没有 host 命令注册表，
+ * 前端 `ui-commands` 的 `commands.execute` 只认 `/permission`、`/plan off` 两条。
+ * 这里不伪造一个"看起来能跑"的 `/export`——菜单入口已经覆盖同一动作，
+ * 缺口记在 docs/05 完成注里。
  */
 import type { Context } from '@deepseek-ai/cordis'
 import type { SessionId } from '@deepseek-ai/dsh-session/types'
@@ -18,7 +29,14 @@ import type {} from '@deepseek-ai/dsh-client-ui-renderer/client'
 import type {} from '@deepseek-ai/dsh-client-ui-conversation/client'
 import type {} from '@deepseek-ai/dsh-client-ui-context-menu/client'
 import type {} from '@deepseek-ai/dsh-client-ui-layout/client'
+import { IconDownloadOutlineRegular } from '@deepseek-ai/dsh-client-ui-primitives'
 import { SessionMarkdownCopyController } from '../dsh/packages/session-query/session-log-export/src/client/copy-controller'
+import {
+  SessionLogDownloadController,
+} from '../dsh/packages/session-query/session-log-export/src/client/controller'
+import {
+  SessionLogDownloadDialog, type SessionLogDownloadDialogInjected,
+} from '../dsh/packages/session-query/session-log-export/src/client/Dialog'
 import {
   SessionMarkdownCopyToast, type SessionMarkdownCopyToastInjected,
 } from '../dsh/packages/session-query/session-log-export/src/client/CopyToast'
@@ -30,6 +48,7 @@ import { writeClipboardText } from '../host/clipboard'
 import { ExplorerButton, OPEN_LOCAL_COMMAND } from './ExplorerButton'
 import { openInSystemExplorer } from './open-workspace'
 import { exportMarkdownFetcher } from './export-markdown'
+import { exportZipFetcher, exportZipSaver } from './export-zip'
 import { en, NS, zh } from './locales'
 
 /** 必需服务：槽位、词典、菜单、快捷键、会话与对话视图。 */
@@ -124,6 +143,26 @@ export function apply(ctx: Context): void {
   )
   ctx.effect(() => async () => { await copyController.dispose() }, 'shaniu-header: markdown copy lifecycle')
 
+  // SH-114 批 2：ZIP 导出。上游 controller 的「HEAD 探活 → save 触发」形状原样保留，
+  // 只把 HTTP 载体换成宿主命令（探活 = export_probe；保存 = 对话框 + 写盘），
+  // 取舍与"为什么 save 是 fire-and-forget"见 export-zip.ts 文件头。
+  const downloadController = new SessionLogDownloadController(
+    exportZipFetcher(tauriBridge()),
+    exportZipSaver(tauriBridge(), titleOf, (message, error) => {
+      ctx.logger.warn('%s: %s', message, error)
+    }),
+  )
+  ctx.effect(() => async () => { await downloadController.dispose() }, 'shaniu-header: zip download lifecycle')
+
+  // 菜单图标：上游把这组 key 注册在自己的 client 插件里，SHANIU 没挂它的 apply，
+  // 所以在这里补同一个 key——菜单项只认 key，图标实现放哪不影响文案与行为。
+  ctx.slots.inject('contextMenu.icon', function* () {
+    yield ctx.slots.register({
+      name: 'contextMenu.icon',
+      key: 'session-log-download.download',
+    }, IconDownloadOutlineRegular)
+  })
+
   ctx.slots.inject('shell.overlay', () => ctx.slots.register({
     name: 'shell.overlay',
     id: 'shaniu-session-copy-toast',
@@ -134,18 +173,45 @@ export function apply(ctx: Context): void {
     }),
   }, SessionMarkdownCopyToast))
 
+  ctx.slots.inject('shell.overlay', () => ctx.slots.register({
+    name: 'shell.overlay',
+    id: 'shaniu-session-log-download',
+    locale: EXPORT_NS,
+    inject: (): SessionLogDownloadDialogInjected => ({
+      hooks: { sessionLogDownload: downloadController.store },
+      dismiss: (sessionId: SessionId) => { downloadController.dismiss(sessionId) },
+    }),
+  }, SessionLogDownloadDialog))
+
+  const tExport = ctx.locale.bind(EXPORT_NS)
+
   ctx.effect(() => ctx.contextMenus.register({
     id: 'shaniu.session-header',
     target: 'sessionHeader',
     order: 0,
+    // 下载项在飞行中要变禁用、复制项在复制中要变禁用——上游靠 observe 让菜单
+    // 在 store 变化时重算；少了它只有"下一次打开菜单"才看得到状态，点了第二次
+    // 才发现被合并（controller 会把并发请求并进同一次操作，不至于出错，但表现为
+    // "点了没反应"）。
+    observe: () => [copyController.store, downloadController.store, ctx.locale],
     resolve: ({ sessionId }) => [
       {
         id: 'copy-markdown',
         label: t('menu.copyMarkdown'),
         icon: { key: 'workspace.copy' },
+        disabled: copyController.store.getSnapshot().copying,
         failureLabel: t('menu.copyFailed'),
         // controller 把失败转成 toast 通知，不在这里抛；与上游菜单同一用法。
         run: () => copyController.copy(sessionId),
+      },
+      {
+        id: 'download',
+        // 文案直接取 vendored 词典（8 种语言现成），不往本插件词典再抄一份。
+        label: tExport('menu.download'),
+        icon: { key: 'session-log-download.download' },
+        disabled: downloadController.store.getSnapshot().bySession[sessionId]?.status === 'downloading',
+        failureLabel: t('menu.copyFailed'),
+        run: () => downloadController.download(sessionId),
       },
       {
         id: 'copy-id',

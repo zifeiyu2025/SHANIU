@@ -58,6 +58,7 @@ $allow = @{
     'session_query'= @('rollout', 'model_client')                                  # E24、E25（SH-113 只读派生索引）
     'model_discovery' = @('app_state')                                             # E26（SH-098 命令壳取 tauri::State；config 属 infra 全局放行）
     'session_title'   = @('model_client', 'rollout', 'app_state')                   # E27（SH-104；config 属 infra 全局放行）
+    'session_export'  = @()                                                          # E28（SH-114 批 2 ZIP 编码；零业务依赖，档案读取在组合根 lib.rs）
 }
 # rollout 已落地（SH-030）：它只借用 model_client 的 HistoryItem 作为条目载荷，
 # 不反向依赖循环或工具层——档案是被读写的对象，不是参与者。

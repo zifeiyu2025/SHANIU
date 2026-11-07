@@ -167,9 +167,11 @@ describe('header actions', () => {
     expect(invoke).not.toHaveBeenCalled()
   })
 
-  it('更多操作只保留两项入口，不出现本地与 vendored 的双份「复制 Markdown」', () => {
+  it('更多操作三项入口（复制 Markdown / 下载日志 / 复制 ID），不出现双份「复制 Markdown」', () => {
     const { contributions } = harness()
-    expect(sessionMenu(contributions).map(action => action.id)).toEqual(['copy-markdown', 'copy-id'])
+    // 顺序即渲染顺序：上游是 copy → download，本地补充项排在最后。
+    expect(sessionMenu(contributions).map(action => action.id))
+      .toEqual(['copy-markdown', 'download', 'copy-id'])
   })
 })
 

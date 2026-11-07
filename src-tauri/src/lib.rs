@@ -9,6 +9,7 @@ pub mod model_discovery;
 pub mod sandbox;
 pub mod permission;
 pub mod rollout;
+pub mod session_export;
 pub mod session_query;
 pub mod session_title;
 pub mod tool_router;
@@ -1070,6 +1071,77 @@ async fn pick_folder(app: tauri::AppHandle) -> Option<String> {
         .map(|path| path.to_string_lossy().into_owned())
 }
 
+/// SH-114 批 2：导出探活（前端 `HEAD` 的落点）。
+///
+/// 只回答"这份档案能不能导出"，并把 SHANIU 档案首行 `SessionMeta` 翻译成上游
+/// `SessionHeader` 的语义（前端用它拼 canonical `session.jsonl` 的首行）。
+/// **不读全部事件**（那是 `load_session` 的事），也不写盘。
+#[tauri::command]
+fn export_probe(
+    app: tauri::AppHandle,
+    session_id: String,
+) -> Result<session_export::ExportHeader, String> {
+    let state = app.state::<AppState>();
+    let path = state
+        .data_root()
+        .join(rollout::ROLLOUT_DIR)
+        .join(format!("{session_id}.jsonl"));
+    let archive = rollout::read(&path).map_err(|e| format!("档案读不回: {e}"))?;
+    match &archive.meta {
+        rollout::RolloutItem::SessionMeta {
+            session_id: id,
+            parent_id,
+            created_at,
+            config_snapshot,
+            ..
+        } => {
+            let cwd = config_snapshot.workspace_root.trim();
+            Ok(session_export::ExportHeader {
+                id: id.clone(),
+                created_at: *created_at,
+                cwd: if cwd.is_empty() {
+                    None
+                } else {
+                    Some(cwd.to_string())
+                },
+                parent_session: parent_id.clone(),
+                // 上游 `delegationDepth` 缺省为 0；SHANIU 只有根/一级子代理两态。
+                delegation_depth: u32::from(parent_id.is_some()),
+            })
+        }
+        _ => Err("档案首行不是 SessionMeta".into()),
+    }
+}
+
+/// SH-114 批 2：会话日志的保存位置选择（原生「另存为」对话框）。
+///
+/// 与 `pick_folder` 同款：阻塞式选择器只在异步命令里用，主线程保持可渲染。
+/// 用户取消返回 None。
+#[tauri::command]
+async fn pick_save_file(app: tauri::AppHandle, default_name: String) -> Option<String> {
+    use tauri_plugin_dialog::DialogExt;
+    app.dialog()
+        .file()
+        .set_title("保存会话日志")
+        .set_file_name(&default_name)
+        .add_filter("ZIP 压缩包", &["zip"])
+        .blocking_save_file()
+        .and_then(|path| path.into_path().ok())
+        .map(|path| path.to_string_lossy().into_owned())
+}
+
+/// SH-114 批 2：把条目写成 ZIP。
+///
+/// 条目内容是"canonical 逻辑会话日志"（上游 `archive.ts` 的原文定义），由前端
+/// `session-events.ts` 那套唯一的事件翻译产出；宿主只负责压缩与路径安全。
+#[tauri::command]
+fn export_session_log(
+    dest: String,
+    entries: Vec<session_export::ExportEntry>,
+) -> Result<session_export::ExportReport, String> {
+    session_export::write_zip(std::path::Path::new(&dest), &entries)
+}
+
 /// 产品目录视图：前端用它把默认工作区基线落到宿主解析出的 `<数据根>\Workspace`。
 #[tauri::command]
 fn get_product_dirs() -> config::ProductDirsView {
@@ -1214,6 +1286,9 @@ pub fn run() {
             delete_api_key,
             open_in_explorer,
             pick_folder,
+            export_probe,
+            pick_save_file,
+            export_session_log,
             get_product_dirs,
             read_clipboard_text,
             write_clipboard_text
