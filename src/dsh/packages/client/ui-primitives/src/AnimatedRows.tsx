@@ -1,5 +1,5 @@
 /** React-commit-driven movement and entry/exit fades for keyed rows. */
-import { Component, createRef, type AriaRole, type ReactNode } from 'react'
+import { Component, createRef, type AriaRole, type KeyboardEvent, type ReactNode } from 'react'
 import css from './AnimatedRows.module.css'
 
 const ROW_FADE_MS = 100
@@ -16,6 +16,8 @@ export interface AnimatedRowsProps {
   ready: boolean
   /** Changes that replace the view or reveal hidden rows settle immediately. */
   resetKey: string
+  /** List key handling owned by the component that supplies the rows. */
+  onKeyDown?: (event: KeyboardEvent<HTMLDivElement>) => void
 }
 
 interface RowPosition {
@@ -184,6 +186,7 @@ export class AnimatedRows extends Component<AnimatedRowsProps> {
         className={this.props.className}
         role={this.props.role}
         aria-label={this.props.label}
+        onKeyDown={this.props.onKeyDown}
         onPointerDownCapture={() => { this.armed = true }}
         onKeyDownCapture={() => { this.armed = true }}
       >

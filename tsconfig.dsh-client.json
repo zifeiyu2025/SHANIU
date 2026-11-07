@@ -3886,6 +3886,7 @@
   "./src/dsh/packages/client/ui-workspace/src/client/rows/WorkspaceBrowser.module.css",
   "./src/dsh/packages/client/ui-workspace/src/client/rows/WorkspaceBrowser.tsx",
   "./src/dsh/packages/client/ui-workspace/src/client/rows/WorkspaceDialogs.tsx",
+  "./src/dsh/packages/client/ui-workspace/src/client/rows/treeKeyboard.ts",
   "./src/dsh/packages/client/ui-workspace/src/client/session-actions/ArchiveSession.tsx",
   "./src/dsh/packages/client/ui-workspace/src/client/session-actions/PinSession.tsx",
   "./src/dsh/packages/client/ui-workspace/src/client/session-actions/RenameSession.tsx",
