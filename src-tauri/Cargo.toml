@@ -52,7 +52,7 @@ tracing-appender = "0.2"
 # SH-114 批 2 会话日志 ZIP 导出：宿主侧流式压缩，避免整个归档在 WebView 内存里成形。
 # `default-features = false` 只留 deflate——默认 feature 会拖进 bzip2/zstd/aes 这些
 # 本卡用不到的压缩后端与 C 依赖。DEFLATE 等级 6 对齐上游 archive.ts 的默认值。MIT。
-zip = { version = "2", default-features = false, features = ["deflate"] }
+zip = { version = "9", default-features = false, features = ["deflate"] }
 # SH-113 会话全文搜索：宿主侧 SQLite FTS5 派生索引（独立可丢弃的只读派生库）。
 # `bundled` 让 libsqlite3-sys 编译 SQLite amalgamation 并带 -DSQLITE_ENABLE_FTS5
 # （rusqlite 没有独立 fts5 feature，unicode61 tokenizer 是 FTS5 内置）。MIT 许可。

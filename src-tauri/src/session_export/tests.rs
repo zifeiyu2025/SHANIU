@@ -78,7 +78,7 @@ fn writes_readable_zip_with_deflate() {
     assert_eq!(archive.len(), 1);
     {
         let mut entry = archive.by_index(0).expect("第一条");
-        assert_eq!(entry.name(), "session.v4.jsonl");
+        assert_eq!(entry.name().expect("条目名").as_ref(), "session.v4.jsonl");
         assert_eq!(entry.compression(), CompressionMethod::Deflated, "必须走 DEFLATE");
         let mut text = String::new();
         entry.read_to_string(&mut text).expect("读回");
