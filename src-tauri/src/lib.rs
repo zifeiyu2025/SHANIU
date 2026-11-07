@@ -15,6 +15,7 @@ pub mod rollout;
 pub mod session_compact;
 pub mod session_export;
 pub mod session_query;
+pub mod session_reference;
 pub mod session_title;
 pub mod tool_router;
 pub mod tools;
@@ -1460,7 +1461,8 @@ pub fn run() {
             open_in_app::open_in_app_launch,
             open_in_app::workspace_path_applications,
             open_in_app::open_workspace_path,
-            file_references::list_file_references
+            file_references::list_file_references,
+            session_reference::list_session_references
         ])
         .on_window_event(|window, event| {
             // 关闭 = 隐藏到系统托盘（不退出）；真正退出只走托盘菜单「退出」

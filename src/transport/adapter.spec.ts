@@ -82,7 +82,7 @@ function scriptedBridge(
     async invoke<T>(command: string, args?: Record<string, unknown>): Promise<T> {
       calls.push({ command, args })
       if (command === 'get_settings') return state as T
-      if (command === 'workspace_path_applications' || command === 'open_workspace_path' || command === 'list_file_references') {
+      if (command === 'workspace_path_applications' || command === 'open_workspace_path' || command === 'list_file_references' || command === 'list_session_references') {
         if (openHandler === undefined) return (command === 'open_workspace_path' ? undefined : []) as T
         return openHandler(command, args) as T
       }
@@ -2402,9 +2402,16 @@ describe('session.search 接宿主 FTS5 派生索引（SH-113，wire query-only�
     const call = bridge.calls.find(item => item.command === 'list_file_references')
     expect(call?.args).toEqual({ sessionId: 'sess-1', query: 'main' })
     expect(Object.keys(call?.args ?? {}).some(key => key.includes('_'))).toBe(false)
-    const resolver = (faceOf(remote) as unknown as Record<string, Record<string, (...a: unknown[]) => Promise<Record<string, unknown>>>>).sessionReferenceResolver
-    const sessions = await resolver['candidates']!('sess-1', 'x')
-    expect(sessions['value']).toEqual([])
+    const sessionCandidates = [{ sessionId: 'sess-2', label: '旧会话', displayTitle: '旧会话', sameWorkspace: true, createdAt: 1, mention: '@[旧会话](dsh-session:abc)' }]
+    const bridgeWithSessions = scriptedBridge(HOST_SETTINGS, [], undefined, undefined, undefined, undefined, undefined,
+      command => (command === 'list_session_references' ? sessionCandidates : undefined))
+    const second = createAdapter({ bridge: bridgeWithSessions })
+    const resolver = (faceOf(second.remote) as unknown as Record<string, Record<string, (...a: unknown[]) => Promise<Record<string, unknown>>>>).sessionReferenceResolver
+    const sessions = await resolver['candidates']!('sess-1', '旧')
+    expect(sessions['value']).toEqual(sessionCandidates)
+    const sessionCall = bridgeWithSessions.calls.find(item => item.command === 'list_session_references')
+    expect(sessionCall?.args).toEqual({ sessionId: 'sess-1', query: '旧' })
+    second.dispose()
     dispose()
   })
 

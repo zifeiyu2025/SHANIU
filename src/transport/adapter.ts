@@ -2378,12 +2378,18 @@ export function createAdapter(options: AdapterOptions): { remote: unknown; dispo
     },
   }
   /**
-   * 会话引用候选：SH-090 批 1 只接文件引用。会话引用需要「发送时校验 + 捕获被引用会话
-   * 上下文」的宿主面（上游 session-reference 的 pre-step 语义），尚未实现；这里如实给出
-   * 空候选，让 `@` 菜单保留文件组而不是伪造会话行。
+   * 会话引用候选（SH-090 批 2）：宿主读 rollout 摘要、按同工作区优先排序；
+   * mention 的 canonical `dsh-session:` URI 由宿主生成。发送时的校验与上下文捕获在
+   * agent_loop 的 pre-step 展开里完成（见 session_reference.rs）。
    */
   const sessionReferenceResolverNamespace = {
-    candidates: async () => OK([]),
+    candidates: async (sessionId: string, query: string) => {
+      try {
+        return OK(await bridge.invoke<Array<Record<string, unknown>>>('list_session_references', { sessionId, query }))
+      } catch (reason) {
+        return FAIL((reason as { message?: string } | undefined)?.message ?? '无法列出会话引用候选')
+      }
+    },
   }
 
   const namespaces = new Map<string, unknown>([

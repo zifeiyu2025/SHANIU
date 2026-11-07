@@ -291,7 +291,29 @@ impl AgentLoop {
                 }
             }
 
-            let mut stream = match self.backend.stream(&history, &declarations, &instructions).await {
+            // 2.7) 会话引用展开（SH-090 批 2）：只作用于本步请求副本，档案与展示历史不动。
+            // 轮次内的后续采样末尾不是 user 消息，不会重复展开。
+            let expanded = match self.rollout.as_ref() {
+                Some(writer) => {
+                    let dir = writer.path().parent().map(std::path::Path::to_path_buf);
+                    let id = writer.path().file_stem().map(|stem| stem.to_string_lossy().into_owned());
+                    match (dir, id) {
+                        (Some(dir), Some(id)) => crate::session_reference::prepare_request(&history, &dir, &id),
+                        _ => Ok(None),
+                    }
+                }
+                None => Ok(None),
+            };
+            let expanded = match expanded {
+                Ok(value) => value,
+                Err(message) => {
+                    emit(&sink, EventMsg::Error { message });
+                    reason = TurnEndReasonLocal::Failed;
+                    break 'outer;
+                }
+            };
+            let request_history: &[HistoryItem] = expanded.as_deref().unwrap_or(&history);
+            let mut stream = match self.backend.stream(request_history, &declarations, &instructions).await {
                 Ok(s) => s,
                 Err(e) => {
                     emit(&sink, EventMsg::Error { message: e });
@@ -1104,5 +1126,124 @@ mod tests {
         )));
         // 也不应触发审批（守卫先于审批门禁）
         assert!(!events.iter().any(|e| matches!(e, EventMsg::ExecApprovalRequest { .. })));
+    }
+
+    /// SH-090 批 2：会话 mention 只在本步请求副本里展开——首条 user 消息剥离 mention，
+    /// 紧跟一条 `<referenced-sessions>` 上下文；持久化历史（`run_with_history` 的入参）不动。
+    #[tokio::test]
+    async fn session_reference_mentions_expand_into_the_request_only() {
+        use crate::rollout::{ConfigSnapshot, RolloutItem, RolloutWriter};
+
+        struct RecordingBackend {
+            seen: Arc<Mutex<Vec<Vec<HistoryItem>>>>,
+            script: Mutex<VecDeque<Vec<ModelStreamEvent>>>,
+        }
+
+        #[async_trait::async_trait]
+        impl ModelBackend for RecordingBackend {
+            async fn stream(
+                &self,
+                history: &[HistoryItem],
+                _tools: &[ToolDeclaration],
+                _instructions: &str,
+            ) -> Result<ModelStream, String> {
+                self.seen.lock().unwrap().push(history.to_vec());
+                let mut queue = self.script.lock().unwrap();
+                match queue.pop_front() {
+                    Some(script) => Ok(Box::pin(futures::stream::iter(script))),
+                    None => Ok(Box::pin(futures::stream::pending())),
+                }
+            }
+        }
+
+        fn meta(id: &str) -> RolloutItem {
+            RolloutItem::SessionMeta {
+                session_id: id.into(),
+                agent_id: id.into(),
+                parent_id: None,
+                created_at: 1,
+                config_snapshot: ConfigSnapshot {
+                    provider: "p".into(),
+                    base_url: String::new(),
+                    model: "m".into(),
+                    sandbox: "WorkspaceWrite".into(),
+                    approval: "Ask".into(),
+                    workspace_root: "D:/ws".into(),
+                },
+            }
+        }
+
+        let dir = std::env::temp_dir().join(format!(
+            "shaniu-sref-loop-{}-{}",
+            std::process::id(),
+            ulid::Ulid::generate()
+        ));
+        std::fs::create_dir_all(&dir).unwrap();
+        let writer = Arc::new(RolloutWriter::create(&dir, &meta("self")).unwrap());
+        let referenced = RolloutWriter::create(&dir, &meta("ref-1")).unwrap();
+        referenced
+            .append(&RolloutItem::ResponseItem {
+                item: HistoryItem::Message { role: Role::User, text: "被引用的问题".into(), reasoning: None },
+            })
+            .unwrap();
+        referenced
+            .append(&RolloutItem::ResponseItem {
+                item: HistoryItem::Message { role: Role::Assistant, text: "被引用的回答".into(), reasoning: None },
+            })
+            .unwrap();
+
+        let seen = Arc::new(Mutex::new(Vec::new()));
+        let mut router = ToolRouter::new();
+        router.register(Arc::new(EchoTool::default()));
+        let broker = Arc::new(ApprovalBroker::new());
+        let agent = AgentLoop {
+            backend: Arc::new(RecordingBackend {
+                seen: seen.clone(),
+                script: Mutex::new(VecDeque::from([vec![
+                    ModelStreamEvent::OutputTextDelta { delta: "收到".into() },
+                    usage_ev(),
+                ]])),
+            }),
+            router: Arc::new(router),
+            broker: broker.clone(),
+            plan_state: Arc::new(PlanState::new()),
+            workspace_root: std::env::temp_dir(),
+            max_turns: 1,
+            token_budget: 0,
+            policy: policy::SessionPolicy {
+                approval: crate::config::ApprovalMode::Ask,
+                sandbox: crate::config::SandboxMode::WorkspaceWrite,
+            },
+            rollout: Some(writer),
+            rollout_broke: std::sync::atomic::AtomicBool::new(false),
+        };
+        let (sink, _store) = CapturingSink::new();
+        let task = format!(
+            "请参考 @[旧会话]({}) 回答",
+            crate::session_reference::encode_uri("ref-1")
+        );
+        agent
+            .run_with_history(
+                vec![HistoryItem::Message { role: Role::User, text: task, reasoning: None }],
+                0,
+                Arc::new(sink),
+                CancellationToken::new(),
+            )
+            .await;
+        let captured = seen.lock().unwrap();
+        let request = captured.first().expect("后端应收到请求");
+        assert_eq!(request.len(), 2, "原消息 + 引用上下文");
+        match &request[0] {
+            HistoryItem::Message { text, .. } => assert_eq!(text, "请参考 @旧会话 回答"),
+            _ => panic!("首条应是剥离 mention 的用户消息"),
+        }
+        match &request[1] {
+            HistoryItem::Message { role: Role::User, text, .. } => {
+                assert!(text.starts_with("## Referenced sessions"));
+                assert!(text.contains("被引用的回答"));
+            }
+            _ => panic!("第二条应是引用上下文"),
+        }
+        std::fs::remove_dir_all(&dir).ok();
     }
 }

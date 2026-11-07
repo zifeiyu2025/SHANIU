@@ -45,7 +45,7 @@ $OutputEncoding = [System.Text.UTF8Encoding]::new($false)
 # 只有共享基础设施 config、events，而它们由下方 $infraModules 全局放行，故表内无需再列，
 # 顺手补进去只会造成冗余。要给这些模块新增业务依赖，必须先改 §2.3.1，再写进这里。
 $allow = @{
-    'agent_loop'   = @('model_client', 'tool_router', 'permission', 'rollout', 'compaction')  # E02–E04、E06、E23
+    'agent_loop'   = @('model_client', 'tool_router', 'permission', 'rollout', 'compaction', 'session_reference')  # E02–E04、E06、E23、E35
     'tool_router'  = @('model_client', 'tools')                                 # E08、E11
     'tools'        = @('tool_router', 'sandbox', 'permission')                   # E12–E14
     'permission'   = @()
@@ -64,6 +64,7 @@ $allow = @{
     'file_actions'    = @()                                                          # E31（SH-092 批 2 原生另存为：base64 解码 + 保存对话框，零业务依赖）
     'open_in_app'     = @()                                                          # E32（SH-092 批 3 open-in-app：注册表关联 + ShellExecute，零业务依赖）
     'file_references' = @('workspace_files', 'app_state')                             # E33（SH-090 批 1 @file 候选：复用会话根解析 + tauri::State 取句柄）
+    'session_reference' = @('model_client', 'rollout', 'workspace_files', 'app_state') # E34（SH-090 批 2 会话引用：历史项类型 + 读被引用档案 + 会话根 + State 句柄）
 }
 # rollout 已落地（SH-030）：它只借用 model_client 的 HistoryItem 作为条目载荷，
 # 不反向依赖循环或工具层——档案是被读写的对象，不是参与者。
