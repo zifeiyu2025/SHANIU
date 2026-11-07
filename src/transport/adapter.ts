@@ -83,6 +83,8 @@ interface QueuedSubmission {
   text: string
   /** 用户气泡展示文本（不含附件块）；缺省回落到 text。 */
   displayText?: string
+  /** 排队消息的可持久图片引用（回合收口补发时重建 image 内容块）。 */
+  images?: readonly PromptImageRef[]
 }
 
 /**
@@ -260,6 +262,59 @@ interface AttachmentReadWire {
   readonly bytes: number
   readonly data: string
   readonly truncated: boolean
+  readonly width?: number
+  readonly height?: number
+}
+
+/** 持久图片引用：与 DSH `ImageAttachmentRef` 同形，随 user/message 内容落 journal。 */
+interface PromptImageRef {
+  readonly attachmentId: string
+  readonly mediaType: string
+  readonly bytes: number
+  readonly width: number
+  readonly height: number
+  readonly name?: string
+}
+
+const IMAGE_MARKER_PREFIX = '<!-- shaniu-image:'
+
+/**
+ * 图片引用在**任务文本**里的隐藏标记：rollout 只存用户消息文本，没有附件字段；
+ * 用一行 HTML 注释（渲染时不可见）把引用带过去，重开档案时解析回 image 内容块。
+ */
+function encodeImageMarker(image: PromptImageRef): string {
+  return `${IMAGE_MARKER_PREFIX}${encodeURIComponent(JSON.stringify(image))} -->`
+}
+
+/** 从档案用户文本里剥离图片标记；返回干净正文与可重建的图片引用。 */
+function decodeImageMarkers(text: string): { text: string; images: PromptImageRef[] } {
+  const images: PromptImageRef[] = []
+  const kept: string[] = []
+  for (const line of text.split('\n')) {
+    if (!line.startsWith(IMAGE_MARKER_PREFIX) || !line.endsWith(' -->')) {
+      kept.push(line)
+      continue
+    }
+    try {
+      const raw = JSON.parse(decodeURIComponent(line.slice(IMAGE_MARKER_PREFIX.length, -4))) as Partial<PromptImageRef>
+      if (typeof raw.attachmentId === 'string' && typeof raw.mediaType === 'string'
+        && typeof raw.bytes === 'number' && typeof raw.width === 'number' && typeof raw.height === 'number') {
+        images.push({
+          attachmentId: raw.attachmentId,
+          mediaType: raw.mediaType,
+          bytes: raw.bytes,
+          width: raw.width,
+          height: raw.height,
+          ...(typeof raw.name === 'string' ? { name: raw.name } : {}),
+        })
+        continue
+      }
+    } catch {
+      // 坏标记当普通文本保留：不因一条注释丢掉用户正文
+    }
+    kept.push(line)
+  }
+  return { text: kept.join('\n'), images }
 }
 
 const TEXTUAL_MEDIA = /^(?:text\/)|^(?:application\/(?:json|xml|x-yaml|yaml|toml|sql|x-sh|x-httpd-php))/i
@@ -298,10 +353,11 @@ async function composePromptText(
   bridge: HostBridge,
   sessionId: string | undefined,
   content: readonly PromptAttachmentPart[] | undefined,
-): Promise<{ ok: true; text: string; displayText: string } | { ok: false; error: string }> {
+): Promise<{ ok: true; text: string; displayText: string; images: PromptImageRef[] } | { ok: false; error: string }> {
   let text = ''
   let displayText = ''
   let afterAttachment = false
+  const images: PromptImageRef[] = []
   const append = (block: string): void => {
     afterAttachment = true
     text += text === '' ? block : `\n\n${block}`
@@ -309,14 +365,14 @@ async function composePromptText(
   for (const part of content ?? []) {
     if (part.type === 'text') {
       const chunk = part.text ?? ''
-      if (afterAttachment && chunk !== '') text += '\\n\\n'
+      if (afterAttachment && chunk !== '') text += '\n\n'
       afterAttachment = false
       text += chunk
       displayText += chunk
       continue
     }
     if (part.type === 'image') {
-      // 内联图片（无回执）目前只到占位：桌面模型链路还不消费图片字节。
+      // 内联图片（无回执）没有 durable id，只能给占位，不能进档案重开。
       append(attachmentBlock(part.name ?? 'image', part.mediaType ?? 'image/*', 0))
       continue
     }
@@ -338,13 +394,27 @@ async function composePromptText(
       const message = reason instanceof Error ? reason.message : String(reason)
       return { ok: false, error: `读取附件失败：${message}` }
     }
-    if (TEXTUAL_MEDIA.test(read.mediaType) || TEXTUAL_EXT.test(read.name)) {
+    if (read.mediaType.startsWith('image/')) {
+      if (read.width === undefined || read.height === undefined || read.width <= 0 || read.height <= 0) {
+        return { ok: false, error: '图片附件缺少有效尺寸，拒绝伪造图片引用' }
+      }
+      const image: PromptImageRef = {
+        attachmentId: part.receiptId,
+        mediaType: read.mediaType,
+        bytes: read.bytes,
+        width: read.width,
+        height: read.height,
+        name: read.name,
+      }
+      images.push(image)
+      append(`${attachmentBlock(read.name, read.mediaType, read.bytes)}\n${encodeImageMarker(image)}`)
+    } else if (TEXTUAL_MEDIA.test(read.mediaType) || TEXTUAL_EXT.test(read.name)) {
       append(attachmentBlock(read.name, read.mediaType, read.bytes, base64ToText(read.data), read.truncated))
     } else {
       append(attachmentBlock(read.name, read.mediaType, read.bytes))
     }
   }
-  return { ok: true, text, displayText }
+  return { ok: true, text, displayText, images }
 }
 
 export interface AdapterOptions {
@@ -785,7 +855,10 @@ export function createAdapter(options: AdapterOptions): { remote: unknown; dispo
     pushEvent(journal, 'user/message', {
       id: `shaniu-user-${journal.seq + 1}`,
       role: 'user',
-      content: [{ type: 'text', text: shown }],
+      content: [
+        ...(item.images ?? []).map(image => ({ type: 'image', attachment: image })),
+        ...(shown === '' ? [] : [{ type: 'text', text: shown }]),
+      ],
       source: { kind: 'user', rpcId: item.requestId },
     }, { surfaceOp: 'append' })
     dispatch('api-session/status', sessionId, true)
@@ -982,10 +1055,14 @@ export function createAdapter(options: AdapterOptions): { remote: unknown; dispo
       if (entry.kind === 'message' && entry.role === 'user') {
         startTurn()
         openStep(0)
+        const parsed = decodeImageMarkers(entry.text)
         pushEvent(journal, 'user/message', {
           id: `shaniu-replay-user-${index}`,
           role: 'user',
-          content: [{ type: 'text', text: entry.text }],
+          content: [
+            ...parsed.images.map(image => ({ type: 'image', attachment: image })),
+            ...(parsed.text === '' ? [] : [{ type: 'text', text: parsed.text }]),
+          ],
           source: { kind: 'user' },
         }, { surfaceOp: 'append' })
       } else if (entry.kind === 'message') {
@@ -1314,7 +1391,7 @@ export function createAdapter(options: AdapterOptions): { remote: unknown; dispo
    * host 插件的 handler 里 `agent.steer(createUserMessage(...))`），桌面壳没有运行中
    * 注入面（SH-053），空闲态下等价动作就是走这条与用户输入完全相同的提交链。
    */
-  const submitPromptNow = async (sessionId: string | undefined, text: string, rpcId?: string, displayText?: string): Promise<void> => {
+  const submitPromptNow = async (sessionId: string | undefined, text: string, rpcId?: string, displayText?: string, images: readonly PromptImageRef[] = []): Promise<void> => {
     const agentId = await bridge.invoke<string>('send_task', { task: text, agentId: sessionId })
     const journal = journalOf(agentId)
     const shown = displayText ?? text
@@ -1331,7 +1408,10 @@ export function createAdapter(options: AdapterOptions): { remote: unknown; dispo
     pushEvent(journal, 'user/message', {
       id: `shaniu-user-${journal.seq + 1}`,
       role: 'user',
-      content: [{ type: 'text', text: shown }],
+      content: [
+        ...images.map(image => ({ type: 'image', attachment: image })),
+        ...(shown === '' ? [] : [{ type: 'text', text: shown }]),
+      ],
       source: { kind: 'user', ...(rpcId === undefined ? {} : { rpcId }) },
     }, { surfaceOp: 'append' })
   }
@@ -1468,12 +1548,14 @@ export function createAdapter(options: AdapterOptions): { remote: unknown; dispo
             id: `shaniu-queued-${queueSeq}`,
             requestId: request.requestId,
             text,
+            displayText: composed.displayText,
+            images: composed.images,
           }]
           pushInboxFrame(request.sessionId, busy)
           return OK({ accepted: true })
         }
       }
-      submitPromptNow(request.sessionId, text, request.requestId, composed.displayText)
+      submitPromptNow(request.sessionId, text, request.requestId, composed.displayText, composed.images)
       return OK({ accepted: true })
     },
     cancel: async (request: { sessionId?: string } = {}) => {
@@ -1517,7 +1599,7 @@ export function createAdapter(options: AdapterOptions): { remote: unknown; dispo
             pushTitle(sessionId, hostTitle)
           } else {
             const firstUser = entries.find(entry => entry.kind === 'message' && entry.role === 'user')
-            const text = firstUser?.kind === 'message' ? firstUser.text : ''
+            const text = firstUser?.kind === 'message' ? decodeImageMarkers(firstUser.text).text : ''
             pushTitle(sessionId, text.trim().slice(0, 12) || '新会话')
           }
         }
@@ -1643,6 +1725,33 @@ export function createAdapter(options: AdapterOptions): { remote: unknown; dispo
       // 「等下一帧」的 await 上（与 session.follow 同一类悬挂）。
       for await (const frame of projectionLog.tail(from, signal)) yield frame
     },
+    attachment: async (request: { sessionId?: string; attachment?: PromptImageRef } = {}) => {
+      const sessionId = request.sessionId
+      const image = request.attachment
+      if (sessionId === undefined || image === undefined) {
+        return FAIL('附件读取缺少 sessionId 或 attachment')
+      }
+      try {
+        const read = await bridge.invoke<AttachmentReadWire>('read_attachment', {
+          sessionId,
+          receiptId: image.attachmentId,
+          maxBytes: 32 * 1024 * 1024,
+        })
+        return OK({
+          attachment: {
+            ...image,
+            mediaType: read.mediaType,
+            bytes: read.bytes,
+            width: read.width ?? image.width,
+            height: read.height ?? image.height,
+          },
+          data: read.data,
+        })
+      } catch (reason) {
+        const message = reason instanceof Error ? reason.message : String(reason)
+        return FAIL(`读取历史附件失败：${message}`)
+      }
+    },
     page: async (request: { sessionId?: string; throughSeq?: number } = {}) => {
       const journal = request.sessionId === undefined ? undefined : journals.get(request.sessionId)
       if (journal === undefined) return OK({ records: [], hasMore: false, cursor: -1 })
@@ -1764,7 +1873,6 @@ export function createAdapter(options: AdapterOptions): { remote: unknown; dispo
       // 客户端只用它做投影排序，不会据此回放内容。
       return OK({ title: accepted ?? '', seq: journals.get(sessionId)?.seq ?? -1 })
     },
-    attachment: () => unimplemented('session.attachment', 'SH-040'),
     /**
      * 客户端队列的行内操作（上游语义见 commands.ts:447-519；这里操作适配层自己的
      * 待发队列——补发前的编辑/移除都是真实生效的）。steer 的上游语义（注入进行中的
@@ -1799,6 +1907,7 @@ export function createAdapter(options: AdapterOptions): { remote: unknown; dispo
           }
           item.text = text
           item.displayText = text
+          item.images = []
           pushInboxFrame(request.sessionId!, journal)
           return OK({ accepted: true })
         }

@@ -341,6 +341,68 @@ describe('SH-116 批 1：附件 prompt 拼装', () => {
     dispose()
   })
 
+  it('图片附件：journal 带 image 块、任务带隐藏标记，session.attachment 可读回', async () => {
+    const bridge = scriptedBridge(undefined, [], undefined, undefined, undefined, undefined, undefined, undefined, () => ({
+      name: 'shot.png', mediaType: 'image/png', bytes: 4, data: btoa('png!'), truncated: false, width: 2, height: 3,
+    }))
+    const { remote, dispose } = createAdapter({ bridge })
+    const session = faceOf(remote).session
+    const result = await session.prompt({
+      sessionId: 'agent-new',
+      content: [{ type: 'file', receiptId: '01ARZ3NDEKTSV4RRFFQ69G5FAV' }, { type: 'text', text: '看图' }],
+    })
+    expect(result['ok']).toBe(true)
+    const task = String(bridge.calls.find(call => call.command === 'send_task')?.args?.['task'] ?? '')
+    expect(task).toContain('<!-- shaniu-image:')
+    expect(task).toContain('看图')
+
+    const iterator = session.follow({ address: { kind: 'session', sessionId: 'agent-new' } })
+    const snapshot = (await iterator.next()).value as Record<string, unknown>
+    const user = eventsOf(snapshot).find(event => event['type'] === 'user/message')
+    const content = (user?.['data'] as { content: Record<string, unknown>[] }).content
+    expect(content[0]).toMatchObject({
+      type: 'image',
+      attachment: { attachmentId: '01ARZ3NDEKTSV4RRFFQ69G5FAV', mediaType: 'image/png', width: 2, height: 3 },
+    })
+    expect(content[1]).toEqual({ type: 'text', text: '看图' })
+    await iterator.return?.(undefined)
+
+    const read = await (session as unknown as {
+      attachment: (request: { sessionId: string; attachment: Record<string, unknown> }) => Promise<Record<string, unknown>>
+    }).attachment({
+      sessionId: 'agent-new',
+      attachment: { attachmentId: '01ARZ3NDEKTSV4RRFFQ69G5FAV', mediaType: 'image/png', bytes: 4, width: 2, height: 3 },
+    })
+    expect(read['ok']).toBe(true)
+    expect((read['value'] as { data: string }).data).toBe(btoa('png!'))
+    dispose()
+  })
+
+  it('档案回放：用户文本里的图片标记重建为 image 内容块，标题不带标记', async () => {
+    const marker = `<!-- shaniu-image:${encodeURIComponent(JSON.stringify({
+      attachmentId: '01ARZ3NDEKTSV4RRFFQ69G5FAV', mediaType: 'image/png', bytes: 4, width: 2, height: 3, name: 'shot.png',
+    }))} -->`
+    const archive = [
+      { kind: 'message', role: 'user', text: `${marker}\n看图` },
+      { kind: 'message', role: 'assistant', text: '看到了' },
+    ]
+    const bridge = scriptedBridge(undefined, archive)
+    const { remote, dispose } = createAdapter({ bridge })
+    const session = faceOf(remote).session
+    const iterator = session.follow({ address: { kind: 'session', sessionId: 'agent-new' } })
+    const snapshot = (await iterator.next()).value as {
+      records: { event: Record<string, unknown> }[]
+      projections: { values: { title: string | null } }
+    }
+    const user = eventsOf(snapshot as unknown as Record<string, unknown>).find(event => event['type'] === 'user/message')
+    const content = (user?.['data'] as { content: Record<string, unknown>[] }).content
+    expect(content[0]).toMatchObject({ type: 'image', attachment: { attachmentId: '01ARZ3NDEKTSV4RRFFQ69G5FAV' } })
+    expect(content[1]).toEqual({ type: 'text', text: '看图' })
+    expect(snapshot.projections.values.title).not.toContain('shaniu-image')
+    await iterator.return?.(undefined)
+    dispose()
+  })
+
   it('缺回执/读回失败显式失败，绝不静默丢附件', async () => {
     const noReceipt = scriptedBridge()
     const noReceiptAdapter = createAdapter({ bridge: noReceipt })
@@ -1052,7 +1114,6 @@ describe('适配层的命令面映射', () => {
     const terminal = (faceOf(remote) as unknown as Record<string, Record<string, (() => Promise<unknown>) | undefined>>).terminal
     await expect(terminal['run']!()).rejects.toThrow(/未接线/)
     await expect(terminal['run']!()).rejects.toThrow(/SH-040/)
-    await expect(faceOf(remote).session.attachment()).rejects.toThrow(/SH-040/)
     dispose()
   })
 

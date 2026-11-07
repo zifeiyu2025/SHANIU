@@ -58,6 +58,10 @@ pub struct AttachmentRead {
     pub bytes: u64,
     pub data: String,
     pub truncated: bool,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub width: Option<u32>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub height: Option<u32>,
 }
 
 #[derive(Debug, Serialize, Deserialize)]
@@ -225,6 +229,8 @@ pub fn read(
         bytes: meta.bytes,
         data: base64::engine::general_purpose::STANDARD.encode(window),
         truncated,
+        width: meta.width,
+        height: meta.height,
     })
 }
 
@@ -309,6 +315,9 @@ mod tests {
         assert_eq!(image.media_type, "image/png");
         assert_eq!((image.width, image.height), (4, 3));
         assert!(stored.file.is_none());
+        let read = read(&root, "sess-1", &stored.receipt_id, 1024).expect("read image");
+        assert_eq!(read.media_type, "image/png");
+        assert_eq!((read.width, read.height), (Some(4), Some(3)));
         // 图片缺尺寸必须拒绝，不能编一个 0x0 的伪图
         assert!(store(&root, "sess-1", "bad.png", "image/png", "aGk=", None, None).is_err());
         fs::remove_dir_all(&root).ok();
