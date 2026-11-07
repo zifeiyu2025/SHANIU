@@ -179,6 +179,20 @@ fn read_session_events(
     )
 }
 
+/// 反查子代理事件归属的父会话（SH-056 批 2）。
+///
+/// 重启后前端直接打开泳道时只有泳道 id（子代理的 `agent_id`）；子代理没有独立
+/// rollout 档案，靠这条命令找回父会话再整树回放。没有命中如实返回 `null`——
+/// 让前端走空态，而不是把"找不到"包装成一个假的会话 id。
+#[tauri::command]
+fn session_of_agent(app: tauri::AppHandle, agent_id: String) -> Result<Option<String>, String> {
+    let state = app.state::<AppState>();
+    event_journal::owner_session_of_agent(
+        &state.data_root().join(config::SESSIONS_DIR),
+        &agent_id,
+    )
+}
+
 /// gateway 连接信息（SH-094 批 2，控制面）：前端据此连 `ws://127.0.0.1:{port}` 并以 token 鉴权。
 /// token 是 loopback 传输鉴权串（非 API Key），仅经此特权 invoke 通道交给本应用前端，不落日志。
 #[derive(serde::Serialize)]
@@ -1624,6 +1638,7 @@ pub fn run() {
             set_plan_mode,
             get_product_dirs,
             read_session_events,
+            session_of_agent,
             gateway_info,
             upload_attachment,
             read_attachment,

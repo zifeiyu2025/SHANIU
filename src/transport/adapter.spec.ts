@@ -185,7 +185,21 @@ function scriptedBridge(
       }
       if (command === 'create_session') return 'agent-new' as T
       if (command === 'send_task') return (args?.agentId ?? 'agent-new') as T
-      if (command === 'load_session') return archive as T
+      if (command === 'load_session') {
+        // SH-056 批 2：给了事件档案就以它判断"该会话有没有自己的 rollout"——
+        // 子代理没有独立档案（读回空表），父会话有（它落了 agent_id='root' 的事件）。
+        const agentId = String(args?.['agentId'] ?? '')
+        if (journal !== undefined && !journal.some(row => row.session_id === agentId && row.agent_id === 'root')) {
+          return [] as T
+        }
+        return archive as T
+      }
+      // SH-056 批 2：子代理归属反查（宿主 owner_session_of_agent 的替身）。
+      if (command === 'session_of_agent') {
+        if (journal === undefined) return null as T
+        const agentId = String(args?.['agentId'] ?? '')
+        return (journal.find(row => row.agent_id === agentId)?.session_id ?? null) as T
+      }
       // SH-056：事件档案分页读（宿主 read_session_events 的替身，语义同 read_after）。
       if (command === 'read_session_events') {
         if (journal === undefined) return undefined as T
@@ -2970,6 +2984,59 @@ describe('子代理生命周期事件接泳道（SH-053 批 2）', () => {
     await control.return?.(undefined)
     await lane.return?.(undefined)
     await parent.return?.(undefined)
+    dispose()
+  })
+
+  it('泳道直达：重启后不先开父会话，直接 follow 子泳道也能从父档案重建（SH-056 批 2）', async () => {
+    const journal: AgentEvent[] = []
+    const bridge = scriptedBridge(
+      undefined,
+      [
+        { kind: 'message', role: 'user', text: '并行调研两个边界' },
+        { kind: 'message', role: 'assistant', text: '汇总：17 + 42' },
+      ],
+      undefined, undefined, undefined, undefined, undefined, undefined, undefined, undefined, journal,
+    )
+    let ts = 1_760_000_000_000
+    const tick = (ms: number): number => (ts += ms)
+    bridge.emit('agent-new', { type: 'turn_started', turn: 1 }, 'root', tick(0))
+    bridge.emit('agent-new', spawned, 'lane-a', tick(120))
+    bridge.emit('agent-new', { type: 'turn_started', turn: 1 }, 'lane-a', tick(30))
+    bridge.emit('agent-new', { type: 'agent_message_delta', delta: '17' }, 'lane-a', tick(400))
+    bridge.emit('agent-new', { type: 'turn_completed', turn: 1, reason: 'completed' }, 'lane-a', tick(20))
+
+    // 重启：内存 journal 全空，且**先**打开泳道（此前这条路径必然读不回 → 主面板空白）。
+    const { remote, dispose } = createAdapter({ bridge })
+    const session = faceOf(remote).session as ControlFace['session']
+    const lane = followLane(session)
+    const snapshot = (await lane.next()).value as Record<string, unknown>
+    const laneEvents = eventsOf(snapshot)
+
+    // 反查发生在子档案读空之后：不能靠"子代理也有 rollout"的假数据蒙混过关。
+    const commands = bridge.calls.map(call => call.command)
+    expect(commands.indexOf('session_of_agent')).toBeGreaterThan(commands.indexOf('load_session'))
+    expect(bridge.calls.find(call => call.command === 'session_of_agent')?.args).toEqual({ agentId: 'lane-a' })
+    expect(bridge.calls.filter(call => call.command === 'load_session').map(call => call.args?.['agentId']))
+      .toEqual(['lane-a', 'agent-new'])
+
+    expect(laneEvents[0]?.['type']).toBe('subagent/descriptor')
+    expect(laneEvents[0]?.['data']).toMatchObject({ version: 3, label: '探索 transport 边界' })
+    // 任务全文（不是 label 摘要）与正文都来自父档案里的子代理事件。
+    expect(laneEvents.find(event => event['type'] === 'user/message')?.['data']).toMatchObject({
+      content: [{ type: 'text', text: '探索 transport 边界\n第二行背景说明' }],
+    })
+    expect(laneEvents.filter(event => event['type'] === 'assistant/message').at(-1)?.['data']).toMatchObject({
+      message: { content: [{ type: 'text', text: '17' }] },
+    })
+    // 客户端协议判据：cursor 必须等于末条 record 的 seq。
+    expect(snapshot['cursor']).toBe(laneEvents.at(-1)?.['seq'])
+
+    const control = session.control()
+    const baseline = (await control.next()).value
+    const timing = baseline.value.projections['lane-a']?.values['subagentTiming'] as { settledMs?: number }
+    expect(timing.settledMs).toBe(450)
+    await control.return?.(undefined)
+    await lane.return?.(undefined)
     dispose()
   })
 })

@@ -1733,6 +1733,85 @@ export function createAdapter(options: AdapterOptions): { remote: unknown; dispo
     }
   }
 
+  /**
+   * 从 rollout 档案重建一个会话的 journal（SH-033；SH-056 批 2 从 `follow` 抽出）。
+   *
+   * 两条入口共用同一套口径：跟随父会话（重启后重开旧会话）与跟随泳道（子代理
+   * 没有自己的 rollout，先反查父会话再整树回放）。返回 `undefined` = 档案为空，
+   * 调用方决定交空快照还是继续尝试别的来源。
+   *
+   * 标题回填同样只在这里做一次：宿主 `list_sessions` 的 title 已合并自定义标题，
+   * 本地再从档案派生会把它盖掉（重启后用户改过的名字就丢了）。
+   */
+  const rebuildFromArchive = async (sessionId: string): Promise<Journal | undefined> => {
+    const entries = await bridge.invoke<SessionEntry[]>('load_session', { agentId: sessionId })
+    if (entries.length === 0) return undefined
+    const replayed = replayArchive(entries)
+    journals.set(sessionId, replayed)
+    if (!titles.has(sessionId)) {
+      const rows = await bridge.invoke<{ agentId: string; title: string }[]>('list_sessions')
+        .catch((): { agentId: string; title: string }[] => [])
+      const hostTitle = rows.find(row => row.agentId === sessionId)?.title ?? ''
+      if (hostTitle !== '') {
+        pushTitle(sessionId, hostTitle)
+      } else {
+        const firstUser = entries.find(entry => entry.kind === 'message' && entry.role === 'user')
+        const text = firstUser?.kind === 'message' ? decodeImageMarkers(firstUser.text).text : ''
+        pushTitle(sessionId, text.trim().slice(0, 12) || '新会话')
+      }
+    }
+    // 泳道从父会话的事件档案按 agent_id 折叠重建（SH-056 批 1）。
+    await replayLanes(sessionId)
+    return replayed
+  }
+
+  /**
+   * 档案重建后的首个快照与后续帧（`follow` 的两条入口共用）。
+   *
+   * 必须在取 `from` 之前完成泳道回放：结算通知会追加进父 journal，晚取会把它们
+   * 排除在快照之外。
+   */
+  const followReplayed = async function* (
+    sessionId: string,
+    replayed: Journal,
+    signal?: AbortSignal,
+  ): AsyncGenerator<Record<string, unknown>> {
+    const from = replayed.log.length
+    traceFollow(sessionId, 'snapshot-replayed', { from, revision: replayed.revision, records: replayed.log.eventsUpTo(from).length })
+    yield {
+      type: 'snapshot',
+      header: { version: 0, id: sessionId, createdAt: replayed.createdAt, isSeeded: false },
+      cursor: replayed.seq,
+      records: replayed.log.eventsUpTo(from),
+      hasMore: false,
+      projections: {
+        asOfSeq: 0,
+        values: {
+          modelSelection: currentModelSelection(),
+          title: titles.get(sessionId) ?? null,
+          permissions: permissionsProjection(),
+          ...(planProjectionValues()),
+          // 档案重建出的任务清单（todo/write 推导）随快照带出：重开旧会话
+          // TodoDock 直接回到最后一份清单（上游回放语义）。
+          ...todosProjectionValues(replayed),
+          // 重建已折叠出步/回合计数：重开旧会话底部指标立即有值（时间不计，见
+          // replay 的注记）；旧档案没有用量，tokenUsage/contextPressure 不挂。
+          ...metricsProjectionsOf(replayed),
+          // 泳道位：父会话挂 subagentCatalog、泳道挂 subagentTiming（缺席=无数据）。
+          ...subagentProjectionsOf(sessionId),
+          // 目标投影：重开旧会话时从宿主持久层读回当前目标（没有则 null）。
+          goal: await loadGoal(sessionId),
+        },
+      },
+      assistantStream: { revision: replayed.revision },
+    }
+    try {
+      for await (const frame of replayed.log.tail(from, signal)) yield frame
+    } finally {
+      traceFollow(sessionId, 'end-replayed')
+    }
+  }
+
   const addressOf = (request: unknown): string | undefined => {
     const address = (request as { address?: { kind?: string; sessionId?: string; childSessionId?: string } } | undefined)?.address
     return address?.kind === 'session' ? address.sessionId : address?.childSessionId
@@ -1928,72 +2007,41 @@ export function createAdapter(options: AdapterOptions): { remote: unknown; dispo
       // 让 WS gateway 为这个会话补订阅：页面重载后 follow 只重建档案，不补订阅的话
       // 运行中任务的后半段实时帧不会推过来（gateway 只发已订阅会话）。
       bridge.observeEvents?.(sessionId)
-      const journal = journals.get(sessionId)
+      let journal = journals.get(sessionId)
       if (journal === undefined) {
         // 没在当前进程里观察过：能从档案重建就重建（SH-033 的"打开旧会话"），
         // 重建不出内容才交空快照。档案读不回是硬错误——静默交空态会让用户以为
         // 会话没了，而实际只是宿主读失败。
-        const entries = await bridge.invoke<SessionEntry[]>('load_session', { agentId: sessionId })
-        if (entries.length === 0) {
+        const replayed = await rebuildFromArchive(sessionId)
+        if (replayed !== undefined) {
+          yield* followReplayed(sessionId, replayed, signal)
+          return
+        }
+        // 重启后直接打开泳道（SH-056 批 2）：子代理没有自己的 rollout 档案，
+        // `load_session(child)` 必然为空；它的全部事件记在父会话的事件档案里。
+        // 反查归属会话 → 重建父整树 → 泳道 journal 由 `replayLanes` 经同一
+        // `onEvent` 建出来，然后落到下面的实时快照分支（它带 activeAttempt 基线，
+        // 比档案快照更能处理"档案断在流中途"的泳道）。
+        const ownerId = await bridge
+          .invoke<string | null>('session_of_agent', { agentId: sessionId })
+          .catch((reason: unknown) => {
+            console.warn('[SHANIU] 子代理归属反查失败：泳道无法直达恢复', reason)
+            return null
+          })
+        if (ownerId !== null && ownerId !== sessionId) {
+          // 子代理事件经父会话频道广播（gateway 按信封 `session_id` 分发）：只订阅
+          // 泳道 id 收不到任何帧，这里把父会话一并补订阅。
+          bridge.observeEvents?.(ownerId)
+          if (!journals.has(ownerId)) await rebuildFromArchive(ownerId)
+          // 父 rollout 为空也必须回放：泳道的持久事实在事件档案里，不在 rollout 里。
+          if (!journals.has(sessionId)) await replayLanes(ownerId)
+          journal = journals.get(sessionId)
+        }
+        if (journal === undefined) {
           traceFollow(sessionId, 'end-empty')
           yield emptySnapshot(sessionId, now())
           return
         }
-        const replayed = replayArchive(entries)
-        journals.set(sessionId, replayed)
-        if (!titles.has(sessionId)) {
-          // 宿主回显优先：list_sessions 的 title 已合并 titles.json 的自定义标题
-          // （缺省回落后端自己的派生规则）。本地再从档案派生一份会把它盖掉——
-          // 重启后用户改过的名字就丢了（真机实测暴露的缺陷）。
-          const rows = await bridge.invoke<{ agentId: string; title: string }[]>('list_sessions')
-            .catch((): { agentId: string; title: string }[] => [])
-          const hostTitle = rows.find(row => row.agentId === sessionId)?.title ?? ''
-          if (hostTitle !== '') {
-            pushTitle(sessionId, hostTitle)
-          } else {
-            const firstUser = entries.find(entry => entry.kind === 'message' && entry.role === 'user')
-            const text = firstUser?.kind === 'message' ? decodeImageMarkers(firstUser.text).text : ''
-            pushTitle(sessionId, text.trim().slice(0, 12) || '新会话')
-          }
-        }
-        // 泳道从父会话的事件档案按 agent_id 折叠重建（SH-056 批 1）。必须早于
-        // `from` 取值：结算通知会追加进父 journal，晚取会把它们排除在快照外。
-        await replayLanes(sessionId)
-        const from = replayed.log.length
-        traceFollow(sessionId, 'snapshot-replayed', { from, revision: replayed.revision, records: replayed.log.eventsUpTo(from).length })
-        yield {
-          type: 'snapshot',
-          header: { version: 0, id: sessionId, createdAt: replayed.createdAt, isSeeded: false },
-          cursor: replayed.seq,
-          records: replayed.log.eventsUpTo(from),
-          hasMore: false,
-          projections: {
-            asOfSeq: 0,
-            values: {
-              modelSelection: currentModelSelection(),
-              title: titles.get(sessionId) ?? null,
-              permissions: permissionsProjection(),
-              ...(planProjectionValues()),
-              // 档案重建出的任务清单（todo/write 推导）随快照带出：重开旧会话
-              // TodoDock 直接回到最后一份清单（上游回放语义）。
-              ...todosProjectionValues(replayed),
-              // 重建已折叠出步/回合计数：重开旧会话底部指标立即有值（时间不计，见
-              // replay 的注记）；旧档案没有用量，tokenUsage/contextPressure 不挂。
-              ...metricsProjectionsOf(replayed),
-              // 泳道位：父会话挂 subagentCatalog、泳道挂 subagentTiming（缺席=无数据）。
-              ...subagentProjectionsOf(sessionId),
-              // 目标投影：重开旧会话时从宿主持久层读回当前目标（没有则 null）。
-              goal: await loadGoal(sessionId),
-            },
-          },
-          assistantStream: { revision: replayed.revision },
-        }
-        try {
-          for await (const frame of replayed.log.tail(from, signal)) yield frame
-        } finally {
-          traceFollow(sessionId, 'end-replayed')
-        }
-        return
       }
       // 下标在同步块里一次捕获：cursor / revision / records 必须描述同一时刻，
       // 之后产生的帧由 tail(from) 按位置补齐，不存在"注册太晚丢帧"的窗口。
