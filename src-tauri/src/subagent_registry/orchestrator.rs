@@ -33,10 +33,15 @@ impl RegistryOrchestrator {
 
 #[async_trait]
 impl AgentOrchestrator for RegistryOrchestrator {
-    async fn spawn_agent(&self, parent: &AgentScope, task: &str) -> Result<String, String> {
+    async fn spawn_agent(
+        &self,
+        parent: &AgentScope,
+        task: &str,
+        budget_tokens: Option<u64>,
+    ) -> Result<String, String> {
         // 每代理 rollout 在 SH-056 落地；当前子代理不落盘（诚实降级，见 docs/05 SH-052）。
         self.registry
-            .spawn(self.engine.clone(), parent, task, None)
+            .spawn_with_budget(self.engine.clone(), parent, task, None, budget_tokens)
             .map_err(|error| error.to_string())
     }
 

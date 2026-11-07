@@ -90,6 +90,7 @@ fn engine(live: Arc<AtomicUsize>) -> Arc<AgentLoop> {
         workspace_root: std::env::temp_dir(),
         max_turns: 8,
         token_budget: 0,
+        tree_budget: Default::default(),
         policy: policy::SessionPolicy {
             approval: ApprovalMode::Ask,
             sandbox: SandboxMode::WorkspaceWrite,

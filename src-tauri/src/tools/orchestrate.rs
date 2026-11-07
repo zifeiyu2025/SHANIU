@@ -65,7 +65,7 @@ impl SpawnAgent {
                     "properties": {
                         "task": { "type": "string", "description": "子任务描述；子代理不继承当前会话历史，背景必须写全" },
                         "profile": { "type": "string", "description": "可选预设；当前仅支持 worker（完整工具集）" },
-                        "budget_tokens": { "type": "integer", "description": "预留给 SH-055 树级共账；当前不支持，传入会失败" },
+                        "budget_tokens": { "type": "integer", "description": "该子树自己的 token 上限（须 > 0）；不影响全树预算，只能在全树之内进一步收窄" },
                         "allowed_tools": { "type": "array", "items": { "type": "string" }, "description": "预留给 SH-054 权限合成；当前不支持，传入会失败" }
                     },
                     "required": ["task"]
@@ -95,9 +95,9 @@ impl ToolExecutor for SpawnAgent {
                 "allowed_tools 需要权限合成（SH-054），当前不支持；请在 task 中限定范围或在子代理内自行约束".into(),
             ));
         }
-        if args.budget_tokens.is_some() {
+        if args.budget_tokens == Some(0) {
             return Err(ToolError::InvalidArgs(
-                "budget_tokens 需要树级共账（SH-055），当前不支持；请改用 task 描述控制工作量".into(),
+                "budget_tokens 必须大于 0；不限额就省略该字段".into(),
             ));
         }
         if let Some(profile) = args.profile.as_deref() {
@@ -108,7 +108,7 @@ impl ToolExecutor for SpawnAgent {
             }
         }
         let agent_id = orchestrator(ctx)?
-            .spawn_agent(scope(ctx)?, args.task.trim())
+            .spawn_agent(scope(ctx)?, args.task.trim(), args.budget_tokens)
             .await
             .map_err(ToolError::Execution)?;
         Ok(ToolOutput::ok(
@@ -340,14 +340,21 @@ mod tests {
     #[derive(Default)]
     struct StubOrchestrator {
         spawned: Mutex<Vec<String>>,
+        budgets: Mutex<Vec<Option<u64>>>,
         resumed: Mutex<Vec<(String, Option<String>)>>,
         messages: Mutex<Vec<(String, String)>>,
     }
 
     #[async_trait]
     impl AgentOrchestrator for StubOrchestrator {
-        async fn spawn_agent(&self, _parent: &AgentScope, task: &str) -> Result<String, String> {
+        async fn spawn_agent(
+            &self,
+            _parent: &AgentScope,
+            task: &str,
+            budget_tokens: Option<u64>,
+        ) -> Result<String, String> {
             self.spawned.lock().unwrap().push(task.to_string());
+            self.budgets.lock().unwrap().push(budget_tokens);
             Ok("child-1".into())
         }
 
@@ -413,7 +420,7 @@ mod tests {
         for args in [
             serde_json::json!({ "task": "   " }),
             serde_json::json!({ "task": "x", "allowed_tools": ["read_file"] }),
-            serde_json::json!({ "task": "x", "budget_tokens": 100 }),
+            serde_json::json!({ "task": "x", "budget_tokens": 0 }),
             serde_json::json!({ "task": "x", "profile": "explorer" }),
             serde_json::json!({ "task": "x", "unknown": 1 }),
         ] {
@@ -425,11 +432,13 @@ mod tests {
         assert!(stub.spawned.lock().unwrap().is_empty(), "校验失败不得真的派生子代理");
 
         let output = tool
-            .execute(serde_json::json!({ "task": "  探索仓库  " }), &ctx)
+            .execute(serde_json::json!({ "task": "  探索仓库  ", "budget_tokens": 2000 }), &ctx)
             .await
             .expect("合法参数应成功");
         assert!(output.output.contains("child-1"));
         assert_eq!(*stub.spawned.lock().unwrap(), vec!["探索仓库".to_string()]);
+        // 预算必须原样交给编排层，不能在工具层被吞掉。
+        assert_eq!(*stub.budgets.lock().unwrap(), vec![Some(2000)]);
     }
 
     #[tokio::test]

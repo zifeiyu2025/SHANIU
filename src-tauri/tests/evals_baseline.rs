@@ -276,6 +276,7 @@ async fn run_one(task: &Task, fixture: &BTreeMap<String, String>, backend: Arc<R
             .ok()
             .and_then(|v| v.parse().ok())
             .unwrap_or(0),
+        tree_budget: Default::default(),
         policy: policy::SessionPolicy {
             approval: ApprovalMode::AutoReadOnly,
             sandbox: SandboxMode::WorkspaceWrite,

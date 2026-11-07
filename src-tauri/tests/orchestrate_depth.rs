@@ -57,7 +57,12 @@ struct NoopOrchestrator;
 
 #[async_trait]
 impl AgentOrchestrator for NoopOrchestrator {
-    async fn spawn_agent(&self, _parent: &AgentScope, _task: &str) -> Result<String, String> {
+    async fn spawn_agent(
+        &self,
+        _parent: &AgentScope,
+        _task: &str,
+        _budget_tokens: Option<u64>,
+    ) -> Result<String, String> {
         Err("本测试不派生子代理".into())
     }
 
@@ -94,6 +99,7 @@ fn engine(seen: Arc<Mutex<Vec<Vec<String>>>>) -> AgentLoop {
         workspace_root: std::env::temp_dir(),
         max_turns: 1,
         token_budget: 0,
+        tree_budget: Default::default(),
         policy: policy::SessionPolicy {
             approval: ApprovalMode::Ask,
             sandbox: SandboxMode::WorkspaceWrite,

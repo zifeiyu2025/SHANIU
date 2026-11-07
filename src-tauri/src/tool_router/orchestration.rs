@@ -67,7 +67,15 @@ pub struct AgentOutcome {
 #[async_trait]
 pub trait AgentOrchestrator: Send + Sync {
     /// 派生一个子代理，立即返回 id（不阻塞）。
-    async fn spawn_agent(&self, parent: &AgentScope, task: &str) -> Result<String, String>;
+    ///
+    /// `budget_tokens` = 该子树自己的 token 上限（`spawn_agent.budget_tokens`）：
+    /// 它不会放宽全树预算，只能在全树之内进一步收窄。
+    async fn spawn_agent(
+        &self,
+        parent: &AgentScope,
+        task: &str,
+        budget_tokens: Option<u64>,
+    ) -> Result<String, String>;
 
     /// 从一个已退出子代理的历史恢复继续工作；`task` 为 None 时用默认续跑指令。
     async fn resume_agent(

@@ -40,6 +40,9 @@ struct Ledger {
     tokens: AtomicU64,
     round_limit: Option<u32>,
     rounds: AtomicU32,
+    /// 派生账本的父账本（`spawn_agent.budget_tokens`）：消耗向上汇总，
+    /// 上限沿链向下生效。深度硬限为 1（ADR-101），链长实际不超过 2。
+    parent: Option<Arc<Ledger>>,
 }
 
 /// 树级预算句柄：克隆即共享同一本账（父代理与全部后代同账）。
@@ -52,16 +55,44 @@ pub struct TreeBudget {
     inner: Arc<Ledger>,
 }
 
+impl Default for TreeBudget {
+    /// 默认不限额：既有调用方（测试、无编排的单代理运行）不该被迫先配预算。
+    fn default() -> Self {
+        Self::unlimited()
+    }
+}
+
 impl TreeBudget {
     pub fn new(token_limit: Option<u64>, round_limit: Option<u32>) -> Self {
+        Self::with_parent(token_limit, round_limit, None)
+    }
+
+    fn with_parent(
+        token_limit: Option<u64>,
+        round_limit: Option<u32>,
+        parent: Option<Arc<Ledger>>,
+    ) -> Self {
         Self {
             inner: Arc::new(Ledger {
                 token_limit,
                 tokens: AtomicU64::new(0),
                 round_limit,
                 rounds: AtomicU32::new(0),
+                parent,
             }),
         }
+    }
+
+    /// 为派生出的子树建一本子账（`spawn_agent.budget_tokens`）。
+    ///
+    /// 语义是「这棵子树最多花这么多」：子账本自己的上限先拦，父账本照旧汇总全部后代的
+    /// 消耗并用自己的上限拦。两个上限任一触顶，子句柄都领不到新一轮。没有限额时直接
+    /// 复用父账本，不制造多余层级。
+    pub fn derive(&self, token_limit: Option<u64>, round_limit: Option<u32>) -> Self {
+        if token_limit.is_none() && round_limit.is_none() {
+            return self.clone();
+        }
+        Self::with_parent(token_limit, round_limit, Some(self.inner.clone()))
     }
 
     /// 不限额的账本：仍需记账（供指标展示），但永不触顶。
@@ -75,31 +106,40 @@ impl TreeBudget {
     }
 
     /// 记一笔模型用量（输入+输出总量）。允许越过上限（在途请求已发生），
-    /// 越过之后由 `exhaustion`/`claim_round` 拦下一次。
+    /// 越过之后由 `exhaustion`/`claim_round` 拦下一次。子账本会逐级向上汇总，
+    /// 因此父账本的 `tokens_spent` 始终等于「本代理自身 + 全部后代」。
     pub fn record_tokens(&self, tokens: u64) {
-        self.inner.tokens.fetch_add(tokens, Ordering::Relaxed);
+        let mut cursor = Some(self.inner.as_ref());
+        while let Some(ledger) = cursor {
+            ledger.tokens.fetch_add(tokens, Ordering::Relaxed);
+            cursor = ledger.parent.as_deref();
+        }
     }
 
     /// 领一轮（= 一次模型请求名额）。触顶返回 `Err`，调用方据此暂停整树。
+    ///
+    /// 先占自身名额，再沿链向上逐级占；任一级已满则回滚已占的名额并返回 `Err`。
+    /// 回滚窗口内理论上有并发抢占的边角（轮数可能多算一次），但 token 上限在
+    /// 领名额之前已判定，不会因此放行超额请求。
     pub fn claim_round(&self) -> Result<(), Exhaustion> {
         if let Some(exhausted) = self.exhaustion() {
             return Err(exhausted);
         }
-        match self.inner.round_limit {
-            None => {
-                self.inner.rounds.fetch_add(1, Ordering::Relaxed);
-                Ok(())
+        bump_rounds(&self.inner)?;
+        let mut reserved: Vec<Arc<Ledger>> = Vec::new();
+        let mut cursor = self.inner.parent.clone();
+        while let Some(ledger) = cursor {
+            if let Err(exhausted) = bump_rounds(&ledger) {
+                self.inner.rounds.fetch_sub(1, Ordering::Relaxed);
+                for held in &reserved {
+                    held.rounds.fetch_sub(1, Ordering::Relaxed);
+                }
+                return Err(exhausted);
             }
-            // try_update：并发下也绝不超过上限（先比较再自增是一个原子操作）。
-            Some(limit) => self
-                .inner
-                .rounds
-                .try_update(Ordering::Relaxed, Ordering::Relaxed, |started| {
-                    (started < limit).then_some(started + 1)
-                })
-                .map(|_| ())
-                .map_err(|_| Exhaustion::Rounds),
+            cursor = ledger.parent.clone();
+            reserved.push(ledger);
         }
+        Ok(())
     }
 
     pub fn tokens_spent(&self) -> u64 {
@@ -110,6 +150,16 @@ impl TreeBudget {
         self.inner.rounds.load(Ordering::Relaxed)
     }
 
+    /// 全树（走到最顶层账本）的累计 token，用于错误信息——不能只报本子树，
+    /// 否则触顶原因是父账本时用户会看到「已用 10 / 上限 100 却停了」。
+    pub fn tree_tokens_spent(&self) -> u64 {
+        let mut cursor = self.inner.clone();
+        while let Some(parent) = cursor.parent.clone() {
+            cursor = parent;
+        }
+        cursor.tokens.load(Ordering::Relaxed)
+    }
+
     /// 剩余 token；`None` = 不限额。
     pub fn remaining_tokens(&self) -> Option<u64> {
         self.inner
@@ -117,19 +167,45 @@ impl TreeBudget {
             .map(|limit| limit.saturating_sub(self.tokens_spent()))
     }
 
-    /// 当前是否触顶；两个维度都触顶时先报 `Tokens`。
+    /// 当前是否触顶；先看自身、再沿链看祖先。两个维度都触顶时先报 `Tokens`。
     pub fn exhaustion(&self) -> Option<Exhaustion> {
-        if let Some(limit) = self.inner.token_limit {
-            if self.tokens_spent() >= limit {
-                return Some(Exhaustion::Tokens);
+        let mut cursor = Some(self.inner.as_ref());
+        while let Some(ledger) = cursor {
+            if let Some(limit) = ledger.token_limit {
+                if ledger.tokens.load(Ordering::Relaxed) >= limit {
+                    return Some(Exhaustion::Tokens);
+                }
             }
+            cursor = ledger.parent.as_deref();
         }
-        if let Some(limit) = self.inner.round_limit {
-            if self.rounds_started() >= limit {
-                return Some(Exhaustion::Rounds);
+        let mut cursor = Some(self.inner.as_ref());
+        while let Some(ledger) = cursor {
+            if let Some(limit) = ledger.round_limit {
+                if ledger.rounds.load(Ordering::Relaxed) >= limit {
+                    return Some(Exhaustion::Rounds);
+                }
             }
+            cursor = ledger.parent.as_deref();
         }
         None
+    }
+}
+
+/// 在单个账本上占一轮；优先 `try_update` 保证并发下不超限。
+fn bump_rounds(ledger: &Arc<Ledger>) -> Result<(), Exhaustion> {
+    match ledger.round_limit {
+        None => {
+            ledger.rounds.fetch_add(1, Ordering::Relaxed);
+            Ok(())
+        }
+        // try_update：并发下也绝不超过上限（先比较再自增是一个原子操作）。
+        Some(limit) => ledger
+            .rounds
+            .try_update(Ordering::Relaxed, Ordering::Relaxed, |started| {
+                (started < limit).then_some(started + 1)
+            })
+            .map(|_| ())
+            .map_err(|_| Exhaustion::Rounds),
     }
 }
 
@@ -184,6 +260,44 @@ mod tests {
         assert!(parent.claim_round().is_ok());
         assert_eq!(child.claim_round(), Err(Exhaustion::Rounds));
         assert_eq!(parent.exhaustion(), Some(Exhaustion::Rounds));
+    }
+
+    #[test]
+    fn derived_subtree_limit_blocks_itself_but_not_siblings() {
+        let parent = TreeBudget::unlimited();
+        let limited = parent.derive(Some(40), None);
+        let sibling = parent.child();
+        assert!(limited.claim_round().is_ok());
+        limited.record_tokens(40);
+        // 子树自己的上限触顶：它领不到，兄弟不受影响。
+        assert_eq!(limited.claim_round(), Err(Exhaustion::Tokens));
+        assert!(sibling.claim_round().is_ok());
+        // 但消耗已经向上汇总到父账本。
+        assert_eq!(parent.tokens_spent(), 40);
+        assert_eq!(limited.tree_tokens_spent(), 40);
+    }
+
+    #[test]
+    fn parent_limit_also_blocks_a_derived_subtree() {
+        let parent = TreeBudget::new(Some(50), None);
+        let limited = parent.derive(Some(1000), None);
+        assert!(limited.claim_round().is_ok());
+        limited.record_tokens(60);
+        assert_eq!(limited.tokens_spent(), 60);
+        // 全树上限先到，子账本自己还很宽裕也必须停。
+        assert_eq!(limited.exhaustion(), Some(Exhaustion::Tokens));
+        assert_eq!(limited.claim_round(), Err(Exhaustion::Tokens));
+        assert_eq!(parent.claim_round(), Err(Exhaustion::Tokens));
+        assert_eq!(limited.tree_tokens_spent(), 60);
+    }
+
+    #[test]
+    fn derive_without_limits_reuses_the_same_ledger() {
+        let parent = TreeBudget::new(Some(100), None);
+        let child = parent.derive(None, None);
+        child.record_tokens(30);
+        assert_eq!(parent.tokens_spent(), 30);
+        assert_eq!(parent.remaining_tokens(), Some(70));
     }
 
     #[test]

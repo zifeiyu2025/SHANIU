@@ -13,6 +13,8 @@ use tokio_util::sync::CancellationToken;
 use crate::model_client::{HistoryItem, Role, Usage};
 use crate::rollout::RolloutWriter;
 
+use super::budget::TreeBudget;
+
 /// 子代理允许的最大嵌套深度（docs/02 §2.3 决策：硬限 2 = root(0) + 子(1)）。
 pub const MAX_AGENT_DEPTH: u32 = 1;
 
@@ -60,6 +62,9 @@ pub struct AgentInstance {
     /// 父代理经 `send_agent_message` 注入的 steering 消息（SH-052）。
     /// 每轮采样前由 `run_instance` 排空并追加为 user 消息；注册表持同一 Arc 用于写入。
     pub inbox: Arc<Mutex<Vec<String>>>,
+    /// 本实例的树级预算句柄（SH-055）。root 由引擎注入，子代理在派生时克隆父句柄，
+    /// 因此全树同一本账；默认不限额，避免测试与三方调用被迫先配预算。
+    pub budget: TreeBudget,
 }
 
 impl AgentInstance {
@@ -76,6 +81,7 @@ impl AgentInstance {
             session_id: None,
             usage: TokenTotals::default(),
             inbox: Arc::new(Mutex::new(Vec::new())),
+            budget: TreeBudget::unlimited(),
         }
     }
 
@@ -102,6 +108,7 @@ impl AgentInstance {
             session_id: None,
             usage: TokenTotals::default(),
             inbox: Arc::new(Mutex::new(Vec::new())),
+            budget: TreeBudget::unlimited(),
         }
     }
 

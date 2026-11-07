@@ -236,6 +236,19 @@ impl SubagentRegistry {
         task: impl Into<String>,
         rollout: Option<Arc<RolloutWriter>>,
     ) -> Result<String, SpawnError> {
+        self.spawn_with_budget(engine, parent, task, rollout, None)
+    }
+
+    /// `spawn` 的预算参数版本：`budget_tokens` = 该子树自己的 token 上限（SH-055）。
+    /// 不传就只共享全树账本；传了就派生一本子账，消耗照旧向上汇总。
+    pub fn spawn_with_budget(
+        self: &Arc<Self>,
+        engine: Arc<AgentLoop>,
+        parent: &AgentScope,
+        task: impl Into<String>,
+        rollout: Option<Arc<RolloutWriter>>,
+        budget_tokens: Option<u64>,
+    ) -> Result<String, SpawnError> {
         let task = task.into();
         validate_parent(parent, &task)?;
         let agent_id = ulid::Ulid::generate().to_string();
@@ -243,6 +256,8 @@ impl SubagentRegistry {
         let cancel = parent.cancel.child_token();
         let mut instance = AgentInstance::child(&agent_id, &parent.agent_id, &task, cancel);
         instance.rollout = rollout;
+        // 预算共账（SH-055）：子代理挂引擎树账本；传了 budget_tokens 就再收窄一层。
+        instance.budget = engine.tree_budget.derive(budget_tokens, None);
         let sink = child_sink(parent, &agent_id);
         Ok(self.start_run(engine, instance, task, sink))
     }
@@ -287,6 +302,8 @@ impl SubagentRegistry {
         instance.history = history;
         instance.history.push(HistoryItem::Message { role: Role::User, text: task.clone(), reasoning: None });
         instance.rollout = rollout;
+        // 续跑同样计入同一棵树（SH-055）。
+        instance.budget = engine.tree_budget.child();
         let sink = child_sink(parent, &agent_id);
         Ok(self.start_run(engine, instance, task, sink))
     }
@@ -674,6 +691,7 @@ mod tests {
             workspace_root: std::env::temp_dir(),
             max_turns: 2,
             token_budget: 0,
+            tree_budget: Default::default(),
             policy: policy::SessionPolicy {
                 approval: ApprovalMode::Ask,
                 sandbox: SandboxMode::WorkspaceWrite,
@@ -928,6 +946,7 @@ mod tests {
             workspace_root: std::env::temp_dir(),
             max_turns: 2,
             token_budget: 0,
+            tree_budget: Default::default(),
             policy: policy::SessionPolicy {
                 approval: ApprovalMode::Ask,
                 sandbox: SandboxMode::WorkspaceWrite,

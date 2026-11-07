@@ -26,7 +26,7 @@ use crate::model_client::{
 use crate::permission::{policy, ApprovalBroker};
 use crate::tool_router::{PlanState, ToolContext, ToolRouter};
 
-pub use budget::TurnBudget;
+pub use budget::{Exhaustion, TreeBudget, TurnBudget};
 pub use instance::{AgentInstance, TokenTotals, MAX_AGENT_DEPTH};
 
 // ============================== 模型后端抽象 ==============================
@@ -84,6 +84,11 @@ pub struct AgentLoop {
     /// 单会话 token 预算（04 §4 `[agent].token_budget`）：每轮采样前据此判定是否压缩。
     /// 0 = 不启用压缩（`compaction::plan_if_needed` 对 0 直接返回 None）。
     pub token_budget: usize,
+    /// 树级预算账本（SH-055，02 ADR-103）：root 实例直接用这本账，派生出的子代理
+    /// 克隆同一句柄，于是「任一代理触顶 → 全树不再发起新模型请求」由同一个账本保证。
+    /// 默认 `unlimited()`：本单元只做共账接线，配置面与 `spawn_agent.budget_tokens`
+    /// 的限额派生在下一单元收口。
+    pub tree_budget: TreeBudget,
     pub policy: policy::SessionPolicy,
     /// 会话档案写入器（SH-030）。None = 本次运行不落盘（测试与无目录启动用）。
     /// 这是 `run_with_history` 构造 root 实例时的默认值；`run_instance` 以实例自带的
@@ -232,6 +237,7 @@ impl AgentLoop {
             workspace_root,
             max_turns: TurnBudget::from_config(cfg).max_turns,
             token_budget: cfg.agent.token_budget,
+            tree_budget: TreeBudget::unlimited(),
             policy: policy::SessionPolicy {
                 approval: cfg.approval.mode,
                 sandbox: cfg.sandbox.mode,
@@ -294,6 +300,8 @@ impl AgentLoop {
     ) -> TurnSummary {
         let mut instance = AgentInstance::root(history, persisted, cancel);
         instance.rollout = self.rollout.clone();
+        // root 用引擎的树级账本；子代理由注册表在派生时挂同一个句柄（SH-055）。
+        instance.budget = self.tree_budget.clone();
         self.run_instance_with_orchestrator(&mut instance, sink, orchestrator).await
     }
 
@@ -326,6 +334,8 @@ impl AgentLoop {
             sink: sink.clone(),
         };
         let inbox = instance.inbox.clone();
+        // 树级预算句柄（SH-055）：与 root/子代理共享同一本账，解构前先取出来。
+        let budget = instance.budget.clone();
         // 只解构本函数要用的字段：身份/深度留给注册表与后续工具上下文（SH-051）。
         let AgentInstance { cancel, history, recorded, rollout, session_id, usage: totals, .. } = instance;
         let cancel = &*cancel;
@@ -352,6 +362,25 @@ impl AgentLoop {
         'outer: for turn in 1..=self.max_turns {
             last_turn = turn;
             emit(&sink, EventMsg::TurnStarted { turn });
+
+            // SH-055 / FF-103：每次模型请求前先领名额（本轮的压缩请求也算一次采样）。
+            // 触顶后**任何**代理都领不到新一轮——这就是「整树停止发起新模型请求」的执行点；
+            // 已在途的请求不中断（暂停/询问用户由上层处理，账本只回答能不能继续）。
+            if let Err(exhausted) = budget.claim_round() {
+                let message = match exhausted {
+                    Exhaustion::Tokens => format!(
+                        "已达树级 token 预算上限（全树已用 {}），整树停止发起新模型请求",
+                        budget.tree_tokens_spent()
+                    ),
+                    Exhaustion::Rounds => format!(
+                        "已达树级轮数上限（{} 轮），整树停止发起新模型请求",
+                        budget.rounds_started()
+                    ),
+                };
+                emit(&sink, EventMsg::Error { message });
+                reason = TurnEndReasonLocal::BudgetExhausted;
+                break 'outer;
+            }
 
             // SH-052：父代理经 send_agent_message 注入的 steering 消息在采样前排空，
             // 作为普通 user 消息进入本轮上下文。不新造事件类型：它本来就是用户侧输入。
@@ -481,8 +510,10 @@ impl AgentLoop {
                 }
             }
             if let Some(u) = usage {
-                // 实例级累计（ExitSummary 的 token_usage）；树级共账见 SH-055。
+                // 实例级累计（ExitSummary 的 token_usage）。
                 totals.absorb(&u);
+                // 树级共账（SH-055）：父与全部后代记同一本账；cached 是 input 的子集，不重复计。
+                budget.record_tokens(u64::from(u.input_tokens) + u64::from(u.output_tokens));
                 observed_input_tokens = usize::try_from(u.input_tokens).unwrap_or(usize::MAX);
                 emit(&sink, EventMsg::TokenUsage {
                     turn,
@@ -832,6 +863,7 @@ mod tests {
             // 既有循环用例一律不启用压缩：它们断言的是轮次与工具回填行为，
             // 混进压缩会让"为什么这轮历史变短"变成隐性变量。
             token_budget: 0,
+            tree_budget: TreeBudget::unlimited(),
             policy: policy::SessionPolicy {
                 approval: crate::config::ApprovalMode::Ask,
                 sandbox: crate::config::SandboxMode::WorkspaceWrite,
@@ -990,6 +1022,32 @@ mod tests {
             e,
             EventMsg::Error { message } if message.contains("最大轮数")
         )));
+    }
+
+    #[tokio::test]
+    async fn tree_budget_exhaustion_blocks_the_next_model_request() {
+        // 每轮用量 15（10 输入 + 5 输出）；上限 20 → 第 2 轮结束后累计 30，
+        // 第 3 轮必须在**发起采样之前**被拦下（FF-103 的执行点）。
+        let (mut agent, store, cancel, _broker) = make_loop(vec![
+            vec![fn_call_ev(), usage_ev()],
+            vec![fn_call_ev(), usage_ev()],
+            vec![ModelStreamEvent::OutputTextDelta { delta: "不该到这里".into() }, usage_ev()],
+        ]);
+        agent.max_turns = 5; // 排除"轮数上限"这条路径，只测树级预算
+        agent.tree_budget = TreeBudget::new(Some(20), None);
+        let summary = agent.run_task("任务", Arc::new(CapturingSink(store.clone())), cancel).await;
+        assert_eq!(summary.reason, TurnEndReason::BudgetExhausted);
+        assert!(store.lock().unwrap().iter().any(|e| matches!(
+            e,
+            EventMsg::Error { message } if message.contains("树级 token 预算")
+        )));
+        // 用量停在 30 = 只发生过两次采样；第 3 段脚本从未被消费。
+        assert_eq!(agent.tree_budget.tokens_spent(), 30);
+        assert!(store
+            .lock()
+            .unwrap()
+            .iter()
+            .all(|e| !matches!(e, EventMsg::AgentMessageDelta { delta } if delta == "不该到这里")));
     }
 
     #[tokio::test]
@@ -1155,6 +1213,7 @@ mod tests {
             workspace_root: workspace,
             max_turns: 2,
             token_budget: 0,
+            tree_budget: TreeBudget::unlimited(),
             policy: policy::SessionPolicy {
                 approval: crate::config::ApprovalMode::Ask,
                 sandbox: crate::config::SandboxMode::WorkspaceWrite,
@@ -1356,6 +1415,7 @@ mod tests {
             workspace_root: std::env::temp_dir(),
             max_turns: 1,
             token_budget: 0,
+            tree_budget: TreeBudget::unlimited(),
             policy: policy::SessionPolicy {
                 approval: crate::config::ApprovalMode::Ask,
                 sandbox: crate::config::SandboxMode::WorkspaceWrite,

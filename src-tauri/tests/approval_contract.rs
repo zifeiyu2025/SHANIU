@@ -106,6 +106,7 @@ fn harness(tool_name: &str) -> Harness {
         workspace_root: std::env::temp_dir(),
         max_turns: 2,
         token_budget: 0,
+        tree_budget: Default::default(),
         policy: policy::SessionPolicy {
             approval: ApprovalMode::Ask,
             sandbox: SandboxMode::WorkspaceWrite,

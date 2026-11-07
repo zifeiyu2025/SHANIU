@@ -123,6 +123,7 @@ fn loop_with(agent_ws: &Path, backend: Arc<Scripted>, writer: Arc<RolloutWriter>
         workspace_root: agent_ws.to_path_buf(),
         max_turns: 3,
         token_budget: 0,
+        tree_budget: Default::default(),
         policy: policy::SessionPolicy { approval: ApprovalMode::AutoReadOnly, sandbox: SandboxMode::WorkspaceWrite },
         rollout: Some(writer),
         rollout_broke: std::sync::atomic::AtomicBool::new(false),
@@ -329,6 +330,7 @@ async fn resume_continues_real_work_on_a_real_endpoint() {
             workspace_root: dir.clone(),
             max_turns: 8,
             token_budget: 0,
+        tree_budget: Default::default(),
             policy: policy::SessionPolicy {
                 approval: ApprovalMode::AutoReadOnly,
                 sandbox: SandboxMode::WorkspaceWrite,
