@@ -2258,9 +2258,98 @@ export function createAdapter(options: AdapterOptions): { remote: unknown; dispo
     },
   }
 
+  /**
+   * `remote.workspaceFiles`（SH-092「文档预览真实读取」）。
+   *
+   * **边界为什么不带 workspaceId**：宿主按会话档案首行固化的根判定越界，客户端只能交出
+   * 路径、交不出作用域——交出作用域等于让越界方指定它能看哪些目录。
+   * **`changes` 为什么如实拒**：宿主没有文件监视面。契约自带 `workspace-file/watch-unsupported`
+   * 这个码就是给这种情况用的；挂在一条永不发声的流上会把"没有实时刷新"伪装成"已接好"。
+   * **base64 为什么不直接过 IPC**：Tauri 的 JSON 返回值容不下 `Uint8Array`，而字节窗口
+   * 上限 1 MiB，编解码代价可控（宿主 `workspace_files.rs` 的 MAX_BYTES）。
+   */
+  const workspaceFileFailure = (reason: unknown) => {
+    const raw = (reason ?? {}) as { code?: string; message?: string; details?: Record<string, unknown> }
+    const detail = raw.details ?? {}
+    const message = typeof raw.message === 'string' ? raw.message : String(reason)
+    const path = String(detail['path'] ?? '')
+    const fail = <C extends string, D extends Record<string, unknown>>(code: C, details: D) =>
+      ({ ok: false as const, error: new RemoteError(code as never, message, details as never) })
+    switch (raw.code) {
+      case 'workspace-file/not-found': return fail('workspace-file/not-found', { path })
+      case 'workspace-file/outside-workspace': return fail('workspace-file/outside-workspace', { path })
+      case 'workspace-file/too-large': return fail('workspace-file/too-large', { path, limit: Number(detail['limit'] ?? 0) })
+      case 'workspace-file/not-text': return fail('workspace-file/not-text', { path })
+      case 'workspace-file/not-regular-file': return fail('workspace-file/not-regular-file', { path, kind: String(detail['kind'] ?? 'other') })
+      case 'workspace-file/not-directory': return fail('workspace-file/not-directory', { path, kind: String(detail['kind'] ?? 'other') })
+      case 'workspace/not-found': return fail('workspace/not-found', { workspaceId: String(detail['workspaceId'] ?? '') })
+      default: return fail('gateway/internal', {})
+    }
+  }
+
+  const bytesFromBase64 = (body: string): Uint8Array => {
+    const binary = atob(body)
+    const data = new Uint8Array(binary.length)
+    for (let index = 0; index < binary.length; index += 1) data[index] = binary.charCodeAt(index)
+    return data
+  }
+
+  const workspaceFilesNamespace = {
+    stat: async (sessionId: string, path: string) => {
+      try {
+        return OK(await bridge.invoke<Record<string, unknown>>('workspace_file_stat', { sessionId, path }))
+      } catch (reason) {
+        return workspaceFileFailure(reason)
+      }
+    },
+    read: async (sessionId: string, path: string, range: { offset?: number; limit?: number } = {}) => {
+      try {
+        return OK(await bridge.invoke<Record<string, unknown>>('workspace_file_read', {
+          sessionId,
+          path,
+          ...(range.offset === undefined ? {} : { offset: range.offset }),
+          ...(range.limit === undefined ? {} : { limit: range.limit }),
+        }))
+      } catch (reason) {
+        return workspaceFileFailure(reason)
+      }
+    },
+    readBytes: async (
+      sessionId: string,
+      path: string,
+      options: { range?: { offset?: number; length?: number }; baseFile?: string } = {},
+    ) => {
+      try {
+        const value = await bridge.invoke<Record<string, unknown>>('workspace_file_read_bytes', {
+          sessionId,
+          path,
+          ...(options.range?.offset === undefined ? {} : { offset: options.range.offset }),
+          ...(options.range?.length === undefined ? {} : { length: options.range.length }),
+          ...(options.baseFile === undefined || options.baseFile === '' ? {} : { baseFile: options.baseFile }),
+        })
+        const { data, ...rest } = value
+        return OK({ ...rest, data: bytesFromBase64(String(data ?? '')) })
+      } catch (reason) {
+        return workspaceFileFailure(reason)
+      }
+    },
+    list: async (sessionId: string, path: string) => {
+      try {
+        return OK(await bridge.invoke<Record<string, unknown>>('workspace_file_list', { sessionId, path }))
+      } catch (reason) {
+        return workspaceFileFailure(reason)
+      }
+    },
+    changes: async function* (_sessionId: string, path: string, _signal?: AbortSignal): AsyncGenerator<never> {
+      // 契约要求首帧是 ready；这里没有可声明的监视器，如实带码中断而不是挂一条空流。
+      throw new RemoteError('workspace-file/watch-unsupported' as never, '宿主没有文件监视面（SH-092 未含 watcher）', { path } as never)
+    },
+  }
+
   const namespaces = new Map<string, unknown>([
     ['session', sessionNamespace],
     ['workspace', workspaceNamespace],
+    ['workspaceFiles', workspaceFilesNamespace],
     ['directoryPicker', directoryPickerNamespace],
     ['toolResults', toolResultsNamespace],
     ['settings', settingsNamespace],

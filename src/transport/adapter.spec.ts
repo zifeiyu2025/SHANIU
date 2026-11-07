@@ -61,6 +61,8 @@ function scriptedBridge(
   searchHandler?: (args: Record<string, unknown> | undefined) => unknown,
   /** SH-115：`compact_session` 的宿主替身（null = 没有可压历史；可 throw 模拟失败）。 */
   compactHandler?: (args: Record<string, unknown> | undefined) => unknown,
+  /** SH-092：`workspace_file_*` 四条命令的宿主替身（throw {code,message,details} = 类型化失败）。 */
+  fileHandler?: (command: string, args: Record<string, unknown> | undefined) => unknown,
 ): ScriptedBridge {
   const calls: ScriptedBridge['calls'] = []
   const handlers = new Set<(event: AgentEvent) => void>()
@@ -78,6 +80,11 @@ function scriptedBridge(
     async invoke<T>(command: string, args?: Record<string, unknown>): Promise<T> {
       calls.push({ command, args })
       if (command === 'get_settings') return state as T
+      if (command.startsWith('workspace_file_')) {
+        // 缺省给一份最小可用形状：单测只在需要断言失败/内容时才接 fileHandler。
+        if (fileHandler === undefined) return { absolutePath: 'C:\w\a.txt', version: '1-2', bytes: 2 } as T
+        return fileHandler(command, args) as T
+      }
       // SH-115：计划态命令面的替身
       if (command === 'set_plan_mode') {
         planActive = args?.['active'] === true
@@ -899,9 +906,10 @@ describe('适配层的命令面映射', () => {
   it('未接线的命名空间显式抛错并指向核销清单', async () => {
     const bridge = scriptedBridge()
     const { remote, dispose } = createAdapter({ bridge })
-    const workspaceFiles = faceOf(remote).workspaceFiles
-    await expect(workspaceFiles['read']!()).rejects.toThrow(/未接线/)
-    await expect(workspaceFiles['read']!()).rejects.toThrow(/SH-040/)
+    // SH-092 之后 workspaceFiles 已接真，未接线样本改取 terminal（宿主没有终端面）。
+    const terminal = (faceOf(remote) as unknown as Record<string, Record<string, (() => Promise<unknown>) | undefined>>).terminal
+    await expect(terminal['run']!()).rejects.toThrow(/未接线/)
+    await expect(terminal['run']!()).rejects.toThrow(/SH-040/)
     await expect(faceOf(remote).session.attachment()).rejects.toThrow(/SH-040/)
     dispose()
   })
@@ -2300,6 +2308,68 @@ describe('session.search 接宿主 FTS5 派生索引（SH-113，wire query-only�
     const secondValue = second['value'] as { items: unknown[]; hasMore: boolean }
     expect(secondValue.items).toEqual(firstValue.items)
     expect(secondValue.hasMore).toBe(true)
+    dispose()
+  })
+
+  // ── SH-092：文档预览真实读取（workspaceFiles 接宿主） ──────────────────────────
+  it('SH-092 文本读：顶层参数正好是 camelCase，宿主返回原样交出', async () => {
+    const body = { absolutePath: 'C:/w/a.txt', version: '7-3', bytes: 3, offset: 2, text: 'x\ny', lines: 2, eof: true }
+    const bridge = scriptedBridge(HOST_SETTINGS, [], undefined, undefined, undefined, undefined, () => body)
+    const { remote, dispose } = createAdapter({ bridge })
+    const files = faceOf(remote).workspaceFiles as unknown as Record<string, (...args: unknown[]) => Promise<Record<string, unknown>>>
+    const result = await files['read']!('sess-1', 'a.txt', { offset: 2, limit: 50 })
+    const call = bridge.calls.find(item => item.command === 'workspace_file_read')
+    expect(Object.keys(call?.args ?? {})).toEqual(['sessionId', 'path', 'offset', 'limit'])
+    expect(Object.keys(call?.args ?? {}).some(key => key.includes('_'))).toBe(false)
+    expect(result['value']).toEqual(body)
+    dispose()
+  })
+
+  it('SH-092 字节读：base64 还原成 Uint8Array，元数据字段不丢', async () => {
+    const bridge = scriptedBridge(HOST_SETTINGS, [], undefined, undefined, undefined, undefined,
+      () => ({ absolutePath: 'C:/w/p.png', version: '9-5', bytes: 5, offset: 0, data: 'aGVsbG8=', eof: true }))
+    const { remote, dispose } = createAdapter({ bridge })
+    const files = faceOf(remote).workspaceFiles as unknown as Record<string, (...args: unknown[]) => Promise<Record<string, unknown>>>
+    const result = await files['readBytes']!('sess-1', 'p.png', { range: { offset: 0, length: 5 } })
+    const value = result['value'] as { data: Uint8Array; bytes: number; eof: boolean; absolutePath: string }
+    expect(Array.from(value.data)).toEqual([104, 101, 108, 108, 111])
+    expect(value.bytes).toBe(5)
+    expect(value.eof).toBe(true)
+    const call = bridge.calls.find(item => item.command === 'workspace_file_read_bytes')
+    expect(call?.args).toEqual({ sessionId: 'sess-1', path: 'p.png', offset: 0, length: 5 })
+    dispose()
+  })
+
+  it('SH-092 类型化失败按码翻译，details 带上越界路径与上限', async () => {
+    const outside = { code: 'workspace-file/outside-workspace', message: '越界', details: { path: 'C:/outside' } }
+    const bridge = scriptedBridge(HOST_SETTINGS, [], undefined, undefined, undefined, undefined, () => { throw outside })
+    const { remote, dispose } = createAdapter({ bridge })
+    const files = faceOf(remote).workspaceFiles as unknown as Record<string, (...args: unknown[]) => Promise<Record<string, unknown>>>
+    const failed = await files['stat']!('sess-1', 'C:/outside/x.txt')
+    expect(failed['ok']).toBe(false)
+    expect((failed['error'] as { code: string }).code).toBe('workspace-file/outside-workspace')
+    expect((failed['error'] as { details: Record<string, unknown> }).details['path']).toBe('C:/outside')
+    const large = { code: 'workspace-file/too-large', message: '太大', details: { path: 'big.txt', limit: 1048576 } }
+    const other = scriptedBridge(HOST_SETTINGS, [], undefined, undefined, undefined, undefined, () => { throw large })
+    const second = createAdapter({ bridge: other })
+    const result = await (faceOf(second.remote).workspaceFiles as unknown as Record<string, (...a: unknown[]) => Promise<Record<string, unknown>>>)['read']!('sess-1', 'big.txt')
+    expect((result['error'] as { details: Record<string, unknown> }).details['limit']).toBe(1048576)
+    // 认不出的码不猜语义：如实回落 gateway/internal
+    const weird = { code: 'workspace-file/未来码', message: '不认识', details: {} }
+    const third = scriptedBridge(HOST_SETTINGS, [], undefined, undefined, undefined, undefined, () => { throw weird })
+    const adapter3 = createAdapter({ bridge: third })
+    const fallback = await (faceOf(adapter3.remote).workspaceFiles as unknown as Record<string, (...a: unknown[]) => Promise<Record<string, unknown>>>)['list']!('sess-1', '')
+    expect((fallback['error'] as { code: string }).code).toBe('gateway/internal')
+    dispose()
+    second.dispose()
+    adapter3.dispose()
+  })
+
+  it('SH-092 变更流：宿主没有监视面就带码中断，不挂一条永不发声的流', async () => {
+    const bridge = scriptedBridge()
+    const { remote, dispose } = createAdapter({ bridge })
+    const stream = (faceOf(remote).workspaceFiles as unknown as Record<string, (...a: unknown[]) => AsyncGenerator<unknown>>)['changes']!('sess-1', 'a.txt')
+    await expect(stream.next()).rejects.toThrow(/宿主没有文件监视面/)
     dispose()
   })
 })

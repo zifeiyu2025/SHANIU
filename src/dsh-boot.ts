@@ -40,6 +40,7 @@ import { apply as uiInputTriggerApply, inject as uiInputTriggerInject } from '@d
 import { apply as uiCommandsApply, inject as uiCommandsInject } from '@deepseek-ai/dsh-client-ui-commands/client'
 import { apply as fileUploadApply, inject as fileUploadInject } from '@deepseek-ai/dsh-client-file-upload/client'
 import { apply as resourcesApply, inject as resourcesInject } from '@deepseek-ai/dsh-client-resources/client'
+import { apply as workspaceFilesProviderApply, inject as workspaceFilesProviderInject } from '@deepseek-ai/dsh-api-workspace-files/client'
 import { apply as workspaceControllerApply, inject as workspaceControllerInject } from '@deepseek-ai/dsh-api-workspace-controller/client'
 import { apply as sessionControllerApply, inject as sessionControllerInject } from '@deepseek-ai/dsh-api-session-controller/client'
 import { apply as uiSettingsApply, inject as uiSettingsInject } from '@deepseek-ai/dsh-client-ui-settings/client'
@@ -187,6 +188,9 @@ export async function bootShaniu(container: HTMLElement): Promise<BootHandle> {
     // ui-settings 必须最先：提供 configForms（本地 schema 表单，不依赖后端），theme 依赖它
     { inject: uiSettingsInject, apply: uiSettingsApply },
     { inject: resourcesInject, apply: resourcesApply },
+    // 文件资源 provider（SH-092）：文档预览的 `file` 资源解析靠它，缺了预览只会说
+    // 「文件资源服务不可用」。数据面是上面的 `remote.workspaceFiles`。
+    { inject: workspaceFilesProviderInject, apply: workspaceFilesProviderApply },
     { inject: fileUploadInject, apply: fileUploadApply },
     { inject: sessionControllerInject, apply: sessionControllerApply },
     { inject: uiFileDragInject, apply: uiFileDragApply },

@@ -15,6 +15,7 @@ pub mod session_query;
 pub mod session_title;
 pub mod tool_router;
 pub mod tools;
+pub mod workspace_files;
 
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
@@ -1446,7 +1447,11 @@ pub fn run() {
             set_plan_mode,
             get_product_dirs,
             read_clipboard_text,
-            write_clipboard_text
+            write_clipboard_text,
+            workspace_files::workspace_file_stat,
+            workspace_files::workspace_file_read,
+            workspace_files::workspace_file_read_bytes,
+            workspace_files::workspace_file_list
         ])
         .on_window_event(|window, event| {
             // 关闭 = 隐藏到系统托盘（不退出）；真正退出只走托盘菜单「退出」
