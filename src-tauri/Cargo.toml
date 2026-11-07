@@ -33,7 +33,11 @@ ignore = "0.4"
 thiserror = "2"
 regex = "1"
 # 异步运行时（tauri 内含；此处直连以获得 #[tokio::test]、进程/超时等能力）
-tokio = { version = "1", features = ["macros", "rt", "process", "io-util", "time"] }
+# net/sync 为 SH-094 loopback WebSocket gateway 所需（TcpListener + broadcast/mpsc）
+tokio = { version = "1", features = ["macros", "rt", "process", "io-util", "time", "net", "sync"] }
+# SH-094 数据面传输：loopback WebSocket gateway（ADR-005）。MIT，按会话多路复用 +
+# credit 背压 + event_id 续播；取代无背压的 Tauri 全局广播。
+tokio-tungstenite = "0.26"
 # SH-042 日志面（docs/01 §9.3 目录表要求 logs\ 按天滚动、保留 14 天、落盘前统一脱敏）。
 # 三者同族、均 MIT：
 #   tracing            — 事件门面；reqwest/tower 这些依赖本身就在发 tracing 事件，

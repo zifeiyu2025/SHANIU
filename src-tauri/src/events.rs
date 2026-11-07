@@ -9,6 +9,7 @@ use std::time::{SystemTime, UNIX_EPOCH};
 
 use serde::{Deserialize, Serialize};
 use tauri::Emitter;
+use tokio::sync::broadcast;
 
 /// 后端 → 前端事件流通道。
 pub const EVENT_CHANNEL: &str = "shaniu://event";
@@ -208,16 +209,25 @@ pub struct TauriEventSink {
     session_id: String,
     /// SH-094 批 1：注入的事件信封持久化缝。None = 不落盘（测试/无目录启动）。
     journal: Option<Arc<dyn EventJournal>>,
+    /// SH-094 批 2：注入的 WS gateway 广播发送端（依赖倒置——events 不引用 gateway 模块，
+    /// 只持 tokio Sender）。None = 不喂 gateway。组合根从 GatewayHub 取发送端注入。
+    broadcast: Option<broadcast::Sender<AgentEvent>>,
 }
 
 impl TauriEventSink {
     pub fn root(app: tauri::AppHandle, session_id: String) -> Self {
-        Self { app, session_id, journal: None }
+        Self { app, session_id, journal: None, broadcast: None }
     }
 
     /// 注入持久化实现：信封逐条落盘；广播仍是主通道，日志失败只告警不中断回合。
     pub fn with_journal(mut self, journal: Arc<dyn EventJournal>) -> Self {
         self.journal = Some(journal);
+        self
+    }
+
+    /// 注入 WS gateway 广播发送端：信封落盘后发布到 gateway hub（批 3 切前端后取代 Tauri emit）。
+    pub fn with_broadcast(mut self, sender: broadcast::Sender<AgentEvent>) -> Self {
+        self.broadcast = Some(sender);
         self
     }
 }
@@ -230,6 +240,10 @@ impl EventSink for TauriEventSink {
                 if let Err(error) = journal.append(event) {
                     tracing::warn!("事件日志写入失败（广播继续）: {error}");
                 }
+            }
+            // 喂 WS gateway（无接收端时 send 返回 Err，值丢弃——续播由日志兜底）。
+            if let Some(sender) = &self.broadcast {
+                let _ = sender.send(event.clone());
             }
             self.app.emit(EVENT_CHANNEL, event).map_err(|e| format!("事件广播失败: {e}"))
         })

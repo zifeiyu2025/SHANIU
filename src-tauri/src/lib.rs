@@ -7,6 +7,7 @@ pub mod event_journal;
 pub mod events;
 pub mod file_actions;
 pub mod file_references;
+pub mod gateway;
 pub mod model_client;
 pub mod model_discovery;
 pub mod open_in_app;
@@ -64,7 +65,7 @@ fn send_task(app: tauri::AppHandle, task: String, agent_id: Option<String>) -> R
             // 不阻塞主回合；失败/关开关/没密钥都静默保持截断 fallback。
             session_title::spawn_generation(app.clone(), new_id.clone(), task.clone());
             let sink: Arc<dyn events::EventSink> =
-                Arc::new(events::TauriEventSink::root(app.clone(), new_id.clone()).with_journal(Arc::new(event_journal::FileEventJournal::new(app.state::<AppState>().data_root().join(config::SESSIONS_DIR)))));
+                Arc::new(events::TauriEventSink::root(app.clone(), new_id.clone()).with_journal(Arc::new(event_journal::FileEventJournal::new(app.state::<AppState>().data_root().join(config::SESSIONS_DIR)))).with_broadcast(app.state::<gateway::GatewayHub>().broadcast_sender()));
             tauri::async_runtime::spawn(async move {
                 let _ = agent.run_task(&task, sink, cancel).await;
                 app.state::<AppState>().end_task();
@@ -115,7 +116,7 @@ fn continue_session(
         if session_workspace.as_os_str().is_empty() { state.workspace_root() } else { session_workspace },
         Some(Arc::new(writer)),
     )?;
-    let sink: Arc<dyn events::EventSink> = Arc::new(events::TauriEventSink::root(app.clone(), agent_id).with_journal(Arc::new(event_journal::FileEventJournal::new(app.state::<AppState>().data_root().join(config::SESSIONS_DIR)))));
+    let sink: Arc<dyn events::EventSink> = Arc::new(events::TauriEventSink::root(app.clone(), agent_id).with_journal(Arc::new(event_journal::FileEventJournal::new(app.state::<AppState>().data_root().join(config::SESSIONS_DIR)))).with_broadcast(app.state::<gateway::GatewayHub>().broadcast_sender()));
     // spawn 的 future 必须是 'static：借用的 app 只能换成 owned 句柄再 move 进去。
     let app_handle = app.clone();
     tauri::async_runtime::spawn(async move {
@@ -162,6 +163,24 @@ fn read_session_events(
         after_event_id.as_deref(),
         limit.unwrap_or(event_journal::DEFAULT_LIMIT),
     )
+}
+
+/// gateway 连接信息（SH-094 批 2，控制面）：前端据此连 `ws://127.0.0.1:{port}` 并以 token 鉴权。
+/// token 是 loopback 传输鉴权串（非 API Key），仅经此特权 invoke 通道交给本应用前端，不落日志。
+#[derive(serde::Serialize)]
+struct GatewayInfo {
+    port: u16,
+    token: String,
+}
+
+#[tauri::command]
+fn gateway_info(app: tauri::AppHandle) -> Result<GatewayInfo, String> {
+    let hub = app.state::<gateway::GatewayHub>();
+    let port = hub.port();
+    if port == 0 {
+        return Err("WebSocket gateway 尚未绑定端口".into());
+    }
+    Ok(GatewayInfo { port, token: hub.token().to_string() })
 }
 
 /// 打开一个会话所需的历史条目。
@@ -1429,9 +1448,14 @@ pub fn run() {
             (AppConfig::default(), dirs.config_root.join(config::CONFIG_FILE))
         });
 
+    // SH-094 批 2：gateway hub（广播发送端 + 一次性 token + 动态端口）。sink 取发送端喂事件，
+    // .setup 绑定 loopback 端口跑 accept 循环，gateway_info 命令回报 port/token 给前端。
+    let gateway_hub = gateway::GatewayHub::new(dirs.data_root.join(config::SESSIONS_DIR));
+
     tauri::Builder::default()
         .plugin(tauri_plugin_dialog::init())
         .manage(AppState::new(app_config, config_path, dirs.data_root.clone()))
+        .manage(gateway_hub.clone())
         .invoke_handler(tauri::generate_handler![
             dev_ping,
             send_task,
@@ -1471,6 +1495,7 @@ pub fn run() {
             set_plan_mode,
             get_product_dirs,
             read_session_events,
+            gateway_info,
             read_clipboard_text,
             write_clipboard_text,
             workspace_files::workspace_file_stat,
@@ -1495,6 +1520,19 @@ pub fn run() {
             }
         })
         .setup(|app| {
+            // SH-094 批 2：loopback WS gateway。动态端口绑定后写入 hub 供 gateway_info 回报；
+            // 绑定失败只告警降级（事件仍走 Tauri 广播），不拦启动。
+            let gateway_hub = app.state::<gateway::GatewayHub>().inner().clone();
+            tauri::async_runtime::spawn(async move {
+                match tokio::net::TcpListener::bind("127.0.0.1:0").await {
+                    Ok(listener) => {
+                        if let Err(e) = gateway::serve(gateway_hub, listener).await {
+                            tracing::warn!("WebSocket gateway 退出: {e}");
+                        }
+                    }
+                    Err(e) => tracing::warn!("WebSocket gateway 绑定失败（事件仍走 Tauri 广播）: {e}"),
+                }
+            });
             // 系统托盘：菜单 = 显示 / 退出；左键单击图标 = 显示主窗口
             let show = MenuItem::with_id(app, "show", "显示", true, None::<&str>)?;
             let quit = MenuItem::with_id(app, "quit", "退出", true, None::<&str>)?;
