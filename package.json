@@ -9,6 +9,7 @@
     "build": "vite build",
     "typecheck": "tsc -b --force",
     "test": "vitest run",
+    "package:portable": "powershell -NoProfile -ExecutionPolicy Bypass -File scripts/package-portable.ps1",
     "tauri": "tauri"
   },
   "dependencies": {
