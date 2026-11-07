@@ -37,7 +37,9 @@ import { apply as uiScheduleApply, inject as uiScheduleInject } from '@deepseek-
 import { apply as uiContextMenuApply, inject as uiContextMenuInject } from '@deepseek-ai/dsh-client-ui-context-menu/client'
 import { apply as uiFileDragApply, inject as uiFileDragInject } from '@deepseek-ai/dsh-client-ui-file-drag/client'
 import { apply as uiFileActionsApply, inject as uiFileActionsInject } from '@deepseek-ai/dsh-client-ui-file-actions/client'
+import { apply as uiOpenInAppApply, inject as uiOpenInAppInject } from '@deepseek-ai/dsh-client-ui-open-in-app/client'
 import { installDesktopFileActions } from './file-actions/desktop-bridge'
+import { installOpenInAppRoutes } from './open-in-app/route-fetch'
 import { apply as uiInputTriggerApply, inject as uiInputTriggerInject } from '@deepseek-ai/dsh-client-ui-input-trigger/client'
 import { apply as uiCommandsApply, inject as uiCommandsInject } from '@deepseek-ai/dsh-client-ui-commands/client'
 import { apply as fileUploadApply, inject as fileUploadInject } from '@deepseek-ai/dsh-client-file-upload/client'
@@ -65,7 +67,6 @@ import {
 import { apply as brandApply, inject as brandInject } from './brand'
 import { apply as headerActionsApply, inject as headerActionsInject } from './header-actions'
 import { apply as modelConfigApply, inject as modelConfigInject } from './model-config'
-import { apply as workspaceMenuApply, inject as workspaceMenuInject } from './workspace-menu'
 
 export interface BootHandle {
   readonly ctx: Context
@@ -132,6 +133,9 @@ export async function bootShaniu(container: HTMLElement): Promise<BootHandle> {
     // 原始文件动作的桌面适配面（SH-092 批 2）：上游 ui-file-actions 从这里取
     // `dshDesktop.fileActions`；保存目标只由命令内部的原生对话框产生。
     installDesktopFileActions(tauriBridge())
+    // open-in-app 的三条 Host HTTP 路由（SH-092 批 3）接到 Tauri 命令；vendored
+    // ui-open-in-app 只经全局 fetch 访问相对路径，源码无需改动。
+    installOpenInAppRoutes(tauriBridge())
     // 默认工作区基线必须在挂载前写入；家目录给 connection 基线缩写路径用
     const { homeDir } = await applyProductWorkspacePath()
     adapter = createAdapter({
@@ -144,7 +148,7 @@ export async function bootShaniu(container: HTMLElement): Promise<BootHandle> {
         return typeof scoped?.scope === 'function' ? scoped.scope(sessionId) : undefined
       },
     })
-    const covered = ['session', 'workspace', 'toolResults', 'settings', 'llm', 'credentials', 'commands', 'permissionPresets', 'subagents']
+    const covered = ['session', 'workspace', 'workspaceFiles', 'toolResults', 'settings', 'llm', 'credentials', 'commands', 'permissionPresets', 'subagents']
     root.provide('remote', adapter.remote)
     // 适配层已接管的名字不再被 stub 覆盖：后注册的 stub 会让"消息流能跑、
     // 设置页永远抛错"，而抛错看起来像后端坏了，不像接线接反了。
@@ -202,6 +206,8 @@ export async function bootShaniu(container: HTMLElement): Promise<BootHandle> {
     // 原始文件动作（SH-092 批 2）：下载/另存为/复制图片。桌面适配面是
     // 原生保存对话框（路径只由用户手势产生），浏览器态退回 anchor 下载。
     { inject: uiFileActionsInject, apply: uiFileActionsApply },
+    // 打开方式/在文件管理器中显示/复制路径（SH-092 批 3）。
+    { inject: uiOpenInAppInject, apply: uiOpenInAppApply },
     { inject: uiContextMenuInject, apply: uiContextMenuApply },
     { inject: uiInputTriggerInject, apply: uiInputTriggerApply },
     { inject: uiCommandsInject, apply: uiCommandsApply },
@@ -219,8 +225,6 @@ export async function bootShaniu(container: HTMLElement): Promise<BootHandle> {
     { inject: brandInject, apply: brandApply },
     { inject: headerActionsInject, apply: headerActionsApply },
     { inject: modelConfigInject, apply: modelConfigApply },
-    // 工作区行菜单的「在文件夹显示」项（上游 ui-open-in-app 的 workspace 序位补齐）
-    { inject: workspaceMenuInject, apply: workspaceMenuApply },
     { inject: uiSettingsGeneralInject, apply: uiSettingsGeneralApply },
     { inject: uiSettingsModelsInject, apply: uiSettingsModelsApply },
     { inject: uiChatInject, apply: uiChatApply },

@@ -462,6 +462,18 @@
    "@deepseek-ai/dsh-client-ui-file-actions/*": [
     "./src/dsh/packages/client/ui-file-actions/src/*"
    ],
+   "@deepseek-ai/dsh-client-ui-open-in-app": [
+    "./src/dsh/packages/client/ui-open-in-app/src/index.ts"
+   ],
+   "@deepseek-ai/dsh-client-ui-open-in-app/*": [
+    "./src/dsh/packages/client/ui-open-in-app/src/*"
+   ],
+   "@deepseek-ai/dsh-host-open-in-app": [
+    "./src/dsh/packages/host/open-in-app/src/index.ts"
+   ],
+   "@deepseek-ai/dsh-host-open-in-app/*": [
+    "./src/dsh/packages/host/open-in-app/src/*"
+   ],
    "@deepseek-ai/dsh-client-ui-input-trigger": [
     "./src/dsh/packages/client/ui-input-trigger/src/index.ts"
    ],
@@ -1682,6 +1694,9 @@
    ],
    "@deepseek-ai/dsh-client-ui-file-actions/client": [
     "./src/dsh/packages/client/ui-file-actions/src/client/index.ts"
+   ],
+   "@deepseek-ai/dsh-client-ui-open-in-app/client": [
+    "./src/dsh/packages/client/ui-open-in-app/src/client/index.ts"
    ],
    "@deepseek-ai/dsh-client-ui-input-trigger/client": [
     "./src/dsh/packages/client/ui-input-trigger/src/client/index.ts"
@@ -3097,6 +3112,25 @@
   "./src/dsh/packages/client/ui-file-actions/src/css-modules.d.ts",
   "./src/dsh/packages/client/ui-file-actions/src/index.ts",
   "./src/dsh/packages/client/ui-file-actions/src/types.ts",
+  "./src/dsh/packages/client/ui-open-in-app/src/client/FileRouteAction.tsx",
+  "./src/dsh/packages/client/ui-open-in-app/src/client/OpenInAppAction.tsx",
+  "./src/dsh/packages/client/ui-open-in-app/src/client/OpenPathAction.tsx",
+  "./src/dsh/packages/client/ui-open-in-app/src/client/OpenPathEmptyAction.tsx",
+  "./src/dsh/packages/client/ui-open-in-app/src/client/OpenTargetButton.module.css",
+  "./src/dsh/packages/client/ui-open-in-app/src/client/OpenTargetButton.tsx",
+  "./src/dsh/packages/client/ui-open-in-app/src/client/applications.ts",
+  "./src/dsh/packages/client/ui-open-in-app/src/client/context-menus.tsx",
+  "./src/dsh/packages/client/ui-open-in-app/src/client/controller.ts",
+  "./src/dsh/packages/client/ui-open-in-app/src/client/file-applications.ts",
+  "./src/dsh/packages/client/ui-open-in-app/src/client/index.ts",
+  "./src/dsh/packages/client/ui-open-in-app/src/client/locales.ts",
+  "./src/dsh/packages/client/ui-open-in-app/src/client/open-path.ts",
+  "./src/dsh/packages/client/ui-open-in-app/src/client/open-toast.tsx",
+  "./src/dsh/packages/client/ui-open-in-app/src/client/outcome.ts",
+  "./src/dsh/packages/client/ui-open-in-app/src/client/session-open-with.ts",
+  "./src/dsh/packages/client/ui-open-in-app/src/css-modules.d.ts",
+  "./src/dsh/packages/client/ui-open-in-app/src/index.ts",
+  "./src/dsh/packages/host/open-in-app/src/shared.ts",
   "./src/dsh/packages/client/ui-input-trigger/src/client/MenuView.module.css",
   "./src/dsh/packages/client/ui-input-trigger/src/client/MenuView.tsx",
   "./src/dsh/packages/client/ui-input-trigger/src/client/contract.ts",

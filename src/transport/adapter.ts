@@ -1521,9 +1521,28 @@ export function createAdapter(options: AdapterOptions): { remote: unknown; dispo
       return selected
     },
     canOpenWorkspacePath: async () => OK(true),
-    openWorkspacePath: async (request: { path?: string } = {}) => {
-      await bridge.invoke('open_in_explorer', { path: request.path ?? '' })
-      return OK({ opened: true })
+    /**
+     * SH-092 批 3：某文件当前的注册处理器（上游 `NativeFileApplication` 数组）。
+     * application 打开时宿主会重新校验一次关联表——这里只做传递，不缓存处理器列表。
+     */
+    workspacePathApplications: async (request: { path?: string } = {}) => {
+      try {
+        return OK(await bridge.invoke<Array<Record<string, unknown>>>('workspace_path_applications', { path: request.path ?? '' }))
+      } catch (reason) {
+        return FAIL((reason as { message?: string } | undefined)?.message ?? '无法读取文件关联')
+      }
+    },
+    openWorkspacePath: async (request: { path?: string; action?: 'reveal'; application?: string } = {}) => {
+      try {
+        await bridge.invoke('open_workspace_path', {
+          path: request.path ?? '',
+          ...(request.action === undefined ? {} : { action: request.action }),
+          ...(request.application === undefined ? {} : { application: request.application }),
+        })
+        return OK({ opened: true })
+      } catch (reason) {
+        return FAIL((reason as { message?: string } | undefined)?.message ?? '无法打开该路径')
+      }
     },
     initializeDefaultModel: async () => {
       await face.refresh()
@@ -1628,7 +1647,6 @@ export function createAdapter(options: AdapterOptions): { remote: unknown; dispo
     observeEvent: () => unimplemented('session.observeEvent', 'SH-094'),
     observeProjections: () => unimplemented('session.observeProjections', 'SH-094'),
     observeState: () => unimplemented('session.observeState', 'SH-094'),
-    workspacePathApplications: () => unimplemented('session.workspacePathApplications', 'SH-092'),
   }
 
   /**

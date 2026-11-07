@@ -63,6 +63,8 @@ function scriptedBridge(
   compactHandler?: (args: Record<string, unknown> | undefined) => unknown,
   /** SH-092：`workspace_file_*` 四条命令的宿主替身（throw {code,message,details} = 类型化失败）。 */
   fileHandler?: (command: string, args: Record<string, unknown> | undefined) => unknown,
+  /** SH-092 批 3：open-in-app 的 `workspace_path_applications`/`open_workspace_path` 替身。 */
+  openHandler?: (command: string, args: Record<string, unknown> | undefined) => unknown,
 ): ScriptedBridge {
   const calls: ScriptedBridge['calls'] = []
   const handlers = new Set<(event: AgentEvent) => void>()
@@ -80,6 +82,10 @@ function scriptedBridge(
     async invoke<T>(command: string, args?: Record<string, unknown>): Promise<T> {
       calls.push({ command, args })
       if (command === 'get_settings') return state as T
+      if (command === 'workspace_path_applications' || command === 'open_workspace_path') {
+        if (openHandler === undefined) return (command === 'open_workspace_path' ? undefined : []) as T
+        return openHandler(command, args) as T
+      }
       if (command.startsWith('workspace_file_')) {
         // 缺省给一份最小可用形状：单测只在需要断言失败/内容时才接 fileHandler。
         if (fileHandler === undefined) return { absolutePath: 'C:\w\a.txt', version: '1-2', bytes: 2 } as T
@@ -2363,6 +2369,39 @@ describe('session.search 接宿主 FTS5 派生索引（SH-113，wire query-only�
     dispose()
     second.dispose()
     adapter3.dispose()
+  })
+
+  it('SH-092 批3 打开方式：应用列表透传、显式应用随 open 请求下发、reveal 不带应用', async () => {
+    const apps = [{ id: 'C:/Apps/Code.exe', name: 'Visual Studio Code', default: true, icon: null }]
+    const bridge = scriptedBridge(HOST_SETTINGS, [], undefined, undefined, undefined, undefined, undefined,
+      command => (command === 'workspace_path_applications' ? apps : undefined))
+    const { remote, dispose } = createAdapter({ bridge })
+    const listed = await (faceOf(remote).session as unknown as Record<string, (...a: unknown[]) => Promise<Record<string, unknown>>>)['workspacePathApplications']!({ path: 'C:/ws/a.ts' })
+    expect(listed['value']).toEqual(apps)
+    expect(bridge.calls.find(call => call.command === 'workspace_path_applications')?.args).toEqual({ path: 'C:/ws/a.ts' })
+
+    const opened = await (faceOf(remote).session as unknown as Record<string, (...a: unknown[]) => Promise<Record<string, unknown>>>)['openWorkspacePath']!({ path: 'C:/ws/a.ts', application: 'C:/Apps/Code.exe' })
+    expect(opened['value']).toEqual({ opened: true })
+    expect(bridge.calls.find(call => call.command === 'open_workspace_path')?.args).toEqual({ path: 'C:/ws/a.ts', application: 'C:/Apps/Code.exe' })
+
+    await (faceOf(remote).session as unknown as Record<string, (...a: unknown[]) => Promise<Record<string, unknown>>>)['openWorkspacePath']!({ path: 'C:/ws/a.ts', action: 'reveal' })
+    const revealCalls = bridge.calls.filter(call => call.command === 'open_workspace_path')
+    expect(revealCalls.at(-1)?.args).toEqual({ path: 'C:/ws/a.ts', action: 'reveal' })
+    expect(revealCalls.at(-1)?.args && Object.keys(revealCalls.at(-1)!.args!)).not.toContain('application')
+    dispose()
+  })
+
+  it('SH-092 批3 打开方式：宿主拒单回 {ok:false}，不让 rejection 穿透', async () => {
+    const bridge = scriptedBridge(HOST_SETTINGS, [], undefined, undefined, undefined, undefined, undefined,
+      () => { throw { message: '应用不可用' } })
+    const { remote, dispose } = createAdapter({ bridge })
+    const session = faceOf(remote).session as unknown as Record<string, (...a: unknown[]) => Promise<Record<string, unknown>>>
+    const failed = await session['openWorkspacePath']!({ path: 'C:/ws/a.ts', application: 'C:/gone.exe' })
+    expect(failed['ok']).toBe(false)
+    expect((failed['error'] as { message: string }).message).toContain('应用不可用')
+    const listFailed = await session['workspacePathApplications']!({ path: 'C:/ws/a.ts' })
+    expect(listFailed['ok']).toBe(false)
+    dispose()
   })
 
   it('SH-092 变更流：宿主没有监视面就带码中断，不挂一条永不发声的流', async () => {
