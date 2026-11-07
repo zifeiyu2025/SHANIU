@@ -88,9 +88,24 @@ pub struct AgentLoop {
     /// 落盘失败只播报一次：磁盘满时每条历史都报一遍会把事件流刷满，却没有任何新信息。
     /// 与其余字段一样公开——`AgentLoop` 是纯数据结构，测试与装配层都按字面量构造它。
     pub rollout_broke: std::sync::atomic::AtomicBool,
+    /// 会话 id（SH-089）：后台作业的属主；装配层通过 `with_jobs` 注入。
+    pub session_id: Option<String>,
+    /// 进程级作业注册表（SH-089）。
+    pub jobs: Option<Arc<crate::jobs::JobRegistry>>,
 }
 
 impl AgentLoop {
+    /// 注入会话作用域与作业注册表（SH-089）；装配层在构造后调用。
+    pub fn with_jobs(
+        mut self,
+        session_id: impl Into<String>,
+        jobs: Arc<crate::jobs::JobRegistry>,
+    ) -> Self {
+        self.session_id = Some(session_id.into());
+        self.jobs = Some(jobs);
+        self
+    }
+
     /// 把 `history` 里尚未落盘的尾部条目补写进档案。
     ///
     /// 失败不中断本轮执行——工具与模型都不依赖档案；但必须**播报**：
@@ -216,6 +231,8 @@ impl AgentLoop {
             },
             rollout,
             rollout_broke: std::sync::atomic::AtomicBool::new(false),
+            session_id: None,
+            jobs: None,
         }
     }
 
@@ -511,7 +528,8 @@ impl AgentLoop {
                     call_id.clone(),
                     sink.clone(),
                     self.policy.sandbox,
-                );
+                )
+                .with_jobs(self.session_id.clone(), self.jobs.clone());
                 let result = self.router.execute(name, args_val, &tool_ctx).await;
                 let output_text = match &result {
                     Ok(out) => {
@@ -725,6 +743,8 @@ mod tests {
             },
             rollout: None,
             rollout_broke: std::sync::atomic::AtomicBool::new(false),
+            session_id: None,
+            jobs: None,
         };
         (agent, store, CancellationToken::new(), broker)
     }
@@ -1046,6 +1066,8 @@ mod tests {
             },
             rollout: None,
             rollout_broke: std::sync::atomic::AtomicBool::new(false),
+            session_id: None,
+            jobs: None,
         };
         (agent, recorded, store)
     }
@@ -1245,6 +1267,8 @@ mod tests {
             },
             rollout: Some(writer),
             rollout_broke: std::sync::atomic::AtomicBool::new(false),
+            session_id: None,
+            jobs: None,
         };
         let (sink, _store) = CapturingSink::new();
         let task = format!(

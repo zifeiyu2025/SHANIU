@@ -6,6 +6,7 @@
 
 pub mod apply_patch;
 pub mod fs_read;
+pub mod job_tools;
 pub mod plan;
 pub mod skill;
 pub mod todo;
@@ -24,5 +25,8 @@ pub fn register_builtin(router: &mut ToolRouter, plan_state: Arc<PlanState>) {
     router.register(Arc::new(apply_patch::ApplyPatch::new()));
     router.register(Arc::new(todo::TodoWrite::default()));
     router.register(Arc::new(skill::SkillTool::new()));
+    router.register(Arc::new(job_tools::JobOutput::new()));
+    router.register(Arc::new(job_tools::JobList::new()));
+    router.register(Arc::new(job_tools::JobKill::new()));
     plan::register(router, plan_state);
 }

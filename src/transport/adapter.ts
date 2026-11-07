@@ -3062,6 +3062,118 @@ export function createAdapter(options: AdapterOptions): { remote: unknown; dispo
     },
   }
 
+  /**
+   * `remote.job`（SH-089）：后台作业面。
+   *
+   * 上游 gateway 推 `job.list`/`job.follow` 流；桌面壳没有作业事件通道，
+   * 适配层用宿主的 `job_list`/`job_read` 轮询还原同名帧语义：
+   * rows 整表替换、opened 锚点 + output 增量 + 落定 status。注册表在进程内存，
+   * 进程退出即清空（`docs/05` SH-089 注）。
+   */
+  const JOB_POLL_MS = 400
+  const JOB_TERMINAL = new Set(['completed', 'killed', 'failed'])
+  interface JobRowWire {
+    readonly id: string
+    readonly status: string
+    readonly output: { readonly total: number; readonly earliest: number }
+  }
+  interface JobChunkWire {
+    readonly at: number
+    readonly text: string
+    readonly channel?: string
+    readonly gapBefore?: true
+  }
+  interface JobReadWire {
+    readonly job: JobRowWire
+    readonly chunks: readonly JobChunkWire[]
+    readonly next: number
+    readonly lossy: boolean
+  }
+  const waitAbortable = (ms: number, signal?: AbortSignal): Promise<void> => new Promise((resolve) => {
+    if (signal?.aborted === true) {
+      resolve()
+      return
+    }
+    const done = (): void => {
+      clearTimeout(timer)
+      signal?.removeEventListener('abort', done)
+      resolve()
+    }
+    const timer = setTimeout(done, ms)
+    signal?.addEventListener('abort', done, { once: true })
+  })
+
+  const jobNamespace = {
+    list: async function* (
+      request: { sessionId: string },
+      signal?: AbortSignal,
+    ): AsyncGenerator<Record<string, unknown>> {
+      let previous = ''
+      while (signal?.aborted !== true) {
+        const jobs = await bridge.invoke<JobRowWire[]>('job_list', { sessionId: request.sessionId })
+        const signature = JSON.stringify(jobs)
+        if (signature !== previous) {
+          previous = signature
+          yield { type: 'rows', jobs }
+        }
+        await waitAbortable(JOB_POLL_MS, signal)
+      }
+    },
+    follow: async function* (
+      request: { sessionId?: string; jobId: string; from?: number },
+      signal?: AbortSignal,
+    ): AsyncGenerator<Record<string, unknown>> {
+      let cursor = request.from
+      let anchored = false
+      while (signal?.aborted !== true) {
+        const read = await bridge.invoke<JobReadWire>('job_read', {
+          ...(request.sessionId === undefined ? {} : { sessionId: request.sessionId }),
+          jobId: request.jobId,
+          ...(cursor === undefined ? {} : { from: cursor }),
+        })
+        if (!anchored) {
+          cursor = cursor ?? read.job.output.earliest
+          yield { type: 'opened', job: read.job, from: cursor }
+          anchored = true
+        }
+        if (read.chunks.length > 0) {
+          yield {
+            type: 'output',
+            chunks: read.chunks,
+            next: read.next,
+            ...(read.lossy ? { lossy: true as const } : {}),
+          }
+          cursor = read.next
+        }
+        // 落定且输出已排干：交终态帧并结束这一代（服务端会 close 观察流）。
+        const position = cursor ?? read.job.output.earliest
+        if (JOB_TERMINAL.has(read.job.status) && position >= read.job.output.total) {
+          yield { type: 'status', job: read.job }
+          return
+        }
+        await waitAbortable(JOB_POLL_MS, signal)
+      }
+    },
+    kill: async (request: { sessionId: string; jobId: string }) => {
+      try {
+        return OK(await bridge.invoke<{ outcome: 'requested' | 'already-finished' }>('job_kill', {
+          sessionId: request.sessionId,
+          jobId: request.jobId,
+        }))
+      } catch (reason) {
+        const raw = (reason ?? {}) as { code?: string; message?: string }
+        const code = raw.code === 'job/not-found' ? 'job/not-found' : 'gateway/internal'
+        const details = code === 'job/not-found'
+          ? { sessionId: request.sessionId, jobId: request.jobId }
+          : {}
+        return {
+          ok: false as const,
+          error: new RemoteError(code as never, raw.message ?? '无法终止后台作业', details as never),
+        }
+      }
+    },
+  }
+
   const namespaces = new Map<string, unknown>([
     ['session', sessionNamespace],
     ['workspace', workspaceNamespace],
@@ -3070,6 +3182,7 @@ export function createAdapter(options: AdapterOptions): { remote: unknown; dispo
     ['sessionReferenceResolver', sessionReferenceResolverNamespace],
     ['skills', skillsNamespace],
     ['goals', goalsNamespace],
+    ['job', jobNamespace],
     ['directoryPicker', directoryPickerNamespace],
     ['toolResults', toolResultsNamespace],
     ['settings', settingsNamespace],

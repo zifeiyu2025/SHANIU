@@ -282,6 +282,8 @@ async fn run_one(task: &Task, fixture: &BTreeMap<String, String>, backend: Arc<R
         },
         rollout: Some(writer),
         rollout_broke: std::sync::atomic::AtomicBool::new(false),
+        session_id: None,
+        jobs: None,
     };
 
     let started = Instant::now();

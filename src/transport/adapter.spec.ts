@@ -67,6 +67,8 @@ function scriptedBridge(
   openHandler?: (command: string, args: Record<string, unknown> | undefined) => unknown,
   /** SH-116：`read_attachment` 替身（缺省回一个文本文件）。 */
   attachmentRead?: (args: Record<string, unknown> | undefined) => unknown,
+  /** SH-089：`job_list`/`job_read`/`job_kill` 的宿主替身（throw {code,message} = 类型化失败）。 */
+  jobHandler?: (command: string, args: Record<string, unknown> | undefined) => unknown,
 ): ScriptedBridge {
   const calls: ScriptedBridge['calls'] = []
   const handlers = new Set<(event: AgentEvent) => void>()
@@ -160,6 +162,12 @@ function scriptedBridge(
         }
         goalState = { ...goalState, goal: next }
         return structuredClone(goalState) as T
+      }
+      // SH-089：后台作业注册表的宿主替身。缺省空表 / 未找到，避免误把空壳当成功。
+      if (command === 'job_list' || command === 'job_read' || command === 'job_kill') {
+        if (jobHandler !== undefined) return jobHandler(command, args) as T
+        if (command === 'job_list') return [] as T
+        throw { code: 'job/not-found', message: `没有作业 ${String(args?.['jobId'])}` }
       }
       if (command === 'save_settings') {
         if (saveFailure !== undefined) throw saveFailure
@@ -1911,6 +1919,60 @@ describe('Plan 芯片与客户端排队', () => {
     expect(activations.at(-1)).toEqual({ sessionId: 'agent-new' })
     expect(await face.goals.get('agent-new')).toMatchObject({ ok: true, value: undefined })
     off()
+    dispose()
+  })
+
+  it('remote.job：list 整表帧、follow opened→output→status、kill 类型化失败', async () => {
+    const running = {
+      id: 'bash-1', kind: 'bash', label: 'sleep', status: 'running', startedAt: 1,
+      output: { total: 3, earliest: 0 },
+    }
+    const done = {
+      id: 'bash-2', kind: 'bash', label: 'echo hi', status: 'completed', startedAt: 2,
+      finishedAt: 3, detail: 'exit code: 0', output: { total: 6, earliest: 0 },
+    }
+    const bridge = scriptedBridge(
+      undefined, [], undefined, undefined, undefined, undefined, undefined, undefined, undefined,
+      (command, args) => {
+        if (command === 'job_list') return [running, done]
+        if (command === 'job_read') {
+          return { job: done, chunks: [{ at: 0, text: 'hi\n', channel: 'stdout' }], next: 6, lossy: false }
+        }
+        if (command === 'job_kill') {
+          if (args?.['jobId'] === 'bash-2') return { outcome: 'already-finished' }
+          throw { code: 'job/not-found', message: '没有该作业' }
+        }
+        return undefined
+      },
+    )
+    const { remote, dispose } = createAdapter({ bridge })
+    const face = remote as unknown as {
+      job: {
+        list(request: Record<string, unknown>, signal?: AbortSignal): AsyncIterable<Record<string, unknown>>
+        follow(request: Record<string, unknown>, signal?: AbortSignal): AsyncIterable<Record<string, unknown>>
+        kill(request: Record<string, unknown>): Promise<Record<string, unknown>>
+      }
+    }
+
+    const controller = new AbortController()
+    const listed = face.job.list({ sessionId: 'agent-new' }, controller.signal)
+    expect((await listed[Symbol.asyncIterator]().next()).value).toEqual({ type: 'rows', jobs: [running, done] })
+    controller.abort()
+    expect((await listed[Symbol.asyncIterator]().next()).done).toBe(true)
+
+    const frames: Record<string, unknown>[] = []
+    for await (const frame of face.job.follow({ sessionId: 'agent-new', jobId: 'bash-2' })) frames.push(frame)
+    expect(frames.map(frame => frame['type'])).toEqual(['opened', 'output', 'status'])
+    expect(frames[0]).toMatchObject({ type: 'opened', from: 0, job: { id: 'bash-2' } })
+    expect(frames[1]).toMatchObject({ type: 'output', next: 6, chunks: [{ text: 'hi\n', channel: 'stdout' }] })
+    expect(frames[2]).toMatchObject({ type: 'status', job: { status: 'completed' } })
+
+    expect(await face.job.kill({ sessionId: 'agent-new', jobId: 'bash-x' })).toMatchObject({
+      ok: false, error: { code: 'job/not-found' },
+    })
+    expect(await face.job.kill({ sessionId: 'agent-new', jobId: 'bash-2' })).toMatchObject({
+      ok: true, value: { outcome: 'already-finished' },
+    })
     dispose()
   })
 

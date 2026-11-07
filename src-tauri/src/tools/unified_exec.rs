@@ -54,7 +54,11 @@ impl UnifiedExec {
                     "properties": {
                         "command": { "type": "string", "description": "要执行的命令行" },
                         "cwd": { "type": "string", "description": "工作目录（工作区相对路径，默认根）" },
-                        "timeout_ms": { "type": "integer", "description": "超时毫秒数，默认 120000，上限 600000" }
+                        "timeout_ms": { "type": "integer", "description": "超时毫秒数，默认 120000，上限 600000" },
+                        "run_in_background": {
+                            "type": "boolean",
+                            "description": "在后台运行：立即返回作业 id，输出改用 job_output 读取，可用 job_kill 终止"
+                        }
                     },
                     "required": ["command"]
                 }),
@@ -97,6 +101,71 @@ fn spawn_reader(
     })
 }
 
+/// 后台作业 worker：脱离工具调用独立运行，输出进注册表环形缓冲，
+/// 由 `job_kill` 的终止信号或超时结束；退出码落定终态。
+fn spawn_background_worker(
+    jobs: std::sync::Arc<crate::jobs::JobRegistry>,
+    job_id: String,
+    mut waiter: Waiter,
+    mut rx: mpsc::Receiver<sandbox::ExecLine>,
+    mut kill_rx: tokio::sync::oneshot::Receiver<()>,
+    timeout_ms: u64,
+) {
+    tokio::spawn(async move {
+        let deadline = tokio::time::sleep(Duration::from_millis(timeout_ms));
+        tokio::pin!(deadline);
+        loop {
+            tokio::select! {
+                _ = &mut kill_rx => {
+                    waiter.kill();
+                    jobs.finish(&job_id, "killed", Some("kill requested".into()));
+                    return;
+                }
+                _ = &mut deadline => {
+                    waiter.kill();
+                    jobs.finish(
+                        &job_id,
+                        "failed",
+                        Some(format!("命令超时（{timeout_ms}ms）被终止")),
+                    );
+                    return;
+                }
+                status = waiter.status() => {
+                    // 排干管道余量；限时防孤儿进程挂住。
+                    let drain_deadline = tokio::time::sleep(Duration::from_secs(1));
+                    tokio::pin!(drain_deadline);
+                    loop {
+                        tokio::select! {
+                            _ = &mut drain_deadline => break,
+                            item = rx.recv() => match item {
+                                Some((channel, line)) => append_line(&jobs, &job_id, channel, &line),
+                                None => break,
+                            }
+                        }
+                    }
+                    match status {
+                        Ok(status) => {
+                            let code = status.code().unwrap_or(-1);
+                            let state = if code == 0 { "completed" } else { "failed" };
+                            jobs.finish(&job_id, state, Some(format!("exit code: {code}")));
+                        }
+                        Err(error) => {
+                            jobs.finish(&job_id, "failed", Some(format!("等待进程失败: {error}")));
+                        }
+                    }
+                    return;
+                }
+                Some((channel, line)) = rx.recv() => append_line(&jobs, &job_id, channel, &line),
+            }
+        }
+    });
+}
+
+fn append_line(jobs: &crate::jobs::JobRegistry, job_id: &str, channel: u8, line: &str) {
+    let channel = if channel == 0 { Some("stdout") } else { Some("stderr") };
+    jobs.append(job_id, &format!("{line}\n"), channel);
+}
+
 #[async_trait]
 impl ToolExecutor for UnifiedExec {
     fn spec(&self) -> &ToolSpec {
@@ -124,6 +193,10 @@ impl ToolExecutor for UnifiedExec {
             .and_then(|v| v.as_u64())
             .unwrap_or(DEFAULT_TIMEOUT_MS)
             .clamp(100, MAX_TIMEOUT_MS);
+        let run_in_background = args
+            .get("run_in_background")
+            .and_then(|v| v.as_bool())
+            .unwrap_or(false);
 
         // stdio 行通道（Plain=tokio 读任务 / Restricted=std 读线程，统一回传）
         let (tx, mut rx) = mpsc::channel::<sandbox::ExecLine>(256);
@@ -162,9 +235,29 @@ impl ToolExecutor for UnifiedExec {
         };
         drop(tx);
 
+        if run_in_background {
+            let (Some(jobs), Some(session_id)) = (ctx.jobs.clone(), ctx.session_id.clone()) else {
+                waiter.kill();
+                return Err(ToolError::InvalidArgs(
+                    "run_in_background 需要会话作用域（请从会话内调用）".into(),
+                ));
+            };
+            let (job_id, kill_rx) = jobs.create("bash", command, Some(session_id));
+            jobs.append(&job_id, &format!("$ {command}\n"), None);
+            spawn_background_worker(jobs, job_id.clone(), waiter, rx, kill_rx, timeout_ms);
+            return Ok(ToolOutput::ok(format!(
+                "后台作业已启动: {job_id}\n命令: {command}\n用 job_output 读取增量输出，job_list 查看作业列表，job_kill 终止。"
+            )));
+        }
+
         let mut collected: Vec<String> = Vec::new();
         let mut collected_bytes = 0usize;
         let mut truncated_note: Option<String> = None;
+
+        // 超时必须在循环外固定截止点：在 select! 里每次迭代重建 sleep 会让
+        // 持续输出的长命令永远等不到超时。
+        let deadline = tokio::time::sleep(Duration::from_millis(timeout_ms));
+        tokio::pin!(deadline);
 
         let result = loop {
             tokio::select! {
@@ -172,7 +265,7 @@ impl ToolExecutor for UnifiedExec {
                     waiter.kill();
                     return Err(ToolError::Cancelled);
                 }
-                _ = tokio::time::sleep(Duration::from_millis(timeout_ms)) => {
+                _ = &mut deadline => {
                     waiter.kill();
                     break Ok(ToolOutput::fail(format!(
                         "命令超时（{timeout_ms}ms）被终止。已捕获输出：\n{}",
@@ -365,6 +458,63 @@ mod tests {
             .await
             .unwrap_err();
         assert!(matches!(err, ToolError::InvalidArgs(_)));
+        std::fs::remove_dir_all(&ws).ok();
+    }
+
+    #[tokio::test]
+    async fn background_job_collects_output_and_settles() {
+        let ws = workspace();
+        let registry = std::sync::Arc::new(crate::jobs::JobRegistry::new());
+        let context = ctx(&ws).with_jobs(Some("s1".into()), Some(registry.clone()));
+        let out = UnifiedExec::new()
+            .execute(
+                serde_json::json!({"command": "echo bg-hello", "run_in_background": true}),
+                &context,
+            )
+            .await
+            .unwrap();
+        assert!(out.success);
+        let id = out
+            .output
+            .split_whitespace()
+            .nth(1)
+            .expect("输出应含作业 id")
+            .to_string();
+        for _ in 0..100 {
+            if registry.read(&id, "s1", None).unwrap().job.status != "running" {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(50)).await;
+        }
+        let read = registry.read(&id, "s1", None).unwrap();
+        assert_eq!(read.job.status, "completed");
+        assert_eq!(read.job.detail.as_deref(), Some("exit code: 0"));
+        assert!(read.chunks.iter().any(|chunk| chunk.text.contains("bg-hello")));
+        std::fs::remove_dir_all(&ws).ok();
+    }
+
+    #[tokio::test]
+    async fn background_job_can_be_killed() {
+        let ws = workspace();
+        let registry = std::sync::Arc::new(crate::jobs::JobRegistry::new());
+        let context = ctx(&ws).with_jobs(Some("s1".into()), Some(registry.clone()));
+        let out = UnifiedExec::new()
+            .execute(
+                serde_json::json!({"command": "ping -n 30 127.0.0.1", "run_in_background": true}),
+                &context,
+            )
+            .await
+            .unwrap();
+        let id = out.output.split_whitespace().nth(1).unwrap().to_string();
+        let killed = registry.kill(&id, "s1").unwrap();
+        assert_eq!(killed.outcome, "requested");
+        for _ in 0..100 {
+            if registry.read(&id, "s1", None).unwrap().job.status == "killed" {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(50)).await;
+        }
+        assert_eq!(registry.read(&id, "s1", None).unwrap().job.status, "killed");
         std::fs::remove_dir_all(&ws).ok();
     }
 

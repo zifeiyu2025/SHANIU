@@ -108,6 +108,8 @@ async fn rollout_file_matches_history_after_one_task() {
         policy: policy::SessionPolicy { approval: ApprovalMode::Ask, sandbox: SandboxMode::WorkspaceWrite },
         rollout: Some(writer.clone()),
         rollout_broke: std::sync::atomic::AtomicBool::new(false),
+        session_id: None,
+        jobs: None,
     };
     let sink: Arc<dyn EventSink> = Arc::new(NullSink);
     let summary = agent.run_task("读 a.txt", sink, CancellationToken::new()).await;

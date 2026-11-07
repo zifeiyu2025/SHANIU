@@ -25,6 +25,8 @@ pub struct AppState {
     pub broker: Arc<ApprovalBroker>,
     /// 计划态标志（Plan Mode，跨任务保留：同一会话内后续任务仍在计划态时继续只读）。
     pub plan_state: Arc<PlanState>,
+    /// 进程级后台作业注册表（SH-089）：跨任务保留，进程退出即清空。
+    pub jobs: Arc<crate::jobs::JobRegistry>,
 }
 
 impl AppState {
@@ -37,6 +39,7 @@ impl AppState {
             active_task: Mutex::new(None),
             broker: Arc::new(ApprovalBroker::new()),
             plan_state: Arc::new(PlanState::new()),
+            jobs: Arc::new(crate::jobs::JobRegistry::new()),
         }
     }
 

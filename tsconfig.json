@@ -1756,6 +1756,15 @@
    "@deepseek-ai/dsh-client-ui-goal/client": [
     "./node_modules/.cache/dsh-types-client/src/dsh/packages/client/ui-goal/src/client/index.d.ts"
    ],
+   "@deepseek-ai/dsh-client-ui-jobs": [
+    "./node_modules/.cache/dsh-types-client/src/dsh/packages/client/ui-jobs/src/index.d.ts"
+   ],
+   "@deepseek-ai/dsh-client-ui-jobs/*": [
+    "./node_modules/.cache/dsh-types-client/src/dsh/packages/client/ui-jobs/src/*"
+   ],
+   "@deepseek-ai/dsh-client-ui-jobs/client": [
+    "./node_modules/.cache/dsh-types-client/src/dsh/packages/client/ui-jobs/src/client/index.d.ts"
+   ],
    "@deepseek-ai/dsh-client-ui-plan/client": [
     "./node_modules/.cache/dsh-types-client/src/dsh/packages/client/ui-plan/src/client/index.d.ts"
    ],

@@ -42,6 +42,9 @@ import type { CompactionCheckpointSource } from '@deepseek-ai/dsh-compaction/che
 import type {
   CreateGoalRequest, CreateGoalResult, EditGoalRequest, GoalRef, GoalView,
 } from '@deepseek-ai/dsh-goal/client'
+import type {
+  JobFollowFrame, JobFollowRequest, JobKillRequest, JobKillValue, JobListFrame, JobListRequest,
+} from '@deepseek-ai/dsh-api-job-controller/client'
 
 declare module '@deepseek-ai/dsh-llm' {
   interface MessageSourceMap {
@@ -140,12 +143,20 @@ interface GoalsRemote {
   clear(sessionId: SessionId, ref: GoalRef): Promise<RemoteResult<GoalRef>>
 }
 
+/** 后台作业（SH-089）：与上游 `job` Remote 命名空间同形，stream 由适配层轮询还原。 */
+interface JobRemote {
+  list(request: JobListRequest, signal?: AbortSignal): AsyncIterable<JobListFrame>
+  follow(request: JobFollowRequest, signal?: AbortSignal): AsyncIterable<JobFollowFrame>
+  kill(request: JobKillRequest): Promise<RemoteResult<JobKillValue>>
+}
+
 export interface RemoteNamespaces {
   readonly session: SessionRemote
   readonly fileReferences: FileReferencesRemote
   readonly sessionReferenceResolver: SessionReferenceResolverRemote
   readonly skills: SkillsRemote
   readonly goals: GoalsRemote
+  readonly job: JobRemote
   readonly settings: SettingsRemote
   readonly credentials: CredentialsRemote
   readonly llm: LlmRemote

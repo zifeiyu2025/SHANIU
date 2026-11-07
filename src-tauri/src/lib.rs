@@ -10,6 +10,7 @@ pub mod file_actions;
 pub mod file_references;
 pub mod gateway;
 pub mod goals;
+pub mod jobs;
 pub mod model_client;
 pub mod model_discovery;
 pub mod open_in_app;
@@ -982,7 +983,8 @@ fn build_agent_with(
         &cfg,
         workspace_root,
         writer,
-    );
+    )
+    .with_jobs(agent_id.to_string(), state.jobs.clone());
     Ok((agent, cancel))
 }
 
@@ -1556,7 +1558,10 @@ pub fn run() {
             goals::goal_edit,
             goals::goal_pause,
             goals::goal_resume,
-            goals::goal_clear
+            goals::goal_clear,
+            jobs::job_list,
+            jobs::job_read,
+            jobs::job_kill
         ])
         .on_window_event(|window, event| {
             // 关闭 = 隐藏到系统托盘（不退出）；真正退出只走托盘菜单「退出」

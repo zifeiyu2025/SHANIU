@@ -525,6 +525,12 @@
    "@deepseek-ai/dsh-client-ui-goal/*": [
     "./src/dsh/packages/client/ui-goal/src/*"
    ],
+   "@deepseek-ai/dsh-client-ui-jobs": [
+    "./src/dsh/packages/client/ui-jobs/src/index.ts"
+   ],
+   "@deepseek-ai/dsh-client-ui-jobs/*": [
+    "./src/dsh/packages/client/ui-jobs/src/*"
+   ],
    "@deepseek-ai/dsh-client-ui-plan": [
     "./src/dsh/packages/client/ui-plan/src/index.ts"
    ],
@@ -1745,6 +1751,9 @@
    ],
    "@deepseek-ai/dsh-client-ui-goal/client": [
     "./src/dsh/packages/client/ui-goal/src/client/index.ts"
+   ],
+   "@deepseek-ai/dsh-client-ui-jobs/client": [
+    "./src/dsh/packages/client/ui-jobs/src/client/index.ts"
    ],
    "@deepseek-ai/dsh-client-ui-plan/client": [
     "./src/dsh/packages/client/ui-plan/src/client/index.ts"
@@ -3237,6 +3246,16 @@
   "./src/dsh/packages/client/ui-goal/src/client/user-text-rules.ts",
   "./src/dsh/packages/client/ui-goal/src/css-modules.d.ts",
   "./src/dsh/packages/client/ui-goal/src/index.ts",
+  "./src/dsh/packages/api/job-controller/src/client/index.ts",
+  "./src/dsh/packages/api/job-controller/src/client/model.ts",
+  "./src/dsh/packages/api/job-controller/src/client/service.ts",
+  "./src/dsh/packages/api/job-controller/src/types.ts",
+  "./src/dsh/packages/client/ui-jobs/src/client/JobListAction.module.css",
+  "./src/dsh/packages/client/ui-jobs/src/client/JobListAction.tsx",
+  "./src/dsh/packages/client/ui-jobs/src/client/index.ts",
+  "./src/dsh/packages/client/ui-jobs/src/client/locales.ts",
+  "./src/dsh/packages/client/ui-jobs/src/css-modules.d.ts",
+  "./src/dsh/packages/client/ui-jobs/src/index.ts",
   "./src/dsh/packages/client/ui-plan/src/client/PlanCard.tsx",
   "./src/dsh/packages/client/ui-plan/src/client/PlanModeControl.module.css",
   "./src/dsh/packages/client/ui-plan/src/client/PlanModeControl.tsx",

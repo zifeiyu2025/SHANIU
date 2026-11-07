@@ -112,6 +112,8 @@ fn harness(tool_name: &str) -> Harness {
         },
         rollout: None,
         rollout_broke: std::sync::atomic::AtomicBool::new(false),
+        session_id: None,
+        jobs: None,
     };
     Harness { agent, hits, events, broker, cancel: CancellationToken::new() }
 }

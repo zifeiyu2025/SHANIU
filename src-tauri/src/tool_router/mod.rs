@@ -92,6 +92,10 @@ pub struct ToolContext {
     pub sink: Arc<dyn EventSink>,
     /// 沙箱策略（unified_exec 启动子进程时生效）。
     pub sandbox: crate::config::SandboxMode,
+    /// 会话作用域（SH-089）：后台作业的属主。测试与无会话路径为 None。
+    pub session_id: Option<String>,
+    /// 进程级作业注册表：`run_in_background` 与 job 工具从这里读写。
+    pub jobs: Option<Arc<crate::jobs::JobRegistry>>,
 }
 
 impl ToolContext {
@@ -108,7 +112,20 @@ impl ToolContext {
             call_id: call_id.into(),
             sink,
             sandbox,
+            session_id: None,
+            jobs: None,
         }
+    }
+
+    /// 注入会话与作业注册表（agent_loop 在每个 turn 的工具上下文上调用）。
+    pub fn with_jobs(
+        mut self,
+        session_id: Option<String>,
+        jobs: Option<Arc<crate::jobs::JobRegistry>>,
+    ) -> Self {
+        self.session_id = session_id;
+        self.jobs = jobs;
+        self
     }
 }
 
