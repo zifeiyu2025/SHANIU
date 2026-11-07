@@ -11,6 +11,11 @@ export interface HostBridge {
   invoke<T>(command: string, args?: Record<string, unknown>): Promise<T>
   /** 订阅 `shaniu://event`；返回卸载器。 */
   listenEvents(handler: (event: AgentEvent) => void): () => void
+  /**
+   * 可选：告诉事件通道"这个会话正在被观察"（适配层 follow 入口调用）。
+   * WS gateway 据此补订阅；Tauri 全局广播与测试桥无需实现。
+   */
+  observeEvents?(sessionId: string): void
 }
 
 let bridge: HostBridge | undefined

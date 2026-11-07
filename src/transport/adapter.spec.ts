@@ -384,6 +384,77 @@ describe('适配层把 EventMsg 流映射成 DSH 会话 journal', () => {
     dispose()
   })
 
+  it('流式中途打开 follow：快照带 activeAttempt 紧凑前缀，后续 revision 续接不丢正文', async () => {
+    const bridge = scriptedBridge()
+    const { remote, dispose } = createAdapter({ bridge })
+    const session = faceOf(remote).session
+    await session.prompt({ sessionId: 'agent-new', requestId: 'rpc-mid', content: [{ type: 'text', text: '中途接入' }] })
+    // 先吐两段，再打开 follow（实时态只渲染用户气泡的 B-20 场景）。
+    bridge.emit('agent-new', { type: 'reasoning_delta', delta: '先想' })
+    bridge.emit('agent-new', { type: 'agent_message_delta', delta: '答' })
+
+    const iterator = session.follow({ address: { kind: 'session', sessionId: 'agent-new' } })
+    const snapshot = (await iterator.next()).value as Record<string, unknown>
+    const baseline = snapshot['assistantStream'] as {
+      revision: number
+      activeAttempt?: {
+        attemptId: string
+        startedAfterSeq: number
+        turn: number
+        step: number
+        nextIndex: number
+        stream: { time: number; chunk: Record<string, unknown> }[]
+      }
+    }
+    expect(baseline.revision).toBe(3)
+    expect(baseline.activeAttempt).toBeDefined()
+    expect(baseline.activeAttempt?.nextIndex).toBe(2)
+    expect(baseline.activeAttempt?.stream.map(item => item.chunk)).toEqual([
+      { type: 'reasoning-delta', index: 0, text: '先想' },
+      { type: 'text-delta', index: 0, text: '答' },
+    ])
+
+    bridge.emit('agent-new', { type: 'agent_message_delta', delta: '案' })
+    bridge.emit('agent-new', { type: 'turn_completed', turn: 1, reason: 'completed' })
+    const frames: Record<string, unknown>[] = []
+    for (let index = 0; index < 4; index += 1) frames.push((await iterator.next()).value as Record<string, unknown>)
+    const stream = frames
+      .filter(frame => frame['type'] === 'assistant-stream')
+      .map(frame => frame['frame'] as Record<string, unknown>)
+    // 基线 revision=3（start + 两段）之后必须是 4（chunk）→ 5（end），不能跳号/重号。
+    expect(stream.map(frame => frame['revision'])).toEqual([4, 5])
+    expect((stream[0]?.['chunk'] as { text: string }).text).toBe('案')
+    expect((stream[1]?.['outcome'] as { kind: string }).kind).toBe('committed')
+
+    await iterator.return?.(undefined)
+    dispose()
+  })
+
+  it('同一 id 的空白复用不得替换已被 follow 捕获的 journal（B-20 回归）', async () => {
+    const bridge = scriptedBridge()
+    const { remote, dispose } = createAdapter({ bridge })
+    const session = faceOf(remote).session
+    await session.create({})
+    // 视图先打开 follow（空 journal 的实时快照）。
+    const iterator = session.follow({ address: { kind: 'session', sessionId: 'agent-new' } })
+    await iterator.next()
+    // 选工作区/再次新建可能对同一个空白 id 再调一次 create：不得换掉 follow 已捕获的对象。
+    await session.create({})
+    await session.prompt({ sessionId: 'agent-new', requestId: 'rpc-reuse', content: [{ type: 'text', text: '继续' }] })
+    bridge.emit('agent-new', { type: 'agent_message_delta', delta: '答' })
+    bridge.emit('agent-new', { type: 'turn_completed', turn: 1, reason: 'completed' })
+
+    const next = await Promise.race([
+      iterator.next().then(result => result.value as Record<string, unknown>),
+      new Promise<never>((_, reject) =>
+        setTimeout(() => reject(new Error('follow 仍挂在被替换的 journal 上：后续帧没有到达')), 300)),
+    ])
+    // 快照之后必须还能收到实时流（旧实现会永久挂起在这个断言之前）。
+    expect(['event', 'assistant-stream']).toContain(next['type'])
+    await iterator.return?.(undefined)
+    dispose()
+  })
+
   it('两次采样迭代各开一次尝试：同一次内 attemptId 恒定，跨 attempt 不同', async () => {
     const bridge = scriptedBridge()
     const { remote, dispose } = createAdapter({ bridge })

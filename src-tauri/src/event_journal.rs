@@ -53,6 +53,29 @@ pub fn append(dir: &Path, event: &AgentEvent) -> Result<(), String> {
         .map_err(|e| format!("事件日志写入失败（{}）: {e}", path.display()))
 }
 
+/// 读取日志最后一条合法事件 id（只用于 live-only 订阅的游标种子，不重放大历史）。
+/// 不存在的日志 = 没有历史；坏行/torn 尾行跳过，与 `read_after` 同口径。
+pub fn latest_event_id(dir: &Path, session_id: &str) -> Result<Option<String>, String> {
+    let path = log_path(dir, session_id)?;
+    if !path.exists() {
+        return Ok(None);
+    }
+    let file = std::fs::File::open(&path)
+        .map_err(|e| format!("事件日志打开失败（{}）: {e}", path.display()))?;
+    let mut last = None;
+    for line in BufReader::new(file).lines() {
+        let Ok(line) = line else { break };
+        let line = line.trim();
+        if line.is_empty() {
+            continue;
+        }
+        if let Ok(event) = serde_json::from_str::<AgentEvent>(line) {
+            last = Some(event.event_id);
+        }
+    }
+    Ok(last)
+}
+
 /// 读取 `after_event_id` 之后的一页事件。`None` = 从头读；不存在的日志如实空页。
 pub fn read_after(
     dir: &Path,
@@ -164,6 +187,23 @@ mod tests {
         assert!(read_after(&dir, "s2", None, 10).unwrap().events[0].event_id == "02");
         assert!(read_after(&dir, "missing", None, 10).unwrap().events.is_empty());
         assert!(read_after(&dir, "../escape", None, 10).is_err());
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn latest_event_id_reads_tail_and_tolerates_corrupt_lines() {
+        let dir = temp_dir();
+        assert_eq!(latest_event_id(&dir, "s1").unwrap(), None);
+        append(&dir, &event("s1", "01", 1)).unwrap();
+        append(&dir, &event("s1", "02", 2)).unwrap();
+        assert_eq!(latest_event_id(&dir, "s1").unwrap().as_deref(), Some("02"));
+        // torn 尾行不改变最后一条合法事件
+        let path = dir.join("s1.events.jsonl");
+        let mut file = OpenOptions::new().append(true).open(&path).unwrap();
+        file.write_all(b"{\"event_id\":\"03\"").unwrap();
+        file.write_all(b"\n").unwrap();
+        assert_eq!(latest_event_id(&dir, "s1").unwrap().as_deref(), Some("02"));
+        assert!(latest_event_id(&dir, "../escape").is_err());
         std::fs::remove_dir_all(&dir).ok();
     }
 

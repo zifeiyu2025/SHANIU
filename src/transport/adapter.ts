@@ -159,10 +159,17 @@ class FrameLog {
   static eventSeq(entry: Record<string, unknown>): number {
     return (entry['event'] as { seq: number }).seq
   }
+
+  /** 开发期诊断：只读拷贝，不改变 `tail` 的游标语义。 */
+  dump(): readonly Record<string, unknown>[] {
+    return this.entries.slice()
+  }
 }
 
 /** 一个会话在当前进程内的 journal 与回合状态。 */
 interface Journal {
+  /** 诊断用代次：同一 id 的 journal 被替换时能看出来（follow 捕获的是旧对象）。 */
+  serial: number
   seq: number
   revision: number
   log: FrameLog
@@ -176,6 +183,16 @@ interface Journal {
   chunkIndex: number
   attemptOpen: boolean
   attemptSeq: number
+  /**
+   * 进行中尝试的重连基线（wire `SessionAssistantStreamBaseline.activeAttempt`）：
+   * follow 在流式中途打开时，客户端必须拿这份紧凑快照重建已吐出的正文；只给
+   * `revision` 会让中途 mounted 的视图把后续 chunk 当成「没有 start 的孤儿」丢掉，
+   * 表现就是实时态只有用户气泡（B-20）。
+   */
+  attemptStream: { time: number; chunk: Record<string, unknown> }[]
+  attemptTurn: number
+  attemptStep: number
+  attemptStartedAfterSeq: number
   /**
    * 本次尝试的稳定身份。它必须**不随帧变化**：start/chunk/end 三帧共用一个 attemptId，
    * 客户端才把它们认成同一段流（按 revision 生成会让每一帧都"换了一次尝试"）。
@@ -237,11 +254,17 @@ export interface AdapterOptions {
   readonly approvalScope?: (sessionId: string) => unknown
 }
 
+let journalSerial = 0
+
 function newJournal(createdAt: number): Journal {
+  journalSerial += 1
   return {
+    serial: journalSerial,
     seq: -1, revision: 0, log: new FrameLog(), createdAt,
     turn: 0, step: 0, taskOpen: false, text: '', reasoning: '', chunkIndex: 0,
-    attemptOpen: false, attemptSeq: -1, attemptId: '', usage: undefined, outputs: new Map(),
+    attemptOpen: false, attemptSeq: -1, attemptId: '',
+    attemptStream: [], attemptTurn: 0, attemptStep: 0, attemptStartedAfterSeq: -1,
+    usage: undefined, outputs: new Map(),
     entryToSeq: [],
     metrics: zeroMetrics(),
     stepStartAt: undefined, firstDeltaAt: undefined, countedTurn: undefined,
@@ -276,6 +299,13 @@ export function createAdapter(options: AdapterOptions): { remote: unknown; dispo
   const listeners = new Map<string, ((...args: unknown[]) => unknown)[]>()
   const projectionLog = new FrameLog()
   let projectionSeq = 0
+  /** 开发期 follow 生命周期取证（进入/快照/结束）；真机排查"视图没接上 journal"用。 */
+  const followTrace: Record<string, unknown>[] = []
+  const traceFollow = (sessionId: string | undefined, phase: string, extra: Record<string, unknown> = {}): void => {
+    if (!import.meta.env.DEV) return
+    followTrace.push({ at: now(), sessionId, phase, ...extra })
+    if (followTrace.length > 50) followTrace.shift()
+  }
   /**
    * 计划态（上游 `plan` 投影的数据源）。宿主 PlanState 是进程级全局（app_state.rs 的
    * Arc<PlanState>，跨任务/跨会话持久），这里镜像它：模型调 enter_plan_mode 执行成功
@@ -709,7 +739,23 @@ export function createAdapter(options: AdapterOptions): { remote: unknown; dispo
     journal.chunkIndex = 0
     journal.attemptSeq = journal.seq
     journal.attemptId = `shaniu-attempt-${journal.turn}-${journal.step}-${journal.revision + 1}`
+    journal.attemptTurn = journal.turn
+    journal.attemptStep = journal.step
+    journal.attemptStartedAfterSeq = journal.attemptSeq
+    journal.attemptStream = []
     pushStreamFrame(journal, { type: 'start', startedAfterSeq: journal.attemptSeq, turn: journal.turn, step: journal.step })
+  }
+
+  /**
+   * 追加一帧助手流（start 后才会到这里）：同一份 `{time, chunk}` 同时进 journal 流帧
+   * 与重连基线，快照重建出的前缀与后续帧的 index 才能严格接上。
+   */
+  const pushAssistantChunk = (journal: Journal, chunk: Record<string, unknown>): void => {
+    ensureAttempt(journal)
+    const time = now()
+    journal.attemptStream.push({ time, chunk })
+    pushStreamFrame(journal, { type: 'chunk', index: journal.chunkIndex, time, chunk })
+    journal.chunkIndex += 1
   }
 
   /**
@@ -752,6 +798,7 @@ export function createAdapter(options: AdapterOptions): { remote: unknown; dispo
         ? { kind: 'committed', eventType: 'assistant/message', seq }
         : { kind: 'abandoned' },
     })
+    journal.attemptStream = []
     journal.text = ''
     journal.reasoning = ''
   }
@@ -999,24 +1046,14 @@ export function createAdapter(options: AdapterOptions): { remote: unknown; dispo
         return
       }
       case 'agent_message_delta':
-        ensureAttempt(journal)
         journal.text += msg.delta
         if (journal.firstDeltaAt === undefined) journal.firstDeltaAt = now()
-        pushStreamFrame(journal, {
-          type: 'chunk', index: journal.chunkIndex, time: now(),
-          chunk: { type: 'text-delta', index: 0, text: msg.delta },
-        })
-        journal.chunkIndex += 1
+        pushAssistantChunk(journal, { type: 'text-delta', index: 0, text: msg.delta })
         return
       case 'reasoning_delta':
-        ensureAttempt(journal)
         journal.reasoning += msg.delta
         if (journal.firstDeltaAt === undefined) journal.firstDeltaAt = now()
-        pushStreamFrame(journal, {
-          type: 'chunk', index: journal.chunkIndex, time: now(),
-          chunk: { type: 'reasoning-delta', index: 0, text: msg.delta },
-        })
-        journal.chunkIndex += 1
+        pushAssistantChunk(journal, { type: 'reasoning-delta', index: 0, text: msg.delta })
         return
       case 'token_usage': {
         // 上游 TokenUsage 语义：inputTokens 是**未命中缓存**的输入（bucketsFrom 直接
@@ -1251,7 +1288,12 @@ export function createAdapter(options: AdapterOptions): { remote: unknown; dispo
         ...(cwd === face.workspaceRoot() ? {} : { workspacePath: cwd }),
         ...(reusableBlank === undefined ? {} : { sessionId: reusableBlank }),
       })
-      journals.set(agentId, newJournal(now()))
+      // 复用空白会话时宿主的 `create_session` 会回同一个 id（上游 findReusableBlank 同构），
+      // 而视图的 `follow` 可能已经在这个 id 上打开并捕获了 journal 对象。这里**不能**
+      // 用新 journal 覆盖同 id 的旧对象：follow 的 tail 会永远挂在孤儿 journal 上，新任务
+      // 的事件写进另一个对象——真机表现就是"实时态只有用户气泡，重载后档案全对"（B-20）。
+      // 已有 journal 就保留（空白复用的语义就是接着这个会话继续）；只有从未观察过才新建。
+      if (!journals.has(agentId)) journals.set(agentId, newJournal(now()))
       // 工作区分组按 sessionIds 显示：新会话建完就要推一帧，否则侧栏的工作区树
       // 里看不到它，要重开窗口才出现。目标工作区可能不是默认那家，按路径找视图。
       const target = registered.find(ws => ws.path === cwd) ?? registered[0]
@@ -1331,9 +1373,14 @@ export function createAdapter(options: AdapterOptions): { remote: unknown; dispo
     follow: async function* (request: unknown, signal?: AbortSignal): AsyncGenerator<Record<string, unknown>> {
       const sessionId = addressOf(request)
       if (sessionId === undefined) {
+        traceFollow(undefined, 'no-address')
         yield emptySnapshot('', now())
         return
       }
+      traceFollow(sessionId, 'enter', { known: journals.has(sessionId) })
+      // 让 WS gateway 为这个会话补订阅：页面重载后 follow 只重建档案，不补订阅的话
+      // 运行中任务的后半段实时帧不会推过来（gateway 只发已订阅会话）。
+      bridge.observeEvents?.(sessionId)
       const journal = journals.get(sessionId)
       if (journal === undefined) {
         // 没在当前进程里观察过：能从档案重建就重建（SH-033 的"打开旧会话"），
@@ -1341,6 +1388,7 @@ export function createAdapter(options: AdapterOptions): { remote: unknown; dispo
         // 会话没了，而实际只是宿主读失败。
         const entries = await bridge.invoke<SessionEntry[]>('load_session', { agentId: sessionId })
         if (entries.length === 0) {
+          traceFollow(sessionId, 'end-empty')
           yield emptySnapshot(sessionId, now())
           return
         }
@@ -1362,6 +1410,7 @@ export function createAdapter(options: AdapterOptions): { remote: unknown; dispo
           }
         }
         const from = replayed.log.length
+        traceFollow(sessionId, 'snapshot-replayed', { from, revision: replayed.revision, records: replayed.log.eventsUpTo(from).length })
         yield {
           type: 'snapshot',
           header: { version: 0, id: sessionId, createdAt: replayed.createdAt, isSeeded: false },
@@ -1387,7 +1436,11 @@ export function createAdapter(options: AdapterOptions): { remote: unknown; dispo
           },
           assistantStream: { revision: replayed.revision },
         }
-        for await (const frame of replayed.log.tail(from, signal)) yield frame
+        try {
+          for await (const frame of replayed.log.tail(from, signal)) yield frame
+        } finally {
+          traceFollow(sessionId, 'end-replayed')
+        }
         return
       }
       // 下标在同步块里一次捕获：cursor / revision / records 必须描述同一时刻，
@@ -1398,6 +1451,7 @@ export function createAdapter(options: AdapterOptions): { remote: unknown; dispo
         records: journal.log.eventsUpTo(from),
         revision: journal.revision,
       }
+      traceFollow(sessionId, 'snapshot-live', { serial: journal.serial, from, revision: baseline.revision, records: baseline.records.length })
       yield {
         type: 'snapshot',
         header: { version: 0, id: sessionId, createdAt: journal.createdAt, isSeeded: false },
@@ -1423,9 +1477,30 @@ export function createAdapter(options: AdapterOptions): { remote: unknown; dispo
           },
         },
         // 客户端总是带 assistantStream:true 打开，缺这个基线即 gateway/internal。
-        assistantStream: { revision: baseline.revision },
+        // 流式中途打开时必须带 activeAttempt（含已吐出的紧凑前缀），否则客户端拿不到
+        // 这个尝试的身份，后续 chunk 会被当成孤儿丢掉（实时态空白，B-20 根因）。
+        assistantStream: {
+          revision: baseline.revision,
+          ...(journal.attemptOpen
+            ? {
+                activeAttempt: {
+                  attemptId: journal.attemptId,
+                  startedAfterSeq: journal.attemptStartedAfterSeq,
+                  turn: journal.attemptTurn,
+                  step: journal.attemptStep,
+                  nextIndex: journal.chunkIndex,
+                  // 快照必须是不可变值：交给客户端后再追加的 chunk 不能改到这份基线。
+                  stream: journal.attemptStream.map(item => ({ time: item.time, chunk: item.chunk })),
+                },
+              }
+            : {}),
+        },
       }
-      for await (const frame of journal.log.tail(from, signal)) yield frame
+      try {
+        for await (const frame of journal.log.tail(from, signal)) yield frame
+      } finally {
+        traceFollow(sessionId, 'end-live')
+      }
     },
     control: async function* (signal?: AbortSignal): AsyncGenerator<Record<string, unknown>> {
       await face.refresh()
@@ -2530,6 +2605,42 @@ export function createAdapter(options: AdapterOptions): { remote: unknown; dispo
       })
     },
   })
+
+  // 开发期诊断（`import.meta.env.DEV` 静态裁剪）：真机排查"事件到了适配层却没渲染"
+  // 时用它看 journal 的事件/助手流 revision 是否连续，不必往生产代码里塞日志。
+  if (import.meta.env.DEV) {
+    ;(globalThis as Record<string, unknown>).__SHANIU_ADAPTER_DUMP__ = () => {
+      const result: Record<string, unknown> = {}
+      for (const [id, journal] of journals) {
+        const entries = journal.log.dump()
+        const events = entries
+          .filter(entry => entry['type'] === 'event')
+          .map(entry => (entry['event'] as { type: string }))
+        const streams = entries
+          .filter(entry => entry['type'] === 'assistant-stream')
+          .map(entry => entry['frame'] as { type: string; revision: number; index?: number; attemptId?: string })
+        const gaps: string[] = []
+        for (let index = 1; index < streams.length; index += 1) {
+          const previous = streams[index - 1]!
+          const current = streams[index]!
+          if (current.revision !== previous.revision + 1) gaps.push(`${previous.revision}->${current.revision}`)
+        }
+        result[id] = {
+          serial: journal.serial,
+          seq: journal.seq,
+          revision: journal.revision,
+          taskOpen: journal.taskOpen,
+          attemptOpen: journal.attemptOpen,
+          chunkIndex: journal.chunkIndex,
+          events: events.map(event => event.type),
+          streams: streams.map(frame => ({ type: frame.type, revision: frame.revision, index: frame.index, attemptId: frame.attemptId })),
+          gaps,
+        }
+      }
+      result['__follow'] = followTrace
+      return result
+    }
+  }
 
   const unlisten = bridge.listenEvents(onEvent)
   void face.refresh()

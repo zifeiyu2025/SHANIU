@@ -147,11 +147,13 @@ struct SessionState {
     credits: u64,
     queue: VecDeque<AgentEvent>,
     last_id: Option<String>,
+    /// 续播还没补完（队列到顶先停下，等 credit 腾出空间再接着从 `last_id` 读）。
+    replay_pending: bool,
 }
 
 impl SessionState {
     fn new(credits: u64, after: Option<String>) -> Self {
-        Self { credits, queue: VecDeque::new(), last_id: after }
+        Self { credits, queue: VecDeque::new(), last_id: after, replay_pending: false }
     }
 
     /// 入队一条信封：event_id 必须严格大于 last_id（单调去重）。返回是否队列溢出。
@@ -236,21 +238,25 @@ async fn handle_connection(hub: GatewayHub, ws: WebSocketStream<TcpStream>) {
                     Ok(ev) => {
                         let session_id = ev.session_id.clone();
                         if let Some(state) = sessions.get_mut(&session_id) {
-                            if state.enqueue(ev) {
+                            if state.replay_pending {
+                                // journal-first：这条 live 早已落进事件日志，继续 replay 会按
+                                // event_id 顺序送到。此时入队会跳过未补的历史（last_id 前移），
+                                // 所以只让 replay 接管，不入队。
+                            } else if state.enqueue(ev) {
                                 let _ = send_frame(&mut sink, &ServerFrame::error("overflow", "出站队列溢出，请带 after_event_id 重连")).await;
                                 break;
                             }
                         }
-                        if flush_all(&mut sink, &mut sessions).await.is_err() {
+                        if pump(&hub, &mut sink, &mut sessions).await.is_err() {
                             break;
                         }
                     }
                     Err(broadcast::error::RecvError::Lagged(_)) => {
                         // 广播 lag 丢了帧：从日志按各会话 last_id 补齐（续播同源）。
                         for (session_id, state) in sessions.iter_mut() {
-                            replay_into(&hub.journal_dir, session_id, state);
+                            state.replay_pending = replay_into(&hub.journal_dir, session_id, state, MAX_QUEUE);
                         }
-                        if flush_all(&mut sink, &mut sessions).await.is_err() {
+                        if pump(&hub, &mut sink, &mut sessions).await.is_err() {
                             break;
                         }
                     }
@@ -273,10 +279,23 @@ async fn handle_frame(
             send_frame(sink, &ServerFrame::error("bad-request", "已鉴权，勿重发 hello")).await
         }
         ClientFrame::Subscribe { session_id, after_event_id, credits } => {
+            let explicit_cursor = after_event_id.is_some();
             let mut state = SessionState::new(credits, after_event_id.clone());
-            replay_into(&hub.journal_dir, &session_id, &mut state);
+            if explicit_cursor {
+                // 带游标 = 断线/新会话续播：从游标之后 replay（分页、受队列上限约束）。
+                state.replay_pending = replay_into(&hub.journal_dir, &session_id, &mut state, MAX_QUEUE);
+            } else {
+                // 省略游标 = 只接 live（docs/04 §1.4）：用日志尾作为去重基线，绝不重放历史。
+                // 不种这个游标的话，`last_id = None` 会让 lag 路径/后续续播把整段历史再送一遍，
+                // 客户端看到的是重复内容与错乱的助手流 revision（真机 B-20 复发的直接原因）。
+                match event_journal::latest_event_id(&hub.journal_dir, &session_id) {
+                    Ok(last) => state.last_id = last,
+                    Err(e) => tracing::warn!("gateway 读取日志尾失败（{session_id}）: {e}"),
+                }
+            }
             sessions.insert(session_id, state);
-            flush_all(sink, sessions).await
+            // 初始 credit 为 0 时队列先攒着（replay_pending 保留），等 `credit` 帧再推进。
+            pump(hub, sink, sessions).await
         }
         ClientFrame::Unsubscribe { session_id } => {
             sessions.remove(&session_id);
@@ -286,45 +305,72 @@ async fn handle_frame(
             if let Some(state) = sessions.get_mut(&session_id) {
                 state.credits = state.credits.saturating_add(credits);
             }
-            flush_all(sink, sessions).await
+            pump(hub, sink, sessions).await
         }
     }
 }
 
-/// 从事件日志把 `after_id` 之后的信封分页入队（去重由 SessionState.enqueue 保证）。
-/// 读失败只告警：续播是尽力而为的恢复面，不替协议层掩盖缺失（与批 1 同口径）。
-fn replay_into(journal_dir: &Path, session_id: &str, state: &mut SessionState) {
+/// 按 credit 把各会话队列发出去，并在腾出空间后继续未补完的日志续播。
+///
+/// 续播**不能**一次把整段历史塞进队列：长会话的事件数远超 `MAX_QUEUE`。这里每轮先按
+/// credit 发队列，再给还有空间的会话继续读日志，直到没有可推进的会话为止。读失败只
+/// 告警（续播是尽力而为的恢复面），不把 `replay_pending` 卡死成永久静默。
+async fn pump(
+    hub: &GatewayHub,
+    sink: &mut WsSink,
+    sessions: &mut HashMap<String, SessionState>,
+) -> Result<(), String> {
+    loop {
+        for state in sessions.values_mut() {
+            while state.credits > 0 {
+                let Some(event) = state.queue.pop_front() else { break };
+                send_frame(sink, &ServerFrame::Event { event }).await?;
+                state.credits -= 1;
+            }
+        }
+        let mut replayed = false;
+        for (session_id, state) in sessions.iter_mut() {
+            if state.replay_pending && state.queue.len() < MAX_QUEUE {
+                state.replay_pending = replay_into(&hub.journal_dir, session_id, state, MAX_QUEUE);
+                replayed = true;
+            }
+        }
+        if !replayed {
+            break;
+        }
+    }
+    Ok(())
+}
+
+/// 从事件日志把 `last_id` 之后的信封分页入队（去重由 `SessionState.enqueue` 保证，
+/// 队列上限由 `max_queue` 控制）。返回是否还有没补完的历史（true = 队列到顶停下，
+/// 等 credit 腾空间后从新的 `last_id` 续补）。
+fn replay_into(
+    journal_dir: &Path,
+    session_id: &str,
+    state: &mut SessionState,
+    max_queue: usize,
+) -> bool {
     let mut cursor = state.last_id.clone();
     loop {
         let page = match event_journal::read_after(journal_dir, session_id, cursor.as_deref(), REPLAY_LIMIT) {
             Ok(page) => page,
             Err(e) => {
                 tracing::warn!("gateway 续播读取失败（{session_id}）: {e}");
-                return;
+                return false;
             }
         };
         for event in page.events {
             cursor = Some(event.event_id.clone());
-            if state.enqueue(event) {
-                return; // 队列满：停补，等 credit  drain 后由 live/lag 路径再补
+            // `enqueue` 的溢出判定基于生产上限；这里用显式上限给单测留出可验证的小队列。
+            if state.enqueue(event) || state.queue.len() > max_queue {
+                return true;
             }
         }
         if !page.has_more {
-            return;
+            return false;
         }
     }
-}
-
-/// 按 credit 把各会话队列尽可能发出。发送失败向上传播（连接已断）。
-async fn flush_all(sink: &mut WsSink, sessions: &mut HashMap<String, SessionState>) -> Result<(), String> {
-    for state in sessions.values_mut() {
-        while state.credits > 0 {
-            let Some(event) = state.queue.pop_front() else { break };
-            send_frame(sink, &ServerFrame::Event { event }).await?;
-            state.credits -= 1;
-        }
-    }
-    Ok(())
 }
 
 #[cfg(test)]
@@ -392,25 +438,29 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn subscribe_routes_by_session_and_credit_gates() {
+    async fn live_only_subscription_never_replays_and_routes_by_session() {
         let (hub, url, dir) = spawn_server().await;
-        // 先落盘一条 s1 信封：subscribe 时经 replay 投递，收到它即证明订阅已在服务端生效。
-        // 此后的 live 发布不再有 subscribe/publish 竞态——与生产 journal-first 契约同口径
-        // （TauriEventSink 先 append 再 broadcast，journal 是续播兜底的事实来源）。
-        event_journal::append(&dir, &event("s1", "02")).unwrap();
+        // 种一条历史：省略 after_event_id 的 live-only 订阅绝不能收到它。
+        event_journal::append(&dir, &event("s1", "01")).unwrap();
         let mut ws = hello_ok(&url, &hub).await;
-        // 订阅 s1，初始 credit=1 → replay 先发 s1(02)，credit 随即耗尽
         ws.send(Message::text(r#"{"type":"subscribe","session_id":"s1","credits":1}"#)).await.unwrap();
+        // 给服务端处理 subscribe 的时间窗口：这期间不应有 replay 帧。
+        tokio::time::sleep(Duration::from_millis(100)).await;
+        assert!(timeout(Duration::from_millis(100), ws.next()).await.is_err(), "live-only 不得重放历史");
+
+        // s2 未订阅必须丢弃；s1 的 live 事件按 credit 放行。
+        hub.publish(&event("s2", "09"));
+        hub.publish(&event("s1", "02"));
         let first = next_event(&mut ws).await;
         assert_eq!(first.session_id, "s1");
         assert_eq!(first.event_id, "02");
-        // 订阅已生效：发布未订阅的 s2（必须被丢弃）与 s1 live（credit=0 应排队等待）
-        hub.publish(&event("s2", "01"));
+
+        // credit 耗尽：s1(03) 排队等待，不能越过 credit 闸门。
         hub.publish(&event("s1", "03"));
-        // 再 grant 1 → 只放行 s1(03)；若 s2 被错误路由会先于 03 到达，下面的断言即失败
+        tokio::time::sleep(Duration::from_millis(50)).await;
+        assert!(timeout(Duration::from_millis(100), ws.next()).await.is_err());
         ws.send(Message::text(r#"{"type":"credit","session_id":"s1","credits":1}"#)).await.unwrap();
         let second = next_event(&mut ws).await;
-        assert_eq!(second.session_id, "s1");
         assert_eq!(second.event_id, "03");
         std::fs::remove_dir_all(&dir).ok();
     }
@@ -433,6 +483,29 @@ mod tests {
         hub.publish(&event("s1", "04"));
         let c = next_event(&mut ws).await;
         assert_eq!(c.event_id, "04");
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    /// 续播超过队列上限时必须停下、等 credit 腾空间后从 `last_id` 继续，不能留下缺口。
+    #[test]
+    fn replay_resumes_after_queue_cap_without_gaps() {
+        let dir = temp_dir();
+        for index in 0..10 {
+            event_journal::append(&dir, &event("s1", &format!("{index:02}"))).unwrap();
+        }
+        let mut state = SessionState::new(0, Some(String::new()));
+        let mut seen: Vec<String> = Vec::new();
+        loop {
+            let pending = replay_into(&dir, "s1", &mut state, 3);
+            while let Some(ev) = state.queue.pop_front() {
+                seen.push(ev.event_id);
+            }
+            if !pending {
+                break;
+            }
+        }
+        let expected: Vec<String> = (0..10).map(|index| format!("{index:02}")).collect();
+        assert_eq!(seen, expected);
         std::fs::remove_dir_all(&dir).ok();
     }
 }

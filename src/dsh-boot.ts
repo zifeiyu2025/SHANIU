@@ -61,6 +61,7 @@ import {
 import { createAdapter } from './transport/adapter'
 import { hostServices } from './transport/host-services'
 import { tauriBridge } from './transport/tauri'
+import { createWsBridge } from './transport/ws-bridge'
 import {
   installMockRemoteNamespaces, mockConnection, mockModules, mockRemote, mockTypert,
   setDefaultWorkspacePath,
@@ -107,8 +108,9 @@ async function applyProductWorkspacePath(): Promise<{ homeDir: string }> {
  * false = 桌面窗口装适配层（`transport/adapter.ts` + `transport/settings-face.ts`），
  * 事件流与设置面都走宿主命令；仍未接线的命令面继续落到显式 stub 核销清单。
  * 这是有意偏离 ADR-006 的临时口径——docs/01 风险表把"适配层掩盖能力缺口"列为风险，
- * 所以未接线项（SH-025 审批 UI、SH-094 WS、SH-033 历史回放…）核销前，浏览器开发态
- * 仍留在 mock 上，只有真实桌面切过去。
+ * 所以未接线项（SH-025 审批 UI、SH-033 历史回放…）核销前，浏览器开发态仍留在 mock 上，
+ * 只有真实桌面切过去。SH-094 批 3 已把桌面事件面切到 loopback WS（`ws-bridge.ts`），
+ * gateway 不可用时由它退回 Tauri 广播。
  */
 const MOCK_IN_DESKTOP = false
 
@@ -140,7 +142,9 @@ export async function bootShaniu(container: HTMLElement): Promise<BootHandle> {
     // 默认工作区基线必须在挂载前写入；家目录给 connection 基线缩写路径用
     const { homeDir } = await applyProductWorkspacePath()
     adapter = createAdapter({
-      bridge: tauriBridge(),
+      // SH-094 批 3：命令面仍走 Tauri invoke，事件面切 loopback WS gateway；
+      // gateway 连续不可用时桥自己退回 Tauri 全局广播（只退一次，不双通道投递）。
+      bridge: createWsBridge(tauriBridge()),
       // 审批卡靠监听器的 `this` 认会话，而会话作用域 Context 由 sessions 服务持有
       // （装配时还没装好），所以给的是"派发时再取"的闭包。
       approvalScope: (sessionId: string): unknown => {
