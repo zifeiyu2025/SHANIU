@@ -19,7 +19,7 @@ use tokio::sync::mpsc;
 
 use crate::config::SandboxMode;
 
-pub use windows_impl::ExecLine;
+pub use windows_impl::{ExecLine, RestrictedStdioChild, StdioEvent};
 
 /// 沙箱错误（文本回填模型/日志；不包含敏感内容）。
 #[derive(Debug, thiserror::Error)]
@@ -76,6 +76,35 @@ pub fn prepare_spawn(
     }
 }
 
+/// 按策略准备 MCP stdio server（SH-060，X10：默认一律走沙箱）。
+///
+/// - read-only：纯策略拒绝（只读沙箱不允许任何进程执行）；
+/// - workspace-write：受限令牌 + Job + 句柄白名单（默认路径）；
+/// - danger-full-access：**调用方必须先确认该 server 的 `unsandboxed=true` 且原因已记录**
+///   （逐服务器显式豁免），这里才走未沙箱启动。
+pub fn prepare_stdio(
+    policy: SandboxMode,
+    program: &str,
+    args: &[&str],
+    cwd: &Path,
+    env: &std::collections::BTreeMap<String, String>,
+    tx: mpsc::Sender<StdioEvent>,
+) -> Result<windows_impl::RestrictedStdioChild, SandboxError> {
+    match policy {
+        SandboxMode::ReadOnly => Err(SandboxError::PolicyDenied(
+            "只读沙箱禁止启动 MCP server 进程".into(),
+        )),
+        SandboxMode::WorkspaceWrite => {
+            windows_impl::spawn_restricted_stdio(program, args, cwd, env, tx)
+                .map_err(SandboxError::CreateFailed)
+        }
+        SandboxMode::DangerFullAccess => {
+            windows_impl::spawn_unsandboxed_stdio(program, args, cwd, env, tx)
+                .map_err(SandboxError::CreateFailed)
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -109,6 +138,23 @@ mod tests {
         };
         drop(spawn);
         std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn readonly_policy_denies_mcp_stdio() {
+        let (tx, _rx) = mpsc::channel(4);
+        let err = match prepare_stdio(
+            SandboxMode::ReadOnly,
+            "cmd",
+            &["/C", "echo"],
+            &ws(),
+            &Default::default(),
+            tx,
+        ) {
+            Err(error) => error,
+            Ok(_) => panic!("readonly 应拒绝启动 MCP server"),
+        };
+        assert!(matches!(err, SandboxError::PolicyDenied(_)));
     }
 
     #[cfg(windows)]
