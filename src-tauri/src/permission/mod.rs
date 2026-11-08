@@ -82,6 +82,17 @@ pub struct ApprovalBroker {
     /// 命令前缀白名单（ADR-007③）。来自用户 config.toml，进程内只读装载；
     /// **没有全局规则文件**，也没有任何代理可调用的写入路径（ADR-008）。
     prefix: std::sync::RwLock<PrefixAllowlist>,
+    /// 本 turn 的批量确认窗口（SH-118④）：用户批准过一次的 (agent, tool)，
+    /// 同一 turn 内后续调用不再逐次弹窗。turn 开始由 `begin_turn` 清空。
+    batch: Mutex<Option<BatchGrant>>,
+}
+
+/// 批量确认窗口的内容：只记身份与工具，不记参数——参数不同的调用同样算"同一类操作"，
+/// 这正是"连续 3 次只问 1 次"要的效果。
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct BatchGrant {
+    agent_id: String,
+    tool: String,
 }
 
 impl ApprovalBroker {
@@ -147,9 +158,19 @@ impl ApprovalBroker {
             .expect("remembered 锁中毒")
             .get(subject.agent_id)
             .is_some_and(|tools| tools.contains(tool));
+        // 同一 turn 内的批量确认（SH-118④）：本轮已经为用户批准过的 (agent, tool)
+        // 不再逐次弹窗。作用域只有"一个 turn + 一个代理 + 一个工具"，turn 开始即清空；
+        // destructive 永不进入批量（它本来每次必问）。
+        let batched = self
+            .batch
+            .lock()
+            .expect("batch 锁中毒")
+            .as_ref()
+            .is_some_and(|grant| grant.agent_id == subject.agent_id && grant.tool == tool);
         match policy::decide(risk, policy.approval, policy.sandbox, remembered) {
             Decision::Allow => GateOutcome::Allowed,
             Decision::Deny => GateOutcome::Forbidden,
+            Decision::Prompt if batched && risk != RiskLevel::Destructive => GateOutcome::Allowed,
             Decision::Prompt => {
                 self.request_approval(
                     tool,
@@ -161,6 +182,15 @@ impl ApprovalBroker {
                 )
                 .await
             }
+        }
+    }
+
+    /// 新 turn 开始：清空批量确认窗口（SH-118④）。上一 turn 的批准不延用到下一 turn，
+    /// 否则"同 turn 批量"会退化成"整个会话只问一次"。
+    pub fn begin_turn(&self, agent_id: &str) {
+        let mut batch = self.batch.lock().expect("batch 锁中毒");
+        if batch.as_ref().is_some_and(|grant| grant.agent_id == agent_id) {
+            *batch = None;
         }
     }
 
@@ -222,10 +252,16 @@ impl ApprovalBroker {
                 // 允许一次 = 只放行这一次，**不记忆**。ADR-003 的"本会话记住"只由
                 // AllowAlways 触发；把 Allow 也写进 remembered_execute 会让用户点一次
                 // 「允许一次」后，同进程后续 execute 全部静默放行（真机复测发现）。
-                Ok(ApprovalDecision::Allow) => GateOutcome::Allowed,
+                Ok(ApprovalDecision::Allow) => {
+                    if remember {
+                        self.grant_batch(tool, risk, subject.agent_id);
+                    }
+                    GateOutcome::Allowed
+                }
                 Ok(d @ ApprovalDecision::AllowAlways) => {
                     if remember {
                         self.remember_if_execute(tool, risk, subject.agent_id);
+                        self.grant_batch(tool, risk, subject.agent_id);
                     }
                     GateOutcome::from(d)
                 }
@@ -250,6 +286,17 @@ impl ApprovalBroker {
                 .or_default()
                 .insert(tool.to_string());
         }
+    }
+
+    /// 用户已批准 → 本 turn 内同类调用免问。destructive 永不批量。
+    fn grant_batch(&self, tool: &str, risk: RiskLevel, agent_id: &str) {
+        if risk == RiskLevel::Destructive {
+            return;
+        }
+        *self.batch.lock().expect("batch 锁中毒") = Some(BatchGrant {
+            agent_id: agent_id.to_string(),
+            tool: tool.to_string(),
+        });
     }
 
     /// 前端回执入口（approve 命令）；返回是否命中 pending。
@@ -392,6 +439,74 @@ mod tests {
         );
     }
 
+    /// SH-118③：`AllowAlways` 只作用于批准它的那个代理——子代理记住后，
+    /// 父代理（以及兄弟）仍必须被拦。ADR-103 的"父→子单向、子→父不回灌"。
+    #[tokio::test]
+    async fn allow_always_is_scoped_to_the_approving_agent() {
+        let broker = Arc::new(ApprovalBroker::new());
+        let capture = Arc::new(CaptureSink::default());
+        let sink: Arc<dyn EventSink> = capture.clone();
+        let cancel = CancellationToken::new();
+        let session = policy::SessionPolicy {
+            approval: ApprovalMode::OnRequest,
+            sandbox: SandboxMode::WorkspaceWrite,
+        };
+
+        // 子代理批准 AllowAlways
+        let b = broker.clone();
+        let s = sink.clone();
+        let c = cancel.clone();
+        let child = tokio::spawn(async move {
+            b.gate(
+                "unified_exec",
+                &args(),
+                "child-1",
+                session,
+                GateSubject {
+                    agent_id: "child",
+                    task_summary: Some("子任务"),
+                    allowed_tools: None,
+                    risk_override: None,
+                },
+                GateEnv { sink: &s, cancel: &c },
+            )
+            .await
+        });
+        for _ in 0..200 {
+            if broker.has_pending("appr-child-1") {
+                assert!(broker.resolve("appr-child-1", ApprovalDecision::AllowAlways));
+                break;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+        }
+        assert_eq!(child.await.unwrap(), GateOutcome::Allowed);
+
+        // 父代理再调同一工具：仍要询问（记忆与批量窗口都不跨代理）
+        capture.take();
+        let b = broker.clone();
+        let s = sink.clone();
+        let c = cancel.clone();
+        let root = tokio::spawn(async move {
+            b.gate(
+                "unified_exec",
+                &args(),
+                "root-1",
+                session,
+                GateSubject::root("root"),
+                GateEnv { sink: &s, cancel: &c },
+            )
+            .await
+        });
+        for _ in 0..200 {
+            if broker.has_pending("appr-root-1") {
+                assert!(broker.resolve("appr-root-1", ApprovalDecision::Deny));
+                break;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+        }
+        assert_eq!(root.await.unwrap(), GateOutcome::Denied, "父代理不得继承子代理的批准");
+    }
+
     /// SH-120 / ADR-007②：`never` 档下执行不回审批卡（不弹窗），破坏性工具直接拒绝。
     #[tokio::test]
     async fn never_mode_never_emits_approval_request() {
@@ -517,7 +632,9 @@ mod tests {
         }
         assert!(first_prompted, "第一次 execute 必须挂起等审批");
         assert_eq!(gate1.await.unwrap(), GateOutcome::Allowed);
-        // 第二次 execute 必须重新询问：Allow 不得写入 remembered_execute
+        // 下一个 turn 的同类调用必须重新询问：Allow 不写 remembered_execute，
+        // 批量确认窗口（SH-118④）也随 turn 清空——"允许一次"不是"允许整个会话"。
+        broker.begin_turn("root");
         let b = broker.clone();
         let s2 = sink.clone();
         let c2 = cancel.clone();
@@ -533,7 +650,7 @@ mod tests {
             }
             tokio::time::sleep(std::time::Duration::from_millis(10)).await;
         }
-        assert!(prompted, "「允许一次」不得记忆 execute：第二次必须挂起等审批");
+        assert!(prompted, "「允许一次」不得跨 turn 免问：下一 turn 必须挂起等审批");
         assert_eq!(gate2.await.unwrap(), GateOutcome::Denied);
     }
 

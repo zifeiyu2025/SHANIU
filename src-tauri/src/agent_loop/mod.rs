@@ -464,6 +464,8 @@ impl AgentLoop {
             // SH-120：策略快照按 turn 取。运行中切换审批档只影响后续 turn，
             // 不回改正在执行的这一轮——一轮之内裁决依据必须自洽。
             let turn_policy = self.policy.snapshot();
+            // SH-118④：批量确认窗口按 turn 重置——上一轮的批准不延用到下一轮。
+            self.broker.begin_turn(gate_subject.agent_id);
             emit(&sink, EventMsg::TurnStarted { turn });
 
             // SH-055 / FF-103：每次模型请求前先领名额（本轮的压缩请求也算一次采样）。

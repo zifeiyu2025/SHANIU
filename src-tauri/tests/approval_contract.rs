@@ -80,6 +80,72 @@ impl ModelBackend for ScriptedBackend {
     }
 }
 
+/// 一轮内发多次同类工具调用（SH-118④ 的"连续 3 次只问 1 次"样本）。
+struct MultiCallBackend {
+    tool: String,
+    call_ids: Vec<String>,
+}
+
+#[async_trait]
+impl ModelBackend for MultiCallBackend {
+    async fn stream(
+        &self,
+        history: &[HistoryItem],
+        _tools: &[ToolDeclaration],
+        _instructions: &str,
+    ) -> Result<ModelStream, String> {
+        let tool_already_ran = history
+            .iter()
+            .any(|h| matches!(h, HistoryItem::FunctionCallOutput { .. }));
+        let events = if tool_already_ran {
+            vec![ModelStreamEvent::OutputTextDelta { delta: "完成".into() }]
+        } else {
+            self.call_ids
+                .iter()
+                .map(|call_id| {
+                    ModelStreamEvent::OutputItem(ResponseItem::FunctionCall {
+                        name: self.tool.clone(),
+                        arguments: "{}".into(),
+                        call_id: call_id.clone(),
+                    })
+                })
+                .collect()
+        };
+        Ok(Box::pin(futures::stream::iter(events)))
+    }
+}
+
+/// 每个 turn 发一次同类调用：用来证明批量窗口**不跨 turn**。
+struct SequentialBackend {
+    tool: String,
+    emitted: Arc<AtomicUsize>,
+}
+
+#[async_trait]
+impl ModelBackend for SequentialBackend {
+    async fn stream(
+        &self,
+        history: &[HistoryItem],
+        _tools: &[ToolDeclaration],
+        _instructions: &str,
+    ) -> Result<ModelStream, String> {
+        let outputs = history
+            .iter()
+            .filter(|h| matches!(h, HistoryItem::FunctionCallOutput { .. }))
+            .count();
+        let events = if outputs >= 2 {
+            vec![ModelStreamEvent::OutputTextDelta { delta: "完成".into() }]
+        } else {
+            vec![ModelStreamEvent::OutputItem(ResponseItem::FunctionCall {
+                name: self.tool.clone(),
+                arguments: "{}".into(),
+                call_id: format!("c{}", self.emitted.fetch_add(1, Ordering::SeqCst) + 1),
+            })]
+        };
+        Ok(Box::pin(futures::stream::iter(events)))
+    }
+}
+
 struct Harness {
     agent: AgentLoop,
     hits: Arc<AtomicUsize>,
@@ -90,6 +156,10 @@ struct Harness {
 
 /// `tool_name` 决定风险等级：`unified_exec` = execute（询问）、未知名 = destructive。
 fn harness(tool_name: &str) -> Harness {
+    harness_with(Arc::new(ScriptedBackend { tool: tool_name.to_string() }), tool_name, 2)
+}
+
+fn harness_with(backend: Arc<dyn ModelBackend>, tool_name: &str, max_turns: u32) -> Harness {
     let hits = Arc::new(AtomicUsize::new(0));
     let mut router = ToolRouter::new();
     router.register(Arc::new(CountingTool {
@@ -99,12 +169,12 @@ fn harness(tool_name: &str) -> Harness {
     let broker = Arc::new(ApprovalBroker::new());
     let events = Arc::new(Mutex::new(Vec::new()));
     let agent = AgentLoop {
-        backend: Arc::new(ScriptedBackend { tool: tool_name.to_string() }),
+        backend,
         router: Arc::new(router),
         broker: broker.clone(),
         plan_state: Arc::new(PlanState::new()),
         workspace_root: std::env::temp_dir(),
-        max_turns: 2,
+        max_turns,
         token_budget: 0,
         tree_budget: Default::default(),
         policy: Arc::new(policy::SessionPolicyHandle::new(policy::SessionPolicy {
@@ -218,23 +288,29 @@ impl OnFailureHarness {
     }
 }
 
-/// 等第一个审批请求出现，返回 (request_id, reason)。
+/// 等第 `skip+1` 个审批请求出现，返回 (request_id, reason)。
 async fn wait_for_request(
     events: &Arc<Mutex<Vec<EventMsg>>>,
+    skip: usize,
 ) -> (String, Option<String>) {
     for _ in 0..500 {
-        let found = events.lock().unwrap().iter().find_map(|e| match e {
-            EventMsg::ExecApprovalRequest { request_id, reason, .. } => {
-                Some((request_id.clone(), reason.clone()))
-            }
-            _ => None,
-        });
+        let found = events
+            .lock()
+            .unwrap()
+            .iter()
+            .filter_map(|e| match e {
+                EventMsg::ExecApprovalRequest { request_id, reason, .. } => {
+                    Some((request_id.clone(), reason.clone()))
+                }
+                _ => None,
+            })
+            .nth(skip);
         if let Some(found) = found {
             return found;
         }
         tokio::time::sleep(Duration::from_millis(10)).await;
     }
-    panic!("未观察到审批请求");
+    panic!("未观察到第 {} 个审批请求", skip + 1);
 }
 
 /// `on-failure`：沙箱拒绝**之后**才问，批准后以 danger 沙箱重试一次。
@@ -245,7 +321,7 @@ async fn on_failure_asks_after_sandbox_denial_and_retries_with_danger() {
     let broker = h.broker.clone();
     let task = tokio::spawn(async move { h.run().await });
 
-    let (request_id, reason) = wait_for_request(&events).await;
+    let (request_id, reason) = wait_for_request(&events, 0).await;
     assert_eq!(request_id, "appr-c1-escalate", "提权请求必须挂在原调用上");
     assert!(
         reason.unwrap_or_default().contains("沙箱拒绝"),
@@ -272,7 +348,7 @@ async fn on_failure_denied_keeps_original_failure() {
     let broker = h.broker.clone();
     let task = tokio::spawn(async move { h.run().await });
 
-    let (request_id, _reason) = wait_for_request(&events).await;
+    let (request_id, _reason) = wait_for_request(&events, 0).await;
     assert!(broker.resolve(&request_id, ApprovalDecision::Deny));
 
     let (summary, hits, danger_hits, events) = task.await.unwrap();
@@ -300,6 +376,96 @@ async fn never_mode_does_not_prompt_or_escalate_on_sandbox_denial() {
     assert!(
         !events.iter().any(|e| matches!(e, EventMsg::ExecApprovalRequest { .. })),
         "never 档不得发任何审批卡"
+    );
+}
+
+// ============================== 批量确认（SH-118④） ==============================
+
+/// 同一 turn 连续 3 次同类调用：只产生 1 个审批事件，三次都真的执行。
+#[tokio::test]
+async fn same_turn_batches_three_calls_into_one_prompt() {
+    let backend = Arc::new(MultiCallBackend {
+        tool: "unified_exec".into(),
+        call_ids: vec!["c1".into(), "c2".into(), "c3".into()],
+    });
+    let h = harness_with(backend, "unified_exec", 2);
+    let events = h.events.clone();
+    let broker = h.broker.clone();
+    let task = tokio::spawn(async move { h.run().await });
+
+    let (request_id, _reason) = wait_for_request(&events, 0).await;
+    assert!(broker.resolve(&request_id, ApprovalDecision::Allow));
+
+    let (summary, hits, events) = task.await.unwrap();
+    assert_eq!(summary.reason, shaniu_lib::events::TurnEndReason::Completed);
+    assert_eq!(hits, 3, "批量只减少弹窗，不减少执行");
+    assert_eq!(
+        events
+            .iter()
+            .filter(|e| matches!(e, EventMsg::ExecApprovalRequest { .. }))
+            .count(),
+        1,
+        "同一 turn 同类调用只问一次"
+    );
+}
+
+/// 批量窗口不跨 turn：第 2 个 turn 的同类调用必须重新询问。
+#[tokio::test]
+async fn batch_window_does_not_cross_turns() {
+    let backend = Arc::new(SequentialBackend {
+        tool: "unified_exec".into(),
+        emitted: Arc::new(AtomicUsize::new(0)),
+    });
+    let h = harness_with(backend, "unified_exec", 4);
+    let events = h.events.clone();
+    let broker = h.broker.clone();
+    let task = tokio::spawn(async move { h.run().await });
+
+    let (first, _) = wait_for_request(&events, 0).await;
+    assert!(broker.resolve(&first, ApprovalDecision::Allow));
+    let (second, _) = wait_for_request(&events, 1).await;
+    assert!(broker.resolve(&second, ApprovalDecision::Allow));
+
+    let (summary, hits, events) = task.await.unwrap();
+    assert_eq!(summary.reason, shaniu_lib::events::TurnEndReason::Completed);
+    assert_eq!(hits, 2);
+    assert_eq!(
+        events
+            .iter()
+            .filter(|e| matches!(e, EventMsg::ExecApprovalRequest { .. }))
+            .count(),
+        2,
+        "跨 turn 不得复用上一轮的批准"
+    );
+}
+
+/// destructive 永不批量：同一 turn 三次调用必须三次都问。
+#[tokio::test]
+async fn destructive_calls_never_batch() {
+    let backend = Arc::new(MultiCallBackend {
+        tool: "mcp__danger__op".into(),
+        call_ids: vec!["c1".into(), "c2".into(), "c3".into()],
+    });
+    let h = harness_with(backend, "mcp__danger__op", 2);
+    let events = h.events.clone();
+    let broker = h.broker.clone();
+    let task = tokio::spawn(async move { h.run().await });
+
+    for index in 0..3 {
+        let (request_id, _reason) = wait_for_request(&events, index).await;
+        assert!(broker.resolve(&request_id, ApprovalDecision::Allow));
+    }
+
+    let (summary, hits, events) = task.await.unwrap();
+    assert_eq!(summary.reason, shaniu_lib::events::TurnEndReason::Completed);
+    assert_eq!(hits, 3);
+    assert_eq!(
+        events
+            .iter()
+            .filter(|e| matches!(e, EventMsg::ExecApprovalRequest { .. }))
+            .count(),
+        3,
+        "破坏性操作每次必问"
     );
 }
 
