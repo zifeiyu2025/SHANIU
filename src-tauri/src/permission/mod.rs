@@ -85,6 +85,9 @@ pub struct ApprovalBroker {
     /// 本 turn 的批量确认窗口（SH-118④）：用户批准过一次的 (agent, tool)，
     /// 同一 turn 内后续调用不再逐次弹窗。turn 开始由 `begin_turn` 清空。
     batch: Mutex<Option<BatchGrant>>,
+    /// 批量确认的**关闭**开关：默认 false（生产启用）。评估基线用它跑"关闭批量"的
+    /// 对照组，否则量不出 SH-119 的打断次数变化（同进程内切换，不是产品开关）。
+    batch_disabled: std::sync::atomic::AtomicBool,
 }
 
 /// 批量确认窗口的内容：只记身份与工具，不记参数——参数不同的调用同样算"同一类操作"，
@@ -107,6 +110,12 @@ impl ApprovalBroker {
 
     pub fn prefix_rule_count(&self) -> usize {
         self.prefix.read().expect("prefix 锁中毒").rule_count()
+    }
+
+    /// 关闭批量确认（评估对照用）。只影响 `gate` 的批量短路，不改记忆与风险评估。
+    pub fn disable_batch(&self) {
+        self.batch_disabled
+            .store(true, std::sync::atomic::Ordering::SeqCst);
     }
 
     /// 工具执行前的门禁：白名单 → 裁决 → 必要时发审批请求并等待回执。
@@ -161,12 +170,15 @@ impl ApprovalBroker {
         // 同一 turn 内的批量确认（SH-118④）：本轮已经为用户批准过的 (agent, tool)
         // 不再逐次弹窗。作用域只有"一个 turn + 一个代理 + 一个工具"，turn 开始即清空；
         // destructive 永不进入批量（它本来每次必问）。
-        let batched = self
-            .batch
-            .lock()
-            .expect("batch 锁中毒")
-            .as_ref()
-            .is_some_and(|grant| grant.agent_id == subject.agent_id && grant.tool == tool);
+        let batched = !self
+            .batch_disabled
+            .load(std::sync::atomic::Ordering::SeqCst)
+            && self
+                .batch
+                .lock()
+                .expect("batch 锁中毒")
+                .as_ref()
+                .is_some_and(|grant| grant.agent_id == subject.agent_id && grant.tool == tool);
         match policy::decide(risk, policy.approval, policy.sandbox, remembered) {
             Decision::Allow => GateOutcome::Allowed,
             Decision::Deny => GateOutcome::Forbidden,

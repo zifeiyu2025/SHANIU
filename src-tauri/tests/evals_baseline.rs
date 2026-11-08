@@ -161,6 +161,9 @@ struct Agg {
     /// 工具调用轨迹（begin → end 配对，上限 10 条）：SH-085 这类"跑完但没产出"
     /// 的失败，只有看到模型实际发了什么才有归因，否则只能猜提示词。
     trace: Vec<String>,
+    /// 每一次审批打断的归因（工具 + 风险档 + 原因，上限 12 条）：SH-119 要求报告
+    /// 「每次打断的工具、原因、是否本可降噪」，只给总数无法回答"该不该降噪"。
+    prompts: Vec<String>,
 }
 
 /// 参数摘要：够认出模型发了什么，又不至于把报告撑爆。
@@ -179,6 +182,10 @@ fn args_summary(args: &serde_json::Value) -> String {
 struct EvalSink {
     agg: Mutex<Agg>,
     broker: Arc<ApprovalBroker>,
+    /// 代答用的决定：默认 `AllowAlways`（等价"总是允许"，量任务能力）；
+    /// `SHANIU_EVAL_APPROVAL=allow_once` 切到 `Allow`，模拟真实用户逐次确认，
+    /// 用于 SH-119 的打断次数测量——用 AllowAlways 会把"记忆"混进指标，量不准。
+    decision: ApprovalDecision,
 }
 
 impl EventSink for EvalSink {
@@ -228,9 +235,16 @@ impl EventSink for EvalSink {
                     agg.errors.push(trimmed);
                 }
             }
-            EventMsg::ExecApprovalRequest { request_id, .. } => {
+            EventMsg::ExecApprovalRequest { request_id, tool, risk, reason, args, .. } => {
                 agg.approvals += 1;
-                if self.broker.resolve(request_id, ApprovalDecision::AllowAlways) {
+                if agg.prompts.len() < 12 {
+                    agg.prompts.push(format!(
+                        "{tool} risk={risk:?} 原因={} 参数={}",
+                        reason.as_deref().unwrap_or("-"),
+                        args_summary(args)
+                    ));
+                }
+                if self.broker.resolve(request_id, self.decision) {
                     agg.auto_resolved += 1;
                 } else {
                     agg.unresolved += 1;
@@ -248,6 +262,7 @@ struct Outcome {
     success: bool,
     detail: String,
     trace: Vec<String>,
+    prompts: Vec<String>,
     turns: u32,
     input_tokens: u64,
     output_tokens: u64,
@@ -255,6 +270,32 @@ struct Outcome {
     approvals: u32,
     unresolved: u32,
     ms: u128,
+}
+
+/// 评估用的 broker：默认装**生产语义**（同 turn 批量确认 + 前缀白名单都在），
+/// 两个 `SHANIU_EVAL_ABLATE_*` 开关只用于 SH-119 的前后对照——关掉它们就复现
+/// "降噪前"的逐次打断。两处用例（任务集 + repair）共用同一套装配，避免漂移。
+fn eval_broker() -> Arc<ApprovalBroker> {
+    let broker = Arc::new(ApprovalBroker::new());
+    if std::env::var("SHANIU_EVAL_ABLATE_BATCH").is_ok() {
+        broker.disable_batch();
+    }
+    if std::env::var("SHANIU_EVAL_ABLATE_PREFIX").is_err() {
+        let (rules, _) = policy::PrefixAllowlist::from_config(
+            &shaniu_lib::config::default_allow_prefixes(),
+        );
+        broker.set_prefix_rules(rules);
+    }
+    broker
+}
+
+/// 代答决定：默认 `AllowAlways`（量任务能力）；`allow_once` 模拟真实用户逐次确认。
+fn eval_decision() -> ApprovalDecision {
+    if std::env::var("SHANIU_EVAL_APPROVAL").as_deref() == Ok("allow_once") {
+        ApprovalDecision::Allow
+    } else {
+        ApprovalDecision::AllowAlways
+    }
 }
 
 async fn run_one(task: &Task, fixture: &BTreeMap<String, String>, backend: Arc<ResponsesBackend>) -> Outcome {
@@ -271,10 +312,12 @@ async fn run_one(task: &Task, fixture: &BTreeMap<String, String>, backend: Arc<R
     let plan_state = Arc::new(PlanState::new());
     let mut router = ToolRouter::new();
     tools::register_builtin(&mut router, plan_state.clone());
-    let broker = Arc::new(ApprovalBroker::new());
+    let broker = eval_broker();
+    let decision = eval_decision();
     let sink = Arc::new(EvalSink {
         agg: Mutex::new(Agg::default()),
         broker: broker.clone(),
+        decision,
     });
     // 顺带验证持久化链路（SH-030）：真实端点跑完一轮，档案必须落盘且能原样读回。
     // 放在评估里做是因为它跑的是生产同一套 AgentLoop 装配——单测造得出历史，造不出真实时序。
@@ -354,6 +397,7 @@ async fn run_one(task: &Task, fixture: &BTreeMap<String, String>, backend: Arc<R
         success: verdict.is_ok(),
         detail,
         trace: agg.trace.clone(),
+        prompts: agg.prompts.clone(),
         turns,
         input_tokens: agg.input_tokens,
         output_tokens: agg.output_tokens,
@@ -456,6 +500,7 @@ async fn evals_baseline_v0() {
                 "turns": out.turns,
                 "tool_calls": out.tool_calls,
                 "trace": out.trace,
+                "prompts": out.prompts,
                 "input_tokens": out.input_tokens,
                 "output_tokens": out.output_tokens,
                 "approvals": out.approvals,
@@ -472,9 +517,14 @@ async fn evals_baseline_v0() {
             .map(|r| r["input_tokens"].as_u64().unwrap_or(0) + r["output_tokens"].as_u64().unwrap_or(0))
             .sum();
         println!(
-            "[evals] run {run}/{repeats} 小计 成功率={passed}/{count}，平均轮数={:.2}，平均 token={:.0}",
+            "[evals] run {run}/{repeats} 小计 成功率={passed}/{count}，平均轮数={:.2}，平均 token={:.0}，平均打断={:.2}",
             f64::from(sum_turns) / n,
             sum_tokens as f64 / n,
+            if count == 0 {
+                0.0
+            } else {
+                rows.iter().filter_map(|r| r["approvals"].as_u64()).sum::<u64>() as f64 / n
+            },
         );
         if first_rows.is_none() {
             first_rows = Some(rows.clone());
@@ -487,6 +537,12 @@ async fn evals_baseline_v0() {
                 "success_rate": passed as f64 / n,
                 "avg_turns": f64::from(sum_turns) / n,
                 "avg_total_tokens": sum_tokens as f64 / n,
+                // SH-119：每任务打断次数（审批卡数），中位数口径由 score.mjs/人工比对
+                "avg_approvals": if count == 0 {
+                    0.0
+                } else {
+                    rows.iter().filter_map(|r| r["approvals"].as_u64()).sum::<u64>() as f64 / n
+                },
             },
             "tasks": rows,
         }));
@@ -652,10 +708,12 @@ async fn repair_loop_fixes_broken_rust_project_until_cargo_test_green() {
     let plan_state = Arc::new(PlanState::new());
     let mut router = ToolRouter::new();
     tools::register_builtin(&mut router, plan_state.clone());
-    let broker = Arc::new(ApprovalBroker::new());
+    let broker = eval_broker();
+    let decision = eval_decision();
     let sink = Arc::new(EvalSink {
         agg: Mutex::new(Agg::default()),
         broker: broker.clone(),
+        decision,
     });
     let agent = AgentLoop {
         backend,
