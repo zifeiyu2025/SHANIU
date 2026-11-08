@@ -1938,7 +1938,8 @@ pub fn run() {
             user_terminal::user_terminal_write,
             user_terminal::user_terminal_resize,
             user_terminal::user_terminal_close,
-            user_terminal::user_terminal_close_all
+            user_terminal::user_terminal_close_all,
+            user_terminal::user_terminal_active_count,
         ])
         .on_window_event(|window, event| {
             // 关闭 = 隐藏到系统托盘（不退出）；真正退出只走托盘菜单「退出」

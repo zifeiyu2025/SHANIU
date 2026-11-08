@@ -225,6 +225,15 @@ impl UserTerminalManager {
             .cloned()
             .ok_or_else(|| format!("终端不存在: {id}"))
     }
+
+    /// 存活会话数。唯一用途是给"隐藏到托盘时仍有终端在跑"提供状态，
+    /// 不推断控制权、不代表任何接管语义。
+    fn active_count(&self) -> usize {
+        self.inner
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .len()
+    }
 }
 
 impl Drop for UserTerminalManager {
@@ -434,6 +443,12 @@ pub fn user_terminal_close_all(state: State<'_, UserTerminalManager>) {
     state.close_all();
 }
 
+/// 存活会话数：给"关窗口只是隐藏到托盘，但仍有终端在跑"这条提示提供状态。
+#[tauri::command]
+pub fn user_terminal_active_count(state: State<'_, UserTerminalManager>) -> usize {
+    state.active_count()
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -552,6 +567,31 @@ mod tests {
             "关闭后 Job 内仍有 {} 个活动进程",
             spawn.child.active_processes()
         );
+    }
+
+    /// 存活计数只反映会话表长度：开一个 +1，关掉归零（托盘提示的唯一数据源）。
+    #[test]
+    fn active_count_tracks_open_and_close() {
+        let manager = UserTerminalManager::default();
+        assert_eq!(manager.active_count(), 0, "初始应为 0");
+        let sink = Arc::new(RecordingSink::default());
+        let id = String::from("count-terminal");
+        manager
+            .open(
+                OpenRequest {
+                    id: id.clone(),
+                    shell: None,
+                    cwd: Some(std::env::temp_dir().display().to_string()),
+                    cols: Some(80),
+                    rows: Some(24),
+                    title: None,
+                },
+                sink,
+            )
+            .expect("启动用户终端");
+        assert_eq!(manager.active_count(), 1, "开一个终端后应为 1");
+        manager.close(&id);
+        assert_eq!(manager.active_count(), 0, "关闭后应归零");
     }
 
     #[test]
