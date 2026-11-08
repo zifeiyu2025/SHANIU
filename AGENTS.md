@@ -67,6 +67,16 @@
 | 协议/事件变更 | schema 快照测试 | 兼容性说明（additive?） | 禁止跳过 |
 | 沙箱/权限变更 | 全部健身函数测试（文档 §5） | 探针结果 | 禁止跳过 |
 
+### 4.1 测试密钥（唯一约定）
+
+- **变量名固定**：`SHANIU_TEST_API_KEY`；端点与模型用 `SHANIU_TEST_BASE_URL` / `SHANIU_TEST_MODEL` 覆盖。不要每轮另造变量名，也不要把密钥写进 `.env` 或任何入库文件。
+- **来源（本机，二者都不入库）**：
+  1. 仓库根 `测试API.txt` 第一行，形如 `<endpoint>/v1/chat/completions  KEY=<key>`——对应 `SHANIU_TEST_MODEL=LongCat-2.5`，`SHANIU_TEST_BASE_URL` 取到 `/v1` 为止；该文件已在 `.gitignore`。
+  2. 系统环境变量 `DeepSeekAPI`——对应 `SHANIU_TEST_MODEL=deepseek-flash`。
+- **注入方式**：只在启动测试进程的那条命令里设**进程级**环境变量，例如 PowerShell：
+  `$env:SHANIU_TEST_API_KEY = (从上述来源提取); cargo test --test evals_baseline -- --ignored --nocapture`
+- **禁止**：打印密钥、写进仓库内任何文件、提交、写进日志或错误信息。确认密钥存在时只能输出布尔值与长度。
+
 ## 5. 验证与验收
 
 - 测试要有意义：测行为与契约，禁止只对字面量快照（如把整个 JSON 原样 assert）。
