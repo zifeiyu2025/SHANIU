@@ -613,10 +613,21 @@ impl McpRuntime {
             }
         };
         self.clear_blocked(&config.id).await;
-        let identity = session
-            .initialize(DEFAULT_HANDSHAKE_TIMEOUT)
-            .await
-            .map_err(|error| format!("MCP 握手失败: {error}"))?;
+        let identity = match session.initialize(DEFAULT_HANDSHAKE_TIMEOUT).await {
+            Ok(identity) => identity,
+            Err(error) => {
+                // 握手失败最常见的原因是 server 启动期就崩了（runtime/依赖读不到）；
+                // 不带上 stderr 尾部，用户只能看到「连接已关闭」。进程已退出时
+                // 稍等一下再取尾部，避免读线程还没把管道内容搬进环里。
+                if session.is_closed() {
+                    tokio::time::sleep(Duration::from_millis(200)).await;
+                }
+                return Err(format!(
+                    "MCP 握手失败: {error}\n{}",
+                    session.crash_report(-1)
+                ));
+            }
+        };
         let remote_tools = session
             .list_tools(DEFAULT_HANDSHAKE_TIMEOUT)
             .await
