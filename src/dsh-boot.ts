@@ -17,6 +17,7 @@ import { apply as uiSidebarApply, inject as uiSidebarInject } from '@deepseek-ai
 import { apply as uiSidebarRightApply, inject as uiSidebarRightInject } from '@deepseek-ai/dsh-client-ui-sidebar-right/client'
 import { apply as uiSidebarFilesApply, inject as uiSidebarFilesInject } from '@deepseek-ai/dsh-client-ui-sidebar-files/client'
 import { apply as uiSidebarBrowserApply, inject as uiSidebarBrowserInject } from '@deepseek-ai/dsh-client-ui-sidebar-browser/client'
+import { apply as uiSidebarTerminalApply, inject as uiSidebarTerminalInject } from '@deepseek-ai/dsh-client-ui-sidebar-terminal/client'
 import { apply as uiConversationApply, inject as uiConversationInject } from '@deepseek-ai/dsh-client-ui-conversation/client'
 import { apply as uiChatApply, inject as uiChatInject } from '@deepseek-ai/dsh-client-ui-chat/client'
 import { apply as uiSubagentApply, inject as uiSubagentInject } from '@deepseek-ai/dsh-client-ui-subagent/client'
@@ -77,6 +78,7 @@ import { apply as headerActionsApply, inject as headerActionsInject } from './he
 import { apply as mcpTrustApply, inject as mcpTrustInject } from './mcp-trust'
 import { apply as modelConfigApply, inject as modelConfigInject } from './model-config'
 import { apply as sandboxStatusApply, inject as sandboxStatusInject } from './sandbox-status'
+import { apply as userTerminalSourceApply, inject as userTerminalSourceInject } from './terminal-source'
 
 export interface BootHandle {
   readonly ctx: Context
@@ -249,6 +251,12 @@ export async function bootShaniu(container: HTMLElement, options: BootOptions = 
       : { inject: directoryPickerBrowseInject, apply: directoryPickerBrowseApply },
     { inject: uiConversationInject, apply: uiConversationApply },
     { inject: uiSidebarRightInject, apply: uiSidebarRightApply },
+    // SH-071 用户终端：先装数据源（提供 `webTerminals`，走宿主的裸进程 ConPTY），
+    // 再装上游 UI 包。只在桌面态挂载——浏览器联调没有本地进程可连，挂了只会是假入口。
+    ...(realData
+      ? [{ inject: userTerminalSourceInject, apply: userTerminalSourceApply } as FeaturePlugin,
+        { inject: uiSidebarTerminalInject, apply: uiSidebarTerminalApply } as FeaturePlugin]
+      : []),
     { inject: uiSidebarFilesInject, apply: uiSidebarFilesApply },
     { inject: uiSidebarBrowserInject, apply: uiSidebarBrowserApply },
     { inject: uiSidebarInject, apply: uiSidebarApply },

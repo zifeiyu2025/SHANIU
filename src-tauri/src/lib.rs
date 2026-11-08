@@ -26,6 +26,8 @@ pub mod session_title;
 pub mod skills;
 pub mod subagent_registry;
 pub mod text_encoding;
+/// SH-071：右侧栏「给人用」的独立终端（裸进程 + ConPTY，不进沙箱 / 不进模型上下文）。
+pub mod user_terminal;
 /// 测试夹具公共设施（自删临时目录）。`#[doc(hidden)]`：不是产品 API，只为单测/集成测试共用。
 #[doc(hidden)]
 pub mod test_support;
@@ -1850,6 +1852,7 @@ pub fn run() {
         .plugin(tauri_plugin_dialog::init())
         .manage(app_state)
         .manage(gateway_hub.clone())
+        .manage(user_terminal::UserTerminalManager::default())
         .invoke_handler(tauri::generate_handler![
             dev_ping,
             frontend_ready,
@@ -1929,7 +1932,13 @@ pub fn run() {
             mcp_connect_and_review,
             mcp_resolve_trust,
             mcp_revoke_trust,
-            mcp_revoke_exemption
+            mcp_revoke_exemption,
+            user_terminal::user_terminal_shells,
+            user_terminal::user_terminal_open,
+            user_terminal::user_terminal_write,
+            user_terminal::user_terminal_resize,
+            user_terminal::user_terminal_close,
+            user_terminal::user_terminal_close_all
         ])
         .on_window_event(|window, event| {
             // 关闭 = 隐藏到系统托盘（不退出）；真正退出只走托盘菜单「退出」

@@ -1804,6 +1804,12 @@
    "@deepseek-ai/dsh-client-ui-sidebar-right/client": [
     "./node_modules/.cache/dsh-types-client/src/dsh/packages/client/ui-sidebar-right/src/client/index.d.ts"
    ],
+   "@deepseek-ai/dsh-client-ui-sidebar-terminal": [
+    "./node_modules/.cache/dsh-types-client/src/dsh/packages/client/ui-sidebar-terminal/src/index.d.ts"
+   ],
+   "@deepseek-ai/dsh-client-ui-sidebar-terminal/client": [
+    "./node_modules/.cache/dsh-types-client/src/dsh/packages/client/ui-sidebar-terminal/src/client/index.d.ts"
+   ],
    "@deepseek-ai/dsh-client-ui-theme/client": [
     "./node_modules/.cache/dsh-types-client/src/dsh/packages/client/ui-theme/src/client/index.d.ts"
    ],

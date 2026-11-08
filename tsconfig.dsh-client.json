@@ -1794,6 +1794,12 @@
    "@deepseek-ai/dsh-client-ui-sidebar-right/client": [
     "./src/dsh/packages/client/ui-sidebar-right/src/client/index.ts"
    ],
+   "@deepseek-ai/dsh-client-ui-sidebar-terminal": [
+    "./src/dsh/packages/client/ui-sidebar-terminal/src/index.ts"
+   ],
+   "@deepseek-ai/dsh-client-ui-sidebar-terminal/client": [
+    "./src/dsh/packages/client/ui-sidebar-terminal/src/client/index.ts"
+   ],
    "@deepseek-ai/dsh-client-ui-theme/client": [
     "./src/dsh/packages/client/ui-theme/src/client/index.ts"
    ],
@@ -3707,6 +3713,21 @@
   "./src/dsh/packages/client/ui-sidebar-files/src/client/navigator-layout.ts",
   "./src/dsh/packages/client/ui-sidebar-files/src/client/store.ts",
   "./src/dsh/packages/client/ui-sidebar-files/src/client/workspace-tree.ts",
+  "./src/dsh/packages/client/ui-sidebar-terminal/src/client/LazyTerminalBody.tsx",
+  "./src/dsh/packages/client/ui-sidebar-terminal/src/client/TerminalCleanup.tsx",
+  "./src/dsh/packages/client/ui-sidebar-terminal/src/client/TerminalGuide.tsx",
+  "./src/dsh/packages/client/ui-sidebar-terminal/src/client/TerminalIcon.tsx",
+  "./src/dsh/packages/client/ui-sidebar-terminal/src/client/TerminalRecovery.tsx",
+  "./src/dsh/packages/client/ui-sidebar-terminal/src/client/TerminalTitle.tsx",
+  "./src/dsh/packages/client/ui-sidebar-terminal/src/client/face.ts",
+  "./src/dsh/packages/client/ui-sidebar-terminal/src/client/index.ts",
+  "./src/dsh/packages/client/ui-sidebar-terminal/src/client/locales.ts",
+  "./src/dsh/packages/client/ui-sidebar-terminal/src/client/model.ts",
+  "./src/dsh/packages/client/ui-sidebar-terminal/src/client/terminal-cursor.ts",
+  "./src/dsh/packages/client/ui-sidebar-terminal/src/client/terminal-theme.ts",
+  "./src/dsh/packages/client/ui-sidebar-terminal/src/client/terminal.tsx",
+  "./src/dsh/packages/client/ui-sidebar-terminal/src/css-modules.d.ts",
+  "./src/dsh/packages/client/ui-sidebar-terminal/src/index.ts",
   "./src/dsh/packages/client/ui-sidebar-right/src/client/contract/params.ts",
   "./src/dsh/packages/client/ui-sidebar-right/src/client/contract/seed.ts",
   "./src/dsh/packages/client/ui-sidebar-right/src/client/contract/slots.ts",

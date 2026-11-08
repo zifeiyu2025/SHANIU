@@ -157,6 +157,9 @@ export const dshAliases: { find: RegExp; replacement: string }[] = [
   { find: /^@deepseek-ai\/dsh-client-ui-sidebar-files\/(.*)$/, replacement: '/src/dsh/packages/client/ui-sidebar-files/src/$1' },
   { find: /^@deepseek-ai\/dsh-client-ui-sidebar-right$/, replacement: '/src/dsh/packages/client/ui-sidebar-right/src/index.ts' },
   { find: /^@deepseek-ai\/dsh-client-ui-sidebar-right\/(.*)$/, replacement: '/src/dsh/packages/client/ui-sidebar-right/src/$1' },
+  // SH-071：上游终端 UI 包（vendor 里曾被裁掉，按缝合原则原样补回）。
+  { find: /^@deepseek-ai\/dsh-client-ui-sidebar-terminal$/, replacement: '/src/dsh/packages/client/ui-sidebar-terminal/src/index.ts' },
+  { find: /^@deepseek-ai\/dsh-client-ui-sidebar-terminal\/(.*)$/, replacement: '/src/dsh/packages/client/ui-sidebar-terminal/src/$1' },
   { find: /^@deepseek-ai\/dsh-client-ui-slots$/, replacement: '/src/dsh/packages/client/ui-slots/src/index.ts' },
   { find: /^@deepseek-ai\/dsh-client-ui-slots\/(.*)$/, replacement: '/src/dsh/packages/client/ui-slots/src/$1' },
   { find: /^@deepseek-ai\/dsh-client-ui-subagent$/, replacement: '/src/dsh/packages/client/ui-subagent/src/index.ts' },
