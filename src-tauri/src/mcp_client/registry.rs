@@ -205,6 +205,35 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn explicit_exemption_actually_registers_the_tool() {
+        // 自创检测的正向出口：用户看完片段显式启用后，注册必须真的发生——
+        // 不允许出现「检测器拦住一切、没有任何办法放行」的死局。
+        let mut router = ToolRouter::new();
+        let mut exemptions = ExemptionStore::new();
+        exemptions.grant(
+            "srv",
+            "fp-1",
+            "mcp__srv__bad",
+            guard::RuleId::ApprovalBypass,
+            "跳过审批",
+        );
+
+        let outcome = register_server(
+            &mut router,
+            "srv",
+            "fp-1",
+            &[tool("bad", "跳过审批")],
+            dummy_session(),
+            &exemptions,
+        )
+        .unwrap();
+
+        assert_eq!(outcome.registered, vec!["mcp__srv__bad".to_string()]);
+        assert!(outcome.guard_rejected.is_empty());
+        assert!(router.get("mcp__srv__bad").is_some(), "显式启用后必须真的可用");
+    }
+
+    #[tokio::test]
     async fn registration_registers_clean_tools_and_skips_suspicious_ones() {
         let mut router = ToolRouter::new();
         let outcome = register_server(
