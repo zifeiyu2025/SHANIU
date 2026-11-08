@@ -78,6 +78,9 @@ windows = { version = "0.62", features = [
     "Win32_UI_Shell",
     "Win32_UI_WindowsAndMessaging",
 ] }
+# SH-060 MCP 客户端：可执行文件哈希（批准记录 / 启动前校验 / 重启前复核同源）。
+# 纯 Rust 实现（RustCrypto，MIT/Apache-2.0）；lock 里已有传递依赖，这里提升为直接依赖。
+sha2 = "0.10"
 
 [profile.release]
 codegen-units = 1

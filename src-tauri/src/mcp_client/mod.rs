@@ -12,4 +12,6 @@
 //! - 本模块**不**直接向模型注入声明——MCP 工具一律转成 `ToolSpec` 注册；
 //! - 依赖边只允许 `config` / `events` / `tool_router` / `sandbox`（docs/01 E47）。
 
+pub mod command;
+pub mod process;
 pub mod rpc;
