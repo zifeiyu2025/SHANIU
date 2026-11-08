@@ -8,6 +8,14 @@ edition = "2021"
 name = "shaniu_lib"
 crate-type = ["staticlib", "cdylib", "rlib"]
 
+# 上游模板同名 feature：tauri-codegen 用它决定 `generate_context!` 内嵌前端资源
+# 还是走 `build.devUrl`（`dev = cfg!(not(feature = "custom-protocol"))`）。
+# 故意**不设 default**：一旦默认开启，任何 `cargo check/clippy/test` 都会要求
+# `dist/` 已存在（tauri-codegen 在 frontendDist 缺失时直接 panic），而 CI 与本地
+# 都是先跑 cargo 检查再 `pnpm build`。发布与手工构建按 docs/01 §9.4 启用本 feature。
+[features]
+custom-protocol = ["tauri/custom-protocol"]
+
 [build-dependencies]
 tauri-build = { version = "2", features = [] }
 

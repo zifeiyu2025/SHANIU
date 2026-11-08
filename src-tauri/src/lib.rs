@@ -30,6 +30,7 @@ pub mod tools;
 pub mod workspace_files;
 
 use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 
 use tauri::{
@@ -46,6 +47,25 @@ use config::AppConfig;
 #[tauri::command]
 fn dev_ping(app: tauri::AppHandle, nonce: String) -> Result<(), String> {
     events::emit_pong(&app, &nonce)
+}
+
+/// 主窗口是否已收到前端的就绪信号（首帧启动页已可显示）。
+static FRONTEND_READY: AtomicBool = AtomicBool::new(false);
+
+/// 首帧就绪信号：窗口以 `visible: false` 创建（tauri.conf.json），前端把启动页
+/// 画出来后调用这里再显示，避免用户先看到未绘制窗口。重复调用无副作用；
+/// 前端若始终不发信号（脚本崩溃、页面加载失败），setup 里的 3 秒兜底会强制显示。
+///
+/// 为什么"先隐藏、就绪再显示"：实测页面 FCP 与窗口 show 基本同刻（Rust 日志里
+/// 就绪信号在 gateway 监听后 85–101 ms，页面 FCP 在页龄 120–128 ms），所以窗口真正
+/// 可见时启动页已经画好，WebView2 默认纯白帧不会被用户看到。改回"先 show 再加载"
+/// 会让那段纯白重新出现（见 docs/01 §9.5.1）。
+#[tauri::command]
+fn frontend_ready(app: tauri::AppHandle) {
+    if !FRONTEND_READY.swap(true, Ordering::SeqCst) {
+        tracing::info!("前端就绪信号到达，显示主窗口");
+    }
+    show_main_window(&app);
 }
 
 /// 提交任务，并返回**本次使用的 agent_id**。
@@ -1600,6 +1620,7 @@ pub fn run() {
         .manage(gateway_hub.clone())
         .invoke_handler(tauri::generate_handler![
             dev_ping,
+            frontend_ready,
             send_task,
             create_session,
             resume_session,
@@ -1677,6 +1698,23 @@ pub fn run() {
             }
         })
         .setup(|app| {
+            // 延迟显示窗口的兜底（tauri.conf.json 的 visible:false）：前端脚本崩溃、
+            // 页面加载失败或就绪信号丢失时，3 秒后强制显示，保证不存在"窗口永不出现"。
+            //
+            // 为什么是 3 秒：正常路径的就绪信号在进程启动后约 300–345 ms 到达（实测
+            // 10 次 85–101 ms / gateway 监听后），3 秒留了约 10 倍余量，足够吸收冷启动
+            // 抖动与杀软扫描；同时它必须明显短于失败出口的另外两层——主包内 8 秒超时
+            // 与 index.html 的 12 秒看门狗——这样"窗口没出现"永远先于"面板报错"结束，
+            // 用户不会面对一个看不见的窗口里转圈。上限侧则要压住"点了没反应"的体感，
+            // 超过 3 秒还没有任何窗口，用户会怀疑程序没启动。
+            let handle = app.handle().clone();
+            tauri::async_runtime::spawn(async move {
+                tokio::time::sleep(std::time::Duration::from_secs(3)).await;
+                if !FRONTEND_READY.load(Ordering::SeqCst) {
+                    tracing::warn!("前端未在 3 秒内发出就绪信号，强制显示主窗口");
+                    show_main_window(&handle);
+                }
+            });
             // SH-094 批 2：loopback WS gateway。动态端口绑定后写入 hub 供 gateway_info 回报；
             // 绑定失败只告警降级（事件仍走 Tauri 广播），不拦启动。
             let gateway_hub = app.state::<gateway::GatewayHub>().inner().clone();

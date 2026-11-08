@@ -1,12 +1,246 @@
 <!doctype html>
-<html lang="zh-CN" data-theme="dark">
+<html lang="zh-CN">
   <head>
     <meta charset="UTF-8" />
     <meta name="viewport" content="width=device-width, initial-scale=1.0" />
     <title>SHANIU</title>
+    <script>
+      // L0 主题引导：对齐上游 ui-theme/boot-theme.ts 的两段式，但偏好来源不同——
+      // 上游由宿主在渲染 index 时注入，我们的 index.html 是静态文件，拿不到 IPC，
+      // 因此用上次启动缓存下的解析结果兜底，没有缓存时跟随系统。
+      // 这里只解析偏好并写到 <html>，让下面的内联样式在"脚本执行前"就能给出正确底色；
+      // body 开头的脚本再把 data-ds-dark-theme 写到 body（base.css 的暗色选择器），
+      // 避免样式表里的浅色默认值闪一下。
+      // 已知限制：静态文件读不到宿主设置，只能沿用上次结果；main.tsx 用 MutationObserver
+      // 跟随每次主题切换写回，所以只有"切换后立刻强杀进程"才会遗留一次错配。
+      ;(function () {
+        var resolved = null
+        try {
+          resolved = localStorage.getItem('shaniu.theme.resolved')
+        } catch (error) {
+          // 隐私模式等取不到存储：退回跟随系统
+        }
+        var dark =
+          resolved === 'dark' || resolved === 'light'
+            ? resolved === 'dark'
+            : !!(window.matchMedia && window.matchMedia('(prefers-color-scheme: dark)').matches)
+        window.__shaniuBootDark = dark
+        document.documentElement.setAttribute('data-boot-theme', dark ? 'dark' : 'light')
+      })()
+    </script>
+    <!--
+      L0 预涂 + L1 启动页样式（与 tauri.conf.json 的窗口 backgroundColor 是两层防护）：
+      ① 主包（4.8 MB）下载、解析、执行期间，页面底色已经是主题色，不出现纯白帧；
+      ② 启动页随 HTML 一起解析，不依赖任何脚本。
+      动效只有呼吸式脉冲（没有真实比例就不画进度条）；prefers-reduced-motion 下退化为静态。
+    -->
+    <style>
+      html {
+        --boot-bg: #151517;
+        --boot-fg: rgba(255, 255, 255, 0.72);
+        --boot-muted: rgba(255, 255, 255, 0.42);
+        --boot-line: rgba(255, 255, 255, 0.14);
+        --boot-danger: #f2777a;
+        color-scheme: dark;
+      }
+      html[data-boot-theme='light'] {
+        --boot-bg: #ffffff;
+        --boot-fg: rgba(0, 0, 0, 0.66);
+        --boot-muted: rgba(0, 0, 0, 0.44);
+        --boot-line: rgba(0, 0, 0, 0.14);
+        --boot-danger: #c0392b;
+        color-scheme: light;
+      }
+      html,
+      body,
+      #root {
+        height: 100%;
+        margin: 0;
+        background: var(--boot-bg);
+      }
+      #boot-splash {
+        position: fixed;
+        inset: 0;
+        z-index: 2147483000;
+        display: flex;
+        flex-direction: column;
+        align-items: center;
+        justify-content: center;
+        gap: 18px;
+        background: var(--boot-bg);
+        transition: opacity 160ms ease;
+        user-select: none;
+        -webkit-user-select: none;
+      }
+      #boot-splash.is-leaving {
+        opacity: 0;
+        pointer-events: none;
+      }
+      .boot-brand {
+        display: flex;
+        align-items: center;
+        gap: 10px;
+        color: var(--boot-fg);
+      }
+      .boot-wordmark {
+        font: 600 12px/1 system-ui, -apple-system, 'Segoe UI', 'Microsoft YaHei', sans-serif;
+        letter-spacing: 0.42em;
+        text-indent: 0.42em;
+      }
+      .boot-dot {
+        width: 6px;
+        height: 6px;
+        border-radius: 50%;
+        background: currentColor;
+        animation: boot-breathe 1.6s ease-in-out infinite;
+      }
+      @keyframes boot-breathe {
+        0%,
+        100% {
+          opacity: 0.22;
+        }
+        50% {
+          opacity: 0.9;
+        }
+      }
+      .boot-status {
+        font: 12px/1.5 system-ui, -apple-system, 'Segoe UI', 'Microsoft YaHei', sans-serif;
+        letter-spacing: 0.02em;
+        color: var(--boot-muted);
+        opacity: 0;
+        transition: opacity 180ms ease;
+        min-height: 18px;
+      }
+      .boot-status.is-visible {
+        opacity: 1;
+      }
+      .boot-failure {
+        max-width: 560px;
+        padding: 0 24px;
+        text-align: center;
+        font: 12.5px/1.7 system-ui, -apple-system, 'Segoe UI', 'Microsoft YaHei', sans-serif;
+        color: var(--boot-fg);
+      }
+      .boot-failure-title {
+        margin-bottom: 6px;
+        font-weight: 600;
+        color: var(--boot-danger);
+      }
+      .boot-failure-stage,
+      .boot-failure code {
+        color: var(--boot-muted);
+        word-break: break-all;
+      }
+      .boot-failure code {
+        display: block;
+        margin-top: 10px;
+        font: 11.5px/1.6 ui-monospace, 'Cascadia Mono', Consolas, monospace;
+      }
+      .boot-retry {
+        margin-top: 14px;
+        padding: 6px 16px;
+        border: 1px solid var(--boot-line);
+        border-radius: 6px;
+        background: transparent;
+        color: var(--boot-fg);
+        font: inherit;
+        cursor: pointer;
+      }
+      .boot-retry:hover {
+        border-color: var(--boot-fg);
+      }
+      @media (prefers-reduced-motion: reduce) {
+        #boot-splash,
+        .boot-status {
+          transition: none;
+        }
+        .boot-dot {
+          animation: none;
+          opacity: 0.6;
+        }
+      }
+    </style>
   </head>
   <body>
-    <div id="root"></div>
+    <script>
+      // 与 head 里解析出的偏好保持一致：base.css 靠 body[data-ds-dark-theme] 切暗色变量，
+      // 在样式表生效前写入，避免"浅色默认值 → 暗色"闪一下。
+      ;(function () {
+        if (window.__shaniuBootDark) document.body.setAttribute('data-ds-dark-theme', '')
+      })()
+    </script>
+    <!--
+      L1 静态启动页：直接写在 #root 里，HTML 解析即出现，占据主包执行期间的空窗。
+      #root 由 React 挂载时清空；main.tsx 会先把这一层提到 body 下再挂载，
+      这样它能在应用首屏画好之后再做淡出交接（L3），不会出现"撤了但还没画上"的中间帧。
+    -->
+    <div id="root">
+      <div id="boot-splash" role="status" aria-live="polite">
+        <div class="boot-brand">
+          <span class="boot-wordmark">SHANIU</span>
+          <span class="boot-dot" aria-hidden="true"></span>
+        </div>
+        <div class="boot-status" data-boot-status></div>
+      </div>
+    </div>
     <script type="module" src="/src/main.tsx"></script>
+    <script>
+      // 窗口以 visible:false 创建（tauri.conf.json），这里在启动页已解析、即将绘制时
+      // 通知宿主显示窗口。rAF 在隐藏窗口里可能被节流，故另设 150ms 兜底；
+      // Rust 侧还有 3s 强制显示，保证不存在"窗口永不出现"。
+      // 浏览器联调没有 __TAURI_INTERNALS__，静默跳过。
+      ;(function () {
+        var internals = window.__TAURI_INTERNALS__
+        if (!internals || typeof internals.invoke !== 'function') return
+        var shown = false
+        function show() {
+          if (shown) return
+          shown = true
+          internals.invoke('frontend_ready').catch(function () {})
+        }
+        requestAnimationFrame(function () {
+          requestAnimationFrame(show)
+        })
+        setTimeout(show, 150)
+      })()
+    </script>
+    <script>
+      // 失败出口（最后一层）：主包压根没跑起来（内嵌资源损坏、模块加载失败）时，
+      // 上面的信号已让窗口出现，但没有任何脚本会报错，启动页就会永久停住——比白屏更糟。
+      // 这里放一个比主包内超时（8s）更长的看门狗，超时把启动页换成可诊断面板；
+      // 主包接管后调用 __shaniuBootSettle() 就不再触发。
+      ;(function () {
+        var settled = false
+        window.__shaniuBootSettle = function () {
+          settled = true
+        }
+        setTimeout(function () {
+          if (settled) return
+          var splash = document.getElementById('boot-splash')
+          if (!splash) return
+          var title = document.createElement('div')
+          title.className = 'boot-failure-title'
+          title.textContent = '启动没有完成'
+          var message = document.createElement('div')
+          message.textContent = '界面代码没有在 12 秒内开始运行，可能是程序文件损坏或加载失败。'
+          var stage = document.createElement('div')
+          stage.className = 'boot-failure-stage'
+          stage.textContent = '停在：加载界面代码'
+          var hint = document.createElement('code')
+          hint.textContent = '日志：%LOCALAPPDATA%\\SHANIU\\logs（便携版为程序目录下 data\\logs）'
+          var retry = document.createElement('button')
+          retry.type = 'button'
+          retry.className = 'boot-retry'
+          retry.textContent = '重试'
+          retry.addEventListener('click', function () {
+            window.location.reload()
+          })
+          var wrap = document.createElement('div')
+          wrap.className = 'boot-failure'
+          wrap.append(title, message, stage, hint, retry)
+          splash.replaceChildren(wrap)
+        }, 12000)
+      })()
+    </script>
   </body>
 </html>

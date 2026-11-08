@@ -120,8 +120,13 @@ async function applyProductWorkspacePath(): Promise<{ homeDir: string }> {
  */
 const MOCK_IN_DESKTOP = false
 
+/** 启动阶段回调：只上报真实存在的阶段（启动页据此显示，见 src/host/boot-progress.ts）。 */
+export interface BootOptions {
+  onStage?: (label: string) => void
+}
+
 /** 组装并挂载完整 UI；失败时把原因抛给调用方（入口页自绘错误）。 */
-export async function bootShaniu(container: HTMLElement): Promise<BootHandle> {
+export async function bootShaniu(container: HTMLElement, options: BootOptions = {}): Promise<BootHandle> {
   const root = new Context()
   const mockData = !usingTauriBackend() || MOCK_IN_DESKTOP
   const realData = usingTauriBackend() && !MOCK_IN_DESKTOP
@@ -149,6 +154,7 @@ export async function bootShaniu(container: HTMLElement): Promise<BootHandle> {
     // 必须在 fileUpload 插件构造前注入（本分支早于 features 挂载）。
     installAttachmentUploadFetch()
     // 默认工作区基线必须在挂载前写入；家目录给 connection 基线缩写路径用
+    options.onStage?.('准备工作区')
     const { homeDir } = await applyProductWorkspacePath()
     adapter = createAdapter({
       // SH-094 批 3：命令面仍走 Tauri invoke，事件面切 loopback WS gateway；
@@ -280,7 +286,9 @@ export async function bootShaniu(container: HTMLElement): Promise<BootHandle> {
     { inject: uiPluginManagerInject, apply: uiPluginManagerApply },
     { inject: uiScheduleInject, apply: uiScheduleApply },
   ]
-  for (const feature of features) {
+  for (const [index, feature] of features.entries()) {
+    // 真实进度：已装载数量 / 总数（不编造比例，见 boot-progress.ts 的约束）
+    options.onStage?.(`装载界面插件 ${index + 1}/${features.length}`)
     await root.plugin({ inject: [...feature.inject], apply: feature.apply }).await()
   }
 
@@ -297,6 +305,7 @@ export async function bootShaniu(container: HTMLElement): Promise<BootHandle> {
 
   const uiRenderer = root.get('uiRenderer')
   if (uiRenderer === undefined) throw new Error('dsh-boot: uiRenderer 服务未就位')
+  options.onStage?.('渲染界面')
   const unmount = uiRenderer.mount(container)
   // 开发期诊断：真机排查槽位/视图注册（例如"会话头 More 不出现"）时读根 Context。
   if (import.meta.env.DEV) {
