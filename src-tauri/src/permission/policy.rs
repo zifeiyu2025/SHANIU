@@ -80,6 +80,9 @@ pub fn risk_of(tool_name: &str) -> RiskLevel {
         "skill" => RiskLevel::Read,
         "apply_patch" => RiskLevel::WriteInWorkspace,
         "unified_exec" => RiskLevel::Execute,
+        // terminal（SH-070，docs/02 ADR-106）：能起任意进程且是持久会话，按执行档。
+        // 与 unified_exec 同档：不额外加严（沙箱边界仍是真边界），也不放宽。
+        "terminal" => RiskLevel::Execute,
         // SH-052 编排四工具（docs/02 §2.2 风险分级）：派生/恢复/注入消息会改变
         // 子代理行为面，按写入档审批；wait_agent 只读结果，不审批（否则每等一次都要点一下）。
         "spawn_agent" | "resume_agent" | "send_agent_message" => RiskLevel::WriteInWorkspace,

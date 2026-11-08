@@ -31,9 +31,13 @@ use windows::Win32::Security::{
     SECURITY_ATTRIBUTES, SECURITY_CAPABILITIES, SE_PRIVILEGE_REMOVED, SID_AND_ATTRIBUTES,
     TOKEN_ACCESS_MASK, TOKEN_PRIVILEGES, TokenPrivileges, PSID,
 };
+use windows::Win32::System::Console::{
+    ClosePseudoConsole, CreatePseudoConsole, COORD, HPCON,
+};
 use windows::Win32::System::JobObjects::{
-    AssignProcessToJobObject, CreateJobObjectW, SetInformationJobObject,
-    JobObjectExtendedLimitInformation, JOBOBJECT_EXTENDED_LIMIT_INFORMATION,
+    AssignProcessToJobObject, CreateJobObjectW, QueryInformationJobObject, SetInformationJobObject,
+    JobObjectBasicAccountingInformation, JobObjectExtendedLimitInformation,
+    JOBOBJECT_BASIC_ACCOUNTING_INFORMATION, JOBOBJECT_EXTENDED_LIMIT_INFORMATION,
     JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE,
 };
 use windows::Win32::System::Pipes::CreatePipe;
@@ -42,7 +46,8 @@ use windows::Win32::System::Threading::{
     GetExitCodeProcess, InitializeProcThreadAttributeList, OpenProcessToken,
     UpdateProcThreadAttribute, EXTENDED_STARTUPINFO_PRESENT, INFINITE,
     LPPROC_THREAD_ATTRIBUTE_LIST, PROCESS_CREATION_FLAGS, PROC_THREAD_ATTRIBUTE_HANDLE_LIST,
-    PROC_THREAD_ATTRIBUTE_JOB_LIST, PROC_THREAD_ATTRIBUTE_SECURITY_CAPABILITIES,
+    PROC_THREAD_ATTRIBUTE_JOB_LIST, PROC_THREAD_ATTRIBUTE_PSEUDOCONSOLE,
+    PROC_THREAD_ATTRIBUTE_SECURITY_CAPABILITIES,
     PROCESS_INFORMATION, ResumeThread, STARTF_USESTDHANDLES,
     STARTUPINFOEXW, STARTUPINFOW, WaitForSingleObject, CREATE_NO_WINDOW, CREATE_SUSPENDED,
     CREATE_UNICODE_ENVIRONMENT,
@@ -439,6 +444,339 @@ pub fn spawn_appcontainer_command(
 }
 
 
+// ============================== ConPTY 终端（SH-070 / ADR-106） ==============================
+//
+// 与上面两条一次性命令路径的区别：
+//  - stdio 不是管道，而是 `PROC_THREAD_ATTRIBUTE_PSEUDOCONSOLE` 注入的伪控制台；
+//  - 因此**不设** `STARTF_USESTDHANDLES`，`bInheritHandles=FALSE`（一个句柄都不漏给子进程）；
+//  - 仍在同一套三层边界内：受限令牌（删全部特权）+ JobObject（KILL_ON_JOB_CLOSE）
+//    + AppContainer（路径/网络）。terminal 不新开一条无沙箱的旁路。
+//  - R106：Job 随会话结构释放 → 整棵进程树被内核回收，不依赖 shell 自觉退出。
+
+/// 伪控制台持有者：失败路径必须关闭，否则句柄与 conhost 进程泄漏。
+struct PseudoConsoleGuard(Option<HPCON>);
+
+impl PseudoConsoleGuard {
+    fn new(hpc: HPCON) -> Self {
+        Self(Some(hpc))
+    }
+
+    /// 移交所有权（成功启动后由 `TerminalChild` 负责关闭）。
+    fn take(mut self) -> HPCON {
+        self.0.take().expect("伪控制台刚由 new 写入")
+    }
+}
+
+impl Drop for PseudoConsoleGuard {
+    fn drop(&mut self) {
+        if let Some(hpc) = self.0.take() {
+            unsafe { ClosePseudoConsole(hpc) };
+        }
+    }
+}
+
+/// 已启动的 PTY 会话。`close`/`Drop` = 终止 shell + 关伪控制台；
+/// Job 句柄随结构释放时由内核回收整棵子树（R106）。
+pub struct TerminalChild {
+    process: OwnedHandle,
+    hpc: Mutex<Option<HPCON>>,
+    job: JobGuard,
+}
+
+unsafe impl Send for TerminalChild {}
+
+impl TerminalChild {
+    /// 作业内活动进程数：0 = 整树已退出；用于「关闭后不得留孤儿」的断言。
+    pub fn active_processes(&self) -> u32 {
+        let mut info = JOBOBJECT_BASIC_ACCOUNTING_INFORMATION::default();
+        let result = unsafe {
+            QueryInformationJobObject(
+                Some(self.job.handle()),
+                JobObjectBasicAccountingInformation,
+                &mut info as *mut _ as *mut core::ffi::c_void,
+                std::mem::size_of::<JOBOBJECT_BASIC_ACCOUNTING_INFORMATION>() as u32,
+                None,
+            )
+        };
+        if result.is_err() {
+            return 0;
+        }
+        info.ActiveProcesses
+    }
+
+    /// shell 退出码；仍在运行返回 None。
+    pub fn exit_code(&self) -> Option<u32> {
+        use std::os::windows::io::AsRawHandle as _;
+        const STILL_ACTIVE: u32 = 259;
+        let mut code = 0u32;
+        unsafe { GetExitCodeProcess(HANDLE(self.process.as_raw_handle()), &mut code) }.ok()?;
+        if code == STILL_ACTIVE {
+            None
+        } else {
+            Some(code)
+        }
+    }
+
+    /// 关闭会话：先终止 shell（让 ClosePseudoConsole 及时返回），再关伪控制台。
+    pub fn close(&self) {
+        use std::os::windows::io::AsRawHandle as _;
+        unsafe {
+            let _ = windows::Win32::System::Threading::TerminateProcess(
+                HANDLE(self.process.as_raw_handle()),
+                1,
+            );
+            let hpc = self
+                .hpc
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner())
+                .take();
+            if let Some(hpc) = hpc {
+                ClosePseudoConsole(hpc);
+            }
+        }
+    }
+}
+
+impl Drop for TerminalChild {
+    fn drop(&mut self) {
+        self.close();
+    }
+}
+
+/// PTY 会话的父侧端点：`reader` 读终端输出，`writer` 写终端输入。
+pub struct TerminalSpawn {
+    pub child: TerminalChild,
+    pub reader: std::fs::File,
+    pub writer: std::fs::File,
+}
+
+/// 启动身份三选一（与一次性命令的三种沙箱档一一对应）。
+enum TerminalMode<'a> {
+    /// danger-full-access：用户明示，直接执行（仍挂 Job，保证整树可回收）。
+    Unsandboxed,
+    /// `sandbox.os = "logical"` 的显式回退：受限令牌 + Job。
+    Restricted,
+    /// workspace-write 默认：受限令牌 + Job + AppContainer。
+    AppContainer {
+        container: PSID,
+        capabilities: &'a [PSID],
+        extra_env: &'a [(String, String)],
+    },
+}
+
+/// 创建一对匿名管道；`inheritable=false` 时两端都显式清掉继承位。
+unsafe fn create_pipe_pair(inheritable: bool) -> Result<(HandleGuard, HandleGuard), String> {
+    let sa = SECURITY_ATTRIBUTES {
+        nLength: std::mem::size_of::<SECURITY_ATTRIBUTES>() as u32,
+        lpSecurityDescriptor: std::ptr::null_mut(),
+        bInheritHandle: inheritable.into(),
+    };
+    let mut read_end = HANDLE::default();
+    let mut write_end = HANDLE::default();
+    CreatePipe(&mut read_end, &mut write_end, Some(&sa), 0)
+        .map_err(|e| format!("CreatePipe 失败: {e}"))?;
+    if !inheritable {
+        SetHandleInformation(read_end, HANDLE_FLAG_INHERIT.0, HANDLE_FLAGS(0))
+            .map_err(|e| format!("SetHandleInformation(read) 失败: {e}"))?;
+        SetHandleInformation(write_end, HANDLE_FLAG_INHERIT.0, HANDLE_FLAGS(0))
+            .map_err(|e| format!("SetHandleInformation(write) 失败: {e}"))?;
+    }
+    Ok((HandleGuard::new(read_end), HandleGuard::new(write_end)))
+}
+
+/// 终端的启动参数：程序 / 参数 / 工作目录 / 窗口大小（三个沙箱档共用）。
+pub struct TerminalLaunch<'a> {
+    pub program: &'a str,
+    pub args: &'a [&'a str],
+    pub cwd: &'a Path,
+    pub cols: u16,
+    pub rows: u16,
+}
+
+/// AppContainer 内的持久终端（默认路径）。
+pub fn spawn_appcontainer_terminal(
+    launch: TerminalLaunch<'_>,
+    app_container_sid: PSID,
+    capabilities: Vec<PSID>,
+    extra_env: &[(String, String)],
+) -> Result<TerminalSpawn, String> {
+    spawn_terminal_impl(
+        launch,
+        TerminalMode::AppContainer {
+            container: app_container_sid,
+            capabilities: &capabilities,
+            extra_env,
+        },
+    )
+}
+
+/// 逻辑沙箱（受限令牌 + Job）内的持久终端。
+pub fn spawn_restricted_terminal(launch: TerminalLaunch<'_>) -> Result<TerminalSpawn, String> {
+    spawn_terminal_impl(launch, TerminalMode::Restricted)
+}
+
+/// danger-full-access 下的持久终端（无令牌/容器，仍挂 Job）。
+pub fn spawn_unsandboxed_terminal(launch: TerminalLaunch<'_>) -> Result<TerminalSpawn, String> {
+    spawn_terminal_impl(launch, TerminalMode::Unsandboxed)
+}
+
+fn spawn_terminal_impl(
+    launch: TerminalLaunch<'_>,
+    mode: TerminalMode<'_>,
+) -> Result<TerminalSpawn, String> {
+    let TerminalLaunch {
+        program,
+        args,
+        cwd,
+        cols,
+        rows,
+    } = launch;
+    let mut command_line = program.to_string();
+    for arg in args {
+        command_line.push(' ');
+        command_line.push_str(arg);
+    }
+    let application_wide = wide(program);
+    let mut command_line_wide = wide(&command_line);
+    let cwd_wide = wide(cwd.as_os_str());
+
+    // AppContainer 需要白名单式环境（同 spawn_appcontainer_command / MCP server）：
+    // 整块继承父环境会带进容器读不到的路径与无关变量，cmd 初始化直接 0xC0000142。
+    let environment_wide = match &mode {
+        TerminalMode::AppContainer { extra_env, .. } => {
+            let extra: BTreeMap<String, String> = extra_env.iter().cloned().collect();
+            let env = build_environment(&extra)?;
+            Some(build_environment_block(&env))
+        }
+        _ => None,
+    };
+
+    unsafe {
+        // 纵深第 1 层：受限令牌（danger 档不建）
+        let token_guard = match &mode {
+            TerminalMode::Unsandboxed => None,
+            _ => Some(create_restricted_token()?),
+        };
+
+        // 纵深第 2 层：Job（创建时经 JOB_LIST 原子入 Job，无「先跑再入」窗口）
+        let job = CreateJobObjectW(None, PCWSTR::null())
+            .map_err(|e| format!("CreateJobObject 失败: {e}"))?;
+        let job_guard = JobGuard(HandleGuard::new(job));
+        let mut limits = JOBOBJECT_EXTENDED_LIMIT_INFORMATION::default();
+        limits.BasicLimitInformation.LimitFlags = JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE;
+        SetInformationJobObject(
+            job_guard.handle(),
+            JobObjectExtendedLimitInformation,
+            &limits as *const _ as *const core::ffi::c_void,
+            std::mem::size_of::<JOBOBJECT_EXTENDED_LIMIT_INFORMATION>() as u32,
+        )
+        .map_err(|e| format!("SetInformationJobObject 失败: {e}"))?;
+
+        // 伪控制台的两对管道端点：**不可继承**，一个句柄也不漏给子进程
+        // （同 node-pty `conpty.cc`：bInheritHandles=FALSE 是硬要求）。
+        let (pty_input_read, pty_input_write) = create_pipe_pair(false)?;
+        let (pty_output_read, pty_output_write) = create_pipe_pair(false)?;
+
+        let size = COORD {
+            X: cols.max(1) as i16,
+            Y: rows.max(1) as i16,
+        };
+        let console = PseudoConsoleGuard::new(
+            CreatePseudoConsole(size, pty_input_read.handle(), pty_output_write.handle(), 0)
+                .map_err(|e| format!("CreatePseudoConsole 失败: {e}"))?,
+        );
+        // 交给 ConPTY 的两端必须活到**子进程创建完成之后**再关：微软文档
+        // "Creating a Pseudoconsole session" 明确写了，托管进程还在启动/连接时
+        // 关掉伪控制台（或给它一个无效的 HPCON），客户端一律收到 0xC0000142。
+        // 官方样例也是先 CreateProcess、后 CloseHandle 这两个 PTY 端。
+        // 这里不提前 drop，交给作用域结束（CreateProcess 之后）释放。
+
+        // 纵深第 3 层：AppContainer（路径/网络）。
+        let attribute_count: u32 = match &mode {
+            TerminalMode::AppContainer { .. } => 3,
+            _ => 2,
+        };
+        let mut attributes = AttrList::new(attribute_count)?;
+        attributes.set_job(job_guard.handle())?;
+        attributes.set_pseudoconsole(console.0.expect("伪控制台刚创建，尚未移交"))?;
+        if let TerminalMode::AppContainer {
+            container,
+            capabilities,
+            ..
+        } = &mode
+        {
+            attributes.set_security_capabilities(*container, capabilities)?;
+        }
+
+        let mut startup = STARTUPINFOEXW::default();
+        startup.StartupInfo.cb = std::mem::size_of::<STARTUPINFOEXW>() as u32;
+        startup.lpAttributeList = attributes.as_mut_ptr();
+        // stdio 全部交给伪控制台：显式把三个字段置 NULL，避免不设 STARTF_USESTDHANDLES
+        // 时子进程继承宿主的控制台句柄（在受限令牌/容器下这组句柄无效）。
+        // node-pty 的 `conpty.cc` 同样填 NULL；真正的 stdio 由伪控制台注入。
+        startup.StartupInfo.dwFlags |= STARTF_USESTDHANDLES;
+        startup.StartupInfo.hStdInput = HANDLE::default();
+        startup.StartupInfo.hStdOutput = HANDLE::default();
+        startup.StartupInfo.hStdError = HANDLE::default();
+
+        let flags = PROCESS_CREATION_FLAGS(
+            EXTENDED_STARTUPINFO_PRESENT.0 | CREATE_UNICODE_ENVIRONMENT.0,
+        );
+        let environment_ptr = environment_wide
+            .as_ref()
+            .map(|block| block.as_ptr().cast());
+        let mut process_info = PROCESS_INFORMATION::default();
+        let app_ptr = PCWSTR(application_wide.as_ptr());
+        let created = match token_guard.as_ref() {
+            Some(token) => CreateProcessAsUserW(
+                Some(token.handle()),
+                app_ptr,
+                Some(PWSTR(command_line_wide.as_mut_ptr())),
+                None,
+                None,
+                false,
+                flags,
+                environment_ptr,
+                PCWSTR(cwd_wide.as_ptr()),
+                &startup.StartupInfo,
+                &mut process_info,
+            ),
+            None => CreateProcessW(
+                app_ptr,
+                Some(PWSTR(command_line_wide.as_mut_ptr())),
+                None,
+                None,
+                false,
+                flags,
+                environment_ptr,
+                PCWSTR(cwd_wide.as_ptr()),
+                &startup.StartupInfo,
+                &mut process_info,
+            ),
+        };
+        created.map_err(|e| {
+            format!(
+                "CreateProcessW(PTY) 失败（program={program}，cwd={}）: {e}",
+                cwd.display()
+            )
+        })?;
+
+        let _ = CloseHandle(process_info.hThread);
+        let raw: RawHandle = process_info.hProcess.0.cast();
+        let process = OwnedHandle::from_raw_handle(raw);
+
+        Ok(TerminalSpawn {
+            child: TerminalChild {
+                process,
+                hpc: Mutex::new(Some(console.take())),
+                job: job_guard,
+            },
+            reader: pty_output_read.into_file(),
+            writer: pty_input_write.into_file(),
+        })
+    }
+}
+
 /// std::thread 逐行读管道 → blocking_send 桥接 tokio 通道（codex read_handle_loop 同思路）。
 fn spawn_pipe_reader(
     read: std::fs::File,
@@ -718,6 +1056,31 @@ impl AttrList {
             )
         }
         .map_err(|e| format!("UpdateProcThreadAttribute(JOB_LIST) 失败: {e}"))
+    }
+
+    /// 挂伪控制台（`PROC_THREAD_ATTRIBUTE_PSEUDOCONSOLE`，SH-070）。
+    ///
+    /// **属性值就是这个 HPCON 本身**，不是「指向 HPCON 的指针」——这是它与
+    /// `HANDLE_LIST` / `JOB_LIST` 的区别。传 `&hpc` 时子进程拿不到可用的伪控制台，
+    /// 客户端在 DLL 初始化阶段就退出，表现为 `0xC0000142`
+    /// （STATUS_DLL_INIT_FAILED），且与沙箱档位无关。
+    /// 对照证据（2026-11-09，同一台机、同一会话）：同一段 P/Invoke 探针
+    /// 传 `&hpc` → `0xC0000142`，改成传 `hpc` → exit 0 且能收到输出；
+    /// 微软官方伪控制台样例与 node-pty 的 `conpty.cc` 都是直接传 HPCON 值。
+    fn set_pseudoconsole(&mut self, hpc: HPCON) -> Result<(), String> {
+        let list = self.as_mut_ptr();
+        unsafe {
+            UpdateProcThreadAttribute(
+                list,
+                0,
+                PROC_THREAD_ATTRIBUTE_PSEUDOCONSOLE as usize,
+                Some(hpc.0 as *const core::ffi::c_void),
+                std::mem::size_of::<HPCON>(),
+                None,
+                None,
+            )
+        }
+        .map_err(|e| format!("UpdateProcThreadAttribute(PSEUDOCONSOLE) 失败: {e}"))
     }
 
     /// 挂 AppContainer 身份（`PROC_THREAD_ATTRIBUTE_SECURITY_CAPABILITIES`）。
@@ -1369,12 +1732,8 @@ mod stdio_tests {
     /// 子进程重入后用到的完整测试名（libtest `--exact`）。
     const PROBE_TEST: &str = "sandbox::windows_impl::stdio_tests::handle_probe_child";
 
-    fn temp_dir() -> PathBuf {
-        static SEQ: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
-        let n = SEQ.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
-        let dir = std::env::temp_dir().join(format!("shaniu-stdio-{}-{n}", std::process::id()));
-        std::fs::create_dir_all(&dir).unwrap();
-        dir
+    fn temp_dir() -> crate::test_support::TestTempDir {
+        crate::test_support::TestTempDir::new("stdio")
     }
 
     /// 收集事件直到通道断开或超时（不用 blocking_recv，避免测试卡死）。
@@ -1456,7 +1815,6 @@ mod stdio_tests {
         };
         assert!(err.contains("C-R5"), "错误应说明拒绝依据: {err}");
         assert!(err.contains("npx.cmd"), "错误应包含原始命令: {err}");
-        std::fs::remove_dir_all(&dir).ok();
     }
 
     #[test]
@@ -1475,7 +1833,6 @@ mod stdio_tests {
         };
         assert!(err.contains("shaniu-no-such-exe-xyz"), "{err}");
         assert!(err.contains("已搜索"), "错误应说明搜索范围: {err}");
-        std::fs::remove_dir_all(&dir).ok();
     }
 
     // ------------------------------ 真机 ------------------------------
@@ -1498,7 +1855,6 @@ mod stdio_tests {
             "父进程哨兵变量泄漏进 server 环境: {lines:?}"
         );
         drop(child);
-        std::fs::remove_dir_all(&dir).ok();
     }
 
     #[test]
@@ -1516,7 +1872,6 @@ mod stdio_tests {
         assert_ne!(line.trim(), "[%SystemRoot%]", "SystemRoot 没有进入白名单");
         assert!(line.trim().len() > 2, "SystemRoot 为空: {line:?}");
         drop(child);
-        std::fs::remove_dir_all(&dir).ok();
     }
 
     #[test]
@@ -1535,7 +1890,6 @@ mod stdio_tests {
             "含空格的 argv 被拆开了: {lines:?}"
         );
         drop(child);
-        std::fs::remove_dir_all(&dir).ok();
     }
 
     #[test]
@@ -1552,7 +1906,6 @@ mod stdio_tests {
             "显式豁免路径没有读到输出: {lines:?}"
         );
         drop(child);
-        std::fs::remove_dir_all(&dir).ok();
     }
 
     #[test]
@@ -1613,7 +1966,6 @@ mod stdio_tests {
         );
         child.kill();
         drop(child);
-        std::fs::remove_dir_all(&dir).ok();
     }
 
     #[test]
@@ -1654,7 +2006,7 @@ mod stdio_tests {
         tag: &str,
     ) -> (
         crate::sandbox::appcontainer::AppContainer,
-        PathBuf,
+        crate::test_support::TestTempDir,
         crate::sandbox::acl::AclManager,
     ) {
         container_fixture_with(tag, crate::sandbox::acl::Access::Write)
@@ -1665,7 +2017,7 @@ mod stdio_tests {
         access: crate::sandbox::acl::Access,
     ) -> (
         crate::sandbox::appcontainer::AppContainer,
-        PathBuf,
+        crate::test_support::TestTempDir,
         crate::sandbox::acl::AclManager,
     ) {
         let name = format!("Shaniu.Test.{}.{}", std::process::id(), tag);
@@ -1680,7 +2032,7 @@ mod stdio_tests {
 
     fn container_teardown(
         container: crate::sandbox::appcontainer::AppContainer,
-        dir: PathBuf,
+        _dir: crate::test_support::TestTempDir,
         mut acl: crate::sandbox::acl::AclManager,
     ) {
         if let Err(error) = acl.restore_all() {
@@ -1689,7 +2041,6 @@ mod stdio_tests {
         if let Err(error) = container.delete() {
             eprintln!("清理测试 profile 失败: {error}");
         }
-        std::fs::remove_dir_all(&dir).ok();
     }
 
     #[test]
@@ -1882,7 +2233,6 @@ mod stdio_tests {
             !process_alive(grandchild),
             "Job 关闭后孙进程 {grandchild} 仍在运行（孤儿进程）"
         );
-        std::fs::remove_dir_all(&dir).ok();
     }
 }
 

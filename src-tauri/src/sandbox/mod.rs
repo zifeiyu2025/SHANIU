@@ -26,6 +26,8 @@ use std::sync::{Mutex, OnceLock};
 use tokio::process::Command;
 use tokio::sync::mpsc;
 
+use windows::Win32::Security::PSID;
+
 use crate::config::{AllowedRoot, OsSandbox, SandboxMode, WorkspaceAccess};
 
 pub use windows_impl::{ExecLine, RestrictedStdioChild, StdioEvent};
@@ -153,11 +155,87 @@ pub fn prepare_spawn_with(
     }
 }
 
+/// 持久 PTY 终端的启动请求（SH-070）。与一次性命令共用同一套策略与三层边界。
+pub struct TerminalRequest<'a> {
+    pub policy: SandboxMode,
+    pub os: OsSandbox,
+    pub network: NetworkAccess,
+    pub workspace_root: &'a Path,
+    pub program: &'a str,
+    pub args: &'a [&'a str],
+    pub cwd: &'a Path,
+    pub cols: u16,
+    pub rows: u16,
+}
+
+/// 启动一个持久终端会话（ConPTY）。
+///
+/// 三个沙箱档与一次性命令一一对应：read-only 拒绝、workspace-write 走
+/// AppContainer/Logical、danger-full-access 无令牌无容器。**无论哪档都挂 Job**，
+/// 因为 R106 要求「关闭会话即整树终止」，这条不随沙箱档放宽。
+pub fn prepare_terminal(
+    request: &TerminalRequest<'_>,
+) -> Result<windows_impl::TerminalSpawn, SandboxError> {
+    let launch = windows_impl::TerminalLaunch {
+        program: request.program,
+        args: request.args,
+        cwd: request.cwd,
+        cols: request.cols,
+        rows: request.rows,
+    };
+    match request.policy {
+        SandboxMode::ReadOnly => Err(SandboxError::PolicyDenied(
+            "只读沙箱禁止打开交互终端".into(),
+        )),
+        SandboxMode::DangerFullAccess => {
+            windows_impl::spawn_unsandboxed_terminal(launch).map_err(SandboxError::CreateFailed)
+        }
+        SandboxMode::WorkspaceWrite => match request.os {
+            OsSandbox::AppContainer => {
+                let (sid, capabilities) = app_container_scope(request.workspace_root, request.network)?;
+                windows_impl::spawn_appcontainer_terminal(
+                    launch,
+                    sid,
+                    capabilities,
+                    msvc::toolchain_env(),
+                )
+                .map_err(SandboxError::CreateFailed)
+            }
+            OsSandbox::Logical => {
+                warn_logical_fallback_once();
+                windows_impl::spawn_restricted_terminal(launch).map_err(SandboxError::CreateFailed)
+            }
+        },
+    }
+}
+
 #[cfg(windows)]
 fn spawn_in_app_container(
     request: &SpawnRequest<'_>,
     tx: mpsc::Sender<ExecLine>,
 ) -> Result<PreparedSpawn, SandboxError> {
+    let (sid, capabilities) = app_container_scope(request.workspace_root, request.network)?;
+    let child = windows_impl::spawn_appcontainer_command(
+        request.program,
+        request.args,
+        request.cwd,
+        sid,
+        capabilities,
+        msvc::toolchain_env(),
+        tx,
+    )
+    .map_err(SandboxError::CreateFailed)?;
+    Ok(PreparedSpawn::Restricted(child))
+}
+
+/// 容器运行时 + 工作区写 ACE 的公共准备步骤。
+/// ACE 只加三类位置：工作区根 / temp / 工具链目录；授权对象是容器 SID。
+/// 每个工作区根在进程内只解析一次 scope：重复 exec / 终端不再碰 DACL（docs/04 §1.5）。
+#[cfg(windows)]
+fn app_container_scope(
+    workspace_root: &Path,
+    network: NetworkAccess,
+) -> Result<(PSID, Vec<PSID>), SandboxError> {
     let mutex = RUNTIME.get_or_init(|| Mutex::new(None));
     let mut guard = mutex
         .lock()
@@ -167,31 +245,19 @@ fn spawn_in_app_container(
     }
     let runtime = guard.as_mut().expect("刚初始化的沙箱运行时");
 
-    // ACE 只加三类位置：工作区根 / temp / 工具链目录；授权对象是容器 SID。
-    // 每个工作区根在进程内只解析一次 scope：重复 exec 不再碰 DACL（见 docs/04 §1.5）。
-    if !runtime.resolved_roots.contains(request.workspace_root) {
+    if !runtime.resolved_roots.contains(workspace_root) {
         let sid = runtime.container.sid();
-        for dir in acl::write_scope(request.workspace_root) {
+        for dir in acl::write_scope(workspace_root) {
             with_acl(|acl| acl.grant(&dir, sid, acl::Access::Write))?;
         }
-        runtime.resolved_roots.insert(request.workspace_root.to_path_buf());
+        runtime.resolved_roots.insert(workspace_root.to_path_buf());
     }
 
-    let capabilities = match request.network {
+    let capabilities = match network {
         NetworkAccess::Allow => vec![runtime.capability_internet.as_psid()],
         NetworkAccess::Deny => Vec::new(),
     };
-    let child = windows_impl::spawn_appcontainer_command(
-        request.program,
-        request.args,
-        request.cwd,
-        runtime.container.sid(),
-        capabilities,
-        msvc::toolchain_env(),
-        tx,
-    )
-    .map_err(SandboxError::CreateFailed)?;
-    Ok(PreparedSpawn::Restricted(child))
+    Ok((runtime.container.sid(), capabilities))
 }
 
 /// 进程内唯一的目录 ACL 管理器。
@@ -820,7 +886,6 @@ mod tests {
             _ => panic!("danger 应为 Plain"),
         };
         drop(spawn);
-        std::fs::remove_dir_all(&dir).ok();
     }
 
     #[test]
@@ -885,7 +950,6 @@ mod tests {
         };
         assert!(matches!(err, SandboxError::CreateFailed(_)), "实际: {err}");
         assert!(err.to_string().contains("profile"), "错误应指清是容器名派生失败: {err}");
-        std::fs::remove_dir_all(&dir).ok();
     }
 
     /// 每个 server 一个容器：建立后可释放，释放时 profile 一并删除。
@@ -952,7 +1016,6 @@ mod tests {
         );
         // 重复释放是 no-op，不得 panic。
         release_mcp_server(&id);
-        std::fs::remove_dir_all(&dir).ok();
     }
 
     /// 真机：容器内启动 cmd，并读取工作区里的文件（验证 ACE 真的生效）。
@@ -1002,7 +1065,6 @@ mod tests {
         }
         assert!(output.contains("container-read-ok"), "容器内应能读到工作区文件，实际: {output}");
         release_mcp_server(&id);
-        std::fs::remove_dir_all(&dir).ok();
     }
 
     #[cfg(windows)]
@@ -1027,6 +1089,5 @@ mod tests {
             }
         }
         assert!(found, "沙箱化子进程 stdout 应含输出");
-        std::fs::remove_dir_all(&dir).ok();
     }
 }
