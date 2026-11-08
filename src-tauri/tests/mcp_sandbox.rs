@@ -16,7 +16,6 @@
 
 use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
-use std::sync::atomic::{AtomicUsize, Ordering};
 use std::time::Duration;
 
 use serde_json::{json, Value};
@@ -32,20 +31,46 @@ use shaniu_lib::mcp_client::session::McpSession;
 const HANDSHAKE: Duration = Duration::from_secs(30);
 const CALL: Duration = Duration::from_secs(20);
 
-static SEQ: AtomicUsize = AtomicUsize::new(0);
-
 fn unique_dir(tag: &str) -> shaniu_lib::test_support::TestTempDir {
     shaniu_lib::test_support::TestTempDir::new(&format!("mcpsb-{tag}"))
 }
 
 /// 用户主目录下、不在任何授权范围内的目录（`%TEMP%` 是 exec 的允许位置，不能当越界靶子）。
+///
+/// 这是**唯一**允许落到工作区/`%TEMP%` 之外的测试写入（决策见 AGENTS.md §3 与用户
+/// 2026-11-09 指令）：越界读写的边界只能在受保护范围之外验证，拿允许位置当靶子测不出
+/// 隔离是否生效。约束：名字带 pid + ulid 不可预测（防撞上用户真实目录），
+/// 结束时必须 `remove_outside_and_assert` 断言已删干净。
 fn outside_dir(tag: &str) -> PathBuf {
-    let n = SEQ.fetch_add(1, Ordering::SeqCst);
     let home = std::env::var_os("USERPROFILE").expect("探针需要 USERPROFILE");
-    let dir = PathBuf::from(home).join(format!("shaniu-mcpsb-{tag}-{}-{n}", std::process::id()));
-    let _ = std::fs::remove_dir_all(&dir);
+    let dir = PathBuf::from(home).join(format!(
+        "shaniu-mcpsb-{tag}-{}-{}",
+        std::process::id(),
+        ulid::Ulid::generate()
+    ));
     std::fs::create_dir_all(&dir).expect("创建越界目录");
     dir
+}
+
+/// 删除越界探针目录并**断言已不存在**：先有界重试（容器/子进程句柄释放有延迟），
+/// 仍失败就 fail——越界目录留在用户主目录里是不可接受的。
+fn remove_outside_and_assert(dir: &Path) {
+    let mut last = None;
+    for attempt in 0..10 {
+        if attempt > 0 {
+            std::thread::sleep(Duration::from_millis(100));
+        }
+        match std::fs::remove_dir_all(dir) {
+            Ok(()) => return,
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => return,
+            Err(error) => last = Some(error),
+        }
+    }
+    panic!(
+        "越界探针目录未能删除，会残留在用户主目录：{}（{:?}）",
+        dir.display(),
+        last
+    );
 }
 
 fn fixture_path() -> String {
@@ -270,7 +295,7 @@ async fn container_handshake_and_path_boundaries() {
     session.shutdown();
     // workspace 由 TestTempDir 守卫自动清理；outside 目录不归夹具管，保持手工删。
     for dir in [&outside, &read_root, &write_root] {
-        std::fs::remove_dir_all(dir).ok();
+        remove_outside_and_assert(dir);
     }
 }
 
