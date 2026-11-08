@@ -14,6 +14,7 @@
 
 pub mod acl;
 pub mod appcontainer;
+pub mod msvc;
 pub mod network;
 pub mod windows_impl;
 
@@ -186,6 +187,7 @@ fn spawn_in_app_container(
         request.cwd,
         runtime.container.sid(),
         capabilities,
+        msvc::toolchain_env(),
         tx,
     )
     .map_err(SandboxError::CreateFailed)?;

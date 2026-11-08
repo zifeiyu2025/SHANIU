@@ -333,6 +333,7 @@ pub fn spawn_appcontainer_command(
     cwd: &Path,
     app_container_sid: PSID,
     capabilities: Vec<PSID>,
+    extra_env: &[(String, String)],
     tx: mpsc::Sender<ExecLine>,
 ) -> Result<RestrictedChild, String> {
     let mut command_line = program.to_string();
@@ -342,6 +343,19 @@ pub fn spawn_appcontainer_command(
     }
     let mut cmdline_wide = wide(&command_line);
     let cwd_wide = wide(cwd.as_os_str());
+    // 宿主环境 + 工具链注入（MSVC：PATH/INCLUDE/LIB，见 sandbox::msvc）。按 Windows 惯例
+    // 键名大小写不敏感排序；CREATE_UNICODE_ENVIRONMENT 已在 flags 里。
+    let mut env_map: std::collections::BTreeMap<String, String> = std::env::vars().collect();
+    for (key, value) in extra_env {
+        env_map.insert(key.clone(), value.clone());
+    }
+    let mut env_block = env_map
+        .into_iter()
+        .map(|(key, value)| format!("{key}={value}"))
+        .collect::<Vec<_>>()
+        .join("\0");
+    env_block.push('\0');
+    let env_wide = wide(&env_block);
 
     unsafe {
         // 纵深第 1 层：删除全部特权的受限令牌（提权面）
@@ -394,7 +408,7 @@ pub fn spawn_appcontainer_command(
             None,
             true,
             flags,
-            None,
+            Some(env_wide.as_ptr().cast()),
             PCWSTR::from_raw(cwd_wide.as_ptr()),
             &startup.StartupInfo,
             &mut pi,
