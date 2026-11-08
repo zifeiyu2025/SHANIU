@@ -11,6 +11,7 @@ pub mod file_references;
 pub mod gateway;
 pub mod goals;
 pub mod jobs;
+pub mod mcp_client;
 pub mod model_client;
 pub mod model_discovery;
 pub mod open_in_app;
