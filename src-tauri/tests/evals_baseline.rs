@@ -19,7 +19,9 @@
 //! SHANIU_TEST_API_KEY=... cargo test --test evals_baseline -- --ignored --nocapture
 //! ```
 //! 默认端点为 deepseek-flash（非推理档，FF-5 实测 P95 1.13s，成本与抖动都最低）。
-//! 产出 `evals/latest.json`，由 `evals/score.mjs` 与 `evals/baseline.json` 比对判退化。
+//! **默认跑 5 次**（`SHANIU_EVAL_REPEATS` 可覆盖），报告里同时保留每次运行的原始数字
+//! 与中位数；单次运行会被端点漂移支配（实测整体上抬 32%/轮），不足以判红绿。
+//! 产出 `evals/latest.json`，由 `evals/score.mjs` 与 `evals/baseline.<model>.json` 比对判退化。
 
 use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
@@ -367,54 +369,104 @@ async fn evals_baseline_v0() {
         panic!("SHANIU_EVAL_ONLY={only} 在 tasks.json 里没有对应任务 id");
     }
 
-    let mut rows = Vec::new();
-    let mut passed = 0usize;
-    let count = selected.len();
-    for task in selected {
-        let out = run_one(task, &spec.fixture, backend.clone()).await;
-        if out.success {
-            passed += 1;
-        }
-        println!(
-            "[evals] {:<20} {} turns={} calls={} tok={}/{} appr={} 耗时={}ms {}",
-            task.id,
-            if out.success { "PASS" } else { "FAIL" },
-            out.turns,
-            out.tool_calls,
-            out.input_tokens,
-            out.output_tokens,
-            out.approvals,
-            out.ms,
-            out.detail,
-        );
-        if !out.success {
-            // 失败必带轨迹：没有"模型实际发了什么"，归因只能靠猜
-            for line in &out.trace {
-                println!("    · {line}");
+    // 单次运行不足以判定退化：端点抖动能轻易造成 30% 级别的 token 偏移（实测 32%/轮）。
+    // 门禁口径因此改为「默认 5 次，取中位数」，并保留每一次的数字（含变红的那些）。
+    let repeats = std::env::var("SHANIU_EVAL_REPEATS")
+        .ok()
+        .and_then(|value| value.parse::<usize>().ok())
+        .filter(|value| *value > 0)
+        .unwrap_or(5);
+    if repeats < 5 && only.is_empty() {
+        println!("[evals] 警告：SHANIU_EVAL_REPEATS={repeats} < 5，样本不足，score.mjs 会拒绝下结论");
+    }
+
+    let mut runs = Vec::new();
+    let mut first_rows: Option<Vec<serde_json::Value>> = None;
+    for run in 1..=repeats {
+        let mut rows = Vec::new();
+        let mut passed = 0usize;
+        let count = selected.len();
+        for task in &selected {
+            let out = run_one(task, &spec.fixture, backend.clone()).await;
+            if out.success {
+                passed += 1;
             }
+            println!(
+                "[evals] run {run}/{repeats} {:<20} {} turns={} calls={} tok={}/{} appr={} 耗时={}ms {}",
+                task.id,
+                if out.success { "PASS" } else { "FAIL" },
+                out.turns,
+                out.tool_calls,
+                out.input_tokens,
+                out.output_tokens,
+                out.approvals,
+                out.ms,
+                out.detail,
+            );
+            if !out.success {
+                // 失败必带轨迹：没有"模型实际发了什么"，归因只能靠猜
+                for line in &out.trace {
+                    println!("    · {line}");
+                }
+            }
+            rows.push(json!({
+                "id": task.id,
+                "title": task.title,
+                "success": out.success,
+                "turns": out.turns,
+                "tool_calls": out.tool_calls,
+                "trace": out.trace,
+                "input_tokens": out.input_tokens,
+                "output_tokens": out.output_tokens,
+                "approvals": out.approvals,
+                "unresolved_approvals": out.unresolved,
+                "ms": out.ms,
+                "detail": out.detail,
+            }));
         }
-        rows.push(json!({
-            "id": task.id,
-            "title": task.title,
-            "success": out.success,
-            "turns": out.turns,
-            "tool_calls": out.tool_calls,
-            "trace": out.trace,
-            "input_tokens": out.input_tokens,
-            "output_tokens": out.output_tokens,
-            "approvals": out.approvals,
-            "unresolved_approvals": out.unresolved,
-            "ms": out.ms,
-            "detail": out.detail,
+
+        let n = count as f64;
+        let sum_turns: u32 = rows.iter().filter_map(|r| r["turns"].as_u64()).map(|t| t as u32).sum();
+        let sum_tokens: u64 = rows
+            .iter()
+            .map(|r| r["input_tokens"].as_u64().unwrap_or(0) + r["output_tokens"].as_u64().unwrap_or(0))
+            .sum();
+        println!(
+            "[evals] run {run}/{repeats} 小计 成功率={passed}/{count}，平均轮数={:.2}，平均 token={:.0}",
+            f64::from(sum_turns) / n,
+            sum_tokens as f64 / n,
+        );
+        if first_rows.is_none() {
+            first_rows = Some(rows.clone());
+        }
+        runs.push(json!({
+            "run": run,
+            "summary": {
+                "n": count,
+                "passed": passed,
+                "success_rate": passed as f64 / n,
+                "avg_turns": f64::from(sum_turns) / n,
+                "avg_total_tokens": sum_tokens as f64 / n,
+            },
+            "tasks": rows,
         }));
     }
 
-    let n = count as f64;
-    let sum_turns: u32 = rows.iter().filter_map(|r| r["turns"].as_u64()).map(|t| t as u32).sum();
-    let sum_tokens: u64 = rows
+    // 汇总口径：三项指标都取多次运行的中位数。单次极值不参与判定，
+    // 但每一次的原始数字都留在 `runs` 里（含变红的那些），禁止只保留最好的一次。
+    let metric = |key: &str| -> Vec<f64> {
+        runs.iter()
+            .map(|run| run["summary"][key].as_f64().unwrap_or(0.0))
+            .collect()
+    };
+    let success_rates = metric("success_rate");
+    let turns = metric("avg_turns");
+    let tokens = metric("avg_total_tokens");
+    let passed_values: Vec<f64> = runs
         .iter()
-        .map(|r| r["input_tokens"].as_u64().unwrap_or(0) + r["output_tokens"].as_u64().unwrap_or(0))
-        .sum();
+        .map(|run| run["summary"]["passed"].as_f64().unwrap_or(0.0))
+        .collect();
+    let median_success = median(&success_rates);
     let report = json!({
         "version": spec.version,
         "epoch_ms": SystemTime::now().duration_since(UNIX_EPOCH).unwrap().as_millis(),
@@ -422,19 +474,34 @@ async fn evals_baseline_v0() {
         "base_url": provider.base_url,
         "model": provider.model,
         "max_turns_per_task": MAX_TURNS_PER_TASK,
+        "repeats": repeats,
+        "aggregate": "median-of-runs",
         "summary": {
-            "n": count,
-            "passed": passed,
-            "success_rate": passed as f64 / n,
-            "avg_turns": f64::from(sum_turns) / n,
-            "avg_total_tokens": sum_tokens as f64 / n,
+            "n": selected.len(),
+            "passed": median(&passed_values) as u32,
+            "success_rate": median_success,
+            "avg_turns": median(&turns),
+            "avg_total_tokens": median(&tokens),
+            // 区间一并留档：中位数相同但离散度暴涨，同样是退化信号。
+            "success_rate_range": [min(&success_rates), max(&success_rates)],
+            "avg_turns_range": [min(&turns), max(&turns)],
+            "avg_total_tokens_range": [min(&tokens), max(&tokens)],
         },
-        "tasks": rows,
+        "runs": runs,
+        // 逐任务差异对比用第一次运行；完整数据在 runs 里。
+        "tasks": first_rows.unwrap_or_default(),
     });
     println!(
-        "[evals] 本轮成功率={passed}/{count}，平均轮数={:.2}，平均 token={:.0}",
-        f64::from(sum_turns) / n,
-        sum_tokens as f64 / n,
+        "[evals] 汇总（{repeats} 次中位数）成功率={:.0}%（区间 {:.0}%–{:.0}%），平均轮数={:.2}（{:.2}–{:.2}），平均 token={:.0}（{:.0}–{:.0}）",
+        median_success * 100.0,
+        min(&success_rates) * 100.0,
+        max(&success_rates) * 100.0,
+        median(&turns),
+        min(&turns),
+        max(&turns),
+        median(&tokens),
+        min(&tokens),
+        max(&tokens),
     );
     if only.is_empty() {
         let out_path = repo_root().join("evals").join("latest.json");
@@ -448,7 +515,27 @@ async fn evals_baseline_v0() {
     // 运行器自身的底线：全 0 分通常是环境坏了（端点/密钥/沙箱），不是"模型笨"，
     // 必须让跑的人立刻分辨这两种情况，否则基线报告会被当成可信数据用。
     assert!(
-        passed > 0,
-        "5 个任务全数失败：先怀疑环境（端点可达性/沙箱创建/审批代答），再怀疑模型能力"
+        median(&passed_values) > 0.0,
+        "多次运行的中位数仍是 0 分：先怀疑环境（端点可达性/沙箱创建/审批代答），再怀疑模型能力"
     );
+}
+
+/// 中位数（1 个样本时就是它自己）。偶数个样本取中间两个的均值。
+fn median(values: &[f64]) -> f64 {
+    let mut sorted = values.to_vec();
+    sorted.sort_by(|a, b| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal));
+    let mid = sorted.len() / 2;
+    if sorted.len().is_multiple_of(2) {
+        (sorted[mid - 1] + sorted[mid]) / 2.0
+    } else {
+        sorted[mid]
+    }
+}
+
+fn min(values: &[f64]) -> f64 {
+    values.iter().copied().fold(f64::INFINITY, f64::min)
+}
+
+fn max(values: &[f64]) -> f64 {
+    values.iter().copied().fold(f64::NEG_INFINITY, f64::max)
 }
