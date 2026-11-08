@@ -609,6 +609,9 @@ pub fn default_allow_prefixes() -> Vec<String> {
         "git blame",
         "dir",
         "type",
+        // 只读搜索：参数级守卫在 `permission::policy::findstr_allows`，
+        // 带盘符/路径/`..`/`/G:` 的组合仍走审批。
+        "findstr",
     ]
     .iter()
     .map(|rule| (*rule).to_string())

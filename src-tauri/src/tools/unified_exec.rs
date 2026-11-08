@@ -35,6 +35,32 @@ enum IoChannel {
 
 pub struct UnifiedExec {
     spec: ToolSpec,
+    /// 已经提示过"改用 read_file"的会话（SH-126①）：同一会话只提示一次，
+    /// 连续 `type` 不会把提示刷满上下文。
+    hinted_read: std::sync::Mutex<std::collections::HashSet<String>>,
+}
+
+/// 用 shell 读文件的命令（SH-126①）。它们能跑通，但绕过了 `read_file` 的截断、
+/// 行号与读状态登记——后续写同一文件时会被"未读先写"拦下，所以值得提示一次。
+const SHELL_READERS: &[&str] = &["cat", "type", "get-content", "gc"];
+
+/// 认出"用 shell 读文件"的形态，返回命中的程序名（None = 不是这类命令）。
+///
+/// 只看被执行的**第一条命令**的程序名：`cmd /c type x`、`powershell -c Get-Content x`
+/// 都算；参数里顺带出现 `cat` 不算（否则 `cargo run -- cat` 也会被误提示）。
+fn shell_reader_program(command: &str) -> Option<&'static str> {
+    let lower = command.to_ascii_lowercase();
+    let words: Vec<&str> = lower.split_whitespace().collect();
+    let mut index = 0;
+    if matches!(words.first().copied(), Some("cmd" | "powershell" | "pwsh")) {
+        index = words
+            .iter()
+            .position(|word| matches!(*word, "/c" | "/k" | "-c" | "-command"))
+            .map(|at| at + 1)
+            .unwrap_or(0);
+    }
+    let program = words.get(index)?.trim_matches('"').trim_end_matches(".exe");
+    SHELL_READERS.iter().copied().find(|known| *known == program)
 }
 
 impl Default for UnifiedExec {
@@ -63,7 +89,27 @@ impl UnifiedExec {
                     "required": ["command"]
                 }),
             ),
+            hinted_read: std::sync::Mutex::new(std::collections::HashSet::new()),
         }
+    }
+
+    /// SH-126①：读文件走 shell 时，在结果尾部追加一条改用 `read_file` 的提示。
+    /// **同一会话只提示一次**（`cat`/`type`/`Get-Content` 视为同一类误用，不各提示一遍）；
+    /// 只改文本、不改 `success`，因此不计入工具失败率。
+    fn read_file_hint(&self, ctx: &ToolContext, command: &str) -> Option<String> {
+        let program = shell_reader_program(command)?;
+        let key = ctx
+            .session_id
+            .clone()
+            .unwrap_or_else(|| "__sessionless__".to_string());
+        let mut hinted = self.hinted_read.lock().expect("hinted_read 锁中毒");
+        if !hinted.insert(key) {
+            return None;
+        }
+        Some(format!(
+            "\n[提示] `{program}` 读文件绕过了 read_file 的截断、行号与读状态登记，\
+             后续写同一文件可能被判为「未读先写」；改用 read_file 更稳（本会话只提示这一次）。"
+        ))
     }
 
     fn emit_delta(&self, ctx: &ToolContext, channel: IoChannel, line: &str) {
@@ -301,6 +347,10 @@ impl ToolExecutor for UnifiedExec {
                         text.push_str(note.as_str());
                     }
                     text.push_str(&format!("\n[exit code: {code}]"));
+                    // SH-126①：`type`/`cat`/`Get-Content` 这类读文件形态，提示一次改用 read_file。
+                    if let Some(hint) = self.read_file_hint(ctx, command) {
+                        text.push_str(&hint);
+                    }
                     break if code == 0 {
                         Ok(ToolOutput::ok(text))
                     } else {
@@ -515,6 +565,43 @@ mod tests {
             tokio::time::sleep(Duration::from_millis(50)).await;
         }
         assert_eq!(registry.read(&id, "s1", None).unwrap().job.status, "killed");
+        std::fs::remove_dir_all(&ws).ok();
+    }
+
+    #[tokio::test]
+    async fn shell_read_hint_appears_once_per_session() {
+        let ws = workspace();
+        std::fs::write(ws.join("note.txt"), "hello-note").unwrap();
+        let exec = UnifiedExec::new();
+        let first = exec
+            .execute(serde_json::json!({"command": "type note.txt"}), &ctx(&ws))
+            .await
+            .unwrap();
+        assert!(first.success, "提示不阻断执行: {}", first.output);
+        assert!(first.output.contains("hello-note"));
+        assert!(first.output.contains("read_file"), "应提示改用 read_file: {}", first.output);
+        // 同会话第二次（换个别名也算同一类误用）：不再提示，避免刷屏
+        let second = exec
+            .execute(serde_json::json!({"command": "type note.txt"}), &ctx(&ws))
+            .await
+            .unwrap();
+        assert!(!second.output.contains("[提示]"), "同会话只提示一次: {}", second.output);
+        std::fs::remove_dir_all(&ws).ok();
+    }
+
+    #[tokio::test]
+    async fn shell_read_hint_ignores_unrelated_commands() {
+        let ws = workspace();
+        let out = UnifiedExec::new()
+            .execute(serde_json::json!({"command": "echo hi"}), &ctx(&ws))
+            .await
+            .unwrap();
+        assert!(!out.output.contains("[提示]"));
+        // 只在参数里出现 `cat` 不算误用
+        assert_eq!(shell_reader_program("cargo run -- cat x"), None);
+        assert_eq!(shell_reader_program("cmd /c type x"), Some("type"));
+        assert_eq!(shell_reader_program("powershell -Command Get-Content x"), Some("get-content"));
+        assert_eq!(shell_reader_program("TYPE.EXE x"), Some("type"));
         std::fs::remove_dir_all(&ws).ok();
     }
 

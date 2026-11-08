@@ -246,8 +246,13 @@ impl PrefixAllowlist {
 
     /// 命令命中哪条规则（取最长匹配，审计里记最具体的那条）。
     /// 命令含 shell 元字符时一律不命中：`cargo test && del x` 不能被 `cargo test` 放行。
+    /// 命中后还要过参数级只读守卫（`findstr` 这类带文件路径参数的除外），
+    /// 否则"前缀对"不等于"这次调用只读"。
     pub fn match_command(&self, command: &str) -> Option<&PrefixRule> {
         let tokens = tokenize(command)?;
+        if !readonly_guard_allows(&tokens) {
+            return None;
+        }
         self.rules
             .iter()
             .filter(|rule| {
@@ -265,12 +270,58 @@ impl PrefixAllowlist {
     }
 }
 
+/// 不产生文件写入的重定向形式（**整词精确匹配**，`2>&1` / `NUL` 大小写不敏感）。
+///
+/// 只认这几种：`2>&1`、`1>&2` 是句柄合并，`>NUL`/`1>NUL`/`2>NUL` 丢弃到空设备——
+/// 三者都写不到文件系统，因此不构成绕过前缀白名单的写入路径。
+/// 刻意**不做子串判断**：`2>&1x`、`>NUL.txt`、`2> NUL`（空格拆开）、`>con` 一律不算，
+/// 它们要么写文件、要么把判定降级成"包含即放行"。
+const SAFE_REDIRECT_WORDS: &[&str] = &["2>&1", "1>&2", ">nul", "1>nul", "2>nul"];
+
+fn is_safe_redirect(word: &str) -> bool {
+    SAFE_REDIRECT_WORDS.contains(&word.to_ascii_lowercase().as_str())
+}
+
+/// 参数级只读守卫：前缀命中之后再过一道，防止"程序名对、参数越界"的调用免审。
+///
+/// 目前只有 `findstr` 需要守卫（`docs/05` SH-119 降噪 (c)）：它的搜索目标可能是指向
+/// 工作区外的绝对路径或 `..`，那种形态必须落回审批。没注册守卫的命令不受影响。
+fn readonly_guard_allows(tokens: &[String]) -> bool {
+    let program = tokens[0].to_ascii_lowercase();
+    match program.trim_end_matches(".exe") {
+        "findstr" => findstr_allows(&tokens[1..]),
+        _ => true,
+    }
+}
+
+/// `findstr` 的许可形态：白名单开关 + 不指向工作区外的搜索目标。
+///
+/// 开关只在白名单里（`/G`、`/F`、`/D` 这些能读其它文件的组合一律不放行）；
+/// 非开关 token 不得含盘符、路径分隔符或 `..`，否则可能命中工作区外的文件。
+fn findstr_allows(args: &[String]) -> bool {
+    const FLAGS: &[&str] = &[
+        "/b", "/e", "/i", "/l", "/m", "/n", "/o", "/p", "/r", "/s", "/v",
+    ];
+    args.iter().all(|arg| {
+        let lower = arg.to_ascii_lowercase();
+        if lower.starts_with('/') {
+            return FLAGS.contains(&lower.as_str()) || lower.starts_with("/c:");
+        }
+        !arg.contains(['\\', ':', '/']) && !arg.contains("..")
+    })
+}
+
 /// 极简分词：只服务前缀匹配。返回 `None` = 不可安全匹配（元字符/未闭合引号/空）。
+///
+/// 未加引号的 shell 元字符不再一律拒绝，而是先整词收集、收词后判定：
+/// 整词恰好是安全重定向（`2>&1`、`>NUL`）就丢弃该词，其余含元字符的词一律返回 `None`。
+/// 引号内的元字符仍是普通字符（cmd 不会解释它们），保持原语义。
 fn tokenize(command: &str) -> Option<Vec<String>> {
-    let mut tokens = Vec::new();
+    let mut raw: Vec<(String, bool)> = Vec::new();
     let mut current = String::new();
     let mut in_quotes = false;
     let mut has_token = false;
+    let mut has_meta = false;
     for ch in command.chars() {
         if in_quotes {
             match ch {
@@ -286,11 +337,16 @@ fn tokenize(command: &str) -> Option<Vec<String>> {
             }
             // cmd 在执行前会重新解释这些字符（含 %变量% 展开），
             // 因此"前段匹配"无法代表整条命令的真实语义。
-            '&' | '|' | ';' | '<' | '>' | '^' | '%' | '!' | '`' | '\n' | '\r' => return None,
+            '&' | '|' | ';' | '<' | '>' | '^' | '%' | '!' | '`' | '\n' | '\r' => {
+                current.push(ch);
+                has_token = true;
+                has_meta = true;
+            }
             ch if ch.is_whitespace() => {
                 if has_token {
-                    tokens.push(std::mem::take(&mut current));
+                    raw.push((std::mem::take(&mut current), has_meta));
                     has_token = false;
+                    has_meta = false;
                 }
             }
             ch => {
@@ -299,11 +355,19 @@ fn tokenize(command: &str) -> Option<Vec<String>> {
             }
         }
     }
-    if in_quotes || !has_token && tokens.is_empty() {
+    if in_quotes || !has_token && raw.is_empty() {
         return None;
     }
     if has_token {
-        tokens.push(current);
+        raw.push((current, has_meta));
+    }
+    let mut tokens = Vec::with_capacity(raw.len());
+    for (word, meta) in raw {
+        if !meta {
+            tokens.push(word);
+        } else if !is_safe_redirect(&word) {
+            return None;
+        }
     }
     Some(tokens)
 }
@@ -487,6 +551,64 @@ mod tests {
         }
         // 只是前缀相同、不是同一程序：不命中
         assert!(rules.match_command("cargo testing").is_none());
+    }
+
+    /// SH-119 降噪 (b)：不产生文件写入的重定向尾巴按**整词语法**放行。
+    /// 判据是"能不能落到文件系统"，不是"看起来像重定向"。
+    #[test]
+    fn safe_redirect_tails_are_dropped_but_file_redirects_still_rejected() {
+        let (rules, _) =
+            PrefixAllowlist::from_config(&["cargo test".to_string(), "dir".to_string()]);
+        for command in [
+            "cargo test 2>&1",
+            "cargo test 2>&1 -- --nocapture",
+            "cargo test >NUL",
+            "cargo test 2>nul",
+            "dir /b 1>NUL",
+            "cargo test 2>&1 1>&2",
+        ] {
+            assert!(rules.match_command(command).is_some(), "安全重定向应命中: {command}");
+        }
+        // 写文件 / 写其它设备 / 语法变形 / 与其它元字符混用：一律落回审批
+        for command in [
+            "cargo test > out.txt",
+            "cargo test >> out.txt",
+            "cargo test >NUL.txt",
+            "cargo test 2>&1x",
+            "cargo test 2> NUL",
+            "cargo test >NUL && del important",
+            "cargo test 2>&1 | more",
+            "dir >con",
+        ] {
+            assert!(rules.match_command(command).is_none(), "不得命中: {command}");
+        }
+    }
+
+    /// SH-119 降噪 (c)：`findstr` 只按"本地相对搜索"免问；带盘符/路径/`..`
+    /// 或使用能读其它文件的开关时，落回审批。
+    #[test]
+    fn findstr_prefix_only_covers_relative_searches() {
+        let (rules, rejected) =
+            PrefixAllowlist::from_config(&crate::config::default_allow_prefixes());
+        assert!(rejected.is_empty(), "{rejected:?}");
+        for command in [
+            "findstr TODO *.*",
+            "findstr /S /N /C:\"TODO\" *.*",
+            "findstr /I /S todo *.rs",
+            "findstr /V \"skip me\" notes.txt",
+        ] {
+            assert!(rules.match_command(command).is_some(), "只读相对搜索应命中: {command}");
+        }
+        for command in [
+            "findstr TODO C:\\Windows\\win.ini",
+            "findstr TODO ..\\secret.txt",
+            "findstr /G:patterns.txt *.*",
+            "findstr /F:list.txt TODO",
+            "findstr /D:C:\\Users TODO *.*",
+            "findstr TODO D:notes.txt",
+        ] {
+            assert!(rules.match_command(command).is_none(), "越界搜索不得命中: {command}");
+        }
     }
 
     #[test]
