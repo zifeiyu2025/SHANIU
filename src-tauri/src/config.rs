@@ -54,6 +54,9 @@ pub struct AppConfig {
     /// 这里只存用户通过侧栏「添加工作区」注册的那几家。为空 = 旧单工作区行为。
     pub workspaces: Vec<WorkspaceProfile>,
 
+    /// MCP 客户端（SH-060，additive `[[mcp.servers]]`）。空 = 未启用，行为与旧版逐字一致。
+    pub mcp: McpConfig,
+
     /// 当前生效的服务商 id；空或指不到任何一项时同样回落 `[model]`。
     pub active_provider: String,
     /// 服务商文档的修订号（设置页乐观锁的比对基准），每次写入 +1。
@@ -259,6 +262,65 @@ impl AppConfig {
             seen_paths.push(key);
         }
         Ok(())
+    }
+
+    /// 校验 MCP 配置（SH-060，docs/02 §3.1）。fail-closed：任一项不合法即拒载整份配置，
+    /// 而不是跳过坏的那家继续启动——「跳过」等于用户以为自己配了三家、实际只跑了两家。
+    ///
+    /// 只做**语法与不变式**检查；可执行文件是否存在、SHA-256、工具清单属于连接期指纹，
+    /// 不在这里做（配置里存的是用户意图，二进制后来被替换必须由指纹发现）。
+    pub fn validate_mcp(mcp: &McpConfig) -> Result<(), String> {
+        let mut seen: Vec<&str> = Vec::with_capacity(mcp.servers.len());
+        for server in &mcp.servers {
+            if !is_valid_mcp_server_id(&server.id) {
+                return Err(format!(
+                    "MCP server id 非法：「{}」（要求 ^[a-z0-9][a-z0-9-]{{0,31}}$，取自用户配置而非 server 自报名）",
+                    server.id
+                ));
+            }
+            if seen.contains(&server.id.as_str()) {
+                // 重复 id = 同一命名空间由两家进程声明，分发名会互相覆盖；
+                // 拒绝整份配置，避免「后写者获胜」。
+                return Err(format!("MCP server id 重复：{}", server.id));
+            }
+            seen.push(server.id.as_str());
+
+            if server.command.trim().is_empty() {
+                return Err(format!("MCP server {} 缺 command", server.id));
+            }
+            if server.command.contains('\0') || server.args.iter().any(|a| a.contains('\0')) {
+                return Err(format!("MCP server {} 的 command/args 含 NUL 字符", server.id));
+            }
+            let cwd = server.cwd.trim();
+            if !cwd.is_empty() && !std::path::Path::new(cwd).is_absolute() {
+                return Err(format!(
+                    "MCP server {} 的 cwd {cwd} 不是绝对路径（指纹与进程 cwd 都要求确定的绝对路径）",
+                    server.id
+                ));
+            }
+            if server.unsandboxed && server.unsandboxed_reason.trim().is_empty() {
+                // X10：豁免必须用户主动、记录在案、界面可见；没有原因等于静默放行。
+                return Err(format!(
+                    "MCP server {} 声明 unsandboxed = true，但未填写 unsandboxed_reason——\
+                     豁免必须留下可追溯的原因",
+                    server.id
+                ));
+            }
+            for (key, value) in &server.env {
+                if key.trim().is_empty() || key.contains('=') || key.contains('\0') {
+                    return Err(format!("MCP server {} 的环境变量名非法：{:?}", server.id, key));
+                }
+                if value.contains('\0') {
+                    return Err(format!("MCP server {} 的环境变量 {} 含 NUL 字符", server.id, key));
+                }
+            }
+        }
+        Ok(())
+    }
+
+    /// 启动配置的完整性校验（解析成功后立即调用）。
+    fn validate_loaded(&self) -> Result<(), String> {
+        Self::validate_mcp(&self.mcp)
     }
 
     /// 按 id 找额外工作区；`default-workspace` 不在这里（它来自 [workspace].root）。
@@ -526,6 +588,79 @@ pub enum ApprovalMode {
     AutoReadOnly,
 }
 
+/// MCP 客户端配置（docs/02 §3.1，additive `[mcp]` / `[[mcp.servers]]`）。
+///
+/// 空列表 = 未启用 MCP，旧 config.toml 不改一个字也能跑。
+/// v1 仅支持 stdio 传输（本地子进程），不提供托管市场/自动安装。
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(default)]
+pub struct McpConfig {
+    pub servers: Vec<McpServerConfig>,
+}
+
+/// 一家 stdio MCP server。
+///
+/// **不可信第三方进程**（docs/02 §3.1.1）：这里只存用户自己填的启动参数，
+/// server 自报的名称/版本/工具描述一律不写回配置。
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(default)]
+pub struct McpServerConfig {
+    /// 稳定标识，同时是分发名 `mcp__<id>__<slug>` 的命名空间来源。
+    /// 语法 `^[a-z0-9][a-z0-9-]{0,31}$`——**不采用 server 自报名称**（B-R1）。
+    pub id: String,
+    /// 可执行文件（命令名或绝对路径）。连接时解析成绝对路径并固化进指纹，
+    /// 之后不再走 PATH 解析（C-R5：不做 shell 解释）。
+    pub command: String,
+    /// 完整 argv（逐项原样传入，不做 shell 拼接）。
+    pub args: Vec<String>,
+    /// 环境变量白名单：server 环境 = **仅**这些键值（`env_clear` 后逐项注入，C-R4）。
+    /// 字典序序列化，保证指纹稳定。
+    pub env: std::collections::BTreeMap<String, String>,
+    /// 工作目录（绝对路径）。空 = 落回数据根下的默认工作区。
+    pub cwd: String,
+    /// 是否启用；false = 不连接、工具不注册。默认 true（写了配置就是要用）。
+    pub enabled: bool,
+    /// **逐服务器显式豁免沙箱**（docs/02 §3.1.5 X10）。默认 false = 受限令牌 + Job Object。
+    /// 置 true 必须同时填写 `unsandboxed_reason`，界面须常驻可见——不允许静默放行。
+    pub unsandboxed: bool,
+    /// 豁免原因（记录在案，供界面与审计展示）。非空才允许 `unsandboxed = true`。
+    pub unsandboxed_reason: String,
+    /// 是否允许该 server 访问网络（默认拒绝，C-R4）。v1 若底层未实现网络策略，
+    /// 该项只是声明值，残余风险按 §3.1.9 如实记录，不得声称已拦截。
+    pub allow_network: bool,
+}
+
+impl Default for McpServerConfig {
+    fn default() -> Self {
+        Self {
+            id: String::new(),
+            command: String::new(),
+            args: Vec::new(),
+            env: Default::default(),
+            cwd: String::new(),
+            enabled: true,
+            unsandboxed: false,
+            unsandboxed_reason: String::new(),
+            allow_network: false,
+        }
+    }
+}
+
+/// id 语法（B-R1）：小写字母/数字开头，仅小写字母、数字与连字符，总长 1~32。
+pub fn is_valid_mcp_server_id(id: &str) -> bool {
+    let bytes = id.as_bytes();
+    if bytes.is_empty() || bytes.len() > 32 {
+        return false;
+    }
+    let first = bytes[0];
+    if !(first.is_ascii_lowercase() || first.is_ascii_digit()) {
+        return false;
+    }
+    bytes
+        .iter()
+        .all(|b| b.is_ascii_lowercase() || b.is_ascii_digit() || *b == b'-')
+}
+
 /// 工作区配置（docs §9.1：Agent 操作的项目目录，用户指定）。
 #[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
 #[serde(default)]
@@ -688,6 +823,7 @@ impl AppConfig {
         }
         let raw = fs::read_to_string(&path).map_err(|e| format!("读取配置失败: {e}"))?;
         let cfg: Self = toml::from_str(&raw).map_err(|e| format!("解析配置失败: {e}"))?;
+        cfg.validate_loaded()?;
         Ok((cfg, path))
     }
 
@@ -1639,5 +1775,157 @@ mod provider_tests {
         let second = write_crash_report(&dir, "second", "loc", "main").expect("第二份");
         assert_ne!(first, second, "同一毫秒的两次 panic 也不能互相覆盖");
         fs::remove_dir_all(&dir).ok();
+    }
+}
+
+// ============================== MCP 配置（SH-060） ==============================
+
+#[cfg(test)]
+mod mcp_config_tests {
+    use super::*;
+    use std::fs;
+
+    fn server(id: &str) -> McpServerConfig {
+        McpServerConfig { id: id.into(), command: "node".into(), ..Default::default() }
+    }
+
+    fn temp_root(tag: &str) -> PathBuf {
+        let root = std::env::temp_dir().join(format!("shaniu-mcp-cfg-{tag}-{}", std::process::id()));
+        fs::create_dir_all(&root).unwrap();
+        root
+    }
+
+    #[test]
+    fn mcp_defaults_are_empty_enabled_and_sandboxed() {
+        let cfg = AppConfig::default();
+        assert!(cfg.mcp.servers.is_empty(), "不配 MCP = 旧行为");
+        let d = McpServerConfig::default();
+        assert!(d.enabled, "写了配置即启用");
+        assert!(!d.unsandboxed, "X10：默认必须走沙箱");
+        assert!(!d.allow_network, "C-R4：网络默认拒绝");
+        assert!(d.unsandboxed_reason.is_empty());
+    }
+
+    #[test]
+    fn mcp_section_parses_from_toml_and_round_trips() {
+        let body = r#"
+[[mcp.servers]]
+id = "filesystem"
+command = "npx"
+args = ["-y", "@modelcontextprotocol/server-filesystem", 'D:\work']
+env = { LOG_LEVEL = "error" }
+cwd = 'D:\work'
+
+[[mcp.servers]]
+id = "legacy"
+command = "node"
+unsandboxed = true
+unsandboxed_reason = "旧版 server 在受限令牌下无法启动"
+"#;
+        let cfg: AppConfig = toml::from_str(body).unwrap();
+        AppConfig::validate_mcp(&cfg.mcp).expect("合法配置");
+        assert_eq!(cfg.mcp.servers.len(), 2);
+        let fs_srv = &cfg.mcp.servers[0];
+        assert_eq!(fs_srv.args.len(), 3);
+        assert_eq!(fs_srv.env.get("LOG_LEVEL").map(String::as_str), Some("error"));
+        assert!(fs_srv.enabled, "缺省 enabled = true");
+        assert!(!fs_srv.unsandboxed);
+        assert!(cfg.mcp.servers[1].unsandboxed);
+        // 往返无损：否则用户改一次别处的设置就会把 mcp 段写丢
+        let round = toml::to_string_pretty(&cfg).unwrap();
+        assert_eq!(toml::from_str::<AppConfig>(&round).unwrap(), cfg);
+    }
+
+    #[test]
+    fn validate_mcp_rejects_illegal_ids_and_duplicates() {
+        for bad in ["File", "file_system", "-fs", &"a".repeat(33)] {
+            let err = AppConfig::validate_mcp(&McpConfig { servers: vec![server(bad)] })
+                .unwrap_err();
+            assert!(err.contains("id 非法"), "{bad} 应被拒绝: {err}");
+        }
+        // 合法边界：单字符 / 32 字符 / 数字开头 / 含连字符
+        for ok in ["a", "0", "fs-1", "fs-", &"a".repeat(32)] {
+            assert!(is_valid_mcp_server_id(ok), "{ok} 是合法 id");
+        }
+        // 重复 id = 同一命名空间两家进程，拒绝整份配置而不是后者覆盖前者
+        let err = AppConfig::validate_mcp(&McpConfig {
+            servers: vec![server("dup"), server("dup")],
+        })
+        .unwrap_err();
+        assert!(err.contains("重复"), "{err}");
+    }
+
+    #[test]
+    fn validate_mcp_rejects_missing_command_bad_cwd_and_bad_env() {
+        let mut no_cmd = server("a");
+        no_cmd.command = "  ".into();
+        assert!(AppConfig::validate_mcp(&McpConfig { servers: vec![no_cmd] })
+            .unwrap_err()
+            .contains("缺 command"));
+
+        let mut relative = server("a");
+        relative.cwd = "relative/dir".into();
+        assert!(AppConfig::validate_mcp(&McpConfig { servers: vec![relative] })
+            .unwrap_err()
+            .contains("不是绝对路径"));
+
+        let mut bad_env = server("a");
+        bad_env.env.insert("BAD=KEY".into(), "v".into());
+        assert!(AppConfig::validate_mcp(&McpConfig { servers: vec![bad_env] })
+            .unwrap_err()
+            .contains("环境变量名非法"));
+
+        let mut nul_arg = server("a");
+        nul_arg.args.push("x\0y".into());
+        assert!(AppConfig::validate_mcp(&McpConfig { servers: vec![nul_arg] })
+            .unwrap_err()
+            .contains("NUL"));
+    }
+
+    #[test]
+    fn unsandboxed_requires_a_recorded_reason() {
+        let mut exempt = server("a");
+        exempt.unsandboxed = true;
+        let err = AppConfig::validate_mcp(&McpConfig { servers: vec![exempt.clone()] })
+            .unwrap_err();
+        assert!(err.contains("unsandboxed_reason"), "{err}");
+
+        exempt.unsandboxed_reason = "旧版 server 需要交互式桌面".into();
+        assert!(AppConfig::validate_mcp(&McpConfig { servers: vec![exempt] }).is_ok());
+    }
+
+    #[test]
+    fn invalid_mcp_config_fails_closed_on_load() {
+        let root = temp_root("load");
+        let body = r#"
+[[mcp.servers]]
+id = "dup"
+command = "node"
+
+[[mcp.servers]]
+id = "dup"
+command = "node"
+"#;
+        fs::write(root.join(CONFIG_FILE), body).unwrap();
+        let err = AppConfig::load_or_create(&root).unwrap_err();
+        assert!(err.contains("id 重复"), "坏配置必须拒载而不是跳过后继续: {err}");
+        fs::remove_dir_all(&root).ok();
+    }
+
+    #[test]
+    fn valid_mcp_config_survives_load() {
+        let root = temp_root("ok");
+        let body = r#"
+[[mcp.servers]]
+id = "fs"
+command = "node"
+args = ["server.js"]
+"#;
+        fs::write(root.join(CONFIG_FILE), body).unwrap();
+        let (cfg, _) = AppConfig::load_or_create(&root).unwrap();
+        assert_eq!(cfg.mcp.servers.len(), 1);
+        assert_eq!(cfg.mcp.servers[0].id, "fs");
+        assert!(cfg.mcp.servers[0].enabled);
+        fs::remove_dir_all(&root).ok();
     }
 }
