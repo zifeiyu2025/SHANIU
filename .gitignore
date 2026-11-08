@@ -51,6 +51,8 @@ scratch/
 # 真机验收截图/取证产物（体积大、可复现，状态记在 docs/05）
 artifacts/
 
-# 评估运行产物（每次跑覆盖，入库会churn；基线看 evals/baseline.json）
+# 评估运行产物（一进程一份，入库会churn；基线看 evals/baseline.<model>.json）
 evals/latest.json
 evals/control.json
+evals/results/
+evals/.eval.lock

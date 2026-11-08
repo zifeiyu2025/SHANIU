@@ -21,9 +21,20 @@
 //! 默认端点为 deepseek-flash（非推理档，FF-5 实测 P95 1.13s，成本与抖动都最低）。
 //! **默认跑 5 次**（`SHANIU_EVAL_REPEATS` 可覆盖），报告里同时保留每次运行的原始数字
 //! 与中位数；单次运行会被端点漂移支配（实测整体上抬 32%/轮），不足以判红绿。
-//! 产出 `evals/latest.json`，由 `evals/score.mjs` 与 `evals/baseline.<model>.json` 比对判退化。
+//!
+//! **并发隔离（2026-11-09 事故后重做）**：曾发生多进程同时写 `evals/latest.json`，
+//! 磁盘结果与进程自报对不上、并发下 repair 任务全灭。现在：
+//!  - 一进程一份结果文件 `evals/results/<epoch_ms>-<pid>-<role>.json`，不写共享单文件；
+//!  - `evals/.eval.lock` 是 OS 级独占锁，第二个进程直接 panic 说明原因；
+//!  - 工作区（`target/evals-<task>-<pid>-<seq>`）与档案目录（`target/evals-rollouts-<pid>`）
+//!    都带 pid，两臂不可能共享可写状态；
+//!  - 报告自带 pid / 提交号 / 端点 / 模型，并校验「样本数 == 实际档案数」，不一致标 `valid:false`。
+//!
+//! 对比用 `node evals/score.mjs <实验.json> <对照.json>`（显式传路径，不读"最新"）。
 
 use std::collections::BTreeMap;
+use std::fs::{File, OpenOptions};
+use std::io::Write;
 use std::path::{Path, PathBuf};
 use std::process::id;
 use std::sync::atomic::{AtomicUsize, Ordering};
@@ -50,6 +61,106 @@ fn repo_root() -> PathBuf {
         .parent()
         .expect("src-tauri 的上一级是仓库根")
         .to_path_buf()
+}
+
+fn now_ms() -> u128 {
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .expect("系统时钟早于 1970")
+        .as_millis()
+}
+
+fn short_commit() -> String {
+    let root = repo_root();
+    std::process::Command::new("git")
+        .arg("-C")
+        .arg(&root)
+        .args(["rev-parse", "--short", "HEAD"])
+        .output()
+        .ok()
+        .filter(|out| out.status.success())
+        .map(|out| String::from_utf8_lossy(&out.stdout).trim().to_string())
+        .unwrap_or_else(|| "-".to_string())
+}
+
+// ============================== 运行隔离 ==============================
+//
+// 事故（2026-11-09）：多个评估进程同时写 `evals/latest.json`，磁盘上的结果与进程自报
+// 不一致（100% / 17,216 vs 83% / 21,201），并发下 repair 任务 5 次全失败。结论：
+// **评估结果一旦会被静默覆盖，所有基于 eval 的判断都不可信**。因此这里加三道闸：
+//  1. OS 级独占锁：第二个进程根本起不来，而不是"起来了但结果被覆盖"；
+//  2. 一进程一份结果文件，文件名带时间戳与 pid，谁也不会覆盖谁；
+//  3. 工作区与档案目录都按 pid 隔离，两臂之间不存在共享可写状态。
+
+/// 独占锁。持有期间别的进程 `acquire` 会 panic（带持有者信息）。
+/// 锁随文件句柄释放，进程崩溃也不会留下永久死锁。
+struct EvalRunLock {
+    _file: File,
+}
+
+impl EvalRunLock {
+    fn acquire() -> Self {
+        let path = repo_root().join("evals").join(".eval.lock");
+        if let Some(dir) = path.parent() {
+            std::fs::create_dir_all(dir).ok();
+        }
+        // `truncate(false)`：锁文件在抢到锁之后才写入持有者信息，抢锁前不能清空
+        // （否则后到的进程可能把「正在跑」的持有者信息抹掉）。显式写出来也给 clippy 看。
+        let mut file = OpenOptions::new()
+            .create(true)
+            .read(true)
+            .write(true)
+            .truncate(false)
+            .open(&path)
+            .unwrap_or_else(|error| panic!("打不开评估锁 {}：{error}", path.display()));
+        if let Err(error) = file.try_lock() {
+            // 持有者信息是抢到锁之后才写的，极端情况下会读到"刚抢到、还没落盘"的空文件。
+            let mut owner = std::fs::read_to_string(&path).unwrap_or_default();
+            if owner.trim().is_empty() {
+                std::thread::sleep(Duration::from_millis(50));
+                owner = std::fs::read_to_string(&path).unwrap_or_default();
+            }
+            let owner = owner.trim().to_string();
+            panic!(
+                "已有评估进程在跑，拒绝并行启动（{error}）。\n\
+锁：{}\n\
+持有者：{}\n\
+并行会互相覆盖结果与工作区，结论不可用。等它结束再跑；\
+确认没有进程在跑时，删除该锁文件即可（锁本身随进程退出自动释放）。",
+                path.display(),
+                if owner.is_empty() { "（未记录）" } else { owner.as_str() },
+            );
+        }
+        let info = format!(
+            "pid={} started_ms={} role={} endpoint={} model={}\n",
+            id(),
+            now_ms(),
+            std::env::var("SHANIU_EVAL_ROLE").unwrap_or_else(|_| "treatment".to_string()),
+            std::env::var("SHANIU_TEST_BASE_URL").unwrap_or_default(),
+            std::env::var("SHANIU_TEST_MODEL").unwrap_or_default(),
+        );
+        file.set_len(0).ok();
+        file.write_all(info.as_bytes()).ok();
+        file.flush().ok();
+        Self { _file: file }
+    }
+}
+
+/// 一进程一份结果文件：`evals/results/<epoch_ms>-<pid>-<role>.json`。
+fn result_path(role: &str) -> PathBuf {
+    let dir = repo_root().join("evals").join("results");
+    std::fs::create_dir_all(&dir).expect("创建 evals/results");
+    dir.join(format!("{}-{}-{role}.json", now_ms(), id()))
+}
+
+/// 本进程独占的档案目录：评估要断言"真实端点跑完留下可读档案"，共享目录会被
+/// 并发进程删改，断言就失去意义。
+fn rollout_dir() -> PathBuf {
+    let dir = repo_root().join("target").join(format!("evals-rollouts-{}", id()));
+    // 起点清空：样本校验靠"数 jsonl 文件"，残留会让校验永远对不上。
+    std::fs::remove_dir_all(&dir).ok();
+    std::fs::create_dir_all(&dir).expect("创建评估档案目录");
+    dir
 }
 
 // ============================== 任务集 ==============================
@@ -298,13 +409,19 @@ fn eval_decision() -> ApprovalDecision {
     }
 }
 
-async fn run_one(task: &Task, fixture: &BTreeMap<String, String>, backend: Arc<ResponsesBackend>) -> Outcome {
-    let ws = repo_root().join("target").join(format!(
-        "evals-{}-{}-{}",
-        task.id,
-        id(),
-        SEQ.fetch_add(1, Ordering::SeqCst)
-    ));
+async fn run_one(
+    task: &Task,
+    fixture: &BTreeMap<String, String>,
+    backend: Arc<ResponsesBackend>,
+    rollout_dir: &Path,
+) -> Outcome {
+    let seq = SEQ.fetch_add(1, Ordering::SeqCst);
+    // 会话与工作区都带本次序号：档案目录按 pid 独占，文件名按任务+序号唯一，
+    // 这样"跑了几个样本"可以直接数档案文件，不会互相覆盖。
+    let session_id = format!("{}-{seq}", task.id);
+    let ws = repo_root()
+        .join("target")
+        .join(format!("evals-{}-{}-{}", task.id, id(), seq));
     seed_fixture(&ws, fixture);
     // 任务级覆盖层：同名键后写覆盖前写。
     seed_fixture(&ws, &task.fixture);
@@ -321,15 +438,12 @@ async fn run_one(task: &Task, fixture: &BTreeMap<String, String>, backend: Arc<R
     });
     // 顺带验证持久化链路（SH-030）：真实端点跑完一轮，档案必须落盘且能原样读回。
     // 放在评估里做是因为它跑的是生产同一套 AgentLoop 装配——单测造得出历史，造不出真实时序。
-    let rollout_dir = repo_root().join("target").join("evals-rollouts");
-    std::fs::create_dir_all(&rollout_dir).unwrap();
-    std::fs::remove_file(rollout_dir.join(format!("{}.jsonl", task.id))).ok();
     let writer = Arc::new(
         shaniu_lib::rollout::RolloutWriter::create(
-            &rollout_dir,
+            rollout_dir,
             &shaniu_lib::rollout::RolloutItem::SessionMeta {
-                session_id: task.id.clone(),
-                agent_id: task.id.clone(),
+                session_id: session_id.clone(),
+                agent_id: session_id.clone(),
                 parent_id: None,
                 created_at: std::time::SystemTime::now()
                     .duration_since(std::time::UNIX_EPOCH)
@@ -408,8 +522,8 @@ async fn run_one(task: &Task, fixture: &BTreeMap<String, String>, backend: Arc<R
     };
     // 档案契约（SH-030 的真机一侧）：真实端点跑完必须留下可读回的档案。
     // 断言放在这里而不是另开单测——单测造得出历史，造不出真实端点的时序与取消路径。
-    let archive = shaniu_lib::rollout::read(&rollout_dir.join(format!("{}.jsonl", task.id)))
-        .unwrap_or_else(|e| panic!("任务 {} 的档案读回失败：{e}", task.id));
+    let archive = shaniu_lib::rollout::read(&rollout_dir.join(format!("{session_id}.jsonl")))
+        .unwrap_or_else(|e| panic!("任务 {session_id} 的档案读回失败：{e}"));
     assert!(
         archive.items.len() >= 2,
         "档案至少要有用户任务与一条助手输出，实际 {} 条：{:?}",
@@ -426,6 +540,9 @@ async fn run_one(task: &Task, fixture: &BTreeMap<String, String>, backend: Arc<R
 #[tokio::test]
 #[ignore = "SH-028 评估基线需要真实端点密钥与外网，按里程碑/变更回归手动或定时运行"]
 async fn evals_baseline_v0() {
+    // 第一件事就是抢锁：没有锁，后面的任何数字都可能是别人的。
+    let _lock = EvalRunLock::acquire();
+    let started_ms = now_ms();
     let api_key = std::env::var("SHANIU_TEST_API_KEY")
         .expect("评估基线必须配真实端点：设置 SHANIU_TEST_API_KEY（勿把密钥写进仓库）");
     let provider = ProviderConfig {
@@ -466,12 +583,13 @@ async fn evals_baseline_v0() {
 
     let mut runs = Vec::new();
     let mut first_rows: Option<Vec<serde_json::Value>> = None;
+    let rollout_dir = rollout_dir();
     for run in 1..=repeats {
         let mut rows = Vec::new();
         let mut passed = 0usize;
         let count = selected.len();
         for task in &selected {
-            let out = run_one(task, &spec.fixture, backend.clone()).await;
+            let out = run_one(task, &spec.fixture, backend.clone(), &rollout_dir).await;
             if out.success {
                 passed += 1;
             }
@@ -578,6 +696,16 @@ async fn evals_baseline_v0() {
         (false, true) => "repair_off",
         (false, false) => "ar6_on",
     };
+    let expected_samples = repeats * selected.len();
+    let actual_sessions = std::fs::read_dir(&rollout_dir)
+        .map(|entries| {
+            entries
+                .filter_map(Result::ok)
+                .filter(|entry| entry.path().extension().is_some_and(|ext| ext == "jsonl"))
+                .count()
+        })
+        .unwrap_or(0);
+    let samples_match = expected_samples == actual_sessions;
     let report = json!({
         "version": spec.version,
         "arm": arm,
@@ -590,6 +718,22 @@ async fn evals_baseline_v0() {
         "max_turns_per_task": MAX_TURNS_PER_TASK,
         "repeats": repeats,
         "aggregate": "median-of-runs",
+        // 来源自证：谁跑的、什么时候、哪份提交、写到了哪个文件。
+        // 没有这四项，"磁盘上的数字是谁的"这个问题在事后无法回答。
+        "process": {
+            "pid": id(),
+            "commit": short_commit(),
+            "started_ms": started_ms,
+            "finished_ms": now_ms(),
+            "rollout_dir": rollout_dir.display().to_string(),
+        },
+        // 样本数 == 实际档案数，是"这份报告确实跑满了"的唯一硬证据；
+        // 对不上说明有样本丢失或被别的进程删改，整份报告标无效。
+        "valid": samples_match,
+        "samples": {
+            "expected": expected_samples,
+            "actual_sessions": actual_sessions,
+        },
         "summary": {
             "n": selected.len(),
             "passed": median(&passed_values) as u32,
@@ -617,21 +761,74 @@ async fn evals_baseline_v0() {
         min(&tokens),
         max(&tokens),
     );
-    if only.is_empty() {
-        let file = if role == "control" { "control.json" } else { "latest.json" };
-        let out_path = repo_root().join("evals").join(file);
-        std::fs::write(&out_path, serde_json::to_string_pretty(&report).unwrap()).unwrap();
-        println!("[evals] 报告已写入 {}（arm={arm} role={role}）", out_path.display());
-    } else {
-        // 单任务调试绝不能覆写 latest.json：否则一次调试跑就把基线门禁的参照物换掉
-        println!("[evals] 调试模式（SHANIU_EVAL_ONLY={only}）：不写 latest.json，不影响门禁");
+    println!(
+        "[evals] 样本校验：期望 {expected_samples} 份档案，实际 {actual_sessions} 份 → {}",
+        if samples_match { "一致" } else { "不一致（报告已标记 valid:false，禁止据此下结论）" }
+    );
+    // 一进程一份，文件名带时间戳与 pid：不存在"谁覆盖谁"，也不再写 latest.json。
+    let out_path = result_path(&role);
+    std::fs::write(&out_path, serde_json::to_string_pretty(&report).unwrap()).unwrap();
+    println!(
+        "[evals] 报告已写入 {}（arm={arm} role={role} pid={} commit={}）",
+        out_path.display(),
+        id(),
+        short_commit()
+    );
+    println!(
+        "[evals] 对比：node evals/score.mjs {} <对照臂.json>",
+        out_path.display()
+    );
+    if !only.is_empty() {
+        // 单任务调试也写自己那份：调试结果混进门禁是无意义的，但也不该丢证据。
+        println!("[evals] 调试模式（SHANIU_EVAL_ONLY={only}）：本份仅供定位，不要当作回归结论");
     }
+    assert!(
+        samples_match,
+        "样本数与实际档案数不一致（期望 {expected_samples}，实际 {actual_sessions}）：\
+这份报告不可信，先查是否有并发进程或档案目录被清理"
+    );
 
     // 运行器自身的底线：全 0 分通常是环境坏了（端点/密钥/沙箱），不是"模型笨"，
     // 必须让跑的人立刻分辨这两种情况，否则基线报告会被当成可信数据用。
     assert!(
         median(&passed_values) > 0.0,
         "多次运行的中位数仍是 0 分：先怀疑环境（端点可达性/沙箱创建/审批代答），再怀疑模型能力"
+    );
+}
+
+// ============================== 并发隔离实测（不需要端点与密钥）==============================
+
+/// 子进程侧探针：只有父进程会设 `SHANIU_EVAL_LOCK_PROBE`，平常跑测试时它只是空转。
+#[test]
+fn eval_lock_probe_child() {
+    if std::env::var("SHANIU_EVAL_LOCK_PROBE").is_err() {
+        return;
+    }
+    match std::panic::catch_unwind(EvalRunLock::acquire) {
+        Ok(_) => println!("LOCKED-ACQUIRED"),
+        Err(_) => println!("LOCKED-DENIED"),
+    }
+}
+
+/// 真起第二个进程：本进程持锁后，子进程必须被拒绝。
+/// 验的是 OS 级互斥，而不是同进程里的一个布尔标志——事故就是跨进程发生的。
+#[test]
+fn eval_lock_rejects_second_process() {
+    let _lock = EvalRunLock::acquire();
+    let exe = std::env::current_exe().expect("测试二进制路径");
+    let output = std::process::Command::new(exe)
+        .args(["eval_lock_probe_child", "--exact", "--nocapture"])
+        .env("SHANIU_EVAL_LOCK_PROBE", "1")
+        .output()
+        .expect("应能启动子进程");
+    let text = format!(
+        "{}{}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert!(
+        text.contains("LOCKED-DENIED") && !text.contains("LOCKED-ACQUIRED"),
+        "第二个进程必须被拒绝，实际输出：{text}"
     );
 }
 

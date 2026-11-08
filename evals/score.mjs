@@ -7,13 +7,17 @@
 //
 // **分母是当日对照，不是冻结基线**：端点漂移实测把整份基线抬升 32%/轮，
 // 冻结点已经不是同一把尺子；拿它当分母，结论永远红且红得没有意义。
-//   对照臂：SHANIU_EVAL_ROLE=control SHANIU_EVAL_ABLATE_AR6=1  → evals/control.json
-//   实验臂：SHANIU_EVAL_ROLE=treatment（默认，条款常驻）      → evals/latest.json
+//   对照臂：SHANIU_EVAL_ROLE=control SHANIU_EVAL_ABLATE_AR6=1  → evals/results/*-control.json
+//   实验臂：SHANIU_EVAL_ROLE=treatment（默认，条款常驻）      → evals/results/*-treatment.json
 // 两臂必须同日、同端点、同模型、同参数（任务集/轮数上限/重复次数），否则拒绝下结论。
 //
 // 用法：
-//   node evals/score.mjs                 # 当日对照 vs 当日实验，判退化
-//   node evals/score.mjs --promote       # 把实验臂写成该模型的历史参考点（仅参考，不参与判定）
+//   node evals/score.mjs <实验.json> <对照.json>   # 显式传两份（推荐；跑完会打印本次路径）
+//   node evals/score.mjs <实验.json> --promote    # 写成该模型的历史参考点（仅参考，不参与判定）
+//   node evals/score.mjs                          # 兜底：读 evals/latest.json 与 evals/control.json（旧产物）
+//
+// 拒绝下结论的硬条件（除下面三条判据外）：报告 valid=false、样本数与实际档案数不符、
+// 两臂 pid 相同（同一个进程只可能是一种 arm）。
 //
 // 判据（相对变化，阈值 10% 不变）：
 //   - success_rate：中位数下降 > 10% → 硬否决。
@@ -31,6 +35,18 @@ const HERE = dirname(fileURLToPath(import.meta.url));
 const THRESHOLD = 0.1;
 const MIN_RUNS = 5;
 const promote = process.argv.includes('--promote');
+// 显式传路径：`node evals/score.mjs <实验.json> [对照.json]`。
+// 不再默认读"最新那份"——2026-11-09 的并发事故就是被"最新"掩盖的：
+// 磁盘上的 latest.json 是另一个进程写的，报告自报的却是另一组数字。
+const positional = process.argv.slice(2).filter((arg) => !arg.startsWith('--'));
+
+function loadPath(file) {
+  try {
+    return JSON.parse(readFileSync(file, 'utf8'));
+  } catch (e) {
+    refuse(`读不到 ${file}：${e.message}`);
+  }
+}
 
 function load(name, { required = true } = {}) {
   try {
@@ -44,7 +60,7 @@ function load(name, { required = true } = {}) {
   }
 }
 
-const latest = load('latest.json');
+const latest = positional[0] ? loadPath(positional[0]) : load('latest.json');
 if (promote) {
   const name = `baseline.${latest.model}.json`;
   writeFileSync(join(HERE, name), `${JSON.stringify(latest, null, 2)}\n`);
@@ -52,7 +68,7 @@ if (promote) {
   process.exit(0);
 }
 
-const control = load('control.json');
+const control = positional[1] ? loadPath(positional[1]) : load('control.json');
 const fmt = (v) => (typeof v === 'number' ? (Number.isInteger(v) ? `${v}` : v.toFixed(3)) : `${v}`);
 const pct = (d) => `${d >= 0 ? '+' : ''}${(d * 100).toFixed(1)}%`;
 const dateOf = (ms) => new Date(ms).toLocaleDateString('sv-SE');
@@ -98,6 +114,30 @@ if (dateOf(control.epoch_ms) !== dateOf(latest.epoch_ms)) {
 const ids = (report) => report.tasks.map((t) => t.id).sort().join(',');
 if (ids(control) !== ids(latest)) {
   refuse('两臂任务集不一致');
+}
+
+// 自证校验：报告必须能回答"这份数字是谁跑的、跑满了没有"。
+// 2026-11-09 的并发事故里，两边数字都"看起来正常"，唯一破绽是样本对不上。
+for (const [label, report] of [
+  ['实验', latest],
+  ['对照', control],
+]) {
+  if (report.valid === false) {
+    refuse(
+      `${label}报告自证无效：样本数 ${report.samples?.expected} != 实际档案 ${report.samples?.actual_sessions}`,
+    );
+  }
+  if (report.samples && report.samples.expected !== report.samples.actual_sessions) {
+    refuse(
+      `${label}报告样本数对不上（期望 ${report.samples.expected}，实际 ${report.samples.actual_sessions}）`,
+    );
+  }
+  if (!report.process?.pid) {
+    console.warn(`[evals] 警告：${label}报告没有进程自证（旧格式），无法确认未被并发覆盖`);
+  }
+}
+if (latest.process?.pid && latest.process.pid === control.process?.pid) {
+  refuse('两臂来自同一个进程（pid 相同），不可能是同日两臂各跑一次的独立结果');
 }
 
 // 每臂每次运行的原始数字全部打印：红的也要留档，不能被中位数抹掉。
