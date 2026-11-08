@@ -10,8 +10,17 @@
 use std::sync::Arc;
 use std::time::Instant;
 
-use shaniu_lib::tools::web::{Bing, FallbackProvider, SearchProvider, WebClient};
+use shaniu_lib::tools::web::{Bing, FallbackProvider, SearchProvider, WebClient, WebFetch};
 use tokio_util::sync::CancellationToken;
+
+/// 集成测试在 crate 外部，拿不到 `#[cfg(test)]` 的 `NullEventSink`，这里补一个丢弃型出口。
+struct NoopSink;
+
+impl shaniu_lib::events::EventSink for NoopSink {
+    fn emit(&self, _msg: &shaniu_lib::events::EventMsg) -> Result<(), String> {
+        Ok(())
+    }
+}
 
 #[tokio::test]
 #[ignore = "需要外网；手动运行"]
@@ -56,4 +65,41 @@ async fn bing_real_queries() {
         succeeded > 0,
         "三个查询全部失败：说明当前网络、搜索页结构或限流状态有问题，请按上面的 kind 判断"
     );
+}
+
+/// 正常公网抓取：会真的出网，因此同样 `#[ignore]`。
+/// 私网/重定向/上限等安全路径由 `tools::web::fetch` 的本地靶子测试覆盖。
+#[tokio::test]
+#[ignore = "需要外网；手动运行"]
+async fn web_fetch_real_page() {
+    use shaniu_lib::config::SandboxMode;
+    use shaniu_lib::tool_router::{ToolContext, ToolExecutor};
+
+    let tool = WebFetch::new(Arc::new(WebClient::new()));
+    let sink: Arc<dyn shaniu_lib::events::EventSink> = Arc::new(NoopSink);
+    let context = ToolContext::new(
+        std::env::temp_dir(),
+        CancellationToken::new(),
+        "call-web-fetch-real",
+        sink,
+        SandboxMode::ReadOnly,
+    );
+    let started = Instant::now();
+    let output = tool
+        .execute(
+            serde_json::json!({ "url": "https://example.com/", "max_chars": 2000 }),
+            &context,
+        )
+        .await
+        .expect("公网抓取失败");
+    println!(
+        "web_fetch https://example.com/ 耗时={}ms success={} 输出前 200 字：\n{}",
+        started.elapsed().as_millis(),
+        output.success,
+        output.output.chars().take(200).collect::<String>()
+    );
+    assert!(output.success);
+    assert!(output.output.contains("<<<WEB_FETCH:"));
+    assert!(output.output.contains("status=200"));
+    assert!(output.output.contains("Example Domain"));
 }

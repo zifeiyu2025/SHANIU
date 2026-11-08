@@ -25,7 +25,7 @@ use tokio_util::sync::CancellationToken;
 use crate::tool_router::{ToolContext, ToolError, ToolExecutor, ToolOutput, ToolSpec};
 
 use super::client::{WebClient, WebError, WebResponse};
-use super::{new_nonce, truncate_chars, wrap_untrusted};
+use super::{decode_entities, new_nonce, truncate_chars, wrap_untrusted};
 
 /// 单次返回条数上限。
 pub const MAX_RESULTS: usize = 10;
@@ -668,58 +668,6 @@ fn text_of(html: &str) -> String {
         .split_whitespace()
         .collect::<Vec<_>>()
         .join(" ")
-}
-
-fn decode_entities(input: &str) -> String {
-    let mut out = String::with_capacity(input.len());
-    let mut rest = input;
-    while let Some(amp) = rest.find('&') {
-        out.push_str(&rest[..amp]);
-        let tail = &rest[amp..];
-        // 分号是单字节，按字节窗口找即可；`;` 的位置一定是合法 char 边界。
-        let window = &tail.as_bytes()[..tail.len().min(12)];
-        let Some(byte_index) = window.iter().position(|byte| *byte == b';') else {
-            out.push('&');
-            rest = &tail[1..];
-            continue;
-        };
-        let semicolon = byte_index;
-        let entity = &tail[1..semicolon];
-        let decoded = match entity {
-            "amp" => Some('&'),
-            "lt" => Some('<'),
-            "gt" => Some('>'),
-            "quot" => Some('"'),
-            "apos" => Some('\''),
-            "nbsp" => Some(' '),
-            "hellip" => Some('…'),
-            "mdash" => Some('—'),
-            "ndash" => Some('–'),
-            "rsquo" => Some('\u{2019}'),
-            "lsquo" => Some('\u{2018}'),
-            "ldquo" => Some('\u{201c}'),
-            "rdquo" => Some('\u{201d}'),
-            other if other.starts_with("#x") || other.starts_with("#X") => {
-                u32::from_str_radix(&other[2..], 16).ok().and_then(char::from_u32)
-            }
-            other if other.starts_with('#') => {
-                other[1..].parse::<u32>().ok().and_then(char::from_u32)
-            }
-            _ => None,
-        };
-        match decoded {
-            Some(character) => {
-                out.push(character);
-                rest = &tail[semicolon + 1..];
-            }
-            None => {
-                out.push('&');
-                rest = &tail[1..];
-            }
-        }
-    }
-    out.push_str(rest);
-    out
 }
 
 // ============================== 工具 ==============================

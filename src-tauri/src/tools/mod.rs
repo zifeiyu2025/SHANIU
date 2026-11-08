@@ -42,6 +42,7 @@ pub fn register_builtin(router: &mut ToolRouter, plan_state: Arc<PlanState>) {
     // `SearchProvider` trait 与 FallbackProvider 保留：以后接插件或换源从这里进，不改调用方。
     // 抓取走共享 WebClient：同一套 scheme/私网/逐跳重定向校验，不因「固定域名」放宽。
     let web_client = Arc::new(web::WebClient::new());
-    let chain: Arc<dyn web::SearchProvider> = Arc::new(web::Bing::new(web_client));
+    let chain: Arc<dyn web::SearchProvider> = Arc::new(web::Bing::new(web_client.clone()));
     router.register(Arc::new(web::WebSearch::new(chain)));
+    router.register(Arc::new(web::WebFetch::new(web_client)));
 }

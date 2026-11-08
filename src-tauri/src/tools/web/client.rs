@@ -105,6 +105,10 @@ pub struct WebClient {
     timeout: Duration,
     max_redirects: usize,
     cache_ttl: Duration,
+    /// 仅测试：把某个主机名的**物理连接**改到本地靶子服务器。
+    /// 校验仍走 `resolver` 的真实解析结果，所以不会放宽任何安全判定。
+    #[cfg(test)]
+    dial: Option<(String, SocketAddr)>,
 }
 
 impl Default for WebClient {
@@ -127,7 +131,16 @@ impl WebClient {
             timeout: DEFAULT_TIMEOUT,
             max_redirects: DEFAULT_MAX_REDIRECTS,
             cache_ttl: DEFAULT_CACHE_TTL,
+            #[cfg(test)]
+            dial: None,
         }
+    }
+
+    /// 仅测试：让 `host` 的物理连接落到 `addr`（通常是 127.0.0.1 上的靶子服务器）。
+    #[cfg(test)]
+    pub(crate) fn with_test_dial(mut self, host: &str, addr: SocketAddr) -> Self {
+        self.dial = Some((host.to_string(), addr));
+        self
     }
 
     /// 测试与受限场景用：缩小上限、缩短超时。
@@ -176,10 +189,25 @@ impl WebClient {
                 .timeout(self.timeout)
                 .no_proxy()
                 .user_agent(USER_AGENT);
-            if host.parse::<IpAddr>().is_err() {
-                if let Some(addr) = addrs.first() {
-                    // reqwest 只接受一个固定地址；多 A 记录时取第一个，
-                    // 其余地址在失败后不会回退（已知限制，保守优先）。
+            // reqwest 只接受一个固定地址；多 A 记录时取第一个，
+            // 其余地址在失败后不会回退（已知限制，保守优先）。
+            let dial: Option<SocketAddr> = {
+                #[cfg(test)]
+                {
+                    self.dial
+                        .as_ref()
+                        .filter(|(dial_host, _)| dial_host == &host)
+                        .map(|(_, addr)| *addr)
+                }
+                #[cfg(not(test))]
+                {
+                    None
+                }
+            };
+            if let Some(addr) = dial {
+                builder = builder.resolve(&host, addr);
+            } else if let Some(addr) = addrs.first() {
+                if host.parse::<IpAddr>().is_err() {
                     builder = builder.resolve(&host, SocketAddr::new(addr.ip(), addr.port()));
                 }
             }
