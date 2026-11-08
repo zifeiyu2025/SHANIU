@@ -1,12 +1,12 @@
 /**
- * MCP 信任页的纯逻辑 + 段落注册契约。
+ * MCP 连接器的纯逻辑 + 条目注册契约。
  *
- * 渲染快照不测：这一页的语义都在「默认不批准 / 默认 destructive / 显式启用要真下传」
- * 与「注册 id 被 settingsShell.openSection 引用」两点上，直接测这两点。
+ * 渲染快照不测：这一页的语义都在「默认不批准 / 默认 destructive / 显式启用要真下传」、
+ * 「卡片摘要的状态聚合」与「一份 UI 两个挂载点（同一组件）」这几点上，直接测这几点。
  */
 import { describe, expect, it } from 'vitest'
 import { apply } from './index'
-import { McpTrustSection } from './McpTrustSection'
+import { McpConnector } from './McpConnector'
 import {
   approvedCount,
   buildDecisions,
@@ -14,8 +14,9 @@ import {
   needsInjectionConsent,
   SELECTABLE_RISKS,
   shortFingerprint,
+  summarizeServers,
 } from './model'
-import type { ReviewPayloadWire, ReviewToolWire } from '../transport/mcp-wire'
+import type { McpServerSummaryWire, ReviewPayloadWire, ReviewToolWire } from '../transport/mcp-wire'
 
 function tool(overrides: Partial<ReviewToolWire>): ReviewToolWire {
   return {
@@ -41,6 +42,8 @@ function review(tools: readonly ReviewToolWire[]): ReviewPayloadWire {
     transport: 'stdio',
     executable: 'C:/node.exe',
     executable_sha256: 'a'.repeat(64),
+    approved_at_ms: 0,
+    tools_stale: false,
     argv: ['server.js'],
     cwd: 'C:/work',
     env: ['TOKEN = sha256:12345678…'],
@@ -54,6 +57,28 @@ function review(tools: readonly ReviewToolWire[]): ReviewPayloadWire {
     approved_tools: [],
     exemptions: [],
     warnings: [],
+  }
+}
+
+/** 摘要视图的测试替身：把键与计数原样拼出来，便于断言聚合顺序。 */
+function translate(key: string, params: { count: number }): string {
+  return `${key}:${params.count}`
+}
+
+function server(status: string, overrides: Partial<McpServerSummaryWire> = {}): McpServerSummaryWire {
+  return {
+    id: 'srv',
+    enabled: true,
+    command: 'C:/node.exe',
+    args: ['server.js'],
+    unsandboxed: false,
+    allow_network: false,
+    status,
+    fingerprint: 'f'.repeat(64),
+    approved_tools: [],
+    exemption_count: 0,
+    reason: null,
+    ...overrides,
   }
 }
 
@@ -121,8 +146,31 @@ describe('展示辅助', () => {
   })
 })
 
-describe('段落注册', () => {
-  it('以 settings.section id=mcp 注册，供设置页与 settingsShell.openSection 使用', () => {
+describe('卡片摘要', () => {
+  it('没有服务器时给出空态，不拼出「0 台」', () => {
+    expect(summarizeServers([], translate)).toBe('summary.none:0')
+  })
+
+  it('按「需要人处理 → 稳定」的顺序聚合，且同状态合并计数', () => {
+    const summary = summarizeServers([
+      server('trusted', { id: 'a' }),
+      server('review', { id: 'b' }),
+      server('retrust', { id: 'c' }),
+      server('review', { id: 'd' }),
+    ], translate)
+    expect(summary).toBe('summary.total:4 · summary.review:2 · summary.retrust:1 · summary.trusted:1')
+  })
+
+  it('0 台的状态不出现在摘要里', () => {
+    const summary = summarizeServers([server('trusted')], translate)
+    expect(summary).not.toContain('summary.review')
+    expect(summary).not.toContain('summary.retrust')
+    expect(summary).toContain('summary.trusted:1')
+  })
+})
+
+describe('条目注册', () => {
+  it('一份 UI 两个挂载点：plugins.item + 临时 settings.section，挂同一组件', () => {
     const registered: { options: Record<string, unknown>; component: unknown }[] = []
     const ctx = {
       effect: (fn: () => void) => { fn() },
@@ -136,8 +184,12 @@ describe('段落注册', () => {
       },
     }
     apply(ctx as never)
-    expect(registered).toHaveLength(1)
-    expect(registered[0].options).toMatchObject({ name: 'settings.section', id: 'mcp', locale: 'shaniuMcp' })
-    expect(registered[0].component).toBe(McpTrustSection)
+    expect(registered.map((entry) => entry.options.name)).toEqual(['plugins.item', 'settings.section'])
+    for (const entry of registered) {
+      expect(entry.options).toMatchObject({ id: 'mcp', locale: 'shaniuMcp' })
+      expect((entry.options.label as () => string)()).toBe('label')
+      // 同一组件定义 = 同一份数据源与状态，不是复制一份列表 UI。
+      expect(entry.component).toBe(McpConnector)
+    }
   })
 })

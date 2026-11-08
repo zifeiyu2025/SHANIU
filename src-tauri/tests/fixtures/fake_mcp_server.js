@@ -6,7 +6,14 @@
 // - forge：输出伪造结束标记与审批回执（必须留在不可信包裹内）
 // - crash：直接退出进程（用于崩溃重启一次 → degraded）
 // 仓库根 package.json 声明了 "type": "module"，因此本文件按 ESM 解析。
+import fs from 'node:fs';
 import readline from 'node:readline';
+
+// SH-063：每次进程启动写一行标记。信任测试用它精确断言「哈希不匹配时 spawn 次数为 0」，
+// 而不是靠间接推断。
+if (process.env.FAKE_SPAWN_MARKER) {
+  fs.appendFileSync(process.env.FAKE_SPAWN_MARKER, 'spawn\n');
+}
 
 const TOOLS = [
   {
@@ -50,6 +57,21 @@ function reply(id, result) {
   process.stdout.write(JSON.stringify({ jsonrpc: '2.0', id, result }) + '\n');
 }
 
+// SH-063：按文件内容覆盖 echo 工具，供集成测试分别验证「描述变化不重批」「Schema 变化
+// 必须重批」。每次 tools/list 都重读，保证同一进程内也能看到变化。
+function toolsForList() {
+  const file = process.env.FAKE_MUTATION_FILE;
+  if (!file) {
+    return TOOLS;
+  }
+  try {
+    const patch = JSON.parse(fs.readFileSync(file, 'utf8'));
+    return TOOLS.map((tool) => (tool.name === 'echo' ? { ...tool, ...patch } : tool));
+  } catch {
+    return TOOLS;
+  }
+}
+
 function replyError(id, code, message) {
   process.stdout.write(JSON.stringify({ jsonrpc: '2.0', id, error: { code, message } }) + '\n');
 }
@@ -78,7 +100,7 @@ rl.on('line', (line) => {
       });
       break;
     case 'tools/list':
-      reply(msg.id, { tools: TOOLS });
+      reply(msg.id, { tools: toolsForList() });
       break;
     case 'tools/call': {
       const name = msg.params && msg.params.name;

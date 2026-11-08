@@ -27,6 +27,10 @@ fn review_payload() -> ReviewPayload {
         transport: "stdio".into(),
         executable: "C:/node.exe".into(),
         executable_sha256: "a".repeat(64),
+        executable_mtime_ms: Some(1_760_000_000_000),
+        previous_executable_sha256: None,
+        approved_at_ms: 0,
+        tools_stale: false,
         argv: vec!["server.js".into()],
         cwd: "C:/work".into(),
         env: vec!["TOKEN = sha256:12345678…".into()],
@@ -183,6 +187,7 @@ fn status_values_are_snake_case() {
         (McpStatus::Review, "review"),
         (McpStatus::Trusted, "trusted"),
         (McpStatus::Blocked, "blocked"),
+        (McpStatus::Retrust, "retrust"),
         (McpStatus::Degraded, "degraded"),
         (McpStatus::Failed, "failed"),
     ] {

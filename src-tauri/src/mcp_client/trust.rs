@@ -5,8 +5,9 @@
 //!   是给哪个可执行文件 / argv / cwd / env / 工具清单的」；
 //! - **逐工具风险档位由用户指定**：默认 `destructive`，随记录持久化；server 的
 //!   `readOnlyHint`/`destructiveHint` 不进入本模块的任何决策路径（ADR-107）；
-//! - **变更语义按用户口径**：工具清单增删 → 重批；描述 / Schema / 注解变化 → 只更新
-//!   摘要，不重批（覆盖 docs/02 §3.1.4(3) 的旧文字）。
+//! - **变更语义按用户口径（docs/02 §3.1.4(3)）**：工具清单增删、参数 **Schema**
+//!   变化 → 重批；描述 / 注解变化 → 只更新摘要，不重批，但**每次连接都重跑注入过滤**
+//!   （描述是注入主通道，见 [`super::registry::partition_by_guard`]）。
 //!
 //! 写盘用临时文件 + 替换；文件损坏或算法版本不认识 → 按空存储处理（fail-closed 为
 //! `review`，绝不把损坏当成「已批准」）。
@@ -38,6 +39,9 @@ pub enum TrustStatus {
     Trusted,
     /// 用户阻止：不连接、不注册。
     Blocked,
+    /// 可执行文件哈希与批准记录不一致：**不启动、不注册、不列当前清单**，
+    /// 等用户显式确认新二进制后重新审查（docs/02 §3.1.4(3)）。
+    Retrust,
 }
 
 impl TrustStatus {
@@ -46,6 +50,7 @@ impl TrustStatus {
             TrustStatus::Review => "review",
             TrustStatus::Trusted => "trusted",
             TrustStatus::Blocked => "blocked",
+            TrustStatus::Retrust => "retrust",
         }
     }
 }
@@ -67,6 +72,19 @@ pub struct ToolGrant {
     pub annotations_sha256: Option<String>,
 }
 
+/// 旧清单快照：可执行文件变化时用来展示「上次批准的是什么」。
+///
+/// **只作参照，不是当前有效清单**——界面必须标注旧版本，且不得据此注册工具。
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct CachedTool {
+    pub dispatch_name: String,
+    pub raw_name: String,
+    pub description: String,
+    pub schema: Value,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub annotations: Option<Value>,
+}
+
 /// 一次批准记录。`input` 就是被批准的那份身份，界面据此展示「授权给谁」。
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct TrustRecord {
@@ -80,6 +98,9 @@ pub struct TrustRecord {
     pub input: FingerprintInput,
     #[serde(default)]
     pub tools: Vec<ToolGrant>,
+    /// 批准时的清单快照（含描述/Schema），仅用于「旧版本参考」展示。
+    #[serde(default)]
+    pub cached_tools: Vec<CachedTool>,
     /// 注入检测的显式启用记录（A-R4），与信任同生共死。
     #[serde(default)]
     pub exemptions: Vec<Exemption>,
@@ -144,7 +165,10 @@ pub enum TrustError {
 pub enum ToolChangeKind {
     Added,
     Removed,
+    /// 只有描述 / 注解变化：不重批，但下次连接仍必须重跑注入过滤。
     ContentChanged,
+    /// 参数 Schema 变化：用户批准时看到的工具形态变了，必须重批。
+    SchemaChanged,
 }
 
 impl ToolChangeKind {
@@ -153,6 +177,7 @@ impl ToolChangeKind {
             ToolChangeKind::Added => "added",
             ToolChangeKind::Removed => "removed",
             ToolChangeKind::ContentChanged => "content_changed",
+            ToolChangeKind::SchemaChanged => "schema_changed",
         }
     }
 }
@@ -169,17 +194,32 @@ pub struct ManifestDiff {
 }
 
 impl ManifestDiff {
-    /// **只有增删要重批**。描述 / Schema / 注解变化只更新摘要（用户口径）。
+    /// **增删与 Schema 变化要重批**；描述 / 注解变化只更新摘要（用户口径）。
+    ///
+    /// 原因：描述是注入主通道但不构成授权面（风险档位由用户设定，描述被改也不会给工具
+    /// 增加权限），只要每次连接都重跑注入过滤即可；注解只做展示，不参与裁决。
+    /// 而 Schema 是参数契约——用户批准时看到的工具形态变了，不能悄悄过。
     pub fn requires_review(&self) -> bool {
-        self.changes
-            .iter()
-            .any(|change| matches!(change.kind, ToolChangeKind::Added | ToolChangeKind::Removed))
+        self.changes.iter().any(|change| {
+            matches!(
+                change.kind,
+                ToolChangeKind::Added | ToolChangeKind::Removed | ToolChangeKind::SchemaChanged
+            )
+        })
     }
 
     pub fn content_changed(&self) -> Vec<String> {
         self.changes
             .iter()
             .filter(|change| change.kind == ToolChangeKind::ContentChanged)
+            .map(|change| change.dispatch_name.clone())
+            .collect()
+    }
+
+    pub fn schema_changed(&self) -> Vec<String> {
+        self.changes
+            .iter()
+            .filter(|change| change.kind == ToolChangeKind::SchemaChanged)
             .map(|change| change.dispatch_name.clone())
             .collect()
     }
@@ -194,7 +234,8 @@ impl ManifestDiff {
                 let label = match change.kind {
                     ToolChangeKind::Added => "新增",
                     ToolChangeKind::Removed => "删除",
-                    ToolChangeKind::ContentChanged => "描述/Schema/注解变化",
+                    ToolChangeKind::ContentChanged => "描述/注解变化（不重批）",
+                    ToolChangeKind::SchemaChanged => "参数 Schema 变化（必须重批）",
                 };
                 format!("{label}: {}", change.dispatch_name)
             })
@@ -218,8 +259,12 @@ pub fn diff_manifest(old: &[ToolGrant], new: &[ToolGrant]) -> ManifestDiff {
                 kind: ToolChangeKind::Added,
             }),
             Some(previous) => {
-                if previous.description_sha256 != grant.description_sha256
-                    || previous.schema_sha256 != grant.schema_sha256
+                if previous.schema_sha256 != grant.schema_sha256 {
+                    changes.push(ToolChange {
+                        dispatch_name: (*name).to_string(),
+                        kind: ToolChangeKind::SchemaChanged,
+                    });
+                } else if previous.description_sha256 != grant.description_sha256
                     || previous.annotations_sha256 != grant.annotations_sha256
                 {
                     changes.push(ToolChange {
@@ -240,6 +285,20 @@ pub fn diff_manifest(old: &[ToolGrant], new: &[ToolGrant]) -> ManifestDiff {
     }
     changes.sort_by(|a, b| a.dispatch_name.cmp(&b.dispatch_name));
     ManifestDiff { changes }
+}
+
+/// 把清单转换结果转成「旧版本参考」快照。
+pub fn cached_from_plan(plan: &RegistrationPlan) -> Vec<CachedTool> {
+    plan.accepted
+        .iter()
+        .map(|tool| CachedTool {
+            dispatch_name: tool.dispatch_name.clone(),
+            raw_name: tool.raw_name.clone(),
+            description: tool.spec.description.clone(),
+            schema: tool.spec.parameters.clone(),
+            annotations: tool.annotations.clone(),
+        })
+        .collect()
 }
 
 /// 把清单转换结果转成批准项（默认 `destructive`、默认不勾选）。
@@ -353,6 +412,7 @@ impl TrustStore {
         server_id: &str,
         input: FingerprintInput,
         tools: Vec<ToolGrant>,
+        cached_tools: Vec<CachedTool>,
         reason: Option<String>,
     ) -> Result<TrustRecord, TrustError> {
         let fingerprint = input.fingerprint();
@@ -367,6 +427,7 @@ impl TrustStore {
             approved_at_ms: 0,
             input,
             tools,
+            cached_tools,
             exemptions,
             reason,
         };
@@ -542,7 +603,7 @@ mod tests {
     fn review_record(store_path: &Path, server_id: &str) -> TrustRecord {
         let input = input(BTreeMap::new(), &["mcp__srv__read", "mcp__srv__write"]);
         let mut store = TrustStore::load(store_path);
-        store.store_review(server_id, input, grants(), None).unwrap()
+        store.store_review(server_id, input, grants(), Vec::new(), None).unwrap()
     }
 
     #[test]
@@ -676,7 +737,7 @@ mod tests {
         env.insert("API_TOKEN".to_string(), secret.to_string());
         let mut store = TrustStore::load(&path);
         store
-            .store_review("srv", input(env, &["mcp__srv__read"]), grants(), None)
+            .store_review("srv", input(env, &["mcp__srv__read"]), grants(), Vec::new(), None)
             .unwrap();
 
         let raw = std::fs::read_to_string(&path).unwrap();
@@ -686,16 +747,32 @@ mod tests {
     }
 
     #[test]
-    fn manifest_diff_only_requires_review_on_add_and_remove() {
+    fn manifest_diff_review_semantics_follow_user_ruling() {
+        // ① 描述变更：不重批（注入过滤在每次连接时重跑，不靠这里）。
         let old = grants();
-
-        let mut content_only = old.clone();
-        content_only[0].description_sha256 = "changed".into();
-        let diff = diff_manifest(&old, &content_only);
+        let mut description_only = old.clone();
+        description_only[0].description_sha256 = "changed".into();
+        let diff = diff_manifest(&old, &description_only);
         assert!(!diff.requires_review(), "改描述不重批（用户口径）");
         assert_eq!(diff.content_changed(), vec!["mcp__srv__read".to_string()]);
-        assert!(diff.explain().contains("描述/Schema/注解变化"));
+        assert!(diff.explain().contains("不重批"));
 
+        // ② 注解变更：不重批（只做展示，从不参与裁决）。
+        let mut annotations_only = old.clone();
+        annotations_only[0].annotations_sha256 = Some("annotated".into());
+        let diff = diff_manifest(&old, &annotations_only);
+        assert!(!diff.requires_review(), "改注解不重批");
+        assert_eq!(diff.content_changed(), vec!["mcp__srv__read".to_string()]);
+
+        // ③ Schema 变更：必须重批（参数契约变了，用户看到的工具形态也变了）。
+        let mut schema_only = old.clone();
+        schema_only[0].schema_sha256 = "schema-v2".into();
+        let diff = diff_manifest(&old, &schema_only);
+        assert!(diff.requires_review(), "改 Schema 必须重批");
+        assert_eq!(diff.schema_changed(), vec!["mcp__srv__read".to_string()]);
+        assert!(diff.explain().contains("Schema"));
+
+        // ④ 增删：必须重批。
         let mut added = old.clone();
         added.push(ToolGrant {
             dispatch_name: "mcp__srv__exec".into(),
@@ -729,6 +806,7 @@ mod tests {
                 schema_sha256: "schema".into(),
                 annotations_sha256: None,
             }],
+            cached_tools: Vec::new(),
             exemptions: Vec::new(),
             reason: None,
         };

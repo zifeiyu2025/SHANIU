@@ -598,6 +598,23 @@ pub struct McpConfig {
     pub servers: Vec<McpServerConfig>,
 }
 
+/// MCP 配置来源：把「首审可以 spawn 二进制」的正当性变成**被检查的事实**，
+/// 而不是默认假设。
+///
+/// v1 的唯一来源是应用级 `config.toml`（用户本人撰写）。一旦将来引入工作区/
+/// 项目级 `mcp.servers`（从仓库读到配置），那等同于执行仓库提供的二进制，
+/// 必须先完成「不 spawn 的两阶段审查」改造；在那之前运行时会在 spawn 前直接
+/// 拒绝 `Workspace` 来源（`mcp_client::runtime::connect_and_review_with`）。
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum McpConfigSource {
+    /// 应用级 `config.toml`，由用户本人撰写。
+    #[default]
+    User,
+    /// 工作区/项目级配置（**当前没有写入路径**，为将来的改造预留）。
+    Workspace,
+}
+
 /// 一家 stdio MCP server。
 ///
 /// **不可信第三方进程**（docs/02 §3.1.1）：这里只存用户自己填的启动参数，
@@ -605,6 +622,11 @@ pub struct McpConfig {
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(default)]
 pub struct McpServerConfig {
+    /// 配置来源。`#[serde(skip)]`：**不可由 TOML 指定**——来源只能由加载代码
+    /// 设置，用户不能自称「这是用户配置」。默认 `User` 对应 v1 唯一来源
+    /// 应用级 `config.toml`；工作区加载器将来必须显式置 `Workspace`。
+    #[serde(skip)]
+    pub source: McpConfigSource,
     /// 稳定标识，同时是分发名 `mcp__<id>__<slug>` 的命名空间来源。
     /// 语法 `^[a-z0-9][a-z0-9-]{0,31}$`——**不采用 server 自报名称**（B-R1）。
     pub id: String,
@@ -633,6 +655,7 @@ pub struct McpServerConfig {
 impl Default for McpServerConfig {
     fn default() -> Self {
         Self {
+            source: McpConfigSource::User,
             id: String::new(),
             command: String::new(),
             args: Vec::new(),
@@ -1834,6 +1857,30 @@ unsandboxed_reason = "旧版 server 在受限令牌下无法启动"
         // 往返无损：否则用户改一次别处的设置就会把 mcp 段写丢
         let round = toml::to_string_pretty(&cfg).unwrap();
         assert_eq!(toml::from_str::<AppConfig>(&round).unwrap(), cfg);
+    }
+
+    #[test]
+    fn mcp_source_cannot_be_set_from_toml_and_defaults_to_user() {
+        // 来源是安全判据，不能由配置自称：TOML 里写 source 也不会生效。
+        let body = r#"
+[[mcp.servers]]
+id = "sneaky"
+command = "node"
+source = "workspace"
+"#;
+        let cfg: AppConfig = toml::from_str(body).unwrap();
+        assert_eq!(
+            cfg.mcp.servers[0].source,
+            McpConfigSource::User,
+            "用户不能通过配置文件自称来源"
+        );
+        // 序列化不回写：改别的设置不会把来源带出去，更不会把 User 洗成别的值。
+        let round = toml::to_string_pretty(&cfg).unwrap();
+        assert!(!round.contains("source"), "source 不得进 config.toml: {round}");
+        // 只有加载代码能显式设置非 User 来源（将来工作区加载器的入口）。
+        let mut workspace_sourced = server("ws");
+        workspace_sourced.source = McpConfigSource::Workspace;
+        assert_eq!(workspace_sourced.source, McpConfigSource::Workspace);
     }
 
     #[test]

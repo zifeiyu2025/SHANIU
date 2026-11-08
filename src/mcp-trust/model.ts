@@ -6,10 +6,12 @@
  */
 import type {
   McpRiskLevel,
+  McpServerSummaryWire,
   ReviewPayloadWire,
   ReviewToolWire,
   TrustDecisionWire,
 } from '../transport/mcp-wire'
+import type { McpTrustKey } from './locales'
 
 /** 界面上一个工具的裁决状态（受控表单值）。 */
 export interface ToolSelection {
@@ -72,4 +74,47 @@ export function needsInjectionConsent(tool: ReviewToolWire): boolean {
 /** 指纹缩写（完整值在详情里给全）。 */
 export function shortFingerprint(fingerprint: string): string {
   return fingerprint.length > 16 ? `${fingerprint.slice(0, 16)}…` : fingerprint
+}
+
+/**
+ * 卡片摘要的状态聚合（插件页列表层唯一的位置）。
+ *
+ * 顺序固定为「需要人处理的在前，稳定的在后」，同类状态合并成一段文字；
+ * 0 台的状态不出现，避免摘要被无信息的段位撑长。
+ */
+const SUMMARY_ORDER = [
+  'review',
+  'retrust',
+  'blocked',
+  'failed',
+  'degraded',
+  'trusted',
+  'idle',
+  'disabled',
+] as const
+
+/** 摘要里每个状态段落的词典键。 */
+type SummaryStateKey = `summary.${typeof SUMMARY_ORDER[number]}`
+
+/**
+ * 把服务器列表压成一行卡片摘要。
+ * @param servers - 宿主返回的配置项与运行状态。
+ * @param t - 本命名空间的翻译函数（只用到 `summary.*`）。
+ * @returns 形如「3 台服务器 · 1 台待审查 · 1 台需要重新信任」的文本。
+ */
+export function summarizeServers(
+  servers: readonly McpServerSummaryWire[],
+  t: (key: McpTrustKey, params: { count: number }) => string,
+): string {
+  if (servers.length === 0) return t('summary.none', { count: 0 })
+  const counts = new Map<string, number>()
+  for (const server of servers) {
+    counts.set(server.status, (counts.get(server.status) ?? 0) + 1)
+  }
+  const parts = [t('summary.total', { count: servers.length })]
+  for (const status of SUMMARY_ORDER) {
+    const count = counts.get(status) ?? 0
+    if (count > 0) parts.push(t(`summary.${status}` as SummaryStateKey, { count }))
+  }
+  return parts.join(' · ')
 }

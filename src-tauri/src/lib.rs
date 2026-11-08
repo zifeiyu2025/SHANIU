@@ -1603,6 +1603,8 @@ struct McpServerSummary {
     status: String,
     fingerprint: Option<String>,
     approved_tools: Vec<crate::mcp_client::runtime::ApprovedToolView>,
+    /// 用户显式启用的注入豁免数量（插件页列表层展示用）。
+    exemption_count: usize,
     reason: Option<String>,
 }
 
@@ -1638,6 +1640,7 @@ async fn mcp_list_servers(app: tauri::AppHandle) -> Result<Vec<McpServerSummary>
                 approved_tools: status
                     .map(|item| item.approved_tools.clone())
                     .unwrap_or_default(),
+                exemption_count: status.map(|item| item.exemption_count).unwrap_or(0),
                 reason: status.and_then(|item| item.reason.clone()),
             }
         })
@@ -1645,10 +1648,14 @@ async fn mcp_list_servers(app: tauri::AppHandle) -> Result<Vec<McpServerSummary>
 }
 
 /// 首连审查：启动 server、读取清单、计算指纹；未批准前不注册任何工具。
+///
+/// `accept_new_binary` 只由「需要重新信任」界面的显式确认传入：可执行文件哈希与批准
+/// 记录不一致时，默认**不启动进程**（docs/02 §3.1.4(3)）。
 #[tauri::command]
 async fn mcp_connect_and_review(
     app: tauri::AppHandle,
     server_id: String,
+    accept_new_binary: Option<bool>,
 ) -> Result<crate::mcp_client::runtime::ReviewPayload, String> {
     let state = app.state::<AppState>();
     let cfg = state.config();
@@ -1660,7 +1667,10 @@ async fn mcp_connect_and_review(
         .cloned()
         .ok_or_else(|| format!("配置里没有 MCP server: {server_id}"))?;
     let workspace = state.workspace_root();
-    state.mcp.connect_and_review(&server, &workspace).await
+    state
+        .mcp
+        .connect_and_review_with(&server, &workspace, accept_new_binary.unwrap_or(false))
+        .await
 }
 
 /// 应用首连审查的逐工具裁决（批准位 + 风险档位 + 注入工具显式启用）。
@@ -1685,15 +1695,28 @@ async fn mcp_revoke_trust(app: tauri::AppHandle, server_id: String) -> Result<()
     state.mcp.revoke_trust(&server_id).await
 }
 
-/// 撤销单个注入豁免（工具立即不可调用，下次连接不再注册）。
+/// 列出全部显式启用记录（插件页「豁免」台账；跨服务器、跨指纹只读展示）。
+#[tauri::command]
+async fn mcp_list_exemptions(
+    app: tauri::AppHandle,
+) -> Result<Vec<crate::mcp_client::guard::Exemption>, String> {
+    let state = app.state::<AppState>();
+    Ok(state.mcp.list_exemptions().await)
+}
+
+/// 撤销单个注入豁免；`fingerprint` 用于撤销旧指纹留下的记录（缺省 = 当前指纹）。
 #[tauri::command]
 async fn mcp_revoke_exemption(
     app: tauri::AppHandle,
     server_id: String,
     dispatch_name: String,
+    fingerprint: Option<String>,
 ) -> Result<(), String> {
     let state = app.state::<AppState>();
-    state.mcp.revoke_exemption(&server_id, &dispatch_name).await
+    state
+        .mcp
+        .revoke_exemption(&server_id, &dispatch_name, fingerprint.as_deref())
+        .await
 }
 
 /// 从托盘恢复主窗口：取消最小化 + 显示 + 聚焦。
@@ -1813,6 +1836,7 @@ pub fn run() {
             jobs::job_read,
             jobs::job_kill,
             mcp_list_servers,
+            mcp_list_exemptions,
             mcp_connect_and_review,
             mcp_resolve_trust,
             mcp_revoke_trust,

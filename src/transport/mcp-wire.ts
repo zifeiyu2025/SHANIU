@@ -1,5 +1,5 @@
 /**
- * SH-063 MCP 信任面的前端镜像：应用级事件（`shaniu://mcp`）与 5 个宿主命令。
+ * SH-063 MCP 信任面的前端镜像：应用级事件（`shaniu://mcp`）与 6 个宿主命令。
  *
  * 约定与 `types.ts` 一致：字段名跟 Rust serde 的 snake_case 走，不做重命名；
  * 事件判别值是 `McpEventWire` 的 `type` 字面量，与 Rust `McpEvent` 的
@@ -12,7 +12,7 @@
 import type { HostBridge } from './tauri'
 
 /** 运行时状态（Rust `McpStatus`）。 */
-export type McpStatus = 'idle' | 'review' | 'trusted' | 'blocked' | 'degraded' | 'failed'
+export type McpStatus = 'idle' | 'review' | 'trusted' | 'blocked' | 'retrust' | 'degraded' | 'failed'
 
 /** 风险档位（Rust `events::RiskLevel`）。 */
 export type McpRiskLevel = 'read' | 'write_in_workspace' | 'execute' | 'destructive' | 'plan_review'
@@ -71,6 +71,14 @@ export interface ReviewPayloadWire {
   readonly transport: string
   readonly executable: string
   readonly executable_sha256: string
+  /** 可执行文件当前修改时间（ms）；只在「需要重新信任」时给出。 */
+  readonly executable_mtime_ms?: number
+  /** 上次批准时记录的可执行文件哈希；只在「需要重新信任」时给出。 */
+  readonly previous_executable_sha256?: string
+  /** 上次批准时间（ms）。 */
+  readonly approved_at_ms: number
+  /** `tools` 来自旧版本缓存，仅作参考，不是当前有效清单。 */
+  readonly tools_stale: boolean
   readonly argv: readonly string[]
   readonly cwd: string
   /** `KEY = sha256:xxxxxxxx…`，值永不明文。 */
@@ -105,10 +113,12 @@ export interface McpServerSummaryWire {
   readonly args: readonly string[]
   readonly unsandboxed: boolean
   readonly allow_network: boolean
-  /** `idle | review | trusted | blocked | degraded | failed | disabled`。 */
+  /** `idle | review | trusted | blocked | retrust | degraded | failed | disabled`。 */
   readonly status: string
   readonly fingerprint: string | null
   readonly approved_tools: readonly ApprovedToolWire[]
+  /** 用户显式启用的注入豁免数量。 */
+  readonly exemption_count: number
   readonly reason: string | null
 }
 
@@ -174,12 +184,24 @@ export function mcpListServers(bridge: HostBridge): Promise<McpServerSummaryWire
   return bridge.invoke<McpServerSummaryWire[]>('mcp_list_servers')
 }
 
-/** 首连审查：未批准前宿主不会注册任何工具。 */
+/** 全部显式启用记录（插件页「豁免」tab 的只读台账）。 */
+export function mcpListExemptions(bridge: HostBridge): Promise<ExemptionWire[]> {
+  return bridge.invoke<ExemptionWire[]>('mcp_list_exemptions')
+}
+
+/**
+ * 首连审查：未批准前宿主不会注册任何工具。
+ *
+ * `acceptNewBinary` 只由「需要重新信任」界面的显式确认传入。可执行文件哈希与批准记录
+ * 不一致时，宿主默认**不启动进程**，只返回 `retrust` 载荷（上次哈希 vs 当前哈希、
+ * 旧清单仅供参考）。
+ */
 export function mcpConnectAndReview(
   bridge: HostBridge,
   serverId: string,
+  acceptNewBinary = false,
 ): Promise<ReviewPayloadWire> {
-  return bridge.invoke<ReviewPayloadWire>('mcp_connect_and_review', { serverId })
+  return bridge.invoke<ReviewPayloadWire>('mcp_connect_and_review', { serverId, acceptNewBinary })
 }
 
 /** 应用裁决：批准位 + 逐工具档位 + 注入工具的显式启用。 */
@@ -197,11 +219,12 @@ export function mcpRevokeTrust(bridge: HostBridge, serverId: string): Promise<vo
   return bridge.invoke<void>('mcp_revoke_trust', { serverId })
 }
 
-/** 撤销单个注入豁免（工具立即不可调用）。 */
+/** 撤销单个注入豁免（工具立即不可调用）；`fingerprint` 缺省作用于当前指纹。 */
 export function mcpRevokeExemption(
   bridge: HostBridge,
   serverId: string,
   dispatchName: string,
+  fingerprint?: string,
 ): Promise<void> {
-  return bridge.invoke<void>('mcp_revoke_exemption', { serverId, dispatchName })
+  return bridge.invoke<void>('mcp_revoke_exemption', { serverId, dispatchName, fingerprint })
 }

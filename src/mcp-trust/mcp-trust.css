@@ -1,191 +1,229 @@
-/* SH-063 MCP 信任设置页（宿主插件样式，跟随 DSH 主题变量）。 */
+/*
+ * SH-063 MCP 连接器（宿主插件样式）。
+ *
+ * 外壳与列表项由插件页 / 上游基础组件提供；这里只补排版：间距、网格、等宽字体、
+ * 表格分隔线。不写卡片、按钮、徽章一类容器样式——那些由 `Tag` / `Button` /
+ * `DisclosureRow` / `SegmentedTabs` 负责。
+ */
 
-.mcp-trust {
+.mcp-connector {
   display: flex;
   flex-direction: column;
-  gap: 16px;
-  padding: 16px 20px 32px;
-  color: var(--dsh-text-primary, #1f2328);
+  gap: 14px;
+  min-width: 0;
+  color: var(--dsw-alias-label-primary, inherit);
   font-size: 13px;
 }
 
-.mcp-trust-head {
+.mcp-connector-intro,
+.mcp-connector-note {
+  margin: 0;
+  color: var(--dsw-alias-label-secondary, currentColor);
+  line-height: 1.55;
+}
+
+.mcp-connector-alert {
   display: flex;
-  align-items: flex-start;
-  justify-content: space-between;
-  gap: 16px;
+  flex-wrap: wrap;
+  align-items: center;
+  gap: 8px;
+  margin: 0;
+  color: var(--dsw-alias-state-error-primary, #d1242f);
 }
 
-.mcp-trust-head h2 {
-  margin: 0 0 6px;
-  font-size: 16px;
-  font-weight: 600;
+.mcp-connector-attention,
+.mcp-connector-panel {
+  display: flex;
+  flex-direction: column;
+  gap: 8px;
+  min-width: 0;
 }
 
-.mcp-trust-desc,
-.mcp-hint {
-  margin: 4px 0;
-  color: var(--dsh-text-secondary, #5c6370);
-  line-height: 1.5;
+.mcp-connector-attention-title,
+.mcp-connector-panel-title {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  gap: 8px;
+  margin: 0;
 }
 
-.mcp-alert,
-.mcp-warn {
-  border: 1px solid var(--dsh-danger-border, #d1242f55);
-  background: var(--dsh-danger-bg, #ffebe9);
-  color: var(--dsh-danger-text, #82071e);
-  border-radius: 8px;
-  padding: 10px 12px;
-}
-
-.mcp-warn ul {
-  margin: 6px 0 0;
-  padding-left: 18px;
-}
-
-.mcp-servers,
-.mcp-tools,
-.mcp-exemptions {
+.mcp-connector-attention-list,
+.mcp-connector-servers,
+.mcp-connector-tools {
   list-style: none;
   margin: 0;
   padding: 0;
   display: flex;
   flex-direction: column;
-  gap: 10px;
+  gap: 8px;
 }
 
-.mcp-server,
-.mcp-tool,
-.mcp-exemption {
-  border: 1px solid var(--dsh-border-default, #d0d7de);
-  border-radius: 8px;
-  padding: 10px 12px;
-  background: var(--dsh-surface-raised, #fff);
-}
-
-.mcp-server-line {
+.mcp-connector-attention-list li {
   display: flex;
   flex-wrap: wrap;
   align-items: center;
   gap: 8px;
 }
 
-.mcp-server-cmd,
-.mcp-mono {
-  font-family: var(--dsh-font-mono, ui-monospace, SFMono-Regular, Consolas, monospace);
-  font-size: 12px;
-  color: var(--dsh-text-secondary, #5c6370);
-  word-break: break-all;
-  white-space: pre-wrap;
+.mcp-connector-attention-id {
+  font-weight: 600;
+  overflow-wrap: anywhere;
 }
 
-.mcp-badge {
-  border-radius: 999px;
-  padding: 1px 8px;
-  font-size: 11px;
-  line-height: 18px;
-  background: var(--dsh-surface-sunken, #eaeef2);
+/* 折叠行是固定 24px 的单行：计数不换行、命令单行省略，否则长 argv 会换行
+   溢出到下一行上面（真机截图中出现过的重叠）。 */
+.mcp-connector-row-note {
+  flex: none;
+  margin-right: 6px;
+  white-space: nowrap;
 }
 
-.mcp-badge-trusted {
-  background: #dafbe1;
-  color: #116329;
+.mcp-connector-row-command {
+  flex: 1 1 auto;
+  min-width: 0;
+  overflow: hidden;
+  white-space: nowrap;
+  text-overflow: ellipsis;
 }
 
-.mcp-badge-review {
-  background: #fff8c5;
-  color: #7d4e00;
-}
-
-.mcp-badge-blocked,
-.mcp-badge-failed {
-  background: #ffebe9;
-  color: #82071e;
-}
-
-.mcp-actions {
+.mcp-connector-detail {
   display: flex;
-  flex-wrap: wrap;
-  gap: 8px;
-  margin-top: 10px;
+  flex-direction: column;
+  gap: 10px;
+  min-width: 0;
+  padding: 6px 0 12px 24px;
 }
 
-.mcp-btn {
-  border: 1px solid var(--dsh-border-default, #d0d7de);
-  background: var(--dsh-surface-raised, #fff);
-  color: inherit;
-  border-radius: 6px;
-  padding: 4px 12px;
-  font-size: 12px;
-  cursor: pointer;
+/* 「待审查」与「需要重新信任」的文字区别在词典里；这行保证它可见且不被挤掉。 */
+.mcp-connector-state {
+  margin: 0;
+  font-weight: 500;
+  overflow-wrap: anywhere;
 }
 
-.mcp-btn:disabled {
-  opacity: 0.5;
-  cursor: default;
-}
-
-.mcp-btn-primary {
-  background: #1f6feb;
-  border-color: #1f6feb;
-  color: #fff;
-}
-
-.mcp-btn-danger {
-  color: #82071e;
-  border-color: #d1242f55;
-}
-
-.mcp-identity {
+.mcp-connector-identity {
   display: grid;
-  grid-template-columns: 160px 1fr;
+  /* 窄容器下固定列会挤爆：标签列可缩，值列允许断行。 */
+  grid-template-columns: minmax(96px, 160px) minmax(0, 1fr);
   gap: 4px 12px;
   margin: 0;
-  padding: 10px 12px;
-  border: 1px solid var(--dsh-border-default, #d0d7de);
-  border-radius: 8px;
 }
 
-.mcp-identity dt {
-  color: var(--dsh-text-secondary, #5c6370);
+.mcp-connector-identity dt {
+  color: var(--dsw-alias-label-secondary, currentColor);
 }
 
-.mcp-identity dd {
+.mcp-connector-identity dd {
   margin: 0;
+  min-width: 0;
+  overflow-wrap: anywhere;
+  /* 全局 dd 默认色在暗色主题下是近黑，直接继承宿主文字色。 */
+  color: inherit;
 }
 
-.mcp-tool-head {
+.mcp-connector-mono {
+  /* DSH 主题没有等宽字体令牌，直接给字体栈。 */
+  font-family: ui-monospace, SFMono-Regular, Consolas, monospace;
+  font-size: 12px;
+  overflow-wrap: anywhere;
+}
+
+/* 指纹与哈希是安全关键信息，不能被压成低对比度的次要色。 */
+.mcp-connector-identity .mcp-connector-mono,
+.mcp-connector-table .mcp-connector-mono {
+  color: inherit;
+}
+
+.mcp-connector-tool {
   display: flex;
+  flex-direction: column;
+  gap: 6px;
+  min-width: 0;
+}
+
+.mcp-connector-tool-head {
+  display: flex;
+  flex-wrap: wrap;
   align-items: center;
   gap: 8px;
 }
 
-.mcp-tool-head select {
+.mcp-connector-tool-head select {
+  flex: none;
   margin-left: auto;
   font-size: 12px;
   padding: 2px 6px;
 }
 
-.mcp-desc {
-  margin: 6px 0 0;
-  color: var(--dsh-text-secondary, #5c6370);
-  white-space: pre-wrap;
+.mcp-connector-tool-desc,
+.mcp-connector-tool-guard,
+.mcp-connector-warn {
+  display: flex;
+  flex-direction: column;
+  gap: 6px;
+  min-width: 0;
+  margin: 0;
 }
 
-.mcp-consent {
+.mcp-connector-tool-desc {
+  color: var(--dsw-alias-label-secondary, currentColor);
+  overflow-wrap: anywhere;
+}
+
+.mcp-connector-tool-guard p,
+.mcp-connector-warn p {
   display: flex;
+  flex-wrap: wrap;
   align-items: center;
   gap: 6px;
-  margin-top: 8px;
+  margin: 0;
 }
 
-.mcp-exemption {
+.mcp-connector-tool-guard ul,
+.mcp-connector-warn ul {
+  margin: 0;
+  padding-left: 18px;
+  overflow-wrap: anywhere;
+}
+
+.mcp-connector-actions {
   display: flex;
-  align-items: center;
-  justify-content: space-between;
-  gap: 12px;
+  flex-wrap: wrap;
+  gap: 8px;
 }
 
-.mcp-empty {
-  color: var(--dsh-text-secondary, #5c6370);
+.mcp-connector-table {
+  width: 100%;
+  border-collapse: collapse;
+  font-size: 12px;
+}
+
+.mcp-connector-table th {
+  padding: 4px 8px 6px 0;
+  text-align: left;
+  font-weight: 500;
+  color: var(--dsw-alias-label-secondary, currentColor);
+  white-space: nowrap;
+}
+
+/* 操作列只放一个按钮：固定宽度，避免被前面的长指纹/长片段挤成两行。 */
+.mcp-connector-table th:last-child,
+.mcp-connector-table td:last-child {
+  width: 1%;
+  white-space: nowrap;
+}
+
+.mcp-connector-table td {
+  padding: 6px 8px 6px 0;
+  vertical-align: top;
+  overflow-wrap: anywhere;
+}
+
+.mcp-connector-table tr + tr td {
+  border-top: 1px solid var(--dsw-alias-border-l2, transparent);
+}
+
+.mcp-connector-fragment {
+  max-width: 320px;
 }

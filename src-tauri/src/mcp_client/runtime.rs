@@ -18,7 +18,7 @@ use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use tokio::sync::Mutex;
 
-use crate::config::{McpServerConfig, SandboxMode};
+use crate::config::{McpConfigSource, McpServerConfig, SandboxMode};
 use crate::events::RiskLevel;
 use crate::tool_router::ToolExecutor;
 
@@ -47,6 +47,8 @@ pub enum McpStatus {
     Trusted,
     /// 用户阻止。
     Blocked,
+    /// 可执行文件与上次批准记录不一致：**未启动进程**，等用户显式确认新二进制后重新审查。
+    Retrust,
     /// 进程退化（崩溃重启后仍失败）。
     Degraded,
     /// 连接/握手失败（不产生授权）。
@@ -60,6 +62,7 @@ impl McpStatus {
             McpStatus::Review => "review",
             McpStatus::Trusted => "trusted",
             McpStatus::Blocked => "blocked",
+            McpStatus::Retrust => "retrust",
             McpStatus::Degraded => "degraded",
             McpStatus::Failed => "failed",
         }
@@ -72,6 +75,7 @@ impl From<TrustStatus> for McpStatus {
             TrustStatus::Review => McpStatus::Review,
             TrustStatus::Trusted => McpStatus::Trusted,
             TrustStatus::Blocked => McpStatus::Blocked,
+            TrustStatus::Retrust => McpStatus::Retrust,
         }
     }
 }
@@ -127,6 +131,18 @@ pub struct ReviewPayload {
     pub transport: String,
     pub executable: String,
     pub executable_sha256: String,
+    /// 可执行文件当前修改时间（ms）。只在「需要重新信任」时给出，供用户判断替换时间。
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub executable_mtime_ms: Option<u64>,
+    /// 上次批准时记录的可执行文件哈希（只在「需要重新信任」时给出）。
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub previous_executable_sha256: Option<String>,
+    /// 上次批准时间（ms）。
+    #[serde(default)]
+    pub approved_at_ms: u64,
+    /// `tools` 来自旧版本缓存，仅作参考，**不是当前有效清单**（retrust 载荷）。
+    #[serde(default)]
+    pub tools_stale: bool,
     pub argv: Vec<String>,
     pub cwd: String,
     /// `KEY = sha256:xxxxxxxx…`，值永不明文（§3.1.4(1)）。
@@ -272,11 +288,35 @@ impl McpRuntime {
         config: &McpServerConfig,
         workspace_root: &Path,
     ) -> Result<ReviewPayload, String> {
+        self.connect_and_review_with(config, workspace_root, false).await
+    }
+
+    /// 同 [`connect_and_review`](Self::connect_and_review)，但允许用户显式确认新二进制。
+    ///
+    /// `accept_new_binary=false` 时，只要可执行文件哈希与批准记录不一致就**不启动进程、
+    /// 不注册、不列当前清单**——「两次批准之间二进制自己变了」本身即攻击形态，不能为了
+    /// 展示清单先把它跑起来（docs/02 §3.1.4(3)）。用户确认后才 spawn → 握手 → 列清单 →
+    /// 走逐工具风险档位。
+    pub async fn connect_and_review_with(
+        &self,
+        config: &McpServerConfig,
+        workspace_root: &Path,
+        accept_new_binary: bool,
+    ) -> Result<ReviewPayload, String> {
         if !crate::config::is_valid_mcp_server_id(&config.id) {
             return Err(format!("非法的 MCP server id: {}", config.id));
         }
         if !config.enabled {
             return Err(format!("MCP server {} 未启用", config.id));
+        }
+        // 首审 spawn 的正当性只成立于「配置由用户自己撰写」（应用级 config.toml）。
+        // 工作区/项目级 mcp.servers 等同于执行仓库提供的二进制，必须先审声明再启动，
+        // 不能沿用首审 spawn 路径。这里做成硬拒绝，而不是依赖调用方自觉。
+        if config.source != McpConfigSource::User {
+            return Err(format!(
+                "MCP server {} 来自工作区配置，必须先完成两阶段审查（不 spawn）才能启动；当前拒绝 spawn",
+                config.id
+            ));
         }
         self.stop_server(&config.id).await;
 
@@ -307,6 +347,33 @@ impl McpRuntime {
                 config.id,
                 cwd.display()
             ));
+        }
+
+        let existing = self.trust.lock().await.record(&config.id).cloned();
+        // `accept_new_binary` 只在**已处于 retrust** 时才生效：它代表「用户在『需要重新
+        // 信任』界面上确认了新二进制」。任何自动化流程、重试逻辑或前端默认值直接传 true
+        // 都不能绕过这道闸——非 retrust 状态下的 true 一律按 false 处理。
+        let confirmed = accept_new_binary
+            && matches!(
+                existing.as_ref().map(|record| record.status),
+                Some(TrustStatus::Retrust)
+            );
+        // 哈希不一致 = 两次批准之间二进制被换过。没有用户显式确认时**绝不 spawn**：
+        // 为了展示清单先把它跑起来，等于把最危险的一步放在最前面。
+        if !confirmed {
+            if let Some(record) = &existing {
+                let approved_before = !matches!(record.status, TrustStatus::Review);
+                if approved_before
+                    && !record
+                        .input
+                        .executable_sha256
+                        .eq_ignore_ascii_case(&executable_sha256)
+                {
+                    return Ok(self
+                        .retrust_payload(config, record, &executable, &executable_sha256, &cwd)
+                        .await);
+                }
+            }
         }
 
         let sandbox_mode = if config.unsandboxed {
@@ -348,7 +415,6 @@ impl McpRuntime {
         let fresh_grants = trust::grants_from_plan(&plan);
         let session = Arc::new(Mutex::new(session));
 
-        let existing = self.trust.lock().await.record(&config.id).cloned();
         let guard_rejected = {
             let exemptions = self.exemptions.lock().await;
             registry::partition_by_guard(&plan, &config.id, &fingerprint, &exemptions).1
@@ -375,9 +441,33 @@ impl McpRuntime {
             Some(record)
                 if record.fingerprint == fingerprint && record.status == TrustStatus::Trusted =>
             {
-                // 内容摘要可能变了（描述/Schema/注解），只更新基线，不重批。
+                let diff = trust::diff_manifest(&record.tools, &fresh_grants);
+                if diff.requires_review() {
+                    // 指纹里只有工具名，能走到这里的变化只可能是参数 Schema：
+                    // 用户批准时看到的工具形态变了，必须重新审查（docs/02 §3.1.4(3)）。
+                    let reason = Some(format!(
+                        "工具参数 Schema 已变化，需要重新审查：{}",
+                        diff.explain()
+                    ));
+                    return self
+                        .enter_review(
+                            config,
+                            identity,
+                            input,
+                            plan,
+                            guard_rejected,
+                            remote_tools,
+                            session,
+                            fresh_grants,
+                            reason,
+                            warnings,
+                        )
+                        .await;
+                }
+                // 描述 / 注解变化：只更新基线，不重批；注入过滤在每次连接时都已重跑。
                 let mut refreshed = record.clone();
                 trust::refresh_digests(&mut refreshed, &fresh_grants);
+                refreshed.cached_tools = trust::cached_from_plan(&plan);
                 if let Err(error) = self.upsert_quiet(&refreshed).await {
                     tracing::warn!("更新 MCP 内容摘要失败: {error}");
                 }
@@ -507,7 +597,13 @@ impl McpRuntime {
             .trust
             .lock()
             .await
-            .store_review(&config.id, input.clone(), fresh_grants, reason)
+            .store_review(
+                &config.id,
+                input.clone(),
+                fresh_grants,
+                trust::cached_from_plan(&plan),
+                reason,
+            )
             .map_err(|error| error.to_string())?;
         self.pending.lock().await.insert(
             config.id.clone(),
@@ -544,6 +640,120 @@ impl McpRuntime {
             reason: record.reason.clone(),
         });
         Ok(payload)
+    }
+
+    /// 可执行文件哈希变化时的载荷：**没有启动进程**，工具清单来自上次批准的缓存。
+    ///
+    /// 状态置为 `retrust` 并落盘；界面据此展示「上次批准哈希 vs 当前哈希、路径、时间」，
+    /// 旧清单必须标注为参考。只有用户显式确认后才会走完整的 spawn → 握手 → 审查流程。
+    async fn retrust_payload(
+        &self,
+        config: &McpServerConfig,
+        record: &TrustRecord,
+        executable: &Path,
+        executable_sha256: &str,
+        cwd: &Path,
+    ) -> ReviewPayload {
+        let previous = record.input.executable_sha256.clone();
+        let reason = format!(
+            "可执行文件哈希已变化（上次批准 {}，当前 {}）：未启动进程，需确认新二进制后重新审查",
+            short_sha(&previous),
+            short_sha(executable_sha256)
+        );
+        if record.status != TrustStatus::Retrust {
+            let mut updated = record.clone();
+            updated.status = TrustStatus::Retrust;
+            updated.reason = Some(reason.clone());
+            if let Err(error) = self.upsert_quiet(&updated).await {
+                tracing::warn!("写入 MCP 重新信任状态失败: {error}");
+            }
+        }
+
+        let tools: Vec<ReviewTool> = record
+            .cached_tools
+            .iter()
+            .map(|tool| {
+                let grant = record
+                    .tools
+                    .iter()
+                    .find(|grant| grant.dispatch_name == tool.dispatch_name);
+                let (guard_hits, guard_explanation) = match guard::inspect(&tool.description) {
+                    GuardVerdict::Clean => (Vec::new(), None),
+                    GuardVerdict::Suspicious(hits) => (
+                        hits.iter()
+                            .map(|hit| GuardHitView {
+                                rule: hit.rule.as_str().to_string(),
+                                fragment: hit.fragment.clone(),
+                            })
+                            .collect(),
+                        Some(guard::explain(&tool.dispatch_name, &hits)),
+                    ),
+                };
+                ReviewTool {
+                    dispatch_name: tool.dispatch_name.clone(),
+                    raw_name: tool.raw_name.clone(),
+                    description: tool.description.clone(),
+                    schema: tool.schema.clone(),
+                    annotations: tool.annotations.clone(),
+                    server_read_only_hint: tool
+                        .annotations
+                        .as_ref()
+                        .and_then(|value| value.get("readOnlyHint"))
+                        .and_then(Value::as_bool)
+                        .unwrap_or(false),
+                    risk: grant.map(|grant| grant.risk).unwrap_or(RiskLevel::Destructive),
+                    // 旧批准属于旧指纹：一律显示未批准，绝不冒充当前有效授权。
+                    approved: false,
+                    fingerprint: record.fingerprint.clone(),
+                    guard_hits,
+                    guard_explanation,
+                    guard_exempted: false,
+                }
+            })
+            .collect();
+
+        let mtime_ms = std::fs::metadata(executable)
+            .and_then(|metadata| metadata.modified())
+            .ok()
+            .and_then(|time| time.duration_since(std::time::UNIX_EPOCH).ok())
+            .map(|duration| duration.as_millis() as u64);
+
+        let payload = ReviewPayload {
+            server_id: config.id.clone(),
+            status: McpStatus::Retrust,
+            fingerprint: record.fingerprint.clone(),
+            transport: record.input.transport.clone(),
+            executable: executable.to_string_lossy().to_string(),
+            executable_sha256: executable_sha256.to_string(),
+            executable_mtime_ms: mtime_ms,
+            previous_executable_sha256: Some(previous),
+            approved_at_ms: record.approved_at_ms,
+            tools_stale: true,
+            argv: record.input.argv.clone(),
+            cwd: cwd.to_string_lossy().to_string(),
+            env: record.input.masked_env(),
+            protocol_version: record.input.protocol_version.clone(),
+            server_name: record.input.server_name.clone(),
+            server_version: record.input.server_version.clone(),
+            allow_network: config.allow_network,
+            unsandboxed: config.unsandboxed,
+            tools,
+            rejected_tools: Vec::new(),
+            approved_tools: Vec::new(),
+            exemptions: record.exemptions.clone(),
+            warnings: vec![
+                "可执行文件在两次批准之间发生了变化：本次没有启动进程，也没有注册任何工具。"
+                    .to_string(),
+                "下面的工具清单来自上次批准的缓存，仅作参考，不是当前版本。".to_string(),
+            ],
+            reason: Some(reason),
+        };
+        self.emit(McpEvent::ServerStatusChanged {
+            server_id: config.id.clone(),
+            status: McpStatus::Retrust,
+            reason: payload.reason.clone(),
+        });
+        payload
     }
 
     /// 应用用户裁决：批准位 + 逐工具档位 + 注入工具的显式启用。
@@ -756,22 +966,32 @@ impl McpRuntime {
         Ok(())
     }
 
+    /// 全部豁免记录（插件页「豁免」tab 的只读数据源，跨服务器、跨指纹）。
+    pub async fn list_exemptions(&self) -> Vec<Exemption> {
+        self.exemptions.lock().await.list()
+    }
+
     /// 撤销单个注入豁免：工具立即不可调用，下次连接也不再注册。
+    ///
+    /// `fingerprint` 用于撤销**旧指纹**留下的记录（插件页豁免台账会列出它们）；
+    /// 缺省时作用于当前信任记录的指纹。
     pub async fn revoke_exemption(
         &self,
         server_id: &str,
         dispatch_name: &str,
+        fingerprint: Option<&str>,
     ) -> Result<(), String> {
-        let fingerprint = {
+        let current_fingerprint = {
             let trust = self.trust.lock().await;
             let record = trust
                 .record(server_id)
                 .ok_or_else(|| format!("服务器 {server_id} 没有信任记录"))?;
             record.fingerprint.clone()
         };
+        let fingerprint = fingerprint.unwrap_or(&current_fingerprint);
         {
             let mut exemptions = self.exemptions.lock().await;
-            exemptions.revoke(&ExemptionKey::new(server_id, &fingerprint, dispatch_name));
+            exemptions.revoke(&ExemptionKey::new(server_id, fingerprint, dispatch_name));
         }
         let scoped: Vec<Exemption> = self
             .exemptions
@@ -779,7 +999,9 @@ impl McpRuntime {
             .await
             .list()
             .into_iter()
-            .filter(|entry| entry.server_id == server_id && entry.fingerprint == fingerprint)
+            .filter(|entry| {
+                entry.server_id == server_id && entry.fingerprint == current_fingerprint
+            })
             .collect();
         self.trust
             .lock()
@@ -805,7 +1027,7 @@ impl McpRuntime {
             }
             let built = registry::build_executors(
                 server_id,
-                &fingerprint,
+                &current_fingerprint,
                 &remote_tools,
                 &approved,
                 session,
@@ -819,7 +1041,7 @@ impl McpRuntime {
         }
         self.emit(McpEvent::ExemptionChanged {
             server_id: server_id.to_string(),
-            fingerprint,
+            fingerprint: current_fingerprint,
             exemptions: scoped,
         });
         Ok(())
@@ -863,6 +1085,7 @@ impl McpRuntime {
                             risk,
                         })
                         .collect(),
+                    exemption_count: record.exemptions.len(),
                     reason: record.reason.clone(),
                 }
             })
@@ -1019,6 +1242,10 @@ impl McpRuntime {
             transport: input.transport.clone(),
             executable: input.executable.clone(),
             executable_sha256: input.executable_sha256.clone(),
+            executable_mtime_ms: None,
+            previous_executable_sha256: None,
+            approved_at_ms: record.map(|record| record.approved_at_ms).unwrap_or(0),
+            tools_stale: false,
             argv: input.argv.clone(),
             cwd: input.cwd.clone(),
             env: input.masked_env(),
@@ -1035,6 +1262,10 @@ impl McpRuntime {
             reason: record.and_then(|record| record.reason.clone()),
         }
     }
+}
+
+fn short_sha(value: &str) -> &str {
+    &value[..12.min(value.len())]
 }
 
 fn approved_from_record(record: &TrustRecord) -> Vec<ApprovedTool> {
@@ -1055,6 +1286,9 @@ pub struct ServerStatus {
     pub status: McpStatus,
     pub fingerprint: String,
     pub approved_tools: Vec<ApprovedToolView>,
+    /// 用户显式启用的注入豁免数量。
+    #[serde(default)]
+    pub exemption_count: usize,
     #[serde(default)]
     pub reason: Option<String>,
 }
@@ -1107,6 +1341,7 @@ mod tests {
             (McpStatus::Review, "review"),
             (McpStatus::Trusted, "trusted"),
             (McpStatus::Blocked, "blocked"),
+            (McpStatus::Retrust, "retrust"),
             (McpStatus::Degraded, "degraded"),
             (McpStatus::Failed, "failed"),
         ] {
