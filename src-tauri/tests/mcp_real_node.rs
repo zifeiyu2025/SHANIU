@@ -243,6 +243,22 @@ async fn real_node_filesystem_mixed_risk_and_denied_write() {
             .expect("已批准的工具应能注册进路由");
     }
     let write_name = writes.first().expect("至少一个写入工具").clone();
+
+    // 模型可见面 = `declarations()`，不是内部执行器表。未批准的工具必须**根本不在清单里**：
+    // 若它出现在声明中，模型会反复尝试调用，用户看到的是「模型一直报错」，
+    // 而不是「这个能力我没授权」——「不可见」和「可见但被拒」是两种体验。
+    let declared: Vec<String> = router.declarations().into_iter().map(|d| d.name).collect();
+    for write in &writes {
+        assert!(
+            !declared.contains(write),
+            "未批准的写入工具不得出现在模型可见清单: {write}"
+        );
+    }
+    eprintln!(
+        "模型可见工具 {} 个（写入工具已被排除在声明之外）",
+        declared.len()
+    );
+
     let error = router
         .execute(&write_name, json!({"path": root.join("pwned.txt").display().to_string()}), &context(&root, sink.clone()))
         .await
