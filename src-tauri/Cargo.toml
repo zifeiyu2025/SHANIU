@@ -26,6 +26,9 @@ tauri = { version = "=2.12.5", features = ["tray-icon"] }
 tauri-plugin-dialog = "2"
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
+# SH-072 view_image：PNG/JPEG 解码 + 长边缩放（MIT/Apache-2.0）。
+# 只用得到这两个格式，关掉默认 features 避免把 webp/tiff 等解码器一起编进来。
+image = { version = "0.25", default-features = false, features = ["png", "jpeg"] }
 ulid = "3"
 base64 = "0.22"                    # SH-092：UI 预览字节窗口过 IPC（MIT/Apache-2.0，lock 里已有同版本）
 toml = "1.2"

@@ -387,6 +387,8 @@ pub struct ToolContext {
     pub reads: Option<Arc<ReadRegistry>>,
     /// 写日志（SH-126）：写工具登记、自愈闭环判定「是否靠改测试变绿」。
     pub writes: Option<Arc<WriteJournal>>,
+    /// 会话级图片预算（SH-072）：`view_image` 的张数/字节上限。
+    pub images: Option<Arc<std::sync::Mutex<crate::tools::view_image::ImageBudget>>>,
 }
 
 impl ToolContext {
@@ -409,6 +411,7 @@ impl ToolContext {
             orchestrator: None,
             reads: None,
             writes: None,
+            images: None,
         }
     }
 
@@ -450,6 +453,15 @@ impl ToolContext {
     /// 注入写日志（SH-126）：写工具登记、自愈闭环消费。
     pub fn with_writes(mut self, writes: Arc<WriteJournal>) -> Self {
         self.writes = Some(writes);
+        self
+    }
+
+    /// 注入会话级图片预算（SH-072）：`view_image` 的张数与字节上限按会话累计。
+    pub fn with_images(
+        mut self,
+        images: Arc<std::sync::Mutex<crate::tools::view_image::ImageBudget>>,
+    ) -> Self {
+        self.images = Some(images);
         self
     }
 }

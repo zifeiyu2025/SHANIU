@@ -82,6 +82,8 @@ pub fn risk_of(tool_name: &str) -> RiskLevel {
         // 结果按不可信内容包裹回填。按只读档，免审批（用户已明确不新增打断点）。
         // web_fetch：只读公开 http(s) 页面，私网/非文本在抓取前直拒；同样免审批但留审计。
         "web_search" | "web_fetch" => RiskLevel::Read,
+        // view_image（SH-072）：只读工作区内图片；工作区外的路径在工具层直接拒绝。
+        "view_image" => RiskLevel::Read,
         "apply_patch" => RiskLevel::WriteInWorkspace,
         "unified_exec" => RiskLevel::Execute,
         // terminal（SH-070，docs/02 ADR-106）：能起任意进程且是持久会话，按执行档。
@@ -406,6 +408,7 @@ mod tests {
         assert_eq!(risk_of("web_search"), RiskLevel::Read);
         // web_fetch：只读公开页面，私网/非文本在抓取前直拒
         assert_eq!(risk_of("web_fetch"), RiskLevel::Read);
+        assert_eq!(risk_of("view_image"), RiskLevel::Read);
     }
 
     #[test]
@@ -643,6 +646,7 @@ mod tests {
         assert!(plan_mode_allows("search"));
         assert!(plan_mode_allows("web_search"));
         assert!(plan_mode_allows("web_fetch"));
+        assert!(plan_mode_allows("view_image"));
         // 计划态列 todo 是上游规划工作流的形态（清单就是规划产物）
         assert!(plan_mode_allows("todo_write"));
         assert!(plan_mode_allows("exit_plan_mode"));

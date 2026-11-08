@@ -11,7 +11,7 @@ use eventsource_stream::{Event, Eventsource};
 use futures::{Stream, StreamExt};
 use serde::{Deserialize, Serialize};
 
-use provider::ProviderConfig;
+pub use provider::ProviderConfig;
 
 // ============================== 协议类型（纯数据，可测试） ==============================
 

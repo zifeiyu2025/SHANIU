@@ -430,6 +430,10 @@ impl AgentLoop {
         let read_registry = Arc::new(crate::tool_router::ReadRegistry::new());
         // SH-126：本次任务共享一份写日志——写工具登记，自愈闭环据此判定「是否靠改测试变绿」。
         let write_journal = Arc::new(crate::tool_router::WriteJournal::new());
+        // SH-072：本次任务共享一份图片预算——view_image 的张数/字节上限按会话累计。
+        let image_budget = Arc::new(std::sync::Mutex::new(
+            crate::tools::view_image::ImageBudget::default(),
+        ));
         // 自上次失败以来发生过的写入（恢复窗口内），命令重新通过时结算。
         let mut pending_writes: Vec<crate::tool_router::FileWrite> = Vec::new();
         // SH-125：失败自愈状态机（每任务一份，跨 turn 累积重试次数与错误签名）。
@@ -818,6 +822,7 @@ impl AgentLoop {
                 .with_jobs(session_id.clone(), self.jobs.clone())
                 .with_reads(read_registry.clone())
                 .with_writes(write_journal.clone())
+                .with_images(image_budget.clone())
                 .with_scope(scope.clone());
                 // 只有 root（depth=0）拿到编排能力；子代理沿用 scope 但无 orchestrator，
                 // 分发层会拒绝它调用编排工具（第二层深度门控）。
@@ -907,6 +912,20 @@ impl AgentLoop {
                     call_id: call_id.clone(),
                     output: output_text.clone(),
                 });
+                // SH-072：view_image 的图片以引用形式回填成一条用户消息——Chat 协议不允许
+                // 图片挂在 tool 消息里，模型只能从用户消息里看到它。字节取自进程内缓存，
+                // 历史里只有 ImageRef（rollout 因此不会变大）。
+                if let Ok(out) = &result {
+                    if out.success {
+                        if let Some(image) = crate::tools::view_image::attachment(&out.output) {
+                            history.push(HistoryItem::ImageMessage {
+                                role: crate::model_client::Role::User,
+                                text: format!("[view_image] {}", image.path),
+                                images: vec![image],
+                            });
+                        }
+                    }
+                }
                 // SH-126：把本次调用的写入搬进本地缓冲。写日志本身是 take 语义，
                 // 不搬走就会被下一次写入覆盖掉一半判定依据。
                 pending_writes.extend(write_journal.take());

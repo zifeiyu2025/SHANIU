@@ -13,6 +13,7 @@ pub mod skill;
 pub mod terminal;
 pub mod todo;
 pub mod unified_exec;
+pub mod view_image;
 pub mod web;
 
 use std::sync::Arc;
@@ -45,4 +46,7 @@ pub fn register_builtin(router: &mut ToolRouter, plan_state: Arc<PlanState>) {
     let chain: Arc<dyn web::SearchProvider> = Arc::new(web::Bing::new(web_client.clone()));
     router.register(Arc::new(web::WebSearch::new(chain)));
     router.register(Arc::new(web::WebFetch::new(web_client)));
+
+    // SH-072：看工作区内的图片。只读；字节只进进程内缓存，会话档案只落引用。
+    router.register(Arc::new(view_image::ViewImage::new()));
 }
