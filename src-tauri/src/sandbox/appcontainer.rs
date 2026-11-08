@@ -157,10 +157,15 @@ impl AppContainer {
 
 /// `internetClient` 能力 SID（仅当会话级网络授权被批准时使用）。
 pub fn internet_client_capability() -> Result<Sid, String> {
-    let text = wide(INTERNET_CLIENT_SID);
+    capability_sid(INTERNET_CLIENT_SID)
+}
+
+/// 把 SID 文本解析成能力 SID（测试与其它能力用；调用方负责生命周期）。
+pub fn capability_sid(text_sid: &str) -> Result<Sid, String> {
+    let text = wide(text_sid);
     let mut sid = PSID(std::ptr::null_mut());
     unsafe { ConvertStringSidToSidW(PCWSTR(text.as_ptr()), &mut sid) }
-        .map_err(|e| format!("解析能力 SID {INTERNET_CLIENT_SID} 失败: {e}"))?;
+        .map_err(|e| format!("解析能力 SID {text_sid} 失败: {e}"))?;
     Ok(Sid::new(sid, SidMem::LocalAlloc))
 }
 

@@ -166,11 +166,15 @@ fn spawn_in_app_container(
     let runtime = guard.as_mut().expect("刚初始化的沙箱运行时");
 
     // ACE 只加三类位置：工作区根 / temp / 工具链目录；授权对象是容器 SID。
-    for dir in acl::write_scope(request.workspace_root) {
-        runtime
-            .acl
-            .grant_write(&dir, runtime.container.sid())
-            .map_err(SandboxError::CreateFailed)?;
+    // 每个工作区根在进程内只解析一次 scope：重复 exec 不再碰 DACL（见 docs/04 §1.5）。
+    if !runtime.resolved_roots.contains(request.workspace_root) {
+        for dir in acl::write_scope(request.workspace_root) {
+            runtime
+                .acl
+                .grant(&dir, runtime.container.sid(), acl::Access::Write)
+                .map_err(SandboxError::CreateFailed)?;
+        }
+        runtime.resolved_roots.insert(request.workspace_root.to_path_buf());
     }
 
     let capabilities = match request.network {
@@ -193,6 +197,8 @@ struct Runtime {
     container: appcontainer::AppContainer,
     acl: acl::AclManager,
     capability_internet: appcontainer::Sid,
+    /// 已经解析过写权限 scope 的工作区根：同一进程内重复 exec 不再碰 DACL。
+    resolved_roots: std::collections::HashSet<std::path::PathBuf>,
     /// 退出时是否删除 profile：本进程创建，或接管了上次异常退出留下的备份。
     owns_profile: bool,
 }
@@ -212,7 +218,13 @@ fn build_runtime() -> Result<Runtime, SandboxError> {
     let capability_internet = appcontainer::internet_client_capability()
         .map_err(SandboxError::CreateFailed)?;
     let owns_profile = container.created() || recovered > 0;
-    Ok(Runtime { container, acl, capability_internet, owns_profile })
+    Ok(Runtime {
+        container,
+        acl,
+        capability_internet,
+        resolved_roots: std::collections::HashSet::new(),
+        owns_profile,
+    })
 }
 
 /// 进程退出时调用：先还原 DACL，再删除自己创建的容器 profile。
@@ -250,6 +262,8 @@ pub struct SandboxStatus {
     pub os: &'static str,
     /// 是否真的启用了 OS 级隔离；false 时 UI 必须常驻标注。
     pub os_enabled: bool,
+    /// 容器 profile 名（UI 常驻展示"跑的到底是哪个容器"）；logical 模式为空串。
+    pub profile: String,
     pub note: String,
 }
 
@@ -274,6 +288,10 @@ pub fn status(mode: SandboxMode, os: OsSandbox) -> SandboxStatus {
         },
         os: os_name,
         os_enabled,
+        profile: match os {
+            OsSandbox::AppContainer => appcontainer::PROFILE_NAME.to_string(),
+            OsSandbox::Logical => String::new(),
+        },
         note: note.to_string(),
     }
 }

@@ -9,6 +9,7 @@
 
 use std::io;
 use std::os::windows::process::ExitStatusExt;
+use std::path::Path;
 use std::process::{ExitStatus, Stdio};
 use std::time::Duration;
 
@@ -61,6 +62,208 @@ fn shell_reader_program(command: &str) -> Option<&'static str> {
     }
     let program = words.get(index)?.trim_matches('"').trim_end_matches(".exe");
     SHELL_READERS.iter().copied().find(|known| *known == program)
+}
+
+/// 依赖卷信息、在 AppContainer 下会静默退出的 cmd 命令（SH-021 实测：退出码 1、零输出）。
+const VOLUME_DEPENDENT: &[&str] = &["dir", "vol", "tree"];
+
+/// 认出「依赖卷信息」的命令程序名（None = 不是这类命令）。
+///
+/// 与 `shell_reader_program` 同一解析口径：只看被执行的**第一条命令**，
+/// 允许 `cmd /c ...` / `cmd /k ...` 外壳。
+fn volume_dependent_program(command: &str) -> Option<&'static str> {
+    let lower = command.to_ascii_lowercase();
+    let words: Vec<&str> = lower.split_whitespace().collect();
+    let mut index = 0;
+    if matches!(words.first().copied(), Some("cmd" | "cmd.exe")) {
+        index = words
+            .iter()
+            .position(|word| matches!(*word, "/c" | "/k" | "-c" | "-command"))
+            .map(|at| at + 1)
+            .unwrap_or(0);
+    }
+    let program = words.get(index)?.trim_matches('"').trim_end_matches(".exe");
+    VOLUME_DEPENDENT.iter().copied().find(|known| *known == program)
+}
+
+/// 一次「纯 `dir` 列举」请求。
+#[derive(Debug, PartialEq, Eq)]
+struct DirListing {
+    target: String,
+    /// `/b`：只输出名字，一行一个。
+    bare: bool,
+    /// `/a`：包含隐藏/系统项（cmd 默认不显示）。
+    show_all: bool,
+}
+
+const DIR_FALLBACK_LIMIT: usize = 500;
+const FILE_ATTRIBUTE_HIDDEN: u32 = 0x2;
+const FILE_ATTRIBUTE_SYSTEM: u32 = 0x4;
+
+/// 按引号切词；引号不配对返回 None（无法安全判定形态）。
+fn split_words(line: &str) -> Option<Vec<String>> {
+    let mut words = Vec::new();
+    let mut current = String::new();
+    let mut quoted = false;
+    for ch in line.chars() {
+        match ch {
+            '"' => quoted = !quoted,
+            c if c.is_whitespace() && !quoted => {
+                if !current.is_empty() {
+                    words.push(std::mem::take(&mut current));
+                }
+            }
+            c => current.push(c),
+        }
+    }
+    if quoted {
+        return None;
+    }
+    if !current.is_empty() {
+        words.push(current);
+    }
+    Some(words)
+}
+
+/// 识别可以安全等价替代的 `dir` 形态（SH-021 降级处理）。
+///
+/// 只接单条、无管道/重定向/串接的 `dir`：`dir`、`dir /b`、`dir /a sub`、`dir "a b"`。
+/// `/s` 递归、多目标、其他开关一律返回 None（交回真实 shell；失败时仍有空输出提示兜底），
+/// 避免自造一套与 cmd 不一致的语义。
+fn dir_listing(command: &str) -> Option<DirListing> {
+    let trimmed = command.trim();
+    if trimmed.contains(['&', '|', '>', '<', '^']) {
+        return None;
+    }
+    let mut words = split_words(trimmed)?;
+    if words.is_empty() {
+        return None;
+    }
+    if words[0].eq_ignore_ascii_case("cmd") || words[0].eq_ignore_ascii_case("cmd.exe") {
+        if words.len() < 3 || !matches!(words[1].to_ascii_lowercase().as_str(), "/c" | "/k") {
+            return None;
+        }
+        words.drain(0..2);
+    }
+    let program = words[0].trim_end_matches(".exe");
+    if !program.eq_ignore_ascii_case("dir") {
+        return None;
+    }
+    let mut bare = false;
+    let mut show_all = false;
+    let mut target: Option<String> = None;
+    for word in &words[1..] {
+        if word.starts_with('/') || word.starts_with('-') {
+            let switch = word[1..].to_ascii_lowercase();
+            // 带限定符的开关（/a:d、/o:s…）语义不同，别假装等价。
+            if switch.contains(':') {
+                return None;
+            }
+            match switch.as_str() {
+                "a" => show_all = true,
+                "b" => bare = true,
+                "w" | "q" | "x" | "4" | "n" | "l" | "d" | "o" | "t" => {}
+                _ => return None,
+            }
+            continue;
+        }
+        // `dir a b` 是多目标列举，语义不同，不替代。
+        if target.is_some() {
+            return None;
+        }
+        target = Some(word.clone());
+    }
+    Some(DirListing {
+        target: target.unwrap_or_else(|| ".".to_string()),
+        bare,
+        show_all,
+    })
+}
+
+fn is_hidden(meta: &std::fs::Metadata) -> bool {
+    use std::os::windows::fs::MetadataExt;
+    meta.file_attributes() & (FILE_ATTRIBUTE_HIDDEN | FILE_ATTRIBUTE_SYSTEM) != 0
+}
+
+/// 宿主侧等价列举（只读；作用域仍由 `resolve_in_workspace` 限制在工作区内）。
+///
+/// 输出**明确标注是替代实现**，不假装是 cmd 的原样输出；空目录也给计数行，
+/// 保证模型不会拿到一片空白。
+fn render_dir_listing(full: &Path, request: &DirListing) -> ToolOutput {
+    let mut entries: Vec<(String, bool, u64)> = Vec::new();
+    if full.is_file() {
+        let name = full
+            .file_name()
+            .map(|name| name.to_string_lossy().to_string())
+            .unwrap_or_else(|| full.display().to_string());
+        let size = std::fs::metadata(full).map(|meta| meta.len()).unwrap_or(0);
+        entries.push((name, false, size));
+    } else {
+        let read = match std::fs::read_dir(full) {
+            Ok(read) => read,
+            Err(error) => {
+                return ToolOutput::fail(format!("列举目录失败: {}: {error}", full.display()));
+            }
+        };
+        for entry in read {
+            let entry = match entry {
+                Ok(entry) => entry,
+                Err(error) => {
+                    return ToolOutput::fail(format!(
+                        "列举目录失败: {}: {error}",
+                        full.display()
+                    ));
+                }
+            };
+            let file_type = entry.file_type().ok();
+            let meta = entry.metadata().ok();
+            if !request.show_all {
+                if let Some(meta) = meta.as_ref() {
+                    if is_hidden(meta) {
+                        continue;
+                    }
+                }
+            }
+            let is_dir = file_type.map(|kind| kind.is_dir()).unwrap_or(false);
+            let size = meta.as_ref().map(|meta| meta.len()).unwrap_or(0);
+            entries.push((entry.file_name().to_string_lossy().to_string(), is_dir, size));
+        }
+    }
+    entries.sort_by_key(|(name, _, _)| name.to_ascii_lowercase());
+
+    let dirs = entries.iter().filter(|(_, is_dir, _)| *is_dir).count();
+    let files = entries.len() - dirs;
+    let total: u64 = entries.iter().map(|(_, _, size)| *size).sum();
+    let shown = entries.len().min(DIR_FALLBACK_LIMIT);
+
+    let mut text = String::new();
+    if request.bare {
+        for (name, _, _) in entries.iter().take(shown) {
+            text.push_str(name);
+            text.push('\n');
+        }
+    } else {
+        text.push_str(&format!(
+            "{} 的目录（shaniu 等价列举：容器内 cmd 的 dir 依赖卷信息，AppContainer 下不可用）\n",
+            full.display()
+        ));
+        for (name, is_dir, size) in entries.iter().take(shown) {
+            if *is_dir {
+                text.push_str(&format!("<DIR>  {name}\n"));
+            } else {
+                text.push_str(&format!("{size:>10} B  {name}\n"));
+            }
+        }
+    }
+    text.push_str(&format!(
+        "[共 {dirs} 个目录，{files} 个文件，{total} 字节{}]",
+        if entries.len() > shown {
+            format!("；其余 {} 项未显示", entries.len() - shown)
+        } else {
+            String::new()
+        }
+    ));
+    ToolOutput::ok(text)
 }
 
 impl Default for UnifiedExec {
@@ -244,6 +447,21 @@ impl ToolExecutor for UnifiedExec {
             .and_then(|v| v.as_bool())
             .unwrap_or(false);
 
+        // SH-021 降级处理：AppContainer 内 cmd 的 `dir` 依赖卷信息，会静默退出（退出码 1、零输出）。
+        // `dir` 是模型最常用的列举方式，静默空结果会被误判成"沙箱坏了"再绕路，
+        // 所以在容器模式下把纯 `dir` 列举翻成宿主侧只读列举（仍受工作区根约束）。
+        if !run_in_background
+            && ctx.sandbox == crate::config::SandboxMode::WorkspaceWrite
+            && sandbox::current_os_mode() == crate::config::OsSandbox::AppContainer
+        {
+            if let Some(request) = dir_listing(command) {
+                if let Ok(full) = resolve_in_workspace(&ctx.workspace_root, &request.target) {
+                    return Ok(render_dir_listing(&full, &request));
+                }
+                // 目标在工作区外：交回真实 shell，交给沙箱策略裁决（不在这里替它放行）。
+            }
+        }
+
         // stdio 行通道（Plain=tokio 读任务 / Restricted=std 读线程，统一回传）
         let (tx, mut rx) = mpsc::channel::<sandbox::ExecLine>(256);
 
@@ -353,11 +571,22 @@ impl ToolExecutor for UnifiedExec {
                         }
                     }
                     let code = status.code().unwrap_or(-1);
+                    let silent_failure = code != 0 && collected.is_empty() && truncated_note.is_none();
                     let mut text = collected.join("\n");
                     if let Some(note) = truncated_note {
                         text.push_str(note.as_str());
                     }
                     text.push_str(&format!("\n[exit code: {code}]"));
+                    // SH-021 降级处理：卷信息类命令在容器里会「失败且零输出」，
+                    // 不解释的话模型会误判成沙箱损坏。这里明确说清原因与替代做法。
+                    if silent_failure {
+                        if let Some(program) = volume_dependent_program(command) {
+                            text.push_str(&format!(
+                                "\n[提示] `{program}` 在 AppContainer 内依赖卷信息，以退出码 {code} 静默退出（零输出）——\
+                                 这不是沙箱损坏。列目录请改用 list_dir 工具，或在容器内用 `for %f in (*) do @echo %f`。"
+                            ));
+                        }
+                    }
                     // SH-126①：`type`/`cat`/`Get-Content` 这类读文件形态，提示一次改用 read_file。
                     if let Some(hint) = self.read_file_hint(ctx, command) {
                         text.push_str(&hint);
@@ -581,6 +810,105 @@ mod tests {
             tokio::time::sleep(Duration::from_millis(50)).await;
         }
         assert_eq!(registry.read(&id, "s1", None).unwrap().job.status, "killed");
+        std::fs::remove_dir_all(&ws).ok();
+    }
+
+    #[test]
+    fn dir_listing_parser_accepts_only_simple_forms() {
+        assert_eq!(
+            dir_listing("dir"),
+            Some(DirListing { target: ".".into(), bare: false, show_all: false })
+        );
+        assert_eq!(
+            dir_listing("dir /b"),
+            Some(DirListing { target: ".".into(), bare: true, show_all: false })
+        );
+        assert_eq!(
+            dir_listing("DIR /A \"my dir\""),
+            Some(DirListing { target: "my dir".into(), bare: false, show_all: true })
+        );
+        assert_eq!(
+            dir_listing("cmd /c dir src /w"),
+            Some(DirListing { target: "src".into(), bare: false, show_all: false })
+        );
+        // 语义不同或无法安全等价的一律交回真实 shell（失败时还有空输出提示兜底）
+        assert_eq!(dir_listing("dir /s"), None);
+        assert_eq!(dir_listing("dir /a:d"), None);
+        assert_eq!(dir_listing("dir | findstr x"), None);
+        assert_eq!(dir_listing("dir a b"), None);
+        assert_eq!(dir_listing("echo dir"), None);
+        assert_eq!(dir_listing("dir \"unbalanced"), None);
+    }
+
+    #[test]
+    fn volume_dependent_commands_are_recognized() {
+        assert_eq!(volume_dependent_program("dir"), Some("dir"));
+        assert_eq!(volume_dependent_program("cmd /C vol"), Some("vol"));
+        assert_eq!(volume_dependent_program("TREE.EXE"), Some("tree"));
+        assert_eq!(volume_dependent_program("echo dir"), None);
+        assert_eq!(volume_dependent_program("cargo run -- dir"), None);
+    }
+
+    /// 回归锁（SH-021 降级）：容器内 `dir` 不能静默返回空——必须有真实列举。
+    #[tokio::test]
+    async fn dir_lists_real_entries_instead_of_silent_empty() {
+        let ws = workspace();
+        std::fs::write(ws.join("alpha.txt"), "12345").unwrap();
+        std::fs::create_dir_all(ws.join("nested")).unwrap();
+        let out = UnifiedExec::new()
+            .execute(serde_json::json!({"command": "dir"}), &ctx(&ws))
+            .await
+            .unwrap();
+        assert!(out.success, "dir 替代列举应成功：{}", out.output);
+        assert!(out.output.contains("alpha.txt"), "{}", out.output);
+        assert!(out.output.contains("nested"), "{}", out.output);
+        assert!(out.output.contains("等价列举"), "应明确标注是替代实现：{}", out.output);
+        assert!(out.output.contains("1 个目录，1 个文件"), "应给出计数：{}", out.output);
+        std::fs::remove_dir_all(&ws).ok();
+    }
+
+    #[tokio::test]
+    async fn dir_on_empty_dir_reports_counts_not_nothing() {
+        let ws = workspace();
+        let out = UnifiedExec::new()
+            .execute(serde_json::json!({"command": "dir"}), &ctx(&ws))
+            .await
+            .unwrap();
+        assert!(out.success, "{}", out.output);
+        assert!(!out.output.trim().is_empty(), "空目录也不许返回零字节");
+        assert!(out.output.contains("0 个目录，0 个文件"), "{}", out.output);
+        std::fs::remove_dir_all(&ws).ok();
+    }
+
+    #[tokio::test]
+    async fn dir_bare_lists_names_without_detail_columns() {
+        let ws = workspace();
+        std::fs::write(ws.join("alpha.txt"), "x").unwrap();
+        std::fs::create_dir_all(ws.join("nested")).unwrap();
+        let out = UnifiedExec::new()
+            .execute(serde_json::json!({"command": "dir /b"}), &ctx(&ws))
+            .await
+            .unwrap();
+        assert!(out.success, "{}", out.output);
+        assert!(out.output.contains("alpha.txt"), "{}", out.output);
+        assert!(out.output.contains("nested"), "{}", out.output);
+        assert!(!out.output.contains("<DIR>"), "/b 不应输出明细列：{}", out.output);
+        std::fs::remove_dir_all(&ws).ok();
+    }
+
+    /// 未被替代的卷信息形态（如 `/s`）也不许静默：要么真实输出，要么失败并解释原因。
+    #[tokio::test]
+    async fn unintercepted_dir_never_fails_silently() {
+        let ws = workspace();
+        let out = UnifiedExec::new()
+            .execute(serde_json::json!({"command": "dir /s"}), &ctx(&ws))
+            .await
+            .unwrap();
+        assert!(
+            !out.success && out.output.contains("这不是沙箱损坏"),
+            "dir /s 不允许失败且零解释：{:?}",
+            out.output
+        );
         std::fs::remove_dir_all(&ws).ok();
     }
 

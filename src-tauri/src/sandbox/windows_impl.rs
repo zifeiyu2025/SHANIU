@@ -27,9 +27,9 @@ use windows::Win32::Foundation::{
     CloseHandle, HANDLE, HANDLE_FLAGS, HANDLE_FLAG_INHERIT, SetHandleInformation,
 };
 use windows::Win32::Security::{
-    CreateRestrictedToken, GetTokenInformation, LUID_AND_ATTRIBUTES, SECURITY_ATTRIBUTES,
-    SECURITY_CAPABILITIES, SE_PRIVILEGE_REMOVED, SID_AND_ATTRIBUTES, TOKEN_ACCESS_MASK,
-    TOKEN_PRIVILEGES, TokenPrivileges, PSID,
+    CreateRestrictedToken, GetTokenInformation, LUID_AND_ATTRIBUTES,
+    SECURITY_ATTRIBUTES, SECURITY_CAPABILITIES, SE_PRIVILEGE_REMOVED, SID_AND_ATTRIBUTES,
+    TOKEN_ACCESS_MASK, TOKEN_PRIVILEGES, TokenPrivileges, PSID,
 };
 use windows::Win32::System::JobObjects::{
     AssignProcessToJobObject, CreateJobObjectW, SetInformationJobObject,
@@ -110,6 +110,10 @@ unsafe fn open_current_token() -> Result<HandleGuard, String> {
 }
 
 /// 枚举令牌全部特权 → SE_PRIVILEGE_REMOVED 删除清单。
+///
+/// 5b 现场核对过：祖先目录的遍历不依赖 `SeChangeNotifyPrivilege`——
+/// 叶子目录授权后，删掉全部特权也能在容器内列出/读取/写入（见
+/// `appcontainer_leaf_grant_allows_list_read_write_then_revoke_denies`）。
 unsafe fn privileges_to_remove(token: HANDLE) -> Result<Vec<LUID_AND_ATTRIBUTES>, String> {
     let mut needed = 0u32;
     let _ = GetTokenInformation(
@@ -356,7 +360,7 @@ pub fn spawn_appcontainer_command(
         let mut attributes = AttrList::new(3)?;
         attributes.set_handle_list(vec![out_write.handle(), err_write.handle()])?;
         attributes.set_job(job_guard.handle())?;
-        attributes.set_security_capabilities(app_container_sid, capabilities)?;
+        attributes.set_security_capabilities(app_container_sid, &capabilities)?;
 
         let mut startup = STARTUPINFOEXW::default();
         startup.StartupInfo.cb = std::mem::size_of::<STARTUPINFOEXW>() as u32;
@@ -679,13 +683,13 @@ impl AttrList {
     fn set_security_capabilities(
         &mut self,
         app_container_sid: PSID,
-        capabilities: Vec<PSID>,
+        capabilities: &[PSID],
     ) -> Result<(), String> {
         const SE_GROUP_ENABLED: u32 = 0x0000_0004;
         self.capabilities = capabilities
-            .into_iter()
+            .iter()
             .map(|sid| SID_AND_ATTRIBUTES {
-                Sid: sid,
+                Sid: *sid,
                 Attributes: SE_GROUP_ENABLED,
             })
             .collect();
@@ -1050,12 +1054,23 @@ fn spawn_stderr_reader(mut read: std::fs::File, tail: Arc<Mutex<StderrTail>>) {
     });
 }
 
+/// 启动身份：决定用哪几层隔离（沙箱机制与身份一一对应）。
+#[derive(Clone, Copy)]
+enum StdioIdentity<'a> {
+    /// 删除全部特权的受限令牌 + Job + 句柄白名单（默认）。
+    RestrictedToken,
+    /// 逐服务器显式豁免（X10）：仅 Job + 句柄白名单。
+    Unsandboxed,
+    /// AppContainer + 受限令牌 + Job + 句柄白名单（SH-064 5a）。
+    AppContainer { sid: PSID, capabilities: &'a [PSID] },
+}
+
 struct StdioSpawnSpec<'a> {
     program: &'a str,
     args: &'a [&'a str],
     cwd: &'a Path,
     env: &'a BTreeMap<String, String>,
-    sandboxed: bool,
+    identity: StdioIdentity<'a>,
     max_line_bytes: usize,
 }
 
@@ -1067,13 +1082,16 @@ fn spawn_stdio(spec: &StdioSpawnSpec<'_>, tx: mpsc::Sender<StdioEvent>) -> Resul
     let application_wide = wide(&resolved);
     let cwd_wide = wide(spec.cwd.as_os_str());
     let environment_block = build_environment_block(&env);
-    let mode = if spec.sandboxed { "受限令牌 + Job" } else { "未沙箱（显式豁免）" };
+    let mode = match spec.identity {
+        StdioIdentity::RestrictedToken => "受限令牌 + Job",
+        StdioIdentity::Unsandboxed => "未沙箱（显式豁免）",
+        StdioIdentity::AppContainer { .. } => "AppContainer + 受限令牌 + Job",
+    };
 
     unsafe {
-        let token = if spec.sandboxed {
-            Some(create_restricted_token()?)
-        } else {
-            None
+        let token = match spec.identity {
+            StdioIdentity::Unsandboxed => None,
+            _ => Some(create_restricted_token()?),
         };
 
         // Job：KILL_ON_JOB_CLOSE，随句柄关闭收掉整棵树。
@@ -1100,13 +1118,21 @@ fn spawn_stdio(spec: &StdioSpawnSpec<'_>, tx: mpsc::Sender<StdioEvent>) -> Resul
         }
 
         // 白名单只含三条子端句柄；未列出的可继承句柄不会进入子进程。
-        let mut attributes = AttrList::new(2)?;
+        let attributes_count = if matches!(spec.identity, StdioIdentity::AppContainer { .. }) {
+            3
+        } else {
+            2
+        };
+        let mut attributes = AttrList::new(attributes_count)?;
         attributes.set_handle_list(vec![
             stdin_read.handle(),
             stdout_write.handle(),
             stderr_write.handle(),
         ])?;
         attributes.set_job(job_guard.handle())?;
+        if let StdioIdentity::AppContainer { sid, capabilities } = spec.identity {
+            attributes.set_security_capabilities(sid, capabilities)?;
+        }
 
         let mut startup = STARTUPINFOEXW::default();
         startup.StartupInfo.cb = std::mem::size_of::<STARTUPINFOEXW>() as u32;
@@ -1205,7 +1231,37 @@ pub fn spawn_restricted_stdio(
             args,
             cwd,
             env,
-            sandboxed: true,
+            identity: StdioIdentity::RestrictedToken,
+            max_line_bytes: MAX_MCP_STDIO_LINE_BYTES,
+        },
+        tx,
+    )
+}
+
+/// 以「AppContainer + 删除全部特权的受限令牌 + Job Object + 句柄白名单」启动 MCP stdio server。
+///
+/// `capabilities` 为空 = 不授予 `internetClient`，出站网络由容器边界默认拒绝；
+/// 只在会话级网络授权批准时传 `internet_client_capability()`。
+/// 目录访问由 `acl` 按容器 SID 授权，未授权的路径在容器内不可读写。
+pub fn spawn_appcontainer_stdio(
+    program: &str,
+    args: &[&str],
+    cwd: &Path,
+    env: &BTreeMap<String, String>,
+    app_container_sid: PSID,
+    capabilities: &[PSID],
+    tx: mpsc::Sender<StdioEvent>,
+) -> Result<RestrictedStdioChild, String> {
+    spawn_stdio(
+        &StdioSpawnSpec {
+            program,
+            args,
+            cwd,
+            env,
+            identity: StdioIdentity::AppContainer {
+                sid: app_container_sid,
+                capabilities,
+            },
             max_line_bytes: MAX_MCP_STDIO_LINE_BYTES,
         },
         tx,
@@ -1227,7 +1283,7 @@ pub fn spawn_unsandboxed_stdio(
             args,
             cwd,
             env,
-            sandboxed: false,
+            identity: StdioIdentity::Unsandboxed,
             max_line_bytes: MAX_MCP_STDIO_LINE_BYTES,
         },
         tx,
@@ -1249,7 +1305,7 @@ fn spawn_restricted_stdio_with_max_line(
             args,
             cwd,
             env,
-            sandboxed: true,
+            identity: StdioIdentity::RestrictedToken,
             max_line_bytes,
         },
         tx,
@@ -1542,6 +1598,207 @@ mod stdio_tests {
         }
         println!("PROBE:{}", if leaked { "LEAKED" } else { "BLOCKED" });
     }
+
+    // ------------------------------ AppContainer stdio（SH-064 5a） ------------------------------
+
+    /// 容器 + 已按容器 SID 授权的工作目录。
+    ///
+    /// `cmd` 的内建命令会校验当前目录是否可访问（否则报「当前目录无效。」），
+    /// 所以 cwd 必须先有容器 SID 的 ACE——这本身也是 5b「按 (path,SID) 授权」的输入。
+    fn container_fixture(
+        tag: &str,
+    ) -> (
+        crate::sandbox::appcontainer::AppContainer,
+        PathBuf,
+        crate::sandbox::acl::AclManager,
+    ) {
+        container_fixture_with(tag, crate::sandbox::acl::Access::Write)
+    }
+
+    fn container_fixture_with(
+        tag: &str,
+        access: crate::sandbox::acl::Access,
+    ) -> (
+        crate::sandbox::appcontainer::AppContainer,
+        PathBuf,
+        crate::sandbox::acl::AclManager,
+    ) {
+        let name = format!("Shaniu.Mcp.Test.{}.{}", std::process::id(), tag);
+        let container = crate::sandbox::appcontainer::AppContainer::ensure_named(&name)
+            .expect("测试用 AppContainer profile 应可创建");
+        let dir = temp_dir();
+        let mut acl = crate::sandbox::acl::AclManager::new(dir.join(".acl-backup"));
+        acl.grant(&dir, container.sid(), access)
+            .expect("应能给测试目录授予容器 SID 的 ACE");
+        (container, dir, acl)
+    }
+
+    fn container_teardown(
+        container: crate::sandbox::appcontainer::AppContainer,
+        dir: PathBuf,
+        mut acl: crate::sandbox::acl::AclManager,
+    ) {
+        if let Err(error) = acl.restore_all() {
+            eprintln!("清理测试目录 DACL 失败: {error}");
+        }
+        if let Err(error) = container.delete() {
+            eprintln!("清理测试 profile 失败: {error}");
+        }
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn appcontainer_stdio_round_trips_stdin() {
+        use std::io::Write as _;
+        let (container, dir, acl) = container_fixture("stdin");
+        let (tx, mut rx) = mpsc::channel(64);
+        let mut child = spawn_appcontainer_stdio(
+            "cmd",
+            &["/C", "sort"],
+            &dir,
+            &BTreeMap::new(),
+            container.sid(),
+            &[],
+            tx,
+        )
+        .expect("容器内应能启动 sort");
+        let mut stdin = child.take_stdin().expect("应有 stdin 写端");
+        stdin.write_all(b"beta\nalpha\n").unwrap();
+        stdin.flush().unwrap();
+        // 关写端 → sort 收到 EOF 才输出。
+        drop(stdin);
+        let (lines, errors) = drain(&mut rx, Duration::from_secs(30));
+        let (stderr, _) = child.stderr_tail();
+        drop(child);
+        container_teardown(container, dir, acl);
+        assert!(errors.is_empty(), "{errors:?}");
+        let body: Vec<&str> = lines
+            .iter()
+            .map(|line| line.trim())
+            .filter(|line| !line.is_empty())
+            .collect();
+        assert_eq!(body, vec!["alpha", "beta"], "stdin 往返结果不符: {lines:?}；stderr={stderr}");
+    }
+
+    #[test]
+    fn appcontainer_job_close_kills_child() {
+        let (container, dir, acl) = container_fixture("job");
+        let args = ["/C", "ping -n 60 127.0.0.1 >nul"];
+        let (tx, _rx) = mpsc::channel(16);
+        let child =
+            spawn_appcontainer_stdio("cmd", &args, &dir, &BTreeMap::new(), container.sid(), &[], tx)
+                .expect("容器内应能启动 cmd");
+        let pid = child.pid();
+        assert!(process_alive(pid), "子进程一开始就不在运行: {pid}");
+        drop(child); // Job 句柄关闭 → KILL_ON_JOB_CLOSE 收树
+        let deadline = Instant::now() + Duration::from_secs(10);
+        while Instant::now() < deadline && process_alive(pid) {
+            std::thread::sleep(Duration::from_millis(50));
+        }
+        let alive = process_alive(pid);
+        container_teardown(container, dir, acl);
+        assert!(!alive, "Job 关闭后容器内子进程 {pid} 仍在运行（孤儿）");
+    }
+
+    /// 只读档：能列能读，写入必须失败（Q2 默认姿态）。
+    #[test]
+    fn appcontainer_read_only_grant_allows_read_but_denies_write() {
+        let (container, dir, acl) = container_fixture_with(
+            "readonly",
+            crate::sandbox::acl::Access::Read,
+        );
+        std::fs::write(dir.join("probe.txt"), b"hello-leaf").unwrap();
+
+        let reading = run_container_cmd(container.sid(), &dir, &["/C", "type probe.txt"]);
+        let writing = run_container_cmd(container.sid(), &dir, &["/C", "echo nope> denied.txt"]);
+        println!("[只读] 读文件 {reading:?}");
+        println!("[只读] 写文件 {writing:?}");
+
+        assert_eq!(reading.2, 0, "只读档应能读: {reading:?}");
+        assert!(reading.0.contains("hello-leaf"));
+        assert_ne!(writing.2, 0, "只读档不应能写: {writing:?}");
+        assert!(!dir.join("denied.txt").exists(), "只读档下容器写入了文件");
+
+        container_teardown(container, dir, acl);
+    }
+
+    /// 在容器里跑一条 `cmd` 命令，返回（stdout, stderr, 退出码）。
+    fn run_container_cmd(sid: PSID, cwd: &Path, args: &[&str]) -> (String, String, i32) {
+        let (tx, mut rx) = mpsc::channel(64);
+        let mut child =
+            match spawn_appcontainer_stdio("cmd", args, cwd, &BTreeMap::new(), sid, &[], tx) {
+                Ok(child) => child,
+                // 启动失败（例如 cwd 连打开都不允许）：直接用错误文本当 stderr。
+                Err(error) => return (String::new(), error, -2),
+            };
+        let (lines, errors) = drain(&mut rx, Duration::from_secs(30));
+        let (stderr, _) = child.stderr_tail();
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .expect("测试用 tokio runtime");
+        let code = runtime.block_on(child.wait()).unwrap_or(-3);
+        (lines.join("\n"), format!("{stderr}{}", errors.join("\n")), code)
+    }
+
+    /// 5b 决定性验证：**只**给叶子目录加 ACE → 容器内能列、能读、能写 → 撤销后立刻不能。
+    ///
+    /// 列表用 `for %f in (*)` 而不是 `dir`：`dir` 在 AppContainer 内依赖卷信息，
+    /// 即使 ACL 正确也报「拒绝访问。」（实测 `dir C:\Windows` 同样失败），
+    /// 生产路径已有宿主侧列举兜底（见 unified_exec 的 dir_listing）。
+    #[test]
+    fn appcontainer_leaf_grant_allows_list_read_write_then_revoke_denies() {
+        let (container, dir, mut acl) = container_fixture("leafio");
+        std::fs::write(dir.join("probe.txt"), b"hello-leaf").unwrap();
+
+        let listing = run_container_cmd(container.sid(), &dir, &["/C", "for %f in (*) do @echo %f"]);
+        let reading = run_container_cmd(container.sid(), &dir, &["/C", "type probe.txt"]);
+        let writing = run_container_cmd(container.sid(), &dir, &["/C", "echo written> out.txt"]);
+        let written = std::fs::read_to_string(dir.join("out.txt")).ok();
+        println!("[授权后] 列目录 {listing:?}");
+        println!("[授权后] 读文件 {reading:?}");
+        println!("[授权后] 写文件 {writing:?} → 宿主读到 {written:?}");
+
+        assert_eq!(listing.2, 0, "容器内列目录失败: {listing:?}");
+        assert!(
+            listing.0.contains("probe.txt"),
+            "容器内列目录看不到文件: {listing:?}"
+        );
+        assert_eq!(reading.2, 0, "容器内读文件失败: {reading:?}");
+        assert!(reading.0.contains("hello-leaf"), "读取内容不符: {reading:?}");
+        assert_eq!(writing.2, 0, "容器内写文件失败: {writing:?}");
+        assert_eq!(written.as_deref(), Some("written\r\n"), "宿主看不到容器写入的内容");
+
+        // 撤销 (路径, SID) → 立刻不能读、不能写、不能列。
+        assert!(acl.revoke(&dir, container.sid()).expect("撤销应成功"));
+        let reading_after = run_container_cmd(container.sid(), &dir, &["/C", "type probe.txt"]);
+        let writing_after = run_container_cmd(container.sid(), &dir, &["/C", "echo nope> denied.txt"]);
+        let listing_after = run_container_cmd(container.sid(), &dir, &["/C", "for %f in (*) do @echo %f"]);
+        println!("[撤销后] 读文件 {reading_after:?}");
+        println!("[撤销后] 写文件 {writing_after:?}");
+        println!("[撤销后] 列目录 {listing_after:?}");
+
+        assert_ne!(reading_after.2, 0, "撤销后容器内仍能读: {reading_after:?}");
+        assert!(
+            !reading_after.0.contains("hello-leaf"),
+            "撤销后仍读到内容: {reading_after:?}"
+        );
+        assert_ne!(writing_after.2, 0, "撤销后容器内仍能写: {writing_after:?}");
+        assert!(!dir.join("denied.txt").exists(), "撤销后容器仍写入了文件");
+        // `for` 会吞掉枚举错误：撤销后退出码仍可能是 0，但目录对容器变成「空」。
+        assert!(
+            !listing_after.0.contains("probe.txt"),
+            "撤销后容器内仍能列目录: {listing_after:?}"
+        );
+
+        container_teardown(container, dir, acl);
+    }
+
+    // 句柄白名单与 argv 逐项转义的容器版验证延到 5d：
+    //  · 该代码路径与受限令牌路径共用（`set_handle_list`），已由既有用例覆盖。
+    //  · argv 转义是 `build_command_line` 的纯函数，已由 `quoted_args_follow_command_line_rules`
+    //    锁定；容器路径复用它，没有第二套拼装逻辑。
+    // 真机（5d）补容器内越界读写、断网/放行与 DACL 精确撤销。
 
     /// 真机：父进程关闭 Job 句柄后，server 派生的孙进程也必须消失。
     #[ignore = "真机用例：需要 PowerShell；验证 Job 关闭即杀树"]

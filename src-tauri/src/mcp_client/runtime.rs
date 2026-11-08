@@ -515,7 +515,8 @@ impl McpRuntime {
                 files: tree.files,
                 bytes: tree.bytes,
             }),
-        );
+        )
+        .with_workspace_access(config.workspace_access);
         let fingerprint = input.fingerprint();
         let fresh_grants = trust::grants_from_plan(&plan);
         let session = Arc::new(Mutex::new(session));

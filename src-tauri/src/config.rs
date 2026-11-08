@@ -306,6 +306,16 @@ impl AppConfig {
                     server.id
                 ));
             }
+            if server.allowed_roots.len() > MAX_ALLOWED_ROOTS {
+                return Err(format!(
+                    "MCP server {} 的 allowed_roots 超过上限 {MAX_ALLOWED_ROOTS} 条（拒绝无限扩张）",
+                    server.id
+                ));
+            }
+            for root in &server.allowed_roots {
+                validate_allowed_root(&root.path)
+                    .map_err(|error| format!("MCP server {} 的 allowed_roots 非法：{error}", server.id))?;
+            }
             for (key, value) in &server.env {
                 if key.trim().is_empty() || key.contains('=') || key.contains('\0') {
                     return Err(format!("MCP server {} 的环境变量名非法：{:?}", server.id, key));
@@ -733,6 +743,103 @@ pub struct McpServerConfig {
     /// 是否允许该 server 访问网络（默认拒绝，C-R4）。v1 若底层未实现网络策略，
     /// 该项只是声明值，残余风险按 §3.1.9 如实记录，不得声称已拦截。
     pub allow_network: bool,
+    /// 目录级授权清单（Q2）：默认空 = 只能读工作区。
+    /// 每一项都要经过 [`validate_allowed_root`]；拒绝名单内的路径不许写进配置。
+    pub allowed_roots: Vec<AllowedRoot>,
+    /// 该 server 对工作区的访问档（Q3）：默认 `read`。**进指纹**，
+    /// 改成 `write` 会得到新指纹并要求重新批准。
+    pub workspace_access: WorkspaceAccess,
+}
+
+/// 目录级授权档位（Q2：默认只读，显式升级为可写）。
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum WorkspaceAccess {
+    #[default]
+    Read,
+    Write,
+}
+
+impl WorkspaceAccess {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            WorkspaceAccess::Read => "read",
+            WorkspaceAccess::Write => "write",
+        }
+    }
+}
+
+/// 一条用户勾选的目录授权。
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct AllowedRoot {
+    pub path: String,
+    #[serde(default)]
+    pub access: WorkspaceAccess,
+}
+
+/// 单个 server 的目录授权条数上限（Q1：超出拒绝新增，不无限建）。
+pub const MAX_ALLOWED_ROOTS: usize = 16;
+
+/// 校验并规范化用户勾选的目录（Q2 三道硬约束）：
+/// 1. 必须是**规范化绝对路径**，含 `..` 一律拒绝（不做「解析后等价」的宽容判断）；
+/// 2. 驱动器根、`%SystemRoot%`、`Program Files*`、用户 profile 根直接进拒绝名单；
+/// 3. 目录必须真实存在。
+pub fn validate_allowed_root(raw: &str) -> Result<std::path::PathBuf, String> {
+    use std::path::{Component, PathBuf};
+
+    let trimmed = raw.trim();
+    if trimmed.is_empty() {
+        return Err("目录路径不能为空".into());
+    }
+    if trimmed.contains('\0') {
+        return Err("目录路径含 NUL 字符".into());
+    }
+    let path = PathBuf::from(trimmed);
+    if !path.is_absolute() {
+        return Err(format!("授权目录必须是绝对路径：{trimmed}"));
+    }
+    if path.components().any(|c| matches!(c, Component::ParentDir)) {
+        return Err(format!("授权目录不能包含 `..`：{trimmed}"));
+    }
+    let canonical = std::fs::canonicalize(&path)
+        .map_err(|error| format!("授权目录无法解析（{trimmed}）：{error}"))?;
+    let text = canonical.to_string_lossy();
+    let canonical = PathBuf::from(text.strip_prefix(r"\\?\").unwrap_or(&text));
+    if !canonical.is_dir() {
+        return Err(format!("授权路径不是目录：{}", canonical.display()));
+    }
+    if let Some(reason) = denied_root_reason(&canonical) {
+        return Err(format!("该路径在拒绝名单内（{reason}），不能授权：{}", canonical.display()));
+    }
+    Ok(canonical)
+}
+
+/// 拒绝名单判定（返回拒绝原因；`None` = 允许）。
+fn denied_root_reason(path: &std::path::Path) -> Option<&'static str> {
+    if path.parent().is_none() {
+        return Some("驱动器根目录");
+    }
+    let text = path.to_string_lossy().to_lowercase();
+    if let Some(root) = std::env::var_os("SystemRoot") {
+        let root = std::path::PathBuf::from(root).to_string_lossy().to_lowercase();
+        if text == root || text.starts_with(&format!("{root}\\")) {
+            return Some("系统目录 %SystemRoot%");
+        }
+    }
+    if let Some(home) = std::env::var_os("USERPROFILE") {
+        let home = std::path::PathBuf::from(home).to_string_lossy().to_lowercase();
+        if text == home {
+            return Some("用户 profile 根目录");
+        }
+    }
+    let segments: Vec<&str> = text.split('\\').collect();
+    if segments
+        .iter()
+        .any(|segment| *segment == "program files" || *segment == "program files (x86)")
+    {
+        return Some("Program Files");
+    }
+    None
 }
 
 impl Default for McpServerConfig {
@@ -748,6 +855,8 @@ impl Default for McpServerConfig {
             unsandboxed: false,
             unsandboxed_reason: String::new(),
             allow_network: false,
+            allowed_roots: Vec::new(),
+            workspace_access: WorkspaceAccess::Read,
         }
     }
 }
@@ -915,28 +1024,253 @@ pub fn resolve_dirs_from_env() -> DataDirs {
     )
 }
 
+/// 启动加载的处置结果：调用方据此决定是否进入「配置只读」模式。
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum ConfigLoadOutcome {
+    /// 配置干净，无需动作。
+    Clean,
+    /// 已剔除写串键并写回；`backup` 是修复前的原文件快照。
+    Repaired { backup: PathBuf, removed: Vec<String> },
+    /// 无法安全修复：**磁盘文件一个字节未动**，调用方必须禁止再写回，
+    /// 并把 `reason`（含路径）告诉用户。
+    ReadOnly { reason: String },
+}
+
+/// 一次启动加载的完整结果（配置 + 路径 + 处置）。
+pub struct LoadedConfig {
+    pub config: AppConfig,
+    pub path: PathBuf,
+    pub outcome: ConfigLoadOutcome,
+}
+
 impl AppConfig {
     /// 加载 `config.toml`；不存在则写入默认配置并返回（fail-closed：解析失败即报错）。
     pub fn load_or_create(config_root: &Path) -> Result<(Self, PathBuf), String> {
+        let loaded = Self::load_or_create_diagnosed(config_root);
+        match loaded.outcome {
+            ConfigLoadOutcome::ReadOnly { reason } => Err(reason),
+            _ => Ok((loaded.config, loaded.path)),
+        }
+    }
+
+    /// 启动加载 + **一次性修复**已写坏的配置（串段键）。
+    ///
+    /// 只做一种自动修复：`reasoning_efforts` 里出现非档位键（`path` / `title` 这类
+    /// 别的 section 的键）。流程固定为「备份 → 剔除 → 写回 → 记日志」，任一步失败
+    /// 都退回只读，**绝不覆盖无法确认可用的文件**。
+    ///
+    /// 幂等：修完的配置不再含写串键，下一次启动命中 `Clean`、不再产生备份。
+    pub fn load_or_create_diagnosed(config_root: &Path) -> LoadedConfig {
         let path = config_root.join(CONFIG_FILE);
+        let read_only = |reason: String| LoadedConfig {
+            config: Self::default(),
+            path: path.clone(),
+            outcome: ConfigLoadOutcome::ReadOnly { reason },
+        };
+
         if let Some(parent) = path.parent() {
-            fs::create_dir_all(parent).map_err(|e| format!("创建配置目录失败: {e}"))?;
+            if let Err(error) = fs::create_dir_all(parent) {
+                return read_only(format!(
+                    "创建配置目录失败: {error}（配置文件：{}）",
+                    path.display()
+                ));
+            }
         }
         if !path.exists() {
             let default = Self::default();
-            default.save(&path)?;
-            return Ok((default, path));
+            return match default.save(&path) {
+                Ok(()) => LoadedConfig { config: default, path, outcome: ConfigLoadOutcome::Clean },
+                Err(error) => LoadedConfig {
+                    config: Self::default(),
+                    path,
+                    outcome: ConfigLoadOutcome::ReadOnly { reason: error },
+                },
+            };
         }
-        let raw = fs::read_to_string(&path).map_err(|e| format!("读取配置失败: {e}"))?;
-        let cfg: Self = toml::from_str(&raw).map_err(|e| format!("解析配置失败: {e}"))?;
-        cfg.validate_loaded()?;
-        Ok((cfg, path))
+
+        let raw = match fs::read_to_string(&path) {
+            Ok(raw) => raw,
+            Err(error) => {
+                return read_only(format!("读取配置失败: {error}（配置文件：{}）", path.display()))
+            }
+        };
+        let mut cfg: Self = match toml::from_str(&raw) {
+            Ok(cfg) => cfg,
+            Err(error) => {
+                return read_only(format!(
+                    "解析配置失败: {error}（文件未被改动：{}）",
+                    path.display()
+                ))
+            }
+        };
+        if let Err(error) = cfg.validate_loaded() {
+            return read_only(format!("{error}（文件未被改动：{}）", path.display()));
+        }
+
+        let stray = cfg.stray_reasoning_keys();
+        if stray.is_empty() {
+            return LoadedConfig { config: cfg, path, outcome: ConfigLoadOutcome::Clean };
+        }
+
+        // 修复前先备份；备份失败就不改文件（没有备份更不该写）。
+        let Some(backup) = backup_original(&path) else {
+            return read_only(format!(
+                "配置里有写串键（{}），但备份原文件失败，已拒绝自动修复（文件未被改动：{}）",
+                stray.join("；"),
+                path.display()
+            ));
+        };
+        cfg.strip_stray_reasoning_keys();
+        match cfg.save(&path) {
+            Ok(()) => {
+                tracing::warn!(
+                    config = %path.display(),
+                    backup = %backup.display(),
+                    removed = %stray.join("；"),
+                    "配置已自动修复：剔除了不属于 [providers.models.reasoning_efforts] 的键（原文件已备份）"
+                );
+                LoadedConfig {
+                    config: cfg,
+                    path,
+                    outcome: ConfigLoadOutcome::Repaired { backup, removed: stray },
+                }
+            }
+            Err(error) => read_only(format!(
+                "剔除写串键（{}）后仍无法写回：{error}；配置文件：{}",
+                stray.join("；"),
+                path.display()
+            )),
+        }
     }
 
+    /// 写盘。**先自检、再原子替换**：配置写坏会静默覆盖用户配置，比写失败严重得多。
+    ///
+    /// 两道写前检查：
+    ///  1. `[providers.models.reasoning_efforts]` 的键必须全部是推理档位名。实测过
+    ///     一起真实事故：该表里出现了 `path` / `title`（`[[workspaces]]` 的键），
+    ///     而模型档位只剩这两个键——用户的推理档声明被覆盖，界面上看着"没配档位"。
+    ///  2. 序列化结果反序列化回来必须与内存逐字段相等。section 归属错、丢键、值
+    ///     类型漂移都会让这一条不成立。
+    ///
+    /// 任一条不过就**拒绝落盘**，并把磁盘上的原文件备份成 `config.toml.bak-<ms>`
+    /// 供取证；原文件本身一个字节都不动。
     pub fn save(&self, path: &Path) -> Result<(), String> {
+        let stray = self.stray_reasoning_keys();
+        if !stray.is_empty() {
+            return Err(self.refuse_write(
+                path,
+                format!(
+                    "[providers.models.reasoning_efforts] 里出现了非推理档位的键：{}。\
+                     该表只允许 {} / {}。这是「别的 section 被写串」的典型形态，\
+                     继续写盘会把用户的推理档声明抹掉",
+                    stray.join("、"),
+                    THINKING_LEVELS.join("/"),
+                    "（推荐先删掉这些键再保存）",
+                ),
+            ));
+        }
+
         let body = toml::to_string_pretty(self).map_err(|e| format!("序列化配置失败: {e}"))?;
-        fs::write(path, body).map_err(|e| format!("写入配置失败: {e}"))
+        let back: Self = toml::from_str(&body).map_err(|e| {
+            self.refuse_write(path, format!("序列化结果无法解析回 AppConfig：{e}（拒绝落盘，否则下次启动直接读不回来）"))
+        })?;
+        if back != *self {
+            return Err(self.refuse_write(
+                path,
+                "序列化结果与内存配置不一致：section 归属或字段丢失（拒绝落盘）".to_string(),
+            ));
+        }
+
+        // 原子替换：先写同目录临时文件再 rename。直接 fs::write 中途崩溃会留下
+        // 半截 config.toml——下次启动读不回来，用户看到的就是"配置全没了"。
+        // 临时名跟着目标文件名走，不固定成 config.toml：并发写不同目标（测试里
+        // 每个用例一份）时固定名会互相抢同一个临时文件。
+        let base = path
+            .file_name()
+            .and_then(|name| name.to_str())
+            .unwrap_or(CONFIG_FILE);
+        let seq = TMP_SEQ.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        let tmp = path.with_file_name(format!("{base}.tmp-{}-{seq}", std::process::id()));
+        fs::write(&tmp, &body).map_err(|e| {
+            let _ = fs::remove_file(&tmp);
+            format!("写入配置失败: {e}")
+        })?;
+        if let Err(error) = fs::rename(&tmp, path) {
+            let _ = fs::remove_file(&tmp);
+            return Err(format!("替换配置失败: {error}"));
+        }
+        Ok(())
     }
+
+    /// 档位表里不属于 `THINKING_LEVELS` 的键（`服务商/模型: 键` 形态，供报错与取证）。
+    fn stray_reasoning_keys(&self) -> Vec<String> {
+        let mut out = Vec::new();
+        for provider in &self.providers {
+            for row in &provider.models {
+                let keys: Vec<&str> = row
+                    .reasoning_efforts
+                    .keys()
+                    .map(String::as_str)
+                    .filter(|key| !THINKING_LEVELS.contains(key))
+                    .collect();
+                if !keys.is_empty() {
+                    out.push(format!("{}/{}: {}", provider.id, row.id, keys.join(", ")));
+                }
+            }
+        }
+        out
+    }
+
+    /// 剔除档位表里不属于 `THINKING_LEVELS` 的键（一次性修复用；返回剔除条数）。
+    fn strip_stray_reasoning_keys(&mut self) -> usize {
+        let mut removed = 0usize;
+        for provider in &mut self.providers {
+            for row in &mut provider.models {
+                let before = row.reasoning_efforts.len();
+                row.reasoning_efforts
+                    .retain(|key, _| THINKING_LEVELS.contains(&key.as_str()));
+                removed += before - row.reasoning_efforts.len();
+            }
+        }
+        removed
+    }
+
+    /// 拒绝落盘时的统一处理：备份磁盘原文件（存在才备份），拼出可操作的错误。
+    /// 备份失败也照样拒绝——**没有备份就更不能写**。
+    fn refuse_write(&self, path: &Path, reason: String) -> String {
+        match backup_original(path) {
+            Some(backup) => format!(
+                "{reason}。已拒绝写入，原文件备份在 {}",
+                backup.display()
+            ),
+            None => format!("{reason}。已拒绝写入（原文件不存在或备份失败，因此一个字节都没动）"),
+        }
+    }
+}
+
+/// 配置原子写的临时文件序号：同一毫秒内并发 save 也不互相抢同一个临时文件。
+static TMP_SEQ: AtomicU64 = AtomicU64::new(0);
+
+/// 拒绝落盘前把磁盘上的原文件复制一份（`config.toml.bak-<毫秒>`，重名则加序号）。
+/// 备份只为取证：原文件本身不会被改写。
+fn backup_original(path: &Path) -> Option<PathBuf> {
+    if !path.is_file() {
+        return None;
+    }
+    let ms = SystemTime::now().duration_since(UNIX_EPOCH).ok()?.as_millis();
+    for attempt in 0..10 {
+        let name = if attempt == 0 {
+            format!("{CONFIG_FILE}.bak-{ms}")
+        } else {
+            format!("{CONFIG_FILE}.bak-{ms}-{attempt}")
+        };
+        let candidate = path.with_file_name(name);
+        if candidate.exists() {
+            continue;
+        }
+        return fs::copy(path, &candidate).ok().map(|_| candidate);
+    }
+    None
 }
 
 /// 单调会话 ID（M3 rollout 接入后换正式 ULID/UUID）。
@@ -1722,6 +2056,57 @@ mod provider_tests {
 
     // ---- 推理档（SH-096）----
 
+    /// 串段守卫：真实事故是 `[[workspaces]]` 的 `path` / `title` 落进了
+    /// `[providers.models.reasoning_efforts]`，用户的推理档声明被这两个键顶掉。
+    /// 写盘前必须拦下、原文件一个字节不动，并留一份备份用于取证。
+    #[test]
+    fn stray_reasoning_keys_are_refused_and_original_is_backed_up() {
+        let base = std::env::temp_dir().join(format!("shaniu-stray-{}", std::process::id()));
+        fs::create_dir_all(&base).unwrap();
+        let path = base.join(CONFIG_FILE);
+        let mut listed = profile("longcat", "https://lc/v1", "LongCat-2.5");
+        listed.models = vec![effort_row("LongCat-2.5")];
+        let good = AppConfig {
+            providers: vec![listed],
+            active_provider: "longcat".into(),
+            ..Default::default()
+        };
+        good.save(&path).unwrap();
+        // 原子替换：成功路径不许留下临时文件
+        assert!(
+            !fs::read_dir(&base).unwrap().any(|e| e
+                .map(|e| e.file_name().to_string_lossy().contains(".tmp-"))
+                .unwrap_or(false)),
+            "成功落盘后不应残留临时文件"
+        );
+        let before = fs::read_to_string(&path).unwrap();
+
+        let mut polluted = good.clone();
+        polluted.providers[0].models[0].reasoning_efforts = [
+            ("path".to_string(), r"\\?\D:\tmp\ws2".to_string()),
+            ("title".to_string(), "ws2".to_string()),
+        ]
+        .into_iter()
+        .collect();
+        let err = polluted.save(&path).unwrap_err();
+        assert!(err.contains("path") && err.contains("title"), "报错要点名串进来的键: {err}");
+        assert_eq!(
+            fs::read_to_string(&path).unwrap(),
+            before,
+            "拒绝落盘时原文件必须一个字节都不变"
+        );
+
+        let backups: Vec<String> = fs::read_dir(&base)
+            .unwrap()
+            .filter_map(|entry| entry.ok())
+            .map(|entry| entry.file_name().to_string_lossy().to_string())
+            .filter(|name| name.contains(".bak-"))
+            .collect();
+        assert_eq!(backups.len(), 1, "拒绝落盘必须留一份原文件备份: {backups:?}");
+        assert_eq!(fs::read_to_string(base.join(&backups[0])).unwrap(), before);
+        fs::remove_dir_all(&base).ok();
+    }
+
     fn effort_row(id: &str) -> ModelProfile {
         let mut r = row(id);
         // off 的 wire 值是空串（不发字段）；其余档位给非空 wire 值
@@ -1733,6 +2118,94 @@ mod provider_tests {
         .into_iter()
         .collect();
         r
+    }
+
+    // ---- 启动一次性修复（2026-11-08）----
+
+    /// 盘上已经坏的配置必须能自愈一次：备份 → 剔除 → 写回；第二次启动不再动作。
+    #[test]
+    fn stray_keys_on_disk_are_repaired_once_and_backed_up() {
+        let base = std::env::temp_dir().join(format!("shaniu-repair-{}", std::process::id()));
+        fs::remove_dir_all(&base).ok();
+        fs::create_dir_all(&base).unwrap();
+        let path = base.join(CONFIG_FILE);
+
+        let mut listed = profile("longcat", "https://lc/v1", "LongCat-2.5");
+        listed.models = vec![effort_row("LongCat-2.5")];
+        let mut cfg = AppConfig {
+            providers: vec![listed],
+            active_provider: "longcat".into(),
+            ..Default::default()
+        };
+        cfg.providers[0].models[0].reasoning_efforts.insert("path".into(), r"\\?\D:\tmp\ws2".into());
+        cfg.providers[0].models[0].reasoning_efforts.insert("title".into(), "ws2".into());
+        // 模拟"上一版写坏的盘上文件"：绕过 save 的自检，直接序列化落盘
+        fs::write(&path, toml::to_string_pretty(&cfg).unwrap()).unwrap();
+
+        let first = AppConfig::load_or_create_diagnosed(&base);
+        let (backup, removed) = match &first.outcome {
+            ConfigLoadOutcome::Repaired { backup, removed } => (backup.clone(), removed.clone()),
+            other => panic!("坏配置必须被修复，实际: {other:?}"),
+        };
+        assert_eq!(removed.len(), 1, "一个模型行里的写串键聚合为一条: {removed:?}");
+        assert!(
+            removed[0].contains("path") && removed[0].contains("title"),
+            "必须点名剔掉的键: {removed:?}"
+        );
+        assert!(backup.exists(), "修复前必须先备份原文件");
+        assert!(
+            fs::read_to_string(&backup).unwrap().contains("ws2"),
+            "备份必须是修复前的原样"
+        );
+
+        let repaired = &first.config.providers[0].models[0].reasoning_efforts;
+        assert_eq!(
+            repaired.keys().cloned().collect::<Vec<_>>(),
+            vec!["high".to_string(), "low".to_string(), "off".to_string()],
+            "只保留合法档位键"
+        );
+        let raw = fs::read_to_string(&path).unwrap();
+        assert!(!raw.contains(r"\\?\D:\tmp\ws2") && !raw.contains("title = \"ws2\""), "写回后不许再带写串键: {raw}");
+
+        // 幂等：第二次启动不再修复、不再产生新备份
+        let second = AppConfig::load_or_create_diagnosed(&base);
+        assert_eq!(second.outcome, ConfigLoadOutcome::Clean, "二次启动不应再触发修复");
+        let backups = fs::read_dir(&base)
+            .unwrap()
+            .filter_map(|e| e.ok())
+            .filter(|e| e.file_name().to_string_lossy().contains(".bak-"))
+            .count();
+        assert_eq!(backups, 1, "二次启动不应新增备份文件");
+        fs::remove_dir_all(&base).ok();
+    }
+
+    /// 修不了（解析就失败）必须进只读：原文件一个字节不动，并给出路径。
+    #[test]
+    fn unparseable_config_is_left_untouched_and_reported_read_only() {
+        let base = std::env::temp_dir().join(format!("shaniu-readonly-{}", std::process::id()));
+        fs::remove_dir_all(&base).ok();
+        fs::create_dir_all(&base).unwrap();
+        let path = base.join(CONFIG_FILE);
+        let broken = "[model]\nbase_url = 123\n";
+        fs::write(&path, broken).unwrap();
+
+        let loaded = AppConfig::load_or_create_diagnosed(&base);
+        match &loaded.outcome {
+            ConfigLoadOutcome::ReadOnly { reason } => {
+                assert!(reason.contains(&path.display().to_string()), "只读原因必须带路径: {reason}");
+                assert!(reason.contains("未被改动"), "必须说明文件未被改动: {reason}");
+            }
+            other => panic!("解析失败必须进只读，实际: {other:?}"),
+        }
+        assert_eq!(fs::read_to_string(&path).unwrap(), broken, "不可修复时原文件必须保持不变");
+        assert!(
+            !fs::read_dir(&base)
+                .unwrap()
+                .filter_map(|e| e.ok())
+                .any(|e| e.file_name().to_string_lossy().contains(".bak-")),
+            "没有修复动作就不该产生备份"
+        );
+        fs::remove_dir_all(&base).ok();
     }
 
     #[test]
@@ -1924,6 +2397,35 @@ mod mcp_config_tests {
         assert!(!d.unsandboxed, "X10：默认必须走沙箱");
         assert!(!d.allow_network, "C-R4：网络默认拒绝");
         assert!(d.unsandboxed_reason.is_empty());
+        assert!(d.allowed_roots.is_empty(), "Q2：默认没有任何目录授权");
+        assert_eq!(d.workspace_access, WorkspaceAccess::Read, "Q3：工作区默认只读");
+    }
+
+    #[test]
+    fn allowed_root_validation_rejects_relative_parent_and_denied_paths() {
+        assert!(validate_allowed_root("relative\\dir").is_err(), "相对路径必须拒绝");
+        assert!(validate_allowed_root(r"C:\a\..\b").is_err(), "含 `..` 一律拒绝");
+
+        let drive_root = format!("{}\\", std::env::var("SystemDrive").unwrap_or_else(|_| "C:".into()));
+        assert!(validate_allowed_root(&drive_root).is_err(), "驱动器根必须拒绝");
+
+        if let Ok(system_root) = std::env::var("SystemRoot") {
+            assert!(validate_allowed_root(&system_root).is_err(), "系统目录必须拒绝");
+        }
+        if let Ok(home) = std::env::var("USERPROFILE") {
+            assert!(validate_allowed_root(&home).is_err(), "用户 profile 根必须拒绝");
+        }
+        assert!(
+            validate_allowed_root(r"C:\Program Files").is_err(),
+            "Program Files 必须拒绝"
+        );
+
+        let allowed = std::env::temp_dir();
+        assert!(
+            validate_allowed_root(&allowed.to_string_lossy()).is_ok(),
+            "普通目录应允许：{}",
+            allowed.display()
+        );
     }
 
     #[test]

@@ -61,6 +61,10 @@ pub struct FingerprintInput {
     /// 模块代码树摘要。`None`（非解释器型）时整个字段不进规范输入，旧指纹保持不变。
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub module_tree: Option<ModuleTreeDigest>,
+    /// 工作区访问档（Q3）。`None` = 默认只读，**不进规范输入**，旧批准保持有效；
+    /// 只有显式升级为 `write` 才改变身份并触发重新批准。
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub workspace_access: Option<String>,
 }
 
 impl FingerprintInput {
@@ -104,7 +108,17 @@ impl FingerprintInput {
             server_version: server_version.to_string(),
             tools: tool_names,
             module_tree,
+            workspace_access: None,
         }
+    }
+
+    /// 把工作区访问档并入身份：`read`（默认）不改变指纹，`write` 视为身份变化。
+    pub fn with_workspace_access(mut self, access: crate::config::WorkspaceAccess) -> Self {
+        self.workspace_access = match access {
+            crate::config::WorkspaceAccess::Read => None,
+            crate::config::WorkspaceAccess::Write => Some("write".to_string()),
+        };
+        self
     }
 
     /// 规范 JSON：结构体字段顺序固定，`env` 与 `tools` 已排序，serde_json 的对象键
@@ -263,6 +277,24 @@ mod tests {
             covered.fingerprint(),
             "模块代码树变化必须改变指纹"
         );
+    }
+
+    #[test]
+    fn workspace_access_write_changes_identity_but_read_keeps_old_fingerprint() {
+        let base = input(&BTreeMap::new(), &["mcp__srv__a"]);
+        let read = base.clone().with_workspace_access(crate::config::WorkspaceAccess::Read);
+        assert_eq!(
+            base.fingerprint(),
+            read.fingerprint(),
+            "默认只读不得改变旧指纹，否则升级会无故重批"
+        );
+        let write = base.clone().with_workspace_access(crate::config::WorkspaceAccess::Write);
+        assert_ne!(
+            base.fingerprint(),
+            write.fingerprint(),
+            "把工作区改成可写必须改变身份并触发重新批准"
+        );
+        assert!(write.canonical().contains("\"workspace_access\":\"write\""));
     }
 
     #[test]
