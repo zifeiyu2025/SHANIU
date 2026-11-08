@@ -1,0 +1,191 @@
+/* SH-063 MCP 信任设置页（宿主插件样式，跟随 DSH 主题变量）。 */
+
+.mcp-trust {
+  display: flex;
+  flex-direction: column;
+  gap: 16px;
+  padding: 16px 20px 32px;
+  color: var(--dsh-text-primary, #1f2328);
+  font-size: 13px;
+}
+
+.mcp-trust-head {
+  display: flex;
+  align-items: flex-start;
+  justify-content: space-between;
+  gap: 16px;
+}
+
+.mcp-trust-head h2 {
+  margin: 0 0 6px;
+  font-size: 16px;
+  font-weight: 600;
+}
+
+.mcp-trust-desc,
+.mcp-hint {
+  margin: 4px 0;
+  color: var(--dsh-text-secondary, #5c6370);
+  line-height: 1.5;
+}
+
+.mcp-alert,
+.mcp-warn {
+  border: 1px solid var(--dsh-danger-border, #d1242f55);
+  background: var(--dsh-danger-bg, #ffebe9);
+  color: var(--dsh-danger-text, #82071e);
+  border-radius: 8px;
+  padding: 10px 12px;
+}
+
+.mcp-warn ul {
+  margin: 6px 0 0;
+  padding-left: 18px;
+}
+
+.mcp-servers,
+.mcp-tools,
+.mcp-exemptions {
+  list-style: none;
+  margin: 0;
+  padding: 0;
+  display: flex;
+  flex-direction: column;
+  gap: 10px;
+}
+
+.mcp-server,
+.mcp-tool,
+.mcp-exemption {
+  border: 1px solid var(--dsh-border-default, #d0d7de);
+  border-radius: 8px;
+  padding: 10px 12px;
+  background: var(--dsh-surface-raised, #fff);
+}
+
+.mcp-server-line {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  gap: 8px;
+}
+
+.mcp-server-cmd,
+.mcp-mono {
+  font-family: var(--dsh-font-mono, ui-monospace, SFMono-Regular, Consolas, monospace);
+  font-size: 12px;
+  color: var(--dsh-text-secondary, #5c6370);
+  word-break: break-all;
+  white-space: pre-wrap;
+}
+
+.mcp-badge {
+  border-radius: 999px;
+  padding: 1px 8px;
+  font-size: 11px;
+  line-height: 18px;
+  background: var(--dsh-surface-sunken, #eaeef2);
+}
+
+.mcp-badge-trusted {
+  background: #dafbe1;
+  color: #116329;
+}
+
+.mcp-badge-review {
+  background: #fff8c5;
+  color: #7d4e00;
+}
+
+.mcp-badge-blocked,
+.mcp-badge-failed {
+  background: #ffebe9;
+  color: #82071e;
+}
+
+.mcp-actions {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 8px;
+  margin-top: 10px;
+}
+
+.mcp-btn {
+  border: 1px solid var(--dsh-border-default, #d0d7de);
+  background: var(--dsh-surface-raised, #fff);
+  color: inherit;
+  border-radius: 6px;
+  padding: 4px 12px;
+  font-size: 12px;
+  cursor: pointer;
+}
+
+.mcp-btn:disabled {
+  opacity: 0.5;
+  cursor: default;
+}
+
+.mcp-btn-primary {
+  background: #1f6feb;
+  border-color: #1f6feb;
+  color: #fff;
+}
+
+.mcp-btn-danger {
+  color: #82071e;
+  border-color: #d1242f55;
+}
+
+.mcp-identity {
+  display: grid;
+  grid-template-columns: 160px 1fr;
+  gap: 4px 12px;
+  margin: 0;
+  padding: 10px 12px;
+  border: 1px solid var(--dsh-border-default, #d0d7de);
+  border-radius: 8px;
+}
+
+.mcp-identity dt {
+  color: var(--dsh-text-secondary, #5c6370);
+}
+
+.mcp-identity dd {
+  margin: 0;
+}
+
+.mcp-tool-head {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+}
+
+.mcp-tool-head select {
+  margin-left: auto;
+  font-size: 12px;
+  padding: 2px 6px;
+}
+
+.mcp-desc {
+  margin: 6px 0 0;
+  color: var(--dsh-text-secondary, #5c6370);
+  white-space: pre-wrap;
+}
+
+.mcp-consent {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  margin-top: 8px;
+}
+
+.mcp-exemption {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 12px;
+}
+
+.mcp-empty {
+  color: var(--dsh-text-secondary, #5c6370);
+}

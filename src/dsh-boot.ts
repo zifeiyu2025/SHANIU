@@ -74,6 +74,7 @@ import {
 } from './transport/mock'
 import { apply as brandApply, inject as brandInject } from './brand'
 import { apply as headerActionsApply, inject as headerActionsInject } from './header-actions'
+import { apply as mcpTrustApply, inject as mcpTrustInject } from './mcp-trust'
 import { apply as modelConfigApply, inject as modelConfigInject } from './model-config'
 
 export interface BootHandle {
@@ -255,6 +256,8 @@ export async function bootShaniu(container: HTMLElement, options: BootOptions = 
     { inject: modelConfigInject, apply: modelConfigApply },
     { inject: uiSettingsGeneralInject, apply: uiSettingsGeneralApply },
     { inject: uiSettingsModelsInject, apply: uiSettingsModelsApply },
+    // MCP 信任页（SH-063）：首连指纹审查 / 逐工具风险 / 撤销信任与豁免。
+    { inject: mcpTrustInject, apply: mcpTrustApply },
     { inject: uiChatInject, apply: uiChatApply },
     // 子代理泳道 UI（SH-109）：会话头目录树/面包屑切换/侧栏子会话聊天。
     // 数据面由 transport 提供 subagentCatalog/subagentTiming 投影帧。
