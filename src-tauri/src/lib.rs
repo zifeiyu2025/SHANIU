@@ -1226,6 +1226,9 @@ fn get_settings(app: tauri::AppHandle) -> Result<serde_json::Value, String> {
         "workspaceHidden": cfg.workspace.hidden,
         // 工作区展示顺序（SH-111）：空 = 未拖拽过，face 按派生序排
         "workspaceOrder": cfg.workspace.order,
+        // 配置只读（2026-11-08）：启动时坏配置修不了 → 禁止任何写回。
+        // 字符串带配置文件路径，设置页可直接展示；null = 可写。
+        "configReadOnly": state.config_read_only_reason(),
     }))
 }
 
@@ -1794,11 +1797,26 @@ pub fn run() {
     tracing::info!("data_root:   {}", dirs.data_root.display());
     tracing::info!("workspace:   {}", dirs.workspace_root().display());
 
-    let (app_config, config_path) =
-        AppConfig::load_or_create(&dirs.config_root).unwrap_or_else(|e| {
-            tracing::warn!("配置加载失败（fail-closed，使用临时默认配置）: {e}");
-            (AppConfig::default(), dirs.config_root.join(config::CONFIG_FILE))
-        });
+    // 启动加载 + 一次性修复：盘上可能留着「写串段」的旧配置（`reasoning_efforts`
+    // 里混进 path/title）。修复只做备份→剔除→写回；修不了就进只读、绝不覆盖。
+    let loaded = AppConfig::load_or_create_diagnosed(&dirs.config_root);
+    let (app_config, config_path) = (loaded.config.clone(), loaded.path.clone());
+    match &loaded.outcome {
+        config::ConfigLoadOutcome::Clean => {}
+        config::ConfigLoadOutcome::Repaired { backup, removed } => {
+            tracing::warn!(
+                backup = %backup.display(),
+                removed = %removed.join("；"),
+                "启动时修复了写串的配置：已剔除非法键并写回（原文件已备份）"
+            );
+        }
+        config::ConfigLoadOutcome::ReadOnly { reason } => {
+            tracing::error!(
+                %reason,
+                "配置无法安全加载：进入只读模式，本次运行不会写回任何配置"
+            );
+        }
+    }
 
     // SH-021/022：OS 沙箱机制与会话级网络授权的进程级装配。
     // 回退到 logical 必须是配置里显式写的——这里只负责把它标出来，绝不自动回退。
@@ -1819,9 +1837,14 @@ pub fn run() {
     // .setup 绑定 loopback 端口跑 accept 循环，gateway_info 命令回报 port/token 给前端。
     let gateway_hub = gateway::GatewayHub::new(dirs.data_root.join(config::SESSIONS_DIR));
 
+    let app_state = AppState::new(app_config, config_path, dirs.data_root.clone());
+    if let config::ConfigLoadOutcome::ReadOnly { reason } = &loaded.outcome {
+        app_state.mark_config_read_only(reason.clone());
+    }
+
     tauri::Builder::default()
         .plugin(tauri_plugin_dialog::init())
-        .manage(AppState::new(app_config, config_path, dirs.data_root.clone()))
+        .manage(app_state)
         .manage(gateway_hub.clone())
         .invoke_handler(tauri::generate_handler![
             dev_ping,

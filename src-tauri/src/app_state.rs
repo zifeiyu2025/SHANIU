@@ -13,6 +13,9 @@ use crate::tool_router::PlanState;
 pub struct AppState {
     config: RwLock<AppConfig>,
     config_path: RwLock<PathBuf>,
+    /// 配置只读原因（启动时无法安全修复的坏配置）：Some = 禁止任何写回。
+    /// 写入前不拦的话，一次保存就会把用户修不好的原文件覆盖掉。
+    config_read_only: RwLock<Option<String>>,
     /// 数据根目录（§9.3）：会话档案 rollout 与日志写在这里。
     /// 与 config_root 分开——安装模式下前者是 %LOCALAPPDATA%\SHANIU、后者是 %APPDATA%\SHANIU，
     /// 从 config_path 反推会把档案写错地方。
@@ -53,6 +56,7 @@ impl AppState {
         let state = Self {
             config: RwLock::new(config),
             config_path: RwLock::new(config_path),
+            config_read_only: RwLock::new(None),
             data_root,
             session_seq: AtomicU32::new(1),
             active_task: Mutex::new(None),
@@ -99,15 +103,36 @@ impl AppState {
         crate::config::home_dir()
     }
 
+    /// 标记配置只读（启动时坏配置无法安全修复）。之后所有写回都被拒绝，
+    /// 原因里带配置文件路径，直接回给设置页展示。
+    pub fn mark_config_read_only(&self, reason: impl Into<String>) {
+        let reason = reason.into();
+        tracing::warn!(%reason, "配置进入只读模式：不会写回任何保存");
+        *self.config_read_only.write().expect("config 只读锁中毒") = Some(reason);
+    }
+
+    /// 当前只读原因（None = 可写）。
+    pub fn config_read_only_reason(&self) -> Option<String> {
+        self.config_read_only.read().expect("config 只读锁中毒").clone()
+    }
+
     /// 更新并持久化配置（M1 的 set_model_config / set_workspace 命令复用）。
+    ///
+    /// **先落盘、成功后才改内存**：`save` 的写前自检会拒绝串段/丢字段的配置，
+    /// 若先改内存，拒绝后进程内看到的是新值、磁盘还是旧值——用户以为改好了，
+    /// 而这次运行的所有请求已经用上了那份没落盘的配置。
     pub fn update_config(&self, next: AppConfig) -> Result<(), String> {
+        if let Some(reason) = self.config_read_only_reason() {
+            return Err(format!("配置处于只读模式，已拒绝写入：{reason}"));
+        }
+        let path = self.config_path();
+        next.save(&path)?;
         {
             let mut guard = self.config.write().expect("config 锁中毒");
             *guard = next;
         }
         self.refresh_derived_policy();
-        let path = self.config_path();
-        self.config().save(&path)
+        Ok(())
     }
 
     /// 任务启动时重置会话策略（SH-120）：审批档/沙箱档回到 config，
@@ -222,6 +247,51 @@ mod tests {
         // 持久化落盘可回读
         let raw = std::fs::read_to_string(s.config_path()).unwrap();
         assert!(raw.contains("max_turns = 8"));
+        std::fs::remove_file(s.config_path()).ok();
+    }
+
+    #[test]
+    fn config_read_only_blocks_every_write() {
+        let s = state();
+        s.mark_config_read_only("解析配置失败: bad value（文件未被改动：C:\\cfg\\config.toml）");
+        let err = s.update_config(AppConfig::default()).unwrap_err();
+        assert!(err.contains("只读") && err.contains("config.toml"), "只读原因必须带路径: {err}");
+        assert!(!s.config_path().exists(), "只读模式必须一个字节都不写");
+        assert!(
+            s.config_read_only_reason().unwrap().contains("未被改动"),
+            "只读原因要能原样展示给用户"
+        );
+    }
+
+    #[test]
+    fn rejected_save_keeps_memory_and_disk_unchanged() {
+        let s = state();
+        let mut good = s.config();
+        good.model.max_turns = 9;
+        s.update_config(good).unwrap();
+        let before = std::fs::read_to_string(s.config_path()).unwrap();
+
+        // 串段形态的档位表：写前自检必须拒绝，且**先落盘后改内存**意味着
+        // 拒绝后内存里也不能留下这份坏配置
+        let mut bad = s.config();
+        let row = crate::config::ModelProfile {
+            id: "m".into(),
+            reasoning_efforts: [("path".to_string(), r"\\?\D:\tmp\ws2".to_string())]
+                .into_iter()
+                .collect(),
+            ..Default::default()
+        };
+        let provider = crate::config::ProviderProfile {
+            id: "longcat".into(),
+            models: vec![row],
+            ..Default::default()
+        };
+        bad.providers = vec![provider];
+
+        assert!(s.update_config(bad).is_err());
+        assert!(s.config().providers.is_empty(), "拒绝落盘后内存不得留下坏配置");
+        assert_eq!(s.config().model.max_turns, 9);
+        assert_eq!(std::fs::read_to_string(s.config_path()).unwrap(), before);
         std::fs::remove_file(s.config_path()).ok();
     }
 
