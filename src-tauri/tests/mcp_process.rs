@@ -54,7 +54,8 @@ async fn started_session() -> (McpSession, McpServerConfig, String) {
     // 本文件验证的是**协议语义**（握手/清单/调用/崩溃重启），不是容器隔离。
     // 本机 node 装在管理员所有的目录（改 DACL 会被拒绝访问，容器也读不到），
     // 因此显式走 `sandbox.os = "logical"` 的受限令牌路径；
-    // AppContainer 下的 MCP 启动由 `sandbox::tests::mcp_server_runs_inside_container_and_reads_workspace` 覆盖。
+    // AppContainer 下的 MCP 协议往返与边界由 `tests/mcp_sandbox.rs` 覆盖
+    // （那边会把 node 复制到用户可写的 staging 目录）。
     shaniu_lib::sandbox::set_os_mode(shaniu_lib::config::OsSandbox::Logical);
     let config = config();
     let hash = approved_hash(&config);
