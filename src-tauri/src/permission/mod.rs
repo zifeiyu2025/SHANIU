@@ -39,12 +39,14 @@ pub struct GateSubject<'a> {
     pub task_summary: Option<&'a str>,
     /// 本代理的有效工具白名单；None = 无额外限制。
     pub allowed_tools: Option<&'a ToolAllowlist>,
+    /// 工具级风险覆盖（SH-063，ADR-107）：由用户批准记录注入，`None` 时回退 `risk_of`。
+    pub risk_override: Option<RiskLevel>,
 }
 
 impl<'a> GateSubject<'a> {
     /// root 代理（无任务摘要、无白名单收窄）。
     pub fn root(agent_id: &'a str) -> Self {
-        Self { agent_id, task_summary: None, allowed_tools: None }
+        Self { agent_id, task_summary: None, allowed_tools: None, risk_override: None }
     }
 }
 
@@ -92,7 +94,8 @@ impl ApprovalBroker {
                 return GateOutcome::Forbidden;
             }
         }
-        let risk = risk_of(tool);
+        // 用户批准的工具级档位优先；MCP 未知工具没有覆盖时 risk_of 落 destructive。
+        let risk = subject.risk_override.unwrap_or_else(|| risk_of(tool));
         let remembered = self
             .remembered_execute
             .lock()
@@ -362,6 +365,7 @@ mod tests {
             agent_id: "child-1",
             task_summary: Some("只读探索"),
             allowed_tools: Some(&allowlist),
+            risk_override: None,
         };
         let out = broker
             .gate(
@@ -460,6 +464,7 @@ mod tests {
                             agent_id: "child-9",
                             task_summary: Some("统计仓库文件数"),
                             allowed_tools: None,
+                            risk_override: None,
                         },
                         GateEnv { sink: &(events as Arc<dyn EventSink>), cancel: &cancel },
                     )
@@ -485,5 +490,69 @@ mod tests {
 
         cancel.cancel();
         let _ = gate.await.unwrap();
+    }
+
+    /// SH-063 / ADR-107：用户把 MCP 工具标为 read 时，门禁按用户档位放行，
+    /// 不再因为分发名不在内置名单里就落 destructive。
+    #[tokio::test]
+    async fn risk_override_read_allows_mcp_tool_without_prompt() {
+        let broker = ApprovalBroker::new();
+        let cancel = CancellationToken::new();
+        let subject = GateSubject {
+            agent_id: "root",
+            task_summary: None,
+            allowed_tools: None,
+            risk_override: Some(RiskLevel::Read),
+        };
+        let out = broker
+            .gate(
+                "mcp__srv__read",
+                &args(),
+                "c12",
+                policy::SessionPolicy { approval: ApprovalMode::Ask, sandbox: SandboxMode::WorkspaceWrite },
+                subject,
+                GateEnv { sink: &sink(), cancel: &cancel },
+            )
+            .await;
+        assert_eq!(out, GateOutcome::Allowed);
+        assert!(!broker.has_pending("appr-c12"), "read 档不该发审批");
+    }
+
+    /// 反向：用户把任何工具标成 destructive，都必须弹审批——档位只紧不松。
+    #[tokio::test]
+    async fn risk_override_destructive_forces_prompt_even_for_read_named_tool() {
+        let broker = Arc::new(ApprovalBroker::new());
+        let cancel = CancellationToken::new();
+        let subject = GateSubject {
+            agent_id: "root",
+            task_summary: None,
+            allowed_tools: None,
+            risk_override: Some(RiskLevel::Destructive),
+        };
+        let b = broker.clone();
+        let c = cancel.clone();
+        let s = sink();
+        let gate = tokio::spawn(async move {
+            b.gate(
+                "read_file",
+                &args(),
+                "c13",
+                policy::SessionPolicy { approval: ApprovalMode::Ask, sandbox: SandboxMode::WorkspaceWrite },
+                subject,
+                GateEnv { sink: &s, cancel: &c },
+            )
+            .await
+        });
+        let mut prompted = false;
+        for _ in 0..200 {
+            if broker.has_pending("appr-c13") {
+                prompted = true;
+                assert!(broker.resolve("appr-c13", ApprovalDecision::Deny));
+                break;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+        }
+        assert!(prompted, "destructive 档必须弹审批");
+        assert_eq!(gate.await.unwrap(), GateOutcome::Denied);
     }
 }

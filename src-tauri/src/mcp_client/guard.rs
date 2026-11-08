@@ -402,6 +402,20 @@ impl ExemptionStore {
     pub fn is_empty(&self) -> bool {
         self.entries.is_empty()
     }
+
+    /// 从持久化记录恢复（SH-063：豁免与信任同库存储，启动时灌回）。
+    pub fn from_entries(entries: impl IntoIterator<Item = Exemption>) -> Self {
+        let mut store = Self::new();
+        for entry in entries {
+            let key = ExemptionKey::new(
+                entry.server_id.clone(),
+                entry.fingerprint.clone(),
+                entry.dispatch_name.clone(),
+            );
+            store.entries.insert(key, entry);
+        }
+        store
+    }
 }
 
 fn now_ms() -> u64 {

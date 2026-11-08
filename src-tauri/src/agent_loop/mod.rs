@@ -360,6 +360,8 @@ impl AgentLoop {
             agent_id: &scope.agent_id,
             task_summary: task.as_deref(),
             allowed_tools: allowed_tools.as_ref(),
+            // 工具级档位逐次取（ADR-107）：MCP 工具的风险来自用户批准记录。
+            risk_override: None,
         };
         // 实例没指定作业属主时沿用引擎的会话 id（root 的既有行为）。
         let session_id = session_id.clone().or_else(|| self.session_id.clone());
@@ -620,7 +622,14 @@ impl AgentLoop {
                     continue;
                 }
 
-                // 审批门禁（ADR-003）：裁决 → 询问回执 → 放行/拒绝
+                // 审批门禁（ADR-003）：裁决 → 询问回执 → 放行/拒绝。
+                // 风险档位优先取工具自身的（用户批准时指定，SH-063/ADR-107），
+                // 内置工具没有该字段，回退 risk_of。
+                let risk_override = self
+                    .router
+                    .get(name)
+                    .and_then(|executor| executor.spec().risk);
+                let call_subject = crate::permission::GateSubject { risk_override, ..gate_subject };
                 let args_val =
                     serde_json::from_str(arguments).unwrap_or(serde_json::Value::String(arguments.clone()));
                 match self
@@ -630,7 +639,7 @@ impl AgentLoop {
                         &args_val,
                         call_id,
                         self.policy,
-                        gate_subject,
+                        call_subject,
                         crate::permission::GateEnv { sink: &sink, cancel },
                     )
                     .await

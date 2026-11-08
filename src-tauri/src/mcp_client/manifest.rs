@@ -96,6 +96,8 @@ pub struct PlannedTool {
     /// server 提供的原始描述：注入过滤器要在原文上判定，
     /// 否则被规范化剥掉的零宽/双向控制符就失去证据（A-R2）。
     pub raw_description: String,
+    /// server 自报的注解，仅用于展示与变更检测（ADR-107：**不参与风险决策**）。
+    pub annotations: Option<Value>,
 }
 
 /// 一次清单转换的完整结果（尚未写入注册表）。
@@ -117,7 +119,7 @@ pub fn plan_registration(server_id: &str, tools: &[RemoteTool]) -> RegistrationP
     let mut plan = RegistrationPlan::default();
 
     // 1. 逐项结构校验（名称/描述/Schema）；重名在下一步统一处理。
-    let mut candidates: Vec<(usize, String, String, String, Value)> = Vec::new();
+    let mut candidates: Vec<(usize, String, String, String, Value, Option<Value>)> = Vec::new();
     let mut raw_counts: Vec<(String, usize)> = Vec::new();
     for (index, tool) in tools.iter().enumerate() {
         let raw_name = tool.name.trim().to_string();
@@ -150,6 +152,7 @@ pub fn plan_registration(server_id: &str, tools: &[RemoteTool]) -> RegistrationP
             normalized.text,
             tool.description.clone(),
             tool.input_schema.clone(),
+            tool.annotations.clone(),
         ));
     }
 
@@ -159,7 +162,7 @@ pub fn plan_registration(server_id: &str, tools: &[RemoteTool]) -> RegistrationP
         .filter(|(_, count)| *count > 1)
         .map(|(name, _)| name.clone())
         .collect();
-    candidates.retain(|(_, raw_name, _, _, _)| {
+    candidates.retain(|(_, raw_name, _, _, _, _)| {
         if duplicates.contains(raw_name) {
             plan.rejected.push(RejectedTool {
                 raw_name: raw_name.clone(),
@@ -173,7 +176,7 @@ pub fn plan_registration(server_id: &str, tools: &[RemoteTool]) -> RegistrationP
 
     // 3. 基线分发名分组；冲突组双端各加短哈希。
     let mut groups: Vec<(String, Vec<usize>)> = Vec::new();
-    for (position, (_, raw_name, _, _, _)) in candidates.iter().enumerate() {
+    for (position, (_, raw_name, _, _, _, _)) in candidates.iter().enumerate() {
         let candidate = assemble(server_id, &slugify(raw_name), None);
         match groups.iter_mut().find(|(slug, _)| slug == &candidate) {
             Some((_, members)) => members.push(position),
@@ -215,7 +218,7 @@ pub fn plan_registration(server_id: &str, tools: &[RemoteTool]) -> RegistrationP
         }
     }
 
-    for (position, (_, raw_name, description, raw_description, schema)) in
+    for (position, (_, raw_name, description, raw_description, schema, annotations)) in
         candidates.into_iter().enumerate()
     {
         let dispatch_name = assigned[position].clone().unwrap_or_default();
@@ -234,6 +237,7 @@ pub fn plan_registration(server_id: &str, tools: &[RemoteTool]) -> RegistrationP
             dispatch_name: dispatch_name.clone(),
             spec: ToolSpec::new(&dispatch_name, &description, schema),
             raw_description,
+            annotations,
         });
     }
 
