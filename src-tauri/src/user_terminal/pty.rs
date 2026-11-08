@@ -35,9 +35,10 @@ use windows::Win32::System::JobObjects::{
 use windows::Win32::System::Pipes::CreatePipe;
 use windows::Win32::System::Threading::{
     CreateProcessW, DeleteProcThreadAttributeList, InitializeProcThreadAttributeList,
-    UpdateProcThreadAttribute, EXTENDED_STARTUPINFO_PRESENT, LPPROC_THREAD_ATTRIBUTE_LIST,
-    PROC_THREAD_ATTRIBUTE_JOB_LIST, PROC_THREAD_ATTRIBUTE_PSEUDOCONSOLE, PROCESS_CREATION_FLAGS,
-    PROCESS_INFORMATION, STARTF_USESTDHANDLES, STARTUPINFOEXW,
+    UpdateProcThreadAttribute, EXTENDED_STARTUPINFO_PRESENT, INFINITE,
+    LPPROC_THREAD_ATTRIBUTE_LIST, PROC_THREAD_ATTRIBUTE_JOB_LIST,
+    PROC_THREAD_ATTRIBUTE_PSEUDOCONSOLE, PROCESS_CREATION_FLAGS, PROCESS_INFORMATION,
+    STARTF_USESTDHANDLES, STARTUPINFOEXW, WaitForSingleObject,
 };
 
 /// 内核句柄 RAII 包装：句柄无线程亲和性，跨线程关闭是常规用法（同 `OwnedHandle`）。
@@ -191,6 +192,17 @@ pub fn exit_code_of(process: &OwnedHandle) -> Option<u32> {
     }
     .ok()?;
     (code != STILL_ACTIVE).then_some(code)
+}
+
+/// 阻塞直到进程退出。
+///
+/// 用户自己 `exit` 时输出管道不保证 EOF（伪控制台主机可能继续持有写端），
+/// 读线程会一直阻塞在 `read` 上；判断"进程没了"必须看进程句柄。
+pub fn wait_until_exit(process: &OwnedHandle) {
+    use std::os::windows::io::AsRawHandle as _;
+    unsafe {
+        WaitForSingleObject(HANDLE(process.as_raw_handle()), INFINITE);
+    }
 }
 
 impl Drop for Child {

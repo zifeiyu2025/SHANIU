@@ -124,10 +124,15 @@ impl Drop for Session {
     }
 }
 
-/// 终端注册表：进程生命周期随会话对象，应用退出时随 Tauri 托管状态一起释放。
+/// 终端注册表：只放**进程还活着**的会话。
+///
+/// 进程退出（读线程读到 EOF）时由读线程自己把条目摘掉：否则「存活计数」会把
+/// 已退出的终端算成在跑（托盘提示说错话），而且同一 id 的重连会被
+/// `终端 id 已存在` 挡住——标签切走再切回时 `refresh()` 用的是同一个 id。
+/// 应用退出时随 Tauri 托管状态一起释放。
 #[derive(Default)]
 pub struct UserTerminalManager {
-    inner: Mutex<HashMap<String, Arc<Session>>>,
+    inner: Arc<Mutex<HashMap<String, Arc<Session>>>>,
 }
 
 impl UserTerminalManager {
@@ -157,6 +162,7 @@ impl UserTerminalManager {
 
         let spawn = pty::spawn(&shell.path, &shell.args, &cwd, cols, rows)?;
         let exit_probe = spawn.child.clone_process().ok();
+        let watcher = spawn.child.clone_process().ok();
         let info = TerminalInfo {
             id: request.id.clone(),
             title,
@@ -173,11 +179,27 @@ impl UserTerminalManager {
             writer: Mutex::new(Some(spawn.writer)),
             closed: AtomicBool::new(false),
         });
-        start_reader(spawn.reader, exit_probe, request.id.clone(), sink)?;
+        // 先登记再起读线程：进程秒退时读线程会立刻摘条目，顺序反了会留下幽灵会话。
         self.inner
             .lock()
             .unwrap_or_else(|poisoned| poisoned.into_inner())
-            .insert(request.id, session);
+            .insert(request.id.clone(), session);
+        if let Err(error) = start_reader(
+            spawn.reader,
+            exit_probe,
+            request.id.clone(),
+            Arc::clone(&self.inner),
+            sink,
+        ) {
+            self.inner
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner())
+                .remove(&request.id);
+            return Err(error);
+        }
+        if let Some(process) = watcher {
+            watch_exit(process, request.id.clone(), Arc::clone(&self.inner));
+        }
         Ok(info)
     }
 
@@ -236,7 +258,8 @@ impl UserTerminalManager {
     }
 
     /// 存活会话数。唯一用途是给"隐藏到托盘时仍有终端在跑"提供状态，
-    /// 不推断控制权、不代表任何接管语义。
+    /// 不推断控制权、不代表任何接管语义。表里只留活着的进程（见类型注释），
+    /// 所以这个数就是"真在跑的终端数"，用户已 `exit` 的终端不算。
     pub(crate) fn active_count(&self) -> usize {
         self.inner
             .lock()
@@ -255,6 +278,7 @@ fn start_reader(
     mut reader: std::fs::File,
     exit_probe: Option<std::os::windows::io::OwnedHandle>,
     id: String,
+    sessions: Arc<Mutex<HashMap<String, Arc<Session>>>>,
     sink: Arc<dyn FrameSink>,
 ) -> Result<(), String> {
     std::thread::Builder::new()
@@ -290,10 +314,44 @@ fn start_reader(
                 .and_then(pty::exit_code_of)
                 .map(|value| value as i32)
                 .unwrap_or(1);
-            sink.send(FrameEvent::Exit { id, code });
+            sink.send(FrameEvent::Exit {
+                id: id.clone(),
+                code,
+            });
+            // 进程已经没了：立刻摘掉注册表条目。留在这里会让存活计数虚高，
+            // 也会挡住同 id 的重连（`open` 对已存在 id 直接拒绝）。
+            retire(&sessions, &id);
         })
         .map(|_| ())
         .map_err(|error| format!("启动终端读线程失败: {error}"))
+}
+
+/// 盯进程句柄，退出即摘条目并收起伪控制台。
+///
+/// 读线程只在管道 EOF 时才知道结束；用户 `exit` 后管道可能一直不 EOF，
+/// 所以"进程没了"由这个等待线程负责，读线程随伪控制台关闭而 EOF。
+fn watch_exit(
+    process: std::os::windows::io::OwnedHandle,
+    id: String,
+    sessions: Arc<Mutex<HashMap<String, Arc<Session>>>>,
+) {
+    let _ = std::thread::Builder::new()
+        .name(format!("user-terminal-watch-{id}"))
+        .spawn(move || {
+            pty::wait_until_exit(&process);
+            retire(&sessions, &id);
+        });
+}
+
+/// 从注册表摘掉会话并关闭伪控制台；重复调用是幂等的（第一个摘到的负责关）。
+fn retire(sessions: &Mutex<HashMap<String, Arc<Session>>>, id: &str) {
+    let exited = sessions
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner())
+        .remove(id);
+    if let Some(session) = exited {
+        session.close();
+    }
 }
 
 fn validate_id(id: &str) -> Result<(), String> {
@@ -601,6 +659,73 @@ mod tests {
         assert_eq!(manager.active_count(), 1, "开一个终端后应为 1");
         manager.close(&id);
         assert_eq!(manager.active_count(), 0, "关闭后应归零");
+    }
+
+    /// 多标签 + 只关一个标签：计数必须落在剩下的真实终端数上。
+    ///
+    /// 托盘提示直接读这个数，它把已关的标签也算进去就会说错话。
+    #[test]
+    fn closing_one_tab_keeps_the_other_counted() {
+        let manager = UserTerminalManager::default();
+        let sink = Arc::new(RecordingSink::default());
+        for id in ["tab-a", "tab-b"] {
+            manager
+                .open(
+                    OpenRequest {
+                        id: String::from(id),
+                        shell: None,
+                        cwd: Some(std::env::temp_dir().display().to_string()),
+                        cols: Some(80),
+                        rows: Some(24),
+                        title: None,
+                    },
+                    sink.clone(),
+                )
+                .expect("启动用户终端");
+        }
+        assert_eq!(manager.active_count(), 2, "两个标签应计 2");
+        manager.close("tab-a");
+        assert_eq!(
+            manager.active_count(),
+            1,
+            "只关一个标签后应计 1（剩下那个仍在跑）"
+        );
+    }
+
+    /// 用户自己 `exit`（进程自然结束）：计数立刻回落，不等标签关掉。
+    ///
+    /// 这是托盘提示的另一半真话来源：已退出的终端不该被算成"仍在运行"。
+    #[test]
+    fn exited_terminal_leaves_the_active_count() {
+        let manager = UserTerminalManager::default();
+        let sink = Arc::new(RecordingSink::default());
+        let id = String::from("exit-terminal");
+        manager
+            .open(
+                OpenRequest {
+                    id: id.clone(),
+                    shell: None,
+                    cwd: Some(std::env::temp_dir().display().to_string()),
+                    cols: Some(80),
+                    rows: Some(24),
+                    title: None,
+                },
+                sink.clone(),
+            )
+            .expect("启动用户终端");
+        assert_eq!(manager.active_count(), 1);
+        manager.write(&id, "exit\r\n").expect("写入 exit");
+
+        let deadline = Instant::now() + Duration::from_secs(15);
+        while Instant::now() < deadline && manager.active_count() != 0 {
+            std::thread::sleep(Duration::from_millis(50));
+        }
+        assert_eq!(
+            manager.active_count(),
+            0,
+            "进程退出后应立刻从注册表摘除，事件: {:?}",
+            sink.snapshot()
+        );
     }
 
     #[test]
