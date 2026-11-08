@@ -72,6 +72,7 @@ $allow = @{
     'subagent_registry' = @('agent_loop', 'rollout', 'tool_router', 'model_client', 'permission')    # E42/E45/E46（复用 run_instance/AgentInstance；实现 AgentOrchestrator 契约；resume 复用 HistoryItem；派生收窄读 ToolAllowlist）
     'jobs'            = @('app_state')                                                # E43（SH-089 后台作业注册表：从装配层取注册表句柄）
     'goals'           = @('app_state')                                                # E44（SH-088 会话目标持久层：从装配层取数据根）
+    'mcp_client'      = @('tool_router', 'sandbox')                                   # E47（SH-060 MCP 客户端：try_register/ToolSpec + spawn_restricted_stdio；config/events 属 infra 全局放行）
 }
 # rollout 已落地（SH-030）：它只借用 model_client 的 HistoryItem 作为条目载荷，
 # 不反向依赖循环或工具层——档案是被读写的对象，不是参与者。
