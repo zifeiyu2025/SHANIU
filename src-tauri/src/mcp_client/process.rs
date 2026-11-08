@@ -88,7 +88,8 @@ pub struct McpProcess {
     exe: PathBuf,
     exe_sha256: String,
     child: RestrictedStdioChild,
-    stdout: mpsc::Receiver<StdioEvent>,
+    /// 会话层要独占读端做多路复用，因此允许被取走；未取走时 `next_event` 仍可用。
+    stdout: Option<mpsc::Receiver<StdioEvent>>,
     stdin_tx: mpsc::Sender<Vec<u8>>,
     _writer: std::thread::JoinHandle<()>,
 }
@@ -136,7 +137,7 @@ impl McpProcess {
             exe,
             exe_sha256: actual,
             child,
-            stdout,
+            stdout: Some(stdout),
             stdin_tx,
             _writer: writer,
         })
@@ -167,9 +168,19 @@ impl McpProcess {
             .map_err(|_| StartError::StdinClosed)
     }
 
-    /// 下一条 stdout 事件（行或协议错误）。返回 `None` = 读端已关闭。
+    /// 下一条 stdout 事件（行或协议错误）。返回 `None` = 读端已关闭或已被取走。
     pub async fn next_event(&mut self) -> Option<StdioEvent> {
-        self.stdout.recv().await
+        self.stdout.as_mut()?.recv().await
+    }
+
+    /// 取走 stdout 读端（会话层接管多路复用后，本结构不再读）。
+    pub fn take_stdout(&mut self) -> Option<mpsc::Receiver<StdioEvent>> {
+        self.stdout.take()
+    }
+
+    /// stdin 发送端副本（会话层读线程应答 server→client 请求时要写）。
+    pub fn stdin_sender(&self) -> mpsc::Sender<Vec<u8>> {
+        self.stdin_tx.clone()
     }
 
     /// 等待进程退出，返回退出码（取不到时 -1）。

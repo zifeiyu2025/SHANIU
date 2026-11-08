@@ -24,7 +24,7 @@ pub const METHOD_NOT_FOUND: i64 = -32601;
 pub const INTERNAL_ERROR: i64 = -32603;
 
 /// 请求/响应关联标识：MCP 允许数字或字符串，两种都要能原样回显。
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize, Deserialize)]
 #[serde(untagged)]
 pub enum RequestId {
     Number(i64),
