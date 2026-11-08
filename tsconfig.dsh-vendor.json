@@ -456,12 +456,6 @@
    "@deepseek-ai/dsh-client-ui-layout/*": [
     "./src/dsh/packages/client/ui-layout/src/*"
    ],
-   "@deepseek-ai/dsh-client-ui-message-feedback": [
-    "./src/dsh/packages/client/ui-message-feedback/src/index.ts"
-   ],
-   "@deepseek-ai/dsh-client-ui-message-feedback/*": [
-    "./src/dsh/packages/client/ui-message-feedback/src/*"
-   ],
    "@deepseek-ai/dsh-client-ui-model-selection": [
     "./src/dsh/packages/client/ui-model-selection/src/index.ts"
    ],
@@ -1646,9 +1640,6 @@
    ],
    "@deepseek-ai/dsh-client-ui-layout/client": [
     "./src/dsh/packages/client/ui-layout/src/client/index.ts"
-   ],
-   "@deepseek-ai/dsh-client-ui-message-feedback/client": [
-    "./src/dsh/packages/client/ui-message-feedback/src/client/index.ts"
    ],
    "@deepseek-ai/dsh-client-ui-model-selection/client": [
     "./src/dsh/packages/client/ui-model-selection/src/client/index.ts"
