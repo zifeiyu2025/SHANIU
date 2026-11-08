@@ -398,23 +398,33 @@ fn apply_hunk_seq(
 // ============================== 写前读状态（SH-124） ==============================
 
 const STALE_EXCERPT_LINES: usize = 80;
+/// 回填给模型的上限（字节）。几 MB 的文件全文回填会直接吃光上下文，
+/// 而模型重建补丁只需要一处接缝附近的真实内容——字节上限与行数上限同时生效，
+/// 取先到者（SH-126③）。
+const STALE_EXCERPT_BYTES: usize = 8 * 1024;
 
-/// 冲突回填：给出文件当前内容（带行号，截断到 80 行），让模型基于真实内容重建补丁。
+/// 冲突回填：给出文件当前内容（带行号，行数 + 字节双上限截断），让模型基于真实内容重建补丁。
 fn current_excerpt(bytes: &[u8]) -> String {
     let text = String::from_utf8_lossy(bytes);
-    let mut lines = Vec::new();
+    let mut out = String::new();
     let mut truncated = false;
     for (idx, line) in text.lines().enumerate() {
-        if idx >= STALE_EXCERPT_LINES {
+        // 逐行累加：按整行截断才不会切断 UTF-8 边界。
+        if idx >= STALE_EXCERPT_LINES || out.len() + line.len() + 8 > STALE_EXCERPT_BYTES {
             truncated = true;
             break;
         }
-        lines.push(format!("{}| {line}", idx + 1));
+        if !out.is_empty() {
+            out.push('\n');
+        }
+        out.push_str(&format!("{}| {line}", idx + 1));
     }
     if truncated {
-        lines.push(format!("…（仅显示前 {STALE_EXCERPT_LINES} 行）"));
+        out.push_str(&format!(
+            "\n…（已截断：最多回填前 {STALE_EXCERPT_LINES} 行 / {STALE_EXCERPT_BYTES} 字节）"
+        ));
     }
-    lines.join("\n")
+    out
 }
 
 /// 写前校验：必须先读过（同会话 + 同路径），且内容没被外部改过。
@@ -448,6 +458,13 @@ fn refresh_read_state(ctx: &ToolContext, key: Option<std::path::PathBuf>, full: 
     let (Some(reads), Some(key)) = (&ctx.reads, key) else { return };
     if let Ok(stamp) = crate::tool_router::FileStamp::of_full_file(full) {
         reads.record(ctx.session_id.as_deref(), &key, stamp);
+    }
+}
+
+/// 把本次写入登记进写日志（SH-126）：自愈闭环据此判断「是否靠改测试变绿」。
+fn record_write(ctx: &ToolContext, full: &std::path::Path, before: Option<&str>, after: Option<&str>) {
+    if let Some(writes) = &ctx.writes {
+        writes.record(full, before, after);
     }
 }
 
@@ -517,6 +534,7 @@ impl ToolExecutor for ApplyPatch {
                         return Err(ToolError::Execution(format!("写入失败: {path}")));
                     }
                     snapshot.insert(full.to_string_lossy().to_string(), None);
+                    record_write(ctx, &full, None, Some(&content));
                     refresh_read_state(
                         ctx,
                         Some(crate::tool_router::canonical_key(&full)),
@@ -547,11 +565,12 @@ impl ToolExecutor for ApplyPatch {
                     if had_trailing_newline && !new_text.is_empty() {
                         new_text.push('\n');
                     }
-                    if std::fs::write(&full, new_text).is_err() {
+                    if std::fs::write(&full, &new_text).is_err() {
                         rollback(&snapshot);
                         return Err(ToolError::Execution(format!("写入失败: {path}")));
                     }
                     snapshot.entry(full.to_string_lossy().to_string()).or_insert(Some(original));
+                    record_write(ctx, &full, Some(&text), Some(&new_text));
                     refresh_read_state(ctx, read_key, &full);
                     summary.push(if level == MatchLevel::Exact {
                         format!("~ {path}")
@@ -573,6 +592,7 @@ impl ToolExecutor for ApplyPatch {
                     let read_key = verify_read_state(ctx, path, &full, &original).inspect_err(|_| {
                         rollback(&snapshot);
                     })?;
+                    record_write(ctx, &full, Some(&String::from_utf8_lossy(&original)), None);
                     if std::fs::remove_file(&full).is_err() {
                         rollback(&snapshot);
                         return Err(ToolError::Execution(format!("删除失败: {path}")));
@@ -912,6 +932,71 @@ mod tests {
             .unwrap_err();
         assert!(err.to_string().contains("write_file_not_read"), "{err}");
         assert!(ws.join("a.txt").exists());
+        std::fs::remove_dir_all(&ws).ok();
+    }
+
+    /// SH-126③：stale 回填必须有字节上限——几 MB 的文件全文回填会直接吃光上下文。
+    #[tokio::test]
+    async fn stale_excerpt_is_capped_by_bytes_for_large_files() {
+        let ws = workspace();
+        let reads = Arc::new(crate::tool_router::ReadRegistry::new());
+        std::fs::write(ws.join("big.txt"), "seed\n").unwrap();
+        crate::tools::fs_read::ReadFile::new()
+            .execute(
+                serde_json::json!({"path": "big.txt"}),
+                &ctx_with_reads(&ws, reads.clone()),
+            )
+            .await
+            .unwrap();
+        // 外部改成大文件：行数与字节都远超上限（约 800KB）
+        let filler = "x".repeat(190);
+        let big: String = (1..=4000).map(|i| format!("line{i:04} {filler}\n")).collect();
+        assert!(big.len() > 700_000, "构造的文件应足够大: {}", big.len());
+        std::fs::write(ws.join("big.txt"), &big).unwrap();
+
+        let patch = "*** Begin Patch\n*** Update File: big.txt\n-seed\n+changed\n*** End Patch";
+        let err = ApplyPatch::new()
+            .execute(serde_json::json!({"patch": patch}), &ctx_with_reads(&ws, reads))
+            .await
+            .unwrap_err();
+        let message = err.to_string();
+        assert!(message.contains("write_file_stale"), "{message}");
+        assert!(
+            message.len() < 16 * 1024,
+            "回填必须被字节上限截断，实际 {} 字节",
+            message.len()
+        );
+        assert!(message.contains("已截断"), "必须明示已截断: {message}");
+        // 截断后的内容仍可用：首行能看到行号与真实内容
+        assert!(message.contains("1| line0001"), "{message}");
+        std::fs::remove_dir_all(&ws).ok();
+    }
+
+    /// SH-126：写入必须进写日志，删减断言要被标成「放宽」。
+    #[tokio::test]
+    async fn update_records_assertion_weakening_in_write_journal() {
+        let ws = workspace();
+        let reads = Arc::new(crate::tool_router::ReadRegistry::new());
+        let writes = Arc::new(crate::tool_router::WriteJournal::new());
+        let original = "#[test]\nfn adds() {\n    assert_eq!(add(2, 2), 4);\n}\n";
+        std::fs::write(ws.join("t.rs"), original).unwrap();
+        let ctx = ctx(&ws).with_reads(reads).with_writes(writes.clone());
+        crate::tools::fs_read::ReadFile::new()
+            .execute(serde_json::json!({"path": "t.rs"}), &ctx)
+            .await
+            .unwrap();
+
+        let patch = "*** Begin Patch\n*** Update File: t.rs\n #[test]\n fn adds() {\n-    assert_eq!(add(2, 2), 4);\n }\n*** End Patch";
+        ApplyPatch::new()
+            .execute(serde_json::json!({"patch": patch}), &ctx)
+            .await
+            .unwrap();
+
+        let entries = writes.take();
+        assert_eq!(entries.len(), 1, "{entries:?}");
+        assert!(entries[0].weakened, "删掉断言必须标为放宽: {entries:?}");
+        assert_eq!(entries[0].assertion_delta, -1);
+        assert!(writes.take().is_empty(), "写日志必须被消费干净");
         std::fs::remove_dir_all(&ws).ok();
     }
 }

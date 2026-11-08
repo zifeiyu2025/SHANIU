@@ -159,6 +159,178 @@ impl ReadRegistry {
     }
 }
 
+// ============================== 写日志（SH-126） ==============================
+
+/// 断言类语句的行首前缀（trim 之后比对）。
+///
+/// 只认「行首」是刻意的：Rust 里 `.expect(` 遍地都是，按子串匹配会把普通代码全算成断言；
+/// 而 JS/TS 的 `expect(x)` 与 Python 的 `assert x` 都在行首。
+const ASSERTION_PREFIXES: &[&str] = &[
+    "assert!(",
+    "assert_eq!(",
+    "assert_ne!(",
+    "debug_assert!(",
+    "debug_assert_eq!(",
+    "debug_assert_ne!(",
+    "assert(",
+    "assert.equal(",
+    "assert.strictEqual(",
+    "assert.deepEqual(",
+    "assert.deepStrictEqual(",
+    "assert.ok(",
+    "expect(",
+];
+
+/// 「强断言」前缀：`assert_eq!` / `assert_ne!` 这类同时校验两边的形态。
+/// 它们减少、而普通 `assert!` 增加 = 断言被放宽（SH-126 判定依据之一）。
+const STRICT_ASSERTION_PREFIXES: &[&str] = &[
+    "assert_eq!(",
+    "assert_ne!(",
+    "debug_assert_eq!(",
+    "debug_assert_ne!(",
+    "assert.equal(",
+    "assert.strictEqual(",
+    "assert.deepEqual(",
+    "assert.deepStrictEqual(",
+];
+
+fn is_assertion_line(line: &str) -> bool {
+    let trimmed = line.trim_start();
+    // 只认行首：这是有意的。注释掉的断言（`// assert_eq!`）行首是 `//`，因此**不算**断言，
+    // 它在「改前有、改后没有」的比对里会体现成删减——注释掉断言本来就该按删减处理。
+    if ASSERTION_PREFIXES
+        .iter()
+        .any(|prefix| trimmed.starts_with(prefix))
+        || trimmed.starts_with("assert ")
+    {
+        return true;
+    }
+    // 行内断言也算：`fn adds() { assert_eq!(add(2, 2), 4); }` 这种一行写法很常见，
+    // 只认行首会整条漏掉。Rust 的断言宏字面量特征足够强，可以按子串认；
+    // JS 的 `expect(` 不行（Rust 的 `.expect(` 遍地都是），所以它仍然只在行首生效。
+    ["assert!(", "assert_eq!(", "assert_ne!(", "debug_assert!(", "debug_assert_eq!(", "debug_assert_ne!("]
+        .iter()
+        .any(|needle| line.contains(needle))
+}
+
+fn assertion_lines(text: &str) -> Vec<String> {
+    text.lines()
+        .map(str::trim)
+        .filter(|line| is_assertion_line(line))
+        .map(String::from)
+        .collect()
+}
+
+fn strict_assertion_count(lines: &[String]) -> usize {
+    lines
+        .iter()
+        .filter(|line| {
+            // 用 contains 而不是 starts_with：一行写法 `fn f() { assert_eq!(..) }` 的行首是 `fn`。
+            STRICT_ASSERTION_PREFIXES
+                .iter()
+                .any(|prefix| line.contains(prefix))
+        })
+        .count()
+}
+
+fn ignore_attr_count(text: &str) -> usize {
+    text.lines()
+        .filter(|line| line.trim().starts_with("#[ignore"))
+        .count()
+}
+
+/// 一次文件写入的摘要（写工具落盘后登记，自愈闭环消费）。
+///
+/// 为什么需要它：自愈闭环 + 能改文件 = 存在「把断言删掉让测试通过」的路径。
+/// 宿主看不到模型意图，但看得到「哪些文件被改了、断言有没有变」——
+/// 这就是把「不可见」变成「可见」的最小做法（SH-126）。
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct FileWrite {
+    /// 写入后的绝对路径（已归一化，可直接与诊断路径/读登记表比对）。
+    pub path: PathBuf,
+    /// 内容是否真的变了（新文件/删除也算变）。
+    pub changed: bool,
+    /// 断言条数净变化：>0 新增，<0 删减。
+    pub assertion_delta: i64,
+    /// 断言语句集合是否变化（覆盖「条数不变、只改期望值」的改宽）。
+    pub assertions_touched: bool,
+    /// 是否检测到放宽：删减断言 / 强断言降级 / 新增 `#[ignore]`。
+    pub weakened: bool,
+}
+
+impl FileWrite {
+    /// `before` / `after` 为 `None` 表示文件分别不存在（新建 / 删除）。
+    pub fn between(path: PathBuf, before: Option<&str>, after: Option<&str>) -> Self {
+        let before_text = before.unwrap_or("");
+        let after_text = after.unwrap_or("");
+        let before_assertions = assertion_lines(before_text);
+        let after_assertions = assertion_lines(after_text);
+        let strict_before = strict_assertion_count(&before_assertions);
+        let strict_after = strict_assertion_count(&after_assertions);
+        let plain_before = before_assertions.len() - strict_before;
+        let plain_after = after_assertions.len() - strict_after;
+        let weakened = after_assertions.len() < before_assertions.len()
+            // 强断言变普通断言：`assert_eq!(a, b)` → `assert!(a == b)` 就是放宽。
+            || (strict_after < strict_before && plain_after > plain_before)
+            // 挂 `#[ignore]` = 让测试不再执行，等价于删除断言。
+            || ignore_attr_count(after_text) > ignore_attr_count(before_text);
+        let assertions_touched = match (before, after) {
+            // 新建文件不算「动了断言」：没有可被删减的原断言。
+            (None, _) => false,
+            (Some(_), None) => !before_assertions.is_empty(),
+            (Some(_), Some(_)) => before_assertions != after_assertions,
+        };
+        Self {
+            path,
+            changed: before_text != after_text,
+            assertion_delta: after_assertions.len() as i64 - before_assertions.len() as i64,
+            assertions_touched,
+            weakened,
+        }
+    }
+}
+
+/// 写日志：写工具登记「这次改了什么文件、断言有没有变」，自愈闭环在命令重新通过时消费。
+///
+/// 放在共享内核的原因与 [`ReadRegistry`] 相同：`apply_patch` 是生产者，
+/// `agent_loop` 是消费者，两边不能各造一份状态，否则永远对不上。
+#[derive(Debug, Default)]
+pub struct WriteJournal {
+    entries: std::sync::Mutex<Vec<FileWrite>>,
+}
+
+impl WriteJournal {
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    fn lock(&self) -> std::sync::MutexGuard<'_, Vec<FileWrite>> {
+        self.entries.lock().unwrap_or_else(|e| e.into_inner())
+    }
+
+    /// 登记一次写入；同一文件的多次写入按路径合并，避免一次修复产出多条噪音。
+    pub fn record(&self, path: &Path, before: Option<&str>, after: Option<&str>) {
+        let entry = FileWrite::between(canonical_key(path), before, after);
+        if !entry.changed {
+            return;
+        }
+        let mut entries = self.lock();
+        if let Some(existing) = entries.iter_mut().find(|e| e.path == entry.path) {
+            existing.changed |= entry.changed;
+            existing.assertion_delta += entry.assertion_delta;
+            existing.assertions_touched |= entry.assertions_touched;
+            existing.weakened |= entry.weakened;
+        } else {
+            entries.push(entry);
+        }
+    }
+
+    /// 取走并清空（消费语义：每次命令结果结算一次，不重复判定）。
+    pub fn take(&self) -> Vec<FileWrite> {
+        std::mem::take(&mut *self.lock())
+    }
+}
+
 // ============================== 执行契约 ==============================
 
 /// 工具执行错误。`Execution` 的文本会回填给模型（风险登记册：失败自动回填）。
@@ -209,6 +381,8 @@ pub struct ToolContext {
     /// 读状态登记表（SH-124）：`read_file` 记录、写工具校验。
     /// None = 该路径不启用写前读校验（无会话的测试装配）。
     pub reads: Option<Arc<ReadRegistry>>,
+    /// 写日志（SH-126）：写工具登记、自愈闭环判定「是否靠改测试变绿」。
+    pub writes: Option<Arc<WriteJournal>>,
 }
 
 impl ToolContext {
@@ -230,6 +404,7 @@ impl ToolContext {
             scope: None,
             orchestrator: None,
             reads: None,
+            writes: None,
         }
     }
 
@@ -265,6 +440,12 @@ impl ToolContext {
     /// 注入读状态登记表（SH-124）：`read_file` 与写工具共用同一份。
     pub fn with_reads(mut self, reads: Arc<ReadRegistry>) -> Self {
         self.reads = Some(reads);
+        self
+    }
+
+    /// 注入写日志（SH-126）：写工具登记、自愈闭环消费。
+    pub fn with_writes(mut self, writes: Arc<WriteJournal>) -> Self {
+        self.writes = Some(writes);
         self
     }
 }
@@ -831,6 +1012,96 @@ mod tests {
         assert!(registry.get(None, &path).is_none());
         registry.forget(Some("s1"), &path);
         assert!(registry.get(Some("s1"), &path).is_none());
+        std::fs::remove_dir_all(&ws).ok();
+    }
+
+    // ---------------- 写日志：断言变化判定（SH-126） ----------------
+
+    const TEST_BEFORE: &str = "fn add(a: i32, b: i32) -> i32 { a - b }\n\
+        #[test]\n\
+        fn adds() {\n\
+            assert_eq!(add(2, 2), 4);\n\
+        }\n";
+
+    #[test]
+    fn deleting_an_assertion_is_weakened() {
+        let after = "fn add(a: i32, b: i32) -> i32 { a + b }\n#[test]\nfn adds() {\n}\n";
+        let write = FileWrite::between(PathBuf::from("x.rs"), Some(TEST_BEFORE), Some(after));
+        assert!(write.weakened, "删掉断言必须判为放宽: {write:?}");
+        assert!(write.assertions_touched);
+        assert_eq!(write.assertion_delta, -1);
+    }
+
+    #[test]
+    fn downgrading_strict_assertion_is_weakened() {
+        let after = TEST_BEFORE.replace("assert_eq!(add(2, 2), 4);", "assert!(true);");
+        let write = FileWrite::between(PathBuf::from("x.rs"), Some(TEST_BEFORE), Some(&after));
+        assert!(write.weakened, "assert_eq! → assert! 必须判为放宽: {write:?}");
+    }
+
+    #[test]
+    fn adding_ignore_attribute_is_weakened() {
+        let after = TEST_BEFORE.replace("#[test]", "#[test]\n#[ignore]");
+        let write = FileWrite::between(PathBuf::from("x.rs"), Some(TEST_BEFORE), Some(&after));
+        assert!(write.weakened, "挂 #[ignore] 等价于删断言: {write:?}");
+    }
+
+    #[test]
+    fn changing_expected_value_is_touched_but_not_weakened() {
+        // 条数没变、强断言没降级，只是把期望值改成能通过的值——这是最隐蔽的改宽，
+        // 交给「测试文件被改动」这层判可疑，而不是在这里判删减。
+        let after = TEST_BEFORE.replace("assert_eq!(add(2, 2), 4);", "assert_eq!(add(2, 2), 0);");
+        let write = FileWrite::between(PathBuf::from("x.rs"), Some(TEST_BEFORE), Some(&after));
+        assert!(write.assertions_touched, "{write:?}");
+        assert!(!write.weakened, "只改期望值不算删减/放宽: {write:?}");
+    }
+
+    #[test]
+    fn implementation_only_fix_does_not_touch_assertions() {
+        let after = TEST_BEFORE.replace("a - b", "a + b");
+        let write = FileWrite::between(PathBuf::from("x.rs"), Some(TEST_BEFORE), Some(&after));
+        assert!(write.changed);
+        assert!(!write.assertions_touched, "只改实现不得被算作动了断言: {write:?}");
+        assert!(!write.weakened);
+    }
+
+    #[test]
+    fn creating_a_new_file_never_counts_as_touching_assertions() {
+        let write = FileWrite::between(
+            PathBuf::from("tests/new_test.rs"),
+            None,
+            Some("#[test]\nfn t() { assert_eq!(1, 1); }\n"),
+        );
+        assert!(write.changed);
+        assert!(!write.assertions_touched, "新建文件没有可被删减的原断言");
+        assert!(!write.weakened);
+    }
+
+    #[test]
+    fn delete_is_judged_against_the_removed_content() {
+        let write = FileWrite::between(PathBuf::from("tests/x.rs"), Some(TEST_BEFORE), None);
+        assert!(write.changed);
+        assert!(write.weakened, "删掉整个含断言的测试文件必须判放宽: {write:?}");
+    }
+
+    #[test]
+    fn journal_merges_same_path_and_drains_once() {
+        let ws = temp_workspace();
+        let path = ws.join("a.rs");
+        std::fs::write(&path, TEST_BEFORE).unwrap();
+        let journal = WriteJournal::new();
+        // 第一次：把实现改对（不动断言）
+        journal.record(&path, Some(TEST_BEFORE), Some(&TEST_BEFORE.replace("a - b", "a + b")));
+        let once = journal.take();
+        assert_eq!(once.len(), 1);
+        assert!(!once[0].weakened);
+        assert!(journal.take().is_empty(), "take 之后必须清空");
+        // 同一路径的两次写入合并为一条
+        journal.record(&path, Some(TEST_BEFORE), Some(&TEST_BEFORE.replace("a - b", "a + b")));
+        journal.record(&path, Some(TEST_BEFORE), Some("fn add() {}\n"));
+        let merged = journal.take();
+        assert_eq!(merged.len(), 1, "同路径写入必须合并: {merged:?}");
+        assert!(merged[0].weakened);
         std::fs::remove_dir_all(&ws).ok();
     }
 }

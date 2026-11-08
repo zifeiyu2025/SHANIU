@@ -418,8 +418,19 @@ impl AgentLoop {
         let session_id = session_id.clone().or_else(|| self.session_id.clone());
         // SH-124：本次任务共享一份读状态登记表——read_file 记录，写工具落盘前校验。
         let read_registry = Arc::new(crate::tool_router::ReadRegistry::new());
+        // SH-126：本次任务共享一份写日志——写工具登记，自愈闭环据此判定「是否靠改测试变绿」。
+        let write_journal = Arc::new(crate::tool_router::WriteJournal::new());
+        // 自上次失败以来发生过的写入（恢复窗口内），命令重新通过时结算。
+        let mut pending_writes: Vec<crate::tool_router::FileWrite> = Vec::new();
         // SH-125：失败自愈状态机（每任务一份，跨 turn 累积重试次数与错误签名）。
-        let mut repair = repair::RepairController::new(repair::DEFAULT_REPAIR_ATTEMPTS);
+        let mut repair =
+            repair::RepairController::new(repair::DEFAULT_REPAIR_ATTEMPTS, self.workspace_root.clone());
+        // 评估消融开关（与 `SHANIU_EVAL_ABLATE_AR6` 同口径）：设 1 = 关闭失败自愈闭环。
+        // 没有这个开关就量不出 SH-125 的成本——「跑通带 bug 工程」这类任务的成功率、
+        // 轮数与 token 差异，只有在同日同端点的两臂对照里才有意义（docs/04 §6.5）。
+        let repair_enabled = !std::env::var("SHANIU_EVAL_ABLATE_REPAIR")
+            .ok()
+            .is_some_and(|value| value.trim() == "1");
         // SH-122：空转检测（连续相同工具 + 相同参数），跨 turn 累计连续计数。
         let mut anomaly = anomaly::AnomalyGuard::new();
         let mut reason = TurnEndReasonLocal::Completed;
@@ -787,6 +798,7 @@ impl AgentLoop {
                 )
                 .with_jobs(session_id.clone(), self.jobs.clone())
                 .with_reads(read_registry.clone())
+                .with_writes(write_journal.clone())
                 .with_scope(scope.clone());
                 // 只有 root（depth=0）拿到编排能力；子代理沿用 scope 但无 orchestrator，
                 // 分发层会拒绝它调用编排工具（第二层深度门控）。
@@ -834,21 +846,62 @@ impl AgentLoop {
                     call_id: call_id.clone(),
                     output: output_text.clone(),
                 });
+                // SH-126：把本次调用的写入搬进本地缓冲。写日志本身是 take 语义，
+                // 不搬走就会被下一次写入覆盖掉一半判定依据。
+                pending_writes.extend(write_journal.take());
                 // SH-125：命令失败 → 提取「文件:行」→ 下一轮以独立 System 条目提示
                 // 模型读错、修复、重跑；达到上限或同一错误重复则明示放弃（不伪造成功）。
                 let succeeded = match &result {
                     Ok(out) => out.success,
                     Err(_) => false,
                 };
-                if let Some(action) = repair.observe(name, succeeded, &output_text) {
+                let was_recovering = repair.is_recovering();
+                if let Some(action) = repair_enabled
+                    .then(|| repair.observe(name, succeeded, &output_text))
+                    .flatten()
+                {
                     let text = match action {
-                        repair::RepairAction::Nudge(text) | repair::RepairAction::GiveUp(text) => text,
+                        repair::RepairAction::Nudge(text)
+                        | repair::RepairAction::GiveUp(text)
+                        | repair::RepairAction::RejectedRepair(text)
+                        | repair::RepairAction::SuspiciousRepair(text) => text,
                     };
                     history.push(HistoryItem::Message {
                         role: Role::System,
                         text,
                         reasoning: None,
                     });
+                }
+                // 恢复窗口从这次失败才开始：之前发生的写入属于「修复前」的正常改动，
+                // 不能算到这次修复头上（否则新建测试文件这种正当行为会被误判）。
+                if repair.is_recovering() && !was_recovering {
+                    pending_writes.clear();
+                }
+                // SH-126：命令重新通过时结算——这次「绿」是不是靠改测试换来的。
+                // 只对命令类工具结算：写工具自己的成功不是「修复完成」，写日志要留到重跑时用。
+                if repair_enabled && succeeded && repair::is_command_tool(name) {
+                    match repair.check_test_tampering(name, &pending_writes) {
+                        Some(repair::RepairAction::RejectedRepair(text)) => {
+                            emit(&sink, EventMsg::Error { message: text.clone() });
+                            history.push(HistoryItem::Message {
+                                role: Role::System,
+                                text,
+                                reasoning: None,
+                            });
+                            reason = TurnEndReasonLocal::Failed;
+                            break 'outer;
+                        }
+                        Some(repair::RepairAction::SuspiciousRepair(text)) => {
+                            emit(&sink, EventMsg::Error { message: text.clone() });
+                            history.push(HistoryItem::Message {
+                                role: Role::System,
+                                text,
+                                reasoning: None,
+                            });
+                        }
+                        _ => {}
+                    }
+                    pending_writes.clear();
                 }
             }
             // SH-122：空转提醒排在全部工具输出之后，作为独立上下文条目交给下一轮模型。
@@ -1480,6 +1533,154 @@ mod tests {
             })
             .expect("命令失败后必须注入修复提醒");
         assert!(reminder.contains("src/lib.rs:4:18"), "{reminder}");
+    }
+
+    /// SH-126：模型靠「删掉断言」让命令变绿时，系统必须拒绝把这次当作修复成功。
+    ///
+    /// 这是自愈闭环最危险的一条路径：能改文件 + 能重跑命令 = 可以把测试改成永远通过。
+    /// 本用例走真实接线（写日志 → 命令重跑成功 → 结算），只把两个工具换成可脚本化的假实现。
+    #[tokio::test]
+    async fn weakening_test_assertions_is_rejected_as_a_repair() {
+        use std::sync::atomic::{AtomicU32, Ordering};
+
+        const ORIGINAL: &str = "#[test]\nfn adds() {\n    assert_eq!(add(2, 2), 4);\n}\n";
+        const WEAKENED: &str = "#[test]\nfn adds() {\n}\n";
+
+        struct FailingOnceExec {
+            spec: ToolSpec,
+            calls: AtomicU32,
+        }
+        #[async_trait::async_trait]
+        impl ToolExecutor for FailingOnceExec {
+            fn spec(&self) -> &ToolSpec {
+                &self.spec
+            }
+            async fn execute(&self, _args: Value, _ctx: &ToolContext) -> Result<ToolOutput, ToolError> {
+                if self.calls.fetch_add(1, Ordering::SeqCst) == 0 {
+                    Ok(ToolOutput::fail(
+                        "test adds ... FAILED\n\
+                         thread 'adds' panicked at tests/check.rs:3:5:\n\
+                         assertion `left == right` failed",
+                    ))
+                } else {
+                    Ok(ToolOutput::ok("test result: ok. 1 passed; 0 failed"))
+                }
+            }
+        }
+
+        struct WeakeningPatch {
+            spec: ToolSpec,
+            path: PathBuf,
+        }
+        #[async_trait::async_trait]
+        impl ToolExecutor for WeakeningPatch {
+            fn spec(&self) -> &ToolSpec {
+                &self.spec
+            }
+            async fn execute(&self, _args: Value, ctx: &ToolContext) -> Result<ToolOutput, ToolError> {
+                let before = std::fs::read_to_string(&self.path).unwrap_or_default();
+                std::fs::write(&self.path, WEAKENED).unwrap();
+                if let Some(writes) = &ctx.writes {
+                    writes.record(&self.path, Some(&before), Some(WEAKENED));
+                }
+                Ok(ToolOutput::ok("补丁应用成功"))
+            }
+        }
+
+        /// 审批请求一到就地「总是允许」，让用例专注在结算逻辑上。
+        struct AutoApproveSink {
+            store: Arc<Mutex<Vec<EventMsg>>>,
+            broker: Arc<ApprovalBroker>,
+        }
+        impl EventSink for AutoApproveSink {
+            fn emit(&self, msg: &EventMsg) -> Result<(), String> {
+                self.store.lock().unwrap().push(msg.clone());
+                if let EventMsg::ExecApprovalRequest { request_id, .. } = msg {
+                    self.broker
+                        .resolve(request_id, crate::events::ApprovalDecision::AllowAlways);
+                }
+                Ok(())
+            }
+        }
+
+        static TAMPER_SEQ: std::sync::atomic::AtomicUsize =
+            std::sync::atomic::AtomicUsize::new(0);
+        let ws = std::env::temp_dir().join(format!(
+            "shaniu-tamper-{}-{}",
+            std::process::id(),
+            TAMPER_SEQ.fetch_add(1, std::sync::atomic::Ordering::SeqCst)
+        ));
+        std::fs::create_dir_all(ws.join("tests")).unwrap();
+        let test_file = ws.join("tests/check.rs");
+        std::fs::write(&test_file, ORIGINAL).unwrap();
+
+        let call = |name: &str, id: &str, args: &str| {
+            vec![
+                ModelStreamEvent::OutputItem(ResponseItem::FunctionCall {
+                    name: name.into(),
+                    arguments: args.into(),
+                    call_id: id.into(),
+                }),
+                usage_ev(),
+            ]
+        };
+        let mut router = ToolRouter::new();
+        router.register(Arc::new(FailingOnceExec {
+            spec: ToolSpec::new("unified_exec", "假命令", serde_json::json!({"type":"object"})),
+            calls: AtomicU32::new(0),
+        }));
+        router.register(Arc::new(WeakeningPatch {
+            spec: ToolSpec::new("apply_patch", "假补丁", serde_json::json!({"type":"object"})),
+            path: test_file.clone(),
+        }));
+        let broker = Arc::new(ApprovalBroker::new());
+        let store = Arc::new(Mutex::new(Vec::new()));
+        let agent = AgentLoop {
+            backend: Arc::new(ScriptedBackend::new(vec![
+                call("unified_exec", "c1", "{}"),
+                call("apply_patch", "c2", "{}"),
+                call("unified_exec", "c3", "{}"),
+                vec![ModelStreamEvent::OutputTextDelta { delta: "已修复".into() }, usage_ev()],
+            ])),
+            router: Arc::new(router),
+            broker: broker.clone(),
+            plan_state: Arc::new(PlanState::new()),
+            workspace_root: ws.clone(),
+            max_turns: 5,
+            token_budget: 0,
+            tree_budget: TreeBudget::unlimited(),
+            policy: policy::SessionPolicy {
+                approval: crate::config::ApprovalMode::Ask,
+                sandbox: crate::config::SandboxMode::WorkspaceWrite,
+            },
+            rollout: None,
+            rollout_broke: std::sync::atomic::AtomicBool::new(false),
+            session_id: None,
+            jobs: None,
+            stop_hook: None,
+        };
+        let sink: Arc<dyn EventSink> = Arc::new(AutoApproveSink { store: store.clone(), broker });
+        let summary = agent
+            .run_task("修好它", sink, CancellationToken::new())
+            .await;
+
+        assert_eq!(
+            summary.reason,
+            TurnEndReason::Failed,
+            "靠删断言换来的绿必须按失败处理"
+        );
+        let events = store.lock().unwrap();
+        let rejection = events
+            .iter()
+            .find_map(|e| match e {
+                EventMsg::Error { message } if message.contains("修复被拒绝") => Some(message.clone()),
+                _ => None,
+            })
+            .expect("必须产出可见的拒绝提示，不能静默通过");
+        assert!(rejection.contains("tests/check.rs"), "{rejection}");
+        // 文件确实被改了（说明判定不是靠「没发生写入」侥幸通过）
+        assert_eq!(std::fs::read_to_string(&test_file).unwrap(), WEAKENED);
+        std::fs::remove_dir_all(&ws).ok();
     }
 
     /// SH-122 接线：连续第 4 次相同调用后，下一轮请求里必须多出一条独立 System 提醒。
