@@ -482,6 +482,15 @@ impl SubagentRegistry {
         self.lock().get(agent_id).and_then(|entry| entry.history.clone())
     }
 
+    /// 测试用：读取子代理有效工具白名单（`None` = 无限制）。
+    #[cfg(test)]
+    pub(crate) fn allowed_tools_of(
+        &self,
+        agent_id: &str,
+    ) -> Option<Option<crate::permission::ToolAllowlist>> {
+        self.lock().get(agent_id).map(|entry| entry.allowed_tools.clone())
+    }
+
     /// 当前快照（按 ULID 即创建时间升序）。
     pub fn snapshot(&self) -> Vec<AgentSnapshot> {
         let inner = self.lock();
@@ -1129,6 +1138,38 @@ mod tests {
             item,
             HistoryItem::Message { text, .. } if text == "继续检查边界"
         )), "续跑指令必须进入历史");
+    }
+
+    /// 负向：父代理在子代理存续期间收窄后，resume 必须按父**当前**白名单重算，
+    /// 不得让「结束 → resume」成为绕过收窄的提权路径。
+    #[tokio::test]
+    async fn resume_after_parent_narrowing_cannot_widen_child() {
+        let registry = Arc::new(SubagentRegistry::new(DEFAULT_MAX_CONCURRENT));
+        let engine = engine(vec![
+            vec![ModelStreamEvent::Completed {
+                usage: Usage { input_tokens: 1, cached_input_tokens: None, output_tokens: 1 },
+            }],
+            vec![ModelStreamEvent::Completed {
+                usage: Usage { input_tokens: 1, cached_input_tokens: None, output_tokens: 1 },
+            }],
+        ]);
+        let root = root_scope();
+        let first = registry.spawn(engine.clone(), &root, "初版任务", None).expect("派生应成功");
+        registry.wait_exit(&first, Duration::from_secs(3)).await.expect("应结束");
+
+        // 子代理存续/结束之后，父侧收窄到空集；resume 必须取 min(原收窄集, 父当前)。
+        let mut narrowed = root_scope();
+        narrowed.allowed_tools = Some(Arc::new(std::collections::HashSet::new()));
+        let resumed = registry
+            .resume(engine, &narrowed, &first, Some("继续检查边界"), None)
+            .expect("resume 应成功");
+
+        let effective = registry.allowed_tools_of(&resumed).expect("续跑条目应存在");
+        assert_eq!(
+            effective.map(|set| set.len()),
+            Some(0),
+            "父已收窄，resume 不得恢复到更宽的工具集"
+        );
     }
 
     /// resume 的 fail-closed：未知 id、未结束、无历史都不得产生半成品条目。
