@@ -4,26 +4,21 @@
 //! 运行方式：
 //! `cargo test --test web_real -- --ignored --nocapture`
 //!
-//! 这里验证默认链（DuckDuckGo → Bing）在真实网络下的条数与耗时，并打印来源，
-//! 便于判断实际是 DDG 还是 Bing 在工作。解析细节由 `tools::web::search`
-//! 的单元测试用固定 HTML / 夹具覆盖。
+//! 目前唯一内置 provider 是 Bing。这里验证真实网络下的条数与耗时，并打印来源。
+//! 解析细节由 `tools::web::search` 的单元测试用固定夹具覆盖。
 
 use std::sync::Arc;
 use std::time::Instant;
 
-use shaniu_lib::tools::web::{
-    Bing, DuckDuckGo, FallbackProvider, SearchProvider, WebClient,
-};
+use shaniu_lib::tools::web::{Bing, FallbackProvider, SearchProvider, WebClient};
 use tokio_util::sync::CancellationToken;
 
 #[tokio::test]
 #[ignore = "需要外网；手动运行"]
-async fn default_chain_real_queries() {
+async fn bing_real_queries() {
     let client = Arc::new(WebClient::new());
-    let provider = FallbackProvider::new(vec![
-        Arc::new(DuckDuckGo::new(client.clone())),
-        Arc::new(Bing::new(client)),
-    ]);
+    // 走 FallbackProvider 保持与生产一致的调用形态（目前链上只有一家）。
+    let provider = FallbackProvider::new(vec![Arc::new(Bing::new(client))]);
     let queries = [
         ("通用", "rust programming language"),
         ("技术文档", "tokio select! macro documentation"),

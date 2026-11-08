@@ -1,10 +1,11 @@
-//! `web_search`：provider 抽象 + 内置免 key 实现（DuckDuckGo HTML / Lite、Bing）。
+//! `web_search`：provider 抽象 + 内置免 key 实现（Bing）。
 //!
 //! 为什么抓公开搜索页而不是接搜索 API：内置默认实现不能要求用户先配 key。
 //! 代价是解析脆弱、可能被限流、处于 ToS 灰区——这些边界写在 docs/02，
 //! 工具描述也明确告知模型「结果可能不完整或过期」。
 //!
-//! 默认链是 DuckDuckGo → Bing：DDG 在本机网络经常不可达，Bing 才是实际主力。
+//! 目前唯一内置 provider 是 Bing。`SearchProvider` trait 与 [`FallbackProvider`]
+//! 保留：以后接插件或换搜索源从这里进，不改调用方。
 //!
 //! **三种失败必须区分**（用户明确要求）：
 //! - 无结果：请求成功、页面正常、确实没有匹配 → 空列表，不是错误；
@@ -38,43 +39,12 @@ const MAX_QUERY_CHARS: usize = 400;
 const FAILURES_BEFORE_COOLDOWN: u32 = 3;
 /// 被限流/改版后的冷却时长：短退避，等页面恢复。
 const BLOCKED_COOLDOWN: Duration = Duration::from_secs(60);
-/// 网络不可达后的冷却时长：本机网络里 DDG 被墙就是这种情况，
-/// 每轮都花 10 秒连接超时毫无意义，直接停用 10 分钟。
+/// 网络不可达后的冷却时长：连续失败后短时间不再打请求，等网络恢复。
 const NETWORK_COOLDOWN: Duration = Duration::from_secs(600);
 /// 200 但正文小于此值：视为风控空壳页，而不是「确实没有结果」。
 const MIN_BODY_BYTES: usize = 500;
 
-/// 一个搜索页的结构描述。**endpoint 与选择器只写在这里**：
-/// 搜索引擎改版时改这一处，解析函数本身不动。
-#[derive(Clone, Copy)]
-struct PageSpec {
-    endpoint: &'static str,
-    source: &'static str,
-    /// 结果链接所在元素的 class。
-    link_class: &'static str,
-    /// 摘要所在的标签名。
-    snippet_tag: &'static str,
-    /// 摘要的 class（空串 = 不按 class 过滤）。
-    snippet_class: &'static str,
-}
-
-const DDG_HTML: PageSpec = PageSpec {
-    endpoint: "https://html.duckduckgo.com/html/",
-    source: "duckduckgo-html",
-    link_class: "result__a",
-    snippet_tag: "a",
-    snippet_class: "result__snippet",
-};
-
-const DDG_LITE: PageSpec = PageSpec {
-    endpoint: "https://lite.duckduckgo.com/lite/",
-    source: "duckduckgo-lite",
-    link_class: "result-link",
-    snippet_tag: "td",
-    snippet_class: "result-snippet",
-};
-
-/// Bing 是**容器式**结构，和 DDG 的扁平结构不同：
+/// Bing 是**容器式**结构：
 /// `li.b_algo` 里第一个 `h2 > a` 是结果链接，`div.b_caption` 里是摘要。
 #[derive(Clone, Copy)]
 struct BingSpec {
@@ -153,7 +123,7 @@ pub struct SearchHit {
     pub title: String,
     pub url: String,
     pub snippet: String,
-    /// 来源标识（例如 `duckduckgo-html`），多 provider 时用于区分。
+    /// 来源标识（例如 `bing`），多 provider 时用于区分。
     pub source: String,
 }
 
@@ -220,115 +190,9 @@ impl Health {
     }
 }
 
-/// 内置免 key provider：DuckDuckGo HTML，解析失败时回退 Lite。
-pub struct DuckDuckGo {
-    fetcher: Arc<dyn Fetcher>,
-    health: Mutex<Health>,
-}
-
-impl DuckDuckGo {
-    pub fn new(fetcher: Arc<dyn Fetcher>) -> Self {
-        Self {
-            fetcher,
-            health: Mutex::new(Health::default()),
-        }
-    }
-
-    fn cooldown_remaining(&self) -> Option<Duration> {
-        let guard = self.health.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
-        guard.cooldown_remaining()
-    }
-
-    fn record_success(&self) {
-        let mut guard = self.health.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
-        guard.success();
-    }
-
-    fn record_failure(&self, kind: SearchFailure) {
-        let mut guard = self.health.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
-        guard.failure(kind);
-    }
-
-    async fn attempt(
-        &self,
-        spec: PageSpec,
-        query: &str,
-        limit: usize,
-        cancel: &CancellationToken,
-    ) -> Result<Vec<SearchHit>, SearchError> {
-        let mut url = reqwest::Url::parse(spec.endpoint)
-            .map_err(|error| SearchError::new(SearchFailure::Network, error.to_string()))?;
-        url.query_pairs_mut().append_pair("q", query);
-        let response = self
-            .fetcher
-            .fetch(url.as_str(), cancel)
-            .await
-            .map_err(map_web_error)?;
-        finish(&response, |body| parse_results(body, spec, limit))
-    }
-}
-
-#[async_trait]
-impl SearchProvider for DuckDuckGo {
-    fn id(&self) -> &'static str {
-        "duckduckgo"
-    }
-
-    async fn search(
-        &self,
-        query: &str,
-        limit: usize,
-        cancel: &CancellationToken,
-    ) -> Result<Vec<SearchHit>, SearchError> {
-        if let Some(remaining) = self.cooldown_remaining() {
-            return Err(SearchError::new(
-                SearchFailure::Blocked,
-                format!("连续失败后冷却中，还剩 {} 秒", remaining.as_secs() + 1),
-            ));
-        }
-
-        let first = self.attempt(DDG_HTML, query, limit, cancel).await;
-        match first {
-            Ok(hits) => {
-                self.record_success();
-                return Ok(hits);
-            }
-            Err(error) if error.kind == SearchFailure::Parse => {
-                // HTML 结构对不上时再试 Lite：两边同时改版的概率低于单边。
-                let second = self.attempt(DDG_LITE, query, limit, cancel).await;
-                match second {
-                    Ok(hits) => {
-                        self.record_success();
-                        Ok(hits)
-                    }
-                    Err(lite_error) => {
-                        // 两种都没解析出来：把两条细节都带上，方便判断是不是改版。
-                        self.record_failure(lite_error.kind);
-                        Err(SearchError::new(
-                            lite_error.kind,
-                            format!(
-                                "html 端点：{}；lite 端点：{}",
-                                error.detail, lite_error.detail
-                            ),
-                        ))
-                    }
-                }
-            }
-            Err(error) => {
-                if error.kind != SearchFailure::Parse {
-                    self.record_failure(error.kind);
-                }
-                Err(error)
-            }
-        }
-    }
-}
-
 /// Bing provider。
 ///
-/// DDG 在本机网络经常不可达（Cloudflare IP 可解析、TCP 443 超时），Bing 实测可达，
-/// 因此默认链把 Bing 放在第二跳——它才是实际主力。解析结构集中在 [`BING`]，
-/// 改版时只改那一处。
+/// 目前唯一的免 key provider。解析结构集中在 [`BING`]，改版时只改那一处。
 pub struct Bing {
     fetcher: Arc<dyn Fetcher>,
     health: Mutex<Health>,
@@ -404,9 +268,8 @@ impl SearchProvider for Bing {
 
 /// provider 串行回退链：前一家的任何失败都会尝试下一家。
 ///
-/// 为什么连 `Blocked` 也回退：不同引擎的反爬彼此独立，一家限流不代表另一家不可用；
-/// 这也是「DDG 被墙 → Bing 顶上」的实现形态。**空结果是成功**，不再问下一家，
-/// 否则「确实没有」会被下一家的偶发命中覆盖成「有结果」。
+/// 为什么连 `Blocked` 也回退：不同引擎的反爬彼此独立，一家限流不代表另一家不可用。
+/// **空结果是成功**，不再问下一家，否则「确实没有」会被下一家的偶发命中覆盖成「有结果」。
 pub struct FallbackProvider {
     providers: Vec<Arc<dyn SearchProvider>>,
 }
@@ -553,42 +416,6 @@ const NO_RESULT_MARKERS: &[&str] = &[
 
 // ============================== 解析 ==============================
 
-fn parse_results(html: &str, spec: PageSpec, limit: usize) -> Vec<SearchHit> {
-    let links: Vec<(String, String)> = scan_anchors(html)
-        .into_iter()
-        .filter(|(attrs, _)| has_class(attrs, spec.link_class))
-        .collect();
-    let snippets = if spec.snippet_class.is_empty() {
-        elements_by_tag(html, spec.snippet_tag)
-    } else {
-        elements_by_class(html, spec.snippet_tag, spec.snippet_class)
-    };
-
-    let mut hits = Vec::new();
-    for (index, (attrs, inner)) in links.iter().enumerate() {
-        if hits.len() >= limit {
-            break;
-        }
-        let Some(href) = attr_value(attrs, "href") else { continue };
-        let Some(url) = normalize_href(&href) else { continue };
-        let title = text_of(inner);
-        if title.is_empty() {
-            continue;
-        }
-        let snippet = snippets
-            .get(index)
-            .map(|raw| truncate_chars(&text_of(raw), SNIPPET_CHARS))
-            .unwrap_or_default();
-        hits.push(SearchHit {
-            title,
-            url,
-            snippet,
-            source: spec.source.to_string(),
-        });
-    }
-    hits
-}
-
 /// Bing 的容器式解析：先找 `li.b_algo`，再在容器内找标题链接与摘要。
 fn parse_bing(html: &str, spec: BingSpec, limit: usize) -> Vec<SearchHit> {
     let mut hits = Vec::new();
@@ -636,7 +463,7 @@ fn bing_snippet(container: &str, spec: BingSpec) -> String {
 
 /// 扫描所有 `<a ...>...</a>`，返回（属性串, 内层 HTML）。
 ///
-/// 只做这一种标签是够的：DDG 的结果链接与摘要在两种端点里都是 `<a>` / `<td>`。
+/// 只做这一种标签是够的：Bing 的标题链接在 `h2` 内，仍是 `<a>`。
 fn scan_anchors(html: &str) -> Vec<(String, String)> {
     let mut out = Vec::new();
     let mut index = 0;
@@ -778,42 +605,6 @@ fn attr_value(attrs: &str, name: &str) -> Option<String> {
     None
 }
 
-/// 结果链接规范化：把 DDG 的跳转中间页还原成目标 URL。
-fn normalize_href(href: &str) -> Option<String> {
-    // HTML 属性值同样会做实体编码（最常见的 `&amp;`），先解码再解析 URL。
-    let decoded = decode_entities(href);
-    let href = decoded.trim();
-    if href.is_empty() {
-        return None;
-    }
-    let absolute = if href.starts_with("//") {
-        format!("https:{href}")
-    } else if href.starts_with('/') {
-        format!("https://duckduckgo.com{href}")
-    } else {
-        href.to_string()
-    };
-    let parsed = reqwest::Url::parse(&absolute).ok()?;
-    let is_redirector = parsed
-        .host_str()
-        .map(|host| host.ends_with("duckduckgo.com"))
-        .unwrap_or(false)
-        && parsed.path().starts_with("/l/");
-    let target = if is_redirector {
-        parsed
-            .query_pairs()
-            .find(|(key, _)| key == "uddg")
-            .map(|(_, value)| value.into_owned())?
-    } else {
-        parsed.to_string()
-    };
-    let final_url = reqwest::Url::parse(&target).ok()?;
-    match final_url.scheme() {
-        "http" | "https" => Some(final_url.to_string()),
-        _ => None,
-    }
-}
-
 /// Bing 结果链接规范化：`/ck/a?...&u=a1<base64url>` 是跳转中间页，需要还原成目标 URL。
 ///
 /// Bing 的有机结果大多也是直链，只有部分场景包一层 `ck/a`；站内链接（图片、词典等）
@@ -943,7 +734,7 @@ impl WebSearch {
         Self {
             spec: ToolSpec::new(
                 "web_search",
-                "Search the public web via DuckDuckGo/Bing result pages. Returns titles, URLs \
+                "Search the public web via Bing result pages. Returns titles, URLs \
                  and snippets; results may be incomplete or stale. Use web_fetch to verify. \
                  Network is available to this tool even when sandboxed commands are offline.",
                 serde_json::json!({
@@ -1047,108 +838,25 @@ impl ToolExecutor for WebSearch {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::collections::VecDeque;
-
-    const HTML_SAMPLE: &str = r#"
-<html><body>
-<div class="result results_links results_links_deep web-result">
-  <h2 class="result__title">
-    <a rel="nofollow" class="result__a" href="//duckduckgo.com/l/?uddg=https%3A%2F%2Fdoc.rust-lang.org%2Fbook%2F&amp;rut=abc">The Rust Book</a>
-  </h2>
-  <a class="result__snippet" href="//duckduckgo.com/l/?uddg=https%3A%2F%2Fdoc.rust-lang.org%2Fbook%2F">A book about <b>Rust</b> &amp; systems programming.</a>
-</div>
-<div class="result">
-  <a rel="nofollow" class="result__a" href="https://example.com/page?x=1&amp;y=2">Example Page</a>
-  <a class="result__snippet">Plain snippet</a>
-</div>
-</body></html>
-"#;
-
-    const LITE_SAMPLE: &str = r#"
-<html><body><table>
-<tr><td><a rel="nofollow" href="//duckduckgo.com/l/?uddg=https%3A%2F%2Fexample.org%2F" class='result-link'>Example Org</a></td></tr>
-<tr><td class="result-snippet">Lite snippet here</td></tr>
-</table></body></html>
-"#;
 
     /// 固定夹具：Bing 搜索结果页的骨架。用 include_str! 锁住，
     /// 这样 Bing 改版导致的解析失败会在 CI 暴露，而不是等真机才发现。
     const BING_FIXTURE: &str = include_str!("../../../tests/fixtures/bing_results.html");
-
-    fn classify_ddg(response: &WebResponse) -> Result<Vec<SearchHit>, SearchError> {
-        finish(response, |body| parse_results(body, DDG_HTML, 5))
-    }
 
     fn classify_bing(response: &WebResponse) -> Result<Vec<SearchHit>, SearchError> {
         finish(response, |body| parse_bing(body, BING, 5))
     }
 
     #[test]
-    fn parses_html_endpoint_and_unwraps_redirect() {
-        let hits = parse_results(HTML_SAMPLE, DDG_HTML, 10);
-        assert_eq!(hits.len(), 2);
-        assert_eq!(hits[0].title, "The Rust Book");
-        assert_eq!(hits[0].url, "https://doc.rust-lang.org/book/");
-        assert!(hits[0].snippet.contains("A book about Rust & systems programming."));
-        assert_eq!(hits[1].url, "https://example.com/page?x=1&y=2");
-    }
-
-    #[test]
-    fn parses_lite_endpoint_single_quoted_attrs() {
-        let hits = parse_results(LITE_SAMPLE, DDG_LITE, 10);
-        assert_eq!(hits.len(), 1);
-        assert_eq!(hits[0].url, "https://example.org/");
-        assert_eq!(hits[0].snippet, "Lite snippet here");
-    }
-
-    #[test]
-    fn respects_result_limit() {
-        let hits = parse_results(HTML_SAMPLE, DDG_HTML, 1);
-        assert_eq!(hits.len(), 1);
-    }
-
-    #[test]
-    fn no_results_page_is_success_not_error() {
-        let body = format!("<html><body><div>No results.</div>{}</body></html>", "x".repeat(600));
-        let response = response(200, &body);
-        let result = classify_ddg(&response);
-        assert_eq!(result.unwrap(), Vec::new());
-    }
-
-    #[test]
-    fn captcha_page_is_blocked() {
-        let body = format!("<html><body>Please complete the CAPTCHA</body>{}</html>", "x".repeat(600));
-        let error = classify_ddg(&response(200, &body)).unwrap_err();
-        assert_eq!(error.kind, SearchFailure::Blocked);
-    }
-
-    #[test]
     fn status_429_is_blocked() {
-        let error = classify_ddg(&response(429, "slow down")).unwrap_err();
+        let error = classify_bing(&response(429, "slow down")).unwrap_err();
         assert_eq!(error.kind, SearchFailure::Blocked);
     }
 
     #[test]
     fn empty_shell_is_blocked_not_no_results() {
-        let error = classify_ddg(&response(200, "<html></html>")).unwrap_err();
+        let error = classify_bing(&response(200, "<html></html>")).unwrap_err();
         assert_eq!(error.kind, SearchFailure::Blocked);
-    }
-
-    #[test]
-    fn changed_layout_is_parse_failure() {
-        let body = format!("<html><body><div class=\"brand-new-layout\">hi</div>{}</body></html>", "x".repeat(600));
-        let error = classify_ddg(&response(200, &body)).unwrap_err();
-        assert_eq!(error.kind, SearchFailure::Parse);
-    }
-
-    #[test]
-    fn normalize_href_drops_non_http_and_redirector_without_target() {
-        assert_eq!(normalize_href("javascript:alert(1)"), None);
-        assert_eq!(normalize_href("//duckduckgo.com/l/?rut=1"), None);
-        assert_eq!(
-            normalize_href("//duckduckgo.com/l/?uddg=https%3A%2F%2Fa.example%2Fp%3Fq%3D1"),
-            Some("https://a.example/p?q=1".to_string())
-        );
     }
 
     #[test]
@@ -1166,7 +874,7 @@ mod tests {
 
     fn response(status: u16, body: &str) -> WebResponse {
         WebResponse {
-            final_url: "https://html.duckduckgo.com/html/".into(),
+            final_url: "https://www.bing.com/search".into(),
             status,
             content_type: Some("text/html".into()),
             body: body.as_bytes().to_vec(),
@@ -1174,74 +882,6 @@ mod tests {
             elapsed: Duration::from_millis(1),
             redirects: 0,
         }
-    }
-
-    struct ScriptedFetcher {
-        responses: Mutex<VecDeque<Result<WebResponse, WebError>>>,
-        calls: Mutex<Vec<String>>,
-    }
-
-    #[async_trait]
-    impl Fetcher for ScriptedFetcher {
-        async fn fetch(&self, url: &str, _cancel: &CancellationToken) -> Result<WebResponse, WebError> {
-            self.calls.lock().unwrap().push(url.to_string());
-            self.responses
-                .lock()
-                .unwrap()
-                .pop_front()
-                .unwrap_or_else(|| Err(WebError::Http("没有更多脚本响应".into())))
-        }
-    }
-
-    fn scripted(responses: Vec<Result<WebResponse, WebError>>) -> Arc<ScriptedFetcher> {
-        Arc::new(ScriptedFetcher {
-            responses: Mutex::new(responses.into()),
-            calls: Mutex::new(Vec::new()),
-        })
-    }
-
-    #[tokio::test]
-    async fn falls_back_to_lite_when_html_layout_changes() {
-        let broken = response(200, &format!("<html><body>{}</body></html>", "x".repeat(600)));
-        let lite = response(200, LITE_SAMPLE);
-        let fetcher = scripted(vec![Ok(broken), Ok(lite)]);
-        let provider = DuckDuckGo::new(fetcher.clone());
-        let hits = provider
-            .search("rust", 5, &CancellationToken::new())
-            .await
-            .unwrap();
-        assert_eq!(hits.len(), 1);
-        assert_eq!(hits[0].source, "duckduckgo-lite");
-        let calls = fetcher.calls.lock().unwrap();
-        assert_eq!(calls.len(), 2);
-        assert!(calls[0].contains("html.duckduckgo.com"));
-        assert!(calls[1].contains("lite.duckduckgo.com"));
-    }
-
-    #[tokio::test]
-    async fn blocked_does_not_try_lite() {
-        let fetcher = scripted(vec![Err(WebError::Http("403".into()))]);
-        let provider = DuckDuckGo::new(fetcher.clone());
-        let error = provider.search("x", 5, &CancellationToken::new()).await.unwrap_err();
-        assert_eq!(error.kind, SearchFailure::Network);
-        assert_eq!(fetcher.calls.lock().unwrap().len(), 1);
-    }
-
-    #[tokio::test]
-    async fn cooldown_after_repeated_failures() {
-        let fetcher = scripted(vec![
-            Err(WebError::Http("boom".into())),
-            Err(WebError::Http("boom".into())),
-            Err(WebError::Http("boom".into())),
-        ]);
-        let provider = DuckDuckGo::new(fetcher.clone());
-        for _ in 0..3 {
-            let _ = provider.search("x", 5, &CancellationToken::new()).await;
-        }
-        let error = provider.search("x", 5, &CancellationToken::new()).await.unwrap_err();
-        assert_eq!(error.kind, SearchFailure::Blocked);
-        assert!(error.detail.contains("冷却"));
-        assert_eq!(fetcher.calls.lock().unwrap().len(), 3);
     }
 
     // ---------------------------- Bing 解析 ----------------------------

@@ -9,8 +9,7 @@ pub mod search;
 
 pub use client::{WebClient, WebError, WebResponse};
 pub use search::{
-    Bing, DuckDuckGo, FallbackProvider, SearchError, SearchFailure, SearchHit, SearchProvider,
-    WebSearch,
+    Bing, FallbackProvider, SearchError, SearchFailure, SearchHit, SearchProvider, WebSearch,
 };
 
 /// 生成一次性分隔符随机数（16 字节 hex）。
