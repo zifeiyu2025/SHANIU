@@ -193,6 +193,9 @@ unsafe fn create_inheritable_pipe() -> Result<(std::fs::File, HandleGuard), Stri
 pub struct RestrictedChild {
     process: OwnedHandle, // Send ✓
     _job: JobGuard,
+    /// 两条输出流各自的编码判定结果（读线程回写）。中文 Windows 上 cmd 内建命令
+    /// 按 OEM 代码页（936）写管道，外部程序多用 UTF-8——统一在这里判定一次。
+    encodings: crate::text_encoding::EncodingLedger,
 }
 
 unsafe impl Send for RestrictedChild {}
@@ -201,6 +204,11 @@ unsafe impl Send for RestrictedChild {}
 pub type ExecLine = (u8, String);
 
 impl RestrictedChild {
+    /// 本次 exec 实际采用的输出编码（只报落定过判定的流）；供调用方写进工具输出元数据。
+    pub fn encoding_note(&self) -> Option<String> {
+        self.encodings.note()
+    }
+
     /// 阻塞等待退出（经 spawn_blocking 在阻塞线程池运行），返回退出码。
     pub async fn wait(&mut self) -> io::Result<i32> {
         let process = self
@@ -300,15 +308,16 @@ pub fn spawn_restricted_command(
         // 8) 父侧：关闭继承写端；读端 File 交 std::thread 读线程
         drop(out_write);
         drop(err_write);
-        spawn_pipe_reader(out_read, 0, tx.clone());
-        spawn_pipe_reader(err_read, 1, tx);
+        let encodings = crate::text_encoding::EncodingLedger::new();
+        spawn_pipe_reader(out_read, 0, tx.clone(), encodings.clone());
+        spawn_pipe_reader(err_read, 1, tx, encodings.clone());
 
         // 进程句柄 → OwnedHandle（wait/kill 用）
         let raw: RawHandle = pi.hProcess.0.cast();
         let process = OwnedHandle::from_raw_handle(raw);
         // 线程主句柄立即关闭（线程已 Resume；si 为 Copy 无需 drop）
         let _ = CloseHandle(pi.hThread);
-        Ok(RestrictedChild { process, _job: job_guard })
+        Ok(RestrictedChild { process, _job: job_guard, encodings })
     }
 }
 
@@ -404,19 +413,25 @@ pub fn spawn_appcontainer_command(
         // 父侧：关闭继承写端；读端交读线程
         drop(out_write);
         drop(err_write);
-        spawn_pipe_reader(out_read, 0, tx.clone());
-        spawn_pipe_reader(err_read, 1, tx);
+        let encodings = crate::text_encoding::EncodingLedger::new();
+        spawn_pipe_reader(out_read, 0, tx.clone(), encodings.clone());
+        spawn_pipe_reader(err_read, 1, tx, encodings.clone());
 
         let raw: RawHandle = pi.hProcess.0.cast();
         let process = OwnedHandle::from_raw_handle(raw);
         let _ = CloseHandle(pi.hThread);
-        Ok(RestrictedChild { process, _job: job_guard })
+        Ok(RestrictedChild { process, _job: job_guard, encodings })
     }
 }
 
 
 /// std::thread 逐行读管道 → blocking_send 桥接 tokio 通道（codex read_handle_loop 同思路）。
-fn spawn_pipe_reader(read: std::fs::File, channel: u8, tx: mpsc::Sender<ExecLine>) {
+fn spawn_pipe_reader(
+    read: std::fs::File,
+    channel: u8,
+    tx: mpsc::Sender<ExecLine>,
+    encodings: crate::text_encoding::EncodingLedger,
+) {
     std::thread::spawn(move || {
         use std::io::BufRead;
         // BufReader 必须活在循环外。每轮新建的话，它会把一次 read 拿到的整块（默认 8KB）
@@ -424,17 +439,27 @@ fn spawn_pipe_reader(read: std::fs::File, channel: u8, tx: mpsc::Sender<ExecLine
         // 实测症状：受限沙箱里 `dir /b` 输出四行，模型只收到第一行，于是反复重跑同一命令
         // 却永远看不到完整清单。
         let mut reader = std::io::BufReader::new(read);
-        let mut line = String::new();
+        let mut decoder = crate::text_encoding::StreamDecoder::with_system_oem();
+        let mut raw: Vec<u8> = Vec::new();
         loop {
-            line.clear();
-            match reader.read_line(&mut line) {
+            raw.clear();
+            match reader.read_until(b'\n', &mut raw) {
                 Ok(0) | Err(_) => break,
                 Ok(_) => {}
             }
-            let trimmed = line.trim_end_matches(['\r', '\n']).to_string();
-            if tx.blocking_send((channel, trimmed)).is_err() {
+            while matches!(raw.last(), Some(b'\n') | Some(b'\r')) {
+                raw.pop();
+            }
+            let decoded = decoder.decode_line(&raw);
+            if let Some(encoding) = decoder.decision() {
+                encodings.record(channel, encoding);
+            }
+            if tx.blocking_send((channel, decoded)).is_err() {
                 break;
             }
+        }
+        if let Some(encoding) = decoder.decision() {
+            encodings.record(channel, encoding);
         }
     });
 }

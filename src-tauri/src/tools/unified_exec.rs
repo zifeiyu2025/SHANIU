@@ -329,23 +329,40 @@ impl UnifiedExec {
 }
 
 /// 逐行读取子进程管道送入通道；EOF（管道关闭）后任务自然结束。
+///
+/// 按**原始字节**读行再解码：`read_line(&mut String)` 遇到中文 Windows 的 GBK 输出
+/// 会返回 `InvalidData` 并让整行连同其后内容一起丢失（模型只看到 `�\u{73e}...`）。
+/// 编码由 [`crate::text_encoding::StreamDecoder`] 按整条流判定一次，结果回写进
+/// `encodings`，供调用方写进工具输出元数据。
 fn spawn_reader(
     pipe: Box<dyn tokio::io::AsyncRead + Unpin + Send>,
     channel: u8,
     tx: mpsc::Sender<sandbox::ExecLine>,
+    encodings: crate::text_encoding::EncodingLedger,
 ) -> tokio::task::JoinHandle<()> {
     tokio::spawn(async move {
         let mut reader = BufReader::new(pipe);
-        let mut line = String::new();
-        while let Ok(n) = reader.read_line(&mut line).await {
-            if n == 0 {
+        let mut decoder = crate::text_encoding::StreamDecoder::with_system_oem();
+        let mut raw: Vec<u8> = Vec::new();
+        loop {
+            raw.clear();
+            match reader.read_until(b'\n', &mut raw).await {
+                Ok(0) | Err(_) => break,
+                Ok(_) => {}
+            }
+            while matches!(raw.last(), Some(b'\n') | Some(b'\r')) {
+                raw.pop();
+            }
+            let decoded = decoder.decode_line(&raw);
+            if let Some(encoding) = decoder.decision() {
+                encodings.record(channel, encoding);
+            }
+            if tx.send((channel, decoded)).await.is_err() {
                 break;
             }
-            let trimmed = line.trim_end_matches(['\r', '\n']).to_string();
-            if tx.send((channel, trimmed)).await.is_err() {
-                break;
-            }
-            line.clear();
+        }
+        if let Some(encoding) = decoder.decision() {
+            encodings.record(channel, encoding);
         }
     })
 }
@@ -464,6 +481,8 @@ impl ToolExecutor for UnifiedExec {
 
         // stdio 行通道（Plain=tokio 读任务 / Restricted=std 读线程，统一回传）
         let (tx, mut rx) = mpsc::channel::<sandbox::ExecLine>(256);
+        // 输出编码判定槽：两条流各自回写最终采用的编码，收尾时写进工具输出元数据。
+        let encodings = crate::text_encoding::EncodingLedger::new();
 
         // 按沙箱策略启动（fail-closed：沙箱准备失败 → Execution，执行数为 0）
         // 网络：v1 默认断；只有该会话在 UI 上批准过「允许网络」才带 internetClient 能力。
@@ -494,10 +513,10 @@ impl ToolExecutor for UnifiedExec {
                     .spawn()
                     .map_err(|e| ToolError::Execution(format!("命令启动失败: {e}")))?;
                 if let Some(pipe) = child.stdout.take() {
-                    spawn_reader(Box::new(pipe), 0, tx.clone());
+                    spawn_reader(Box::new(pipe), 0, tx.clone(), encodings.clone());
                 }
                 if let Some(pipe) = child.stderr.take() {
-                    spawn_reader(Box::new(pipe), 1, tx.clone());
+                    spawn_reader(Box::new(pipe), 1, tx.clone(), encodings.clone());
                 }
                 Waiter::Tokio(Box::new(child))
             }
@@ -571,19 +590,32 @@ impl ToolExecutor for UnifiedExec {
                         }
                     }
                     let code = status.code().unwrap_or(-1);
-                    let silent_failure = code != 0 && collected.is_empty() && truncated_note.is_none();
                     let mut text = collected.join("\n");
                     if let Some(note) = truncated_note {
                         text.push_str(note.as_str());
                     }
                     text.push_str(&format!("\n[exit code: {code}]"));
-                    // SH-021 降级处理：卷信息类命令在容器里会「失败且零输出」，
-                    // 不解释的话模型会误判成沙箱损坏。这里明确说清原因与替代做法。
-                    if silent_failure {
+                    // 输出编码元数据：不许无痕猜测——这条流最终按 UTF-8 还是 OEM 代码页
+                    // （中文 Windows = 936）还原，明确写进模型可见的输出。
+                    let encoding_note = match &waiter {
+                        Waiter::Tokio(_) => encodings.note(),
+                        Waiter::Restricted(child) => child.encoding_note(),
+                    };
+                    if let Some(note) = encoding_note {
+                        text.push_str(&format!("\n{note}"));
+                    }
+                    // SH-021 降级处理：卷信息类命令在 AppContainer 里会失败（典型报错
+                    // 「拒绝访问。」）——这是容器拿不到卷信息，不是目录 ACL 故障，也不是
+                    // 沙箱损坏。中文报错现在能正常解码（见 text_encoding），所以触发条件
+                    // 从「零输出」改为「失败 + 容器模式」：既覆盖旧的静默形态，也避免模型
+                    // 把 `拒绝访问。` 误读成授权配置错了。
+                    if code != 0
+                        && sandbox::current_os_mode() == crate::config::OsSandbox::AppContainer
+                    {
                         if let Some(program) = volume_dependent_program(command) {
                             text.push_str(&format!(
-                                "\n[提示] `{program}` 在 AppContainer 内依赖卷信息，以退出码 {code} 静默退出（零输出）——\
-                                 这不是沙箱损坏。列目录请改用 list_dir 工具，或在容器内用 `for %f in (*) do @echo %f`。"
+                                "\n[提示] `{program}` 在 AppContainer 内会因拿不到卷信息而失败（典型报错「拒绝访问。」）——\
+                                 这不是沙箱损坏，也不是目录 ACL 故障。列目录请改用 list_dir 工具，或在容器内用 `for %f in (*) do @echo %f`。"
                             ));
                         }
                     }
@@ -690,6 +722,39 @@ mod tests {
             .unwrap();
         assert!(!out.success);
         assert!(out.output.contains("[exit code: 7]"));
+        std::fs::remove_dir_all(&ws).ok();
+    }
+
+    /// 真机用例（仅中文 Windows 生效）：cmd 的报错按 OEM 代码页（936/GBK）写管道，
+    /// 旧实现会 `InvalidData` 丢整行。这里要求模型侧拿到**可读中文** + 编码元数据，
+    /// 且不得出现替换字符。
+    #[tokio::test]
+    async fn gbk_error_message_is_readable_on_chinese_windows() {
+        if crate::text_encoding::system_oem_codepage() != 936 {
+            return;
+        }
+        let ws = workspace();
+        let out = UnifiedExec::new()
+            .execute(
+                serde_json::json!({"command": "type __shaniu_missing_file_9f3c__.txt"}),
+                &ctx(&ws),
+            )
+            .await
+            .unwrap();
+        assert!(!out.success, "输出: {}", out.output);
+        assert!(!out.output.contains('\u{FFFD}'), "输出: {}", out.output);
+        assert!(
+            out.output
+                .chars()
+                .any(|c| ('\u{4e00}'..='\u{9fff}').contains(&c)),
+            "应拿到可读中文，实际: {}",
+            out.output
+        );
+        assert!(
+            out.output.contains("oem-936"),
+            "缺少编码元数据: {}",
+            out.output
+        );
         std::fs::remove_dir_all(&ws).ok();
     }
 

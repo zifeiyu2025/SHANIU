@@ -77,6 +77,8 @@ windows = { version = "0.62", features = [
     # SH-021/022：AppContainer profile 生命周期（Isolation）与目录 DACL 读写（Authorization）
     "Win32_Security_Isolation",
     "Win32_Security_Authorization",
+    # 子进程输出编码判定：MultiByteToWideChar + GetOEMCP（GBK 回退）
+    "Win32_Globalization",
     "Win32_Storage_FileSystem",
     "Win32_System_JobObjects",
     "Win32_System_Pipes",
