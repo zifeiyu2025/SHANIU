@@ -22,6 +22,7 @@ use tokio::task::JoinHandle;
 
 use crate::config::{McpConfigSource, McpServerConfig, SandboxMode};
 use crate::events::RiskLevel;
+use crate::sandbox;
 use crate::tool_router::ToolExecutor;
 
 use super::command::{file_sha256, resolve_executable};
@@ -29,7 +30,7 @@ use super::fingerprint::{FingerprintInput, ModuleTreeDigest};
 use super::guard::{self, Exemption, ExemptionKey, ExemptionStore, GuardVerdict, RuleId};
 use super::manifest::{self, RegistrationPlan};
 use super::module_tree;
-use super::process::RestartGuard;
+use super::process::{RestartGuard, SpawnSpec};
 use super::registry::{self, ApprovedTool};
 use super::session::{
     McpSession, RemoteTool, RestartOutcome, ServerIdentity, DEFAULT_HANDSHAKE_TIMEOUT,
@@ -273,6 +274,8 @@ struct Pending {
     /// 批准后重建执行器时要原样复用（不重新解析、不再走 PATH）。
     sandbox_mode: SandboxMode,
     cwd: PathBuf,
+    /// 容器授权作用的工作区根（与 `cwd` 可能不同）。
+    workspace_root: PathBuf,
 }
 
 struct Active {
@@ -297,6 +300,7 @@ struct RestartParams {
     config: McpServerConfig,
     sandbox_mode: SandboxMode,
     cwd: PathBuf,
+    workspace_root: PathBuf,
     /// 批准记录里的可执行文件哈希：每次重启前都要重新比对。
     approved_sha256: String,
     /// 批准记录里的模块代码树摘要（解释器型启动才有）：同样每次重启前重算比对。
@@ -323,6 +327,11 @@ pub struct McpRuntime {
     /// 不落盘是刻意的：进程重启后用户重新连接即是一次新的显式动作，应重新走审查；
     /// 但同一进程生命周期内绝不自动复活一个已经放弃的 server。
     degraded: Mutex<BTreeMap<String, String>>,
+    /// 启动失败（沙箱/容器建立不起来）的终态与原因（**内存态**）。
+    ///
+    /// 与 `degraded` 的区别：`degraded` 是「跑起来后又崩了」，这里是「压根没起来」。
+    /// 两者都表示本进程内不再自动拉起，必须用户显式重连。
+    blocked: Mutex<BTreeMap<String, String>>,
     /// 运行期状态原因（例如「第 2 次自动重启成功」）：覆盖信任记录里的静态 reason。
     live_reason: Mutex<BTreeMap<String, String>>,
     sink: RwLock<Arc<dyn McpEventSink>>,
@@ -340,6 +349,7 @@ impl McpRuntime {
             pending: Mutex::new(BTreeMap::new()),
             active: std::sync::Mutex::new(BTreeMap::new()),
             degraded: Mutex::new(BTreeMap::new()),
+            blocked: Mutex::new(BTreeMap::new()),
             live_reason: Mutex::new(BTreeMap::new()),
             sink: RwLock::new(Arc::new(NullMcpSink)),
         }
@@ -479,10 +489,29 @@ impl McpRuntime {
         } else {
             SandboxMode::WorkspaceWrite
         };
-        let mut session =
-            McpSession::start(config, sandbox_mode, &cwd, &executable_sha256, module_tree_sha)
-                .await
-                .map_err(|error| format!("启动 MCP server 失败: {error}"))?;
+        let mut session = match McpSession::start(SpawnSpec {
+            config,
+            sandbox_mode,
+            cwd: &cwd,
+            workspace_root,
+            approved_sha256: &executable_sha256,
+            approved_module_tree: module_tree_sha,
+        })
+        .await
+        {
+            Ok(session) => session,
+            Err(error) => {
+                // 沙箱/容器准备失败就是失败：**不回退到受限令牌**（那会让用户以为它在
+                // 容器里），如实置 blocked 并把原因留给界面与模型。
+                let reason = format!(
+                    "启动 MCP server 失败（{error}）：已置为 blocked，未回退到受限令牌；\
+                     修正沙箱配置后请显式重连"
+                );
+                self.mark_blocked(&config.id, reason.clone()).await;
+                return Err(reason);
+            }
+        };
+        self.clear_blocked(&config.id).await;
         let identity = session
             .initialize(DEFAULT_HANDSHAKE_TIMEOUT)
             .await
@@ -566,6 +595,7 @@ impl McpRuntime {
                             session,
                             sandbox_mode,
                             cwd.clone(),
+                            workspace_root.to_path_buf(),
                             fresh_grants,
                             reason,
                             warnings,
@@ -611,6 +641,7 @@ impl McpRuntime {
                         config: config.clone(),
                         sandbox_mode,
                         cwd: cwd.clone(),
+                        workspace_root: workspace_root.to_path_buf(),
                         approved_sha256: executable_sha256.clone(),
                         approved_module_tree: module_tree_sha.map(str::to_string),
                     },
@@ -669,6 +700,7 @@ impl McpRuntime {
                     session,
                     sandbox_mode,
                     cwd.clone(),
+                    workspace_root.to_path_buf(),
                     fresh_grants,
                     reason,
                     warnings,
@@ -686,6 +718,7 @@ impl McpRuntime {
                     session,
                     sandbox_mode,
                     cwd.clone(),
+                    workspace_root.to_path_buf(),
                     fresh_grants,
                     Some("首次连接：请核对指纹与逐工具风险档位后批准".to_string()),
                     warnings,
@@ -707,6 +740,7 @@ impl McpRuntime {
         session: Arc<Mutex<McpSession>>,
         sandbox_mode: SandboxMode,
         cwd: PathBuf,
+        workspace_root: PathBuf,
         fresh_grants: Vec<ToolGrant>,
         reason: Option<String>,
         warnings: Vec<String>,
@@ -735,6 +769,7 @@ impl McpRuntime {
                 session,
                 sandbox_mode,
                 cwd,
+                workspace_root,
             },
         );
         let payload = self
@@ -1045,6 +1080,7 @@ impl McpRuntime {
                     config: pending.config.clone(),
                     sandbox_mode: pending.sandbox_mode,
                     cwd: pending.cwd.clone(),
+                    workspace_root: pending.workspace_root.clone(),
                     approved_sha256: pending.input.executable_sha256.clone(),
                     approved_module_tree: pending
                         .input
@@ -1218,15 +1254,18 @@ impl McpRuntime {
         let trust = self.trust.lock().await;
         let pending = self.pending.lock().await;
         let degraded = self.degraded.lock().await;
+        let blocked = self.blocked.lock().await;
         let live_reason = self.live_reason.lock().await;
         let active = self.active.lock().expect("MCP active 锁中毒");
         trust
             .records()
             .into_iter()
             .map(|record| {
-                // degraded 是运行时的真实终态：信任记录仍是 trusted，但进程已放弃，
-                // 不能让界面继续显示「已批准、可调用」。
-                let (status, reason) = if let Some(reason) = degraded.get(&record.server_id) {
+                // blocked（压根没起来）与 degraded（起来后又崩）都是真实终态：
+                // 信任记录可能仍是 trusted，但进程不存在，界面不能显示「可调用」。
+                let (status, reason) = if let Some(reason) = blocked.get(&record.server_id) {
+                    (McpStatus::Blocked, Some(reason.clone()))
+                } else if let Some(reason) = degraded.get(&record.server_id) {
                     (McpStatus::Degraded, Some(reason.clone()))
                 } else if pending.contains_key(&record.server_id) {
                     (McpStatus::Review, record.reason.clone())
@@ -1304,6 +1343,10 @@ impl McpRuntime {
             }
             active.session.lock().await.shutdown();
         }
+        self.blocked.lock().await.remove(server_id);
+        // 进程都已停掉，再撤该 server 的容器：删 SID 的 ACE + 删 profile。
+        // 放在 stop/撤信/卸载/退出共同走过的唯一出口，避免有路径漏删。
+        sandbox::release_mcp_server(server_id);
     }
 
     /// 登记一个已批准服务器并启动崩溃监管（唯一的入口，避免两处插入逻辑分叉）。
@@ -1333,6 +1376,24 @@ impl McpRuntime {
     async fn clear_degraded(&self, server_id: &str) {
         self.degraded.lock().await.remove(server_id);
         self.live_reason.lock().await.remove(server_id);
+    }
+
+    /// 启动失败：记录终态原因并广播 `blocked`（界面必须能解释「为什么没起来」）。
+    async fn mark_blocked(&self, server_id: &str, reason: String) {
+        self.blocked
+            .lock()
+            .await
+            .insert(server_id.to_string(), reason.clone());
+        self.emit(McpEvent::ServerStatusChanged {
+            server_id: server_id.to_string(),
+            status: McpStatus::Blocked,
+            reason: Some(reason),
+        });
+    }
+
+    /// 成功启动后清掉上一次的启动失败记录。
+    async fn clear_blocked(&self, server_id: &str) {
+        self.blocked.lock().await.remove(server_id);
     }
 
     async fn set_live_reason(&self, server_id: &str, reason: String) {
@@ -1620,11 +1681,14 @@ async fn supervise(
             let mut session = session.lock().await;
             session
                 .restart(
-                    &params.config,
-                    params.sandbox_mode,
-                    &params.cwd,
-                    &params.approved_sha256,
-                    params.approved_module_tree.as_deref(),
+                    SpawnSpec {
+                        config: &params.config,
+                        sandbox_mode: params.sandbox_mode,
+                        cwd: &params.cwd,
+                        workspace_root: &params.workspace_root,
+                        approved_sha256: &params.approved_sha256,
+                        approved_module_tree: params.approved_module_tree.as_deref(),
+                    },
                     &mut guard,
                 )
                 .await

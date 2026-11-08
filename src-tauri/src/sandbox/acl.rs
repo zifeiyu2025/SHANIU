@@ -132,6 +132,51 @@ fn drop_nested(mut paths: Vec<PathBuf>) -> Vec<PathBuf> {
     kept
 }
 
+impl Access {
+    /// 权限包含关系：`Write ⊇ Read ⊇ Traverse`。
+    fn covers(self, other: Access) -> bool {
+        matches!(
+            (self, other),
+            (Access::Write, _)
+                | (Access::Read, Access::Read | Access::Traverse)
+                | (Access::Traverse, Access::Traverse)
+        )
+    }
+}
+
+/// 收敛一份授权清单：同路径取最强档位，被祖先目录以「不更弱」权限覆盖的条目去掉。
+///
+/// 只为少改 DACL 与少绕一层锁：每个 MCP server 的清单会同时包含工作区根、
+/// 其子目录与工具链目录，逐条授权会重复改写同一个安全描述符。
+pub fn collapse(entries: Vec<(PathBuf, Access)>) -> Vec<(PathBuf, Access)> {
+    let mut merged: Vec<(PathBuf, Access)> = Vec::new();
+    for (path, access) in entries {
+        let path = normalize(&path);
+        match merged.iter_mut().find(|(existing, _)| *existing == path) {
+            Some((_, existing)) => {
+                if !existing.covers(access) {
+                    *existing = access;
+                }
+            }
+            None => merged.push((path, access)),
+        }
+    }
+    merged.retain(|(path, _)| path.is_dir());
+    merged.sort_by_key(|(path, _)| path.components().count());
+    let mut kept: Vec<(PathBuf, Access)> = Vec::new();
+    for (path, access) in merged {
+        let covered = kept
+            .iter()
+            .any(|(parent, parent_access)| {
+                path != *parent && path.starts_with(parent) && parent_access.covers(access)
+            });
+        if !covered {
+            kept.push((path, access));
+        }
+    }
+    kept
+}
+
 pub struct AclManager {
     backup_dir: PathBuf,
     audit_path: PathBuf,
@@ -798,6 +843,38 @@ mod tests {
             root.join("sub").join("toolchain"),
         ]);
         assert_eq!(kept, vec![root, PathBuf::from(r"D:\other")]);
+    }
+
+    /// 收敛规则：父 `Write` 覆盖子 `Read`/`Write`；父 `Read` 不覆盖子 `Write`。
+    #[test]
+    fn collapse_keeps_only_needed_grants() {
+        let root = std::env::temp_dir();
+        let child = root.join("shaniu-collapse-child");
+        std::fs::create_dir_all(&child).unwrap();
+
+        let collapsed = collapse(vec![
+            (root.clone(), Access::Read),
+            (child.clone(), Access::Read),
+            (child.clone(), Access::Write),
+        ]);
+        assert!(collapsed.contains(&(normalize(&root), Access::Read)));
+        assert!(
+            collapsed.contains(&(normalize(&child), Access::Write)),
+            "子目录的 Write 不得被父目录的 Read 吞掉: {collapsed:?}"
+        );
+
+        let collapsed = collapse(vec![(root.clone(), Access::Write), (child.clone(), Access::Read)]);
+        assert_eq!(
+            collapsed,
+            vec![(normalize(&root), Access::Write)],
+            "父 Write 已覆盖子 Read，子项应被收敛掉"
+        );
+
+        // 同一路径两次不同档位：取更强的一档。
+        let same = collapse(vec![(child.clone(), Access::Read), (child.clone(), Access::Write)]);
+        assert_eq!(same, vec![(normalize(&child), Access::Write)]);
+
+        std::fs::remove_dir_all(&child).ok();
     }
 
     #[test]

@@ -11,7 +11,7 @@ use shaniu_lib::config::{McpServerConfig, SandboxMode};
 use shaniu_lib::mcp_client::command;
 use shaniu_lib::mcp_client::guard::ExemptionStore;
 use shaniu_lib::mcp_client::output::{flatten_call_result, OutputWrapper};
-use shaniu_lib::mcp_client::process::RestartGuard;
+use shaniu_lib::mcp_client::process::{RestartGuard, SpawnSpec};
 use shaniu_lib::mcp_client::registry;
 use shaniu_lib::mcp_client::session::{McpSession, RestartOutcome};
 
@@ -51,11 +51,23 @@ fn approved_hash(config: &McpServerConfig) -> String {
 }
 
 async fn started_session() -> (McpSession, McpServerConfig, String) {
+    // 本文件验证的是**协议语义**（握手/清单/调用/崩溃重启），不是容器隔离。
+    // 本机 node 装在管理员所有的目录（改 DACL 会被拒绝访问，容器也读不到），
+    // 因此显式走 `sandbox.os = "logical"` 的受限令牌路径；
+    // AppContainer 下的 MCP 启动由 `sandbox::tests::mcp_server_runs_inside_container_and_reads_workspace` 覆盖。
+    shaniu_lib::sandbox::set_os_mode(shaniu_lib::config::OsSandbox::Logical);
     let config = config();
     let hash = approved_hash(&config);
-    let mut session = McpSession::start(&config, SandboxMode::WorkspaceWrite, config_cwd(&config), &hash, None)
-        .await
-        .expect("受限 stdio 进程应能启动");
+    let mut session = McpSession::start(SpawnSpec {
+        config: &config,
+        sandbox_mode: SandboxMode::WorkspaceWrite,
+        cwd: config_cwd(&config),
+        workspace_root: config_cwd(&config),
+        approved_sha256: &hash,
+        approved_module_tree: None,
+    })
+    .await
+    .expect("受限 stdio 进程应能启动");
     if let Err(error) = session.initialize(HANDSHAKE).await {
         let code = session.wait_exit().await;
         panic!(
@@ -173,11 +185,14 @@ async fn crashed_server_restarts_once_then_degrades() {
     // 哈希未变、额度还有：重启并重跑握手。
     let outcome = session
         .restart(
-            &config,
-            SandboxMode::WorkspaceWrite,
-            config_cwd(&config),
-            &hash,
-            None,
+            SpawnSpec {
+                config: &config,
+                sandbox_mode: SandboxMode::WorkspaceWrite,
+                cwd: config_cwd(&config),
+                workspace_root: config_cwd(&config),
+                approved_sha256: &hash,
+                approved_module_tree: None,
+            },
             &mut guard,
         )
         .await
@@ -190,11 +205,14 @@ async fn crashed_server_restarts_once_then_degrades() {
     let _ = session.wait_exit().await;
     let outcome = session
         .restart(
-            &config,
-            SandboxMode::WorkspaceWrite,
-            config_cwd(&config),
-            &hash,
-            None,
+            SpawnSpec {
+                config: &config,
+                sandbox_mode: SandboxMode::WorkspaceWrite,
+                cwd: config_cwd(&config),
+                workspace_root: config_cwd(&config),
+                approved_sha256: &hash,
+                approved_module_tree: None,
+            },
             &mut guard,
         )
         .await

@@ -1654,7 +1654,7 @@ mod stdio_tests {
         PathBuf,
         crate::sandbox::acl::AclManager,
     ) {
-        let name = format!("Shaniu.Mcp.Test.{}.{}", std::process::id(), tag);
+        let name = format!("Shaniu.Test.{}.{}", std::process::id(), tag);
         let container = crate::sandbox::appcontainer::AppContainer::ensure_named(&name)
             .expect("测试用 AppContainer profile 应可创建");
         let dir = temp_dir();

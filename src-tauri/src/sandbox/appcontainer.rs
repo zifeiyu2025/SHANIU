@@ -29,6 +29,16 @@ pub const PROFILE_NAME: &str = "Shaniu.Sandbox.v1";
 const PROFILE_DISPLAY: &str = "SHANIU 命令沙箱";
 const PROFILE_DESCRIPTION: &str = "SHANIU 命令级 OS 沙箱容器（退出时清理）";
 
+/// 每个 MCP server 一个容器 profile（SH-064 5b）：名字由 server id 派生，
+/// 稳定可派生、可按前缀回收，不同 server 的 ACE 互不共享。
+///
+/// 全小写：Windows 会把 `%LOCALAPPDATA%\Packages` 下的包目录名规范成小写，
+/// 前缀比较与孤儿回收都依赖这一点（配置层的 id 本来就只允许 `[a-z0-9-]`）。
+pub const MCP_PROFILE_PREFIX: &str = "shaniu.mcp.";
+/// 同时存在的 MCP 容器上限：每个 profile 都是真实用户 profile（含包目录与注册记录），
+/// 无上限就是「配多少 server 就建多少」，不能接受。
+pub const MAX_MCP_PROFILES: usize = 16;
+
 /// `internetClient` 能力 SID（`S-1-15-3-1`）：只有显式授予时才允许出站网络。
 pub const INTERNET_CLIENT_SID: &str = "S-1-15-3-1";
 
@@ -160,6 +170,70 @@ pub fn internet_client_capability() -> Result<Sid, String> {
     capability_sid(INTERNET_CLIENT_SID)
 }
 
+/// server id → 容器 profile 名。id 必须满足配置层的 `^[a-z0-9][a-z0-9-]{0,31}$`：
+/// profile 名要能被稳定派生与按前缀回收，不能带任意字符。
+pub fn mcp_profile_name(server_id: &str) -> Result<String, String> {
+    let valid = !server_id.is_empty()
+        && server_id.len() <= 32
+        && !server_id.starts_with('-')
+        && !server_id.ends_with('-')
+        && server_id
+            .bytes()
+            .all(|b| b.is_ascii_lowercase() || b.is_ascii_digit() || b == b'-');
+    if !valid {
+        return Err(format!(
+            "MCP server id「{server_id}」不能派生容器 profile 名：\
+             只允许 ^[a-z0-9][a-z0-9-]{{0,31}}$（不以 - 开头或结尾）"
+        ));
+    }
+    Ok(format!("{MCP_PROFILE_PREFIX}{server_id}"))
+}
+
+/// 本机已有的 MCP 容器 profile 名（`%LOCALAPPDATA%\Packages` 下按前缀扫描）。
+pub fn list_mcp_profiles() -> Vec<String> {
+    let Some(base) = std::env::var_os("LOCALAPPDATA")
+        .map(|base| std::path::PathBuf::from(base).join("Packages"))
+    else {
+        return Vec::new();
+    };
+    let Ok(entries) = std::fs::read_dir(base) else {
+        return Vec::new();
+    };
+    let mut names: Vec<String> = entries
+        .flatten()
+        .filter_map(|entry| entry.file_name().into_string().ok())
+        .map(|name| name.to_ascii_lowercase())
+        .filter(|name| name.starts_with(MCP_PROFILE_PREFIX))
+        .collect();
+    names.sort();
+    names
+}
+
+/// 回收孤儿：删除所有不在 `active` 里的 `Shaniu.Mcp.*` profile。返回删掉的名字。
+///
+/// **边界**：判定依据是「本进程当前活跃的 server」。若同时跑了另一个 SHANIU 实例，
+/// 它正在用的容器会被这里当成孤儿删掉（另一实例的下次启动会重建）。
+/// 单实例是既定运行模型（数据目录与信任台账都不支持并发写），这里只记录删除清单。
+pub fn reclaim_orphans(active: &std::collections::HashSet<String>) -> Vec<String> {
+    let mut deleted = Vec::new();
+    for name in list_mcp_profiles() {
+        if active.contains(&name) {
+            continue;
+        }
+        let wide_name = wide(&name);
+        match unsafe { DeleteAppContainerProfile(PCWSTR(wide_name.as_ptr())) } {
+            Ok(()) => deleted.push(name),
+            Err(error) => {
+                tracing::warn!(profile = %name, %error, "回收孤儿 MCP 容器 profile 失败")
+            }
+        }
+    }
+    if !deleted.is_empty() {
+        tracing::info!(profiles = ?deleted, "已回收上次遗留的 MCP 容器 profile");
+    }
+    deleted
+}
+
 /// 把 SID 文本解析成能力 SID（测试与其它能力用；调用方负责生命周期）。
 pub fn capability_sid(text_sid: &str) -> Result<Sid, String> {
     let text = wide(text_sid);
@@ -213,6 +287,14 @@ fn create_failed_message(name: &str, error: i32) -> String {
     )
 }
 
+/// 测试互斥：孤儿回收会删除本进程之外的所有 `shaniu.mcp.*` profile，
+/// 与其它建容器的测试并行时会互删对方的 profile，必须串行。
+///
+/// 用 tokio 的 Mutex：同步测试走 `blocking_lock()`，异步测试走 `.lock().await`，
+/// 两种测试共用同一把锁（std Mutex 的守卫不能跨 `.await`）。
+#[cfg(test)]
+pub(crate) static PROFILE_TEST_MUTEX: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -243,5 +325,51 @@ mod tests {
         let third = AppContainer::ensure_named(&name).expect("删除后应能重建");
         assert!(third.created(), "删除后再次 ensure 应重新创建");
         third.delete().expect("清理测试 profile");
+    }
+
+    #[test]
+    fn mcp_profile_name_derives_from_configured_ids_only() {
+        assert_eq!(mcp_profile_name("filesystem").unwrap(), "shaniu.mcp.filesystem");
+        assert_eq!(mcp_profile_name("a1-b2").unwrap(), "shaniu.mcp.a1-b2");
+        for bad in ["", "UPPER", "a b", "-lead", "trail-", "中文", "a/b"] {
+            assert!(mcp_profile_name(bad).is_err(), "应拒绝非法 server id: {bad:?}");
+        }
+        // 32 字符上限与配置层 `^[a-z0-9][a-z0-9-]{0,31}$` 一致。
+        assert!(mcp_profile_name(&"a".repeat(32)).is_ok());
+        assert!(mcp_profile_name(&"a".repeat(33)).is_err());
+    }
+
+    /// 真实 profile 往返：列得到、回收删得掉，非 `Shaniu.Mcp.` 前缀的不受影响。
+    #[test]
+    fn mcp_profiles_are_listed_and_reclaimed() {
+        let _serial = PROFILE_TEST_MUTEX.blocking_lock();
+        let id = format!("probe{}", std::process::id());
+        let name = mcp_profile_name(&id).unwrap();
+        let container = AppContainer::ensure_named(&name).expect("创建测试容器");
+        assert!(
+            list_mcp_profiles().contains(&name),
+            "新建的 MCP 容器 profile 应能被列出"
+        );
+
+        let active: std::collections::HashSet<String> =
+            std::collections::HashSet::from([name.clone()]);
+        assert!(
+            !reclaim_orphans(&active).contains(&name),
+            "活跃 profile 不得被当成孤儿回收"
+        );
+
+        // 只把本测试的 profile 当孤儿：把其它现存 profile 全列为 active，
+        // 避免测试误删开发机上正在运行的容器。
+        let keep: std::collections::HashSet<String> = list_mcp_profiles()
+            .into_iter()
+            .filter(|existing| *existing != name)
+            .collect();
+        let deleted = reclaim_orphans(&keep);
+        assert!(deleted.contains(&name), "不在 active 里的 profile 应被回收");
+        assert!(
+            !list_mcp_profiles().contains(&name),
+            "回收后不应再出现在列表里"
+        );
+        drop(container);
     }
 }

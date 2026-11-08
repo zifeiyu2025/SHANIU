@@ -104,16 +104,27 @@ pub struct McpProcess {
     _writer: std::thread::JoinHandle<()>,
 }
 
+/// 启动 / 重启一个 server 的固定上下文。
+///
+/// 用结构体而不是继续加参数：`cwd` 与 `workspace_root` 是两个相邻同类型的路径，
+/// 位置传参很容易传反，而沙箱授权就看这两个值。
+#[derive(Clone, Copy)]
+pub struct SpawnSpec<'a> {
+    pub config: &'a McpServerConfig,
+    pub sandbox_mode: SandboxMode,
+    pub cwd: &'a Path,
+    pub workspace_root: &'a Path,
+    pub approved_sha256: &'a str,
+    pub approved_module_tree: Option<&'a str>,
+}
+
 impl McpProcess {
     /// 启动 server。`approved_sha256` 是批准记录里的哈希——**没有它就没有信任**，
     /// 这里不接受「跳过校验」的入口（C-R1 指纹先于连接）。
-    pub async fn start(
-        config: &McpServerConfig,
-        sandbox_mode: SandboxMode,
-        cwd: &Path,
-        approved_sha256: &str,
-        approved_module_tree: Option<&str>,
-    ) -> Result<Self, StartError> {
+    pub async fn start(spec: SpawnSpec<'_>) -> Result<Self, StartError> {
+        let config = spec.config;
+        let approved_sha256 = spec.approved_sha256;
+        let approved_module_tree = spec.approved_module_tree;
         let exe = command::resolve_executable(&config.command)?;
         let actual = command::file_sha256(&exe)
             .map_err(|e| StartError::Hash { path: exe.display().to_string(), reason: e.to_string() })?;
@@ -141,17 +152,36 @@ impl McpProcess {
             }
         }
 
-        // `unsandboxed` 是逐服务器显式豁免（X10），配置校验已要求同时填写原因。
-        let mode = if config.unsandboxed { SandboxMode::DangerFullAccess } else { sandbox_mode };
+        let mode =
+            if config.unsandboxed { SandboxMode::DangerFullAccess } else { spec.sandbox_mode };
         let (tx, stdout) = mpsc::channel(64);
         let program = exe.to_string_lossy().to_string();
         let args = config.args.clone();
         let env = config.env.clone();
-        let cwd = cwd.to_path_buf();
+        let cwd = spec.cwd.to_path_buf();
+        let workspace_root = spec.workspace_root.to_path_buf();
+        let server_id = config.id.clone();
+        let allowed_roots = config.allowed_roots.clone();
+        let workspace_access = config.workspace_access;
+        let allow_network = config.allow_network;
 
         let mut child = tokio::task::spawn_blocking(move || {
             let arg_refs: Vec<&str> = args.iter().map(String::as_str).collect();
-            sandbox::prepare_stdio(mode, &program, &arg_refs, &cwd, &env, tx)
+            sandbox::prepare_stdio(
+                sandbox::StdioRequest {
+                    policy: mode,
+                    server_id: &server_id,
+                    program: &program,
+                    args: &arg_refs,
+                    cwd: &cwd,
+                    workspace_root: &workspace_root,
+                    workspace_access,
+                    allowed_roots: &allowed_roots,
+                    allow_network,
+                    env: &env,
+                },
+                tx,
+            )
         })
         .await
         .map_err(|e| StartError::Sandbox(format!("启动任务失败: {e}")))?
@@ -341,13 +371,14 @@ mod tests {
     #[tokio::test]
     async fn hash_mismatch_rejects_start_without_spawning() {
         let config = McpServerConfig { id: "probe".into(), command: "cmd".into(), ..Default::default() };
-        let err = match McpProcess::start(
-            &config,
-            SandboxMode::WorkspaceWrite,
-            &std::env::temp_dir(),
-            "deadbeef",
-            None,
-        )
+        let err = match McpProcess::start(SpawnSpec {
+            config: &config,
+            sandbox_mode: SandboxMode::WorkspaceWrite,
+            cwd: &std::env::temp_dir(),
+            workspace_root: &std::env::temp_dir(),
+            approved_sha256: "deadbeef",
+            approved_module_tree: None,
+        })
         .await
         {
             Err(error) => error,
@@ -358,6 +389,8 @@ mod tests {
 
     #[tokio::test]
     async fn restricted_stdio_streams_one_line_and_exits() {
+        // 与沙箱的孤儿回收测试串行：否则本测试的容器 profile 可能被当成孤儿删掉。
+        let _serial = crate::sandbox::appcontainer::PROFILE_TEST_MUTEX.lock().await;
         let exe = command::resolve_executable("cmd").expect("cmd 应可解析");
         let sha = command::file_sha256(&exe).unwrap();
         let config = McpServerConfig {
@@ -366,10 +399,16 @@ mod tests {
             args: vec!["/C".into(), "echo".into(), "hello-mcp".into()],
             ..Default::default()
         };
-        let mut process =
-            McpProcess::start(&config, SandboxMode::WorkspaceWrite, &std::env::temp_dir(), &sha, None)
-                .await
-                .expect("受限沙箱应能启动 cmd");
+        let mut process = McpProcess::start(SpawnSpec {
+            config: &config,
+            sandbox_mode: SandboxMode::WorkspaceWrite,
+            cwd: &std::env::temp_dir(),
+            workspace_root: &std::env::temp_dir(),
+            approved_sha256: &sha,
+            approved_module_tree: None,
+        })
+        .await
+        .expect("受限沙箱应能启动 cmd");
 
         let event = tokio::time::timeout(Duration::from_secs(15), process.next_event())
             .await

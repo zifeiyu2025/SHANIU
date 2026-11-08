@@ -55,11 +55,23 @@ fn config(extra_tool: bool) -> McpServerConfig {
     config
 }
 
+/// 本文件验证**信任/审查语义**（首连不成授权、撤销、清单变化、注入），不是容器隔离。
+///
+/// 本机 node 装在管理员所有的目录：给这种目录改 DACL 会被拒绝访问，容器也读不到，
+/// 启动会按设计置 `blocked`（不回退受限令牌）。因此这里显式走
+/// `sandbox.os = "logical"` 的受限令牌路径；容器内启动由
+/// `sandbox::tests::mcp_server_runs_inside_container_and_reads_workspace` 覆盖。
+fn force_logical_sandbox() {
+    static ONCE: std::sync::Once = std::sync::Once::new();
+    ONCE.call_once(|| shaniu_lib::sandbox::set_os_mode(shaniu_lib::config::OsSandbox::Logical));
+}
+
 fn config_with(
     command: &str,
     spawn_marker: Option<&Path>,
     mutation_file: Option<&Path>,
 ) -> McpServerConfig {
+    force_logical_sandbox();
     let mut env = BTreeMap::new();
     env.insert("FAKE_ALLOWED".to_string(), "1".to_string());
     // Windows 上 node 启动需要 SYSTEMROOT（winsock）；TEMP 供运行时使用。

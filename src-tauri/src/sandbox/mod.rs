@@ -17,14 +17,15 @@ pub mod appcontainer;
 pub mod network;
 pub mod windows_impl;
 
-use std::path::Path;
-use std::sync::atomic::{AtomicU8, Ordering};
+use std::collections::{BTreeMap, HashMap, HashSet};
+use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicU8, AtomicUsize, Ordering};
 use std::sync::{Mutex, OnceLock};
 
 use tokio::process::Command;
 use tokio::sync::mpsc;
 
-use crate::config::{OsSandbox, SandboxMode};
+use crate::config::{AllowedRoot, OsSandbox, SandboxMode, WorkspaceAccess};
 
 pub use windows_impl::{ExecLine, RestrictedStdioChild, StdioEvent};
 
@@ -168,11 +169,9 @@ fn spawn_in_app_container(
     // ACE 只加三类位置：工作区根 / temp / 工具链目录；授权对象是容器 SID。
     // 每个工作区根在进程内只解析一次 scope：重复 exec 不再碰 DACL（见 docs/04 §1.5）。
     if !runtime.resolved_roots.contains(request.workspace_root) {
+        let sid = runtime.container.sid();
         for dir in acl::write_scope(request.workspace_root) {
-            runtime
-                .acl
-                .grant(&dir, runtime.container.sid(), acl::Access::Write)
-                .map_err(SandboxError::CreateFailed)?;
+            with_acl(|acl| acl.grant(&dir, sid, acl::Access::Write))?;
         }
         runtime.resolved_roots.insert(request.workspace_root.to_path_buf());
     }
@@ -193,12 +192,50 @@ fn spawn_in_app_container(
     Ok(PreparedSpawn::Restricted(child))
 }
 
+/// 进程内唯一的目录 ACL 管理器。
+///
+/// exec 容器与每个 MCP 容器共用它，原因有二：
+///  1. `recover_pending()` 只能跑一次——两个管理器各自还原会互相把对方刚加的 ACE 抹掉；
+///  2. 撤销按 `(路径, SID)` 精确匹配，天然支持「每个 server 一个容器 SID」。
+static ACL: OnceLock<Mutex<Option<acl::AclManager>>> = OnceLock::new();
+/// 上次异常退出遗留的备份还原条数（用于判断是否需要接管旧 profile）。
+static ACL_RECOVERED: AtomicUsize = AtomicUsize::new(0);
+
+/// 懒初始化：只跑一次 `recover_pending`，失败即 fail-closed 返回错误。
+fn ensure_acl() -> Result<(), SandboxError> {
+    let mutex = ACL.get_or_init(|| Mutex::new(None));
+    let mut guard = mutex
+        .lock()
+        .map_err(|_| SandboxError::CreateFailed("ACL 管理器锁已中毒".into()))?;
+    if guard.is_some() {
+        return Ok(());
+    }
+    let data_root = crate::config::resolve_dirs_from_env().data_root;
+    let mut manager = acl::AclManager::new(data_root.join("sandbox").join("acl"));
+    // 先还原上次异常退出留下的 DACL，再允许新的授权，避免在被污染的 ACL 上继续。
+    let restored = manager.recover_pending().map_err(SandboxError::CreateFailed)?;
+    ACL_RECOVERED.store(restored, Ordering::Relaxed);
+    *guard = Some(manager);
+    Ok(())
+}
+
+fn with_acl<R>(f: impl FnOnce(&mut acl::AclManager) -> Result<R, String>) -> Result<R, SandboxError> {
+    ensure_acl()?;
+    let mutex = ACL.get().expect("ACL 已初始化");
+    let mut guard = mutex
+        .lock()
+        .map_err(|_| SandboxError::CreateFailed("ACL 管理器锁已中毒".into()))?;
+    let manager = guard
+        .as_mut()
+        .ok_or_else(|| SandboxError::CreateFailed("ACL 管理器未初始化".into()))?;
+    f(manager).map_err(SandboxError::CreateFailed)
+}
+
 struct Runtime {
     container: appcontainer::AppContainer,
-    acl: acl::AclManager,
     capability_internet: appcontainer::Sid,
     /// 已经解析过写权限 scope 的工作区根：同一进程内重复 exec 不再碰 DACL。
-    resolved_roots: std::collections::HashSet<std::path::PathBuf>,
+    resolved_roots: HashSet<PathBuf>,
     /// 退出时是否删除 profile：本进程创建，或接管了上次异常退出留下的备份。
     owns_profile: bool,
 }
@@ -206,12 +243,8 @@ struct Runtime {
 static RUNTIME: OnceLock<Mutex<Option<Runtime>>> = OnceLock::new();
 
 fn build_runtime() -> Result<Runtime, SandboxError> {
-    let data_root = crate::config::resolve_dirs_from_env().data_root;
-    let mut acl = acl::AclManager::new(data_root.join("sandbox").join("acl"));
-
-    // 先还原上次异常退出留下的 DACL，再建/复用 profile，避免在被污染的 ACL 上继续。
-    acl.recover_pending().map_err(SandboxError::CreateFailed)?;
-    let recovered = acl.recovered_stale();
+    ensure_acl()?;
+    let recovered = ACL_RECOVERED.load(Ordering::Relaxed);
 
     let container =
         appcontainer::AppContainer::ensure().map_err(SandboxError::CreateFailed)?;
@@ -220,15 +253,26 @@ fn build_runtime() -> Result<Runtime, SandboxError> {
     let owns_profile = container.created() || recovered > 0;
     Ok(Runtime {
         container,
-        acl,
         capability_internet,
-        resolved_roots: std::collections::HashSet::new(),
+        resolved_roots: HashSet::new(),
         owns_profile,
     })
 }
 
 /// 进程退出时调用：先还原 DACL，再删除自己创建的容器 profile。
 pub fn shutdown() {
+    release_all_mcp_containers();
+    // 不论有没有 exec 运行时，只要动过 DACL 就要还原：MCP 容器也会改目录权限。
+    if ACL.get().is_some() {
+        match with_acl(|acl| acl.restore_all()) {
+            Ok(restored) => {
+                tracing::info!(restored, "沙箱退出：目录 DACL 已按备份还原");
+            }
+            Err(error) => {
+                tracing::error!(%error, "沙箱退出：目录 DACL 还原失败，需人工检查备份目录");
+            }
+        }
+    }
     let Some(mutex) = RUNTIME.get() else {
         return;
     };
@@ -236,22 +280,152 @@ pub fn shutdown() {
         tracing::error!("沙箱退出清理：运行时锁已中毒，DACL 可能未还原");
         return;
     };
-    let Some(mut runtime) = guard.take() else {
+    let Some(runtime) = guard.take() else {
         return;
     };
-    match runtime.acl.restore_all() {
-        Ok(restored) => {
-            tracing::info!(restored, "沙箱退出：目录 DACL 已按备份还原");
-        }
-        Err(error) => {
-            tracing::error!(%error, "沙箱退出：目录 DACL 还原失败，需人工检查备份目录");
-        }
-    }
     if runtime.owns_profile {
         match runtime.container.delete() {
             Ok(()) => tracing::info!("沙箱退出：AppContainer profile 已删除"),
             Err(error) => tracing::error!(%error, "沙箱退出：AppContainer profile 删除失败"),
         }
+    }
+}
+
+// ---------------------------------------------------------------------------
+// 每个 MCP server 一个容器（SH-064 5b）
+// ---------------------------------------------------------------------------
+
+/// 单个 MCP server 的容器与其 ACE 台账。
+struct McpRuntime {
+    container: appcontainer::AppContainer,
+    capability_internet: appcontainer::Sid,
+    /// 本进程给这个容器的 SID 加过的 ACE：释放时按 `(路径, SID)` 精确撤销。
+    granted: Vec<(PathBuf, acl::Access)>,
+}
+
+static MCP_RUNTIMES: OnceLock<Mutex<HashMap<String, McpRuntime>>> = OnceLock::new();
+
+fn mcp_runtimes() -> &'static Mutex<HashMap<String, McpRuntime>> {
+    MCP_RUNTIMES.get_or_init(|| Mutex::new(HashMap::new()))
+}
+
+fn mcp_lock() -> Result<std::sync::MutexGuard<'static, HashMap<String, McpRuntime>>, SandboxError>
+{
+    mcp_runtimes()
+        .lock()
+        .map_err(|_| SandboxError::CreateFailed("MCP 容器锁已中毒".into()))
+}
+
+/// 建立（或复用）某个 server 的容器 profile。
+///
+/// 数量上限与孤儿回收都在这里做：本进程首次接管容器时，`Shaniu.Mcp.*` 里
+/// 不属于当前 server 的都是上次遗留的孤儿（见 `appcontainer::reclaim_orphans` 的边界）。
+fn ensure_mcp_container(server_id: &str) -> Result<(), SandboxError> {
+    let profile = appcontainer::mcp_profile_name(server_id).map_err(SandboxError::CreateFailed)?;
+    let mut runtimes = mcp_lock()?;
+    if runtimes.contains_key(server_id) {
+        return Ok(());
+    }
+    if runtimes.is_empty() {
+        let active: HashSet<String> = HashSet::from([profile.clone()]);
+        appcontainer::reclaim_orphans(&active);
+    }
+    let existing = appcontainer::list_mcp_profiles();
+    if !existing.contains(&profile) && existing.len() >= appcontainer::MAX_MCP_PROFILES {
+        return Err(SandboxError::CreateFailed(format!(
+            "已有 {} 个 MCP 容器 profile，达到上限 {}：请先撤销不再使用的 server 信任\
+             （会同时删除其容器 profile）再连接新的 server",
+            existing.len(),
+            appcontainer::MAX_MCP_PROFILES
+        )));
+    }
+    let container =
+        appcontainer::AppContainer::ensure_named(&profile).map_err(SandboxError::CreateFailed)?;
+    let capability_internet =
+        appcontainer::internet_client_capability().map_err(SandboxError::CreateFailed)?;
+    runtimes.insert(
+        server_id.to_string(),
+        McpRuntime { container, capability_internet, granted: Vec::new() },
+    );
+    Ok(())
+}
+
+fn grant_mcp_paths(
+    server_id: &str,
+    desired: &[(PathBuf, acl::Access)],
+) -> Result<(), SandboxError> {
+    let mut runtimes = mcp_lock()?;
+    let runtime = runtimes.get_mut(server_id).ok_or_else(|| {
+        SandboxError::CreateFailed(format!("MCP server {server_id} 的容器尚未建立"))
+    })?;
+    let sid = runtime.container.sid();
+    for (path, access) in desired {
+        if runtime.granted.iter().any(|(granted, level)| granted == path && level == access) {
+            continue;
+        }
+        with_acl(|acl| acl.grant(path, sid, *access)).map_err(|error| {
+            // 常见根因：运行时装在管理员所有的目录（普通用户改不了它的 DACL，
+            // 容器也没读到它的权限）。给出能照做的两个出口。
+            let detail = match &error {
+                SandboxError::CreateFailed(message) => message.clone(),
+                other => other.to_string(),
+            };
+            SandboxError::CreateFailed(format!(
+                "{detail}。若该目录或运行时由管理员安装，容器读不到它：\
+                 请把运行时装到用户可写目录，或在配置里为这个 server 显式设置 \
+                 unsandboxed = true 并填写原因（逐服务器豁免）"
+            ))
+        })?;
+        runtime.granted.push((path.clone(), *access));
+    }
+    Ok(())
+}
+
+/// 释放某个 server 的容器：撤销本进程加过的全部 ACE，再删除 profile。
+///
+/// 调用点：停止 / 撤信 / 卸载 / 进程退出。失败只记录（退出路径不许 panic），
+/// 下次启动的孤儿回收会兜底。
+pub fn release_mcp_server(server_id: &str) {
+    let Some(mutex) = MCP_RUNTIMES.get() else {
+        return;
+    };
+    let Ok(mut runtimes) = mutex.lock() else {
+        tracing::error!(server_id, "释放 MCP 容器：锁已中毒，ACE 与 profile 可能残留");
+        return;
+    };
+    let Some(runtime) = runtimes.remove(server_id) else {
+        return;
+    };
+    revoke_and_delete(runtime);
+}
+
+fn release_all_mcp_containers() {
+    let Some(mutex) = MCP_RUNTIMES.get() else {
+        return;
+    };
+    let Ok(mut runtimes) = mutex.lock() else {
+        tracing::error!("释放全部 MCP 容器：锁已中毒，ACE 与 profile 可能残留");
+        return;
+    };
+    for (_, runtime) in runtimes.drain() {
+        revoke_and_delete(runtime);
+    }
+}
+
+fn revoke_and_delete(runtime: McpRuntime) {
+    let sid = runtime.container.sid();
+    for (path, _) in &runtime.granted {
+        if let Err(error) = with_acl(|acl| acl.revoke(path, sid)) {
+            tracing::error!(
+                %error,
+                path = %path.display(),
+                "撤销 MCP 容器 ACE 失败（下次启动的备份还原会兜底）"
+            );
+        }
+    }
+    match runtime.container.delete() {
+        Ok(()) => tracing::info!("MCP 容器 profile 已删除"),
+        Err(error) => tracing::error!(%error, "MCP 容器 profile 删除失败"),
     }
 }
 
@@ -306,38 +480,210 @@ fn warn_logical_fallback_once() {
     });
 }
 
+/// 启动一个 MCP stdio server 的请求（SH-060 / SH-064）。
+pub struct StdioRequest<'a> {
+    pub policy: SandboxMode,
+    /// 配置里的 server id（派生容器 profile 名与临时目录）。
+    pub server_id: &'a str,
+    pub program: &'a str,
+    pub args: &'a [&'a str],
+    pub cwd: &'a Path,
+    /// 会话工作区根（`workspace_access` 作用于此）。
+    pub workspace_root: &'a Path,
+    pub workspace_access: WorkspaceAccess,
+    /// 用户逐条勾选的目录授权（Q2）。
+    pub allowed_roots: &'a [AllowedRoot],
+    pub allow_network: bool,
+    pub env: &'a BTreeMap<String, String>,
+}
+
 /// 按策略准备 MCP stdio server（SH-060，X10：默认一律走沙箱）。
 ///
 /// - read-only：纯策略拒绝（只读沙箱不允许任何进程执行）；
-/// - workspace-write：受限令牌 + Job + 句柄白名单（默认路径）；
+/// - workspace-write + `sandbox.os = "app_container"`：**逐 server 一个容器**，
+///   ACE 按 server 的 cwd/allowed_roots 逐条授权，网络默认拒绝；
+/// - workspace-write + `sandbox.os = "logical"`：受限令牌 + Job（用户显式选择）；
 /// - danger-full-access：**调用方必须先确认该 server 的 `unsandboxed=true` 且原因已记录**
 ///   （逐服务器显式豁免），这里才走未沙箱启动。
 ///
-/// **已知边界（SH-021 注）**：MCP stdio 仍是逻辑沙箱，未套 AppContainer——
-/// 其二进制定位在工作区/temp/工具链目录之外，套容器会先把 server 自己挡住。
-/// 该降级在 `status()` 与日志中标出，等后续卡处理。
+/// 失败语义：容器/授权任何一步失败都返回 Err，调用方必须把该 server 置为 `blocked`。
+/// **绝不回退到受限令牌**——那会让用户以为它在容器里，实际没有路径边界。
 pub fn prepare_stdio(
-    policy: SandboxMode,
-    program: &str,
-    args: &[&str],
-    cwd: &Path,
-    env: &std::collections::BTreeMap<String, String>,
+    request: StdioRequest<'_>,
     tx: mpsc::Sender<StdioEvent>,
 ) -> Result<windows_impl::RestrictedStdioChild, SandboxError> {
-    match policy {
+    match request.policy {
         SandboxMode::ReadOnly => Err(SandboxError::PolicyDenied(
             "只读沙箱禁止启动 MCP server 进程".into(),
         )),
-        SandboxMode::WorkspaceWrite => {
-            warn_logical_fallback_once();
-            windows_impl::spawn_restricted_stdio(program, args, cwd, env, tx)
-                .map_err(SandboxError::CreateFailed)
-        }
         SandboxMode::DangerFullAccess => {
-            windows_impl::spawn_unsandboxed_stdio(program, args, cwd, env, tx)
+            windows_impl::spawn_unsandboxed_stdio(
+                request.program,
+                request.args,
+                request.cwd,
+                request.env,
+                tx,
+            )
+            .map_err(SandboxError::CreateFailed)
+        }
+        SandboxMode::WorkspaceWrite => match current_os_mode() {
+            OsSandbox::Logical => {
+                warn_logical_fallback_once();
+                windows_impl::spawn_restricted_stdio(
+                    request.program,
+                    request.args,
+                    request.cwd,
+                    request.env,
+                    tx,
+                )
                 .map_err(SandboxError::CreateFailed)
+            }
+            OsSandbox::AppContainer => spawn_mcp_in_app_container(&request, tx),
+        },
+    }
+}
+
+#[cfg(windows)]
+fn spawn_mcp_in_app_container(
+    request: &StdioRequest<'_>,
+    tx: mpsc::Sender<StdioEvent>,
+) -> Result<windows_impl::RestrictedStdioChild, SandboxError> {
+    ensure_mcp_container(request.server_id)?;
+
+    let data_root = crate::config::resolve_dirs_from_env().data_root;
+    let server_temp = data_root
+        .join("sandbox")
+        .join("mcp-temp")
+        .join(request.server_id);
+    std::fs::create_dir_all(&server_temp).map_err(|error| {
+        SandboxError::CreateFailed(format!(
+            "创建 MCP 临时目录 {} 失败: {error}",
+            server_temp.display()
+        ))
+    })?;
+
+    let workspace_access = acl_access(request.workspace_access);
+    let mut desired: Vec<(PathBuf, acl::Access)> = vec![
+        // 工作区按用户所选档位；cwd 单独列出（可能在工作区之外）。
+        (request.workspace_root.to_path_buf(), workspace_access),
+        (request.cwd.to_path_buf(), workspace_access),
+        // 临时目录必须可写：TEMP/TMP 会在下面改指到这里。
+        (server_temp.clone(), acl::Access::Write),
+    ];
+    for root in request.allowed_roots {
+        desired.push((PathBuf::from(root.path.trim()), acl_access(root.access)));
+    }
+    for root in toolchain_roots(request.program, request.args) {
+        desired.push((root, acl::Access::Read));
+    }
+    let desired = acl::collapse(desired);
+    grant_mcp_paths(request.server_id, &desired)?;
+
+    let mut env = request.env.clone();
+    let temp_text = server_temp.to_string_lossy().to_string();
+    env.insert("TEMP".to_string(), temp_text.clone());
+    env.insert("TMP".to_string(), temp_text);
+
+    let (sid, internet) = {
+        let runtimes = mcp_lock()?;
+        let runtime = runtimes.get(request.server_id).ok_or_else(|| {
+            SandboxError::CreateFailed(format!(
+                "MCP server {} 的容器尚未建立",
+                request.server_id
+            ))
+        })?;
+        (runtime.container.sid(), runtime.capability_internet.as_psid())
+    };
+    let capabilities = if request.allow_network { vec![internet] } else { Vec::new() };
+    windows_impl::spawn_appcontainer_stdio(
+        request.program,
+        request.args,
+        request.cwd,
+        &env,
+        sid,
+        &capabilities,
+        tx,
+    )
+    .map_err(SandboxError::CreateFailed)
+}
+
+#[cfg(not(windows))]
+fn spawn_mcp_in_app_container(
+    _request: &StdioRequest<'_>,
+    _tx: mpsc::Sender<StdioEvent>,
+) -> Result<windows_impl::RestrictedStdioChild, SandboxError> {
+    Err(SandboxError::CreateFailed(
+        "workspace-write 沙箱当前仅支持 Windows（fail-closed）".into(),
+    ))
+}
+
+fn acl_access(access: WorkspaceAccess) -> acl::Access {
+    match access {
+        WorkspaceAccess::Read => acl::Access::Read,
+        WorkspaceAccess::Write => acl::Access::Write,
+    }
+}
+
+/// 容器内启动 server 需要的**只读**工具链目录：可执行文件所在目录、venv 根、
+/// 解释器型启动时代码包根。没有它们，server 连自己的运行时与模块都读不到。
+///
+/// 系统自有目录（`%SystemRoot%`、`Program Files`、`ProgramData`）**不授权**：
+/// AppContainer 对它们本来就有读权限，而给它们加 ACE 需要管理员权限，
+/// 强行加只会让连接以「拒绝访问（Win32 错误 5）」失败。
+fn toolchain_roots(program: &str, args: &[&str]) -> Vec<PathBuf> {
+    let mut roots = Vec::new();
+    let exe = Path::new(program);
+    if let Some(parent) = exe.parent().filter(|parent| parent.is_dir()) {
+        if !is_os_owned(parent) {
+            roots.push(parent.to_path_buf());
+        }
+        if let Some(venv) = find_ancestor(parent, "pyvenv.cfg") {
+            if !is_os_owned(&venv) {
+                roots.push(venv);
+            }
         }
     }
+    // 解释器型启动（`python <script.py>` / `node <entry.js>`）：参数里的现存文件
+    // 是真正的代码。向上找 `package.json` 得到包根，找不到就退到它的父目录。
+    for arg in args {
+        let candidate = Path::new(arg);
+        if !candidate.is_absolute() || !candidate.is_file() {
+            continue;
+        }
+        let Some(dir) = candidate.parent() else {
+            continue;
+        };
+        let root = find_ancestor(dir, "package.json").unwrap_or_else(|| dir.to_path_buf());
+        if !is_os_owned(&root) {
+            roots.push(root);
+        }
+    }
+    roots
+}
+
+/// 是否是 OS 自有目录（AppContainer 默认可读，且加 ACE 会被拒绝访问）。
+fn is_os_owned(dir: &Path) -> bool {
+    if dir.parent().is_none() {
+        return true;
+    }
+    // Windows 路径比较不区分大小写，环境变量与解析出的 exe 路径大小写常不一致。
+    let text = dir.to_string_lossy().to_lowercase();
+    ["SystemRoot", "ProgramFiles", "ProgramFiles(x86)", "ProgramData"]
+        .iter()
+        .filter_map(std::env::var_os)
+        .map(|owned| owned.to_string_lossy().to_lowercase())
+        .any(|owned| !owned.is_empty() && text.starts_with(&owned))
+}
+
+fn find_ancestor(start: &Path, marker: &str) -> Option<PathBuf> {
+    let mut current = Some(start);
+    while let Some(dir) = current {
+        if dir.join(marker).exists() {
+            return Some(dir.to_path_buf());
+        }
+        current = dir.parent();
+    }
+    None
 }
 
 #[cfg(test)]
@@ -378,12 +724,20 @@ mod tests {
     #[test]
     fn readonly_policy_denies_mcp_stdio() {
         let (tx, _rx) = mpsc::channel(4);
+        let dir = ws();
         let err = match prepare_stdio(
-            SandboxMode::ReadOnly,
-            "cmd",
-            &["/C", "echo"],
-            &ws(),
-            &Default::default(),
+            StdioRequest {
+                policy: SandboxMode::ReadOnly,
+                server_id: "probe",
+                program: "cmd",
+                args: &["/C", "echo"],
+                cwd: &dir,
+                workspace_root: &dir,
+                workspace_access: WorkspaceAccess::Read,
+                allowed_roots: &[],
+                allow_network: false,
+                env: &BTreeMap::new(),
+            },
             tx,
         ) {
             Err(error) => error,
@@ -400,6 +754,112 @@ mod tests {
         let container = status(SandboxMode::WorkspaceWrite, OsSandbox::AppContainer);
         assert!(container.os_enabled);
         assert_eq!(container.os, "app_container");
+    }
+
+    /// 非法 server id 派生不出容器名：必须**直接失败**，不能悄悄退回受限令牌。
+    #[cfg(windows)]
+    #[test]
+    fn invalid_server_id_fails_closed_instead_of_token_fallback() {
+        set_os_mode(OsSandbox::AppContainer);
+        let dir = ws();
+        let (tx, _rx) = mpsc::channel(4);
+        let err = match prepare_stdio(
+            StdioRequest {
+                policy: SandboxMode::WorkspaceWrite,
+                server_id: "Bad Id",
+                program: "cmd",
+                args: &["/C", "echo"],
+                cwd: &dir,
+                workspace_root: &dir,
+                workspace_access: WorkspaceAccess::Read,
+                allowed_roots: &[],
+                allow_network: false,
+                env: &BTreeMap::new(),
+            },
+            tx,
+        ) {
+            Err(error) => error,
+            Ok(_) => panic!("非法 id 必须拒绝启动，而不是回退受限令牌"),
+        };
+        assert!(matches!(err, SandboxError::CreateFailed(_)), "实际: {err}");
+        assert!(err.to_string().contains("profile"), "错误应指清是容器名派生失败: {err}");
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    /// 每个 server 一个容器：建立后可释放，释放时 profile 一并删除。
+    #[cfg(windows)]
+    #[test]
+    fn mcp_container_is_per_server_and_deleted_on_release() {
+        let _serial = appcontainer::PROFILE_TEST_MUTEX.blocking_lock();
+        let id = format!("release-{}", std::process::id());
+        ensure_mcp_container(&id).expect("应能建立 per-server 容器");
+        {
+            let runtimes = mcp_lock().unwrap();
+            let runtime = runtimes.get(&id).expect("容器应已登记");
+            assert!(!runtime.container.sid().0.is_null());
+        }
+        let profile = appcontainer::mcp_profile_name(&id).unwrap();
+        assert!(
+            appcontainer::list_mcp_profiles().contains(&profile),
+            "容器 profile 应真实存在"
+        );
+
+        release_mcp_server(&id);
+        assert!(!mcp_lock().unwrap().contains_key(&id), "释放后不应还登记着");
+        assert!(
+            !appcontainer::list_mcp_profiles().contains(&profile),
+            "释放后 profile 应被删除"
+        );
+    }
+
+    /// 真机：容器内启动 cmd，并读取工作区里的文件（验证 ACE 真的生效）。
+    #[cfg(windows)]
+    #[test]
+    fn mcp_server_runs_inside_container_and_reads_workspace() {
+        let _serial = appcontainer::PROFILE_TEST_MUTEX.blocking_lock();
+        set_os_mode(OsSandbox::AppContainer);
+        let dir = ws();
+        let marker = dir.join("marker.txt");
+        std::fs::write(&marker, "container-read-ok").unwrap();
+        let id = format!("spawn-{}", std::process::id());
+        let program = "cmd".to_string();
+        let marker_arg = marker.to_string_lossy().to_string();
+        let args = ["/C", "type", marker_arg.as_str()];
+
+        let (tx, mut rx) = mpsc::channel(64);
+        let mut child = prepare_stdio(
+            StdioRequest {
+                policy: SandboxMode::WorkspaceWrite,
+                server_id: &id,
+                program: &program,
+                args: &args,
+                cwd: &dir,
+                workspace_root: &dir,
+                workspace_access: WorkspaceAccess::Write,
+                allowed_roots: &[],
+                allow_network: false,
+                env: &BTreeMap::new(),
+            },
+            tx,
+        )
+        .expect("容器内应能启动 cmd");
+
+        // 用独立 runtime 阻塞等待，避免把同步锁守卫跨 `.await` 持有。
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .expect("测试用 runtime");
+        let code = runtime.block_on(child.wait()).unwrap();
+        assert_eq!(code, 0, "容器内 type 应成功");
+        let mut output = String::new();
+        while let Ok(event) = rx.try_recv() {
+            if let StdioEvent::Line(line) = event {
+                output.push_str(&line);
+            }
+        }
+        assert!(output.contains("container-read-ok"), "容器内应能读到工作区文件，实际: {output}");
+        release_mcp_server(&id);
+        std::fs::remove_dir_all(&dir).ok();
     }
 
     #[cfg(windows)]

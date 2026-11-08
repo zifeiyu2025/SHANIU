@@ -20,7 +20,6 @@
 //! 结论：自建极小的 pending 表 + 显式拒绝表，换取 C-R6 的可测性。
 
 use std::collections::HashMap;
-use std::path::Path;
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
@@ -29,10 +28,9 @@ use tokio::sync::{mpsc, oneshot};
 use tokio::task::JoinHandle;
 use tokio_util::sync::CancellationToken;
 
-use crate::config::{McpServerConfig, SandboxMode};
 use crate::sandbox::StdioEvent;
 
-use super::process::{McpProcess, RestartDecision, RestartGuard, StartError};
+use super::process::{McpProcess, RestartDecision, RestartGuard, SpawnSpec, StartError};
 use super::rpc::{self, ClientRequestVerdict, Incoming, RequestId};
 
 /// 握手超时。真实 server 首次启动可能要拉起 node 运行时，给宽一点；
@@ -157,16 +155,8 @@ pub struct McpSession {
 impl McpSession {
     /// 启动进程并接管 stdout。**不自动握手**——首次连接必须由用户显式触发（§3.1.4(2)），
     /// 握手由上层在用户确认后调用 [`initialize`](Self::initialize)。
-    pub async fn start(
-        config: &McpServerConfig,
-        sandbox_mode: SandboxMode,
-        cwd: &Path,
-        approved_sha256: &str,
-        approved_module_tree: Option<&str>,
-    ) -> Result<Self, SessionError> {
-        let mut process =
-            McpProcess::start(config, sandbox_mode, cwd, approved_sha256, approved_module_tree)
-                .await?;
+    pub async fn start(spec: SpawnSpec<'_>) -> Result<Self, SessionError> {
+        let mut process = McpProcess::start(spec).await?;
         let stdout = process
             .take_stdout()
             .ok_or_else(|| SessionError::Protocol("stdout 读端已被取走".into()))?;
@@ -177,7 +167,7 @@ impl McpSession {
         let reader = Some(spawn_reader(stdout, stdin.clone(), pending.clone(), events_tx, closed.clone()));
 
         Ok(Self {
-            server_id: config.id.clone(),
+            server_id: spec.config.id.clone(),
             process: Some(process),
             stdin,
             pending,
@@ -296,18 +286,20 @@ impl McpSession {
     /// 一次非预期退出后的重启：**先按哈希判定**，通过才重启并重跑握手。
     pub async fn restart(
         &mut self,
-        config: &McpServerConfig,
-        sandbox_mode: SandboxMode,
-        cwd: &Path,
-        approved_sha256: &str,
-        approved_module_tree: Option<&str>,
+        spec: SpawnSpec<'_>,
         guard: &mut RestartGuard,
     ) -> Result<RestartOutcome, SessionError> {
+        let config = spec.config;
         let process = self
             .process
             .as_ref()
             .ok_or_else(|| SessionError::Protocol("会话没有进程句柄，无法重启".into()))?;
-        match process.restart_decision(guard, approved_sha256, approved_module_tree, &config.args) {
+        match process.restart_decision(
+            guard,
+            spec.approved_sha256,
+            spec.approved_module_tree,
+            &config.args,
+        ) {
             RestartDecision::Blocked { approved, actual } => {
                 self.shutdown();
                 Ok(RestartOutcome::Blocked { approved, actual })
@@ -318,14 +310,7 @@ impl McpSession {
             }
             RestartDecision::Restart => {
                 self.shutdown();
-                let mut fresh = Self::start(
-                    config,
-                    sandbox_mode,
-                    cwd,
-                    approved_sha256,
-                    approved_module_tree,
-                )
-                .await?;
+                let mut fresh = Self::start(spec).await?;
                 fresh.initialize(DEFAULT_HANDSHAKE_TIMEOUT).await?;
                 *self = fresh;
                 Ok(RestartOutcome::Restarted)
