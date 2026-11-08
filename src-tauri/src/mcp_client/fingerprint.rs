@@ -7,7 +7,9 @@
 //! 4. 工作目录（绝对路径）；
 //! 5. 环境变量键名 + 值的摘要（**不落明文**）；
 //! 6. server 自报 name/version（只作变更检测信号）；
-//! 7. 排序后的分发名清单。
+//! 7. 排序后的分发名清单；
+//! 8. 解释器型启动（`python -m <module>`）的模块代码树摘要（见 [`super::module_tree`]）。
+//!    非解释器型启动没有这一项，规范输入与旧版本完全一致，不制造无意义的重新批准。
 //!
 //! **工具描述 / Schema / 注解不进指纹**（用户 2026-11-08 口径，覆盖 docs/02 §3.1.4(3)
 //! 的「描述变更也重批」）：改描述不重批，但工具清单增删必须重批。内容变更的检测与
@@ -30,6 +32,15 @@ pub struct EnvDigest {
     pub value_sha256: String,
 }
 
+/// 已覆盖的模块代码树（解释器型启动才有）。
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ModuleTreeDigest {
+    pub module: String,
+    pub sha256: String,
+    pub files: usize,
+    pub bytes: u64,
+}
+
 /// 指纹规范输入。字段声明顺序就是序列化顺序，`env`/`tools` 进构造时已排序，
 /// 因此 [`canonical`](Self::canonical) 的输出对同一组身份项是稳定的。
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -47,6 +58,9 @@ pub struct FingerprintInput {
     pub server_version: String,
     /// 按分发名排序的完整工具清单。**只放名字**：描述/Schema/注解变更不在指纹里。
     pub tools: Vec<String>,
+    /// 模块代码树摘要。`None`（非解释器型）时整个字段不进规范输入，旧指纹保持不变。
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub module_tree: Option<ModuleTreeDigest>,
 }
 
 impl FingerprintInput {
@@ -62,6 +76,7 @@ impl FingerprintInput {
         server_name: &str,
         server_version: &str,
         tools: &[String],
+        module_tree: Option<ModuleTreeDigest>,
     ) -> Self {
         let mut env_digests: Vec<EnvDigest> = env
             .iter()
@@ -88,6 +103,7 @@ impl FingerprintInput {
             server_name: server_name.to_string(),
             server_version: server_version.to_string(),
             tools: tool_names,
+            module_tree,
         }
     }
 
@@ -159,6 +175,7 @@ mod tests {
             "self-reported-name",
             "1.2.3",
             &owned,
+            None,
         )
     }
 
@@ -224,6 +241,28 @@ mod tests {
         let mut other_protocol = base.clone();
         other_protocol.protocol_version = "2025-06-18".into();
         assert_ne!(base.fingerprint(), other_protocol.fingerprint());
+    }
+
+    #[test]
+    fn module_tree_digest_is_part_of_identity_and_absent_for_direct_executables() {
+        let base = input(&BTreeMap::new(), &["mcp__srv__a"]);
+        assert!(
+            !base.canonical().contains("module_tree"),
+            "非解释器型（None）不得在规范输入里多出字段，否则旧批准会无故失效"
+        );
+
+        let mut covered = base.clone();
+        covered.module_tree = Some(ModuleTreeDigest {
+            module: "pkg".into(),
+            sha256: "c".repeat(64),
+            files: 3,
+            bytes: 1234,
+        });
+        assert_ne!(
+            base.fingerprint(),
+            covered.fingerprint(),
+            "模块代码树变化必须改变指纹"
+        );
     }
 
     #[test]

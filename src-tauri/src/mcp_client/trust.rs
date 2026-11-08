@@ -574,6 +574,7 @@ mod tests {
             "srv-name",
             "1.0.0",
             &tools,
+            None,
         )
     }
 

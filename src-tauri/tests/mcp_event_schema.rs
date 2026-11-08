@@ -8,7 +8,7 @@ use serde_json::{json, Value};
 use shaniu_lib::events::RiskLevel;
 use shaniu_lib::mcp_client::guard::{Exemption, RuleId};
 use shaniu_lib::mcp_client::runtime::{
-    ApprovedToolView, GuardHitView, McpEvent, McpStatus, ReviewPayload, ReviewTool,
+    ApprovedToolView, CoverageView, GuardHitView, McpEvent, McpStatus, ReviewPayload, ReviewTool,
 };
 
 /// 与 `src/transport/mcp-wire.ts` 的 `McpEventWire` 字面量逐一对应。
@@ -69,6 +69,10 @@ fn review_payload() -> ReviewPayload {
             hit_fragment: "ignore previous instructions".into(),
             granted_at_ms: 1_760_000_000_000,
         }],
+        coverage: CoverageView {
+            kind: "module_tree".into(),
+            detail: "已覆盖：解释器 + 模块 pkg 的代码树".into(),
+        },
         warnings: vec!["unsandboxed".into()],
         reason: Some("首次连接".into()),
     }

@@ -162,8 +162,11 @@ impl McpSession {
         sandbox_mode: SandboxMode,
         cwd: &Path,
         approved_sha256: &str,
+        approved_module_tree: Option<&str>,
     ) -> Result<Self, SessionError> {
-        let mut process = McpProcess::start(config, sandbox_mode, cwd, approved_sha256).await?;
+        let mut process =
+            McpProcess::start(config, sandbox_mode, cwd, approved_sha256, approved_module_tree)
+                .await?;
         let stdout = process
             .take_stdout()
             .ok_or_else(|| SessionError::Protocol("stdout 读端已被取走".into()))?;
@@ -297,13 +300,14 @@ impl McpSession {
         sandbox_mode: SandboxMode,
         cwd: &Path,
         approved_sha256: &str,
+        approved_module_tree: Option<&str>,
         guard: &mut RestartGuard,
     ) -> Result<RestartOutcome, SessionError> {
         let process = self
             .process
             .as_ref()
             .ok_or_else(|| SessionError::Protocol("会话没有进程句柄，无法重启".into()))?;
-        match process.restart_decision(guard, approved_sha256) {
+        match process.restart_decision(guard, approved_sha256, approved_module_tree, &config.args) {
             RestartDecision::Blocked { approved, actual } => {
                 self.shutdown();
                 Ok(RestartOutcome::Blocked { approved, actual })
@@ -314,7 +318,14 @@ impl McpSession {
             }
             RestartDecision::Restart => {
                 self.shutdown();
-                let mut fresh = Self::start(config, sandbox_mode, cwd, approved_sha256).await?;
+                let mut fresh = Self::start(
+                    config,
+                    sandbox_mode,
+                    cwd,
+                    approved_sha256,
+                    approved_module_tree,
+                )
+                .await?;
                 fresh.initialize(DEFAULT_HANDSHAKE_TIMEOUT).await?;
                 *self = fresh;
                 Ok(RestartOutcome::Restarted)

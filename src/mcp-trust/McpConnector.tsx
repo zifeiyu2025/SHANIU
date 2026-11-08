@@ -580,6 +580,13 @@ function ReviewPanel({
         <dd className="mcp-connector-mono">{payload.fingerprint}</dd>
         <dt>{t('executableSha')}</dt>
         <dd className="mcp-connector-mono">{payload.executable_sha256}</dd>
+        <dt>{t('coverage')}</dt>
+        <dd>
+          <Tag tone={payload.coverage?.kind === 'module_tree' ? 'success' : 'quiet'}>
+            {t(payload.coverage?.kind === 'module_tree' ? 'coverage.moduleTree' : 'coverage.interpreterOnly')}
+          </Tag>
+          <span className="mcp-connector-note"> {payload.coverage?.detail ?? t('coverage.interpreterOnlyDetail')}</span>
+        </dd>
         <dt>{t('executable')}</dt>
         <dd><PathLabel path={payload.executable} /></dd>
         <dt>{t('argv')}</dt>

@@ -28,6 +28,16 @@ pub enum StartError {
     Hash { path: String, reason: String },
     #[error("可执行文件哈希与批准记录不一致（批准 {approved}，实际 {actual}）：拒绝启动")]
     HashMismatch { approved: String, actual: String },
+    #[error(
+        "模块 `{module}` 的代码树与批准记录不一致（批准 {approved}，实际 {actual}）：拒绝启动，需重新审查"
+    )]
+    ModuleTreeMismatch {
+        module: String,
+        approved: String,
+        actual: String,
+    },
+    #[error("无法复核模块代码树：{0}")]
+    ModuleTree(String),
     #[error("沙箱启动失败: {0}")]
     Sandbox(String),
     #[error("写入 server stdin 失败: {0}")]
@@ -102,12 +112,33 @@ impl McpProcess {
         sandbox_mode: SandboxMode,
         cwd: &Path,
         approved_sha256: &str,
+        approved_module_tree: Option<&str>,
     ) -> Result<Self, StartError> {
         let exe = command::resolve_executable(&config.command)?;
         let actual = command::file_sha256(&exe)
             .map_err(|e| StartError::Hash { path: exe.display().to_string(), reason: e.to_string() })?;
         if !actual.eq_ignore_ascii_case(approved_sha256) {
             return Err(StartError::HashMismatch { approved: approved_sha256.to_string(), actual });
+        }
+        // 解释器型启动：解释器只是外壳，真正执行的模块代码也必须与批准时一致。
+        // 这里重算并比对，覆盖「审查之后、启动之前」被换掉的窗口（TOCTOU）。
+        let current_tree = super::module_tree::digest_for(&exe, &config.args)
+            .map_err(|error| StartError::ModuleTree(error.to_string()))?;
+        match (approved_module_tree, current_tree) {
+            (None, None) => {}
+            (Some(approved), Some(tree)) if approved.eq_ignore_ascii_case(&tree.sha256) => {}
+            (approved, current) => {
+                return Err(StartError::ModuleTreeMismatch {
+                    module: current
+                        .as_ref()
+                        .map(|tree| tree.module.clone())
+                        .unwrap_or_else(|| "-".to_string()),
+                    approved: approved.unwrap_or("<未覆盖>").to_string(),
+                    actual: current
+                        .map(|tree| tree.sha256)
+                        .unwrap_or_else(|| "<无法定位模块>".to_string()),
+                });
+            }
         }
 
         // `unsandboxed` 是逐服务器显式豁免（X10），配置校验已要求同时填写原因。
@@ -212,16 +243,42 @@ impl McpProcess {
         )
     }
 
-    /// 重启前复核：重算当前可执行文件哈希并走状态机。
-    pub fn restart_decision(&self, guard: &mut RestartGuard, approved_sha256: &str) -> RestartDecision {
-        match command::file_sha256(&self.exe) {
-            Ok(actual) => guard.on_unexpected_exit(approved_sha256, &actual),
+    /// 重启前复核：重算可执行文件哈希**与模块代码树**，任一不一致即 blocked。
+    pub fn restart_decision(
+        &self,
+        guard: &mut RestartGuard,
+        approved_sha256: &str,
+        approved_module_tree: Option<&str>,
+        args: &[String],
+    ) -> RestartDecision {
+        let actual = match command::file_sha256(&self.exe) {
+            Ok(actual) => actual,
             // 文件读不到 = 无法确认它还是批准的那个文件——按不一致处理（fail-closed）。
-            Err(_) => RestartDecision::Blocked {
-                approved: approved_sha256.to_string(),
-                actual: "<无法读取>".to_string(),
-            },
+            Err(_) => {
+                return RestartDecision::Blocked {
+                    approved: approved_sha256.to_string(),
+                    actual: "<无法读取>".to_string(),
+                }
+            }
+        };
+        if !actual.eq_ignore_ascii_case(approved_sha256) {
+            return RestartDecision::Blocked { approved: approved_sha256.to_string(), actual };
         }
+        let current_tree = match super::module_tree::digest_for(&self.exe, args) {
+            Ok(tree) => tree.map(|tree| tree.sha256),
+            Err(_) => None,
+        };
+        match (approved_module_tree, current_tree.as_deref()) {
+            (None, None) => {}
+            (Some(approved), Some(current)) if approved.eq_ignore_ascii_case(current) => {}
+            (approved, current) => {
+                return RestartDecision::Blocked {
+                    approved: approved.unwrap_or("<未覆盖>").to_string(),
+                    actual: current.unwrap_or("<无法定位模块>").to_string(),
+                }
+            }
+        }
+        guard.on_unexpected_exit(approved_sha256, &actual)
     }
 }
 
@@ -284,8 +341,14 @@ mod tests {
     #[tokio::test]
     async fn hash_mismatch_rejects_start_without_spawning() {
         let config = McpServerConfig { id: "probe".into(), command: "cmd".into(), ..Default::default() };
-        let err = match McpProcess::start(&config, SandboxMode::WorkspaceWrite, &std::env::temp_dir(), "deadbeef")
-            .await
+        let err = match McpProcess::start(
+            &config,
+            SandboxMode::WorkspaceWrite,
+            &std::env::temp_dir(),
+            "deadbeef",
+            None,
+        )
+        .await
         {
             Err(error) => error,
             Ok(_) => panic!("哈希不一致必须拒绝启动"),
@@ -303,9 +366,10 @@ mod tests {
             args: vec!["/C".into(), "echo".into(), "hello-mcp".into()],
             ..Default::default()
         };
-        let mut process = McpProcess::start(&config, SandboxMode::WorkspaceWrite, &std::env::temp_dir(), &sha)
-            .await
-            .expect("受限沙箱应能启动 cmd");
+        let mut process =
+            McpProcess::start(&config, SandboxMode::WorkspaceWrite, &std::env::temp_dir(), &sha, None)
+                .await
+                .expect("受限沙箱应能启动 cmd");
 
         let event = tokio::time::timeout(Duration::from_secs(15), process.next_event())
             .await

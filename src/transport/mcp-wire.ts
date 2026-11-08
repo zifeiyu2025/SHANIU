@@ -92,8 +92,16 @@ export interface ReviewPayloadWire {
   readonly rejected_tools: readonly RejectedToolWire[]
   readonly approved_tools: readonly ApprovedToolWire[]
   readonly exemptions: readonly ExemptionWire[]
+  /** 指纹覆盖范围：`interpreter_only` 或 `module_tree`（解释器 + 模块代码树）。 */
+  readonly coverage?: CoverageWire
   readonly warnings: readonly string[]
   readonly reason?: string
+}
+
+/** 指纹覆盖范围。两种范围的安全性不同，界面必须分开显示。 */
+export interface CoverageWire {
+  readonly kind: 'interpreter_only' | 'module_tree'
+  readonly detail: string
 }
 
 /** 审查界面逐工具的裁决输入。 */

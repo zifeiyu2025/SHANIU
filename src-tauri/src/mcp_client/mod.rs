@@ -16,6 +16,7 @@ pub mod command;
 pub mod fingerprint;
 pub mod guard;
 pub mod manifest;
+pub mod module_tree;
 pub mod output;
 pub mod process;
 pub mod registry;

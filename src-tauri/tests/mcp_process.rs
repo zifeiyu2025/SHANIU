@@ -53,7 +53,7 @@ fn approved_hash(config: &McpServerConfig) -> String {
 async fn started_session() -> (McpSession, McpServerConfig, String) {
     let config = config();
     let hash = approved_hash(&config);
-    let mut session = McpSession::start(&config, SandboxMode::WorkspaceWrite, config_cwd(&config), &hash)
+    let mut session = McpSession::start(&config, SandboxMode::WorkspaceWrite, config_cwd(&config), &hash, None)
         .await
         .expect("受限 stdio 进程应能启动");
     if let Err(error) = session.initialize(HANDSHAKE).await {
@@ -172,7 +172,14 @@ async fn crashed_server_restarts_once_then_degrades() {
 
     // 哈希未变、额度还有：重启并重跑握手。
     let outcome = session
-        .restart(&config, SandboxMode::WorkspaceWrite, config_cwd(&config), &hash, &mut guard)
+        .restart(
+            &config,
+            SandboxMode::WorkspaceWrite,
+            config_cwd(&config),
+            &hash,
+            None,
+            &mut guard,
+        )
         .await
         .expect("重启应成功");
     assert_eq!(outcome, RestartOutcome::Restarted);
@@ -182,7 +189,14 @@ async fn crashed_server_restarts_once_then_degrades() {
     let _ = session.call_tool("crash", json!({}), CALL, None).await;
     let _ = session.wait_exit().await;
     let outcome = session
-        .restart(&config, SandboxMode::WorkspaceWrite, config_cwd(&config), &hash, &mut guard)
+        .restart(
+            &config,
+            SandboxMode::WorkspaceWrite,
+            config_cwd(&config),
+            &hash,
+            None,
+            &mut guard,
+        )
         .await
         .expect("degraded 结论本身不是启动错误");
     assert_eq!(outcome, RestartOutcome::Degraded);

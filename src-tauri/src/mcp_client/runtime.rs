@@ -12,22 +12,28 @@
 use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, Ordering};
-use std::sync::{Arc, RwLock};
+use std::sync::{Arc, RwLock, Weak};
+use std::time::Duration;
 
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use tokio::sync::Mutex;
+use tokio::task::JoinHandle;
 
 use crate::config::{McpConfigSource, McpServerConfig, SandboxMode};
 use crate::events::RiskLevel;
 use crate::tool_router::ToolExecutor;
 
 use super::command::{file_sha256, resolve_executable};
-use super::fingerprint::FingerprintInput;
+use super::fingerprint::{FingerprintInput, ModuleTreeDigest};
 use super::guard::{self, Exemption, ExemptionKey, ExemptionStore, GuardVerdict, RuleId};
 use super::manifest::{self, RegistrationPlan};
+use super::module_tree;
+use super::process::RestartGuard;
 use super::registry::{self, ApprovedTool};
-use super::session::{McpSession, RemoteTool, ServerIdentity, DEFAULT_HANDSHAKE_TIMEOUT};
+use super::session::{
+    McpSession, RemoteTool, RestartOutcome, ServerIdentity, DEFAULT_HANDSHAKE_TIMEOUT,
+};
 use super::trust::{
     self, ToolDecision, ToolGrant, TrustError, TrustRecord, TrustStatus, TrustStore, TRUST_FILE,
 };
@@ -122,6 +128,41 @@ pub struct ApprovedToolView {
     pub risk: RiskLevel,
 }
 
+/// 指纹覆盖范围。界面必须区分这两种，不能让用户以为「仅解释器」与
+/// 「解释器 + 模块代码树」安全性相同。
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct CoverageView {
+    /// `interpreter_only` | `module_tree`
+    pub kind: String,
+    pub detail: String,
+}
+
+impl Default for CoverageView {
+    fn default() -> Self {
+        Self {
+            kind: "interpreter_only".to_string(),
+            detail: "仅覆盖解释器可执行文件；其加载的脚本与依赖代码不在指纹内".to_string(),
+        }
+    }
+}
+
+impl CoverageView {
+    fn from_digest(tree: Option<&ModuleTreeDigest>) -> Self {
+        match tree {
+            Some(tree) => Self {
+                kind: "module_tree".to_string(),
+                detail: format!(
+                    "已覆盖：解释器 + 模块 {} 的代码树（{} 个文件 / {:.1} KiB）；该模块再 import 的其他包不在覆盖范围内",
+                    tree.module,
+                    tree.files,
+                    tree.bytes as f64 / 1024.0
+                ),
+            },
+            None => Self::default(),
+        }
+    }
+}
+
 /// 一次首连审查（也是信任状态查询）的完整载荷。
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct ReviewPayload {
@@ -156,6 +197,9 @@ pub struct ReviewPayload {
     pub rejected_tools: Vec<RejectedToolView>,
     pub approved_tools: Vec<ApprovedToolView>,
     pub exemptions: Vec<Exemption>,
+    /// 指纹覆盖范围（解释器 / 解释器 + 模块代码树）。
+    #[serde(default)]
+    pub coverage: CoverageView,
     pub warnings: Vec<String>,
     #[serde(default)]
     pub reason: Option<String>,
@@ -226,6 +270,9 @@ struct Pending {
     guard_rejected: Vec<registry::GuardRejection>,
     remote_tools: Vec<RemoteTool>,
     session: Arc<Mutex<McpSession>>,
+    /// 批准后重建执行器时要原样复用（不重新解析、不再走 PATH）。
+    sandbox_mode: SandboxMode,
+    cwd: PathBuf,
 }
 
 struct Active {
@@ -234,6 +281,26 @@ struct Active {
     executors: Vec<Arc<dyn ToolExecutor>>,
     revocation: BTreeMap<String, Arc<AtomicBool>>,
     session: Arc<Mutex<McpSession>>,
+    /// 崩溃监管任务。停止/撤销时 abort，防止「刚关掉的 server 又被拉起来」。
+    supervisor: Option<JoinHandle<()>>,
+}
+
+/// 崩溃监管的轮询间隔：读端关闭后最迟这么久被发现。
+const SUPERVISOR_POLL_INTERVAL: Duration = Duration::from_millis(500);
+/// 两次重启尝试之间的退避基数（第一次重启前先等这么久，不在崩溃瞬间补进程）。
+const RESTART_BACKOFF_BASE: Duration = Duration::from_secs(1);
+/// 退避上限。额度只有 1 次时用不到，保留给将来放宽额度的情况。
+const RESTART_BACKOFF_MAX: Duration = Duration::from_secs(8);
+
+/// 崩溃重启所需的重启参数（与批准记录同源，不在重启时重新解析）。
+struct RestartParams {
+    config: McpServerConfig,
+    sandbox_mode: SandboxMode,
+    cwd: PathBuf,
+    /// 批准记录里的可执行文件哈希：每次重启前都要重新比对。
+    approved_sha256: String,
+    /// 批准记录里的模块代码树摘要（解释器型启动才有）：同样每次重启前重算比对。
+    approved_module_tree: Option<String>,
 }
 
 /// 构建 [`ReviewPayload`] 的上下文：状态、来源信任记录与已收集的警告。
@@ -251,6 +318,13 @@ pub struct McpRuntime {
     pending: Mutex<BTreeMap<String, Pending>>,
     /// 已连接服务器：用 std 锁，组合根需要在**同步**构 router 时取执行器副本。
     active: std::sync::Mutex<BTreeMap<String, Active>>,
+    /// 崩溃重启额度耗尽后的终态与原因（**内存态**，不写盘）。
+    ///
+    /// 不落盘是刻意的：进程重启后用户重新连接即是一次新的显式动作，应重新走审查；
+    /// 但同一进程生命周期内绝不自动复活一个已经放弃的 server。
+    degraded: Mutex<BTreeMap<String, String>>,
+    /// 运行期状态原因（例如「第 2 次自动重启成功」）：覆盖信任记录里的静态 reason。
+    live_reason: Mutex<BTreeMap<String, String>>,
     sink: RwLock<Arc<dyn McpEventSink>>,
 }
 
@@ -265,6 +339,8 @@ impl McpRuntime {
             exemptions: Mutex::new(exemptions),
             pending: Mutex::new(BTreeMap::new()),
             active: std::sync::Mutex::new(BTreeMap::new()),
+            degraded: Mutex::new(BTreeMap::new()),
+            live_reason: Mutex::new(BTreeMap::new()),
             sink: RwLock::new(Arc::new(NullMcpSink)),
         }
     }
@@ -284,7 +360,7 @@ impl McpRuntime {
 
     /// 首连 / 重连：返回审查载荷。已受信任且指纹未变时直接重建执行器并返回 trusted。
     pub async fn connect_and_review(
-        &self,
+        self: &Arc<Self>,
         config: &McpServerConfig,
         workspace_root: &Path,
     ) -> Result<ReviewPayload, String> {
@@ -298,7 +374,7 @@ impl McpRuntime {
     /// 展示清单先把它跑起来（docs/02 §3.1.4(3)）。用户确认后才 spawn → 握手 → 列清单 →
     /// 走逐工具风险档位。
     pub async fn connect_and_review_with(
-        &self,
+        self: &Arc<Self>,
         config: &McpServerConfig,
         workspace_root: &Path,
         accept_new_binary: bool,
@@ -319,6 +395,8 @@ impl McpRuntime {
             ));
         }
         self.stop_server(&config.id).await;
+        // 重新连接是用户的显式动作：清掉上一轮的 degraded 终态，重新走审查/批准。
+        self.clear_degraded(&config.id).await;
 
         let executable = {
             let command = config.command.clone();
@@ -349,6 +427,17 @@ impl McpRuntime {
             ));
         }
 
+        // 解释器型启动（python -m pkg）：解释器只是外壳，模块代码树也必须纳入身份。
+        // 这一步只读文件系统、不执行目标代码；超限/定位失败直接拒绝启动（不静默降级）。
+        let module_tree = {
+            let executable = executable.clone();
+            let args = config.args.clone();
+            tokio::task::spawn_blocking(move || module_tree::digest_for(&executable, &args))
+                .await
+                .map_err(|error| format!("计算模块代码树的任务失败: {error}"))?
+                .map_err(|error| error.to_string())?
+        };
+        let module_tree_sha = module_tree.as_ref().map(|tree| tree.sha256.as_str());
         let existing = self.trust.lock().await.record(&config.id).cloned();
         // `accept_new_binary` 只在**已处于 retrust** 时才生效：它代表「用户在『需要重新
         // 信任』界面上确认了新二进制」。任何自动化流程、重试逻辑或前端默认值直接传 true
@@ -363,14 +452,23 @@ impl McpRuntime {
         if !confirmed {
             if let Some(record) = &existing {
                 let approved_before = !matches!(record.status, TrustStatus::Review);
-                if approved_before
-                    && !record
-                        .input
-                        .executable_sha256
-                        .eq_ignore_ascii_case(&executable_sha256)
-                {
+                let exe_changed = !record
+                    .input
+                    .executable_sha256
+                    .eq_ignore_ascii_case(&executable_sha256);
+                // 解释器没变、模块代码变了，同样是「两次批准之间逻辑被换掉」。
+                let tree_changed = record.input.module_tree.as_ref().map(|tree| &tree.sha256)
+                    != module_tree.as_ref().map(|tree| &tree.sha256);
+                if approved_before && (exe_changed || tree_changed) {
                     return Ok(self
-                        .retrust_payload(config, record, &executable, &executable_sha256, &cwd)
+                        .retrust_payload(
+                            config,
+                            record,
+                            &executable,
+                            &executable_sha256,
+                            module_tree.as_ref(),
+                            &cwd,
+                        )
                         .await);
                 }
             }
@@ -381,9 +479,10 @@ impl McpRuntime {
         } else {
             SandboxMode::WorkspaceWrite
         };
-        let mut session = McpSession::start(config, sandbox_mode, &cwd, &executable_sha256)
-            .await
-            .map_err(|error| format!("启动 MCP server 失败: {error}"))?;
+        let mut session =
+            McpSession::start(config, sandbox_mode, &cwd, &executable_sha256, module_tree_sha)
+                .await
+                .map_err(|error| format!("启动 MCP server 失败: {error}"))?;
         let identity = session
             .initialize(DEFAULT_HANDSHAKE_TIMEOUT)
             .await
@@ -410,6 +509,12 @@ impl McpRuntime {
             &identity.name,
             &identity.version,
             &dispatch_names,
+            module_tree.as_ref().map(|tree| ModuleTreeDigest {
+                module: tree.module.clone(),
+                sha256: tree.sha256.clone(),
+                files: tree.files,
+                bytes: tree.bytes,
+            }),
         );
         let fingerprint = input.fingerprint();
         let fresh_grants = trust::grants_from_plan(&plan);
@@ -458,6 +563,8 @@ impl McpRuntime {
                             guard_rejected,
                             remote_tools,
                             session,
+                            sandbox_mode,
+                            cwd.clone(),
                             fresh_grants,
                             reason,
                             warnings,
@@ -493,14 +600,18 @@ impl McpRuntime {
                         &plan,
                     )
                     .await;
-                self.active.lock().expect("MCP active 锁中毒").insert(
+                self.activate(
                     config.id.clone(),
-                    Active {
-                        remote_tools,
-                        approved,
-                        executors: built.executors,
-                        revocation: built.revocation,
-                        session,
+                    remote_tools,
+                    approved,
+                    built,
+                    session,
+                    RestartParams {
+                        config: config.clone(),
+                        sandbox_mode,
+                        cwd: cwd.clone(),
+                        approved_sha256: executable_sha256.clone(),
+                        approved_module_tree: module_tree_sha.map(str::to_string),
                     },
                 );
                 self.emit(McpEvent::ServerStatusChanged {
@@ -555,6 +666,8 @@ impl McpRuntime {
                     guard_rejected,
                     remote_tools,
                     session,
+                    sandbox_mode,
+                    cwd.clone(),
                     fresh_grants,
                     reason,
                     warnings,
@@ -570,6 +683,8 @@ impl McpRuntime {
                     guard_rejected,
                     remote_tools,
                     session,
+                    sandbox_mode,
+                    cwd.clone(),
                     fresh_grants,
                     Some("首次连接：请核对指纹与逐工具风险档位后批准".to_string()),
                     warnings,
@@ -589,6 +704,8 @@ impl McpRuntime {
         guard_rejected: Vec<registry::GuardRejection>,
         remote_tools: Vec<RemoteTool>,
         session: Arc<Mutex<McpSession>>,
+        sandbox_mode: SandboxMode,
+        cwd: PathBuf,
         fresh_grants: Vec<ToolGrant>,
         reason: Option<String>,
         warnings: Vec<String>,
@@ -615,6 +732,8 @@ impl McpRuntime {
                 guard_rejected,
                 remote_tools,
                 session,
+                sandbox_mode,
+                cwd,
             },
         );
         let payload = self
@@ -652,13 +771,38 @@ impl McpRuntime {
         record: &TrustRecord,
         executable: &Path,
         executable_sha256: &str,
+        current_module_tree: Option<&module_tree::ModuleTree>,
         cwd: &Path,
     ) -> ReviewPayload {
         let previous = record.input.executable_sha256.clone();
+        let exe_changed = !previous.eq_ignore_ascii_case(executable_sha256);
+        let tree_changed = record.input.module_tree.as_ref().map(|tree| &tree.sha256)
+            != current_module_tree.map(|tree| &tree.sha256);
+        let mut changed = Vec::new();
+        if exe_changed {
+            changed.push(format!(
+                "可执行文件哈希已变化（上次批准 {}，当前 {}）",
+                short_sha(&previous),
+                short_sha(executable_sha256)
+            ));
+        }
+        if tree_changed {
+            changed.push(format!(
+                "模块代码树已变化（上次批准 {}，当前 {}）",
+                record
+                    .input
+                    .module_tree
+                    .as_ref()
+                    .map(|tree| short_sha(&tree.sha256))
+                    .unwrap_or("<无>"),
+                current_module_tree
+                    .map(|tree| short_sha(&tree.sha256))
+                    .unwrap_or("<无>")
+            ));
+        }
         let reason = format!(
-            "可执行文件哈希已变化（上次批准 {}，当前 {}）：未启动进程，需确认新二进制后重新审查",
-            short_sha(&previous),
-            short_sha(executable_sha256)
+            "{}：未启动进程，需确认新二进制后重新审查",
+            changed.join("；")
         );
         if record.status != TrustStatus::Retrust {
             let mut updated = record.clone();
@@ -741,8 +885,9 @@ impl McpRuntime {
             rejected_tools: Vec::new(),
             approved_tools: Vec::new(),
             exemptions: record.exemptions.clone(),
+            coverage: CoverageView::from_digest(record.input.module_tree.as_ref()),
             warnings: vec![
-                "可执行文件在两次批准之间发生了变化：本次没有启动进程，也没有注册任何工具。"
+                "可执行文件或模块代码在两次批准之间发生了变化：本次没有启动进程，也没有注册任何工具。"
                     .to_string(),
                 "下面的工具清单来自上次批准的缓存，仅作参考，不是当前版本。".to_string(),
             ],
@@ -758,7 +903,7 @@ impl McpRuntime {
 
     /// 应用用户裁决：批准位 + 逐工具档位 + 注入工具的显式启用。
     pub async fn resolve_trust(
-        &self,
+        self: &Arc<Self>,
         server_id: &str,
         fingerprint: &str,
         decisions: &[TrustDecisionInput],
@@ -888,14 +1033,23 @@ impl McpRuntime {
                 pending.session.clone(),
                 &*self.exemptions.lock().await,
             );
-            self.active.lock().expect("MCP active 锁中毒").insert(
+            self.clear_degraded(server_id).await;
+            self.activate(
                 server_id.to_string(),
-                Active {
-                    remote_tools: pending.remote_tools.clone(),
-                    approved: approved.clone(),
-                    executors: built.executors,
-                    revocation: built.revocation,
-                    session: pending.session.clone(),
+                pending.remote_tools.clone(),
+                approved.clone(),
+                built,
+                pending.session.clone(),
+                RestartParams {
+                    config: pending.config.clone(),
+                    sandbox_mode: pending.sandbox_mode,
+                    cwd: pending.cwd.clone(),
+                    approved_sha256: pending.input.executable_sha256.clone(),
+                    approved_module_tree: pending
+                        .input
+                        .module_tree
+                        .as_ref()
+                        .map(|tree| tree.sha256.clone()),
                 },
             );
             self.pending.lock().await.remove(server_id);
@@ -935,6 +1089,7 @@ impl McpRuntime {
     /// 撤销整个服务器的信任：先让在途执行器失效，再删记录与豁免。
     pub async fn revoke_trust(&self, server_id: &str) -> Result<(), String> {
         self.stop_server(server_id).await;
+        self.clear_degraded(server_id).await;
         let removed = self
             .trust
             .lock()
@@ -1061,17 +1216,29 @@ impl McpRuntime {
     pub async fn statuses(&self) -> Vec<ServerStatus> {
         let trust = self.trust.lock().await;
         let pending = self.pending.lock().await;
+        let degraded = self.degraded.lock().await;
+        let live_reason = self.live_reason.lock().await;
         let active = self.active.lock().expect("MCP active 锁中毒");
         trust
             .records()
             .into_iter()
             .map(|record| {
-                let status = if pending.contains_key(&record.server_id) {
-                    McpStatus::Review
+                // degraded 是运行时的真实终态：信任记录仍是 trusted，但进程已放弃，
+                // 不能让界面继续显示「已批准、可调用」。
+                let (status, reason) = if let Some(reason) = degraded.get(&record.server_id) {
+                    (McpStatus::Degraded, Some(reason.clone()))
+                } else if pending.contains_key(&record.server_id) {
+                    (McpStatus::Review, record.reason.clone())
                 } else if active.contains_key(&record.server_id) {
-                    McpStatus::Trusted
+                    (
+                        McpStatus::Trusted,
+                        live_reason
+                            .get(&record.server_id)
+                            .cloned()
+                            .or_else(|| record.reason.clone()),
+                    )
                 } else {
-                    McpStatus::from(record.status)
+                    (McpStatus::from(record.status), record.reason.clone())
                 };
                 ServerStatus {
                     server_id: record.server_id.clone(),
@@ -1086,7 +1253,7 @@ impl McpRuntime {
                         })
                         .collect(),
                     exemption_count: record.exemptions.len(),
-                    reason: record.reason.clone(),
+                    reason,
                 }
             })
             .collect()
@@ -1127,11 +1294,124 @@ impl McpRuntime {
             pending.session.lock().await.shutdown();
         }
         if let Some(active) = active {
+            // 先停监管，否则「主动关闭」会被监管误判成崩溃而自动拉起。
+            if let Some(supervisor) = active.supervisor {
+                supervisor.abort();
+            }
             for flag in active.revocation.values() {
                 flag.store(false, Ordering::SeqCst);
             }
             active.session.lock().await.shutdown();
         }
+    }
+
+    /// 登记一个已批准服务器并启动崩溃监管（唯一的入口，避免两处插入逻辑分叉）。
+    fn activate(
+        self: &Arc<Self>,
+        server_id: String,
+        remote_tools: Vec<RemoteTool>,
+        approved: Vec<ApprovedTool>,
+        built: registry::BuiltTools,
+        session: Arc<Mutex<McpSession>>,
+        params: RestartParams,
+    ) {
+        let supervisor = spawn_supervisor(self, &server_id, session.clone(), params);
+        self.active.lock().expect("MCP active 锁中毒").insert(
+            server_id,
+            Active {
+                remote_tools,
+                approved,
+                executors: built.executors,
+                revocation: built.revocation,
+                session,
+                supervisor: Some(supervisor),
+            },
+        );
+    }
+
+    async fn clear_degraded(&self, server_id: &str) {
+        self.degraded.lock().await.remove(server_id);
+        self.live_reason.lock().await.remove(server_id);
+    }
+
+    async fn set_live_reason(&self, server_id: &str, reason: String) {
+        self.live_reason
+            .lock()
+            .await
+            .insert(server_id.to_string(), reason);
+    }
+
+    /// 崩溃额度耗尽：撤掉执行器、失效在途副本、写终态与原因，**此后不再 spawn**。
+    async fn mark_degraded(&self, server_id: &str, reason: String) {
+        let removed = self
+            .active
+            .lock()
+            .expect("MCP active 锁中毒")
+            .remove(server_id);
+        if let Some(active) = removed {
+            if let Some(supervisor) = active.supervisor {
+                supervisor.abort();
+            }
+            for flag in active.revocation.values() {
+                flag.store(false, Ordering::SeqCst);
+            }
+            active.session.lock().await.shutdown();
+        }
+        self.live_reason.lock().await.remove(server_id);
+        self.degraded
+            .lock()
+            .await
+            .insert(server_id.to_string(), reason.clone());
+        self.emit(McpEvent::ServerStatusChanged {
+            server_id: server_id.to_string(),
+            status: McpStatus::Degraded,
+            reason: Some(reason),
+        });
+    }
+
+    /// 崩溃后复核发现可执行文件被替换：停止并回到「需要重新信任」，不重启。
+    async fn mark_retrust(&self, server_id: &str, reason: String) {
+        let removed = self
+            .active
+            .lock()
+            .expect("MCP active 锁中毒")
+            .remove(server_id);
+        if let Some(active) = removed {
+            if let Some(supervisor) = active.supervisor {
+                supervisor.abort();
+            }
+            for flag in active.revocation.values() {
+                flag.store(false, Ordering::SeqCst);
+            }
+            active.session.lock().await.shutdown();
+        }
+        {
+            let mut store = self.trust.lock().await;
+            if let Some(record) = store.record(server_id).cloned() {
+                let mut updated = record;
+                updated.status = TrustStatus::Retrust;
+                updated.reason = Some(reason.clone());
+                if let Err(error) = store.upsert(updated) {
+                    tracing::warn!("写入 MCP 重新信任状态失败: {error}");
+                }
+            }
+        }
+        self.degraded.lock().await.remove(server_id);
+        self.live_reason.lock().await.remove(server_id);
+        self.emit(McpEvent::ServerStatusChanged {
+            server_id: server_id.to_string(),
+            status: McpStatus::Retrust,
+            reason: Some(reason),
+        });
+    }
+
+    /// 该服务器当前是否仍由这条会话（而不是别的重连）监管。
+    fn is_supervised(&self, server_id: &str, session: &Arc<Mutex<McpSession>>) -> bool {
+        self.active
+            .lock()
+            .expect("MCP active 锁中毒")
+            .get(server_id)
+            .is_some_and(|active| Arc::ptr_eq(&active.session, session))
     }
 
     async fn build_payload(
@@ -1258,6 +1538,7 @@ impl McpRuntime {
             rejected_tools,
             approved_tools,
             exemptions,
+            coverage: CoverageView::from_digest(input.module_tree.as_ref()),
             warnings,
             reason: record.and_then(|record| record.reason.clone()),
         }
@@ -1277,6 +1558,140 @@ fn approved_from_record(record: &TrustRecord) -> Vec<ApprovedTool> {
             risk,
         })
         .collect()
+}
+
+/// 启动一个崩溃监管任务（每台已批准服务器一个）。
+///
+/// 用 `Weak` 而不是 `Arc`：任务空闲时不应把运行时钉住；运行时被释放即自行退出。
+fn spawn_supervisor(
+    runtime: &Arc<McpRuntime>,
+    server_id: &str,
+    session: Arc<Mutex<McpSession>>,
+    params: RestartParams,
+) -> JoinHandle<()> {
+    let runtime = Arc::downgrade(runtime);
+    let server_id = server_id.to_string();
+    tokio::spawn(async move { supervise(runtime, server_id, session, params).await })
+}
+
+/// 非预期退出的唯一处置点：退避 → 按额度重启 → 成功继续监管，失败写终态并停手。
+async fn supervise(
+    runtime: Weak<McpRuntime>,
+    server_id: String,
+    session: Arc<Mutex<McpSession>>,
+    params: RestartParams,
+) {
+    let mut guard = RestartGuard::default();
+    loop {
+        tokio::time::sleep(SUPERVISOR_POLL_INTERVAL).await;
+        let Some(runtime) = runtime.upgrade() else {
+            return;
+        };
+        // 已被 stop/shutdown/重连替换掉的会话不再归本任务管。
+        if !runtime.is_supervised(&server_id, &session) {
+            return;
+        }
+        if !session.lock().await.is_closed() {
+            continue;
+        }
+
+        // 取退出码与 stderr 尾部，作为「上一次失败原因」写进状态。
+        let report = {
+            let mut session = session.lock().await;
+            let code = tokio::time::timeout(Duration::from_secs(2), session.wait_exit())
+                .await
+                .unwrap_or(-1);
+            session.crash_report(code)
+        };
+        let attempt = guard.restarts_used() + 1;
+
+        // 退避：进程一崩就立刻补一个只会加速打爆，先等一段再试。
+        let backoff = std::cmp::min(
+            RESTART_BACKOFF_BASE * 2u32.pow(u32::from(guard.restarts_used())),
+            RESTART_BACKOFF_MAX,
+        );
+        tokio::time::sleep(backoff).await;
+        if !runtime.is_supervised(&server_id, &session) {
+            return;
+        }
+
+        let outcome = {
+            let mut session = session.lock().await;
+            session
+                .restart(
+                    &params.config,
+                    params.sandbox_mode,
+                    &params.cwd,
+                    &params.approved_sha256,
+                    params.approved_module_tree.as_deref(),
+                    &mut guard,
+                )
+                .await
+        };
+        match outcome {
+            Ok(RestartOutcome::Restarted) => {
+                let reason = format!(
+                    "第 {attempt} 次自动重启成功（已用 {} 次额度）；上一次失败：{}",
+                    guard.restarts_used(),
+                    first_line(&report)
+                );
+                runtime.clear_degraded(&server_id).await;
+                runtime.set_live_reason(&server_id, reason.clone()).await;
+                runtime.emit(McpEvent::ServerStatusChanged {
+                    server_id: server_id.clone(),
+                    status: McpStatus::Trusted,
+                    reason: Some(reason),
+                });
+            }
+            Ok(RestartOutcome::Degraded) => {
+                runtime
+                    .mark_degraded(
+                        &server_id,
+                        format!(
+                            "第 {attempt} 次崩溃（已用掉 {} 次重启额度），不再自动重启；上一次失败：{}",
+                            guard.restarts_used(),
+                            first_line(&report)
+                        ),
+                    )
+                    .await;
+                return;
+            }
+            Ok(RestartOutcome::Blocked { approved, actual }) => {
+                runtime
+                    .mark_retrust(
+                        &server_id,
+                        format!(
+                            "第 {attempt} 次崩溃后发现可执行文件已变化（批准 {}，实际 {}）：未重启，需重新审查",
+                            short_sha(&approved),
+                            short_sha(&actual)
+                        ),
+                    )
+                    .await;
+                return;
+            }
+            Err(error) => {
+                runtime
+                    .mark_degraded(
+                        &server_id,
+                        format!(
+                            "第 {attempt} 次自动重启失败：{error}；不再自动重启（上一次失败：{}）",
+                            first_line(&report)
+                        ),
+                    )
+                    .await;
+                return;
+            }
+        }
+    }
+}
+
+fn first_line(text: &str) -> String {
+    let line = text.lines().next().unwrap_or("").trim();
+    let mut truncated: String = line.chars().take(200).collect();
+    if truncated.is_empty() {
+        truncated = "无输出".to_string();
+    }
+    truncated
 }
 
 /// 服务器状态视图（`mcp_list_servers` 用）。
