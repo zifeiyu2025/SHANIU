@@ -8,6 +8,7 @@
 //!
 //! 每个任务 = 若干 turn；turn 内无工具调用即任务完成（completed）。
 
+pub mod anomaly;
 pub mod budget;
 pub mod instance;
 pub mod prompt;
@@ -419,6 +420,8 @@ impl AgentLoop {
         let read_registry = Arc::new(crate::tool_router::ReadRegistry::new());
         // SH-125：失败自愈状态机（每任务一份，跨 turn 累积重试次数与错误签名）。
         let mut repair = repair::RepairController::new(repair::DEFAULT_REPAIR_ATTEMPTS);
+        // SH-122：空转检测（连续相同工具 + 相同参数），跨 turn 累计连续计数。
+        let mut anomaly = anomaly::AnomalyGuard::new();
         let mut reason = TurnEndReasonLocal::Completed;
         let mut last_turn = 0u32;
         // 最近一次端点报回的上下文规模，作为压缩判据的观测侧（SH-032）。
@@ -653,6 +656,15 @@ impl AgentLoop {
             }
 
             // 6) 工具调用入历史 → 执行 → 输出回填
+            // SH-122：先按派发顺序过一遍空转检测（同一工具 + 规范化参数连续第 4 次），
+            // 提醒在工具输出之后以独立 System 条目注入，每轮最多 3 条。
+            anomaly.begin_turn();
+            let mut anomaly_reminders: Vec<String> = Vec::new();
+            for (name, arguments, _) in &calls {
+                if let Some(reminder) = anomaly.observe(name, arguments) {
+                    anomaly_reminders.push(reminder);
+                }
+            }
             for (name, arguments, call_id) in &calls {
                 history.push(HistoryItem::FunctionCall {
                     name: name.clone(),
@@ -838,6 +850,14 @@ impl AgentLoop {
                         reasoning: None,
                     });
                 }
+            }
+            // SH-122：空转提醒排在全部工具输出之后，作为独立上下文条目交给下一轮模型。
+            for reminder in anomaly_reminders {
+                history.push(HistoryItem::Message {
+                    role: Role::System,
+                    text: reminder,
+                    reasoning: None,
+                });
             }
             // 轮末落盘：崩溃只丢当前轮，之前各轮的档案已经 flush 到位
             self.flush_history(rollout, &sink, history, recorded);
@@ -1460,6 +1480,106 @@ mod tests {
             })
             .expect("命令失败后必须注入修复提醒");
         assert!(reminder.contains("src/lib.rs:4:18"), "{reminder}");
+    }
+
+    /// SH-122 接线：连续第 4 次相同调用后，下一轮请求里必须多出一条独立 System 提醒。
+    #[tokio::test]
+    async fn repeated_identical_calls_inject_anomaly_reminder() {
+        struct RecordingBackend {
+            seen: Arc<Mutex<Vec<Vec<HistoryItem>>>>,
+            script: Mutex<VecDeque<Vec<ModelStreamEvent>>>,
+        }
+        #[async_trait::async_trait]
+        impl ModelBackend for RecordingBackend {
+            async fn stream(
+                &self,
+                history: &[HistoryItem],
+                _tools: &[ToolDeclaration],
+                _instructions: &str,
+            ) -> Result<ModelStream, String> {
+                self.seen.lock().unwrap().push(history.to_vec());
+                let mut queue = self.script.lock().unwrap();
+                match queue.pop_front() {
+                    Some(script) => Ok(Box::pin(futures::stream::iter(script))),
+                    None => Ok(Box::pin(futures::stream::pending())),
+                }
+            }
+        }
+
+        let repeated = || {
+            vec![
+                ModelStreamEvent::OutputItem(ResponseItem::FunctionCall {
+                    name: "read_file".into(),
+                    arguments: r#"{"path":"a.txt"}"#.into(),
+                    call_id: format!("c{}", ulid::Ulid::generate()),
+                }),
+                usage_ev(),
+            ]
+        };
+        let seen = Arc::new(Mutex::new(Vec::new()));
+        let backend = Arc::new(RecordingBackend {
+            seen: seen.clone(),
+            script: Mutex::new(VecDeque::from(vec![
+                repeated(),
+                repeated(),
+                repeated(),
+                repeated(),
+                vec![
+                    ModelStreamEvent::OutputTextDelta { delta: "停".into() },
+                    usage_ev(),
+                ],
+            ])),
+        });
+        let mut router = ToolRouter::new();
+        router.register(Arc::new(EchoTool::default()));
+        let (_sink, store) = CapturingSink::new();
+        let agent = AgentLoop {
+            backend,
+            router: Arc::new(router),
+            broker: Arc::new(ApprovalBroker::new()),
+            plan_state: Arc::new(PlanState::new()),
+            workspace_root: std::env::temp_dir(),
+            max_turns: 6,
+            token_budget: 0,
+            tree_budget: TreeBudget::unlimited(),
+            policy: policy::SessionPolicy {
+                approval: crate::config::ApprovalMode::Ask,
+                sandbox: crate::config::SandboxMode::WorkspaceWrite,
+            },
+            rollout: None,
+            rollout_broke: std::sync::atomic::AtomicBool::new(false),
+            session_id: None,
+            jobs: None,
+            stop_hook: None,
+        };
+        let sink = Arc::new(CapturingSink(store.clone()));
+        agent
+            .run_task("随便", sink, CancellationToken::new())
+            .await;
+
+        let captured = seen.lock().unwrap();
+        assert!(captured.len() >= 5, "四次相同调用 + 收尾轮");
+        for history in captured.iter().take(4) {
+            assert!(
+                !history.iter().any(|item| matches!(
+                    item,
+                    HistoryItem::Message { text, .. } if text.contains("空转提醒")
+                )),
+                "前 3 次不应提醒"
+            );
+        }
+        let reminder = captured[4]
+            .iter()
+            .find_map(|item| match item {
+                HistoryItem::Message { role: Role::System, text, .. }
+                    if text.contains("空转提醒") =>
+                {
+                    Some(text.clone())
+                }
+                _ => None,
+            })
+            .expect("第 4 次相同调用后必须注入空转提醒");
+        assert!(reminder.contains("read_file"), "{reminder}");
     }
 
     fn make_loop_with_destructive(
