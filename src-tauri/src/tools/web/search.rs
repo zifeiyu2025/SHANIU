@@ -885,11 +885,14 @@ fn decode_entities(input: &str) -> String {
     while let Some(amp) = rest.find('&') {
         out.push_str(&rest[..amp]);
         let tail = &rest[amp..];
-        let Some(semicolon) = tail[..tail.len().min(12)].find(';') else {
+        // 分号是单字节，按字节窗口找即可；`;` 的位置一定是合法 char 边界。
+        let window = &tail.as_bytes()[..tail.len().min(12)];
+        let Some(byte_index) = window.iter().position(|byte| *byte == b';') else {
             out.push('&');
             rest = &tail[1..];
             continue;
         };
+        let semicolon = byte_index;
         let entity = &tail[1..semicolon];
         let decoded = match entity {
             "amp" => Some('&'),
@@ -1151,6 +1154,14 @@ mod tests {
     #[test]
     fn entity_decoding() {
         assert_eq!(decode_entities("a &amp; b &#39;c&#x27; &unknown;"), "a & b 'c' &unknown;");
+    }
+
+    #[test]
+    fn decode_entities_never_splits_multibyte_chars() {
+        // 回归：`&` 后跟中文时，按字节窗口找分号不能切在多字节字符中间。
+        assert_eq!(decode_entities("中文&nbsp;中文&amp;尾巴"), "中文 中文&尾巴");
+        assert_eq!(decode_entities("a&程b"), "a&程b");
+        assert_eq!(decode_entities("末尾&"), "末尾&");
     }
 
     fn response(status: u16, body: &str) -> WebResponse {
