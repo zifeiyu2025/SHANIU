@@ -181,9 +181,20 @@ vendor 了 7 个 cordis 插件，不含 hmr 与 logger-console。**理由**：�
      是惰性声明。**判断：不清理**——它属于上游清单原样移植，删除会让 vendor 同步 diff
      变大；等真正需要该清单驱动构建时再按需重建。
 
-4. **`tsconfig.json` 是类型缓存声明表，不是源码表**
+4. **`tsconfig.json` 是类型缓存声明表，不是源码表（本轮这一刀可回滚）**
    - 其中的 346 条映射指向 `node_modules/.cache/dsh-types-*` 的生成 d.ts，由
-     `tsc -b --force` 产出。本轮把未产出的 359 条剪掉；缓存目录本身不进版本库。
+     `pnpm typecheck`（`tsc -b --force`）产出；缓存目录本身不进版本库。
+   - 本轮把从未产出 d.ts 的 359 条剪掉（705 → 346）。
+   - **怎么回**：`git checkout 466192d^ -- tsconfig.json`
+     （等价：`git show 466192d^:tsconfig.json > tsconfig.json`）。
+   - **回滚后 `pnpm typecheck` 仍然通过**——已实测（2026-11-09，`tsc -b --force` 退出码 0）。
+     原因：那 359 条的目标确实不存在，但 `paths` 只在对应模块被 import 时才参与解析，
+     这些包没有任何源码引用，条目纯属惰性声明。
+   - **回滚的代价**：回到「映射在、代码不在」的常态；这 359 条不再被任何检查覆盖
+     （`src/dsh-mapping.spec.ts` 只守 `aliases.ts` 与 `tsconfig.base.json`，
+     不检查这张缓存表），下次审计又得重数一遍。
+   - 什么时候该回滚：只有当上下游工具链开始直接读这张表、或者某天这些 d.ts 真的产出时。
+     回滚本身不会让检查变红，所以"不敢动"不是理由，想留就留、想剪就剪。
 
 ## 6. 维护规则
 
