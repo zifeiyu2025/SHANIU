@@ -13,6 +13,7 @@ pub mod budget;
 pub mod instance;
 pub mod prompt;
 pub mod repair;
+pub mod rules;
 
 use std::path::PathBuf;
 use std::sync::Arc;
@@ -499,12 +500,16 @@ impl AgentLoop {
 
             // 1) 采样（流式）：取消 → drop 流 = 断开连接
             // 系统提示每轮重算（docs/04 §6.1 不变量③）：计划态与沙箱模式变化必须反映到模型
-            let instructions = prompt::system_instruction(
-                &self.workspace_root,
-                turn_policy.sandbox,
-                self.plan_state.is_active(),
-                &skill_catalog,
-            );
+            let instructions = prompt::system_instruction(&prompt::PromptContext {
+                workspace_root: &self.workspace_root,
+                sandbox: turn_policy.sandbox,
+                os: crate::sandbox::current_os_mode(),
+                plan_mode: self.plan_state.is_active(),
+                skill_catalog: &skill_catalog,
+                network_granted: crate::sandbox::network::global()
+                    .is_granted(session_id.as_deref()),
+                env: prompt::EnvironmentFacts::detect(&self.workspace_root),
+            });
             // 计划态下只向模型声明只读工具 + exit_plan_mode（ADR-003 双层防御第一层）
             let declarations = declarations_for(
                 &self.router,
