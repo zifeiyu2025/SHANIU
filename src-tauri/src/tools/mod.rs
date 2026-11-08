@@ -13,6 +13,7 @@ pub mod skill;
 pub mod terminal;
 pub mod todo;
 pub mod unified_exec;
+pub mod web;
 
 use std::sync::Arc;
 
@@ -36,4 +37,14 @@ pub fn register_builtin(router: &mut ToolRouter, plan_state: Arc<PlanState>) {
     // 这样分发层的第二道门控也能对「模型伪造工具名」生效。
     orchestrate::register(router);
     plan::register(router, plan_state);
+
+    // SH-072：web_search 内置免 key 实现。DDG 在本机网络常不可达（Cloudflare IP 可解析、
+    // TCP 443 超时），Bing 实测可达，因此默认链是 DuckDuckGo → Bing，Bing 是实际主力。
+    // 两家共用一个 WebClient：同一套 scheme/私网/逐跳重定向校验，不因「固定域名」放宽。
+    let web_client = Arc::new(web::WebClient::new());
+    let chain: Arc<dyn web::SearchProvider> = Arc::new(web::FallbackProvider::new(vec![
+        Arc::new(web::DuckDuckGo::new(web_client.clone())),
+        Arc::new(web::Bing::new(web_client)),
+    ]));
+    router.register(Arc::new(web::WebSearch::new(chain)));
 }

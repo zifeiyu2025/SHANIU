@@ -99,11 +99,15 @@
 ### D. 远端 / SSH / 网络通道未启用
 
 `ssh(/protocol/schemas)`、`ssh-helper-runtime`、`sandbox-ssh`、`subprocess-ssh`、`fs-ssh`、
-`remote-mock`、`acp`、`subagent-acp`、`webhook`、`webhook-github`、`web-deepseek-api`、
-`web-fetch-http`、`web-search-deepseek`、`browser-use(/brand)`
+`remote-mock`、`acp`、`subagent-acp`、`webhook`、`webhook-github`、`browser-use(/brand)`
 
 **依据**：`src/transport/` 只有 `tauri` 与 `mock` 两种传输，没有远端/SSH 模式。
 **理由**：没有消费者，路径不存在。
+
+**变更（SH-072，2026-11-09）**：`web-search-deepseek`、`web-fetch-http`、`web-deepseek-api`
+已从本组移出并立项，**走 Rust 侧** `src-tauri/src/tools/web/`（`web_search` 已落地，`web_fetch` 随后），
+不 vendor 上游 JS 包：`web-search-deepseek` 绑 DeepSeek 账号体系，我们未接；能力面本就在 `tool_router`。
+实现边界、失败三态、provider 扩展点与托管搜索的四条边界见 `docs/02` §4.1。
 
 ### E. 账号、模型供应、会话标题
 

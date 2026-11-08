@@ -1,0 +1,65 @@
+//! 网络工具共享层：HTTP 客户端、目标校验、不可信内容包裹。
+//!
+//! `web_search` 与 `web_fetch` 共用同一套校验与客户端，**不允许**某个工具
+//! 为了方便（例如"搜索页是固定域名"）绕过 [`client::WebClient`]。
+
+pub mod client;
+pub mod guard;
+pub mod search;
+
+pub use client::{WebClient, WebError, WebResponse};
+pub use search::{
+    Bing, DuckDuckGo, FallbackProvider, SearchError, SearchFailure, SearchHit, SearchProvider,
+    WebSearch,
+};
+
+/// 生成一次性分隔符随机数（16 字节 hex）。
+///
+/// 与 MCP 输出包裹同一思路：分隔符由本进程生成，外部网页无法预知，
+/// 因此无法伪造结束标记来"逃出"不可信区间。
+pub fn new_nonce() -> String {
+    let mut bytes = [0u8; 16];
+    getrandom::fill(&mut bytes).expect("系统熵源不可用，拒绝生成可预测的网页输出分隔符");
+    bytes.iter().map(|byte| format!("{byte:02x}")).collect()
+}
+
+/// 把外部网页内容包进不可信区间。`label` 用于区分来源（WEB_SEARCH / WEB_FETCH）。
+pub fn wrap_untrusted(label: &str, nonce: &str, body: &str) -> String {
+    format!("<<<{label}:{nonce}>>>\n{body}\nEND:{nonce}>>>")
+}
+
+/// 按字符数截断并加省略标记（不能用字节切，中文会切坏）。
+pub fn truncate_chars(text: &str, max_chars: usize) -> String {
+    if text.chars().count() <= max_chars {
+        return text.to_string();
+    }
+    let mut out: String = text.chars().take(max_chars).collect();
+    out.push('…');
+    out
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn nonce_is_hex_and_unique() {
+        let first = new_nonce();
+        let second = new_nonce();
+        assert_eq!(first.len(), 32);
+        assert!(first.chars().all(|c| c.is_ascii_hexdigit()));
+        assert_ne!(first, second);
+    }
+
+    #[test]
+    fn wrap_puts_body_between_markers() {
+        let wrapped = wrap_untrusted("WEB_FETCH", "abc", "正文");
+        assert_eq!(wrapped, "<<<WEB_FETCH:abc>>>\n正文\nEND:abc>>>");
+    }
+
+    #[test]
+    fn truncate_respects_char_boundaries() {
+        assert_eq!(truncate_chars("你好世界", 2), "你好…");
+        assert_eq!(truncate_chars("abc", 5), "abc");
+    }
+}

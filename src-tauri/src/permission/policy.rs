@@ -78,6 +78,9 @@ pub fn risk_of(tool_name: &str) -> RiskLevel {
         "todo_write" => RiskLevel::Read,
         // skill：SH-091 只读取本地 SKILL.md 正文，不写不执行；后续动作仍逐次审批。
         "skill" => RiskLevel::Read,
+        // web_search（SH-072）：只发关键词给公开搜索页，不读不写本地文件，
+        // 结果按不可信内容包裹回填。按只读档，免审批（用户已明确不新增打断点）。
+        "web_search" => RiskLevel::Read,
         "apply_patch" => RiskLevel::WriteInWorkspace,
         "unified_exec" => RiskLevel::Execute,
         // terminal（SH-070，docs/02 ADR-106）：能起任意进程且是持久会话，按执行档。
@@ -398,6 +401,8 @@ mod tests {
         assert_eq!(risk_of("search"), RiskLevel::Read);
         // todo_write（SH-108）：会话内清单不触碰工作区，永不审批
         assert_eq!(risk_of("todo_write"), RiskLevel::Read);
+        // web_search（SH-072）：只发关键词给公开搜索页，按只读档免审批
+        assert_eq!(risk_of("web_search"), RiskLevel::Read);
     }
 
     #[test]
@@ -633,6 +638,7 @@ mod tests {
         assert!(plan_mode_allows("read_file"));
         assert!(plan_mode_allows("list_dir"));
         assert!(plan_mode_allows("search"));
+        assert!(plan_mode_allows("web_search"));
         // 计划态列 todo 是上游规划工作流的形态（清单就是规划产物）
         assert!(plan_mode_allows("todo_write"));
         assert!(plan_mode_allows("exit_plan_mode"));
