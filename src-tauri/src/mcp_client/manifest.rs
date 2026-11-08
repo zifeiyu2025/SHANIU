@@ -248,6 +248,19 @@ pub fn plan_registration(server_id: &str, tools: &[RemoteTool]) -> RegistrationP
     plan
 }
 
+/// 把「容器内 `dir` 可能静默失败」写进工具描述（**只在 AppContainer 模式下调用**）。
+///
+/// 已通过的 server 里，模型仍可能让 server 或者自己用 shell 内建列目录；
+/// 容器里这类命令可能既无输出也无报错。工具描述是模型唯一一定看得到的地方，
+/// 因此在计划阶段统一追加一条，不额外新增工具、不改协议。
+pub fn append_container_hint(plan: &mut RegistrationPlan) {
+    const HINT: &str = "\n\n[SHANIU 沙箱] 该 server 运行在 AppContainer 内：\
+                        列目录请使用文件类工具，不要依赖 shell 内建的 `dir`（容器里可能无输出）。";
+    for tool in &mut plan.accepted {
+        tool.spec.description.push_str(HINT);
+    }
+}
+
 /// 原始工具名 → slug：NFKC → 小写 → 非 `[a-z0-9_]` 映射 `_` → 折叠连续下划线 → 去首尾。
 pub fn slugify(raw_name: &str) -> String {
     let folded: String = raw_name.nfkc().collect();
@@ -347,6 +360,25 @@ mod tests {
             input_schema: json!({"type": "object", "properties": {}}),
             annotations: None,
         }
+    }
+
+    #[test]
+    fn container_hint_is_appended_only_to_accepted_tools() {
+        let mut plan = plan_registration("srv", &[tool("read_file", "read a file")]);
+        append_container_hint(&mut plan);
+        let accepted = &plan.accepted[0].spec.description;
+        assert!(accepted.starts_with("read a file"));
+        assert!(accepted.contains("dir"), "提示必须点名 dir: {accepted}");
+        assert!(accepted.contains("AppContainer"));
+        // 被注入检测拒绝的工具不会出现给模型，也不该被改写（这里直接构造一条）。
+        plan.rejected.push(RejectedTool {
+            raw_name: "bad".into(),
+            reason: RejectReason::EmptyName,
+        });
+        let before: Vec<usize> = plan.rejected.iter().map(|tool| tool.raw_name.len()).collect();
+        append_container_hint(&mut plan);
+        let after: Vec<usize> = plan.rejected.iter().map(|tool| tool.raw_name.len()).collect();
+        assert_eq!(before, after, "拒绝清单不受提示影响");
     }
 
     #[test]

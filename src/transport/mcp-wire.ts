@@ -63,6 +63,20 @@ export interface ExemptionWire {
   readonly granted_at_ms: number
 }
 
+/** 一个 server 的沙箱口径（与状态条、日志同源，后端只算一次）。 */
+export interface SandboxSummaryWire {
+  /** `app_container` | `logical` | `unsandboxed` */
+  readonly kind: string
+  /** 容器 profile 名（仅 app_container 非空）。 */
+  readonly profile?: string
+  /** 工作区授权档位：`read` | `write`；unsandboxed 为空。 */
+  readonly workspace?: string
+  /** 额外目录授权摘要，形如 `读：D:\data`。 */
+  readonly allowed_roots?: readonly string[]
+  /** `allowed` | `denied` | `not_isolated`（逻辑沙箱没有 OS 网络隔离）。 */
+  readonly network: string
+}
+
 /** 首连审查（也是信任状态查询）的完整载荷。 */
 export interface ReviewPayloadWire {
   readonly server_id: string
@@ -94,6 +108,8 @@ export interface ReviewPayloadWire {
   readonly exemptions: readonly ExemptionWire[]
   /** 指纹覆盖范围：`interpreter_only` 或 `module_tree`（解释器 + 模块代码树）。 */
   readonly coverage?: CoverageWire
+  /** 沙箱口径（与状态条、日志同源）。 */
+  readonly sandbox?: SandboxSummaryWire
   readonly warnings: readonly string[]
   readonly reason?: string
 }

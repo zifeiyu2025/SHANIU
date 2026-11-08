@@ -96,9 +96,12 @@ export function SandboxStatusBar({ t, wire = DEFAULT_WIRE }: SandboxStatusBarPro
   useEffect(() => { refresh() }, [refresh])
 
   const logical = status !== null && !status.os_enabled
-  const networkText = grants.length === 0
-    ? t('network.denied')
-    : t('network.grantedSessions', { sessions: grants.map((grant) => shortId(grant.session_id)).join('、') })
+  // 逻辑沙箱没有 OS 级网络拦截：授权记录仍在，但实际可达性不变，不能显示「已断/已放行」。
+  const networkText = logical
+    ? t('network.notEffective')
+    : grants.length === 0
+      ? t('network.denied')
+      : t('network.grantedSessions', { sessions: grants.map((grant) => shortId(grant.session_id)).join('、') })
 
   return (
     <div

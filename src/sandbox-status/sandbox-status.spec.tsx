@@ -135,6 +135,8 @@ describe('src/sandbox-status：常驻状态呈现', () => {
     expect(warning.closest('.shaniu-sandbox-bar-warning')).toBeTruthy()
     expect(document.querySelector('.shaniu-sandbox-bar')?.getAttribute('data-os')).toBe('logical')
     expect(document.body.textContent).not.toContain('Shaniu.Sandbox.v1')
+    // 网络在逻辑沙箱下没有 OS 拦截：状态条不能说「已断（默认拒绝）」。
+    expect(screen.getByText(zh['network.notEffective'])).toBeTruthy()
   })
 
   it('已放行时状态条列出被放行的会话，撤销后从列表消失', async () => {
@@ -182,6 +184,17 @@ describe('src/sandbox-status：会话级网络开关', () => {
     await waitFor(() => expect(wire.revoked).toEqual([SESSION]))
     await waitFor(() => expect(getState().grants).toEqual([]))
     expect(getState().notice?.text).toBe(zh['feedback.revoked'])
+  })
+
+  it('逻辑沙箱下开关显示「未生效」并禁用，点击不产生授权', async () => {
+    const wire = fakeWire({ status: LOGICAL_STATUS })
+    render(toggleElement(wire))
+    await screen.findByLabelText(zh['network.notEffective'])
+
+    const button = screen.getByRole('button') as HTMLButtonElement
+    expect(button.disabled).toBe(true)
+    fireEvent.click(button)
+    expect(wire.granted).toEqual([])
   })
 
   it('后端说"本来就没有授权"时不假装撤销成功', async () => {

@@ -164,6 +164,104 @@ impl CoverageView {
     }
 }
 
+/// 一个 server 的沙箱口径（状态条 / 审查页 / 日志共用同一份事实）。
+///
+/// 为什么要结构体而不是三处各写文案：逻辑沙箱下「网络：拒绝」是**假事实**——
+/// 没有 OS 网络隔离，开关根本不生效。三处必须用同一个 `network` 状态，否则
+/// 状态条说已断、审查页说未生效、日志说允许，用户没法判断。
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, Default)]
+pub struct SandboxSummary {
+    /// `app_container` | `logical` | `unsandboxed`
+    pub kind: String,
+    /// 容器 profile 名（仅 `app_container` 非空）。
+    #[serde(default)]
+    pub profile: String,
+    /// 工作区授权档位：`read` | `write`；`unsandboxed` 为空。
+    #[serde(default)]
+    pub workspace: String,
+    /// 额外目录授权摘要，形如 `读：D:\data`。
+    #[serde(default)]
+    pub allowed_roots: Vec<String>,
+    /// `allowed` | `denied` | `not_isolated`。
+    pub network: String,
+}
+
+impl SandboxSummary {
+    /// 单行描述：日志与界面标题共用，避免三处措辞漂移。
+    pub fn line(&self) -> String {
+        let mut text = match self.kind.as_str() {
+            "app_container" => format!("AppContainer（profile {}）", self.profile),
+            "logical" => "逻辑沙箱（仅受限令牌 + Job，无路径级写入边界）".to_string(),
+            _ => "未沙箱（逐服务器显式豁免）".to_string(),
+        };
+        if !self.workspace.is_empty() {
+            text.push_str(if self.workspace == "write" {
+                "；工作区可写"
+            } else {
+                "；工作区只读"
+            });
+        }
+        if !self.allowed_roots.is_empty() {
+            text.push_str(&format!("；额外目录：{}", self.allowed_roots.join("、")));
+        }
+        text.push_str("；网络：");
+        text.push_str(match self.network.as_str() {
+            "allowed" => "允许",
+            "not_isolated" => "未生效（无 OS 隔离）",
+            _ => "拒绝",
+        });
+        text
+    }
+}
+
+/// 由配置 + 当前 OS 机制推导口径（纯函数，三处调用方共用）。
+fn sandbox_summary(config: &McpServerConfig, os: crate::config::OsSandbox) -> SandboxSummary {
+    if config.unsandboxed {
+        return SandboxSummary {
+            kind: "unsandboxed".to_string(),
+            profile: String::new(),
+            workspace: String::new(),
+            allowed_roots: Vec::new(),
+            // 显式豁免意味着不做任何网络限制：如实写，不冒充「允许」。
+            network: "not_isolated".to_string(),
+        };
+    }
+    let workspace = match config.workspace_access {
+        crate::config::WorkspaceAccess::Read => "read",
+        crate::config::WorkspaceAccess::Write => "write",
+    }
+    .to_string();
+    let allowed_roots: Vec<String> = config
+        .allowed_roots
+        .iter()
+        .map(|root| {
+            let label = match root.access {
+                crate::config::WorkspaceAccess::Read => "读",
+                crate::config::WorkspaceAccess::Write => "写",
+            };
+            format!("{label}：{}", root.path.trim())
+        })
+        .collect();
+    match os {
+        crate::config::OsSandbox::AppContainer => SandboxSummary {
+            kind: "app_container".to_string(),
+            profile: crate::sandbox::appcontainer::mcp_profile_name(&config.id)
+                .unwrap_or_default(),
+            workspace,
+            allowed_roots,
+            network: if config.allow_network { "allowed" } else { "denied" }.to_string(),
+        },
+        crate::config::OsSandbox::Logical => SandboxSummary {
+            kind: "logical".to_string(),
+            profile: String::new(),
+            workspace,
+            allowed_roots,
+            // 逻辑沙箱没有 OS 网络隔离：`allow_network` 开关不生效。
+            network: "not_isolated".to_string(),
+        },
+    }
+}
+
 /// 一次首连审查（也是信任状态查询）的完整载荷。
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct ReviewPayload {
@@ -201,6 +299,9 @@ pub struct ReviewPayload {
     /// 指纹覆盖范围（解释器 / 解释器 + 模块代码树）。
     #[serde(default)]
     pub coverage: CoverageView,
+    /// 沙箱口径（与状态条、日志同源）。
+    #[serde(default)]
+    pub sandbox: SandboxSummary,
     pub warnings: Vec<String>,
     #[serde(default)]
     pub reason: Option<String>,
@@ -521,7 +622,22 @@ impl McpRuntime {
             .await
             .map_err(|error| format!("读取工具清单失败: {error}"))?;
 
-        let plan = manifest::plan_registration(&config.id, &remote_tools);
+        let mut plan = manifest::plan_registration(&config.id, &remote_tools);
+        // 容器里 `dir` 之类的 shell 内建可能没有输出，也不一定会报错（静默失败）。
+        // 只在这种情况下把「用文件工具而不是 dir」写进工具描述，让模型别踩。
+        if !config.unsandboxed
+            && sandbox_mode == SandboxMode::WorkspaceWrite
+            && crate::sandbox::current_os_mode() == crate::config::OsSandbox::AppContainer
+        {
+            manifest::append_container_hint(&mut plan);
+        }
+        // 沙箱口径只在这里算一次：日志、审查页、后续状态都用同一份。
+        let sandbox = sandbox_summary(config, crate::sandbox::current_os_mode());
+        tracing::info!(
+            server_id = %config.id,
+            sandbox = %sandbox.line(),
+            "MCP server 沙箱口径"
+        );
         let dispatch_names: Vec<String> = plan
             .accepted
             .iter()
@@ -922,6 +1038,7 @@ impl McpRuntime {
             approved_tools: Vec::new(),
             exemptions: record.exemptions.clone(),
             coverage: CoverageView::from_digest(record.input.module_tree.as_ref()),
+            sandbox: sandbox_summary(config, crate::sandbox::current_os_mode()),
             warnings: vec![
                 "可执行文件或模块代码在两次批准之间发生了变化：本次没有启动进程，也没有注册任何工具。"
                     .to_string(),
@@ -1601,6 +1718,7 @@ impl McpRuntime {
             approved_tools,
             exemptions,
             coverage: CoverageView::from_digest(input.module_tree.as_ref()),
+            sandbox: sandbox_summary(config, crate::sandbox::current_os_mode()),
             warnings,
             reason: record.and_then(|record| record.reason.clone()),
         }
@@ -1831,5 +1949,58 @@ mod tests {
             );
             assert_eq!(status.as_str(), expected);
         }
+    }
+
+    fn config_for_summary(unsandboxed: bool, allow_network: bool) -> McpServerConfig {
+        McpServerConfig {
+            id: "srv".into(),
+            command: "node".into(),
+            allow_network,
+            unsandboxed,
+            unsandboxed_reason: if unsandboxed { "用户信任本机脚本".into() } else { String::new() },
+            workspace_access: crate::config::WorkspaceAccess::Write,
+            allowed_roots: vec![crate::config::AllowedRoot {
+                path: r"D:\data".into(),
+                access: crate::config::WorkspaceAccess::Read,
+            }],
+            ..McpServerConfig::default()
+        }
+    }
+
+    /// 三处（状态条/审查页/日志）共用的口径：逻辑模式必须如实说「网络未生效」，
+    /// 不能被 `allow_network=false` 粉饰成「已拒绝」。
+    #[test]
+    fn sandbox_summary_is_same_fact_for_all_surfaces() {
+        let config = config_for_summary(false, false);
+        let container = sandbox_summary(&config, crate::config::OsSandbox::AppContainer);
+        assert_eq!(container.kind, "app_container");
+        assert_eq!(container.profile, "shaniu.mcp.srv");
+        assert_eq!(container.workspace, "write");
+        assert_eq!(container.allowed_roots, vec!["读：D:\\data".to_string()]);
+        assert_eq!(container.network, "denied");
+
+        let logical = sandbox_summary(&config, crate::config::OsSandbox::Logical);
+        assert_eq!(logical.kind, "logical");
+        assert_eq!(logical.profile, "");
+        assert_eq!(logical.network, "not_isolated");
+        assert!(logical.line().contains("未生效"), "逻辑模式必须写明网络开关不生效");
+        assert!(logical.line().contains("无路径级写入边界"));
+
+        let unsandboxed =
+            sandbox_summary(&config_for_summary(true, true), crate::config::OsSandbox::AppContainer);
+        assert_eq!(unsandboxed.kind, "unsandboxed");
+        assert_eq!(unsandboxed.network, "not_isolated");
+
+        // 序列化字段与前端镜像一致（snake_case、可选字段有默认值）。
+        let json = serde_json::to_value(&container).unwrap();
+        assert_eq!(json["kind"], "app_container");
+        assert_eq!(json["allowed_roots"][0], "读：D:\\data");
+        let parsed: SandboxSummary = serde_json::from_value(serde_json::json!({
+            "kind": "logical",
+            "network": "not_isolated"
+        }))
+        .unwrap();
+        assert_eq!(parsed.profile, "");
+        assert!(parsed.allowed_roots.is_empty());
     }
 }

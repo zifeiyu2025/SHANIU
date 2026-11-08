@@ -9,6 +9,7 @@ use shaniu_lib::events::RiskLevel;
 use shaniu_lib::mcp_client::guard::{Exemption, RuleId};
 use shaniu_lib::mcp_client::runtime::{
     ApprovedToolView, CoverageView, GuardHitView, McpEvent, McpStatus, ReviewPayload, ReviewTool,
+    SandboxSummary,
 };
 
 /// 与 `src/transport/mcp-wire.ts` 的 `McpEventWire` 字面量逐一对应。
@@ -72,6 +73,13 @@ fn review_payload() -> ReviewPayload {
         coverage: CoverageView {
             kind: "module_tree".into(),
             detail: "已覆盖：解释器 + 模块 pkg 的代码树".into(),
+        },
+        sandbox: SandboxSummary {
+            kind: "app_container".into(),
+            profile: "shaniu.mcp.srv".into(),
+            workspace: "write".into(),
+            allowed_roots: vec!["读：D:\\data".into()],
+            network: "denied".into(),
         },
         warnings: vec!["unsandboxed".into()],
         reason: Some("首次连接".into()),

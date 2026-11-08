@@ -587,6 +587,39 @@ function ReviewPanel({
           </Tag>
           <span className="mcp-connector-note"> {payload.coverage?.detail ?? t('coverage.interpreterOnlyDetail')}</span>
         </dd>
+        {payload.sandbox && (
+          <>
+            <dt>{t('sandbox')}</dt>
+            <dd>
+              <Tag
+                tone={
+                  payload.sandbox.kind === 'app_container'
+                    ? 'success'
+                    : payload.sandbox.kind === 'logical'
+                      ? 'warning'
+                      : 'danger'
+                }
+              >
+                {t(
+                  payload.sandbox.kind === 'app_container'
+                    ? 'sandbox.appContainer'
+                    : payload.sandbox.kind === 'logical'
+                      ? 'sandbox.logical'
+                      : 'sandbox.unsandboxed',
+                )}
+              </Tag>
+              <span className="mcp-connector-note">
+                {payload.sandbox.profile ? ` ${payload.sandbox.profile}` : ''}
+                {payload.sandbox.workspace
+                  ? ` · ${t(payload.sandbox.workspace === 'write' ? 'sandbox.workspaceWrite' : 'sandbox.workspaceRead')}`
+                  : ''}
+                {(payload.sandbox.allowed_roots?.length ?? 0) > 0
+                  ? ` · ${t('sandbox.extraRoots')}：${payload.sandbox.allowed_roots?.join('、')}`
+                  : ''}
+              </span>
+            </dd>
+          </>
+        )}
         <dt>{t('executable')}</dt>
         <dd><PathLabel path={payload.executable} /></dd>
         <dt>{t('argv')}</dt>
@@ -602,7 +635,13 @@ function ReviewPanel({
         <dt>{t('env')}</dt>
         <dd className="mcp-connector-mono">{payload.env.length > 0 ? payload.env.join(' · ') : '—'}</dd>
         <dt>{t('network')}</dt>
-        <dd>{payload.allow_network ? t('allowed') : t('notAllowed')}</dd>
+        <dd>
+          {payload.sandbox?.network === 'not_isolated'
+            ? t('sandbox.networkNotIsolated')
+            : payload.allow_network
+              ? t('allowed')
+              : t('notAllowed')}
+        </dd>
         <dt>{t('approvedAt')}</dt>
         <dd>{formatTime(payload.approved_at_ms)}</dd>
       </dl>

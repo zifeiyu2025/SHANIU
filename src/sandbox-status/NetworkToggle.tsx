@@ -9,7 +9,7 @@
  * 按钮本身只做两件事：批准 / 撤销一次会话级授权，并把结果写进共享状态，
  * 让底部状态条同一刻跟着变（两边看到同一份授权列表）。
  */
-import { useCallback, useState, type ReactNode } from 'react'
+import { useCallback, useEffect, useState, type ReactNode } from 'react'
 import type { PropsLocale, PropsRuntime } from '@deepseek-ai/dsh-client-ui-slots'
 import type {} from '@deepseek-ai/dsh-client-ui-conversation/client'
 import { Button, IconGlobeOutlineRegular, Tooltip } from '@deepseek-ai/dsh-client-ui-primitives'
@@ -37,6 +37,22 @@ export function NetworkToggle({ sessionId, t, wire = DEFAULT_WIRE }: NetworkTogg
   const [pending, setPending] = useState(false)
   const granted = grants.some((grant) => grant.session_id === String(sessionId))
 
+  /**
+   * 逻辑沙箱下没有 OS 级网络拦截，放行与撤销都不改变实际可达性：
+   * 这里必须显示「未生效」并禁用，而不是让用户以为点一下就能开通（Q4）。
+   * 读取失败保持原来的可用状态——失败提示由常驻状态条负责，不在这里重复。
+   */
+  const [osEnabled, setOsEnabled] = useState<boolean | null>(null)
+  useEffect(() => {
+    let live = true
+    wire.status().then(
+      (next) => { if (live) setOsEnabled(next.os_enabled) },
+      () => { if (live) setOsEnabled(null) },
+    )
+    return () => { live = false }
+  }, [wire])
+  const notEffective = osEnabled === false
+
   const toggle = useCallback(async () => {
     setPending(true)
     setNotice(null)
@@ -62,9 +78,11 @@ export function NetworkToggle({ sessionId, t, wire = DEFAULT_WIRE }: NetworkTogg
     }
   }, [granted, sessionId, t, wire])
 
-  const label = pending
-    ? t(granted ? 'action.revoking' : 'action.granting')
-    : t(granted ? 'action.revokeTooltip' : 'action.grantTooltip')
+  const label = notEffective
+    ? t('network.notEffective')
+    : pending
+      ? t(granted ? 'action.revoking' : 'action.granting')
+      : t(granted ? 'action.revokeTooltip' : 'action.grantTooltip')
 
   return (
     <Tooltip label={label} side="bottom" align="end" portal>
@@ -74,7 +92,8 @@ export function NetworkToggle({ sessionId, t, wire = DEFAULT_WIRE }: NetworkTogg
         aria-label={label}
         aria-pressed={granted}
         data-granted={granted ? 'true' : 'false'}
-        disabled={pending}
+        data-effective={notEffective ? 'false' : 'true'}
+        disabled={pending || notEffective}
         icon={<IconGlobeOutlineRegular />}
         onClick={() => { void toggle() }}
       />
