@@ -531,6 +531,143 @@ async fn evals_baseline_v0() {
     );
 }
 
+// ============================== SH-125 真机自愈样本 ==============================
+
+/// 在 workspace 里跑 `cargo test`，返回（是否通过，stdout+stderr）。
+fn run_cargo_test(ws: &Path) -> (bool, String) {
+    let output = std::process::Command::new("cargo")
+        .args(["test", "--offline", "--quiet"])
+        .current_dir(ws)
+        .output()
+        .expect("真机样本依赖本机 Rust 工具链（cargo 不在 PATH）");
+    let mut text = String::from_utf8_lossy(&output.stdout).to_string();
+    text.push_str(&String::from_utf8_lossy(&output.stderr));
+    (output.status.success(), text)
+}
+
+/// 注入两个真实缺陷：一个编译错误（E0308）+ 一个逻辑错误（减法/期望和）。
+/// 修好编译错误后测试仍会红，因此必须跑完两轮自愈才算闭环。
+const BROKEN_LIB: &str = r#"pub fn add(a: i32, b: i32) -> i32 {
+    let total: i32 = "not a number";
+    let _ = total;
+    a - b
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn adds_two_numbers() {
+        assert_eq!(add(2, 3), 5);
+    }
+}
+"#;
+
+/// SH-125④：真机样本——向真实 Rust 工程注入编译错误，自愈闭环修到 `cargo test` 绿。
+#[tokio::test]
+#[ignore = "SH-125 真机自愈样本需要真实端点密钥与本机 Rust 工具链"]
+async fn repair_loop_fixes_broken_rust_project_until_cargo_test_green() {
+    let api_key = match std::env::var("SHANIU_TEST_API_KEY") {
+        Ok(key) if !key.trim().is_empty() => key,
+        _ => {
+            println!("[repair] 跳过：未设置 SHANIU_TEST_API_KEY（密钥只从环境变量读）");
+            return;
+        }
+    };
+    let provider = ProviderConfig {
+        provider: std::env::var("SHANIU_TEST_PROVIDER").unwrap_or_else(|_| "openai-chat".into()),
+        base_url: std::env::var("SHANIU_TEST_BASE_URL")
+            .unwrap_or_else(|_| "https://api.deepseek.com/v1".into()),
+        model: std::env::var("SHANIU_TEST_MODEL").unwrap_or_else(|_| "deepseek-flash".into()),
+        reasoning_effort: None,
+        headers: Default::default(),
+    };
+    let backend = Arc::new(ResponsesBackend { provider, api_key });
+
+    let ws = repo_root().join("target").join(format!(
+        "repair-eval-{}-{}",
+        id(),
+        SEQ.fetch_add(1, Ordering::SeqCst)
+    ));
+    std::fs::create_dir_all(ws.join("src")).unwrap();
+    std::fs::write(
+        ws.join("Cargo.toml"),
+        "[package]\nname = \"shaniu_repair_demo\"\nversion = \"0.1.0\"\nedition = \"2021\"\n\n[dependencies]\n",
+    )
+    .unwrap();
+    std::fs::write(ws.join("src/lib.rs"), BROKEN_LIB).unwrap();
+    // 前置断言：注入后的工程确实是红的（不是"本来就能过"）
+    let (green_before, before_text) = run_cargo_test(&ws);
+    assert!(!green_before, "注入后必须先是红的：{before_text}");
+
+    let plan_state = Arc::new(PlanState::new());
+    let mut router = ToolRouter::new();
+    tools::register_builtin(&mut router, plan_state.clone());
+    let broker = Arc::new(ApprovalBroker::new());
+    let sink = Arc::new(EvalSink {
+        agg: Mutex::new(Agg::default()),
+        broker: broker.clone(),
+    });
+    let agent = AgentLoop {
+        backend,
+        router: Arc::new(router),
+        broker: broker.clone(),
+        plan_state,
+        workspace_root: ws.clone(),
+        max_turns: 8,
+        token_budget: 0,
+        tree_budget: Default::default(),
+        policy: policy::SessionPolicy {
+            approval: ApprovalMode::AutoReadOnly,
+            sandbox: SandboxMode::WorkspaceWrite,
+        },
+        rollout: None,
+        rollout_broke: std::sync::atomic::AtomicBool::new(false),
+        session_id: None,
+        jobs: None,
+        stop_hook: None,
+    };
+    let prompt = "这台机器上的 Rust 工程 `cargo test` 不通过。请运行 `cargo test`，读取错误输出，\
+                  修复 src/lib.rs 里的问题，直到 `cargo test` 全部通过。不要修改测试断言。";
+    let started = Instant::now();
+    let summary = tokio::time::timeout(
+        Duration::from_secs(300),
+        agent.run_task(prompt, sink.clone(), CancellationToken::new()),
+    )
+    .await;
+    let ms = started.elapsed().as_millis();
+    let (turns, reason) = match &summary {
+        Ok(s) => (s.turns, format!("{:?}", s.reason)),
+        Err(_) => (8, "超时（>300s）".to_string()),
+    };
+
+    let (green_after, after_text) = run_cargo_test(&ws);
+    let source = std::fs::read_to_string(ws.join("src/lib.rs")).unwrap_or_default();
+    let agg = sink.agg.lock().unwrap();
+    println!(
+        "[repair] turns={turns} calls={} 审批={} 耗时={ms}ms 收口={reason}",
+        agg.tool_calls, agg.approvals
+    );
+    for line in &agg.trace {
+        println!("    · {line}");
+    }
+    println!("[repair] 修复后 cargo test:\n{after_text}");
+    assert!(
+        green_after,
+        "自愈闭环没有修到 cargo test 绿（turns={turns} 收口={reason}）"
+    );
+    assert!(
+        source.contains("assert_eq!(add(2, 3), 5)"),
+        "不得修改测试断言来冒充成功：{source}"
+    );
+    assert!(
+        source.contains("a + b") || source.contains("a+b"),
+        "逻辑错误应由模型修复，而不是硬编码返回值：{source}"
+    );
+    std::fs::remove_dir_all(&ws).ok();
+}
+
 /// 中位数（1 个样本时就是它自己）。偶数个样本取中间两个的均值。
 fn median(values: &[f64]) -> f64 {
     let mut sorted = values.to_vec();

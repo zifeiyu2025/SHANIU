@@ -11,6 +11,7 @@
 pub mod budget;
 pub mod instance;
 pub mod prompt;
+pub mod repair;
 
 use std::path::PathBuf;
 use std::sync::Arc;
@@ -416,6 +417,8 @@ impl AgentLoop {
         let session_id = session_id.clone().or_else(|| self.session_id.clone());
         // SH-124：本次任务共享一份读状态登记表——read_file 记录，写工具落盘前校验。
         let read_registry = Arc::new(crate::tool_router::ReadRegistry::new());
+        // SH-125：失败自愈状态机（每任务一份，跨 turn 累积重试次数与错误签名）。
+        let mut repair = repair::RepairController::new(repair::DEFAULT_REPAIR_ATTEMPTS);
         let mut reason = TurnEndReasonLocal::Completed;
         let mut last_turn = 0u32;
         // 最近一次端点报回的上下文规模，作为压缩判据的观测侧（SH-032）。
@@ -817,8 +820,24 @@ impl AgentLoop {
                 };
                 history.push(HistoryItem::FunctionCallOutput {
                     call_id: call_id.clone(),
-                    output: output_text,
+                    output: output_text.clone(),
                 });
+                // SH-125：命令失败 → 提取「文件:行」→ 下一轮以独立 System 条目提示
+                // 模型读错、修复、重跑；达到上限或同一错误重复则明示放弃（不伪造成功）。
+                let succeeded = match &result {
+                    Ok(out) => out.success,
+                    Err(_) => false,
+                };
+                if let Some(action) = repair.observe(name, succeeded, &output_text) {
+                    let text = match action {
+                        repair::RepairAction::Nudge(text) | repair::RepairAction::GiveUp(text) => text,
+                    };
+                    history.push(HistoryItem::Message {
+                        role: Role::System,
+                        text,
+                        reasoning: None,
+                    });
+                }
             }
             // 轮末落盘：崩溃只丢当前轮，之前各轮的档案已经 flush 到位
             self.flush_history(rollout, &sink, history, recorded);
@@ -1320,6 +1339,127 @@ mod tests {
             EventMsg::ToolCallEnd { call_id, error: Some(msg), result: Some(ToolCallResult::Denied), .. }
                 if call_id == "c7" && msg.contains("用户拒绝")
         )));
+    }
+
+    /// SH-125 接线：命令工具失败后，下一轮请求里必须多出一条带「文件:行」的 System 提醒。
+    #[tokio::test]
+    async fn command_failure_injects_repair_reminder_with_file_line() {
+        struct FailingExec {
+            spec: ToolSpec,
+        }
+        impl Default for FailingExec {
+            fn default() -> Self {
+                Self {
+                    spec: ToolSpec::new(
+                        "unified_exec",
+                        "假命令",
+                        serde_json::json!({"type":"object"}),
+                    ),
+                }
+            }
+        }
+        #[async_trait::async_trait]
+        impl ToolExecutor for FailingExec {
+            fn spec(&self) -> &ToolSpec {
+                &self.spec
+            }
+            async fn execute(&self, _args: Value, _ctx: &ToolContext) -> Result<ToolOutput, ToolError> {
+                Ok(ToolOutput::fail(
+                    "error[E0308]: mismatched types\n --> src/lib.rs:4:18\n expected `i32`",
+                ))
+            }
+        }
+
+        struct RecordingBackend {
+            seen: Arc<Mutex<Vec<Vec<HistoryItem>>>>,
+            script: Mutex<VecDeque<Vec<ModelStreamEvent>>>,
+        }
+        #[async_trait::async_trait]
+        impl ModelBackend for RecordingBackend {
+            async fn stream(
+                &self,
+                history: &[HistoryItem],
+                _tools: &[ToolDeclaration],
+                _instructions: &str,
+            ) -> Result<ModelStream, String> {
+                self.seen.lock().unwrap().push(history.to_vec());
+                let mut queue = self.script.lock().unwrap();
+                match queue.pop_front() {
+                    Some(script) => Ok(Box::pin(futures::stream::iter(script))),
+                    None => Ok(Box::pin(futures::stream::pending())),
+                }
+            }
+        }
+
+        let seen = Arc::new(Mutex::new(Vec::new()));
+        let backend = Arc::new(RecordingBackend {
+            seen: seen.clone(),
+            script: Mutex::new(VecDeque::from(vec![
+                vec![
+                    ModelStreamEvent::OutputItem(ResponseItem::FunctionCall {
+                        name: "unified_exec".into(),
+                        arguments: "{}".into(),
+                        call_id: "c1".into(),
+                    }),
+                    usage_ev(),
+                ],
+                vec![
+                    ModelStreamEvent::OutputTextDelta { delta: "已修复".into() },
+                    usage_ev(),
+                ],
+            ])),
+        });
+        let mut router = ToolRouter::new();
+        router.register(Arc::new(FailingExec::default()));
+        let (_sink, store) = CapturingSink::new();
+        let broker = Arc::new(ApprovalBroker::new());
+        let agent = AgentLoop {
+            backend,
+            router: Arc::new(router),
+            broker: broker.clone(),
+            plan_state: Arc::new(PlanState::new()),
+            workspace_root: std::env::temp_dir(),
+            max_turns: 3,
+            token_budget: 0,
+            tree_budget: TreeBudget::unlimited(),
+            policy: policy::SessionPolicy {
+                approval: crate::config::ApprovalMode::Ask,
+                sandbox: crate::config::SandboxMode::WorkspaceWrite,
+            },
+            rollout: None,
+            rollout_broke: std::sync::atomic::AtomicBool::new(false),
+            session_id: None,
+            jobs: None,
+            stop_hook: None,
+        };
+        let sink = Arc::new(CapturingSink(store.clone()));
+        let run = tokio::spawn(async move {
+            agent.run_task("修好它", sink, CancellationToken::new()).await
+        });
+        for _ in 0..300 {
+            if broker.has_pending("appr-c1") {
+                assert!(broker.resolve("appr-c1", crate::events::ApprovalDecision::AllowAlways));
+                break;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+        }
+        let summary = run.await.unwrap();
+        assert_eq!(summary.reason, TurnEndReason::Completed);
+
+        let captured = seen.lock().unwrap();
+        assert!(captured.len() >= 2, "至少有失败轮与提醒后的重试轮");
+        let reminder = captured[1]
+            .iter()
+            .find_map(|item| match item {
+                HistoryItem::Message { role: Role::System, text, .. }
+                    if text.contains("自动修复提醒") =>
+                {
+                    Some(text.clone())
+                }
+                _ => None,
+            })
+            .expect("命令失败后必须注入修复提醒");
+        assert!(reminder.contains("src/lib.rs:4:18"), "{reminder}");
     }
 
     fn make_loop_with_destructive(
