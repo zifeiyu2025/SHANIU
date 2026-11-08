@@ -54,6 +54,111 @@ impl PlanState {
     }
 }
 
+// ============================== 读状态（SH-124） ==============================
+
+/// 文件读取戳：mtime + 内容哈希双判（SH-124②）。
+///
+/// `hashed_len` 与 `len` 分离是为了兼容 `read_file` 的截断读取——记录时只哈希了
+/// 读到的前缀，校验时也只比对同样长度的前缀。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct FileStamp {
+    pub modified: Option<std::time::SystemTime>,
+    pub len: u64,
+    pub hashed_len: u64,
+    pub hash: u64,
+}
+
+fn hash_bytes(bytes: &[u8]) -> u64 {
+    use std::hash::{Hash, Hasher};
+    let mut hasher = std::collections::hash_map::DefaultHasher::new();
+    bytes.hash(&mut hasher);
+    hasher.finish()
+}
+
+impl FileStamp {
+    /// 用「已读到的字节 + 文件元数据」构造（`bytes` 可能是截断后的前缀）。
+    pub fn of_read(bytes: &[u8], meta: &std::fs::Metadata) -> Self {
+        Self {
+            modified: meta.modified().ok(),
+            len: meta.len(),
+            hashed_len: bytes.len() as u64,
+            hash: hash_bytes(bytes),
+        }
+    }
+
+    /// 全量读取构造（写工具在自己刚写完/刚读完整文件时使用）。
+    pub fn of_full_file(path: &Path) -> std::io::Result<Self> {
+        let bytes = std::fs::read(path)?;
+        Ok(Self {
+            modified: std::fs::metadata(path).ok().and_then(|m| m.modified().ok()),
+            len: bytes.len() as u64,
+            hashed_len: bytes.len() as u64,
+            hash: hash_bytes(&bytes),
+        })
+    }
+}
+
+/// 当前内容是否仍与读取戳一致：mtime 相同走快路径，不同再比长度与哈希。
+pub fn content_matches(recorded: &FileStamp, current: &[u8], meta: &std::fs::Metadata) -> bool {
+    if current.len() as u64 != recorded.len {
+        return false;
+    }
+    if meta.modified().ok() == recorded.modified {
+        return true;
+    }
+    let limit = recorded.hashed_len.min(current.len() as u64) as usize;
+    limit as u64 == recorded.hashed_len && hash_bytes(&current[..limit]) == recorded.hash
+}
+
+/// 读状态登记表的路径键：canonicalize 后统一剥掉 Windows verbatim 前缀。
+///
+/// `resolve_in_workspace` 已经过 `shell_usable`，而写工具手里的路径是原样 join 的，
+/// 两边必须归一化到同一把键，否则「读过的文件」在写侧永远查不到。
+pub fn canonical_key(path: &Path) -> PathBuf {
+    shell_usable(&path.canonicalize().unwrap_or_else(|_| path.to_path_buf()))
+}
+
+/// 读状态登记表（会话 + 路径）——写工具在落盘前查询，防止「没读就改」与覆盖外部改动。
+///
+/// 放在共享内核而不是 `tools/*`：`read_file`（记录）与各类写工具（校验）都要用它，
+/// 未来新增写工具接同一份登记表即可（SH-124④），不需要各自造状态。
+#[derive(Debug, Default)]
+pub struct ReadRegistry {
+    entries: std::sync::Mutex<HashMap<(String, PathBuf), FileStamp>>,
+}
+
+const DEFAULT_SESSION_KEY: &str = "__no_session__";
+
+impl ReadRegistry {
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    fn key(session: Option<&str>, path: &Path) -> (String, PathBuf) {
+        (
+            session.unwrap_or(DEFAULT_SESSION_KEY).to_string(),
+            path.to_path_buf(),
+        )
+    }
+
+    fn lock(&self) -> std::sync::MutexGuard<'_, HashMap<(String, PathBuf), FileStamp>> {
+        // 登记表只存观测值；锁中毒不该让整个写路径失败。
+        self.entries.lock().unwrap_or_else(|e| e.into_inner())
+    }
+
+    pub fn record(&self, session: Option<&str>, path: &Path, stamp: FileStamp) {
+        self.lock().insert(Self::key(session, path), stamp);
+    }
+
+    pub fn get(&self, session: Option<&str>, path: &Path) -> Option<FileStamp> {
+        self.lock().get(&Self::key(session, path)).copied()
+    }
+
+    pub fn forget(&self, session: Option<&str>, path: &Path) {
+        self.lock().remove(&Self::key(session, path));
+    }
+}
+
 // ============================== 执行契约 ==============================
 
 /// 工具执行错误。`Execution` 的文本会回填给模型（风险登记册：失败自动回填）。
@@ -101,6 +206,9 @@ pub struct ToolContext {
     pub scope: Option<orchestration::AgentScope>,
     /// 编排能力（SH-052）：只有 depth=0 的 root 实例注入；子代理为 None。
     pub orchestrator: Option<Arc<dyn orchestration::AgentOrchestrator>>,
+    /// 读状态登记表（SH-124）：`read_file` 记录、写工具校验。
+    /// None = 该路径不启用写前读校验（无会话的测试装配）。
+    pub reads: Option<Arc<ReadRegistry>>,
 }
 
 impl ToolContext {
@@ -121,6 +229,7 @@ impl ToolContext {
             jobs: None,
             scope: None,
             orchestrator: None,
+            reads: None,
         }
     }
 
@@ -150,6 +259,12 @@ impl ToolContext {
     ) -> Self {
         self.session_id = session_id;
         self.jobs = jobs;
+        self
+    }
+
+    /// 注入读状态登记表（SH-124）：`read_file` 与写工具共用同一份。
+    pub fn with_reads(mut self, reads: Arc<ReadRegistry>) -> Self {
+        self.reads = Some(reads);
         self
     }
 }
@@ -675,6 +790,47 @@ mod tests {
         let ws = temp_workspace();
         let err = resolve_in_workspace(&ws, "no-such-file.txt").unwrap_err();
         assert!(matches!(err, ToolError::InvalidArgs(_)));
+        std::fs::remove_dir_all(&ws).ok();
+    }
+
+    #[test]
+    fn file_stamp_detects_same_length_content_change() {
+        let ws = temp_workspace();
+        let path = ws.join("README.md");
+        std::fs::write(&path, "abc").unwrap();
+        // 人为把 mtime 置为不同值，强制走哈希比对路径
+        let reported = FileStamp {
+            modified: Some(std::time::SystemTime::UNIX_EPOCH),
+            len: 3,
+            hashed_len: 3,
+            hash: {
+                use std::hash::{Hash, Hasher};
+                let mut h = std::collections::hash_map::DefaultHasher::new();
+                b"abc".hash(&mut h);
+                h.finish()
+            },
+        };
+        let meta = std::fs::metadata(&path).unwrap();
+        assert!(content_matches(&reported, b"abc", &meta), "内容相同应判定新鲜");
+        assert!(!content_matches(&reported, b"abd", &meta), "同长度不同内容必须判 stale");
+        assert!(!content_matches(&reported, b"abcd", &meta), "长度变化必须判 stale");
+        std::fs::remove_dir_all(&ws).ok();
+    }
+
+    #[test]
+    fn read_registry_keys_by_session_and_path() {
+        let ws = temp_workspace();
+        let path = ws.join("README.md");
+        std::fs::write(&path, "hello").unwrap();
+        let meta = std::fs::metadata(&path).unwrap();
+        let stamp = FileStamp::of_read(b"hello", &meta);
+        let registry = ReadRegistry::new();
+        registry.record(Some("s1"), &path, stamp);
+        assert!(registry.get(Some("s1"), &path).is_some());
+        assert!(registry.get(Some("s2"), &path).is_none(), "读状态必须按会话隔离");
+        assert!(registry.get(None, &path).is_none());
+        registry.forget(Some("s1"), &path);
+        assert!(registry.get(Some("s1"), &path).is_none());
         std::fs::remove_dir_all(&ws).ok();
     }
 }

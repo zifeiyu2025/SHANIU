@@ -414,6 +414,8 @@ impl AgentLoop {
         };
         // 实例没指定作业属主时沿用引擎的会话 id（root 的既有行为）。
         let session_id = session_id.clone().or_else(|| self.session_id.clone());
+        // SH-124：本次任务共享一份读状态登记表——read_file 记录，写工具落盘前校验。
+        let read_registry = Arc::new(crate::tool_router::ReadRegistry::new());
         let mut reason = TurnEndReasonLocal::Completed;
         let mut last_turn = 0u32;
         // 最近一次端点报回的上下文规模，作为压缩判据的观测侧（SH-032）。
@@ -769,6 +771,7 @@ impl AgentLoop {
                     self.policy.sandbox,
                 )
                 .with_jobs(session_id.clone(), self.jobs.clone())
+                .with_reads(read_registry.clone())
                 .with_scope(scope.clone());
                 // 只有 root（depth=0）拿到编排能力；子代理沿用 scope 但无 orchestrator，
                 // 分发层会拒绝它调用编排工具（第二层深度门控）。

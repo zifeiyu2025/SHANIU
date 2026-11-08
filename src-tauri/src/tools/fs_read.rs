@@ -81,6 +81,14 @@ impl ToolExecutor for ReadFile {
             .read_to_end(&mut buffer)
             .map_err(|e| ToolError::Execution(format!("读取失败: {e}")))?;
         let text = String::from_utf8_lossy(&buffer);
+        // SH-124①：记录读状态（会话 + 路径），写工具落盘前据此判定「没读就改」。
+        if let Some(reads) = &ctx.reads {
+            reads.record(
+                ctx.session_id.as_deref(),
+                &full,
+                crate::tool_router::FileStamp::of_read(&buffer, &meta),
+            );
+        }
         let note = if meta.len() > limit as u64 {
             format!("\n\n[已截断：文件共 {} 字节，仅显示前 {limit} 字节]", meta.len())
         } else {
@@ -318,6 +326,22 @@ mod tests {
             .await
             .unwrap();
         assert!(out.output.starts_with("hello shaniu"));
+        std::fs::remove_dir_all(&ws).ok();
+    }
+
+    #[tokio::test]
+    async fn read_file_records_state_for_writers() {
+        let ws = workspace();
+        let reads = std::sync::Arc::new(crate::tool_router::ReadRegistry::new());
+        ReadFile::new()
+            .execute(
+                serde_json::json!({"path": "README.md"}),
+                &ctx(&ws).with_reads(reads.clone()),
+            )
+            .await
+            .unwrap();
+        let canonical = crate::tool_router::canonical_key(&ws.join("README.md"));
+        assert!(reads.get(None, &canonical).is_some(), "读成功必须登记读状态");
         std::fs::remove_dir_all(&ws).ok();
     }
 

@@ -395,6 +395,62 @@ fn apply_hunk_seq(
     Ok((out, level))
 }
 
+// ============================== 写前读状态（SH-124） ==============================
+
+const STALE_EXCERPT_LINES: usize = 80;
+
+/// 冲突回填：给出文件当前内容（带行号，截断到 80 行），让模型基于真实内容重建补丁。
+fn current_excerpt(bytes: &[u8]) -> String {
+    let text = String::from_utf8_lossy(bytes);
+    let mut lines = Vec::new();
+    let mut truncated = false;
+    for (idx, line) in text.lines().enumerate() {
+        if idx >= STALE_EXCERPT_LINES {
+            truncated = true;
+            break;
+        }
+        lines.push(format!("{}| {line}", idx + 1));
+    }
+    if truncated {
+        lines.push(format!("…（仅显示前 {STALE_EXCERPT_LINES} 行）"));
+    }
+    lines.join("\n")
+}
+
+/// 写前校验：必须先读过（同会话 + 同路径），且内容没被外部改过。
+/// 返回用于写后刷新登记表的路径键（None = 未启用登记表）。
+fn verify_read_state(
+    ctx: &ToolContext,
+    path: &str,
+    full: &std::path::Path,
+    current: &[u8],
+) -> Result<Option<std::path::PathBuf>, ToolError> {
+    let Some(reads) = &ctx.reads else { return Ok(None) };
+    let key = crate::tool_router::canonical_key(full);
+    let Some(recorded) = reads.get(ctx.session_id.as_deref(), &key) else {
+        return Err(ToolError::Execution(format!(
+            "write_file_not_read: 未读取过 {path} 就尝试修改。请先用 read_file 读取当前内容，再基于真实内容生成补丁"
+        )));
+    };
+    let meta = std::fs::metadata(full)
+        .map_err(|e| ToolError::Execution(format!("读取失败: {e}")))?;
+    if !crate::tool_router::content_matches(&recorded, current, &meta) {
+        return Err(ToolError::Execution(format!(
+            "write_file_stale: {path} 在读取后被外部修改，已拒绝覆盖（本轮未写入该文件）。当前文件内容：\n{}",
+            current_excerpt(current)
+        )));
+    }
+    Ok(Some(key))
+}
+
+/// 写成功后刷新登记表：模型自此持有的是文件最新内容。
+fn refresh_read_state(ctx: &ToolContext, key: Option<std::path::PathBuf>, full: &std::path::Path) {
+    let (Some(reads), Some(key)) = (&ctx.reads, key) else { return };
+    if let Ok(stamp) = crate::tool_router::FileStamp::of_full_file(full) {
+        reads.record(ctx.session_id.as_deref(), &key, stamp);
+    }
+}
+
 // ============================== 执行 ==============================
 
 #[async_trait]
@@ -461,12 +517,21 @@ impl ToolExecutor for ApplyPatch {
                         return Err(ToolError::Execution(format!("写入失败: {path}")));
                     }
                     snapshot.insert(full.to_string_lossy().to_string(), None);
+                    refresh_read_state(
+                        ctx,
+                        Some(crate::tool_router::canonical_key(&full)),
+                        &full,
+                    );
                     summary.push(format!("+ {path}"));
                 }
                 PatchOp::Update { path, seq } => {
                     let full = resolve_for_write(&ctx.workspace_root, path)?;
                     let original =
                         std::fs::read(&full).map_err(|e| ToolError::Execution(format!("读取失败: {e}")))?;
+                    // SH-124：先读过、且内容未被外部改动，才允许修改
+                    let read_key = verify_read_state(ctx, path, &full, &original).inspect_err(|_| {
+                        rollback(&snapshot);
+                    })?;
                     let text = String::from_utf8(original.clone())
                         .map_err(|_| ToolError::Execution(format!("非 UTF-8 文本文件: {path}")))?;
                     let had_trailing_newline = text.ends_with('\n');
@@ -487,6 +552,7 @@ impl ToolExecutor for ApplyPatch {
                         return Err(ToolError::Execution(format!("写入失败: {path}")));
                     }
                     snapshot.entry(full.to_string_lossy().to_string()).or_insert(Some(original));
+                    refresh_read_state(ctx, read_key, &full);
                     summary.push(if level == MatchLevel::Exact {
                         format!("~ {path}")
                     } else {
@@ -504,11 +570,17 @@ impl ToolExecutor for ApplyPatch {
                             )));
                         }
                     };
+                    let read_key = verify_read_state(ctx, path, &full, &original).inspect_err(|_| {
+                        rollback(&snapshot);
+                    })?;
                     if std::fs::remove_file(&full).is_err() {
                         rollback(&snapshot);
                         return Err(ToolError::Execution(format!("删除失败: {path}")));
                     }
                     snapshot.insert(full.to_string_lossy().to_string(), Some(original));
+                    if let (Some(reads), Some(key)) = (&ctx.reads, read_key) {
+                        reads.forget(ctx.session_id.as_deref(), &key);
+                    }
                     summary.push(format!("- {path}"));
                 }
             }
@@ -740,6 +812,106 @@ mod tests {
             "line1\nline2\nline3\n",
             "前一个 Update 必须回滚"
         );
+        std::fs::remove_dir_all(&ws).ok();
+    }
+
+    // ---------- SH-124 写前读状态 + stale 检测 ----------
+
+    fn ctx_with_reads(ws: &Path, reads: Arc<crate::tool_router::ReadRegistry>) -> ToolContext {
+        ctx(ws).with_reads(reads)
+    }
+
+    #[tokio::test]
+    async fn update_without_read_is_rejected() {
+        let ws = workspace();
+        let reads = Arc::new(crate::tool_router::ReadRegistry::new());
+        let patch = "*** Begin Patch\n*** Update File: a.txt\n line1\n-line2\n+改过\n line3\n*** End Patch";
+        let err = ApplyPatch::new()
+            .execute(serde_json::json!({"patch": patch}), &ctx_with_reads(&ws, reads))
+            .await
+            .unwrap_err();
+        assert!(err.to_string().contains("write_file_not_read"), "{err}");
+        assert_eq!(
+            std::fs::read_to_string(ws.join("a.txt")).unwrap(),
+            "line1\nline2\nline3\n"
+        );
+        std::fs::remove_dir_all(&ws).ok();
+    }
+
+    #[tokio::test]
+    async fn update_after_read_succeeds_and_read_state_follows_write() {
+        let ws = workspace();
+        let reads = Arc::new(crate::tool_router::ReadRegistry::new());
+        crate::tools::fs_read::ReadFile::new()
+            .execute(
+                serde_json::json!({"path": "a.txt"}),
+                &ctx_with_reads(&ws, reads.clone()),
+            )
+            .await
+            .unwrap();
+        let patch = "*** Begin Patch\n*** Update File: a.txt\n line1\n-line2\n+改过\n line3\n*** End Patch";
+        ApplyPatch::new()
+            .execute(serde_json::json!({"patch": patch}), &ctx_with_reads(&ws, reads.clone()))
+            .await
+            .unwrap();
+        assert_eq!(
+            std::fs::read_to_string(ws.join("a.txt")).unwrap(),
+            "line1\n改过\nline3\n"
+        );
+        // 写成功后登记表已刷新：同一会话的第二次补丁不需要再读
+        let patch2 = "*** Begin Patch\n*** Update File: a.txt\n line1\n-改过\n+再改\n line3\n*** End Patch";
+        ApplyPatch::new()
+            .execute(serde_json::json!({"patch": patch2}), &ctx_with_reads(&ws, reads.clone()))
+            .await
+            .unwrap();
+        assert_eq!(
+            std::fs::read_to_string(ws.join("a.txt")).unwrap(),
+            "line1\n再改\nline3\n"
+        );
+        std::fs::remove_dir_all(&ws).ok();
+    }
+
+    #[tokio::test]
+    async fn stale_after_external_change_is_rejected_and_current_content_returned() {
+        let ws = workspace();
+        let reads = Arc::new(crate::tool_router::ReadRegistry::new());
+        crate::tools::fs_read::ReadFile::new()
+            .execute(
+                serde_json::json!({"path": "a.txt"}),
+                &ctx_with_reads(&ws, reads.clone()),
+            )
+            .await
+            .unwrap();
+        // 外部进程改动文件（长度也变，确保不依赖 mtime 分辨率）
+        std::fs::write(ws.join("a.txt"), "外部写入\n第二行\n第三行\n第四行\n").unwrap();
+        let patch = "*** Begin Patch\n*** Update File: a.txt\n line1\n-line2\n+改过\n line3\n*** End Patch";
+        let err = ApplyPatch::new()
+            .execute(serde_json::json!({"patch": patch}), &ctx_with_reads(&ws, reads.clone()))
+            .await
+            .unwrap_err();
+        let message = err.to_string();
+        assert!(message.contains("write_file_stale"), "{message}");
+        assert!(message.contains("当前文件内容"), "{message}");
+        assert!(message.contains("外部写入"), "必须把当前内容回填模型: {message}");
+        assert_eq!(
+            std::fs::read_to_string(ws.join("a.txt")).unwrap(),
+            "外部写入\n第二行\n第三行\n第四行\n",
+            "stale 时不得覆盖"
+        );
+        std::fs::remove_dir_all(&ws).ok();
+    }
+
+    #[tokio::test]
+    async fn delete_without_read_is_rejected() {
+        let ws = workspace();
+        let reads = Arc::new(crate::tool_router::ReadRegistry::new());
+        let patch = "*** Begin Patch\n*** Delete File: a.txt\n*** End Patch";
+        let err = ApplyPatch::new()
+            .execute(serde_json::json!({"patch": patch}), &ctx_with_reads(&ws, reads))
+            .await
+            .unwrap_err();
+        assert!(err.to_string().contains("write_file_not_read"), "{err}");
+        assert!(ws.join("a.txt").exists());
         std::fs::remove_dir_all(&ws).ok();
     }
 }
