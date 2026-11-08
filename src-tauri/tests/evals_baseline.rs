@@ -318,10 +318,10 @@ async fn run_one(task: &Task, fixture: &BTreeMap<String, String>, backend: Arc<R
             .and_then(|v| v.parse().ok())
             .unwrap_or(0),
         tree_budget: Default::default(),
-        policy: policy::SessionPolicy {
-            approval: ApprovalMode::AutoReadOnly,
+        policy: Arc::new(policy::SessionPolicyHandle::new(policy::SessionPolicy {
+            approval: ApprovalMode::OnRequest,
             sandbox: SandboxMode::WorkspaceWrite,
-        },
+        })),
         rollout: Some(writer),
         rollout_broke: std::sync::atomic::AtomicBool::new(false),
         session_id: None,
@@ -666,10 +666,10 @@ async fn repair_loop_fixes_broken_rust_project_until_cargo_test_green() {
         max_turns: 8,
         token_budget: 0,
         tree_budget: Default::default(),
-        policy: policy::SessionPolicy {
-            approval: ApprovalMode::AutoReadOnly,
+        policy: Arc::new(policy::SessionPolicyHandle::new(policy::SessionPolicy {
+            approval: ApprovalMode::OnRequest,
             sandbox: SandboxMode::WorkspaceWrite,
-        },
+        })),
         rollout: None,
         rollout_broke: std::sync::atomic::AtomicBool::new(false),
         session_id: None,

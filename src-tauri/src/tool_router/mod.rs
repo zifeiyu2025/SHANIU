@@ -340,6 +340,10 @@ pub enum ToolError {
     InvalidArgs(String),
     #[error("{0}")]
     Execution(String),
+    /// 沙箱层面的拒绝/准备失败（SH-120）：与普通执行失败分开，`on-failure` 审批档
+    /// 只在**这一类**失败后询问是否提权重试；普通非零退出不触发询问。
+    #[error("沙箱拒绝: {0}")]
+    SandboxDenied(String),
     #[error("已取消")]
     Cancelled,
 }

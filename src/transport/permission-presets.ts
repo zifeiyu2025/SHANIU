@@ -1,11 +1,12 @@
 /**
  * DSH 一维权限挡位 ⇄ 宿主 `sandbox.mode` 的**唯一**映射（产品拍板，2026-11-07）。
  *
- * 宿主的安全面是 `sandbox.mode × approval.mode` 两维，但裁决矩阵（permission/policy.rs
- * 的 decide）当前只消费沙箱维，所以挡位只映射沙箱档、approval_mode 不动。目录不含
- * 上游实验档 `auto`：它是 danger-full-access × ask 的组合，在"裁决不看 approval"的
- * 宿主里与完全权限行为相同，挂出来是一枚假挡位。挡位语义是**全局**的（写 config.toml，
- * 不随会话走）：agent_loop 在任务启动时固化 SessionPolicy，进行中回合不受切换影响。
+ * 宿主的安全面是 `sandbox.mode × approval.mode` 两维。SH-120 起裁决矩阵（permission/policy.rs
+ * 的 decide）两维都消费，但本挡位只映射沙箱档：审批档由 `set_approval_mode` 在会话内切换
+ * （下一 turn 生效），与"全局默认写 config.toml"是两条路。目录不含上游实验档 `auto`
+ * （danger-full-access × ask）：在宿主里它等于"无沙箱但执行仍逐次问"，与完全权限不等价，
+ * 挂出来会让用户以为拿到了免确认。挡位语义是**全局默认**的（写 config.toml）；单个会话的
+ * 审批档可在运行中切换，任务启动时从 config 重置，不跨任务泄漏。
  *
  * 为什么单独一个模块：这张表有三个消费面——`remote.permissionPresets` 的目录、
  * `/permission <preset>` 命令的执行、设置页 `permission` 域的读视图与写面。三面各写

@@ -1103,6 +1103,9 @@ fn build_agent_with(
             tracing::warn!("MCP 工具注册冲突（已跳过）: {error}");
         }
     }
+    // SH-120：任务启动时把会话策略与前缀白名单重置回 config，
+    // 避免上一任务运行中切换的审批档/沙箱档跨任务泄漏。
+    state.reset_policy();
     let agent = agent_loop::AgentLoop::from_config(
         backend,
         Arc::new(router),
@@ -1112,7 +1115,8 @@ fn build_agent_with(
         workspace_root,
         writer,
     )
-    .with_jobs(agent_id.to_string(), state.jobs.clone());
+    .with_jobs(agent_id.to_string(), state.jobs.clone())
+    .with_policy(state.policy.clone());
     Ok((Arc::new(agent), cancel))
 }
 
@@ -1134,6 +1138,16 @@ fn approve(app: tauri::AppHandle, request_id: String, decision: String) -> Resul
     };
     app.state::<AppState>().broker.resolve(&request_id, decision);
     Ok(())
+}
+
+/// 运行中切换审批档（SH-120 / ADR-007）：只作用于**当前会话**，从下一个 turn 生效。
+/// 不写 config.toml——写成全局默认就是"全局开关"，ADR-008 明确否掉。
+/// `full_access` 的前提（danger 沙箱）不满足时返回错误，不静默回落。
+#[tauri::command]
+fn set_approval_mode(app: tauri::AppHandle, mode: String) -> Result<(), String> {
+    let parsed: config::ApprovalMode = serde_json::from_value(serde_json::Value::String(mode.clone()))
+        .map_err(|_| format!("未知审批档 `{mode}`，可选 {APPROVAL_MODE_NAMES}"))?;
+    app.state::<AppState>().policy.set_approval(parsed)
 }
 
 /// 保存 API Key（DPAPI 加密落盘，docs §9.1 secrets\）。
@@ -1256,7 +1270,7 @@ fn delete_api_key(app: tauri::AppHandle, provider: String) -> Result<(), String>
 /// 报错时列给用户的合法档位名。它必须与 `config.rs` 的枚举同源——
 /// `safety_mode_names_match_enums` 用穷举后的序列化结果逐字比对，加一档忘改这里会直接红。
 const SANDBOX_MODE_NAMES: &str = "read_only / workspace_write / danger_full_access";
-const APPROVAL_MODE_NAMES: &str = "ask / auto_read_only";
+const APPROVAL_MODE_NAMES: &str = "never / on_failure / on_request / full_access";
 
 /// 保存设置：模型端点/工作区入 config.toml，API Key（可选填）DPAPI 加密落盘。
 #[tauri::command]
@@ -1789,6 +1803,7 @@ pub fn run() {
             insert_workspace_before,
             cancel_task,
             approve,
+            set_approval_mode,
             send_subagent_message,
             interrupt_subagent,
             store_api_key,
@@ -2208,7 +2223,12 @@ mod session_projection_tests {
             .join(" / ");
         assert_eq!(sandbox_joined, SANDBOX_MODE_NAMES, "沙箱档位清单与枚举漂移了");
 
-        let approval_all = [config::ApprovalMode::Ask, config::ApprovalMode::AutoReadOnly];
+        let approval_all = [
+            config::ApprovalMode::Never,
+            config::ApprovalMode::OnFailure,
+            config::ApprovalMode::OnRequest,
+            config::ApprovalMode::FullAccess,
+        ];
         let approval_joined = approval_all
             .iter()
             .map(|m| serde_json::to_value(*m).unwrap().as_str().unwrap().to_string())

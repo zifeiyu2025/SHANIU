@@ -100,10 +100,10 @@ fn engine(requests: Arc<CountingBackend>, budget: TreeBudget) -> Arc<AgentLoop> 
         max_turns: 5,
         token_budget: 0,
         tree_budget: budget,
-        policy: policy::SessionPolicy {
-            approval: ApprovalMode::Ask,
+        policy: Arc::new(policy::SessionPolicyHandle::new(policy::SessionPolicy {
+            approval: ApprovalMode::OnRequest,
             sandbox: SandboxMode::WorkspaceWrite,
-        },
+        })),
         rollout: None,
         rollout_broke: std::sync::atomic::AtomicBool::new(false),
         session_id: None,

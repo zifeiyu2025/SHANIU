@@ -124,7 +124,7 @@ fn loop_with(agent_ws: &Path, backend: Arc<Scripted>, writer: Arc<RolloutWriter>
         max_turns: 3,
         token_budget: 0,
         tree_budget: Default::default(),
-        policy: policy::SessionPolicy { approval: ApprovalMode::AutoReadOnly, sandbox: SandboxMode::WorkspaceWrite },
+        policy: Arc::new(policy::SessionPolicyHandle::new(policy::SessionPolicy { approval: ApprovalMode::OnRequest, sandbox: SandboxMode::WorkspaceWrite })),
         rollout: Some(writer),
         rollout_broke: std::sync::atomic::AtomicBool::new(false),
         session_id: None,
@@ -332,10 +332,10 @@ async fn resume_continues_real_work_on_a_real_endpoint() {
             max_turns: 8,
             token_budget: 0,
         tree_budget: Default::default(),
-            policy: policy::SessionPolicy {
-                approval: ApprovalMode::AutoReadOnly,
+            policy: Arc::new(policy::SessionPolicyHandle::new(policy::SessionPolicy {
+                approval: ApprovalMode::OnRequest,
                 sandbox: SandboxMode::WorkspaceWrite,
-            },
+            })),
             rollout: Some(writer),
             rollout_broke: std::sync::atomic::AtomicBool::new(false),
             session_id: None,

@@ -1,14 +1,17 @@
 //! 四级风险分级与裁决策略（docs §8 permission/policy.rs，ADR-003）。
 //!
 //! 纯函数：输入（风险/审批模式/沙箱模式/会话记忆）→ 裁决（Allow/Prompt/Deny）。
-//! 规则矩阵：
+//! 规则矩阵（ADR-007 四档审批，随 turn 生效）：
 //! - read：一律放行；
-//! - write_in_workspace：只读沙箱拒绝；danger 放行；其余按审批模式询问；
-//! - execute：只读沙箱拒绝（ADR-002：只读禁止命令执行）；本会话记住过则放行；否则询问；
-//! - destructive：每次必问（永不记忆）。
+//! - write_in_workspace：只读沙箱拒绝；danger 放行；workspace-write 下
+//!   `never/on-failure/full-access` 放行、`on-request` 询问；
+//! - execute：只读沙箱拒绝（ADR-002：只读禁止命令执行）；`on-request` 下本会话记住过则放行、
+//!   否则询问；其余三档放行（`on-failure` 的提权询问发生在沙箱拒绝之后，不在门禁里）；
+//! - destructive：`on-request` 每次必问（永不记忆）；`never/on-failure` 直接拒绝（fail-closed，
+//!   不询问也不放行）；`full-access` 放行（前提是 danger 沙箱，由 `ApprovalMode::effective` 保证）。
 
 use std::collections::HashSet;
-use std::sync::Arc;
+use std::sync::{Arc, Mutex, RwLock};
 
 use crate::config::{ApprovalMode, SandboxMode};
 use crate::events::RiskLevel;
@@ -91,24 +94,218 @@ pub fn risk_of(tool_name: &str) -> RiskLevel {
 /// 裁决：是否需要人工审批（Prompt）/ 直接放行 / 直接拒绝。
 pub fn decide(
     risk: RiskLevel,
-    _approval_mode: ApprovalMode,
+    approval_mode: ApprovalMode,
     sandbox_mode: SandboxMode,
     remembered_execute: bool,
 ) -> Decision {
+    // 前提校验先做：`full-access` 只在 danger 沙箱下成立，否则按 on-request 裁决。
+    let (approval_mode, _) = approval_mode.effective(sandbox_mode);
     match risk {
         RiskLevel::Read => Decision::Allow,
         RiskLevel::WriteInWorkspace => match sandbox_mode {
             SandboxMode::ReadOnly => Decision::Deny,
             SandboxMode::DangerFullAccess => Decision::Allow,
-            SandboxMode::WorkspaceWrite => Decision::Prompt,
+            SandboxMode::WorkspaceWrite => match approval_mode {
+                // 沙箱就是边界：边界内的写入不再逐次打断
+                ApprovalMode::Never | ApprovalMode::OnFailure => Decision::Allow,
+                ApprovalMode::OnRequest => Decision::Prompt,
+                // effective 已把 full-access 在非 danger 沙箱下回落，这里不可达；
+                // 保守当作 on-request 处理，避免将来改 effective 时静默放宽。
+                ApprovalMode::FullAccess => Decision::Prompt,
+            },
         },
         RiskLevel::Execute => match sandbox_mode {
             SandboxMode::ReadOnly => Decision::Deny,
-            _ if remembered_execute => Decision::Allow,
-            _ => Decision::Prompt,
+            _ => match approval_mode {
+                // on-failure 的询问发生在**沙箱拒绝之后**（执行侧），门禁先放行
+                ApprovalMode::Never | ApprovalMode::OnFailure | ApprovalMode::FullAccess => {
+                    Decision::Allow
+                }
+                ApprovalMode::OnRequest => {
+                    if remembered_execute {
+                        Decision::Allow
+                    } else {
+                        Decision::Prompt
+                    }
+                }
+            },
         },
-        RiskLevel::Destructive | RiskLevel::PlanReview => Decision::Prompt,
+        RiskLevel::Destructive => match approval_mode {
+            // 不询问的档位不能把破坏性操作静默放行：直接失败（fail-closed）
+            ApprovalMode::Never | ApprovalMode::OnFailure => Decision::Deny,
+            ApprovalMode::OnRequest => Decision::Prompt,
+            ApprovalMode::FullAccess => Decision::Allow,
+        },
+        // 计划评审是用户对计划的人工会签，不是风险分级：非交互档不能自动放行，
+        // 否则模型可以自行退出计划态（AGENTS §11.3 退化红线）。
+        RiskLevel::PlanReview => match approval_mode {
+            ApprovalMode::OnRequest => Decision::Prompt,
+            _ => Decision::Deny,
+        },
     }
+}
+
+/// 会话策略句柄：`AgentLoop` 每个 turn 开头取一次快照，因此运行中切换审批档
+/// 从**下一个 turn** 起生效，而不是改一个进程级全局开关（ADR-007）。
+#[derive(Debug, Clone)]
+pub struct SessionPolicyHandle {
+    inner: Arc<RwLock<SessionPolicy>>,
+    /// 生效档被钳制的说明（目前只有 full-access 前提不满足一种）。
+    note: Arc<Mutex<Option<String>>>,
+}
+
+impl SessionPolicyHandle {
+    pub fn new(policy: SessionPolicy) -> Self {
+        let (approval, note) = normalize(policy);
+        Self {
+            inner: Arc::new(RwLock::new(SessionPolicy { approval, ..policy })),
+            note: Arc::new(Mutex::new(note.map(str::to_string))),
+        }
+    }
+
+    pub fn snapshot(&self) -> SessionPolicy {
+        *self.inner.read().expect("policy 锁中毒")
+    }
+
+    /// 重置会话策略（任务启动时由装配层调用）：上一任务运行中切换的档位
+    /// 不得泄漏到下一任务——那等于把"会话内切换"变成了事实上的全局开关。
+    pub fn reset(&self, policy: SessionPolicy) {
+        let (approval, note) = normalize(policy);
+        *self.inner.write().expect("policy 锁中毒") = SessionPolicy { approval, ..policy };
+        *self.note.lock().expect("policy note 锁中毒") = note.map(str::to_string);
+    }
+
+    pub fn note(&self) -> Option<String> {
+        self.note.lock().expect("policy note 锁中毒").clone()
+    }
+
+    /// 运行中切换审批档。`full-access` 前提不满足时**返回错误而不是回落**——
+    /// 用户明确点名 full-access 却得到一个更严的档，必须让他知道。
+    pub fn set_approval(&self, mode: ApprovalMode) -> Result<(), String> {
+        let sandbox = self.snapshot().sandbox;
+        if let (_, Some(reason)) = mode.effective(sandbox) {
+            return Err(reason.to_string());
+        }
+        self.inner.write().expect("policy 锁中毒").approval = mode;
+        *self.note.lock().expect("policy note 锁中毒") = None;
+        Ok(())
+    }
+}
+
+fn normalize(policy: SessionPolicy) -> (ApprovalMode, Option<&'static str>) {
+    policy.approval.effective(policy.sandbox)
+}
+
+/// 一条命令前缀白名单规则（ADR-007③）。`id` 就是规则原文——审计与界面共用，
+/// 改名等于破坏历史可追溯性（同 mcp_client::guard 的规则 id 约定）。
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct PrefixRule {
+    pub id: String,
+    tokens: Vec<String>,
+}
+
+/// 前缀白名单（会话内、来自用户 config.toml；**不落全局规则文件**，ADR-008）。
+#[derive(Debug, Clone, Default)]
+pub struct PrefixAllowlist {
+    rules: Vec<PrefixRule>,
+}
+
+impl PrefixAllowlist {
+    pub fn empty() -> Self {
+        Self::default()
+    }
+
+    /// 从配置装载。非法规则（含 shell 元字符 / 空串）被跳过并返回原因，
+    /// 由装配层播报——静默丢弃会让用户以为规则生效了。
+    pub fn from_config(entries: &[String]) -> (Self, Vec<String>) {
+        let mut rules = Vec::new();
+        let mut rejected = Vec::new();
+        for entry in entries {
+            let id = entry.trim();
+            if id.is_empty() {
+                rejected.push("空白规则被忽略".to_string());
+                continue;
+            }
+            match tokenize(id) {
+                Some(tokens) if !tokens.is_empty() => rules.push(PrefixRule { id: id.to_string(), tokens }),
+                _ => rejected.push(format!(
+                    "规则 `{id}` 含 shell 元字符或引号未闭合，已忽略（前缀匹配会被 `&&`/`|`/重定向绕过）"
+                )),
+            }
+        }
+        (Self { rules }, rejected)
+    }
+
+    pub fn is_empty(&self) -> bool {
+        self.rules.is_empty()
+    }
+
+    pub fn rule_count(&self) -> usize {
+        self.rules.len()
+    }
+
+    /// 命令命中哪条规则（取最长匹配，审计里记最具体的那条）。
+    /// 命令含 shell 元字符时一律不命中：`cargo test && del x` 不能被 `cargo test` 放行。
+    pub fn match_command(&self, command: &str) -> Option<&PrefixRule> {
+        let tokens = tokenize(command)?;
+        self.rules
+            .iter()
+            .filter(|rule| {
+                tokens.len() >= rule.tokens.len()
+                    && rule.tokens.iter().enumerate().all(|(index, expected)| {
+                        // 首 token 是程序名：Windows 下大小写不敏感；其余参数保持精确
+                        if index == 0 {
+                            tokens[index].eq_ignore_ascii_case(expected)
+                        } else {
+                            tokens[index] == *expected
+                        }
+                    })
+            })
+            .max_by_key(|rule| rule.tokens.len())
+    }
+}
+
+/// 极简分词：只服务前缀匹配。返回 `None` = 不可安全匹配（元字符/未闭合引号/空）。
+fn tokenize(command: &str) -> Option<Vec<String>> {
+    let mut tokens = Vec::new();
+    let mut current = String::new();
+    let mut in_quotes = false;
+    let mut has_token = false;
+    for ch in command.chars() {
+        if in_quotes {
+            match ch {
+                '"' => in_quotes = false,
+                _ => current.push(ch),
+            }
+            continue;
+        }
+        match ch {
+            '"' => {
+                in_quotes = true;
+                has_token = true;
+            }
+            // cmd 在执行前会重新解释这些字符（含 %变量% 展开），
+            // 因此"前段匹配"无法代表整条命令的真实语义。
+            '&' | '|' | ';' | '<' | '>' | '^' | '%' | '!' | '`' | '\n' | '\r' => return None,
+            ch if ch.is_whitespace() => {
+                if has_token {
+                    tokens.push(std::mem::take(&mut current));
+                    has_token = false;
+                }
+            }
+            ch => {
+                current.push(ch);
+                has_token = true;
+            }
+        }
+    }
+    if in_quotes || !has_token && tokens.is_empty() {
+        return None;
+    }
+    if has_token {
+        tokens.push(current);
+    }
+    Some(tokens)
 }
 
 /// Plan Mode 白名单：计划态下仅只读工具 + 退出评审可用（ADR-003 只读计划态）。
@@ -127,7 +324,7 @@ mod tests {
     #[test]
     fn read_tools_are_always_allowed() {
         for sandbox in [SandboxMode::ReadOnly, SandboxMode::WorkspaceWrite, SandboxMode::DangerFullAccess] {
-            assert_eq!(decide(RiskLevel::Read, ApprovalMode::Ask, sandbox, false), Decision::Allow);
+            assert_eq!(decide(RiskLevel::Read, ApprovalMode::OnRequest, sandbox, false), Decision::Allow);
         }
         assert_eq!(risk_of("read_file"), RiskLevel::Read);
         assert_eq!(risk_of("list_dir"), RiskLevel::Read);
@@ -138,10 +335,9 @@ mod tests {
 
     #[test]
     fn write_is_gated_by_sandbox_mode() {
-        assert_eq!(decide(RiskLevel::WriteInWorkspace, ApprovalMode::Ask, SandboxMode::ReadOnly, false), Decision::Deny);
-        assert_eq!(decide(RiskLevel::WriteInWorkspace, ApprovalMode::Ask, SandboxMode::WorkspaceWrite, false), Decision::Prompt);
-        assert_eq!(decide(RiskLevel::WriteInWorkspace, ApprovalMode::AutoReadOnly, SandboxMode::WorkspaceWrite, false), Decision::Prompt);
-        assert_eq!(decide(RiskLevel::WriteInWorkspace, ApprovalMode::Ask, SandboxMode::DangerFullAccess, false), Decision::Allow);
+        assert_eq!(decide(RiskLevel::WriteInWorkspace, ApprovalMode::OnRequest, SandboxMode::ReadOnly, false), Decision::Deny);
+        assert_eq!(decide(RiskLevel::WriteInWorkspace, ApprovalMode::OnRequest, SandboxMode::WorkspaceWrite, false), Decision::Prompt);
+        assert_eq!(decide(RiskLevel::WriteInWorkspace, ApprovalMode::OnRequest, SandboxMode::DangerFullAccess, false), Decision::Allow);
         assert_eq!(risk_of("apply_patch"), RiskLevel::WriteInWorkspace);
         // SH-052（docs/02 §2.2）：编排工具不能吃未知工具的 destructive 默认档，
         // 否则每个子代理派生都要人工点一次；wait_agent 只读结果，直接放行。
@@ -153,17 +349,66 @@ mod tests {
 
     #[test]
     fn execute_is_prompted_rememberable_and_denied_in_readonly() {
-        assert_eq!(decide(RiskLevel::Execute, ApprovalMode::Ask, SandboxMode::ReadOnly, false), Decision::Deny);
-        assert_eq!(decide(RiskLevel::Execute, ApprovalMode::Ask, SandboxMode::WorkspaceWrite, false), Decision::Prompt);
-        assert_eq!(decide(RiskLevel::Execute, ApprovalMode::Ask, SandboxMode::WorkspaceWrite, true), Decision::Allow);
+        assert_eq!(decide(RiskLevel::Execute, ApprovalMode::OnRequest, SandboxMode::ReadOnly, false), Decision::Deny);
+        assert_eq!(decide(RiskLevel::Execute, ApprovalMode::OnRequest, SandboxMode::WorkspaceWrite, false), Decision::Prompt);
+        assert_eq!(decide(RiskLevel::Execute, ApprovalMode::OnRequest, SandboxMode::WorkspaceWrite, true), Decision::Allow);
         assert_eq!(risk_of("unified_exec"), RiskLevel::Execute);
+    }
+
+    /// SH-120 / ADR-007②：`never` = 不询问。沙箱内的写入/执行照常放行；
+    /// 沙箱拒绝与破坏性操作直接失败——"不询问"不等于"全部允许"。
+    #[test]
+    fn never_never_prompts_and_fails_closed_on_destructive() {
+        for sandbox in [SandboxMode::WorkspaceWrite, SandboxMode::DangerFullAccess] {
+            assert_eq!(decide(RiskLevel::WriteInWorkspace, ApprovalMode::Never, sandbox, false), Decision::Allow);
+            assert_eq!(decide(RiskLevel::Execute, ApprovalMode::Never, sandbox, false), Decision::Allow);
+            assert_eq!(decide(RiskLevel::Destructive, ApprovalMode::Never, sandbox, false), Decision::Deny);
+        }
+        // 只读沙箱仍是硬边界：不询问 ≠ 绕过沙箱
+        assert_eq!(decide(RiskLevel::Execute, ApprovalMode::Never, SandboxMode::ReadOnly, false), Decision::Deny);
+        // 计划评审不能被模型自行放行
+        assert_eq!(decide(RiskLevel::PlanReview, ApprovalMode::Never, SandboxMode::WorkspaceWrite, false), Decision::Deny);
+    }
+
+    /// `on_failure`：门禁不打断（沙箱内放行），提权询问发生在沙箱拒绝之后；
+    /// 破坏性操作同样 fail-closed。
+    #[test]
+    fn on_failure_allows_in_sandbox_and_fails_closed_on_destructive() {
+        assert_eq!(decide(RiskLevel::WriteInWorkspace, ApprovalMode::OnFailure, SandboxMode::WorkspaceWrite, false), Decision::Allow);
+        assert_eq!(decide(RiskLevel::Execute, ApprovalMode::OnFailure, SandboxMode::WorkspaceWrite, false), Decision::Allow);
+        assert_eq!(decide(RiskLevel::Execute, ApprovalMode::OnFailure, SandboxMode::ReadOnly, false), Decision::Deny);
+        assert_eq!(decide(RiskLevel::Destructive, ApprovalMode::OnFailure, SandboxMode::WorkspaceWrite, false), Decision::Deny);
+        assert_eq!(decide(RiskLevel::PlanReview, ApprovalMode::OnFailure, SandboxMode::WorkspaceWrite, false), Decision::Deny);
+    }
+
+    /// `full_access`：前提是 danger 沙箱。前提不满足时 `effective` 回落 on_request，
+    /// 即"允许面收敛"——不是静默放宽。
+    #[test]
+    fn full_access_requires_danger_sandbox() {
+        assert_eq!(
+            decide(RiskLevel::WriteInWorkspace, ApprovalMode::FullAccess, SandboxMode::DangerFullAccess, false),
+            Decision::Allow
+        );
+        assert_eq!(
+            decide(RiskLevel::Destructive, ApprovalMode::FullAccess, SandboxMode::DangerFullAccess, false),
+            Decision::Allow
+        );
+        // 前提不满足：写操作回到 on_request（Prompt），不是 Allow
+        assert_eq!(
+            decide(RiskLevel::WriteInWorkspace, ApprovalMode::FullAccess, SandboxMode::WorkspaceWrite, false),
+            Decision::Prompt
+        );
+        let (effective, note) = ApprovalMode::FullAccess.effective(SandboxMode::WorkspaceWrite);
+        assert_eq!(effective, ApprovalMode::OnRequest);
+        assert!(note.expect("应给出回落说明").contains("danger_full_access"));
+        assert_eq!(ApprovalMode::FullAccess.effective(SandboxMode::DangerFullAccess).0, ApprovalMode::FullAccess);
     }
 
     #[test]
     fn destructive_is_always_prompted_and_never_remembered() {
         for sandbox in [SandboxMode::ReadOnly, SandboxMode::WorkspaceWrite, SandboxMode::DangerFullAccess] {
-            assert_eq!(decide(RiskLevel::Destructive, ApprovalMode::Ask, sandbox, false), Decision::Prompt);
-            assert_eq!(decide(RiskLevel::Destructive, ApprovalMode::Ask, sandbox, true), Decision::Prompt);
+            assert_eq!(decide(RiskLevel::Destructive, ApprovalMode::OnRequest, sandbox, false), Decision::Prompt);
+            assert_eq!(decide(RiskLevel::Destructive, ApprovalMode::OnRequest, sandbox, true), Decision::Prompt);
         }
     }
 
@@ -175,10 +420,87 @@ mod tests {
     #[test]
     fn plan_review_is_always_prompted() {
         for sandbox in [SandboxMode::ReadOnly, SandboxMode::WorkspaceWrite, SandboxMode::DangerFullAccess] {
-            assert_eq!(decide(RiskLevel::PlanReview, ApprovalMode::Ask, sandbox, true), Decision::Prompt);
+            assert_eq!(decide(RiskLevel::PlanReview, ApprovalMode::OnRequest, sandbox, true), Decision::Prompt);
         }
         assert_eq!(risk_of("exit_plan_mode"), RiskLevel::PlanReview);
         assert_eq!(risk_of("enter_plan_mode"), RiskLevel::Read);
+    }
+
+    /// SH-120：会话策略句柄的重置与切换——运行中切换只改在当前会话，
+    /// `full_access` 前提不满足时**报错**而不是悄悄降档。
+    #[test]
+    fn session_policy_handle_switches_and_resets() {
+        let handle = SessionPolicyHandle::new(SessionPolicy {
+            approval: ApprovalMode::FullAccess,
+            sandbox: SandboxMode::WorkspaceWrite,
+        });
+        // 构造时就钳制：full_access 前提不满足 → on_request + 说明
+        assert_eq!(handle.snapshot().approval, ApprovalMode::OnRequest);
+        assert!(handle.note().expect("应留下回落说明").contains("full_access"));
+
+        assert!(handle.set_approval(ApprovalMode::FullAccess).is_err());
+        assert!(handle.set_approval(ApprovalMode::Never).is_ok());
+        assert_eq!(handle.snapshot().approval, ApprovalMode::Never);
+        assert!(handle.note().is_none());
+
+        // reset 把档位拉回配置，不保留上一任务的选择
+        handle.reset(SessionPolicy { approval: ApprovalMode::OnRequest, sandbox: SandboxMode::WorkspaceWrite });
+        assert_eq!(handle.snapshot().approval, ApprovalMode::OnRequest);
+
+        // danger 沙箱下 full_access 才成立
+        let danger = SessionPolicyHandle::new(SessionPolicy {
+            approval: ApprovalMode::FullAccess,
+            sandbox: SandboxMode::DangerFullAccess,
+        });
+        assert_eq!(danger.snapshot().approval, ApprovalMode::FullAccess);
+    }
+
+    /// SH-120 / ADR-007③：前缀白名单的匹配面。重点不是"能匹配"，而是
+    /// **什么时候必须不匹配**——任何 shell 组合都会让"前段相同"失去意义。
+    #[test]
+    fn prefix_allowlist_rejects_shell_composition() {
+        let (rules, rejected) = PrefixAllowlist::from_config(&[
+            "cargo test".to_string(),
+            "git status".to_string(),
+            "cargo test && del important".to_string(),
+            "  ".to_string(),
+        ]);
+        assert_eq!(rejected.len(), 2, "含元字符/空白的规则必须被拒绝: {rejected:?}");
+        assert_eq!(rules.rule_count(), 2);
+
+        assert_eq!(rules.match_command("cargo test").map(|r| r.id.as_str()), Some("cargo test"));
+        assert_eq!(rules.match_command("cargo test -- --nocapture").map(|r| r.id.as_str()), Some("cargo test"));
+        // 程序名大小写不敏感（Windows），参数保持精确
+        assert!(rules.match_command("CARGO test").is_some());
+        assert!(rules.match_command("cargo Test").is_none());
+
+        // 组合命令/重定向/管道/变量展开一律不命中
+        for command in [
+            "cargo test && del important",
+            "cargo test | more",
+            "cargo test > out.txt",
+            "cargo test; del x",
+            "cargo test %EVIL%",
+            "cargo test \"unterminated",
+        ] {
+            assert!(rules.match_command(command).is_none(), "不应命中: {command}");
+        }
+        // 只是前缀相同、不是同一程序：不命中
+        assert!(rules.match_command("cargo testing").is_none());
+    }
+
+    #[test]
+    fn default_prefixes_are_readonly_or_build_only() {
+        let defaults = crate::config::default_allow_prefixes();
+        for forbidden in ["cargo run", "git commit", "git push", "del", "rm", "curl", "powershell"] {
+            assert!(
+                !defaults.iter().any(|rule| rule == forbidden),
+                "默认前缀不得包含 {forbidden}"
+            );
+        }
+        let (rules, rejected) = PrefixAllowlist::from_config(&defaults);
+        assert!(rejected.is_empty(), "默认规则自身必须合法: {rejected:?}");
+        assert_eq!(rules.rule_count(), defaults.len());
     }
 
     #[test]

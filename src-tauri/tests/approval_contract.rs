@@ -107,10 +107,10 @@ fn harness(tool_name: &str) -> Harness {
         max_turns: 2,
         token_budget: 0,
         tree_budget: Default::default(),
-        policy: policy::SessionPolicy {
-            approval: ApprovalMode::Ask,
+        policy: Arc::new(policy::SessionPolicyHandle::new(policy::SessionPolicy {
+            approval: ApprovalMode::OnRequest,
             sandbox: SandboxMode::WorkspaceWrite,
-        },
+        })),
         rollout: None,
         rollout_broke: std::sync::atomic::AtomicBool::new(false),
         session_id: None,
@@ -130,6 +130,177 @@ impl Harness {
         let events = self.events.lock().unwrap().clone();
         (summary, hits, events)
     }
+}
+
+// ============================== on-failure 提权（SH-120） ==============================
+
+/// 沙箱执行一律拒绝；只有在 danger 沙箱下才成功。用来验证提权重试**真的换了沙箱**，
+/// 而不是"再跑一次同样的沙箱然后假装成功"。
+struct SandboxDeniedTool {
+    spec: ToolSpec,
+    hits: Arc<AtomicUsize>,
+    danger_hits: Arc<AtomicUsize>,
+}
+
+#[async_trait]
+impl ToolExecutor for SandboxDeniedTool {
+    fn spec(&self) -> &ToolSpec {
+        &self.spec
+    }
+    async fn execute(&self, _args: serde_json::Value, ctx: &ToolContext) -> Result<ToolOutput, ToolError> {
+        self.hits.fetch_add(1, Ordering::SeqCst);
+        if ctx.sandbox == SandboxMode::DangerFullAccess {
+            self.danger_hits.fetch_add(1, Ordering::SeqCst);
+            Ok(ToolOutput::ok("ok"))
+        } else {
+            Err(ToolError::SandboxDenied("受限令牌拒绝执行".into()))
+        }
+    }
+}
+
+struct OnFailureHarness {
+    agent: AgentLoop,
+    hits: Arc<AtomicUsize>,
+    danger_hits: Arc<AtomicUsize>,
+    events: Arc<Mutex<Vec<EventMsg>>>,
+    broker: Arc<ApprovalBroker>,
+    cancel: CancellationToken,
+}
+
+fn on_failure_harness(approval: ApprovalMode) -> OnFailureHarness {
+    let hits = Arc::new(AtomicUsize::new(0));
+    let danger_hits = Arc::new(AtomicUsize::new(0));
+    let mut router = ToolRouter::new();
+    router.register(Arc::new(SandboxDeniedTool {
+        spec: ToolSpec::new("unified_exec", "沙箱拒绝样本", serde_json::json!({"type":"object"})),
+        hits: hits.clone(),
+        danger_hits: danger_hits.clone(),
+    }));
+    let broker = Arc::new(ApprovalBroker::new());
+    let events = Arc::new(Mutex::new(Vec::new()));
+    let agent = AgentLoop {
+        backend: Arc::new(ScriptedBackend { tool: "unified_exec".into() }),
+        router: Arc::new(router),
+        broker: broker.clone(),
+        plan_state: Arc::new(PlanState::new()),
+        workspace_root: std::env::temp_dir(),
+        max_turns: 2,
+        token_budget: 0,
+        tree_budget: Default::default(),
+        policy: Arc::new(policy::SessionPolicyHandle::new(policy::SessionPolicy {
+            approval,
+            sandbox: SandboxMode::WorkspaceWrite,
+        })),
+        rollout: None,
+        rollout_broke: std::sync::atomic::AtomicBool::new(false),
+        session_id: None,
+        jobs: None,
+        stop_hook: None,
+    };
+    OnFailureHarness { agent, hits, danger_hits, events, broker, cancel: CancellationToken::new() }
+}
+
+impl OnFailureHarness {
+    async fn run(self) -> (TurnSummary, usize, usize, Vec<EventMsg>) {
+        let sink: Arc<dyn EventSink> = Arc::new(CapturingSink(self.events.clone()));
+        let summary = tokio::time::timeout(
+            Duration::from_secs(10),
+            self.agent.run_task("任务", sink, self.cancel.clone()),
+        )
+        .await
+        .expect("任务超时：on-failure 未按契约收敛");
+        (
+            summary,
+            self.hits.load(Ordering::SeqCst),
+            self.danger_hits.load(Ordering::SeqCst),
+            self.events.lock().unwrap().clone(),
+        )
+    }
+}
+
+/// 等第一个审批请求出现，返回 (request_id, reason)。
+async fn wait_for_request(
+    events: &Arc<Mutex<Vec<EventMsg>>>,
+) -> (String, Option<String>) {
+    for _ in 0..500 {
+        let found = events.lock().unwrap().iter().find_map(|e| match e {
+            EventMsg::ExecApprovalRequest { request_id, reason, .. } => {
+                Some((request_id.clone(), reason.clone()))
+            }
+            _ => None,
+        });
+        if let Some(found) = found {
+            return found;
+        }
+        tokio::time::sleep(Duration::from_millis(10)).await;
+    }
+    panic!("未观察到审批请求");
+}
+
+/// `on-failure`：沙箱拒绝**之后**才问，批准后以 danger 沙箱重试一次。
+#[tokio::test]
+async fn on_failure_asks_after_sandbox_denial_and_retries_with_danger() {
+    let h = on_failure_harness(ApprovalMode::OnFailure);
+    let events = h.events.clone();
+    let broker = h.broker.clone();
+    let task = tokio::spawn(async move { h.run().await });
+
+    let (request_id, reason) = wait_for_request(&events).await;
+    assert_eq!(request_id, "appr-c1-escalate", "提权请求必须挂在原调用上");
+    assert!(
+        reason.unwrap_or_default().contains("沙箱拒绝"),
+        "审批卡必须说明是沙箱拒绝后的提权"
+    );
+    assert!(broker.resolve(&request_id, ApprovalDecision::Allow));
+
+    let (summary, hits, danger_hits, events) = task.await.unwrap();
+    assert_eq!(summary.reason, shaniu_lib::events::TurnEndReason::Completed);
+    assert_eq!(hits, 2, "首次沙箱执行 + 提权后重试");
+    assert_eq!(danger_hits, 1, "只有用户批准的那次才走 danger 沙箱");
+    let requests = events
+        .iter()
+        .filter(|e| matches!(e, EventMsg::ExecApprovalRequest { .. }))
+        .count();
+    assert_eq!(requests, 1, "一次失败只问一次，不重复打断");
+}
+
+/// `on-failure`：用户拒绝提权 → 不重试、不走 danger，原始沙箱失败回填模型。
+#[tokio::test]
+async fn on_failure_denied_keeps_original_failure() {
+    let h = on_failure_harness(ApprovalMode::OnFailure);
+    let events = h.events.clone();
+    let broker = h.broker.clone();
+    let task = tokio::spawn(async move { h.run().await });
+
+    let (request_id, _reason) = wait_for_request(&events).await;
+    assert!(broker.resolve(&request_id, ApprovalDecision::Deny));
+
+    let (summary, hits, danger_hits, events) = task.await.unwrap();
+    assert_eq!(summary.reason, shaniu_lib::events::TurnEndReason::Completed);
+    assert_eq!(hits, 1, "拒绝提权不得重试");
+    assert_eq!(danger_hits, 0, "拒绝提权不得走 danger 沙箱");
+    assert!(
+        events.iter().any(|e| matches!(
+            e,
+            EventMsg::ToolCallEnd { error: Some(msg), .. } if msg.contains("沙箱拒绝")
+        )),
+        "沙箱失败原因必须回填（模型据此换策略而非重试）"
+    );
+}
+
+/// `never`：沙箱拒绝也不弹窗、不提权——失败直接回填。
+#[tokio::test]
+async fn never_mode_does_not_prompt_or_escalate_on_sandbox_denial() {
+    let h = on_failure_harness(ApprovalMode::Never);
+    let task = tokio::spawn(async move { h.run().await });
+
+    let (_summary, hits, danger_hits, events) = task.await.unwrap();
+    assert_eq!(hits, 1, "never 档不重试");
+    assert_eq!(danger_hits, 0);
+    assert!(
+        !events.iter().any(|e| matches!(e, EventMsg::ExecApprovalRequest { .. })),
+        "never 档不得发任何审批卡"
+    );
 }
 
 // ============================== 契约 ==============================
@@ -297,7 +468,7 @@ async fn destructive_allow_always_is_not_remembered() {
                     &serde_json::json!({}),
                     "c2",
                     policy::SessionPolicy {
-                        approval: ApprovalMode::Ask,
+                        approval: ApprovalMode::OnRequest,
                         sandbox: SandboxMode::WorkspaceWrite,
                     },
                     shaniu_lib::permission::GateSubject::root("root"),

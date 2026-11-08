@@ -114,7 +114,7 @@ enum ClientFrame {
 #[serde(tag = "type", rename_all = "snake_case")]
 enum ServerFrame {
     Ready,
-    Event { event: AgentEvent },
+    Event { event: Box<AgentEvent> },
     Error { code: String, message: String },
 }
 
@@ -324,7 +324,7 @@ async fn pump(
         for state in sessions.values_mut() {
             while state.credits > 0 {
                 let Some(event) = state.queue.pop_front() else { break };
-                send_frame(sink, &ServerFrame::Event { event }).await?;
+                send_frame(sink, &ServerFrame::Event { event: Box::new(event) }).await?;
                 state.credits -= 1;
             }
         }

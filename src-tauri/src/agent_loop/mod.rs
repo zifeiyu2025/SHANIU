@@ -136,7 +136,9 @@ pub struct AgentLoop {
     /// 默认 `unlimited()`：本单元只做共账接线，配置面与 `spawn_agent.budget_tokens`
     /// 的限额派生在下一单元收口。
     pub tree_budget: TreeBudget,
-    pub policy: policy::SessionPolicy,
+    /// 会话策略句柄（SH-120）：每个 turn 开头取一次快照，因此审批档的切换
+    /// 从下一个 turn 起生效，而不是改一个进程级全局开关（ADR-007）。
+    pub policy: Arc<policy::SessionPolicyHandle>,
     /// 会话档案写入器（SH-030）。None = 本次运行不落盘（测试与无目录启动用）。
     /// 这是 `run_with_history` 构造 root 实例时的默认值；`run_instance` 以实例自带的
     /// 写入器为准，子代理因此能各写各的档案（SH-050）。
@@ -163,6 +165,13 @@ impl AgentLoop {
     ) -> Self {
         self.session_id = Some(session_id.into());
         self.jobs = Some(jobs);
+        self
+    }
+
+    /// 接管共享的策略句柄（SH-120）：装配层需要它才能在任务运行中切换审批档，
+    /// 并让切换从下一个 turn 起生效（见 [`policy::SessionPolicyHandle`]）。
+    pub fn with_policy(mut self, policy: Arc<policy::SessionPolicyHandle>) -> Self {
+        self.policy = policy;
         self
     }
 
@@ -288,10 +297,10 @@ impl AgentLoop {
             max_turns: TurnBudget::from_config(cfg).max_turns,
             token_budget: cfg.agent.token_budget,
             tree_budget: TreeBudget::unlimited(),
-            policy: policy::SessionPolicy {
+            policy: Arc::new(policy::SessionPolicyHandle::new(policy::SessionPolicy {
                 approval: cfg.approval.mode,
                 sandbox: cfg.sandbox.mode,
-            },
+            })),
             rollout,
             rollout_broke: std::sync::atomic::AtomicBool::new(false),
             session_id: None,
@@ -452,6 +461,9 @@ impl AgentLoop {
 
         'outer: for turn in 1..=self.max_turns {
             last_turn = turn;
+            // SH-120：策略快照按 turn 取。运行中切换审批档只影响后续 turn，
+            // 不回改正在执行的这一轮——一轮之内裁决依据必须自洽。
+            let turn_policy = self.policy.snapshot();
             emit(&sink, EventMsg::TurnStarted { turn });
 
             // SH-055 / FF-103：每次模型请求前先领名额（本轮的压缩请求也算一次采样）。
@@ -487,7 +499,7 @@ impl AgentLoop {
             // 系统提示每轮重算（docs/04 §6.1 不变量③）：计划态与沙箱模式变化必须反映到模型
             let instructions = prompt::system_instruction(
                 &self.workspace_root,
-                self.policy.sandbox,
+                turn_policy.sandbox,
                 self.plan_state.is_active(),
                 &skill_catalog,
             );
@@ -743,7 +755,7 @@ impl AgentLoop {
                         name,
                         &args_val,
                         call_id,
-                        self.policy,
+                        turn_policy,
                         call_subject,
                         crate::permission::GateEnv { sink: &sink, cancel },
                     )
@@ -794,7 +806,7 @@ impl AgentLoop {
                     cancel.clone(),
                     call_id.clone(),
                     sink.clone(),
-                    self.policy.sandbox,
+                    turn_policy.sandbox,
                 )
                 .with_jobs(session_id.clone(), self.jobs.clone())
                 .with_reads(read_registry.clone())
@@ -806,7 +818,49 @@ impl AgentLoop {
                     Some(orchestrator) => tool_ctx.with_orchestration(scope.clone(), orchestrator.clone()),
                     None => tool_ctx,
                 };
-                let result = self.router.execute(name, args_val, &tool_ctx).await;
+                let mut result = self.router.execute(name, args_val.clone(), &tool_ctx).await;
+                // on-failure 提权（SH-120 / ADR-007②）：只有**沙箱拒绝**这一类失败才值得问一次
+                // 「是否以 full-access 重跑」——普通非零退出重跑结果一样，问了只是多一次打断。
+                // 提权必须用户点头：不问就放宽就是静默降级（AGENTS §11.3 退化红线）。
+                if let Err(crate::tool_router::ToolError::SandboxDenied(sandbox_reason)) = &result {
+                    if turn_policy.approval == crate::config::ApprovalMode::OnFailure
+                        && turn_policy.sandbox != crate::config::SandboxMode::DangerFullAccess
+                    {
+                        let escalation = self
+                            .broker
+                            .request_escalation(
+                                name,
+                                &args_val,
+                                call_id,
+                                sandbox_reason,
+                                call_subject,
+                                crate::permission::GateEnv { sink: &sink, cancel },
+                            )
+                            .await;
+                        match escalation {
+                            crate::permission::GateOutcome::Allowed => {
+                                // 只在这一次调用上放宽沙箱；会话策略与后续命令不受影响
+                                let retry_ctx = ToolContext {
+                                    sandbox: crate::config::SandboxMode::DangerFullAccess,
+                                    ..tool_ctx
+                                };
+                                result = self.router.execute(name, args_val, &retry_ctx).await;
+                            }
+                            crate::permission::GateOutcome::Cancelled => {
+                                emit(&sink, EventMsg::ToolCallEnd {
+                                    call_id: call_id.clone(),
+                                    exit_code: None,
+                                    error: Some("已取消".into()),
+                                    result: Some(ToolCallResult::Cancelled),
+                                });
+                                reason = TurnEndReasonLocal::Cancelled;
+                                break 'outer;
+                            }
+                            // 拒绝/策略禁止：保留原始沙箱失败回填给模型
+                            _ => {}
+                        }
+                    }
+                }
                 let output_text = match &result {
                     Ok(out) => {
                         emit(&sink, EventMsg::ToolCallEnd {
@@ -1092,10 +1146,10 @@ mod tests {
             // 混进压缩会让"为什么这轮历史变短"变成隐性变量。
             token_budget: 0,
             tree_budget: TreeBudget::unlimited(),
-            policy: policy::SessionPolicy {
-                approval: crate::config::ApprovalMode::Ask,
+            policy: Arc::new(policy::SessionPolicyHandle::new(policy::SessionPolicy {
+                approval: crate::config::ApprovalMode::OnRequest,
                 sandbox: crate::config::SandboxMode::WorkspaceWrite,
-            },
+            })),
             rollout: None,
             rollout_broke: std::sync::atomic::AtomicBool::new(false),
             session_id: None,
@@ -1495,10 +1549,10 @@ mod tests {
             max_turns: 3,
             token_budget: 0,
             tree_budget: TreeBudget::unlimited(),
-            policy: policy::SessionPolicy {
-                approval: crate::config::ApprovalMode::Ask,
+            policy: Arc::new(policy::SessionPolicyHandle::new(policy::SessionPolicy {
+                approval: crate::config::ApprovalMode::OnRequest,
                 sandbox: crate::config::SandboxMode::WorkspaceWrite,
-            },
+            })),
             rollout: None,
             rollout_broke: std::sync::atomic::AtomicBool::new(false),
             session_id: None,
@@ -1649,10 +1703,10 @@ mod tests {
             max_turns: 5,
             token_budget: 0,
             tree_budget: TreeBudget::unlimited(),
-            policy: policy::SessionPolicy {
-                approval: crate::config::ApprovalMode::Ask,
+            policy: Arc::new(policy::SessionPolicyHandle::new(policy::SessionPolicy {
+                approval: crate::config::ApprovalMode::OnRequest,
                 sandbox: crate::config::SandboxMode::WorkspaceWrite,
-            },
+            })),
             rollout: None,
             rollout_broke: std::sync::atomic::AtomicBool::new(false),
             session_id: None,
@@ -1743,10 +1797,10 @@ mod tests {
             max_turns: 6,
             token_budget: 0,
             tree_budget: TreeBudget::unlimited(),
-            policy: policy::SessionPolicy {
-                approval: crate::config::ApprovalMode::Ask,
+            policy: Arc::new(policy::SessionPolicyHandle::new(policy::SessionPolicy {
+                approval: crate::config::ApprovalMode::OnRequest,
                 sandbox: crate::config::SandboxMode::WorkspaceWrite,
-            },
+            })),
             rollout: None,
             rollout_broke: std::sync::atomic::AtomicBool::new(false),
             session_id: None,
@@ -1868,10 +1922,10 @@ mod tests {
             max_turns: 2,
             token_budget: 0,
             tree_budget: TreeBudget::unlimited(),
-            policy: policy::SessionPolicy {
-                approval: crate::config::ApprovalMode::Ask,
+            policy: Arc::new(policy::SessionPolicyHandle::new(policy::SessionPolicy {
+                approval: crate::config::ApprovalMode::OnRequest,
                 sandbox: crate::config::SandboxMode::WorkspaceWrite,
-            },
+            })),
             rollout: None,
             rollout_broke: std::sync::atomic::AtomicBool::new(false),
             session_id: None,
@@ -2071,10 +2125,10 @@ mod tests {
             max_turns: 1,
             token_budget: 0,
             tree_budget: TreeBudget::unlimited(),
-            policy: policy::SessionPolicy {
-                approval: crate::config::ApprovalMode::Ask,
+            policy: Arc::new(policy::SessionPolicyHandle::new(policy::SessionPolicy {
+                approval: crate::config::ApprovalMode::OnRequest,
                 sandbox: crate::config::SandboxMode::WorkspaceWrite,
-            },
+            })),
             rollout: Some(writer),
             rollout_broke: std::sync::atomic::AtomicBool::new(false),
             session_id: None,

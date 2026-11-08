@@ -231,7 +231,7 @@ impl ToolExecutor for UnifiedExec {
                 // wait/kill 经 RestrictedChild 纯 Win32 封装，Job 守卫随结构存活
                 Waiter::Restricted(Box::new(child))
             }
-            Err(e) => return Err(ToolError::Execution(e.to_string())),
+            Err(e) => return Err(ToolError::SandboxDenied(e.to_string())),
         };
         drop(tx);
 

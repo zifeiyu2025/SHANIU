@@ -809,10 +809,10 @@ mod tests {
             max_turns: 2,
             token_budget: 0,
             tree_budget: Default::default(),
-            policy: policy::SessionPolicy {
-                approval: ApprovalMode::Ask,
+            policy: Arc::new(policy::SessionPolicyHandle::new(policy::SessionPolicy {
+                approval: ApprovalMode::OnRequest,
                 sandbox: SandboxMode::WorkspaceWrite,
-            },
+            })),
             rollout: None,
             rollout_broke: std::sync::atomic::AtomicBool::new(false),
             session_id: None,
@@ -1068,10 +1068,10 @@ mod tests {
             max_turns: 2,
             token_budget: 0,
             tree_budget: Default::default(),
-            policy: policy::SessionPolicy {
-                approval: ApprovalMode::Ask,
+            policy: Arc::new(policy::SessionPolicyHandle::new(policy::SessionPolicy {
+                approval: ApprovalMode::OnRequest,
                 sandbox: SandboxMode::WorkspaceWrite,
-            },
+            })),
             rollout: None,
             rollout_broke: std::sync::atomic::AtomicBool::new(false),
             session_id: None,

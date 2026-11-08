@@ -179,8 +179,15 @@ pub enum EventMsg {
         /// 「哪个子代理为了哪件事要权限」，而不是只有一个工具名。
         #[serde(default, skip_serializing_if = "Option::is_none")]
         task_summary: Option<String>,
+        /// 风险原因（SH-118⑤，additive）：用户在批什么、为什么现在问。
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        reason: Option<String>,
     },
     ExecApprovalResolved { request_id: String, decision: ApprovalDecision },
+    /// 命令前缀白名单命中（SH-120 / ADR-007③，additive）：放行依据必须可事后追溯——
+    /// 不弹窗不等于不留痕。`rule_id` 是规则原文（与 config.toml 同一份字符串）。
+    /// 旧消费端遇到未知 type 走 default 分支忽略，不破坏兼容。
+    AllowlistHit { tool: String, command: String, rule_id: String },
     PlanDelta { delta: String },
     TurnDiff { files: Vec<String> },
     Error { message: String },

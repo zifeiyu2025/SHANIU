@@ -15,7 +15,7 @@ use shaniu_lib::events::{
 };
 
 /// 与 src/transport/types.ts 的 type 判别值逐一对应。
-const EXPECTED_TAGS: [&str; 16] = [
+const EXPECTED_TAGS: [&str; 17] = [
     "turn_started",
     "turn_completed",
     "agent_message_delta",
@@ -25,6 +25,7 @@ const EXPECTED_TAGS: [&str; 16] = [
     "tool_call_end",
     "exec_approval_request",
     "exec_approval_resolved",
+    "allowlist_hit",
     "plan_delta",
     "turn_diff",
     "error",
@@ -50,7 +51,7 @@ fn all_variants() -> Vec<EventMsg> {
             error: Some("用户拒绝".into()),
             result: Some(ToolCallResult::Denied),
         },
-        EventMsg::ExecApprovalRequest { request_id: "r1".into(), tool: "unified_exec".into(), args: serde_json::json!({}), risk: RiskLevel::Destructive, agent_id: None, task_summary: None },
+        EventMsg::ExecApprovalRequest { request_id: "r1".into(), tool: "unified_exec".into(), args: serde_json::json!({}), risk: RiskLevel::Destructive, agent_id: None, task_summary: None, reason: None },
         // SH-054：审批冒泡的 additive 字段（子代理来源）也必须进快照
         EventMsg::ExecApprovalRequest {
             request_id: "r2".into(),
@@ -59,8 +60,16 @@ fn all_variants() -> Vec<EventMsg> {
             risk: RiskLevel::Execute,
             agent_id: Some("01JCHILD".into()),
             task_summary: Some("统计仓库文件数".into()),
+            // SH-118⑤ / SH-120：风险原因（additive）
+            reason: Some("执行命令需要人工确认".into()),
         },
         EventMsg::ExecApprovalResolved { request_id: "r1".into(), decision: ApprovalDecision::Deny },
+        // SH-120：前缀白名单放行审计（additive）
+        EventMsg::AllowlistHit {
+            tool: "unified_exec".into(),
+            command: "cargo test --lib".into(),
+            rule_id: "cargo test".into(),
+        },
         EventMsg::PlanDelta { delta: "step 1".into() },
         EventMsg::TurnDiff { files: vec!["a.rs".into()] },
         EventMsg::Error { message: "boom".into() },
@@ -92,6 +101,7 @@ fn all_variants() -> Vec<EventMsg> {
             | EventMsg::ToolCallEnd { .. }
             | EventMsg::ExecApprovalRequest { .. }
             | EventMsg::ExecApprovalResolved { .. }
+            | EventMsg::AllowlistHit { .. }
             | EventMsg::PlanDelta { .. }
             | EventMsg::TurnDiff { .. }
             | EventMsg::Error { .. }

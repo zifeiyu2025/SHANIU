@@ -23,6 +23,9 @@ pub struct AppState {
     active_task: Mutex<Option<(String, CancellationToken)>>,
     /// 审批 broker（approve 命令回执入口）。
     pub broker: Arc<ApprovalBroker>,
+    /// 会话策略句柄（SH-120）：任务运行中切换审批档，下一 turn 生效。
+    /// 任务启动时由 `reset_policy` 从 config 重新装载，避免上一任务的选择泄漏。
+    pub policy: Arc<crate::permission::SessionPolicyHandle>,
     /// 计划态标志（Plan Mode，跨任务保留：同一会话内后续任务仍在计划态时继续只读）。
     pub plan_state: Arc<PlanState>,
     /// 进程级后台作业注册表（SH-089）：跨任务保留，进程退出即清空。
@@ -40,18 +43,28 @@ impl AppState {
             .parent()
             .map(PathBuf::from)
             .unwrap_or_else(std::env::temp_dir);
-        Self {
+        let policy = Arc::new(crate::permission::SessionPolicyHandle::new(
+            crate::permission::SessionPolicy {
+                approval: config.approval.mode,
+                sandbox: config.sandbox.mode,
+            },
+        ));
+        let broker = Arc::new(ApprovalBroker::new());
+        let state = Self {
             config: RwLock::new(config),
             config_path: RwLock::new(config_path),
             data_root,
             session_seq: AtomicU32::new(1),
             active_task: Mutex::new(None),
-            broker: Arc::new(ApprovalBroker::new()),
+            broker,
+            policy,
             plan_state: Arc::new(PlanState::new()),
             jobs: Arc::new(crate::jobs::JobRegistry::new()),
             active_subagents: Mutex::new(None),
             mcp: Arc::new(crate::mcp_client::runtime::McpRuntime::new(&config_root)),
-        }
+        };
+        state.refresh_derived_policy();
+        state
     }
 
     /// 克隆当前配置（AppConfig 小对象，克隆廉价且避免持锁跨 await）。
@@ -92,8 +105,31 @@ impl AppState {
             let mut guard = self.config.write().expect("config 锁中毒");
             *guard = next;
         }
+        self.refresh_derived_policy();
         let path = self.config_path();
         self.config().save(&path)
+    }
+
+    /// 任务启动时重置会话策略（SH-120）：审批档/沙箱档回到 config，
+    /// 并重新装载前缀白名单——运行中切换过的档位不跨任务泄漏。
+    pub fn reset_policy(&self) {
+        self.refresh_derived_policy();
+    }
+
+    /// config → 运行时策略的**唯一**同步点（构造、配置变更、任务启动都走这里）。
+    fn refresh_derived_policy(&self) {
+        let cfg = self.config();
+        self.policy.reset(crate::permission::SessionPolicy {
+            approval: cfg.approval.mode,
+            sandbox: cfg.sandbox.mode,
+        });
+        let (rules, rejected) =
+            crate::permission::PrefixAllowlist::from_config(&cfg.approval.allow_prefixes);
+        for reason in rejected {
+            // 静默丢弃会让用户以为规则生效了；日志里逐条说明
+            tracing::warn!("前缀白名单规则被忽略: {reason}");
+        }
+        self.broker.set_prefix_rules(rules);
     }
 
     /// 注册新会话，返回唯一 ID。

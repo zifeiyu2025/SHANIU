@@ -572,20 +572,86 @@ pub enum SandboxMode {
     DangerFullAccess,
 }
 
-#[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(default)]
 pub struct ApprovalConfig {
     pub mode: ApprovalMode,
+    /// 命令前缀白名单（ADR-007③ / ADR-009②）：命中即放行、不弹窗，每条命中写审计。
+    ///
+    /// **不做全局落盘规则文件**（ADR-008）：这里只接受用户手写 config.toml，运行时不提供
+    /// 任何改写入口——代理没有路径自行扩权，一次局部放行也不会被后续会话继承。
+    /// 默认集只含只读/构建类；写文件、删除、网络操作不得进入默认前缀（ADR-007 代价节）。
+    pub allow_prefixes: Vec<String>,
 }
 
+impl Default for ApprovalConfig {
+    fn default() -> Self {
+        Self {
+            mode: ApprovalMode::OnRequest,
+            allow_prefixes: default_allow_prefixes(),
+        }
+    }
+}
+
+/// 前缀白名单默认集：只读查看与构建/测试。刻意不含 `cargo run`（执行产物）、
+/// `git commit`/`git push`（写远端）、任何删除/移动/网络命令。
+pub fn default_allow_prefixes() -> Vec<String> {
+    [
+        "cargo build",
+        "cargo check",
+        "cargo clippy",
+        "cargo test",
+        "cargo metadata",
+        "git status",
+        "git diff",
+        "git log",
+        "git show",
+        "git blame",
+        "dir",
+        "type",
+    ]
+    .iter()
+    .map(|rule| (*rule).to_string())
+    .collect()
+}
+
+/// 审批策略分层（ADR-007：随 turn 生效，不是全局开关）。
+///
+/// 语义落在**每条命令/每次工具调用**上，由 `permission::policy::decide` 消费：
+/// - `Never`：从不询问。沙箱允许的写入/执行照常放行；沙箱拒绝、破坏性操作**直接失败**，
+///   不产生审批卡。它不等于"全部允许"——未知工具仍按破坏性拒绝（fail-closed）。
+/// - `OnFailure`：沙箱允许的写入/执行不问；只有**沙箱拒绝**导致命令失败时才询问一次
+///   是否以 full-access 重试（提权必须用户点头，不静默降级）。
+/// - `OnRequest`：写入/执行按风险逐次询问（默认档）。
+/// - `FullAccess`：全部放行且不询问。**前提**是沙箱已是 `danger_full_access`；
+///   前提不满足时回落 `OnRequest`（允许面收敛，不是静默放宽）。
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum ApprovalMode {
-    /// 写入/命令逐次询问（默认）。
+    Never,
+    #[serde(rename = "on_failure", alias = "on-failure")]
+    OnFailure,
+    /// 旧值 `ask` / `auto_read_only` 仍能读入（行为本来就是"按风险询问"）。
     #[default]
-    Ask,
-    /// 只读自动放行，其余仍询问（M2 起 broker 裁决）。
-    AutoReadOnly,
+    #[serde(rename = "on_request", alias = "on-request", alias = "ask", alias = "auto_read_only")]
+    OnRequest,
+    #[serde(rename = "full_access", alias = "full-access")]
+    FullAccess,
+}
+
+impl ApprovalMode {
+    /// 生效档：`full_access` 需要 `danger_full_access` 沙箱作为前提，
+    /// 否则回落到 `on_request` 并返回回落说明（调用方负责播报，不静默）。
+    pub fn effective(self, sandbox: SandboxMode) -> (Self, Option<&'static str>) {
+        if self == Self::FullAccess && sandbox != SandboxMode::DangerFullAccess {
+            (
+                Self::OnRequest,
+                Some("full_access 需要 danger_full_access 沙箱，当前沙箱档不满足，已回落 on_request"),
+            )
+        } else {
+            (self, None)
+        }
+    }
 }
 
 /// MCP 客户端配置（docs/02 §3.1，additive `[mcp]` / `[[mcp.servers]]`）。
@@ -1379,7 +1445,7 @@ mod tests {
         let root = base.join("cfg");
         let (cfg, path) = AppConfig::load_or_create(&root).unwrap();
         assert_eq!(cfg.sandbox.mode, SandboxMode::ReadOnly);
-        assert_eq!(cfg.approval.mode, ApprovalMode::Ask);
+        assert_eq!(cfg.approval.mode, ApprovalMode::OnRequest);
         assert_eq!(cfg.model.max_turns, 32);
 
         // 缺字段 → serde default 兜底（前向兼容旧配置文件）

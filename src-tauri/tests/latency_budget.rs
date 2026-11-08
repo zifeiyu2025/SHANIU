@@ -113,10 +113,10 @@ async fn measure_once(first_byte: Duration) -> (Duration, Duration) {
         max_turns: 1,
         token_budget: 0,
         tree_budget: Default::default(),
-        policy: policy::SessionPolicy {
-            approval: ApprovalMode::Ask,
+        policy: Arc::new(policy::SessionPolicyHandle::new(policy::SessionPolicy {
+            approval: ApprovalMode::OnRequest,
             sandbox: SandboxMode::WorkspaceWrite,
-        },
+        })),
         rollout: None,
         rollout_broke: std::sync::atomic::AtomicBool::new(false),
         session_id: None,
@@ -236,10 +236,10 @@ async fn first_delta_latency_within_budget_on_real_endpoint() {
             max_turns: 1,
             token_budget: 0,
         tree_budget: Default::default(),
-            policy: policy::SessionPolicy {
-                approval: ApprovalMode::Ask,
+            policy: Arc::new(policy::SessionPolicyHandle::new(policy::SessionPolicy {
+                approval: ApprovalMode::OnRequest,
                 sandbox: SandboxMode::ReadOnly,
-            },
+            })),
             rollout: None,
             rollout_broke: std::sync::atomic::AtomicBool::new(false),
             session_id: None,
@@ -342,7 +342,7 @@ async fn cancellation_stops_within_half_second() {
         max_turns: 8,
         token_budget: 0,
         tree_budget: Default::default(),
-        policy: policy::SessionPolicy { approval: ApprovalMode::Ask, sandbox: SandboxMode::WorkspaceWrite },
+        policy: Arc::new(policy::SessionPolicyHandle::new(policy::SessionPolicy { approval: ApprovalMode::OnRequest, sandbox: SandboxMode::WorkspaceWrite })),
         rollout: None,
         rollout_broke: std::sync::atomic::AtomicBool::new(false),
         session_id: None,

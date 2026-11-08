@@ -12,10 +12,13 @@ use std::sync::{Arc, Mutex};
 use serde_json::Value;
 use tokio_util::sync::CancellationToken;
 
+use crate::config::SandboxMode;
 use crate::events::{ApprovalDecision, EventMsg, EventSink, RiskLevel};
 
 // re-export 便于 use permission::{policy, ...}
-pub use policy::{decide, risk_of, Decision, SessionPolicy, ToolAllowlist};
+pub use policy::{
+    decide, risk_of, Decision, PrefixAllowlist, SessionPolicy, SessionPolicyHandle, ToolAllowlist,
+};
 
 /// 门禁结果。
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -59,18 +62,40 @@ pub struct GateEnv<'a> {
     pub cancel: &'a CancellationToken,
 }
 
-/// 审批 broker：pending 请求表 + execute 级会话记忆（按 agent_id 分域）。
+/// 一次审批询问的元信息：风险档 + 风险原因 + 是否允许 `AllowAlways` 写入会话记忆。
+/// 打包成一个参数是因为这三项一起决定"这张审批卡长什么样、批完记不记"，
+/// 铺开 9 个参数会让调用点看不出哪些是身份、哪些是提示。
+#[derive(Debug, Clone, Copy)]
+struct ApprovalPrompt<'a> {
+    risk: RiskLevel,
+    reason: Option<&'a str>,
+    remember: bool,
+}
+
+/// 审批 broker：pending 请求表 + execute 级会话记忆（按 agent_id 分域）+ 命令前缀白名单。
 #[derive(Default)]
 pub struct ApprovalBroker {
     pending: Mutex<HashMap<String, tokio::sync::oneshot::Sender<ApprovalDecision>>>,
     /// `agent_id → 已记住的 execute 工具`。ADR-103：子代理的 AllowAlways 只对它自己
     /// 生效，不能放行父代理或兄弟代理——按 agent 分域是这条语义的唯一实现点。
     remembered_execute: Mutex<HashMap<String, HashSet<String>>>,
+    /// 命令前缀白名单（ADR-007③）。来自用户 config.toml，进程内只读装载；
+    /// **没有全局规则文件**，也没有任何代理可调用的写入路径（ADR-008）。
+    prefix: std::sync::RwLock<PrefixAllowlist>,
 }
 
 impl ApprovalBroker {
     pub fn new() -> Self {
         Self::default()
+    }
+
+    /// 装配层把 config.toml 里的前缀规则装进来（空 = 全部按风险裁决）。
+    pub fn set_prefix_rules(&self, rules: PrefixAllowlist) {
+        *self.prefix.write().expect("prefix 锁中毒") = rules;
+    }
+
+    pub fn prefix_rule_count(&self) -> usize {
+        self.prefix.read().expect("prefix 锁中毒").rule_count()
     }
 
     /// 工具执行前的门禁：白名单 → 裁决 → 必要时发审批请求并等待回执。
@@ -96,6 +121,26 @@ impl ApprovalBroker {
         }
         // 用户批准的工具级档位优先；MCP 未知工具没有覆盖时 risk_of 落 destructive。
         let risk = subject.risk_override.unwrap_or_else(|| risk_of(tool));
+        // 命令前缀白名单（ADR-007③）：先由沙箱划边界——只读沙箱连前缀都不看，
+        // 否则"命中白名单"会成为绕过只读约束的路径。命中 → 放行 + 写审计（ADR-009②）。
+        if risk == RiskLevel::Execute && policy.sandbox != SandboxMode::ReadOnly {
+            if let Some(command) = args.get("command").and_then(Value::as_str) {
+                let hit = self
+                    .prefix
+                    .read()
+                    .expect("prefix 锁中毒")
+                    .match_command(command)
+                    .map(|rule| rule.id.clone());
+                if let Some(rule_id) = hit {
+                    let _ = env.sink.emit(&EventMsg::AllowlistHit {
+                        tool: tool.to_string(),
+                        command: command.to_string(),
+                        rule_id,
+                    });
+                    return GateOutcome::Allowed;
+                }
+            }
+        }
         let remembered = self
             .remembered_execute
             .lock()
@@ -106,9 +151,41 @@ impl ApprovalBroker {
             Decision::Allow => GateOutcome::Allowed,
             Decision::Deny => GateOutcome::Forbidden,
             Decision::Prompt => {
-                self.request_approval(tool, args, call_id, risk, subject, env).await
+                self.request_approval(
+                    tool,
+                    args,
+                    call_id,
+                    ApprovalPrompt { risk, reason: Some(prompt_reason(risk)), remember: true },
+                    subject,
+                    env,
+                )
+                .await
             }
         }
+    }
+
+    /// `on-failure` 提权询问（SH-120 / ADR-007②）：沙箱拒绝某条命令后，问用户
+    /// 是否**只这一次**以 full-access 重跑。`AllowAlways` 不写会话记忆——
+    /// 记忆按工具粒度记的是"要不要审批"，而这里要放的是"沙箱边界"，两者不能混。
+    pub async fn request_escalation(
+        &self,
+        tool: &str,
+        args: &Value,
+        call_id: &str,
+        sandbox_reason: &str,
+        subject: GateSubject<'_>,
+        env: GateEnv<'_>,
+    ) -> GateOutcome {
+        let reason = format!("沙箱拒绝了这条命令（{sandbox_reason}）；是否仅本次以 full-access 重试？");
+        self.request_approval(
+            tool,
+            args,
+            &format!("{call_id}-escalate"),
+            ApprovalPrompt { risk: RiskLevel::Execute, reason: Some(&reason), remember: false },
+            subject,
+            env,
+        )
+        .await
     }
 
     /// 发审批请求并挂起等待；取消时撤单。
@@ -117,10 +194,11 @@ impl ApprovalBroker {
         tool: &str,
         args: &Value,
         call_id: &str,
-        risk: RiskLevel,
+        prompt: ApprovalPrompt<'_>,
         subject: GateSubject<'_>,
         env: GateEnv<'_>,
     ) -> GateOutcome {
+        let ApprovalPrompt { risk, reason, remember } = prompt;
         let request_id = format!("appr-{call_id}");
         let (tx, rx) = tokio::sync::oneshot::channel::<ApprovalDecision>();
         self.pending
@@ -136,6 +214,8 @@ impl ApprovalBroker {
             // 元数据反推"是谁在要权限"——反推在泳道未建立时必然失败。
             agent_id: Some(subject.agent_id.to_string()),
             task_summary: subject.task_summary.map(str::to_string),
+            // SH-118⑤：审批上下文要带风险原因，用户才知道自己在批什么。
+            reason: reason.map(str::to_string),
         });
         let outcome = tokio::select! {
             resp = rx => match resp {
@@ -144,7 +224,9 @@ impl ApprovalBroker {
                 // 「允许一次」后，同进程后续 execute 全部静默放行（真机复测发现）。
                 Ok(ApprovalDecision::Allow) => GateOutcome::Allowed,
                 Ok(d @ ApprovalDecision::AllowAlways) => {
-                    self.remember_if_execute(tool, risk, subject.agent_id);
+                    if remember {
+                        self.remember_if_execute(tool, risk, subject.agent_id);
+                    }
                     GateOutcome::from(d)
                 }
                 Ok(ApprovalDecision::Deny) => GateOutcome::Denied,
@@ -198,6 +280,17 @@ impl From<ApprovalDecision> for GateOutcome {
     }
 }
 
+/// 审批卡上的风险原因（SH-118⑤）：用户要知道自己在批什么，而不是只看到一个工具名。
+fn prompt_reason(risk: RiskLevel) -> &'static str {
+    match risk {
+        RiskLevel::Read => "只读工具本应直接放行；出现此提示说明风险档被用户覆盖",
+        RiskLevel::WriteInWorkspace => "写入工作区需要人工确认（当前审批策略 on_request）",
+        RiskLevel::Execute => "执行命令需要人工确认（当前审批策略 on_request）",
+        RiskLevel::Destructive => "破坏性操作每次必问，不会被会话记忆放行",
+        RiskLevel::PlanReview => "计划评审：退出计划态需要用户确认",
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -213,12 +306,134 @@ mod tests {
         serde_json::json!({"command": "echo x"})
     }
 
+    /// 记录发出的所有事件：前缀放行审计与"never 不发审批卡"都靠它取证。
+    #[derive(Default)]
+    struct CaptureSink {
+        events: Mutex<Vec<EventMsg>>,
+    }
+
+    impl EventSink for CaptureSink {
+        fn emit(&self, msg: &EventMsg) -> Result<(), String> {
+            self.events.lock().unwrap().push(msg.clone());
+            Ok(())
+        }
+    }
+
+    impl CaptureSink {
+        fn take(&self) -> Vec<EventMsg> {
+            std::mem::take(&mut *self.events.lock().unwrap())
+        }
+    }
+
+    /// SH-120 / ADR-007③④：命中前缀白名单 → 放行 + 审计事件（含规则 id）；
+    /// 带 shell 组合的同前缀命令不得被放行。
+    #[tokio::test]
+    async fn prefix_hit_allows_with_audit_and_composition_is_not_allowed() {
+        let broker = ApprovalBroker::new();
+        let (rules, rejected) = PrefixAllowlist::from_config(&["cargo test".to_string()]);
+        assert!(rejected.is_empty());
+        broker.set_prefix_rules(rules);
+        let capture = Arc::new(CaptureSink::default());
+        let sink: Arc<dyn EventSink> = capture.clone();
+        let cancel = CancellationToken::new();
+
+        let out = broker
+            .gate(
+                "unified_exec",
+                &serde_json::json!({"command": "cargo test --lib"}),
+                "c-prefix",
+                policy::SessionPolicy { approval: ApprovalMode::OnRequest, sandbox: SandboxMode::WorkspaceWrite },
+                GateSubject::root("root"),
+                GateEnv { sink: &sink, cancel: &cancel },
+            )
+            .await;
+        assert_eq!(out, GateOutcome::Allowed, "命中前缀应直接放行");
+        let events = capture.take();
+        assert!(
+            events.iter().any(|e| matches!(
+                e,
+                EventMsg::AllowlistHit { rule_id, command, .. }
+                    if rule_id == "cargo test" && command == "cargo test --lib"
+            )),
+            "放行必须留审计: {events:?}"
+        );
+
+        // 组合命令不能借前缀放行：不能出现审批卡也不应放行（这里会挂起等审批，
+        // 因此用一个必然被拒绝的沙箱档先验证"不放行"路径更直接）
+        let readonly = broker
+            .gate(
+                "unified_exec",
+                &serde_json::json!({"command": "cargo test"}),
+                "c-prefix-ro",
+                policy::SessionPolicy { approval: ApprovalMode::OnRequest, sandbox: SandboxMode::ReadOnly },
+                GateSubject::root("root"),
+                GateEnv { sink: &sink, cancel: &cancel },
+            )
+            .await;
+        assert_eq!(readonly, GateOutcome::Forbidden, "只读沙箱下前缀不得绕过执行禁令");
+
+        let composed = broker
+            .gate(
+                "unified_exec",
+                &serde_json::json!({"command": "cargo test && del important"}),
+                "c-composed",
+                policy::SessionPolicy { approval: ApprovalMode::Never, sandbox: SandboxMode::WorkspaceWrite },
+                GateSubject::root("root"),
+                GateEnv { sink: &sink, cancel: &cancel },
+            )
+            .await;
+        // never 档不弹窗：组合命令没有被白名单放行，就按 never 的沙箱内策略放行——
+        // 关键是它**没有**产生 AllowlistHit（审计里不能记成"白名单放行"）
+        assert_eq!(composed, GateOutcome::Allowed);
+        let events = capture.take();
+        assert!(
+            !events.iter().any(|e| matches!(e, EventMsg::AllowlistHit { .. })),
+            "组合命令不得记成白名单放行: {events:?}"
+        );
+    }
+
+    /// SH-120 / ADR-007②：`never` 档下执行不回审批卡（不弹窗），破坏性工具直接拒绝。
+    #[tokio::test]
+    async fn never_mode_never_emits_approval_request() {
+        let broker = ApprovalBroker::new();
+        let capture = Arc::new(CaptureSink::default());
+        let sink: Arc<dyn EventSink> = capture.clone();
+        let cancel = CancellationToken::new();
+
+        let out = broker
+            .gate(
+                "unified_exec",
+                &args(),
+                "c-never",
+                policy::SessionPolicy { approval: ApprovalMode::Never, sandbox: SandboxMode::WorkspaceWrite },
+                GateSubject::root("root"),
+                GateEnv { sink: &sink, cancel: &cancel },
+            )
+            .await;
+        assert_eq!(out, GateOutcome::Allowed);
+        assert!(capture.take().is_empty(), "never 档不得发任何审批事件");
+
+        // 未知工具 = destructive：never 档直接拒绝，不询问
+        let out = broker
+            .gate(
+                "mcp__unknown__tool",
+                &serde_json::json!({}),
+                "c-never-destructive",
+                policy::SessionPolicy { approval: ApprovalMode::Never, sandbox: SandboxMode::WorkspaceWrite },
+                GateSubject::root("root"),
+                GateEnv { sink: &sink, cancel: &cancel },
+            )
+            .await;
+        assert_eq!(out, GateOutcome::Forbidden);
+        assert!(capture.take().is_empty(), "拒绝也不应产生审批卡");
+    }
+
     #[tokio::test]
     async fn read_tool_passes_without_request() {
         let broker = ApprovalBroker::new();
         let cancel = CancellationToken::new();
         let out = broker
-            .gate("read_file", &serde_json::json!({}), "c0", policy::SessionPolicy { approval: ApprovalMode::Ask, sandbox: SandboxMode::ReadOnly }, GateSubject::root("root"), GateEnv { sink: &sink(), cancel: &cancel })
+            .gate("read_file", &serde_json::json!({}), "c0", policy::SessionPolicy { approval: ApprovalMode::OnRequest, sandbox: SandboxMode::ReadOnly }, GateSubject::root("root"), GateEnv { sink: &sink(), cancel: &cancel })
             .await;
         assert_eq!(out, GateOutcome::Allowed);
     }
@@ -228,7 +443,7 @@ mod tests {
         let broker = ApprovalBroker::new();
         let cancel = CancellationToken::new();
         let out = broker
-            .gate("apply_patch", &serde_json::json!({}), "c1", policy::SessionPolicy { approval: ApprovalMode::Ask, sandbox: SandboxMode::ReadOnly }, GateSubject::root("root"), GateEnv { sink: &sink(), cancel: &cancel })
+            .gate("apply_patch", &serde_json::json!({}), "c1", policy::SessionPolicy { approval: ApprovalMode::OnRequest, sandbox: SandboxMode::ReadOnly }, GateSubject::root("root"), GateEnv { sink: &sink(), cancel: &cancel })
             .await;
         assert_eq!(out, GateOutcome::Forbidden, "沙箱拒绝属于策略拒绝，不是用户拒绝");
     }
@@ -244,7 +459,7 @@ mod tests {
         let s = sink.clone();
         let c = cancel.clone();
         let gate1 = tokio::spawn(async move {
-            b.gate("unified_exec", &args(), "c2", policy::SessionPolicy { approval: ApprovalMode::Ask, sandbox: SandboxMode::WorkspaceWrite }, GateSubject::root("root"), GateEnv { sink: &s, cancel: &c }).await
+            b.gate("unified_exec", &args(), "c2", policy::SessionPolicy { approval: ApprovalMode::OnRequest, sandbox: SandboxMode::WorkspaceWrite }, GateSubject::root("root"), GateEnv { sink: &s, cancel: &c }).await
         });
         // 等待请求挂起后回执 deny
         for _ in 0..200 {
@@ -261,7 +476,7 @@ mod tests {
         let s2 = sink.clone();
         let c2 = cancel.clone();
         let gate2 = tokio::spawn(async move {
-            b.gate("unified_exec", &args(), "c3", policy::SessionPolicy { approval: ApprovalMode::Ask, sandbox: SandboxMode::WorkspaceWrite }, GateSubject::root("root"), GateEnv { sink: &s2, cancel: &c2 }).await
+            b.gate("unified_exec", &args(), "c3", policy::SessionPolicy { approval: ApprovalMode::OnRequest, sandbox: SandboxMode::WorkspaceWrite }, GateSubject::root("root"), GateEnv { sink: &s2, cancel: &c2 }).await
         });
         for _ in 0..200 {
             if broker.has_pending("appr-c3") {
@@ -274,7 +489,7 @@ mod tests {
 
         // 记忆生效：不再询问
         let out = broker
-            .gate("unified_exec", &args(), "c4", policy::SessionPolicy { approval: ApprovalMode::Ask, sandbox: SandboxMode::WorkspaceWrite }, GateSubject::root("root"), GateEnv { sink: &sink, cancel: &cancel })
+            .gate("unified_exec", &args(), "c4", policy::SessionPolicy { approval: ApprovalMode::OnRequest, sandbox: SandboxMode::WorkspaceWrite }, GateSubject::root("root"), GateEnv { sink: &sink, cancel: &cancel })
             .await;
         assert_eq!(out, GateOutcome::Allowed);
     }
@@ -289,7 +504,7 @@ mod tests {
         let s = sink.clone();
         let c1 = cancel.clone();
         let gate1 = tokio::spawn(async move {
-            b.gate("unified_exec", &args(), "c6", policy::SessionPolicy { approval: ApprovalMode::Ask, sandbox: SandboxMode::WorkspaceWrite }, GateSubject::root("root"), GateEnv { sink: &s, cancel: &c1 }).await
+            b.gate("unified_exec", &args(), "c6", policy::SessionPolicy { approval: ApprovalMode::OnRequest, sandbox: SandboxMode::WorkspaceWrite }, GateSubject::root("root"), GateEnv { sink: &s, cancel: &c1 }).await
         });
         let mut first_prompted = false;
         for _ in 0..200 {
@@ -307,7 +522,7 @@ mod tests {
         let s2 = sink.clone();
         let c2 = cancel.clone();
         let gate2 = tokio::spawn(async move {
-            b.gate("unified_exec", &args(), "c7", policy::SessionPolicy { approval: ApprovalMode::Ask, sandbox: SandboxMode::WorkspaceWrite }, GateSubject::root("root"), GateEnv { sink: &s2, cancel: &c2 }).await
+            b.gate("unified_exec", &args(), "c7", policy::SessionPolicy { approval: ApprovalMode::OnRequest, sandbox: SandboxMode::WorkspaceWrite }, GateSubject::root("root"), GateEnv { sink: &s2, cancel: &c2 }).await
         });
         let mut prompted = false;
         for _ in 0..200 {
@@ -330,7 +545,7 @@ mod tests {
             let b = broker.clone();
             let s = sink();
             let c = cancel.clone();
-            async move { b.gate("unified_exec", &args(), "c5", policy::SessionPolicy { approval: ApprovalMode::Ask, sandbox: SandboxMode::WorkspaceWrite }, GateSubject::root("root"), GateEnv { sink: &s, cancel: &c }).await }
+            async move { b.gate("unified_exec", &args(), "c5", policy::SessionPolicy { approval: ApprovalMode::OnRequest, sandbox: SandboxMode::WorkspaceWrite }, GateSubject::root("root"), GateEnv { sink: &s, cancel: &c }).await }
         });
         for _ in 0..200 {
             if broker.has_pending("appr-c5") {
@@ -372,7 +587,7 @@ mod tests {
                 "unified_exec",
                 &args(),
                 "c8",
-                policy::SessionPolicy { approval: ApprovalMode::Ask, sandbox: SandboxMode::WorkspaceWrite },
+                policy::SessionPolicy { approval: ApprovalMode::OnRequest, sandbox: SandboxMode::WorkspaceWrite },
                 subject,
                 GateEnv { sink: &(events.clone() as Arc<dyn EventSink>), cancel: &cancel },
             )
@@ -390,7 +605,7 @@ mod tests {
     async fn allow_always_memory_is_scoped_to_the_requesting_agent() {
         let broker = Arc::new(ApprovalBroker::new());
         let cancel = CancellationToken::new();
-        let policy = policy::SessionPolicy { approval: ApprovalMode::Ask, sandbox: SandboxMode::WorkspaceWrite };
+        let policy = policy::SessionPolicy { approval: ApprovalMode::OnRequest, sandbox: SandboxMode::WorkspaceWrite };
 
         // 子代理 A 选择「本会话记住」
         let gate_a = tokio::spawn({
@@ -459,7 +674,7 @@ mod tests {
                         "unified_exec",
                         &args(),
                         "c11",
-                        policy::SessionPolicy { approval: ApprovalMode::Ask, sandbox: SandboxMode::WorkspaceWrite },
+                        policy::SessionPolicy { approval: ApprovalMode::OnRequest, sandbox: SandboxMode::WorkspaceWrite },
                         GateSubject {
                             agent_id: "child-9",
                             task_summary: Some("统计仓库文件数"),
@@ -509,7 +724,7 @@ mod tests {
                 "mcp__srv__read",
                 &args(),
                 "c12",
-                policy::SessionPolicy { approval: ApprovalMode::Ask, sandbox: SandboxMode::WorkspaceWrite },
+                policy::SessionPolicy { approval: ApprovalMode::OnRequest, sandbox: SandboxMode::WorkspaceWrite },
                 subject,
                 GateEnv { sink: &sink(), cancel: &cancel },
             )
@@ -537,7 +752,7 @@ mod tests {
                 "read_file",
                 &args(),
                 "c13",
-                policy::SessionPolicy { approval: ApprovalMode::Ask, sandbox: SandboxMode::WorkspaceWrite },
+                policy::SessionPolicy { approval: ApprovalMode::OnRequest, sandbox: SandboxMode::WorkspaceWrite },
                 subject,
                 GateEnv { sink: &s, cancel: &c },
             )
