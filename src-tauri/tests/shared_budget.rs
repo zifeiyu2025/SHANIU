@@ -108,6 +108,7 @@ fn engine(requests: Arc<CountingBackend>, budget: TreeBudget) -> Arc<AgentLoop> 
         rollout_broke: std::sync::atomic::AtomicBool::new(false),
         session_id: None,
         jobs: None,
+        stop_hook: None,
     })
 }
 

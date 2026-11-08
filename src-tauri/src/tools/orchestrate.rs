@@ -386,6 +386,7 @@ mod tests {
                     summary: "完成".into(),
                     artifacts: Vec::new(),
                     token_usage: None,
+                    turns: Some(3),
                 })
                 .collect()
         }

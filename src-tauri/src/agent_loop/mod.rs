@@ -72,6 +72,51 @@ impl ModelBackend for ResponsesBackend {
     }
 }
 
+// ============================== 结束前否决点（SH-121②） ==============================
+
+/// 结束前否决点的只读上下文。
+pub struct StopContext<'a> {
+    /// 本轮为止的完整历史（不含本次助手文本）。
+    pub history: &'a [HistoryItem],
+    /// 本次助手文本（模型说要结束的那段话）。
+    pub last_text: &'a str,
+    /// 当前轮次（从 1 开始）。
+    pub turn: u32,
+    /// 计划态是否仍然开启（模型可能忘了 `exit_plan_mode`）。
+    pub plan_active: bool,
+}
+
+/// 结束前否决点（对齐 codex `turn.rs:824-842` 的 stop hook 语义）。
+///
+/// 返回 `Some(提醒)` 表示**先别结束**：提醒作为独立 `Role::System` 条目注入历史后
+/// 再跑一轮；返回 `None` 表示允许结束。
+///
+/// 为什么必须由宿主判定：模型文本里的「已完成」只是文本，不能终止循环
+/// （SH-121① 已保证「只有派发了工具调用才继续」）。否决点是反向的同一个原则——
+/// 「只有宿主说可以停，才停」。每次任务最多否决一次，避免变成无限续跑。
+pub trait StopHook: Send + Sync {
+    fn before_stop(&self, ctx: StopContext<'_>) -> Option<String>;
+}
+
+/// 默认否决点：计划态还开着、模型却只用文字收尾。
+///
+/// 这时循环继续一轮并提示提交计划——否则用户看到的是「计划态静默悬空」，
+/// 下一轮对话又回到计划态，白烧一次往返。
+struct PlanModeStopHook;
+
+impl StopHook for PlanModeStopHook {
+    fn before_stop(&self, ctx: StopContext<'_>) -> Option<String> {
+        if !ctx.plan_active {
+            return None;
+        }
+        Some(
+            "宿主检查：计划态仍未退出，而本轮没有调用任何工具。\
+             如果计划已成形，请调用 exit_plan_mode 提交；否则继续执行当前步骤，不要只用文字结束。"
+                .to_string(),
+        )
+    }
+}
+
 // ============================== 循环本体 ==============================
 
 pub struct AgentLoop {
@@ -102,6 +147,9 @@ pub struct AgentLoop {
     pub session_id: Option<String>,
     /// 进程级作业注册表（SH-089）。
     pub jobs: Option<Arc<crate::jobs::JobRegistry>>,
+    /// 结束前否决点（SH-121②）。`None` = 不否决（测试与纯后端路径的默认）。
+    /// 生产装配在 [`AgentLoop::from_config`] 注入 [`PlanModeStopHook`]。
+    pub stop_hook: Option<Arc<dyn StopHook>>,
 }
 
 impl AgentLoop {
@@ -246,6 +294,7 @@ impl AgentLoop {
             rollout_broke: std::sync::atomic::AtomicBool::new(false),
             session_id: None,
             jobs: None,
+            stop_hook: Some(Arc::new(PlanModeStopHook)),
         }
     }
 
@@ -370,6 +419,8 @@ impl AgentLoop {
         // 最近一次端点报回的上下文规模，作为压缩判据的观测侧（SH-032）。
         // 字节估算看不见推理 token 与工具声明开销，只有端点的 input_tokens 是真实值。
         let mut observed_input_tokens = 0usize;
+        // 结束前否决点是否已经用过（SH-121②：每次任务最多一次）。
+        let mut stop_vetoed = false;
         let emit = |sink: &Arc<dyn crate::events::EventSink>, msg: EventMsg| {
             let _ = sink.emit(&msg);
         };
@@ -554,13 +605,39 @@ impl AgentLoop {
             } else {
                 Some(std::mem::take(&mut reasoning_text))
             };
+            // 结束前否决点（SH-121②）：先算再入历史——`text` 之后会被 move。
+            // 只在「确实要结束」且预算还够再跑一轮时询问；每次任务最多否决一次。
+            let veto = if calls.is_empty() && !stop_vetoed && turn < self.max_turns {
+                self.stop_hook.as_ref().and_then(|hook| {
+                    hook.before_stop(StopContext {
+                        history,
+                        last_text: &text,
+                        turn,
+                        plan_active: self.plan_state.is_active(),
+                    })
+                })
+            } else {
+                None
+            };
             if !text.trim().is_empty() || reasoning.is_some() {
                 history.push(HistoryItem::Message { role: Role::Assistant, text, reasoning });
             }
 
-            // 4) 无工具调用 → 任务完成
+            // 4) 无工具调用 → 结束前否决点放行/否决
             if calls.is_empty() {
-                break;
+                match veto {
+                    Some(reminder) => {
+                        stop_vetoed = true;
+                        // 独立 System 条目：不伪装成工具结果、不冒充用户消息。
+                        history.push(HistoryItem::Message {
+                            role: Role::System,
+                            text: reminder,
+                            reasoning: None,
+                        });
+                        continue;
+                    }
+                    None => break,
+                }
             }
 
             // 5) 本轮已到预算上限且仍需工具 → 预算耗尽
@@ -928,6 +1005,7 @@ mod tests {
             rollout_broke: std::sync::atomic::AtomicBool::new(false),
             session_id: None,
             jobs: None,
+            stop_hook: None,
         };
         (agent, store, CancellationToken::new(), broker)
     }
@@ -965,6 +1043,62 @@ mod tests {
             other => panic!("意外事件: {other:?}"),
         }).collect();
         assert_eq!(tags, ["turn_started", "delta", "usage", "turn_completed"]);
+    }
+
+    /// 结束前否决点：始终否决的钩子也只能再要一轮（每次任务上限一次），
+    /// 且提醒以 `Role::System` 注入——不冒充用户消息，也不伪装成工具结果。
+    #[tokio::test]
+    async fn stop_hook_vetoes_at_most_once_then_allows_completion() {
+        struct AlwaysVeto {
+            calls: Mutex<u32>,
+        }
+        impl StopHook for AlwaysVeto {
+            fn before_stop(&self, ctx: StopContext<'_>) -> Option<String> {
+                *self.calls.lock().unwrap() += 1;
+                assert!(ctx.last_text.contains("完成"), "否决点应看到模型收尾文本");
+                Some("宿主提醒：还有未完成的步骤。".into())
+            }
+        }
+
+        let (mut agent, store, cancel, _broker) = make_loop(vec![
+            vec![ModelStreamEvent::OutputTextDelta { delta: "完成".into() }, usage_ev()],
+            vec![ModelStreamEvent::OutputTextDelta { delta: "完成".into() }, usage_ev()],
+            vec![ModelStreamEvent::OutputTextDelta { delta: "完成".into() }, usage_ev()],
+        ]);
+        let hook = Arc::new(AlwaysVeto { calls: Mutex::new(0) });
+        agent.stop_hook = Some(hook.clone() as Arc<dyn StopHook>);
+        let summary = agent.run_task("任务", Arc::new(CapturingSink(store)), cancel).await;
+
+        // 一次否决 → 再跑一轮；第二次想否决时 `stop_vetoed` 已置位，必须放行。
+        assert_eq!(summary.turns, 2);
+        assert_eq!(summary.reason, TurnEndReason::Completed);
+        assert_eq!(*hook.calls.lock().unwrap(), 1);
+    }
+
+    /// 没有钩子时必须一轮结束——否决点不能让既有「文本即完成」的路径多跑。
+    #[tokio::test]
+    async fn without_stop_hook_text_only_turn_completes_immediately() {
+        let (agent, store, cancel, _broker) = make_loop(vec![
+            vec![ModelStreamEvent::OutputTextDelta { delta: "完成".into() }, usage_ev()],
+            vec![ModelStreamEvent::OutputTextDelta { delta: "不该跑到".into() }, usage_ev()],
+        ]);
+        let summary = agent.run_task("任务", Arc::new(CapturingSink(store)), cancel).await;
+        assert_eq!(summary.turns, 1);
+        assert_eq!(summary.reason, TurnEndReason::Completed);
+    }
+
+    /// 默认钩子只对「计划态悬空」开口：正常收尾不得被拦。
+    #[test]
+    fn plan_mode_stop_hook_only_vetoes_when_plan_is_active() {
+        let history: Vec<HistoryItem> = Vec::new();
+        let ctx = |plan_active| StopContext {
+            history: &history,
+            last_text: "完成",
+            turn: 1,
+            plan_active,
+        };
+        assert!(PlanModeStopHook.before_stop(ctx(true)).is_some());
+        assert!(PlanModeStopHook.before_stop(ctx(false)).is_none());
     }
 
     #[tokio::test]
@@ -1278,6 +1412,7 @@ mod tests {
             rollout_broke: std::sync::atomic::AtomicBool::new(false),
             session_id: None,
             jobs: None,
+            stop_hook: None,
         };
         (agent, recorded, store)
     }
@@ -1480,6 +1615,7 @@ mod tests {
             rollout_broke: std::sync::atomic::AtomicBool::new(false),
             session_id: None,
             jobs: None,
+            stop_hook: None,
         };
         let (sink, _store) = CapturingSink::new();
         let task = format!(

@@ -64,6 +64,10 @@ pub struct AgentOutcome {
     pub artifacts: Vec<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub token_usage: Option<AgentTokenUsage>,
+    /// 子代理实际消耗的轮数（SH-121④）。进行中为 `None`，收口后带上真实值——
+    /// 父代理要能区分「跑满预算」与「两轮就收敛」。
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub turns: Option<u32>,
 }
 
 /// 编排能力：由组合根注入到 `ToolContext`（实现见 `subagent_registry`）。

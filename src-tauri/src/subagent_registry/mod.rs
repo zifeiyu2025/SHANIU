@@ -68,11 +68,20 @@ pub struct ExitSummary {
     pub summary: String,
     pub artifacts: Vec<String>,
     pub token_usage: TokenTotals,
+    /// 实际消耗的轮数（SH-121④：收口必须能回答「跑了几轮」）。
+    /// 预算耗尽与正常完成用同一个字段对比，不能靠猜。
+    #[serde(default)]
+    pub turns: u32,
 }
 
 impl ExitSummary {
     /// 由一次 `run_instance` 的收口结果构造。
-    pub fn from_run(reason: TurnEndReason, last_text: Option<&str>, token_usage: TokenTotals) -> Self {
+    pub fn from_run(
+        reason: TurnEndReason,
+        last_text: Option<&str>,
+        token_usage: TokenTotals,
+        turns: u32,
+    ) -> Self {
         let (status, fallback) = match reason {
             TurnEndReason::Completed => (ExitStatus::Done, "子代理已完成，但没有产出文本结果。"),
             TurnEndReason::Cancelled => (ExitStatus::Cancelled, "子代理已被取消，没有回传结果。"),
@@ -86,7 +95,7 @@ impl ExitSummary {
             .filter(|text| !text.is_empty())
             .map(str::to_string)
             .unwrap_or_else(|| fallback.to_string());
-        Self { status, summary, artifacts: Vec::new(), token_usage }
+        Self { status, summary, artifacts: Vec::new(), token_usage, turns }
     }
 
     /// 取消专用的最小摘要（尚未开始运行就被取消）。
@@ -96,6 +105,7 @@ impl ExitSummary {
             summary: reason.to_string(),
             artifacts: Vec::new(),
             token_usage: TokenTotals::default(),
+            turns: 0,
         }
     }
 
@@ -427,6 +437,7 @@ impl SubagentRegistry {
                 summary.reason,
                 instance.last_assistant_text(),
                 instance.usage,
+                summary.turns,
             );
             // 历史必须在收口前快照：finish 之后等待方可能立即 resume。
             let history = instance.history.clone();
@@ -806,6 +817,7 @@ mod tests {
             rollout_broke: std::sync::atomic::AtomicBool::new(false),
             session_id: None,
             jobs: None,
+            stop_hook: None,
         })
     }
 
@@ -956,6 +968,7 @@ mod tests {
             summary: "结".repeat(10_000),
             artifacts: vec![],
             token_usage: TokenTotals::default(),
+            turns: 1,
         };
         let capped = exit.capped();
         assert!(serialized_len(&capped) <= EXIT_SUMMARY_MAX_BYTES);
@@ -966,6 +979,7 @@ mod tests {
             summary: "短结论".into(),
             artifacts: vec![],
             token_usage: TokenTotals::default(),
+            turns: 1,
         };
         assert_eq!(short.clone().capped(), short);
     }
@@ -1062,6 +1076,7 @@ mod tests {
             rollout_broke: std::sync::atomic::AtomicBool::new(false),
             session_id: None,
             jobs: None,
+            stop_hook: None,
         });
         let registry = Arc::new(SubagentRegistry::new(DEFAULT_MAX_CONCURRENT));
         let scope = root_scope();

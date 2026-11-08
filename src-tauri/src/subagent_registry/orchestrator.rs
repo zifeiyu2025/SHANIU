@@ -126,6 +126,7 @@ fn outcome_from_exit(agent_id: &str, exit: ExitSummary) -> AgentOutcome {
             cached_input_tokens: exit.token_usage.cached_input_tokens,
             output_tokens: exit.token_usage.output_tokens,
         }),
+        turns: Some(exit.turns),
     }
 }
 
@@ -136,5 +137,6 @@ fn pending(agent_id: &str, summary: &str) -> AgentOutcome {
         summary: summary.to_string(),
         artifacts: Vec::new(),
         token_usage: None,
+        turns: None,
     }
 }

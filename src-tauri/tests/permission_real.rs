@@ -130,6 +130,7 @@ async fn real_model_is_blocked_when_it_reaches_outside_the_narrowed_allowlist() 
         rollout_broke: std::sync::atomic::AtomicBool::new(false),
         session_id: Some("qa-permission-real".into()),
         jobs: None,
+        stop_hook: None,
     });
     let broker = engine.broker.clone();
 

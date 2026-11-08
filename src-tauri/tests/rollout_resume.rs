@@ -129,6 +129,7 @@ fn loop_with(agent_ws: &Path, backend: Arc<Scripted>, writer: Arc<RolloutWriter>
         rollout_broke: std::sync::atomic::AtomicBool::new(false),
         session_id: None,
         jobs: None,
+        stop_hook: None,
     }
 }
 
@@ -339,6 +340,7 @@ async fn resume_continues_real_work_on_a_real_endpoint() {
             rollout_broke: std::sync::atomic::AtomicBool::new(false),
             session_id: None,
             jobs: None,
+            stop_hook: None,
         };
         (agent, broker)
     };

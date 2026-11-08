@@ -80,6 +80,7 @@ async fn root_spawns_two_real_children_and_collects_their_answers() {
         rollout_broke: std::sync::atomic::AtomicBool::new(false),
         session_id: Some("qa-orchestrate".into()),
         jobs: None,
+        stop_hook: None,
     });
 
     let registry = Arc::new(SubagentRegistry::new(2));
