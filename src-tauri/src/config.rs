@@ -560,6 +560,20 @@ impl Default for SessionTitleConfig {
 #[serde(default)]
 pub struct SandboxConfig {
     pub mode: SandboxMode,
+    /// OS 级沙箱机制（SH-021/022）。默认 AppContainer；回退必须显式选择。
+    pub os: OsSandbox,
+}
+
+/// OS 级沙箱机制。
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum OsSandbox {
+    /// AppContainer 打底：路径/读隔离 + 网络默认拒绝（默认值）。
+    #[default]
+    AppContainer,
+    /// **显式回退**：只有受限令牌 + Job 的逻辑沙箱，没有路径级边界。
+    /// 选中后 UI 与日志必须标注「当前未启用 OS 沙箱」，禁止静默降级。
+    Logical,
 }
 
 /// M0 默认只读：真实沙箱 M2 落地，fail-closed 语义见 ADR-002。
@@ -1458,7 +1472,21 @@ mod tests {
         assert_eq!(cfg2.model.provider, "openai-chat");
         assert_eq!(cfg2.model.max_turns, 32);
         assert_eq!(cfg2.sandbox.mode, SandboxMode::ReadOnly);
+        assert_eq!(cfg2.sandbox.os, OsSandbox::AppContainer, "OS 沙箱默认必须是 AppContainer");
         fs::remove_dir_all(&base).ok();
+    }
+
+    #[test]
+    fn sandbox_os_must_be_explicit_to_fall_back_to_logical() {
+        // 默认值不能是 logical：回退必须由用户写进配置，不能自动发生。
+        let default: SandboxConfig = toml::from_str("").unwrap();
+        assert_eq!(default.os, OsSandbox::AppContainer);
+        let logical: SandboxConfig = toml::from_str("os = \"logical\"").unwrap();
+        assert_eq!(logical.os, OsSandbox::Logical);
+        assert!(
+            toml::from_str::<SandboxConfig>("os = \"auto\"").is_err(),
+            "未知 OS 沙箱取值必须解析失败，不能悄悄落到默认"
+        );
     }
 
     #[test]

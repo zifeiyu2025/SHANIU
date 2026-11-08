@@ -248,11 +248,22 @@ impl ToolExecutor for UnifiedExec {
         let (tx, mut rx) = mpsc::channel::<sandbox::ExecLine>(256);
 
         // 按沙箱策略启动（fail-closed：沙箱准备失败 → Execution，执行数为 0）
-        let mut waiter = match sandbox::prepare_spawn(
-            ctx.sandbox,
-            "cmd",
-            &["/C", command],
-            &cwd,
+        // 网络：v1 默认断；只有该会话在 UI 上批准过「允许网络」才带 internetClient 能力。
+        let network = if sandbox::network::global().is_granted(ctx.session_id.as_deref()) {
+            sandbox::NetworkAccess::Allow
+        } else {
+            sandbox::NetworkAccess::Deny
+        };
+        let mut waiter = match sandbox::prepare_spawn_with(
+            sandbox::SpawnRequest {
+                policy: ctx.sandbox,
+                workspace_root: &ctx.workspace_root,
+                program: "cmd",
+                args: &["/C", command],
+                cwd: &cwd,
+                network,
+                os: sandbox::current_os_mode(),
+            },
             tx.clone(),
         ) {
             Ok(sandbox::PreparedSpawn::Plain(mut cmd)) => {
@@ -453,18 +464,23 @@ mod tests {
         std::fs::remove_dir_all(&ws).ok();
     }
 
+    /// 不碰网络、不碰文件系统的「长命令」：超时 / 取消 / 后台终止用例的样本。
+    /// SH-022 之后默认断网，`ping 127.0.0.1` 在沙箱里会立刻失败退出（exit 1），
+    /// 再拿它当"跑得够久"的样本，超时与取消用例就会因为"进程早退了"而失真。
+    const SLOW_COMMAND: &str = "for /L %i in (1,1,400000000) do @rem";
+
     #[tokio::test]
     async fn timeout_kills_and_reports() {
         let ws = workspace();
         let out = UnifiedExec::new()
             .execute(
-                serde_json::json!({"command": "ping -n 10 127.0.0.1", "timeout_ms": 300}),
+                serde_json::json!({"command": SLOW_COMMAND, "timeout_ms": 300}),
                 &ctx(&ws),
             )
             .await
             .unwrap();
         assert!(!out.success);
-        assert!(out.output.contains("超时"));
+        assert!(out.output.contains("超时"), "超时用例拿到的是：{}", out.output);
         std::fs::remove_dir_all(&ws).ok();
     }
 
@@ -477,7 +493,7 @@ mod tests {
         let handle = tokio::spawn({
             let ctx = context.clone();
             let executor = executor.clone();
-            async move { executor.execute(serde_json::json!({"command": "ping -n 10 127.0.0.1"}), &ctx).await }
+            async move { executor.execute(serde_json::json!({"command": SLOW_COMMAND}), &ctx).await }
         });
         tokio::time::sleep(Duration::from_millis(150)).await;
         context.cancel.cancel();
@@ -550,7 +566,7 @@ mod tests {
         let context = ctx(&ws).with_jobs(Some("s1".into()), Some(registry.clone()));
         let out = UnifiedExec::new()
             .execute(
-                serde_json::json!({"command": "ping -n 30 127.0.0.1", "run_in_background": true}),
+                serde_json::json!({"command": SLOW_COMMAND, "run_in_background": true}),
                 &context,
             )
             .await

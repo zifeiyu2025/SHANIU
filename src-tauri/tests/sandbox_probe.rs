@@ -2,17 +2,22 @@
 //!
 //! 用真实子进程验证 workspace-write 的**行为边界**，而不是断言配置值：
 //! 1) 工作区内写入应成功——证明沙箱本身可用（否则"越界被拒"可能是沙箱根本没跑起来）；
-//! 2) 工作区外写入应失败——FF-3 的核心不变量。
+//! 2) 工作区外写入应失败——FF-3 的核心不变量；
+//! 3) 工作区外读取应失败——AppContainer 的读隔离（SH-021）；
+//! 4) 默认断网——没有会话级授权时不能建立出站连接；
+//! 5) 受限令牌层独立生效——逻辑沙箱路径同样剥离特权（纵深两层各自可验证）。
 //!
-//! 第 2 条当前标记 `#[ignore]`：受限令牌（剥离特权）保留用户 SID，不做路径级裁决；
-//! 越界写封锁依赖 deny-ACE（SH-022），尚未实现。该用例是 SH-019 spike 的度量工具，
-//! 实现 SH-022 后去掉 ignore 即为 FF-3 的回归门禁。
+//! 允许位置按用户 2026-11-08 的决定：工作区根 / temp / 工具链目录。
+//! 因此"越界"探针的目标**不能放在 temp**——temp 是明确授权的位置。
 
 #![cfg(windows)]
 
+use std::io::Write as _;
 use std::path::{Path, PathBuf};
 use std::process::id;
-use std::sync::atomic::{AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
+use std::sync::Arc;
+use std::time::Duration;
 
 use shaniu_lib::config::SandboxMode;
 use shaniu_lib::sandbox::{prepare_spawn, PreparedSpawn};
@@ -27,17 +32,38 @@ fn unique_dir(tag: &str) -> PathBuf {
     dir
 }
 
-/// 在 workspace-write 沙箱内执行 `cmd /C <line>`，返回退出码。
-async fn run_sandboxed(cwd: &Path, line: &str) -> i32 {
-    let (tx, mut rx) = mpsc::channel(256);
-    // 排干读线程，避免管道写满阻塞子进程
-    tokio::spawn(async move { while rx.recv().await.is_some() {} });
+/// 工作区外、且不在 temp / 工具链目录里的位置（用户主目录下）。
+fn outside_dir(tag: &str) -> PathBuf {
+    let n = SEQ.fetch_add(1, Ordering::SeqCst);
+    let home = std::env::var_os("USERPROFILE").expect("探针需要 USERPROFILE 定位工作区外目录");
+    let dir = PathBuf::from(home).join(format!("shaniu-probe-{tag}-{}-{n}", id()));
+    std::fs::create_dir_all(&dir).unwrap();
+    dir
+}
+
+/// 在 workspace-write 沙箱内执行 `cmd /C <line>`，返回退出码与合并输出。
+async fn run_sandboxed_capture(cwd: &Path, line: &str) -> (i32, String) {
+    let (tx, mut rx) = mpsc::channel::<shaniu_lib::sandbox::ExecLine>(256);
+    let collector = tokio::spawn(async move {
+        let mut output = String::new();
+        while let Some((_, text)) = rx.recv().await {
+            output.push_str(&text);
+            output.push('\n');
+        }
+        output
+    });
     let spawn = prepare_spawn(SandboxMode::WorkspaceWrite, "cmd", &["/C", line], cwd, tx)
         .expect("workspace-write 沙箱应可创建（fail-closed 之外的正常路径）");
-    match spawn {
+    let code = match spawn {
         PreparedSpawn::Restricted(mut child) => child.wait().await.expect("等待子进程失败"),
         PreparedSpawn::Plain(_) => panic!("workspace-write 不得退化为无沙箱执行（FF-4）"),
-    }
+    };
+    let output = collector.await.expect("读线程不应 panic");
+    (code, output)
+}
+
+async fn run_sandboxed(cwd: &Path, line: &str) -> i32 {
+    run_sandboxed_capture(cwd, line).await.0
 }
 
 #[tokio::test]
@@ -65,13 +91,11 @@ async fn readonly_mode_refuses_to_spawn() {
     std::fs::remove_dir_all(&ws).ok();
 }
 
-/// FF-3 核心不变量：工作区外写入必须失败。///
-/// 预期当前失败（deny-ACE 未实现），故 ignore；SH-022 落地后移除 ignore 即成为回归门禁。
+/// FF-3 核心不变量：工作区外写入必须失败。
 #[tokio::test]
-#[ignore = "SH-022 deny-ACE 未实现：受限令牌不含路径级写封锁"]
 async fn sandbox_denies_write_outside_workspace() {
     let ws = unique_dir("ws");
-    let outside = unique_dir("outside");
+    let outside = outside_dir("outside");
     let target = outside.join("escaped.txt");
 
     let code = run_sandboxed(&ws, &format!("echo escaped> \"{}\"", target.display())).await;
@@ -79,18 +103,154 @@ async fn sandbox_denies_write_outside_workspace() {
     // 无论 cmd 返回码如何，关键断言是：越界文件不得出现
     assert!(
         !target.exists(),
-        "工作区外写入成功（cmd 退出码 {code}）：沙箱未提供路径级隔离"
+        "工作区外写入成功（cmd 退出码 {code}）：AppContainer 未提供路径级隔离"
     );
     std::fs::remove_dir_all(&ws).ok();
     std::fs::remove_dir_all(&outside).ok();
+}
+
+/// AppContainer 读隔离：工作区外的文件内容不得进入沙箱进程。
+#[tokio::test]
+async fn sandbox_denies_read_outside_workspace() {
+    let ws = unique_dir("read-ws");
+    let outside = outside_dir("read-outside");
+    let secret = outside.join("secret.txt");
+    let marker = "SHANIU-READ-ISOLATION-MARKER";
+    std::fs::write(&secret, marker).unwrap();
+
+    let (_code, output) =
+        run_sandboxed_capture(&ws, &format!("type \"{}\"", secret.display())).await;
+
+    assert!(
+        !output.contains(marker),
+        "工作区外文件内容被读进沙箱（输出：{output}）"
+    );
+    std::fs::remove_dir_all(&ws).ok();
+    std::fs::remove_dir_all(&outside).ok();
+}
+
+/// 一个人工的 HTTP 服务：用于验证「默认断网」不是靠猜。
+///
+/// 必须**先读掉请求再回写**：如果 accept 后不回读就 `write_all` 并立刻 close，
+/// curl 会拿到 RST（exit 56），对照组就变成假红——而对照组一红，断网用例的结论
+/// 就不可信了（分不清"被沙箱拦"还是"服务本身没通"）。
+struct LocalServer {
+    port: u16,
+    stop: Arc<AtomicBool>,
+}
+
+impl LocalServer {
+    fn start() -> Self {
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let port = listener.local_addr().unwrap().port();
+        listener.set_nonblocking(true).unwrap();
+        let stop = Arc::new(AtomicBool::new(false));
+        let thread_stop = stop.clone();
+        std::thread::spawn(move || {
+            while !thread_stop.load(Ordering::Relaxed) {
+                match listener.accept() {
+                    Ok((mut stream, _)) => {
+                        use std::io::Read as _;
+                        let _ = stream.set_read_timeout(Some(Duration::from_secs(1)));
+                        let mut request = [0u8; 2048];
+                        let _ = stream.read(&mut request);
+                        let _ = stream.write_all(
+                            b"HTTP/1.1 200 OK\r\nContent-Length: 2\r\nConnection: close\r\n\r\nok",
+                        );
+                        let _ = stream.flush();
+                        // 半关闭写方向：让 curl 先读到完整响应与 EOF，再随 drop 收尾。
+                        let _ = stream.shutdown(std::net::Shutdown::Write);
+                    }
+                    Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => {
+                        std::thread::sleep(Duration::from_millis(10));
+                    }
+                    Err(_) => break,
+                }
+            }
+        });
+        Self { port, stop }
+    }
+}
+
+impl Drop for LocalServer {
+    fn drop(&mut self) {
+        self.stop.store(true, Ordering::Relaxed);
+    }
+}
+
+/// 默认断网：未授权的会话连 loopback 都出不去；对照组（非沙箱进程）必须能连通，
+/// 否则这条用例就成了"服务没起来"的假绿。
+#[tokio::test]
+async fn sandbox_denies_network_without_session_grant() {
+    let server = LocalServer::start();
+    let url = format!("http://127.0.0.1:{}/", server.port);
+
+    // 对照组：普通进程能连上 → 服务本身可用
+    let control = std::process::Command::new("curl")
+        .args(["-s", "-o", "NUL", "-w", "%{http_code}", "--max-time", "3", &url])
+        .output()
+        .expect("需要系统 curl 做对照");
+    assert!(
+        control.status.success() && String::from_utf8_lossy(&control.stdout).trim() == "200",
+        "对照组 curl 未连通本地服务，断网用例结论不可信：{control:?}"
+    );
+
+    let ws = unique_dir("net");
+    let (code, output) = run_sandboxed_capture(
+        &ws,
+        &format!(
+            "curl -s -o NUL --max-time 3 \"{}\"",
+            url
+        ),
+    )
+    .await;
+    assert_ne!(code, 0, "未授权会话不应能出站（输出：{output}）");
+    std::fs::remove_dir_all(&ws).ok();
+}
+
+/// 纵深第 1 层（受限令牌）独立验证：不走 AppContainer 时，特权也必须已被剥离。
+#[tokio::test]
+async fn restricted_token_layer_strips_privileges_independently() {
+    let ws = unique_dir("token");
+    let (tx, mut rx) = mpsc::channel::<shaniu_lib::sandbox::ExecLine>(256);
+    let collector = tokio::spawn(async move {
+        let mut output = String::new();
+        while let Some((_, text)) = rx.recv().await {
+            output.push_str(&text);
+            output.push('\n');
+        }
+        output
+    });
+    let mut child = shaniu_lib::sandbox::windows_impl::spawn_restricted_command(
+        "whoami",
+        &["/priv"],
+        &ws,
+        tx,
+    )
+    .expect("受限令牌路径应可启动");
+    let code = child.wait().await.expect("等待子进程失败");
+    let output = collector.await.expect("读线程不应 panic");
+    assert_eq!(code, 0, "whoami 应成功：{output}");
+    for privileged in ["SeDebugPrivilege", "SeBackupPrivilege", "SeImpersonatePrivilege"] {
+        assert!(
+            !output.contains(privileged),
+            "受限令牌未剥离 {privileged}（输出：{output}）"
+        );
+    }
+    std::fs::remove_dir_all(&ws).ok();
 }
 
 /// 输出**逐行完整性**探针（FF-3 沙箱路径的数据保真一侧）。
 ///
 /// 回归锁：受限沙箱的管道读线程曾把 `BufReader` 建在读循环内部——每轮新建会读走一整块
 /// （默认 8KB）却只交出一行，缓冲区里的剩余行随 drop 一起丢弃。症状是"命令输出莫名缺行"：
-/// `dir /b` 有 5 个文件，模型只收到第一行，于是反复重跑同一条命令也看不到完整清单。
+/// 列举 5 个文件，模型只收到第一行，于是反复重跑同一条命令也看不到完整清单。
 /// 这类丢失不会让任何一退出码变红，只有把"每一行都必须到齐"写成断言才拦得住。
+///
+/// 为什么用 `for %f in (*)` 而不是 `dir /b`：AppContainer 下的 `cmd /C dir` **实测静默无输出**
+/// （退出码 1、stdout 零字节；`vol` 也返回空卷标），而同一容器里 `for %f in (*)`、`type`、
+/// `echo` 都正常——这是 cmd 依赖卷信息导致的行为差异，不是路径隔离失效。回归锁要锁的是
+/// 管道逐行保真，不该被这个 quirk 绑架，所以用同样会「一次吐多行」的 `for` 列举。
 #[tokio::test]
 async fn sandbox_streams_every_output_line() {
     let names = ["alpha.txt", "bravo.txt", "charlie.txt", "delta.txt", "echofiv.txt"];
@@ -107,15 +267,21 @@ async fn sandbox_streams_every_output_line() {
         }
         lines
     });
-    let spawn = prepare_spawn(SandboxMode::WorkspaceWrite, "cmd", &["/C", "dir /b"], &ws, tx)
-        .expect("workspace-write 沙箱应可创建");
+    let spawn = prepare_spawn(
+        SandboxMode::WorkspaceWrite,
+        "cmd",
+        &["/C", "for %f in (*) do @echo %f"],
+        &ws,
+        tx,
+    )
+    .expect("workspace-write 沙箱应可创建");
     let code = match spawn {
         PreparedSpawn::Restricted(mut child) => child.wait().await.expect("等待子进程失败"),
         PreparedSpawn::Plain(_) => panic!("workspace-write 不得退化为无沙箱执行"),
     };
-    assert_eq!(code, 0, "沙箱内 dir /b 应成功");
-
     let lines = collector.await.expect("读线程不应 panic");
+    assert_eq!(code, 0, "沙箱内 for 列举应成功（实际输出：{lines:?}）");
+
     for name in names {
         assert!(
             lines.iter().any(|l| l == name),

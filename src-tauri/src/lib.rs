@@ -1267,6 +1267,34 @@ fn delete_api_key(app: tauri::AppHandle, provider: String) -> Result<(), String>
     config::SecretStore::new(&state.config_root()).delete_key(&provider)
 }
 
+/// 沙箱状态（SH-021）：UI 依据 `os_enabled=false` 常驻标注「当前未启用 OS 沙箱」。
+#[tauri::command]
+fn sandbox_status(app: tauri::AppHandle) -> sandbox::SandboxStatus {
+    let state = app.state::<AppState>();
+    let cfg = state.config();
+    sandbox::status(cfg.sandbox.mode, cfg.sandbox.os)
+}
+
+/// 当前进程内的会话级网络授权（按会话，重启清零）。
+#[tauri::command]
+fn sandbox_network_grants() -> Vec<sandbox::network::NetworkGrant> {
+    sandbox::network::global().list()
+}
+
+/// 批准某个会话的网络访问（一次性，作用于该会话内全部子进程）。
+#[tauri::command]
+fn sandbox_network_grant(
+    session_id: String,
+) -> Result<sandbox::network::NetworkGrant, String> {
+    sandbox::network::global().grant(&session_id, "用户在 UI 批准：本会话允许网络")
+}
+
+/// 撤销某个会话的网络访问。
+#[tauri::command]
+fn sandbox_network_revoke(session_id: String) -> Result<bool, String> {
+    sandbox::network::global().revoke(&session_id)
+}
+
 /// 报错时列给用户的合法档位名。它必须与 `config.rs` 的枚举同源——
 /// `safety_mode_names_match_enums` 用穷举后的序列化结果逐字比对，加一档忘改这里会直接红。
 const SANDBOX_MODE_NAMES: &str = "read_only / workspace_write / danger_full_access";
@@ -1772,6 +1800,21 @@ pub fn run() {
             (AppConfig::default(), dirs.config_root.join(config::CONFIG_FILE))
         });
 
+    // SH-021/022：OS 沙箱机制与会话级网络授权的进程级装配。
+    // 回退到 logical 必须是配置里显式写的——这里只负责把它标出来，绝不自动回退。
+    sandbox::set_os_mode(app_config.sandbox.os);
+    sandbox::network::init(Some(
+        dirs.data_root.join("sandbox").join("network-audit.jsonl"),
+    ));
+    if app_config.sandbox.mode == config::SandboxMode::WorkspaceWrite
+        && app_config.sandbox.os == config::OsSandbox::Logical
+    {
+        tracing::warn!(
+            "当前未启用 OS 沙箱（sandbox.os = \"logical\"，用户显式选择）：\
+             命令只有受限令牌 + Job 的逻辑隔离，没有路径级写入边界"
+        );
+    }
+
     // SH-094 批 2：gateway hub（广播发送端 + 一次性 token + 动态端口）。sink 取发送端喂事件，
     // .setup 绑定 loopback 端口跑 accept 循环，gateway_info 命令回报 port/token 给前端。
     let gateway_hub = gateway::GatewayHub::new(dirs.data_root.join(config::SESSIONS_DIR));
@@ -1811,6 +1854,10 @@ pub fn run() {
             get_settings,
             save_settings,
             save_providers,
+            sandbox_status,
+            sandbox_network_grants,
+            sandbox_network_grant,
+            sandbox_network_revoke,
             model_discovery::discover_models,
             delete_api_key,
             open_in_explorer,
@@ -1916,7 +1963,11 @@ pub fn run() {
                 .show_menu_on_left_click(false)
                 .on_menu_event(|app, event| match event.id().as_ref() {
                     "show" => show_main_window(app),
-                    "quit" => app.exit(0),
+                    "quit" => {
+                        // SH-021：退出前先还原 DACL 并删除容器 profile，避免残留 ACE/悬空 profile。
+                        sandbox::shutdown();
+                        app.exit(0);
+                    }
                     _ => {}
                 })
                 .on_tray_icon_event(|tray, event| {

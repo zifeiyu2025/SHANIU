@@ -28,7 +28,8 @@ use windows::Win32::Foundation::{
 };
 use windows::Win32::Security::{
     CreateRestrictedToken, GetTokenInformation, LUID_AND_ATTRIBUTES, SECURITY_ATTRIBUTES,
-    SE_PRIVILEGE_REMOVED, TOKEN_ACCESS_MASK, TOKEN_PRIVILEGES, TokenPrivileges,
+    SECURITY_CAPABILITIES, SE_PRIVILEGE_REMOVED, SID_AND_ATTRIBUTES, TOKEN_ACCESS_MASK,
+    TOKEN_PRIVILEGES, TokenPrivileges, PSID,
 };
 use windows::Win32::System::JobObjects::{
     AssignProcessToJobObject, CreateJobObjectW, SetInformationJobObject,
@@ -41,7 +42,8 @@ use windows::Win32::System::Threading::{
     GetExitCodeProcess, InitializeProcThreadAttributeList, OpenProcessToken,
     UpdateProcThreadAttribute, EXTENDED_STARTUPINFO_PRESENT, INFINITE,
     LPPROC_THREAD_ATTRIBUTE_LIST, PROCESS_CREATION_FLAGS, PROC_THREAD_ATTRIBUTE_HANDLE_LIST,
-    PROC_THREAD_ATTRIBUTE_JOB_LIST, PROCESS_INFORMATION, ResumeThread, STARTF_USESTDHANDLES,
+    PROC_THREAD_ATTRIBUTE_JOB_LIST, PROC_THREAD_ATTRIBUTE_SECURITY_CAPABILITIES,
+    PROCESS_INFORMATION, ResumeThread, STARTF_USESTDHANDLES,
     STARTUPINFOEXW, STARTUPINFOW, WaitForSingleObject, CREATE_NO_WINDOW, CREATE_SUSPENDED,
     CREATE_UNICODE_ENVIRONMENT,
 };
@@ -88,7 +90,7 @@ impl JobGuard {
 
 // ============================== 宽字符助手 ==============================
 
-fn wide(s: impl AsRef<OsStr>) -> Vec<u16> {
+pub(crate) fn wide(s: impl AsRef<OsStr>) -> Vec<u16> {
     s.as_ref().encode_wide().chain(std::iter::once(0)).collect()
 }
 
@@ -158,8 +160,11 @@ unsafe fn create_restricted_token() -> Result<HandleGuard, String> {
     Ok(HandleGuard::new(new_token))
 }
 
-// ============================== 匿名管道 ==============================
+// 实测记录（2026-11-08）：AppContainer 走 `PROC_THREAD_ATTRIBUTE_SECURITY_CAPABILITIES`
+// （官方「Launch an AppContainer」样例路径），不要改成 `SetTokenInformation(TokenAppContainerSid)`：
+// 后者对普通令牌与受限令牌都返回 ERROR_INVALID_PARAMETER（0x80070057），不是可用的标记方式。
 
+// ============================== 匿名管道 ==============================
 /// 创建一对匿名管道：读端转 std::fs::File（Send，父进程读）；
 /// 写端 HandleGuard（子进程继承后由父进程关闭）。
 unsafe fn create_inheritable_pipe() -> Result<(std::fs::File, HandleGuard), String> {
@@ -302,6 +307,109 @@ pub fn spawn_restricted_command(
         Ok(RestrictedChild { process, _job: job_guard })
     }
 }
+
+/// 以「删除全部特权的受限令牌 + JobObject + **AppContainer**」启动子进程（SH-021）。
+///
+/// 与 `spawn_restricted_command` 的区别：
+///  - 进程在 AppContainer 里运行，默认只能读写被授予容器 SID 的目录（ACE 由 `acl` 管理）；
+///  - `capabilities` 为空 = 没有 `internetClient`，出站网络被系统拒绝（v1 默认断网）；
+///  - 句柄白名单只放两根管道，避免把父进程其它可继承句柄漏给沙箱子进程。
+pub fn spawn_appcontainer_command(
+    program: &str,
+    args: &[&str],
+    cwd: &Path,
+    app_container_sid: PSID,
+    capabilities: Vec<PSID>,
+    tx: mpsc::Sender<ExecLine>,
+) -> Result<RestrictedChild, String> {
+    let mut command_line = program.to_string();
+    for arg in args {
+        command_line.push(' ');
+        command_line.push_str(arg);
+    }
+    let mut cmdline_wide = wide(&command_line);
+    let cwd_wide = wide(cwd.as_os_str());
+
+    unsafe {
+        // 纵深第 1 层：删除全部特权的受限令牌（提权面）
+        let token_guard = create_restricted_token()?;
+
+        // 纵深第 2 层：Job（进程树回收 / 资源边界）
+        let job = CreateJobObjectW(None, PCWSTR::null())
+            .map_err(|e| format!("CreateJobObject 失败: {e}"))?;
+        let job_guard = JobGuard(HandleGuard::new(job));
+        let mut limits = JOBOBJECT_EXTENDED_LIMIT_INFORMATION::default();
+        limits.BasicLimitInformation.LimitFlags = JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE;
+        SetInformationJobObject(
+            job_guard.handle(),
+            JobObjectExtendedLimitInformation,
+            &limits as *const _ as *const core::ffi::c_void,
+            std::mem::size_of::<JOBOBJECT_EXTENDED_LIMIT_INFORMATION>() as u32,
+        )
+        .map_err(|e| format!("SetInformationJobObject 失败: {e}"))?;
+
+        let (out_read, out_write) = create_inheritable_pipe()?;
+        let (err_read, err_write) = create_inheritable_pipe()?;
+
+        // 纵深第 3 层：容器（路径/读隔离 + 网络默认拒绝）；
+        // 属性表：句柄白名单 + Job + 容器 SID/能力，创建即入容器、入 Job。
+        let mut attributes = AttrList::new(3)?;
+        attributes.set_handle_list(vec![out_write.handle(), err_write.handle()])?;
+        attributes.set_job(job_guard.handle())?;
+        attributes.set_security_capabilities(app_container_sid, capabilities)?;
+
+        let mut startup = STARTUPINFOEXW::default();
+        startup.StartupInfo.cb = std::mem::size_of::<STARTUPINFOEXW>() as u32;
+        startup.StartupInfo.dwFlags = STARTF_USESTDHANDLES;
+        startup.StartupInfo.hStdInput = HANDLE::default();
+        startup.StartupInfo.hStdOutput = out_write.handle();
+        startup.StartupInfo.hStdError = err_write.handle();
+        startup.lpAttributeList = attributes.as_mut_ptr();
+
+        let flags = PROCESS_CREATION_FLAGS(
+            CREATE_SUSPENDED.0
+                | CREATE_NO_WINDOW.0
+                | EXTENDED_STARTUPINFO_PRESENT.0
+                | CREATE_UNICODE_ENVIRONMENT.0,
+        );
+        let mut pi = PROCESS_INFORMATION::default();
+        CreateProcessAsUserW(
+            Some(token_guard.handle()),
+            PCWSTR::null(),
+            Some(PWSTR(cmdline_wide.as_mut_ptr())),
+            None,
+            None,
+            true,
+            flags,
+            None,
+            PCWSTR::from_raw(cwd_wide.as_ptr()),
+            &startup.StartupInfo,
+            &mut pi,
+        )
+        .map_err(|e| {
+            format!(
+                "CreateProcessAsUserW(AppContainer) 失败（program={program}，cwd={}）: {e}。\
+                 容器内无法启动该命令时不会自动降级；如确认是工具链不兼容，\
+                 请显式设置 sandbox.os = \"logical\"",
+                cwd.display()
+            )
+        })?;
+
+        ResumeThread(pi.hThread);
+
+        // 父侧：关闭继承写端；读端交读线程
+        drop(out_write);
+        drop(err_write);
+        spawn_pipe_reader(out_read, 0, tx.clone());
+        spawn_pipe_reader(err_read, 1, tx);
+
+        let raw: RawHandle = pi.hProcess.0.cast();
+        let process = OwnedHandle::from_raw_handle(raw);
+        let _ = CloseHandle(pi.hThread);
+        Ok(RestrictedChild { process, _job: job_guard })
+    }
+}
+
 
 /// std::thread 逐行读管道 → blocking_send 桥接 tokio 通道（codex read_handle_loop 同思路）。
 fn spawn_pipe_reader(read: std::fs::File, channel: u8, tx: mpsc::Sender<ExecLine>) {
@@ -483,12 +591,15 @@ impl RestrictedStdioChild {
     }
 }
 
-/// `PROC_THREAD_ATTRIBUTE_HANDLE_LIST` / `JOB_LIST` 的持有者。
-/// 属性值指向自身 Vec，必须活到 CreateProcess 返回。
+/// `PROC_THREAD_ATTRIBUTE_HANDLE_LIST` / `JOB_LIST` / `SECURITY_CAPABILITIES` 的持有者。
+/// 属性值指向自身 Vec / 结构体，必须活到 CreateProcess 返回。
 struct AttrList {
     buffer: Vec<u8>,
     handle_list: Vec<HANDLE>,
     job_list: Vec<HANDLE>,
+    /// `SECURITY_CAPABILITIES.Capabilities` 指向这里：Vec 必须在结构体存活期间不被移动。
+    capabilities: Vec<SID_AND_ATTRIBUTES>,
+    security_capabilities: Option<SECURITY_CAPABILITIES>,
 }
 
 impl AttrList {
@@ -509,7 +620,13 @@ impl AttrList {
             InitializeProcThreadAttributeList(Some(list), count, None, &mut size)
                 .map_err(|e| format!("InitializeProcThreadAttributeList 失败: {e}"))?;
         }
-        Ok(Self { buffer, handle_list: Vec::new(), job_list: Vec::new() })
+        Ok(Self {
+            buffer,
+            handle_list: Vec::new(),
+            job_list: Vec::new(),
+            capabilities: Vec::new(),
+            security_capabilities: None,
+        })
     }
 
     fn as_mut_ptr(&mut self) -> LPPROC_THREAD_ATTRIBUTE_LIST {
@@ -552,6 +669,56 @@ impl AttrList {
             )
         }
         .map_err(|e| format!("UpdateProcThreadAttribute(JOB_LIST) 失败: {e}"))
+    }
+
+    /// 挂 AppContainer 身份（`PROC_THREAD_ATTRIBUTE_SECURITY_CAPABILITIES`）。
+    ///
+    /// 这是官方「Launch an AppContainer」样例的路径：容器 SID 与能力 SID 一起交给
+    /// 进程创建属性，由内核在建进程时打标。**传空能力列表 = 无 `internetClient`**，
+    /// 出站网络即被容器边界默认拒绝（v1 默认断网就靠这一点，不是靠额外代码拦）。
+    fn set_security_capabilities(
+        &mut self,
+        app_container_sid: PSID,
+        capabilities: Vec<PSID>,
+    ) -> Result<(), String> {
+        const SE_GROUP_ENABLED: u32 = 0x0000_0004;
+        self.capabilities = capabilities
+            .into_iter()
+            .map(|sid| SID_AND_ATTRIBUTES {
+                Sid: sid,
+                Attributes: SE_GROUP_ENABLED,
+            })
+            .collect();
+        self.security_capabilities = Some(SECURITY_CAPABILITIES {
+            AppContainerSid: app_container_sid,
+            Capabilities: if self.capabilities.is_empty() {
+                std::ptr::null_mut()
+            } else {
+                self.capabilities.as_mut_ptr()
+            },
+            CapabilityCount: self.capabilities.len() as u32,
+            Reserved: 0,
+        });
+        let list = self.as_mut_ptr();
+        // 属性值必须指向稳定地址：结构体存在字段里，Vec 已提前填好，这里只取地址。
+        let value = (self
+            .security_capabilities
+            .as_ref()
+            .expect("刚写入的 SECURITY_CAPABILITIES")
+            as *const SECURITY_CAPABILITIES)
+            .cast::<core::ffi::c_void>();
+        unsafe {
+            UpdateProcThreadAttribute(
+                list,
+                0,
+                PROC_THREAD_ATTRIBUTE_SECURITY_CAPABILITIES as usize,
+                Some(value),
+                std::mem::size_of::<SECURITY_CAPABILITIES>(),
+                None,
+                None,
+            )
+        }
+        .map_err(|e| format!("UpdateProcThreadAttribute(SECURITY_CAPABILITIES) 失败: {e}"))
     }
 }
 

@@ -74,6 +74,10 @@ windows = { version = "0.62", features = [
     "Win32_Foundation",
     "Win32_Security_Cryptography",
     "Win32_Security",
+    # SH-021/022：AppContainer profile 生命周期（Isolation）与目录 DACL 读写（Authorization）
+    "Win32_Security_Isolation",
+    "Win32_Security_Authorization",
+    "Win32_Storage_FileSystem",
     "Win32_System_JobObjects",
     "Win32_System_Pipes",
     "Win32_System_Threading",
