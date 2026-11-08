@@ -79,6 +79,7 @@ import { apply as mcpTrustApply, inject as mcpTrustInject } from './mcp-trust'
 import { apply as modelConfigApply, inject as modelConfigInject } from './model-config'
 import { apply as sandboxStatusApply, inject as sandboxStatusInject } from './sandbox-status'
 import { apply as userTerminalSourceApply, inject as userTerminalSourceInject } from './terminal-source'
+import { apply as trayHintApply, inject as trayHintInject } from './tray-hint'
 
 export interface BootHandle {
   readonly ctx: Context
@@ -253,9 +254,11 @@ export async function bootShaniu(container: HTMLElement, options: BootOptions = 
     { inject: uiSidebarRightInject, apply: uiSidebarRightApply },
     // SH-071 用户终端：先装数据源（提供 `webTerminals`，走宿主的裸进程 ConPTY），
     // 再装上游 UI 包。只在桌面态挂载——浏览器联调没有本地进程可连，挂了只会是假入口。
+    // 托盘提示同属终端通道：关窗口只是隐藏到托盘，仍有会话在跑时宿主发一次事件。
     ...(realData
       ? [{ inject: userTerminalSourceInject, apply: userTerminalSourceApply } as FeaturePlugin,
-        { inject: uiSidebarTerminalInject, apply: uiSidebarTerminalApply } as FeaturePlugin]
+        { inject: uiSidebarTerminalInject, apply: uiSidebarTerminalApply } as FeaturePlugin,
+        { inject: trayHintInject, apply: trayHintApply } as FeaturePlugin]
       : []),
     { inject: uiSidebarFilesInject, apply: uiSidebarFilesApply },
     { inject: uiSidebarBrowserInject, apply: uiSidebarBrowserApply },

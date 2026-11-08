@@ -1946,6 +1946,19 @@ pub fn run() {
             if let tauri::WindowEvent::CloseRequested { api, .. } = event {
                 if window.label() == "main" {
                     api.prevent_close();
+                    // 隐藏 ≠ 退出：仍有终端在跑时提示一次，避免「关了窗口就没事」的误判。
+                    // 只在隐藏这一刻发一次，不重复轰炸；没有存活终端则不发。
+                    let count = window
+                        .app_handle()
+                        .try_state::<user_terminal::UserTerminalManager>()
+                        .map(|state| state.active_count())
+                        .unwrap_or(0);
+                    if count > 0 {
+                        let _ = window.emit(
+                            user_terminal::TRAY_HINT_EVENT,
+                            user_terminal::TrayHint { count },
+                        );
+                    }
                     let _ = window.hide();
                 }
             }

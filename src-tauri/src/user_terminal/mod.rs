@@ -28,6 +28,15 @@ use tauri::{AppHandle, Emitter, State};
 /// 用户终端帧事件通道；与 `EventMsg` / 会话事件**不是**同一条通道。
 pub const FRAME_EVENT: &str = "user-terminal://frame";
 
+/// 关窗口（隐藏到托盘）时的一次性提示通道；只在仍有终端存活时发一次。
+pub const TRAY_HINT_EVENT: &str = "user-terminal://tray-hint";
+
+/// 托盘提示载荷。`count` 是当前存活的终端会话数。
+#[derive(Debug, Clone, Serialize)]
+pub struct TrayHint {
+    pub count: usize,
+}
+
 /// 单次写入上限：防止前端一次塞进巨量数据占住 IPC。
 const MAX_INPUT_BYTES: usize = 1 << 20;
 const MAX_ID_LEN: usize = 64;
@@ -228,7 +237,7 @@ impl UserTerminalManager {
 
     /// 存活会话数。唯一用途是给"隐藏到托盘时仍有终端在跑"提供状态，
     /// 不推断控制权、不代表任何接管语义。
-    fn active_count(&self) -> usize {
+    pub(crate) fn active_count(&self) -> usize {
         self.inner
             .lock()
             .unwrap_or_else(|poisoned| poisoned.into_inner())
