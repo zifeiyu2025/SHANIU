@@ -237,7 +237,7 @@ impl McpSession {
         }
 
         let instructions_dropped = result.get("instructions").is_some_and(|value| !value.is_null());
-        self.send_notification("notifications/initialized", None).await?;
+        send_line(&self.stdin, "notifications/initialized", None).await?;
 
         let identity =
             ServerIdentity { name, version, protocol_version, instructions_dropped };
@@ -358,13 +358,6 @@ impl McpSession {
         Ok(())
     }
 
-    async fn send_notification(&self, method: &str, params: Option<Value>) -> Result<(), SessionError> {
-        let line = rpc::encode_notification(method, params);
-        self.stdin.send(line.into_bytes()).await.map_err(|_| SessionError::Closed {
-            reason: "stdin 写端已关闭".into(),
-        })
-    }
-
     /// 发一条请求并等待其响应。超时/取消都会清理 pending，迟到响应由读线程丢弃。
     pub async fn request(
         &mut self,
@@ -428,16 +421,19 @@ impl McpSession {
                 "timeout"
             };
             // 尽力告知 server 别再算了；失败不影响本端结论（连接可能已断）。
-            let _ = self
-                .send_notification("notifications/cancelled", Some(json!({ "requestId": id, "reason": reason })))
-                .await;
+            // 只借用 stdin 通道（不写 `&self` 辅助函数），避免把 Sync 要求传染给整个会话。
+            let line = rpc::encode_notification(
+                "notifications/cancelled",
+                Some(json!({ "requestId": id, "reason": reason })),
+            );
+            let _ = self.stdin.send(line.into_bytes()).await;
         }
         outcome
     }
 
     /// 测试用：用一对内存通道替代真实进程，驱动与生产完全相同的读线程。
     #[cfg(test)]
-    fn with_channels(server_id: &str) -> (Self, mpsc::Receiver<Vec<u8>>, mpsc::Sender<StdioEvent>) {
+    pub(crate) fn with_channels(server_id: &str) -> (Self, mpsc::Receiver<Vec<u8>>, mpsc::Sender<StdioEvent>) {
         let (stdin, server_in) = mpsc::channel(16);
         let (server_out, stdout) = mpsc::channel(16);
         let (events_tx, events) = mpsc::channel(16);
@@ -476,6 +472,23 @@ fn spawn_reader(
     closed: Arc<Mutex<Option<String>>>,
 ) -> JoinHandle<()> {
     tokio::spawn(read_loop(stdout, stdin, pending, events, closed))
+}
+
+/// 发一条通知。
+///
+/// 刻意**不写成 `&self` 的 async 方法**：`&self` 跨 await 会要求 `McpSession: Sync`，
+/// 而进程句柄只保证 `Send`（沙箱结构里的句柄共享需要额外同步）。只借用 stdin 通道，
+/// 会话仍可被 `tokio::sync::Mutex` 独占使用。
+async fn send_line(
+    stdin: &mpsc::Sender<Vec<u8>>,
+    method: &str,
+    params: Option<Value>,
+) -> Result<(), SessionError> {
+    let line = rpc::encode_notification(method, params);
+    stdin
+        .send(line.into_bytes())
+        .await
+        .map_err(|_| SessionError::Closed { reason: "stdin 写端已关闭".into() })
 }
 
 /// 单读者：所有入站消息在这里分流。关闭时把在途请求全部判失败，而不是让它们各自超时。

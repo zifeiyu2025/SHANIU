@@ -89,6 +89,15 @@ windows = { version = "0.62", features = [
 # SH-060 MCP 客户端：可执行文件哈希（批准记录 / 启动前校验 / 重启前复核同源）。
 # 纯 Rust 实现（RustCrypto，MIT/Apache-2.0）；lock 里已有传递依赖，这里提升为直接依赖。
 sha2 = "0.10"
+# SH-061 分发名消歧：codex 的 `_<sha1(raw)[..12]>` 双端短哈希（RustCrypto，MIT/Apache-2.0）。
+# lock 里已有传递依赖，这里提升为直接依赖。
+sha1 = "0.10"
+# SH-062 注入检测前的文本规范化（docs/02 §3.1.2 A-R2 要求 NFKC）。
+# MIT/Apache-2.0；仓库此前没有 Unicode 归一化实现，手写不现实。
+unicode-normalization = "0.1"
+# SH-060 输出包裹 nonce：server 不可预测的 128 位随机数，必须取 OS 熵。
+# MIT/Apache-2.0；lock 里已有同名 crate（0.3.4），这里提升为直接依赖。
+getrandom = "0.3"
 
 [profile.release]
 codegen-units = 1

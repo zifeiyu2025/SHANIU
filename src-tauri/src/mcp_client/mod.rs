@@ -13,6 +13,10 @@
 //! - 依赖边只允许 `config` / `events` / `tool_router` / `sandbox`（docs/01 E47）。
 
 pub mod command;
+pub mod guard;
+pub mod manifest;
+pub mod output;
 pub mod process;
+pub mod registry;
 pub mod rpc;
 pub mod session;
