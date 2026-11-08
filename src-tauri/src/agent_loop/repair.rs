@@ -403,12 +403,8 @@ mod tests {
         RepairController::new(max_attempts, std::env::temp_dir())
     }
 
-    fn temp_workspace() -> PathBuf {
-        static SEQ: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
-        let n = SEQ.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
-        let dir = std::env::temp_dir().join(format!("shaniu-repair-{}-{n}", std::process::id()));
-        std::fs::create_dir_all(&dir).unwrap();
-        dir
+    fn temp_workspace() -> crate::test_support::TestTempDir {
+        crate::test_support::TestTempDir::new("repair")
     }
 
     #[test]
@@ -513,7 +509,7 @@ mod tests {
     const BROKEN_TEST_FILE: &str = "#[test]\nfn adds() {\n    assert_eq!(add(2, 2), 4);\n}\n";
 
     /// 建一个「测试文件 + 失败输出指向它」的工作区，返回 (工作区, 失败输出)。
-    fn failing_test_workspace(relative: &str, content: &str) -> (PathBuf, String) {
+    fn failing_test_workspace(relative: &str, content: &str) -> (crate::test_support::TestTempDir, String) {
         let ws = temp_workspace();
         let full = ws.join(relative);
         if let Some(parent) = full.parent() {
@@ -534,7 +530,7 @@ mod tests {
     #[test]
     fn deleting_assertion_after_failure_is_rejected() {
         let (ws, failure) = failing_test_workspace("tests/check.rs", BROKEN_TEST_FILE);
-        let mut controller = RepairController::new(DEFAULT_REPAIR_ATTEMPTS, ws.clone());
+        let mut controller = RepairController::new(DEFAULT_REPAIR_ATTEMPTS, ws.to_path_buf());
         assert!(matches!(
             controller.observe("unified_exec", false, &failure),
             Some(RepairAction::Nudge(_))
@@ -549,7 +545,6 @@ mod tests {
         };
         assert!(text.contains("tests/check.rs"), "{text}");
         assert!(text.contains("按失败处理"), "{text}");
-        std::fs::remove_dir_all(&ws).ok();
     }
 
     #[test]
@@ -557,7 +552,7 @@ mod tests {
         // 「条数不变，只把期望值改成能通过的值」——语义上无法自动判定是改宽还是重构，
         // 但改了测试文件这件事必须被看见（SH-126 的底线要求）。
         let (ws, failure) = failing_test_workspace("tests/check.rs", BROKEN_TEST_FILE);
-        let mut controller = RepairController::new(DEFAULT_REPAIR_ATTEMPTS, ws.clone());
+        let mut controller = RepairController::new(DEFAULT_REPAIR_ATTEMPTS, ws.to_path_buf());
         assert!(controller.observe("unified_exec", false, &failure).is_some());
         let after = BROKEN_TEST_FILE.replace("add(2, 2), 4", "add(2, 2), 0");
         let writes = vec![write_of(&ws, "tests/check.rs", BROKEN_TEST_FILE, &after)];
@@ -568,7 +563,6 @@ mod tests {
         };
         assert!(text.contains("tests/check.rs"), "{text}");
         assert!(text.contains("不能当作修复成功的证据"), "{text}");
-        std::fs::remove_dir_all(&ws).ok();
     }
 
     #[test]
@@ -576,7 +570,7 @@ mod tests {
         // Rust 常见形态：实现与测试同在 src/lib.rs。改实现是正常修复，改断言才是问题。
         let source = "fn add(a: i32, b: i32) -> i32 { a - b }\n\n#[cfg(test)]\nmod t {\n    #[test]\n    fn adds() { assert_eq!(super::add(2, 2), 4); }\n}\n";
         let (ws, failure) = failing_test_workspace("src/lib.rs", source);
-        let mut controller = RepairController::new(DEFAULT_REPAIR_ATTEMPTS, ws.clone());
+        let mut controller = RepairController::new(DEFAULT_REPAIR_ATTEMPTS, ws.to_path_buf());
         assert!(controller.observe("unified_exec", false, &failure).is_some());
         let widened = source.replace("assert_eq!(super::add(2, 2), 4);", "assert!(true);");
         let writes = vec![write_of(&ws, "src/lib.rs", source, &widened)];
@@ -588,14 +582,13 @@ mod tests {
             ),
             "同一文件里把断言降级也必须被抓到"
         );
-        std::fs::remove_dir_all(&ws).ok();
     }
 
     #[test]
     fn fixing_implementation_only_is_not_flagged() {
         let source = "fn add(a: i32, b: i32) -> i32 { a - b }\n\n#[cfg(test)]\nmod t {\n    #[test]\n    fn adds() { assert_eq!(super::add(2, 2), 4); }\n}\n";
         let (ws, failure) = failing_test_workspace("src/lib.rs", source);
-        let mut controller = RepairController::new(DEFAULT_REPAIR_ATTEMPTS, ws.clone());
+        let mut controller = RepairController::new(DEFAULT_REPAIR_ATTEMPTS, ws.to_path_buf());
         assert!(controller.observe("unified_exec", false, &failure).is_some());
         let fixed = source.replace("a - b", "a + b");
         let writes = vec![write_of(&ws, "src/lib.rs", source, &fixed)];
@@ -604,7 +597,6 @@ mod tests {
             controller.check_test_tampering("unified_exec", &writes).is_none(),
             "只改实现、断言原样保留，不得被判可疑"
         );
-        std::fs::remove_dir_all(&ws).ok();
     }
 
     #[test]
@@ -613,9 +605,8 @@ mod tests {
         let ws = temp_workspace();
         std::fs::create_dir_all(ws.join("tests")).unwrap();
         std::fs::write(ws.join("tests/check.rs"), BROKEN_TEST_FILE).unwrap();
-        let mut controller = RepairController::new(DEFAULT_REPAIR_ATTEMPTS, ws.clone());
+        let mut controller = RepairController::new(DEFAULT_REPAIR_ATTEMPTS, ws.to_path_buf());
         let writes = vec![write_of(&ws, "tests/check.rs", BROKEN_TEST_FILE, "fn adds() {}\n")];
         assert!(controller.check_test_tampering("unified_exec", &writes).is_none());
-        std::fs::remove_dir_all(&ws).ok();
     }
 }

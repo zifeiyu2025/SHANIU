@@ -35,11 +35,8 @@ fn server_root() -> PathBuf {
     PathBuf::from("D:/AI/Windows-MCP")
 }
 
-fn temp_root(tag: &str) -> PathBuf {
-    let dir = std::env::temp_dir().join(format!("shaniu-real-mcp-{tag}-{}", std::process::id()));
-    let _ = std::fs::remove_dir_all(&dir);
-    std::fs::create_dir_all(&dir).expect("创建临时配置根");
-    dir
+fn temp_root(tag: &str) -> shaniu_lib::test_support::TestTempDir {
+    shaniu_lib::test_support::TestTempDir::new(&format!("real-mcp-{tag}"))
 }
 
 /// 关键：`env` 故意留空——只靠全局环境白名单，测的才是「白名单够不够」。
@@ -306,7 +303,8 @@ async fn real_server_binary_replacement_enters_retrust_without_spawn() {
         ..McpServerConfig::default()
     };
 
-    let runtime = std::sync::Arc::new(McpRuntime::new(&temp_root("retrust-trust")));
+    let trust_root = temp_root("retrust-trust");
+    let runtime = std::sync::Arc::new(McpRuntime::new(&trust_root));
     let first = runtime
         .connect_and_review(&config, &server_root())
         .await
@@ -361,7 +359,8 @@ async fn real_server_crash_restarts_once_then_degrades() {
         eprintln!("跳过：未设置 SHANIU_REAL_MCP_PYTHON");
         return;
     };
-    let runtime = std::sync::Arc::new(McpRuntime::new(&temp_root("kill")));
+    let kill_root = temp_root("kill");
+    let runtime = std::sync::Arc::new(McpRuntime::new(&kill_root));
     let review = runtime
         .connect_and_review(&config(&python), &server_root())
         .await
@@ -529,7 +528,8 @@ async fn real_site_packages_change_enters_retrust_without_spawn() {
         ..McpServerConfig::default()
     };
 
-    let runtime = std::sync::Arc::new(McpRuntime::new(&temp_root("tree-trust")));
+    let tree_trust_root = temp_root("tree-trust");
+    let runtime = std::sync::Arc::new(McpRuntime::new(&tree_trust_root));
     let first = runtime
         .connect_and_review(&config, &server_root())
         .await

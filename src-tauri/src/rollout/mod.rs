@@ -449,15 +449,9 @@ fn ends_newline(path: &Path) -> bool {
 mod tests {
     use super::*;
     use crate::model_client::{HistoryItem, Role};
-    use std::sync::atomic::{AtomicUsize, Ordering};
 
-    static SEQ: AtomicUsize = AtomicUsize::new(0);
-
-    fn temp_dir() -> PathBuf {
-        let n = SEQ.fetch_add(1, Ordering::SeqCst);
-        let dir = std::env::temp_dir().join(format!("shaniu-rollout-{}-{n}", std::process::id()));
-        std::fs::create_dir_all(&dir).unwrap();
-        dir
+    fn temp_dir() -> crate::test_support::TestTempDir {
+        crate::test_support::TestTempDir::new("rollout")
     }
 
     fn meta(agent: &str) -> RolloutItem {
@@ -485,7 +479,6 @@ mod tests {
         assert_eq!(v["type"], "session_meta", "首行必须是 session_meta 判别标签");
         assert_eq!(v["agent_id"], agent);
         assert_eq!(v["config_snapshot"]["base_url"], "https://x/v1");
-        std::fs::remove_dir_all(&dir).ok();
     }
 
     #[test]
@@ -494,7 +487,6 @@ mod tests {
         let _w = RolloutWriter::create(&dir, &meta("dup")).unwrap();
         let err = RolloutWriter::create(&dir, &meta("dup")).unwrap_err();
         assert!(matches!(err, RolloutError::AlreadyExists(_)), "覆盖历史档案不可逆，必须拒绝：{err}");
-        std::fs::remove_dir_all(&dir).ok();
     }
 
     #[test]
@@ -515,7 +507,6 @@ mod tests {
         assert_eq!(back.meta, meta("agent-rt"));
         assert_eq!(back.items, items, "读回来的条目序列必须与写入完全一致");
         assert_eq!(back.torn_tail_lines, 0);
-        std::fs::remove_dir_all(&dir).ok();
     }
 
     #[test]
@@ -552,7 +543,6 @@ mod tests {
         .unwrap();
         let err = read(&path).unwrap_err();
         assert!(matches!(err, RolloutError::Corrupted { .. }), "中间坏行必须报错：{err}");
-        std::fs::remove_dir_all(&dir).ok();
     }
 
     #[test]
@@ -573,7 +563,6 @@ mod tests {
         )
         .unwrap();
         assert!(matches!(read(&no_meta).unwrap_err(), RolloutError::NoSessionMeta(_)));
-        std::fs::remove_dir_all(&dir).ok();
     }
 
     #[test]
@@ -587,7 +576,6 @@ mod tests {
         )
         .unwrap_err();
         assert!(matches!(err, RolloutError::NoSessionMeta(_)), "建档只接受 session_meta：{err}");
-        std::fs::remove_dir_all(&dir).ok();
     }
 
     /// 把档案的 mtime 钉成确定值：`list` 的排序判据是更新时间，靠写入先后碰运气会让测试变脆。
@@ -627,7 +615,6 @@ mod tests {
         assert_eq!(one.title, "把 端口 改成 9090");
         // item_count 不含首行 meta
         assert_eq!(one.item_count, 2);
-        std::fs::remove_dir_all(&dir).ok();
     }
 
     #[test]
@@ -639,7 +626,6 @@ mod tests {
         set_mtime(&newer, 2_000);
         let ids: Vec<_> = list(&dir).into_iter().map(|s| s.agent_id).collect();
         assert_eq!(ids, vec!["new".to_string(), "old".to_string()], "最近在用的排最前");
-        std::fs::remove_dir_all(&dir).ok();
     }
 
     #[test]
@@ -651,7 +637,6 @@ mod tests {
         std::fs::write(dir.join("notes.txt"), "不是档案").unwrap();
         let ids: Vec<_> = list(&dir).into_iter().map(|s| s.agent_id).collect();
         assert_eq!(ids, vec!["good".to_string()], "坏档案与非档案文件都不该拖垮列表");
-        std::fs::remove_dir_all(&dir).ok();
     }
 
     #[test]
@@ -667,7 +652,6 @@ mod tests {
         assert_eq!(one.item_count, 3, "行数按物理行计，坏行留给 read() 去报错");
         assert!(matches!(read(&path).unwrap_err(), RolloutError::Corrupted { .. }),
             "同一份档案走 read() 必须仍然报错——两种容错口径不能混用");
-        std::fs::remove_dir_all(&dir).ok();
     }
 
     #[test]
@@ -678,7 +662,6 @@ mod tests {
         let one = &list(&dir)[0];
         assert_eq!(one.title.chars().count(), 41, "40 字 + 省略号，按字符数截断");
         assert!(one.title.ends_with('…'));
-        std::fs::remove_dir_all(&dir).ok();
     }
 
     #[test]
@@ -693,7 +676,6 @@ mod tests {
         // 空标题 = 清除自定义，回落到派生标题：界面"清空名字"不该留下一个空标题行
         assert_eq!(set_title(&dir, "a", "   ").unwrap(), None);
         assert_eq!(list(&dir)[0].title, "第一条用户消息");
-        std::fs::remove_dir_all(&dir).ok();
     }
 
     #[test]
@@ -711,7 +693,6 @@ mod tests {
         assert!(matches!(err, RenameError::TitleInvalid(ref m) if m.contains(&TITLE_MAX_CHARS.to_string())), "{err:?}");
         // 拒绝的写入必须一点都没落盘
         assert!(read_titles(&dir).is_empty());
-        std::fs::remove_dir_all(&dir).ok();
     }
 
     /// 序列化形状是前端契约：适配层按 `code` 分派（`title-invalid` → DSH wire 的
@@ -745,7 +726,6 @@ mod tests {
         let rows = list(&dir);
         assert_eq!(rows.len(), 1, "标题文件坏了也不能让列表打不开");
         assert_eq!(rows[0].title, "正文", "读不到自定义标题就回落派生标题，而不是报错");
-        std::fs::remove_dir_all(&dir).ok();
     }
 
     #[test]
@@ -770,7 +750,6 @@ mod tests {
 
         std::fs::write(dir.join(SESSION_ORDER_FILE), "{ not json").unwrap();
         assert_eq!(read_session_order(&dir), SessionOrderState::default(), "坏文件当空表，不挡列表");
-        std::fs::remove_dir_all(&dir).ok();
     }
 
     /// 归档与置顶的互斥写是上层命令的职责，这里只钉一件事：同一次写里两个集合
@@ -790,6 +769,5 @@ mod tests {
         let final_state = read_session_order(&dir);
         assert_eq!(final_state.archived_session_ids, vec!["x".to_string()]);
         assert_eq!(final_state.pinned_session_ids, vec!["y".to_string()]);
-        std::fs::remove_dir_all(&dir).ok();
     }
 }

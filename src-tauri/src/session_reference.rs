@@ -556,12 +556,7 @@ mod tests {
 
     #[test]
     fn prepare_replaces_mentions_and_appends_context_after_the_citing_message() {
-        let root = std::env::temp_dir().join(format!(
-            "shaniu-sref-{}-{}",
-            std::process::id(),
-            ulid::Ulid::generate()
-        ));
-        std::fs::create_dir_all(&root).unwrap();
+        let root = crate::test_support::TestTempDir::new("sref");
         write_archive(&root, "ref-1", "D:/ws2", &[
             (Role::User, "被引用的问题"),
             (Role::Assistant, "被引用的回答"),
@@ -581,22 +576,15 @@ mod tests {
             }
             _ => panic!("第二条应是引用上下文"),
         }
-        std::fs::remove_dir_all(&root).ok();
     }
 
     #[test]
     fn self_reference_missing_archive_and_too_many_are_errors() {
-        let root = std::env::temp_dir().join(format!(
-            "shaniu-sref-{}-{}",
-            std::process::id(),
-            ulid::Ulid::generate()
-        ));
-        std::fs::create_dir_all(&root).unwrap();
+        let root = crate::test_support::TestTempDir::new("sref");
         let self_ref = vec![message(Role::User, &format!("@[我]({})", encode_uri("self")))];
         assert!(prepare_request(&self_ref, &root, "self").is_err());
         let missing = vec![message(Role::User, &format!("@[没了]({})", encode_uri("nope")))];
         assert!(prepare_request(&missing, &root, "self").is_err());
-        std::fs::remove_dir_all(&root).ok();
         let too_many = format!(
             "@[a]({}) @[b]({}) @[c]({}) @[d]({})",
             encode_uri("a"), encode_uri("b"), encode_uri("c"), encode_uri("d")

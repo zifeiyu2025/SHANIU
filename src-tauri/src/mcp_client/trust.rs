@@ -553,12 +553,8 @@ mod tests {
     use crate::mcp_client::fingerprint::FingerprintInput;
     use crate::mcp_client::guard::RuleId;
 
-    fn temp_dir(tag: &str) -> PathBuf {
-        static SEQ: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
-        let n = SEQ.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
-        let dir = std::env::temp_dir().join(format!("shaniu-trust-{tag}-{}-{n}", std::process::id()));
-        std::fs::create_dir_all(&dir).unwrap();
-        dir
+    fn temp_dir(tag: &str) -> crate::test_support::TestTempDir {
+        crate::test_support::TestTempDir::new(&format!("trust-{tag}"))
     }
 
     fn input(env: BTreeMap<String, String>, tools: &[&str]) -> FingerprintInput {
@@ -619,7 +615,6 @@ mod tests {
         let again = reloaded.record("srv").expect("记录必须落盘");
         assert_eq!(again.fingerprint, record.fingerprint);
         assert_eq!(again.input.executable, record.input.executable);
-        std::fs::remove_dir_all(dir).ok();
     }
 
     #[test]
@@ -629,7 +624,6 @@ mod tests {
         std::fs::write(&path, "{not json").unwrap();
         let store = TrustStore::load(&path);
         assert!(store.record("srv").is_none(), "损坏文件不得被当成已批准");
-        std::fs::remove_dir_all(dir).ok();
     }
 
     #[test]
@@ -655,7 +649,6 @@ mod tests {
         let reloaded = TrustStore::load(&path).record("srv").cloned().unwrap();
         assert_eq!(reloaded.approved_tools(), resolved.approved_tools());
         assert!(!reloaded.tools.iter().find(|g| g.dispatch_name.ends_with("write")).unwrap().approved);
-        std::fs::remove_dir_all(dir).ok();
     }
 
     #[test]
@@ -667,7 +660,6 @@ mod tests {
         let resolved = store.resolve("srv", &record.fingerprint, &[]).unwrap();
         assert_eq!(resolved.status, TrustStatus::Blocked);
         assert!(resolved.approved_tools().is_empty());
-        std::fs::remove_dir_all(dir).ok();
     }
 
     #[test]
@@ -681,7 +673,6 @@ mod tests {
             .unwrap_err();
         assert!(matches!(err, TrustError::FingerprintMismatch { .. }));
         assert_eq!(store.record("srv").unwrap().status, TrustStatus::Review);
-        std::fs::remove_dir_all(dir).ok();
     }
 
     #[test]
@@ -698,7 +689,6 @@ mod tests {
             )
             .unwrap();
         assert_eq!(resolved.approved_tools()[0].1, RiskLevel::Destructive);
-        std::fs::remove_dir_all(dir).ok();
     }
 
     #[test]
@@ -726,7 +716,6 @@ mod tests {
         assert!(store.record("srv").is_none());
         assert!(store.exemptions().is_empty(), "撤销信任必须连豁免一起撤销");
         assert!(TrustStore::load(&path).record("srv").is_none());
-        std::fs::remove_dir_all(dir).ok();
     }
 
     #[test]
@@ -744,7 +733,6 @@ mod tests {
         let raw = std::fs::read_to_string(&path).unwrap();
         assert!(!raw.contains(secret), "env 明文不得落盘");
         assert!(raw.contains("API_TOKEN"), "键名要保留供界面展示");
-        std::fs::remove_dir_all(dir).ok();
     }
 
     #[test]

@@ -6,7 +6,6 @@
 
 use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
-use std::sync::atomic::{AtomicU32, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
@@ -21,8 +20,6 @@ use tokio_util::sync::CancellationToken;
 
 const SERVER: &str = "fake";
 
-static SEQ: AtomicU32 = AtomicU32::new(0);
-
 fn fixture_path() -> String {
     format!(
         "{}/tests/fixtures/fake_mcp_server.js",
@@ -34,15 +31,8 @@ fn workspace() -> PathBuf {
     PathBuf::from(env!("CARGO_MANIFEST_DIR"))
 }
 
-fn temp_root(tag: &str) -> PathBuf {
-    let dir = std::env::temp_dir().join(format!(
-        "shaniu-mcp-trust-{tag}-{}-{}",
-        std::process::id(),
-        SEQ.fetch_add(1, Ordering::SeqCst)
-    ));
-    let _ = std::fs::remove_dir_all(&dir);
-    std::fs::create_dir_all(&dir).expect("创建临时配置根");
-    dir
+fn temp_root(tag: &str) -> shaniu_lib::test_support::TestTempDir {
+    shaniu_lib::test_support::TestTempDir::new(&format!("mcp-trust-{tag}"))
 }
 
 fn config(extra_tool: bool) -> McpServerConfig {

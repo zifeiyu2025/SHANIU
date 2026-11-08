@@ -137,15 +137,9 @@ mod tests {
     use crate::rollout::resume::resume;
     use crate::rollout::{ConfigSnapshot, RolloutItem, RolloutWriter};
     use std::path::PathBuf;
-    use std::sync::atomic::{AtomicUsize, Ordering};
 
-    static SEQ: AtomicUsize = AtomicUsize::new(0);
-
-    fn temp_dir() -> PathBuf {
-        let n = SEQ.fetch_add(1, Ordering::SeqCst);
-        let dir = std::env::temp_dir().join(format!("shaniu-scompact-{}-{n}", std::process::id()));
-        std::fs::create_dir_all(&dir).unwrap();
-        dir
+    fn temp_dir() -> crate::test_support::TestTempDir {
+        crate::test_support::TestTempDir::new("scompact")
     }
 
     fn meta(agent: &str) -> RolloutItem {
@@ -215,6 +209,5 @@ mod tests {
             other => panic!("首条应是摘要 user 消息，得到 {other:?}"),
         }
         assert_eq!(replayed.applied_compactions, 1);
-        std::fs::remove_dir_all(&dir).ok();
     }
 }

@@ -80,16 +80,12 @@ impl ToolExecutor for SkillTool {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::path::PathBuf;
 
-    fn temp_root(tag: &str) -> PathBuf {
-        let dir = std::env::temp_dir().join(format!(
-            "shaniu-skill-tool-{tag}-{}-{}",
-            std::process::id(),
-            ulid::Ulid::generate()
-        ));
-        std::fs::create_dir_all(dir.join(".git")).unwrap();
-        dir
+    fn temp_root(tag: &str) -> crate::test_support::TestTempDir {
+        // 自删临时目录：panic 也会清（2026-11-09 夹具规矩）。
+        let guard = crate::test_support::TestTempDir::new(&format!("skill-tool-{tag}"));
+        std::fs::create_dir_all(guard.join(".git")).unwrap();
+        guard
     }
 
     fn write_skill(root: &std::path::Path, name: &str, extra: &str, body: &str) {
@@ -102,9 +98,9 @@ mod tests {
         .unwrap();
     }
 
-    fn context(root: &PathBuf) -> ToolContext {
+    fn context(root: &std::path::Path) -> ToolContext {
         ToolContext::new(
-            root,
+            root.to_path_buf(),
             tokio_util::sync::CancellationToken::new(),
             "call-skill",
             std::sync::Arc::new(crate::events::NullEventSink),

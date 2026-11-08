@@ -110,15 +110,14 @@ async fn real_model_is_blocked_when_it_reaches_outside_the_narrowed_allowlist() 
 
     let mut router = ToolRouter::new();
     shaniu_lib::tools::register_builtin(&mut router, Arc::new(PlanState::new()));
-    let workspace = std::env::temp_dir().join("shaniu-permission-real");
-    std::fs::create_dir_all(&workspace).expect("创建工作区");
+    let workspace = shaniu_lib::test_support::TestTempDir::new("permission-real");
 
     let engine = Arc::new(AgentLoop {
         backend: Arc::new(ResponsesBackend { provider, api_key }),
         router: Arc::new(router),
         broker: Arc::new(shaniu_lib::permission::ApprovalBroker::new()),
         plan_state: Arc::new(PlanState::new()),
-        workspace_root: workspace,
+        workspace_root: workspace.to_path_buf(),
         max_turns: 6,
         token_budget: 0,
         tree_budget: Default::default(),

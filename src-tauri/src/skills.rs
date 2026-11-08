@@ -558,14 +558,9 @@ pub fn list_skills(
 mod tests {
     use super::*;
 
-    fn temp_root(tag: &str) -> PathBuf {
-        let dir = std::env::temp_dir().join(format!(
-            "shaniu-skill-{tag}-{}-{}",
-            std::process::id(),
-            ulid::Ulid::generate()
-        ));
-        std::fs::create_dir_all(&dir).unwrap();
-        dir
+    fn temp_root(tag: &str) -> crate::test_support::TestTempDir {
+        // 自删临时目录：panic 也会清（2026-11-09 夹具规矩）。
+        crate::test_support::TestTempDir::new(&format!("skill-{tag}"))
     }
 
     fn write_skill(root: &Path, relative: &str, frontmatter: &str, body: &str) {

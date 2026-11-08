@@ -7,9 +7,8 @@ use std::fs;
 
 #[test]
 fn panic_hook_writes_redacted_crash_report() {
-    let dir = std::env::temp_dir().join(format!("shaniu-crash-hook-{}", std::process::id()));
-    let _ = fs::remove_dir_all(&dir);
-    shaniu_lib::config::install_crash_hook(dir.clone());
+    let dir = shaniu_lib::test_support::TestTempDir::new("crash-hook");
+    shaniu_lib::config::install_crash_hook(dir.to_path_buf());
 
     let caught = std::panic::catch_unwind(|| {
         panic!("crash-hook-probe sk-abcdefgh12345678");
@@ -28,5 +27,4 @@ fn panic_hook_writes_redacted_crash_report() {
     assert!(!text.contains("sk-abcdefgh12345678"), "密钥原文落盘：{text}");
     // 报告只写本地，不得包含上报字段/URL。
     assert!(!text.contains("http://") && !text.contains("https://"), "崩溃报告不应含网络地址：{text}");
-    fs::remove_dir_all(&dir).ok();
 }

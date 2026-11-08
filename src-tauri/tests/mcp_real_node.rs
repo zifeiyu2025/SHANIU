@@ -58,10 +58,8 @@ impl EventSink for Recorder {
     }
 }
 
-fn workspace(tag: &str) -> PathBuf {
-    let dir = std::env::temp_dir().join(format!("shaniu-real-node-{tag}-{}", std::process::id()));
-    let _ = std::fs::remove_dir_all(&dir);
-    std::fs::create_dir_all(&dir).expect("创建临时工作区");
+fn workspace(tag: &str) -> shaniu_lib::test_support::TestTempDir {
+    let dir = shaniu_lib::test_support::TestTempDir::new(&format!("real-node-{tag}"));
     std::fs::write(dir.join("hello.txt"), "shaniu node probe\n").expect("写入示例文件");
     dir
 }

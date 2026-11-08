@@ -796,12 +796,9 @@ mod tests {
     use super::*;
     use tokio::sync::mpsc;
 
-    fn ws() -> std::path::PathBuf {
-        static SEQ: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
-        let n = SEQ.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
-        let dir = std::env::temp_dir().join(format!("shaniu-sb-{}-{n}", std::process::id()));
-        std::fs::create_dir_all(&dir).unwrap();
-        dir
+    fn ws() -> crate::test_support::TestTempDir {
+        // 自删临时目录：panic 也会清（2026-11-09 夹具规矩）。
+        crate::test_support::TestTempDir::new("sb")
     }
 
     #[test]

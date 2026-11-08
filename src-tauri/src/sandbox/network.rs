@@ -137,14 +137,8 @@ fn now_ms() -> u64 {
 mod tests {
     use super::*;
 
-    fn dir() -> PathBuf {
-        let dir = std::env::temp_dir().join(format!(
-            "shaniu-net-{}-{:?}",
-            std::process::id(),
-            std::thread::current().id()
-        ));
-        std::fs::create_dir_all(&dir).unwrap();
-        dir
+    fn dir() -> crate::test_support::TestTempDir {
+        crate::test_support::TestTempDir::new("net")
     }
 
     #[test]
@@ -158,7 +152,6 @@ mod tests {
         assert!(!grants.is_granted(None));
         assert!(grants.revoke("s1").unwrap());
         assert!(!grants.is_granted(Some("s1")));
-        std::fs::remove_dir_all(&dir).ok();
     }
 
     #[test]
@@ -179,7 +172,6 @@ mod tests {
         assert!(!grant["granted_by"].as_str().unwrap().is_empty());
         let revoke: serde_json::Value = serde_json::from_str(lines[1]).unwrap();
         assert_eq!(revoke["event"], "revoke");
-        std::fs::remove_dir_all(&dir).ok();
     }
 
     #[test]
@@ -191,6 +183,5 @@ mod tests {
         let error = grants.grant("s1", "x").expect_err("审计写不进去时不得放行");
         assert!(error.contains("审计"), "{error}");
         assert!(!grants.is_granted(Some("s1")));
-        std::fs::remove_dir_all(&dir).ok();
     }
 }

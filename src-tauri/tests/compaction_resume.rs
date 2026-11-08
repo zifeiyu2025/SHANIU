@@ -7,13 +7,9 @@
 use shaniu_lib::compaction;
 use shaniu_lib::model_client::{HistoryItem, Role};
 use shaniu_lib::rollout::{self, ConfigSnapshot, RolloutItem, RolloutWriter};
-use std::path::PathBuf;
 
-fn temp_dir(tag: &str) -> PathBuf {
-    let dir = std::env::temp_dir().join(format!("shaniu-compaction-{tag}-{}", std::process::id()));
-    let _ = std::fs::remove_dir_all(&dir);
-    std::fs::create_dir_all(&dir).unwrap();
-    dir
+fn temp_dir(tag: &str) -> shaniu_lib::test_support::TestTempDir {
+    shaniu_lib::test_support::TestTempDir::new(&format!("compaction-{tag}"))
 }
 
 fn meta(agent: &str) -> RolloutItem {
@@ -101,7 +97,6 @@ fn anchor_written_by_compaction_replays_into_a_shorter_but_complete_history() {
         resumed.history.last().unwrap(),
         HistoryItem::FunctionCallOutput { call_id, .. } if call_id == "c5"
     ));
-    std::fs::remove_dir_all(&dir).ok();
 }
 
 /// 摘要的角色必须是 **user**：thinking 档端点要求重放的每条 assistant 消息都带
@@ -143,7 +138,6 @@ fn summary_lands_as_a_user_message_not_an_assistant_one() {
         ),
         other => panic!("摘要必须是 message，得到 {other:?}"),
     }
-    std::fs::remove_dir_all(&dir).ok();
 }
 
 /// 区间越界必须报错而不是静默吞掉：静默会让一份坏档案伪装成"压缩成功"。
@@ -169,7 +163,6 @@ fn out_of_range_target_is_rejected_by_resume() {
         matches!(err, rollout::RolloutError::Corrupted { .. }),
         "越界要判成档案损坏，而不是悄悄跳过：{err}"
     );
-    std::fs::remove_dir_all(&dir).ok();
 }
 
 /// 把因果链一次钉死：压缩后的历史喂进 ChatCompletions 请求构造，
@@ -222,7 +215,6 @@ fn compacted_history_still_satisfies_thinking_mode_reasoning_requirement() {
             .any(|m| m["role"] == "user" && m["content"].as_str() == Some("交接摘要")),
         "摘要必须仍在请求里"
     );
-    std::fs::remove_dir_all(&dir).ok();
 }
 
 /// compaction 自己不该产越界区间：`range_end` 必须严格小于历史长度。

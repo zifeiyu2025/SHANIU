@@ -349,17 +349,12 @@ fn hex(bytes: &[u8]) -> String {
 mod tests {
     use super::*;
 
-    fn temp_dir(tag: &str) -> PathBuf {
-        static SEQ: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
-        let n = SEQ.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
-        let dir = std::env::temp_dir().join(format!("shaniu-module-tree-{tag}-{}-{n}", std::process::id()));
-        let _ = std::fs::remove_dir_all(&dir);
-        std::fs::create_dir_all(&dir).unwrap();
-        dir
+    fn temp_dir(tag: &str) -> crate::test_support::TestTempDir {
+        crate::test_support::TestTempDir::new(&format!("module-tree-{tag}"))
     }
 
     /// 造一个 venv 布局：`<root>/Scripts/python.exe` + `<root>/Lib/site-packages/<pkg>/…`。
-    fn fake_venv(tag: &str, module: &str) -> (PathBuf, PathBuf) {
+    fn fake_venv(tag: &str, module: &str) -> (crate::test_support::TestTempDir, PathBuf) {
         let root = temp_dir(tag);
         let scripts = root.join("Scripts");
         std::fs::create_dir_all(&scripts).unwrap();
@@ -416,7 +411,6 @@ mod tests {
         std::fs::write(root.join("Lib/site-packages/fakepkg/sub/mod.py"), b"X = 3\n").unwrap();
         let changed = digest_for(&python, &args).unwrap().unwrap();
         assert_ne!(first.sha256, changed.sha256, "模块代码变化必须改变指纹");
-        let _ = std::fs::remove_dir_all(root);
     }
 
     #[test]
@@ -444,12 +438,11 @@ mod tests {
             .expect("可编辑安装必须能定位到模块");
         assert!(tree.root.contains("src"), "根目录应指向 .pth 里的路径: {tree:?}");
         assert_eq!(tree.files, 1);
-        let _ = std::fs::remove_dir_all(root);
     }
 
     #[test]
     fn oversized_module_tree_is_refused_not_silently_skipped() {
-        let (root, python) = fake_venv("too-large", "fakepkg");
+        let (_root, python) = fake_venv("too-large", "fakepkg");
         let args = vec!["-m".to_string(), "fakepkg".to_string()];
         let error = digest_with_limits(
             &python,
@@ -462,7 +455,6 @@ mod tests {
         .unwrap_err();
         assert!(matches!(error, ModuleCoverageError::TooLarge { .. }), "实际: {error:?}");
         assert!(error.to_string().contains("拒绝"), "错误要说清拒绝而不是跳过: {error}");
-        let _ = std::fs::remove_dir_all(root);
     }
 
     #[test]
@@ -476,7 +468,6 @@ mod tests {
         let error = digest_for(&python, &["-m".to_string(), "ghost".to_string()]).unwrap_err();
         assert!(matches!(error, ModuleCoverageError::Unresolved { .. }), "实际: {error:?}");
         assert!(error.to_string().contains("直接可执行文件"), "错误要给可操作建议: {error}");
-        let _ = std::fs::remove_dir_all(root);
     }
 
     #[test]
@@ -494,6 +485,5 @@ mod tests {
             .unwrap()
             .expect("单文件模块也应覆盖");
         assert_eq!(tree.files, 1);
-        let _ = std::fs::remove_dir_all(root);
     }
 }

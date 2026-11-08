@@ -698,12 +698,9 @@ mod tests {
         ToolContext::new(ws, tokio_util::sync::CancellationToken::new(), "call-exec", sink, crate::config::SandboxMode::WorkspaceWrite)
     }
 
-    fn workspace() -> std::path::PathBuf {
-        static SEQ: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
-        let n = SEQ.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
-        let dir = std::env::temp_dir().join(format!("shaniu-exec-{}-{n}", std::process::id()));
-        std::fs::create_dir_all(&dir).unwrap();
-        dir
+    fn workspace() -> crate::test_support::TestTempDir {
+        // 自删临时目录：panic 也会清（2026-11-09 夹具规矩）。
+        crate::test_support::TestTempDir::new("exec")
     }
 
     #[tokio::test]
@@ -716,7 +713,6 @@ mod tests {
         assert!(out.success);
         assert!(out.output.contains("hello-exec"));
         assert!(out.output.contains("[exit code: 0]"));
-        std::fs::remove_dir_all(&ws).ok();
     }
 
     #[tokio::test]
@@ -728,7 +724,6 @@ mod tests {
             .unwrap();
         assert!(!out.success);
         assert!(out.output.contains("[exit code: 7]"));
-        std::fs::remove_dir_all(&ws).ok();
     }
 
     /// 真机用例（仅中文 Windows 生效）：cmd 的报错按 OEM 代码页（936/GBK）写管道，
@@ -761,7 +756,6 @@ mod tests {
             "缺少编码元数据: {}",
             out.output
         );
-        std::fs::remove_dir_all(&ws).ok();
     }
 
     /// 不碰网络、不碰文件系统的「长命令」：超时 / 取消 / 后台终止用例的样本。
@@ -781,7 +775,6 @@ mod tests {
             .unwrap();
         assert!(!out.success);
         assert!(out.output.contains("超时"), "超时用例拿到的是：{}", out.output);
-        std::fs::remove_dir_all(&ws).ok();
     }
 
     #[tokio::test]
@@ -799,7 +792,6 @@ mod tests {
         context.cancel.cancel();
         let err = handle.await.unwrap().unwrap_err();
         assert!(matches!(err, ToolError::Cancelled));
-        std::fs::remove_dir_all(&ws).ok();
     }
 
     #[tokio::test]
@@ -813,7 +805,6 @@ mod tests {
             .await
             .unwrap_err();
         assert!(matches!(err, ToolError::Execution(_)));
-        std::fs::remove_dir_all(&ws).ok();
     }
 
     #[tokio::test]
@@ -824,7 +815,6 @@ mod tests {
             .await
             .unwrap_err();
         assert!(matches!(err, ToolError::InvalidArgs(_)));
-        std::fs::remove_dir_all(&ws).ok();
     }
 
     #[tokio::test]
@@ -856,7 +846,6 @@ mod tests {
         assert_eq!(read.job.status, "completed");
         assert_eq!(read.job.detail.as_deref(), Some("exit code: 0"));
         assert!(read.chunks.iter().any(|chunk| chunk.text.contains("bg-hello")));
-        std::fs::remove_dir_all(&ws).ok();
     }
 
     #[tokio::test]
@@ -881,7 +870,6 @@ mod tests {
             tokio::time::sleep(Duration::from_millis(50)).await;
         }
         assert_eq!(registry.read(&id, "s1", None).unwrap().job.status, "killed");
-        std::fs::remove_dir_all(&ws).ok();
     }
 
     #[test]
@@ -935,7 +923,6 @@ mod tests {
         assert!(out.output.contains("nested"), "{}", out.output);
         assert!(out.output.contains("等价列举"), "应明确标注是替代实现：{}", out.output);
         assert!(out.output.contains("1 个目录，1 个文件"), "应给出计数：{}", out.output);
-        std::fs::remove_dir_all(&ws).ok();
     }
 
     #[tokio::test]
@@ -948,7 +935,6 @@ mod tests {
         assert!(out.success, "{}", out.output);
         assert!(!out.output.trim().is_empty(), "空目录也不许返回零字节");
         assert!(out.output.contains("0 个目录，0 个文件"), "{}", out.output);
-        std::fs::remove_dir_all(&ws).ok();
     }
 
     #[tokio::test]
@@ -964,7 +950,6 @@ mod tests {
         assert!(out.output.contains("alpha.txt"), "{}", out.output);
         assert!(out.output.contains("nested"), "{}", out.output);
         assert!(!out.output.contains("<DIR>"), "/b 不应输出明细列：{}", out.output);
-        std::fs::remove_dir_all(&ws).ok();
     }
 
     /// 未被替代的卷信息形态（如 `/s`）也不许静默：要么真实输出，要么失败并解释原因。
@@ -980,7 +965,6 @@ mod tests {
             "dir /s 不允许失败且零解释：{:?}",
             out.output
         );
-        std::fs::remove_dir_all(&ws).ok();
     }
 
     #[tokio::test]
@@ -1001,7 +985,6 @@ mod tests {
             .await
             .unwrap();
         assert!(!second.output.contains("[提示]"), "同会话只提示一次: {}", second.output);
-        std::fs::remove_dir_all(&ws).ok();
     }
 
     #[tokio::test]
@@ -1017,7 +1000,6 @@ mod tests {
         assert_eq!(shell_reader_program("cmd /c type x"), Some("type"));
         assert_eq!(shell_reader_program("powershell -Command Get-Content x"), Some("get-content"));
         assert_eq!(shell_reader_program("TYPE.EXE x"), Some("type"));
-        std::fs::remove_dir_all(&ws).ok();
     }
 
     #[tokio::test]
@@ -1030,6 +1012,5 @@ mod tests {
             .await
             .unwrap();
         assert!(out.output.contains("routed"));
-        std::fs::remove_dir_all(&ws).ok();
     }
 }

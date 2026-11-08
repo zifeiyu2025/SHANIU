@@ -362,11 +362,8 @@ fn dropped_note(where_to_read: &str, dropped: &[String]) -> String {
 mod tests {
     use super::*;
 
-    fn temp_dir(name: &str) -> PathBuf {
-        let dir = std::env::temp_dir().join(format!("shaniu-rules-{name}-{}", std::process::id()));
-        let _ = std::fs::remove_dir_all(&dir);
-        std::fs::create_dir_all(&dir).expect("创建临时目录");
-        dir
+    fn temp_dir(name: &str) -> crate::test_support::TestTempDir {
+        crate::test_support::TestTempDir::new(&format!("rules-{name}"))
     }
 
     fn write(path: &Path, text: &str) {
@@ -383,7 +380,6 @@ mod tests {
         assert!(rules.is_empty(), "没有 AGENTS.md 时不得注入空标题");
         assert_eq!(rules.fingerprint, "-");
         assert!(rules.sources.is_empty());
-        let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[test]
@@ -401,7 +397,6 @@ mod tests {
         assert!(!rules.text.contains("外层铁律"), "被覆盖的外层内容不得残留");
         assert!(rules.text.contains("外层提交"), "外层独有小节必须保留");
         assert_eq!(rules.sources.len(), 2, "两份文件都要记进来源");
-        let _ = std::fs::remove_dir_all(&outer);
     }
 
     #[test]
@@ -433,7 +428,6 @@ mod tests {
             estimate_tokens(&rules.text)
         );
         assert_eq!(rules.fingerprint.len(), 16, "指纹覆盖全文，长度固定");
-        let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[test]
@@ -453,7 +447,6 @@ mod tests {
             "截断后仍须在预算内：{}",
             estimate_tokens(&rules.text)
         );
-        let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[test]
@@ -495,7 +488,6 @@ mod tests {
             "注入正文不得超过预算：{}",
             estimate_tokens(&rules.text)
         );
-        let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[test]
@@ -598,7 +590,6 @@ mod tests {
                 rules.text
             );
         }
-        let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[test]
@@ -610,7 +601,6 @@ mod tests {
         write(&dir.join(RULE_FILE_NAME), "## 铁律\n第二版\n");
         let second = discover(&dir);
         assert_ne!(first.fingerprint, second.fingerprint, "内容变化必须改变指纹");
-        let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[test]

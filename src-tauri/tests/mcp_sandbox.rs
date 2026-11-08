@@ -34,12 +34,8 @@ const CALL: Duration = Duration::from_secs(20);
 
 static SEQ: AtomicUsize = AtomicUsize::new(0);
 
-fn unique_dir(tag: &str) -> PathBuf {
-    let n = SEQ.fetch_add(1, Ordering::SeqCst);
-    let dir = std::env::temp_dir().join(format!("shaniu-mcpsb-{tag}-{}-{n}", std::process::id()));
-    let _ = std::fs::remove_dir_all(&dir);
-    std::fs::create_dir_all(&dir).expect("创建目录");
-    dir
+fn unique_dir(tag: &str) -> shaniu_lib::test_support::TestTempDir {
+    shaniu_lib::test_support::TestTempDir::new(&format!("mcpsb-{tag}"))
 }
 
 /// 用户主目录下、不在任何授权范围内的目录（`%TEMP%` 是 exec 的允许位置，不能当越界靶子）。
@@ -272,7 +268,8 @@ async fn container_handshake_and_path_boundaries() {
     assert_eq!(std::fs::read_to_string(&marker).unwrap(), "temp-ok");
 
     session.shutdown();
-    for dir in [&workspace, &outside, &read_root, &write_root] {
+    // workspace 由 TestTempDir 守卫自动清理；outside 目录不归夹具管，保持手工删。
+    for dir in [&outside, &read_root, &write_root] {
         std::fs::remove_dir_all(dir).ok();
     }
 }

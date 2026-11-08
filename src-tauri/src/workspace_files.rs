@@ -590,15 +590,13 @@ mod tests {
     fn paths_outside_the_root_and_missing_paths_are_typed() {
         let temp = Temp::new();
         let _ = temp.write("in.txt", "hi");
-        let outside = std::env::temp_dir().join(format!("shaniu-outside-{}", ulid::Ulid::generate()));
-        std::fs::create_dir_all(&outside).expect("根外目录可建");
+        let outside = crate::test_support::TestTempDir::new("outside");
         std::fs::write(outside.join("secret.txt"), "x").expect("根外文件可写");
         let err = resolve_existing(&temp.root, outside.join("secret.txt").to_str().unwrap())
             .expect_err("根外必须拒");
         assert_eq!(err.code, "workspace-file/outside-workspace");
         let err = resolve_existing(&temp.root, "不存在.txt").expect_err("不存在要分开报");
         assert_eq!(err.code, "workspace-file/not-found");
-        std::fs::remove_dir_all(&outside).ok();
     }
 
     #[test]

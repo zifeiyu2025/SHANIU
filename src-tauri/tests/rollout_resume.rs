@@ -7,8 +7,7 @@
 //! 2. 重放出的历史里，工具调用与输出**成对存在**（SH-082 的教训：不成对就 400）；
 //! 3. 续跑新增的条目落在旧条目之后，且旧条目**没有被重写一遍**（`persisted` 参数的作用）。
 
-use std::path::{Path, PathBuf};
-use std::sync::atomic::{AtomicUsize, Ordering};
+use std::path::Path;
 use std::sync::{Arc, Mutex};
 
 use async_trait::async_trait;
@@ -22,13 +21,8 @@ use shaniu_lib::rollout::{self, resume, ConfigSnapshot, RolloutItem, RolloutWrit
 use shaniu_lib::tool_router::{PlanState, ToolContext, ToolError, ToolExecutor, ToolOutput, ToolRouter, ToolSpec};
 use tokio_util::sync::CancellationToken;
 
-static SEQ: AtomicUsize = AtomicUsize::new(0);
-
-fn temp_dir(tag: &str) -> PathBuf {
-    let n = SEQ.fetch_add(1, Ordering::SeqCst);
-    let dir = std::env::temp_dir().join(format!("shaniu-resume-e2e-{tag}-{}-{n}", std::process::id()));
-    std::fs::create_dir_all(&dir).unwrap();
-    dir
+fn temp_dir(tag: &str) -> shaniu_lib::test_support::TestTempDir {
+    shaniu_lib::test_support::TestTempDir::new(&format!("resume-e2e-{tag}"))
 }
 
 /// 按脚本轮次吐事件的桩后端；脚本用尽后只出文本，保证循环必然收口。
@@ -230,7 +224,6 @@ async fn restart_then_resume_continues_the_same_archive() {
         1,
         "用户任务不得在档案里出现两次"
     );
-    std::fs::remove_dir_all(&dir).ok();
 }
 
 #[tokio::test]
@@ -284,7 +277,6 @@ async fn fork_creates_child_archive_linked_to_parent_without_touching_source() {
     assert_eq!(grew.lines().filter(|l| l.contains("\"type\":\"session_meta\"")).count(), 1);
     assert!(grew.starts_with(child_before.as_str()), "子档案续跑同样只能追加");
     assert!(grew.len() > child_before.len(), "子会话的新条目应落在子档案里");
-    std::fs::remove_dir_all(&dir).ok();
 }
 
 /// 真机口径（需要密钥，按里程碑手动跑）：恢复出来的会话必须**真的能把上一轮的活接着做完**。
@@ -328,7 +320,7 @@ async fn resume_continues_real_work_on_a_real_endpoint() {
             router: Arc::new(router),
             broker: broker.clone(),
             plan_state: Arc::new(PlanState::new()),
-            workspace_root: dir.clone(),
+            workspace_root: dir.to_path_buf(),
             max_turns: 8,
             token_budget: 0,
         tree_budget: Default::default(),
@@ -397,5 +389,4 @@ async fn resume_continues_real_work_on_a_real_endpoint() {
     let replayed = resume::resume(&path).unwrap();
     assert!(replayed.history.len() > persisted, "续跑应追加条目而不是重写：{persisted} → {}", replayed.history.len());
     println!("[resume-e2e] B 之后历史 {} 条，port.txt={:?}", replayed.history.len(), final_text.trim());
-    std::fs::remove_dir_all(&dir).ok();
 }

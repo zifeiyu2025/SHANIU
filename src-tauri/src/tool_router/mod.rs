@@ -883,11 +883,8 @@ mod tests {
     }
 
     // resolve_in_workspace 的行为契约
-    fn temp_workspace() -> PathBuf {
-        static SEQ: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
-        let n = SEQ.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
-        let dir = std::env::temp_dir().join(format!("shaniu-ws-{}-{n}", std::process::id()));
-        std::fs::create_dir_all(&dir).unwrap();
+    fn temp_workspace() -> crate::test_support::TestTempDir {
+        let dir = crate::test_support::TestTempDir::new("ws");
         std::fs::write(dir.join("a.txt"), "hello").unwrap();
         dir
     }
@@ -899,7 +896,6 @@ mod tests {
         assert!(rel.ends_with("a.txt"));
         let abs = resolve_in_workspace(&ws, &ws.join("a.txt").to_string_lossy()).unwrap();
         assert!(abs.ends_with("a.txt"));
-        std::fs::remove_dir_all(&ws).ok();
     }
 
     #[test]
@@ -908,7 +904,6 @@ mod tests {
         // ".." 真实存在（temp 父目录）：canonicalize 成功后触发越界判定
         let err = resolve_in_workspace(&ws, "..").unwrap_err();
         assert!(matches!(err, ToolError::Execution(_)));
-        std::fs::remove_dir_all(&ws).ok();
     }
 
     #[test]
@@ -922,7 +917,6 @@ mod tests {
         // 含 .. 的路径直接越界拒绝
         let err = resolve_for_write(&ws, "../evil.txt").unwrap_err();
         assert!(matches!(err, ToolError::Execution(_)));
-        std::fs::remove_dir_all(&ws).ok();
     }
 
     /// SH-085 的回归锁：canonicalize 在 Windows 上必然产出 `\\?\` verbatim 路径，
@@ -949,7 +943,6 @@ mod tests {
             resolve_in_workspace(&ws, "a.txt").unwrap().is_file(),
             "还原后的路径不能再变成不可用"
         );
-        std::fs::remove_dir_all(&ws).ok();
     }
 
     #[cfg(windows)]
@@ -975,7 +968,6 @@ mod tests {
         let ws = temp_workspace();
         let err = resolve_in_workspace(&ws, "no-such-file.txt").unwrap_err();
         assert!(matches!(err, ToolError::InvalidArgs(_)));
-        std::fs::remove_dir_all(&ws).ok();
     }
 
     #[test]
@@ -999,7 +991,6 @@ mod tests {
         assert!(content_matches(&reported, b"abc", &meta), "内容相同应判定新鲜");
         assert!(!content_matches(&reported, b"abd", &meta), "同长度不同内容必须判 stale");
         assert!(!content_matches(&reported, b"abcd", &meta), "长度变化必须判 stale");
-        std::fs::remove_dir_all(&ws).ok();
     }
 
     #[test]
@@ -1016,7 +1007,6 @@ mod tests {
         assert!(registry.get(None, &path).is_none());
         registry.forget(Some("s1"), &path);
         assert!(registry.get(Some("s1"), &path).is_none());
-        std::fs::remove_dir_all(&ws).ok();
     }
 
     // ---------------- 写日志：断言变化判定（SH-126） ----------------
@@ -1106,6 +1096,5 @@ mod tests {
         let merged = journal.take();
         assert_eq!(merged.len(), 1, "同路径写入必须合并: {merged:?}");
         assert!(merged[0].weakened);
-        std::fs::remove_dir_all(&ws).ok();
     }
 }

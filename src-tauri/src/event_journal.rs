@@ -194,14 +194,8 @@ mod tests {
         }
     }
 
-    fn temp_dir() -> PathBuf {
-        let dir = std::env::temp_dir().join(format!(
-            "shaniu-events-{}-{}",
-            std::process::id(),
-            ulid::Ulid::generate()
-        ));
-        std::fs::create_dir_all(&dir).unwrap();
-        dir
+    fn temp_dir() -> crate::test_support::TestTempDir {
+        crate::test_support::TestTempDir::new("events")
     }
 
     #[test]
@@ -220,7 +214,6 @@ mod tests {
         let page = read_after(&dir, "s1", None, 2).unwrap();
         assert_eq!(page.events.len(), 2);
         assert!(page.has_more);
-        std::fs::remove_dir_all(&dir).ok();
     }
 
     #[test]
@@ -232,7 +225,6 @@ mod tests {
         assert!(read_after(&dir, "s2", None, 10).unwrap().events[0].event_id == "02");
         assert!(read_after(&dir, "missing", None, 10).unwrap().events.is_empty());
         assert!(read_after(&dir, "../escape", None, 10).is_err());
-        std::fs::remove_dir_all(&dir).ok();
     }
 
     #[test]
@@ -249,7 +241,6 @@ mod tests {
         file.write_all(b"\n").unwrap();
         assert_eq!(latest_event_id(&dir, "s1").unwrap().as_deref(), Some("02"));
         assert!(latest_event_id(&dir, "../escape").is_err());
-        std::fs::remove_dir_all(&dir).ok();
     }
 
     #[test]
@@ -264,7 +255,6 @@ mod tests {
         let page = read_after(&dir, "s1", None, 10).unwrap();
         let ids: Vec<&str> = page.events.iter().map(|e| e.event_id.as_str()).collect();
         assert_eq!(ids, vec!["01", "03"]);
-        std::fs::remove_dir_all(&dir).ok();
     }
 
     #[test]
@@ -297,7 +287,6 @@ mod tests {
         assert_eq!(owner_session_of_agent(&dir, "child-unknown").unwrap(), None);
         assert_eq!(owner_session_of_agent(&dir, "").unwrap(), None);
         assert_eq!(owner_session_of_agent(&dir.join("missing"), "child-a").unwrap(), None);
-        std::fs::remove_dir_all(&dir).ok();
     }
 
     #[test]
@@ -317,6 +306,5 @@ mod tests {
         .unwrap();
         // 坏行在前不阻断：反查仍能命中后面的合法事件。
         assert_eq!(owner_session_of_agent(&dir, "child-a").unwrap().as_deref(), Some("s1"));
-        std::fs::remove_dir_all(&dir).ok();
     }
 }

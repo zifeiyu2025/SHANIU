@@ -1664,13 +1664,7 @@ mod tests {
             }
         }
 
-        static TAMPER_SEQ: std::sync::atomic::AtomicUsize =
-            std::sync::atomic::AtomicUsize::new(0);
-        let ws = std::env::temp_dir().join(format!(
-            "shaniu-tamper-{}-{}",
-            std::process::id(),
-            TAMPER_SEQ.fetch_add(1, std::sync::atomic::Ordering::SeqCst)
-        ));
+        let ws = crate::test_support::TestTempDir::new("tamper");
         std::fs::create_dir_all(ws.join("tests")).unwrap();
         let test_file = ws.join("tests/check.rs");
         std::fs::write(&test_file, ORIGINAL).unwrap();
@@ -1706,7 +1700,7 @@ mod tests {
             router: Arc::new(router),
             broker: broker.clone(),
             plan_state: Arc::new(PlanState::new()),
-            workspace_root: ws.clone(),
+            workspace_root: ws.to_path_buf(),
             max_turns: 5,
             token_budget: 0,
             tree_budget: TreeBudget::unlimited(),
@@ -1741,7 +1735,6 @@ mod tests {
         assert!(rejection.contains("tests/check.rs"), "{rejection}");
         // 文件确实被改了（说明判定不是靠「没发生写入」侥幸通过）
         assert_eq!(std::fs::read_to_string(&test_file).unwrap(), WEAKENED);
-        std::fs::remove_dir_all(&ws).ok();
     }
 
     /// SH-122 接线：连续第 4 次相同调用后，下一轮请求里必须多出一条独立 System 提醒。
@@ -2094,12 +2087,7 @@ mod tests {
             }
         }
 
-        let dir = std::env::temp_dir().join(format!(
-            "shaniu-sref-loop-{}-{}",
-            std::process::id(),
-            ulid::Ulid::generate()
-        ));
-        std::fs::create_dir_all(&dir).unwrap();
+        let dir = crate::test_support::TestTempDir::new("sref-loop");
         let writer = Arc::new(RolloutWriter::create(&dir, &meta("self")).unwrap());
         let referenced = RolloutWriter::create(&dir, &meta("ref-1")).unwrap();
         referenced
@@ -2169,7 +2157,6 @@ mod tests {
             }
             _ => panic!("第二条应是引用上下文"),
         }
-        std::fs::remove_dir_all(&dir).ok();
     }
 
     // ---- SH-050：AgentInstance（root 与子代理共用同一执行引擎）----

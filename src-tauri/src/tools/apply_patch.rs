@@ -628,11 +628,8 @@ mod tests {
         ToolContext::new(ws, tokio_util::sync::CancellationToken::new(), "call-patch", sink, crate::config::SandboxMode::WorkspaceWrite)
     }
 
-    fn workspace() -> std::path::PathBuf {
-        static SEQ: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
-        let n = SEQ.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
-        let dir = std::env::temp_dir().join(format!("shaniu-patch-{}-{n}", std::process::id()));
-        std::fs::create_dir_all(&dir).unwrap();
+    fn workspace() -> crate::test_support::TestTempDir {
+        let dir = crate::test_support::TestTempDir::new("patch");
         std::fs::write(dir.join("a.txt"), "line1\nline2\nline3\n").unwrap();
         dir
     }
@@ -644,7 +641,6 @@ mod tests {
         let out = ApplyPatch::new().execute(serde_json::json!({"patch": patch}), &ctx(&ws)).await.unwrap();
         assert!(out.success);
         assert_eq!(std::fs::read_to_string(ws.join("new.txt")).unwrap(), "第一行\n第二行\n");
-        std::fs::remove_dir_all(&ws).ok();
     }
 
     #[tokio::test]
@@ -654,7 +650,6 @@ mod tests {
         let out = ApplyPatch::new().execute(serde_json::json!({"patch": patch}), &ctx(&ws)).await.unwrap();
         assert!(out.success);
         assert_eq!(std::fs::read_to_string(ws.join("a.txt")).unwrap(), "line1\n第二行(改)\nline3\n");
-        std::fs::remove_dir_all(&ws).ok();
     }
 
     #[tokio::test]
@@ -664,7 +659,6 @@ mod tests {
         let out = ApplyPatch::new().execute(serde_json::json!({"patch": patch}), &ctx(&ws)).await.unwrap();
         assert!(out.success);
         assert!(!ws.join("a.txt").exists());
-        std::fs::remove_dir_all(&ws).ok();
     }
 
     #[tokio::test]
@@ -676,7 +670,6 @@ mod tests {
         assert!(matches!(err, ToolError::Execution(_)));
         assert!(!ws.join("temp.txt").exists(), "回滚必须删除本轮新增的文件");
         assert_eq!(std::fs::read_to_string(ws.join("a.txt")).unwrap(), "line1\nline2\nline3\n");
-        std::fs::remove_dir_all(&ws).ok();
     }
 
     #[tokio::test]
@@ -686,7 +679,6 @@ mod tests {
         let err = ApplyPatch::new().execute(serde_json::json!({"patch": patch}), &ctx(&ws)).await.unwrap_err();
         assert!(matches!(err, ToolError::Execution(_)));
         assert_eq!(std::fs::read_to_string(ws.join("a.txt")).unwrap(), "line1\nline2\nline3\n");
-        std::fs::remove_dir_all(&ws).ok();
     }
 
     #[tokio::test]
@@ -696,7 +688,6 @@ mod tests {
         let err = ApplyPatch::new().execute(serde_json::json!({"patch": patch}), &ctx(&ws)).await.unwrap_err();
         assert!(matches!(err, ToolError::Execution(_)));
         assert!(!ws.parent().unwrap().join("evil.txt").exists());
-        std::fs::remove_dir_all(&ws).ok();
     }
 
     #[tokio::test]
@@ -707,7 +698,6 @@ mod tests {
             .await
             .unwrap_err();
         assert!(matches!(err, ToolError::InvalidArgs(_)));
-        std::fs::remove_dir_all(&ws).ok();
     }
 
     // ---------- SH-123 匹配级别：8 类样本 ----------
@@ -725,7 +715,6 @@ mod tests {
             std::fs::read_to_string(ws.join("a.txt")).unwrap(),
             "line1\n第二行(改)\nline3\n"
         );
-        std::fs::remove_dir_all(&ws).ok();
     }
 
     #[tokio::test]
@@ -741,7 +730,6 @@ mod tests {
             std::fs::read_to_string(ws.join("a.txt")).unwrap(),
             "line1\n第二行(改)\nline3\n"
         );
-        std::fs::remove_dir_all(&ws).ok();
     }
 
     #[tokio::test]
@@ -760,7 +748,6 @@ mod tests {
             std::fs::read_to_string(ws.join("b.txt")).unwrap(),
             "        alpha();\n        BETA();\n        gamma();\n"
         );
-        std::fs::remove_dir_all(&ws).ok();
     }
 
     #[tokio::test]
@@ -777,7 +764,6 @@ mod tests {
             std::fs::read_to_string(ws.join("c.txt")).unwrap(),
             "let x =    1;\nlet y = 3;\n"
         );
-        std::fs::remove_dir_all(&ws).ok();
     }
 
     #[tokio::test]
@@ -795,7 +781,6 @@ mod tests {
             std::fs::read_to_string(ws.join("d.txt")).unwrap(),
             "begin();\nhandle(item_c);\nfinish();\n"
         );
-        std::fs::remove_dir_all(&ws).ok();
     }
 
     #[tokio::test]
@@ -814,7 +799,6 @@ mod tests {
             std::fs::read_to_string(ws.join("a.txt")).unwrap(),
             "line1\nline2\nline3\n"
         );
-        std::fs::remove_dir_all(&ws).ok();
     }
 
     #[tokio::test]
@@ -832,7 +816,6 @@ mod tests {
             "line1\nline2\nline3\n",
             "前一个 Update 必须回滚"
         );
-        std::fs::remove_dir_all(&ws).ok();
     }
 
     // ---------- SH-124 写前读状态 + stale 检测 ----------
@@ -855,7 +838,6 @@ mod tests {
             std::fs::read_to_string(ws.join("a.txt")).unwrap(),
             "line1\nline2\nline3\n"
         );
-        std::fs::remove_dir_all(&ws).ok();
     }
 
     #[tokio::test]
@@ -888,7 +870,6 @@ mod tests {
             std::fs::read_to_string(ws.join("a.txt")).unwrap(),
             "line1\n再改\nline3\n"
         );
-        std::fs::remove_dir_all(&ws).ok();
     }
 
     #[tokio::test]
@@ -918,7 +899,6 @@ mod tests {
             "外部写入\n第二行\n第三行\n第四行\n",
             "stale 时不得覆盖"
         );
-        std::fs::remove_dir_all(&ws).ok();
     }
 
     #[tokio::test]
@@ -932,7 +912,6 @@ mod tests {
             .unwrap_err();
         assert!(err.to_string().contains("write_file_not_read"), "{err}");
         assert!(ws.join("a.txt").exists());
-        std::fs::remove_dir_all(&ws).ok();
     }
 
     /// SH-126③：stale 回填必须有字节上限——几 MB 的文件全文回填会直接吃光上下文。
@@ -969,7 +948,6 @@ mod tests {
         assert!(message.contains("已截断"), "必须明示已截断: {message}");
         // 截断后的内容仍可用：首行能看到行号与真实内容
         assert!(message.contains("1| line0001"), "{message}");
-        std::fs::remove_dir_all(&ws).ok();
     }
 
     /// SH-126：写入必须进写日志，删减断言要被标成「放宽」。
@@ -997,6 +975,5 @@ mod tests {
         assert!(entries[0].weakened, "删掉断言必须标为放宽: {entries:?}");
         assert_eq!(entries[0].assertion_delta, -1);
         assert!(writes.take().is_empty(), "写日志必须被消费干净");
-        std::fs::remove_dir_all(&ws).ok();
     }
 }

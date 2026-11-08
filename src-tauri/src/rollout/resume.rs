@@ -185,15 +185,9 @@ mod tests {
     use super::*;
     use crate::model_client::HistoryItem;
     use crate::rollout::ConfigSnapshot;
-    use std::sync::atomic::{AtomicUsize, Ordering};
 
-    static SEQ: AtomicUsize = AtomicUsize::new(0);
-
-    fn temp_dir(tag: &str) -> PathBuf {
-        let n = SEQ.fetch_add(1, Ordering::SeqCst);
-        let dir = std::env::temp_dir().join(format!("shaniu-resume-{tag}-{}-{n}", std::process::id()));
-        std::fs::create_dir_all(&dir).unwrap();
-        dir
+    fn temp_dir(tag: &str) -> crate::test_support::TestTempDir {
+        crate::test_support::TestTempDir::new(&format!("resume-{tag}"))
     }
 
     fn meta(agent: &str) -> RolloutItem {
@@ -265,7 +259,6 @@ mod tests {
             }
             other => panic!("压缩锚点应回放为 message，收到 {other:?}"),
         }
-        std::fs::remove_dir_all(&dir).ok();
     }
 
     #[test]
@@ -277,7 +270,6 @@ mod tests {
         drop(w);
         let err = resume(&dir.join("a.jsonl")).unwrap_err();
         assert!(matches!(err, RolloutError::Corrupted { .. }), "越界锚点必须报错：{err}");
-        std::fs::remove_dir_all(&dir).ok();
     }
 
     #[test]
@@ -301,7 +293,6 @@ mod tests {
         let child = resume(&f.path).unwrap();
         assert_eq!(child.parent_id.as_deref(), Some("parent"), "新档案首行要指回父代理");
         assert_eq!(child.history.len(), 3);
-        std::fs::remove_dir_all(&dir).ok();
     }
 
     #[test]
@@ -311,6 +302,5 @@ mod tests {
         std::fs::write(&path, "{}\n").unwrap();
         let err = RolloutWriter::open_existing(&path).map(|_| ()).unwrap_err();
         assert!(matches!(err, RolloutError::Corrupted { .. }), "非 session_meta 首行必须拒绝：{err}");
-        std::fs::remove_dir_all(&dir).ok();
     }
 }

@@ -131,23 +131,19 @@ pub fn file_sha256(path: &Path) -> std::io::Result<String> {
 mod tests {
     use super::*;
 
-    fn temp_file(name: &str, content: &[u8]) -> PathBuf {
-        static SEQ: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
-        let n = SEQ.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
-        let dir = std::env::temp_dir().join(format!("shaniu-mcp-cmd-{}-{n}", std::process::id()));
-        std::fs::create_dir_all(&dir).unwrap();
+    fn temp_file(name: &str, content: &[u8]) -> (crate::test_support::TestTempDir, PathBuf) {
+        let dir = crate::test_support::TestTempDir::new("mcp-cmd");
         let path = dir.join(name);
         std::fs::write(&path, content).unwrap();
-        path
+        (dir, path)
     }
 
     #[test]
     fn absolute_path_resolves_to_itself() {
-        let file = temp_file("server.exe", b"MZ");
+        let (_dir, file) = temp_file("server.exe", b"MZ");
         let resolved = resolve_executable(file.to_str().unwrap()).unwrap();
         assert_eq!(resolved, normalize(&file));
         assert!(resolved.is_absolute());
-        std::fs::remove_dir_all(file.parent().unwrap()).ok();
     }
 
     #[test]
@@ -165,11 +161,10 @@ mod tests {
 
     #[test]
     fn batch_scripts_are_rejected_with_actionable_reason() {
-        let file = temp_file("server.bat", b"@echo off");
+        let (_dir, file) = temp_file("server.bat", b"@echo off");
         let err = resolve_executable(file.to_str().unwrap()).unwrap_err();
         assert!(matches!(err, ResolveError::ShellScript(_)), "实际: {err:?}");
         assert!(err.to_string().contains("shell"), "错误要点出 shell 解释: {err}");
-        std::fs::remove_dir_all(file.parent().unwrap()).ok();
     }
 
     #[test]
@@ -191,14 +186,13 @@ mod tests {
 
     #[test]
     fn hash_is_hex_and_changes_with_content() {
-        let first = temp_file("a.exe", b"first");
-        let second = temp_file("b.exe", b"second");
+        let (_dir_a, first) = temp_file("a.exe", b"first");
+        let (_dir_b, second) = temp_file("b.exe", b"second");
         let a = file_sha256(&first).unwrap();
         let b = file_sha256(&second).unwrap();
         assert_eq!(a.len(), 64);
         assert!(a.chars().all(|c| c.is_ascii_hexdigit()));
         assert_ne!(a, b, "内容不同必须得到不同哈希");
         assert_eq!(a, file_sha256(&first).unwrap(), "同一文件多次计算必须稳定");
-        std::fs::remove_dir_all(first.parent().unwrap()).ok();
     }
 }

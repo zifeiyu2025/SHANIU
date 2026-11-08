@@ -219,19 +219,21 @@ mod tests {
     use super::*;
     use crate::config::AppConfig;
 
-    fn state() -> AppState {
-        static SEQ: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
-        let n = SEQ.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
-        AppState::new(
+    /// 返回 `(临时目录守卫, AppState)`：守卫必须绑定到变量活到测试结束，
+    /// 否则临时目录会被立即删掉（2026-11-09 夹具规矩）。
+    fn state() -> (crate::test_support::TestTempDir, AppState) {
+        let dir = crate::test_support::TestTempDir::new("state");
+        let state = AppState::new(
             AppConfig::default(),
-            std::env::temp_dir().join(format!("shaniu-state-{}-{n}.toml", std::process::id())),
-            std::env::temp_dir().join(format!("shaniu-state-data-{}-{n}", std::process::id())),
-        )
+            dir.join("config.toml"),
+            dir.join("data"),
+        );
+        (dir, state)
     }
 
     #[test]
     fn session_ids_increase_uniquely() {
-        let s = state();
+        let (_dir, s) = state();
         let a = s.next_session_id();
         let b = s.next_session_id();
         assert_ne!(a, b);
@@ -239,7 +241,7 @@ mod tests {
 
     #[test]
     fn config_update_is_visible_and_persisted() {
-        let s = state();
+        let (_dir, s) = state();
         let mut cfg = s.config();
         cfg.model.max_turns = 8;
         s.update_config(cfg).unwrap();
@@ -252,7 +254,7 @@ mod tests {
 
     #[test]
     fn config_read_only_blocks_every_write() {
-        let s = state();
+        let (_dir, s) = state();
         s.mark_config_read_only("解析配置失败: bad value（文件未被改动：C:\\cfg\\config.toml）");
         let err = s.update_config(AppConfig::default()).unwrap_err();
         assert!(err.contains("只读") && err.contains("config.toml"), "只读原因必须带路径: {err}");
@@ -265,7 +267,7 @@ mod tests {
 
     #[test]
     fn rejected_save_keeps_memory_and_disk_unchanged() {
-        let s = state();
+        let (_dir, s) = state();
         let mut good = s.config();
         good.model.max_turns = 9;
         s.update_config(good).unwrap();
@@ -297,7 +299,7 @@ mod tests {
 
     #[test]
     fn task_slot_is_exclusive_and_cancellable() {
-        let s = state();
+        let (_dir, s) = state();
         assert!(!s.has_active_task());
         let token = CancellationToken::new();
         assert!(s.begin_task("sess-1", token.clone()));
@@ -314,7 +316,7 @@ mod tests {
 
     #[test]
     fn subagent_registry_lives_only_for_the_active_task() {
-        let s = state();
+        let (_dir, s) = state();
         assert!(s.subagents().is_none(), "空闲态没有可 steering 的注册表");
         let registry = Arc::new(crate::subagent_registry::SubagentRegistry::new(2));
         assert!(s.begin_task("sess-1", CancellationToken::new()));
@@ -326,7 +328,7 @@ mod tests {
 
     #[test]
     fn workspace_root_falls_back_to_user_profile() {
-        let s = state();
+        let (_dir, s) = state();
         assert!(s.workspace_root().starts_with(std::env::var_os("USERPROFILE").map(PathBuf::from).unwrap_or_default()));
         let mut cfg = s.config();
         cfg.workspace.root = "D:/tmp/ws".into();

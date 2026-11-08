@@ -127,12 +127,9 @@ mod tests {
         )
     }
 
-    fn workspace() -> std::path::PathBuf {
-        static SEQ: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
-        let n = SEQ.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
-        let dir = std::env::temp_dir().join(format!("shaniu-plan-{}-{n}", std::process::id()));
-        std::fs::create_dir_all(&dir).unwrap();
-        dir
+    fn workspace() -> crate::test_support::TestTempDir {
+        // 自删临时目录：panic 也会清（2026-11-09 夹具规矩）。
+        crate::test_support::TestTempDir::new("plan")
     }
 
     #[tokio::test]
@@ -169,7 +166,6 @@ mod tests {
         assert!(!state.is_active(), "批准后必须退出计划态");
         let saved = std::fs::read_to_string(ws.join(".shaniu").join("plan.md")).unwrap();
         assert!(saved.contains("## 步骤"));
-        std::fs::remove_dir_all(&ws).ok();
     }
 
     #[tokio::test]
@@ -183,6 +179,5 @@ mod tests {
             .unwrap_err();
         assert!(matches!(err, ToolError::InvalidArgs(_)));
         assert!(state.is_active(), "拒绝后保持计划态");
-        std::fs::remove_dir_all(&ws).ok();
     }
 }

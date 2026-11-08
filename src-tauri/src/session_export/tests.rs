@@ -6,11 +6,8 @@ use super::*;
 use std::io::Read;
 
 /// 每个用例独立目录，避免并行测试互踩。
-fn temp_dir(tag: &str) -> PathBuf {
-    let dir = std::env::temp_dir().join(format!("shaniu-sx-{tag}-{}", std::process::id()));
-    let _ = fs::remove_dir_all(&dir);
-    fs::create_dir_all(&dir).expect("建临时目录");
-    dir
+fn temp_dir(tag: &str) -> crate::test_support::TestTempDir {
+    crate::test_support::TestTempDir::new(&format!("sx-{tag}"))
 }
 
 fn text_entry(path: &str, content: &str) -> ExportEntry {
@@ -92,7 +89,6 @@ fn writes_readable_zip_with_deflate() {
         report.bytes
     );
 
-    let _ = fs::remove_dir_all(&dir);
 }
 
 #[test]
@@ -123,7 +119,6 @@ fn streams_byte_entries_from_source_file() {
     assert_eq!(round, payload, "字节条目必须逐字节往返");
     drop(entry);
 
-    let _ = fs::remove_dir_all(&dir);
 }
 
 #[test]
@@ -159,7 +154,6 @@ fn refuses_bad_entries_before_touching_disk() {
         "失败必须清理临时文件"
     );
 
-    let _ = fs::remove_dir_all(&dir);
 }
 
 #[test]
@@ -170,5 +164,4 @@ fn destination_failure_does_not_leave_partial_file() {
     let err = write_zip(&dest, &[text_entry("session.v4.jsonl", "x")]).unwrap_err();
     assert!(err.contains("临时文件"), "错误应指出来源: {err}");
     assert!(!dir.join("missing-subdir").exists());
-    let _ = fs::remove_dir_all(&dir);
 }

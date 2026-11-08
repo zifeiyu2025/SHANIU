@@ -766,18 +766,9 @@ fn restore_from_snapshot(path: &Path, snapshot: &[u8]) -> Result<(), String> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::sync::atomic::{AtomicUsize, Ordering};
 
-    static SEQ: AtomicUsize = AtomicUsize::new(0);
-
-    fn temp_dir(tag: &str) -> PathBuf {
-        let n = SEQ.fetch_add(1, Ordering::SeqCst);
-        let dir = std::env::temp_dir().join(format!(
-            "shaniu-acl-{tag}-{}-{n}",
-            std::process::id()
-        ));
-        std::fs::create_dir_all(&dir).unwrap();
-        dir
+    fn temp_dir(tag: &str) -> crate::test_support::TestTempDir {
+        crate::test_support::TestTempDir::new(&format!("acl-{tag}"))
     }
 
     #[test]
@@ -791,7 +782,6 @@ mod tests {
         let (parsed_path, parsed_snapshot) = parse_backup(&blob).unwrap();
         assert_eq!(parsed_path, object);
         assert_eq!(parsed_snapshot, snapshot.as_slice());
-        std::fs::remove_dir_all(&dir).ok();
     }
 
     #[test]
@@ -813,7 +803,6 @@ mod tests {
         assert!(scope.iter().all(|path| path.is_dir()));
         let unique: HashSet<PathBuf> = scope.iter().map(|p| normalize(p)).collect();
         assert_eq!(unique.len(), scope.len(), "write_scope 不应返回重复目录");
-        std::fs::remove_dir_all(&ws).ok();
     }
 
     #[test]
@@ -830,7 +819,6 @@ mod tests {
             .grant(&target, sid.as_psid(), Access::Write)
             .expect_err("备份失败时必须拒绝改动安全描述符");
         assert!(error.contains("备份原始 DACL 失败"), "{error}");
-        std::fs::remove_dir_all(&ws).ok();
     }
 
     #[test]
@@ -848,12 +836,12 @@ mod tests {
     /// 收敛规则：父 `Write` 覆盖子 `Read`/`Write`；父 `Read` 不覆盖子 `Write`。
     #[test]
     fn collapse_keeps_only_needed_grants() {
-        let root = std::env::temp_dir();
-        let child = root.join("shaniu-collapse-child");
+        let root = crate::test_support::TestTempDir::new("acl-collapse");
+        let child = root.join("child");
         std::fs::create_dir_all(&child).unwrap();
 
         let collapsed = collapse(vec![
-            (root.clone(), Access::Read),
+            (root.to_path_buf(), Access::Read),
             (child.clone(), Access::Read),
             (child.clone(), Access::Write),
         ]);
@@ -863,7 +851,7 @@ mod tests {
             "子目录的 Write 不得被父目录的 Read 吞掉: {collapsed:?}"
         );
 
-        let collapsed = collapse(vec![(root.clone(), Access::Write), (child.clone(), Access::Read)]);
+        let collapsed = collapse(vec![(root.to_path_buf(), Access::Write), (child.clone(), Access::Read)]);
         assert_eq!(
             collapsed,
             vec![(normalize(&root), Access::Write)],
@@ -873,8 +861,6 @@ mod tests {
         // 同一路径两次不同档位：取更强的一档。
         let same = collapse(vec![(child.clone(), Access::Read), (child.clone(), Access::Write)]);
         assert_eq!(same, vec![(normalize(&child), Access::Write)]);
-
-        std::fs::remove_dir_all(&child).ok();
     }
 
     #[test]
@@ -917,7 +903,6 @@ mod tests {
             !has_explicit_grant(&target, sid.as_psid(), Access::Write.mask()).unwrap(),
             "按备份还原后显式 ACE 应消失"
         );
-        std::fs::remove_dir_all(&ws).ok();
     }
 
     #[test]
@@ -939,7 +924,6 @@ mod tests {
         assert_eq!(restored, 1);
         let final_snapshot = read_dacl_snapshot(&target).unwrap();
         assert_eq!(final_snapshot, before, "还原后 DACL 应与备份完全一致");
-        std::fs::remove_dir_all(&ws).ok();
     }
 
     /// 撤销必须按 `(路径, SID)` 精确删：另一个 SID 的 ACE 一个都不许动。
@@ -978,6 +962,5 @@ mod tests {
             !has_explicit_grant(&target, sid_b.as_psid(), Access::Write.mask()).unwrap(),
             "还原后另一个 SID 的 ACE 也应消失"
         );
-        std::fs::remove_dir_all(&ws).ok();
     }
 }

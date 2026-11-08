@@ -9,12 +9,9 @@ use shaniu_lib::config;
 use shaniu_lib::model_client::{HistoryItem, Role};
 use shaniu_lib::rollout::{ConfigSnapshot, RolloutItem};
 
-/// 临时目录：按测试名隔离，测完自己清。
-fn temp_dir(name: &str) -> std::path::PathBuf {
-    let dir = std::env::temp_dir().join(format!("shaniu-redact-{}-{name}", std::process::id()));
-    let _ = std::fs::remove_dir_all(&dir);
-    std::fs::create_dir_all(&dir).unwrap();
-    dir
+/// 临时目录：按测试名隔离，测完自己清（panic 也清）。
+fn temp_dir(name: &str) -> shaniu_lib::test_support::TestTempDir {
+    shaniu_lib::test_support::TestTempDir::new(&format!("redact-{name}"))
 }
 
 fn read_dir_text(dir: &Path) -> String {

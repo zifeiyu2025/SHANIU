@@ -302,10 +302,8 @@ mod tests {
     use std::path::Path;
     use std::sync::Arc;
 
-    fn workspace() -> std::path::PathBuf {
-        static SEQ: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
-        let n = SEQ.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
-        let dir = std::env::temp_dir().join(format!("shaniu-fs-{}-{n}", std::process::id()));
+    fn workspace() -> crate::test_support::TestTempDir {
+        let dir = crate::test_support::TestTempDir::new("fs");
         std::fs::create_dir_all(dir.join("src")).unwrap();
         std::fs::write(dir.join("README.md"), "hello shaniu\nsecond line\n").unwrap();
         std::fs::write(dir.join("src/main.rs"), "fn main() {\n    println!(\"hello\");\n}\n").unwrap();
@@ -326,7 +324,6 @@ mod tests {
             .await
             .unwrap();
         assert!(out.output.starts_with("hello shaniu"));
-        std::fs::remove_dir_all(&ws).ok();
     }
 
     #[tokio::test]
@@ -342,7 +339,6 @@ mod tests {
             .unwrap();
         let canonical = crate::tool_router::canonical_key(&ws.join("README.md"));
         assert!(reads.get(None, &canonical).is_some(), "读成功必须登记读状态");
-        std::fs::remove_dir_all(&ws).ok();
     }
 
     #[tokio::test]
@@ -355,7 +351,6 @@ mod tests {
             .unwrap();
         assert!(out.output.contains("[已截断"));
         assert!(out.output.len() < 2000);
-        std::fs::remove_dir_all(&ws).ok();
     }
 
     #[tokio::test]
@@ -367,7 +362,6 @@ mod tests {
             .await
             .unwrap_err();
         assert!(matches!(err, ToolError::Execution(_)));
-        std::fs::remove_dir_all(&ws).ok();
     }
 
     #[tokio::test]
@@ -378,7 +372,6 @@ mod tests {
             .await
             .unwrap_err();
         assert!(matches!(err, ToolError::InvalidArgs(_)));
-        std::fs::remove_dir_all(&ws).ok();
     }
 
     #[tokio::test]
@@ -390,7 +383,6 @@ mod tests {
             .unwrap();
         assert!(out.output.contains("README.md"));
         assert!(out.output.contains("src/"));
-        std::fs::remove_dir_all(&ws).ok();
     }
 
     #[tokio::test]
@@ -402,7 +394,6 @@ mod tests {
             .unwrap();
         assert!(out.output.contains("README.md:1"));
         assert!(out.output.contains("src/main.rs:2"));
-        std::fs::remove_dir_all(&ws).ok();
     }
 
     #[tokio::test]
@@ -418,7 +409,6 @@ mod tests {
             .await
             .unwrap();
         assert!(none.output.contains("无匹配"));
-        std::fs::remove_dir_all(&ws).ok();
     }
 
     #[tokio::test]
@@ -432,6 +422,5 @@ mod tests {
             .await
             .unwrap();
         assert!(out.output.contains("main.rs"));
-        std::fs::remove_dir_all(&ws).ok();
     }
 }

@@ -7,8 +7,6 @@
 //! 3) 一行一条 JSON、以换行结尾（逐行 flush 的直接后果）。
 
 use std::collections::VecDeque;
-use std::path::PathBuf;
-use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
 
 use async_trait::async_trait;
@@ -21,13 +19,8 @@ use shaniu_lib::rollout::{self, ConfigSnapshot, RolloutItem, ROLLOUT_DIR};
 use shaniu_lib::tool_router::{PlanState, ToolRouter};
 use tokio_util::sync::CancellationToken;
 
-static SEQ: AtomicUsize = AtomicUsize::new(0);
-
-fn temp_dir(tag: &str) -> PathBuf {
-    let n = SEQ.fetch_add(1, Ordering::SeqCst);
-    let dir = std::env::temp_dir().join(format!("shaniu-rollout-it-{tag}-{}-{n}", std::process::id()));
-    std::fs::create_dir_all(&dir).unwrap();
-    dir
+fn temp_dir(tag: &str) -> shaniu_lib::test_support::TestTempDir {
+    shaniu_lib::test_support::TestTempDir::new(&format!("rollout-it-{tag}"))
 }
 
 /// 两轮脚本：第一轮文本+工具调用，第二轮纯文本收口。
@@ -102,7 +95,7 @@ async fn rollout_file_matches_history_after_one_task() {
         router: Arc::new(ToolRouter::new()),
         broker: Arc::new(ApprovalBroker::new()),
         plan_state: Arc::new(PlanState::new()),
-        workspace_root: data_root.clone(),
+        workspace_root: data_root.to_path_buf(),
         max_turns: 2,
         token_budget: 0,
         tree_budget: Default::default(),
@@ -173,7 +166,6 @@ async fn rollout_file_matches_history_after_one_task() {
     let with_calls: Vec<_> = msgs.iter().filter(|m| m["tool_calls"].is_array()).collect();
     assert_eq!(with_calls.len(), 1, "同轮调用应合成一条 assistant 消息");
 
-    std::fs::remove_dir_all(&data_root).ok();
 }
 
 #[tokio::test]
@@ -191,7 +183,6 @@ async fn second_task_gets_its_own_rollout_file_not_overwrite() {
     let _first = rollout::RolloutWriter::create(&dir, &meta).unwrap();
     let err = rollout::RolloutWriter::create(&dir, &meta).unwrap_err();
     assert!(matches!(err, rollout::RolloutError::AlreadyExists(_)), "{err}");
-    std::fs::remove_dir_all(&dir).ok();
 }
 
 /// `create_session`（SH-017 的宿主建档）依赖的前提：只写过首行的档案必须能被
@@ -231,5 +222,4 @@ fn meta_only_archive_resumes_to_empty_history_and_still_appends() {
         1,
         "续写不得重写首行"
     );
-    std::fs::remove_dir_all(&dir).ok();
 }

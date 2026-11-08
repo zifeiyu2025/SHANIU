@@ -242,10 +242,8 @@ mod tests {
     use super::*;
     use crate::rollout::{read_titles, set_title, TITLES_FILE};
 
-    fn temp_dir(name: &str) -> std::path::PathBuf {
-        let dir = std::env::temp_dir().join(format!("shaniu-title-{name}-{}", std::process::id()));
-        std::fs::create_dir_all(&dir).unwrap();
-        dir
+    fn temp_dir(name: &str) -> crate::test_support::TestTempDir {
+        crate::test_support::TestTempDir::new(&format!("title-{name}"))
     }
 
     #[test]
@@ -315,7 +313,6 @@ mod tests {
         // 存在性检查覆盖，这里只关心 read_titles 的守卫语义，直接写侧车文件）
         std::fs::write(dir.join(TITLES_FILE), r#"{"a": "用户起的名"}"#).unwrap();
         assert!(user_took_over(&dir, "a"), "生成结果不得覆盖用户手改");
-        std::fs::remove_dir_all(&dir).ok();
     }
 
     /// 超长输入在派发前拒绝（不截断——上游语义），错误里带上限值。
@@ -363,6 +360,5 @@ mod tests {
         assert!(!user_took_over(&dir, id));
         set_title(&dir, id, "桩端点生成的标题").unwrap();
         assert_eq!(read_titles(&dir).get(id).map(String::as_str), Some("桩端点生成的标题"));
-        std::fs::remove_dir_all(&dir).ok();
     }
 }

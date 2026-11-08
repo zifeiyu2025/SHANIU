@@ -1635,14 +1635,15 @@ pub fn prune_expired_logs(dir: &Path, retain_days: u64) {
 mod secrets_tests {
     use super::*;
 
-    fn store() -> SecretStore {
-        let base = std::env::temp_dir().join(format!("shaniu-secrets-{}", std::process::id()));
-        SecretStore::new(&base)
+    fn store() -> (crate::test_support::TestTempDir, SecretStore) {
+        let base = crate::test_support::TestTempDir::new("secrets");
+        let store = SecretStore::new(&base);
+        (base, store)
     }
 
     #[test]
     fn round_trip_store_load() {
-        let s = store();
+        let (_dir, s) = store();
         s.store_key("openai-responses", "sk-test-123").unwrap();
         assert_eq!(s.load_key("openai-responses").unwrap().as_deref(), Some("sk-test-123"));
         // 落盘的是 DPAPI 密文而非明文
@@ -1653,13 +1654,13 @@ mod secrets_tests {
 
     #[test]
     fn missing_key_is_none() {
-        let s = store();
+        let (_dir, s) = store();
         assert_eq!(s.load_key("nonexistent").unwrap(), None);
     }
 
     #[test]
     fn delete_then_load_is_none() {
-        let s = store();
+        let (_dir, s) = store();
         s.store_key("p1", "secret").unwrap();
         s.delete_key("p1").unwrap();
         assert_eq!(s.load_key("p1").unwrap(), None);
@@ -1667,7 +1668,7 @@ mod secrets_tests {
 
     #[test]
     fn tampered_cipher_fails_closed() {
-        let s = store();
+        let (_dir, s) = store();
         s.store_key("p2", "secret-value").unwrap();
         let path = s.key_path("p2").unwrap();
         let mut raw = std::fs::read(&path).unwrap();
@@ -1681,7 +1682,7 @@ mod secrets_tests {
 
     #[test]
     fn provider_name_is_sanitized_against_path_injection() {
-        let s = store();
+        let (_dir, s) = store();
         let path = s.key_path("../evil").unwrap();
         // 分隔符被清洗：不逃逸 secrets 目录
         assert!(path.file_name().unwrap() == "evil.key");
@@ -1689,7 +1690,7 @@ mod secrets_tests {
 
     #[test]
     fn empty_key_rejected() {
-        let s = store();
+        let (_dir, s) = store();
         assert!(s.store_key("p3", "   ").is_err());
     }
 }
@@ -1713,7 +1714,7 @@ mod tests {
 
     #[test]
     fn portable_marker_routes_to_exe_data_dir() {
-        let base = std::env::temp_dir().join(format!("shaniu-test-{}", std::process::id()));
+        let base = crate::test_support::TestTempDir::new("test");
         let exe = base.join("app");
         fs::create_dir_all(&exe).unwrap();
         fs::write(exe.join(PORTABLE_MARKER), b"").unwrap();
@@ -1721,7 +1722,6 @@ mod tests {
         let expected = exe.join("data");
         assert_eq!(dirs.config_root, expected);
         assert_eq!(dirs.data_root, expected);
-        fs::remove_dir_all(&base).ok();
     }
 
     #[test]
@@ -1738,7 +1738,7 @@ mod tests {
 
     #[test]
     fn product_dirs_are_created_for_installed_and_portable() {
-        let base = std::env::temp_dir().join(format!("shaniu-layout-{}", std::process::id()));
+        let base = crate::test_support::TestTempDir::new("layout");
         // 安装版：配置根与数据根分离（%APPDATA% / %LOCALAPPDATA%）
         let installed = DataDirs {
             config_root: base.join("appdata"),
@@ -1763,19 +1763,16 @@ mod tests {
         ensure_product_dirs(&portable).unwrap();
         assert!(portable.workspace_root().is_dir());
         assert!(portable.config_root.join(SECRETS_DIR).is_dir());
-        fs::remove_dir_all(&base).ok();
     }
 
     #[test]
     fn unwritable_root_reports_error_instead_of_silently_skipping() {
-        let base = std::env::temp_dir().join(format!("shaniu-layout-bad-{}", std::process::id()));
-        fs::create_dir_all(&base).unwrap();
+        let base = crate::test_support::TestTempDir::new("layout-bad");
         // 数据根是一条文件路径：建子目录必然失败，必须如实报错而不是当作已建好
         let blocked = base.join("blocked");
         fs::write(&blocked, b"file").unwrap();
         let dirs = DataDirs { config_root: blocked.clone(), data_root: blocked };
         assert!(ensure_product_dirs(&dirs).is_err());
-        fs::remove_dir_all(&base).ok();
     }
 
     #[test]
@@ -1792,7 +1789,7 @@ mod tests {
 
     #[test]
     fn config_round_trips_and_defaults_fill_missing_fields() {
-        let base = std::env::temp_dir().join(format!("shaniu-cfg-{}", std::process::id()));
+        let base = crate::test_support::TestTempDir::new("cfg");
         let root = base.join("cfg");
         let (cfg, path) = AppConfig::load_or_create(&root).unwrap();
         assert_eq!(cfg.sandbox.mode, SandboxMode::ReadOnly);
@@ -1807,7 +1804,6 @@ mod tests {
         assert_eq!(cfg2.model.max_turns, 32);
         assert_eq!(cfg2.sandbox.mode, SandboxMode::ReadOnly);
         assert_eq!(cfg2.sandbox.os, OsSandbox::AppContainer, "OS 沙箱默认必须是 AppContainer");
-        fs::remove_dir_all(&base).ok();
     }
 
     #[test]
@@ -1825,12 +1821,11 @@ mod tests {
 
     #[test]
     fn corrupt_config_fails_closed() {
-        let base = std::env::temp_dir().join(format!("shaniu-bad-{}", std::process::id()));
+        let base = crate::test_support::TestTempDir::new("bad");
         let root = base.join("cfg");
         fs::create_dir_all(&root).unwrap();
         fs::write(root.join(CONFIG_FILE), "???not toml???[").unwrap();
         assert!(AppConfig::load_or_create(&root).is_err());
-        fs::remove_dir_all(&base).ok();
     }
 
     #[test]
@@ -1983,11 +1978,11 @@ mod provider_tests {
             provider_revision: 3,
             ..Default::default()
         };
-        let path = std::env::temp_dir().join(format!("shaniu-providers-{}.toml", std::process::id()));
+        let dir = crate::test_support::TestTempDir::new("providers");
+        let path = dir.join("providers.toml");
         cfg.save(&path).unwrap();
         let back: AppConfig = toml::from_str(&std::fs::read_to_string(&path).unwrap()).unwrap();
         assert_eq!(back, cfg, "服务商文档必须原样往返：半途丢字段就等于用户配的 Key 名变了");
-        std::fs::remove_file(&path).ok();
     }
 
     /// 设置页写的是 JSON，字段名却是 camelCase。serde 对结构体字段**不做**大小写转换，
@@ -2061,8 +2056,7 @@ mod provider_tests {
     /// 写盘前必须拦下、原文件一个字节不动，并留一份备份用于取证。
     #[test]
     fn stray_reasoning_keys_are_refused_and_original_is_backed_up() {
-        let base = std::env::temp_dir().join(format!("shaniu-stray-{}", std::process::id()));
-        fs::create_dir_all(&base).unwrap();
+        let base = crate::test_support::TestTempDir::new("stray");
         let path = base.join(CONFIG_FILE);
         let mut listed = profile("longcat", "https://lc/v1", "LongCat-2.5");
         listed.models = vec![effort_row("LongCat-2.5")];
@@ -2104,7 +2098,6 @@ mod provider_tests {
             .collect();
         assert_eq!(backups.len(), 1, "拒绝落盘必须留一份原文件备份: {backups:?}");
         assert_eq!(fs::read_to_string(base.join(&backups[0])).unwrap(), before);
-        fs::remove_dir_all(&base).ok();
     }
 
     fn effort_row(id: &str) -> ModelProfile {
@@ -2125,9 +2118,7 @@ mod provider_tests {
     /// 盘上已经坏的配置必须能自愈一次：备份 → 剔除 → 写回；第二次启动不再动作。
     #[test]
     fn stray_keys_on_disk_are_repaired_once_and_backed_up() {
-        let base = std::env::temp_dir().join(format!("shaniu-repair-{}", std::process::id()));
-        fs::remove_dir_all(&base).ok();
-        fs::create_dir_all(&base).unwrap();
+        let base = crate::test_support::TestTempDir::new("repair");
         let path = base.join(CONFIG_FILE);
 
         let mut listed = profile("longcat", "https://lc/v1", "LongCat-2.5");
@@ -2176,15 +2167,12 @@ mod provider_tests {
             .filter(|e| e.file_name().to_string_lossy().contains(".bak-"))
             .count();
         assert_eq!(backups, 1, "二次启动不应新增备份文件");
-        fs::remove_dir_all(&base).ok();
     }
 
     /// 修不了（解析就失败）必须进只读：原文件一个字节不动，并给出路径。
     #[test]
     fn unparseable_config_is_left_untouched_and_reported_read_only() {
-        let base = std::env::temp_dir().join(format!("shaniu-readonly-{}", std::process::id()));
-        fs::remove_dir_all(&base).ok();
-        fs::create_dir_all(&base).unwrap();
+        let base = crate::test_support::TestTempDir::new("readonly");
         let path = base.join(CONFIG_FILE);
         let broken = "[model]\nbase_url = 123\n";
         fs::write(&path, broken).unwrap();
@@ -2205,7 +2193,6 @@ mod provider_tests {
                 .any(|e| e.file_name().to_string_lossy().contains(".bak-")),
             "没有修复动作就不该产生备份"
         );
-        fs::remove_dir_all(&base).ok();
     }
 
     #[test]
@@ -2349,7 +2336,7 @@ mod provider_tests {
 
     #[test]
     fn crash_report_is_redacted_and_unique() {
-        let dir = std::env::temp_dir().join(format!("shaniu-crash-{}", std::process::id()));
+        let dir = crate::test_support::TestTempDir::new("crash");
         register_secret("opaque-crash-secret-abc");
         let first = write_crash_report(
             &dir,
@@ -2367,7 +2354,6 @@ mod provider_tests {
 
         let second = write_crash_report(&dir, "second", "loc", "main").expect("第二份");
         assert_ne!(first, second, "同一毫秒的两次 panic 也不能互相覆盖");
-        fs::remove_dir_all(&dir).ok();
     }
 }
 
@@ -2382,10 +2368,8 @@ mod mcp_config_tests {
         McpServerConfig { id: id.into(), command: "node".into(), ..Default::default() }
     }
 
-    fn temp_root(tag: &str) -> PathBuf {
-        let root = std::env::temp_dir().join(format!("shaniu-mcp-cfg-{tag}-{}", std::process::id()));
-        fs::create_dir_all(&root).unwrap();
-        root
+    fn temp_root(tag: &str) -> crate::test_support::TestTempDir {
+        crate::test_support::TestTempDir::new(&format!("mcp-cfg-{tag}"))
     }
 
     #[test]
@@ -2555,7 +2539,6 @@ command = "node"
         fs::write(root.join(CONFIG_FILE), body).unwrap();
         let err = AppConfig::load_or_create(&root).unwrap_err();
         assert!(err.contains("id 重复"), "坏配置必须拒载而不是跳过后继续: {err}");
-        fs::remove_dir_all(&root).ok();
     }
 
     #[test]
@@ -2572,6 +2555,5 @@ args = ["server.js"]
         assert_eq!(cfg.mcp.servers.len(), 1);
         assert_eq!(cfg.mcp.servers[0].id, "fs");
         assert!(cfg.mcp.servers[0].enabled);
-        fs::remove_dir_all(&root).ok();
     }
 }

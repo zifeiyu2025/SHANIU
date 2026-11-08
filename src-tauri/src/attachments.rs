@@ -238,14 +238,8 @@ pub fn read(
 mod tests {
     use super::*;
 
-    fn temp_root(tag: &str) -> PathBuf {
-        let dir = std::env::temp_dir().join(format!(
-            "shaniu-attach-{tag}-{}-{}",
-            std::process::id(),
-            ulid::Ulid::generate()
-        ));
-        fs::create_dir_all(&dir).unwrap();
-        dir
+    fn temp_root(tag: &str) -> crate::test_support::TestTempDir {
+        crate::test_support::TestTempDir::new(&format!("attach-{tag}"))
     }
 
     #[test]
@@ -274,7 +268,6 @@ mod tests {
             base64::engine::general_purpose::STANDARD.decode(read.data).unwrap(),
             b"hello attachment"
         );
-        fs::remove_dir_all(&root).ok();
     }
 
     #[test]
@@ -294,7 +287,6 @@ mod tests {
         assert!(read.truncated);
         assert_eq!(read.bytes, 100);
         assert_eq!(read.data.len(), 16); // 10 bytes -> 16 base64 chars（无 padding）
-        fs::remove_dir_all(&root).ok();
     }
 
     #[test]
@@ -320,7 +312,6 @@ mod tests {
         assert_eq!((read.width, read.height), (Some(4), Some(3)));
         // 图片缺尺寸必须拒绝，不能编一个 0x0 的伪图
         assert!(store(&root, "sess-1", "bad.png", "image/png", "aGk=", None, None).is_err());
-        fs::remove_dir_all(&root).ok();
     }
 
     #[test]
@@ -331,7 +322,6 @@ mod tests {
         assert!(store(&root, "sess-1", "a", "text/plain", "", None, None).is_err());
         assert!(read(&root, "sess-1", "../../etc/passwd", 10).is_err());
         assert!(read(&root, "sess-1", "01ARZ3NDEKTSV4RRFFQ69G5FAV", 10).is_err());
-        fs::remove_dir_all(&root).ok();
     }
 
     #[test]
@@ -350,6 +340,5 @@ mod tests {
         assert_eq!(stored.file.as_ref().expect("file").name, "<b>.txt");
         // 路径穿越不能影响落点：字节文件在 ULID 名下
         assert!(root.join("attachments/sess-1").join(format!("{}.bin", stored.receipt_id)).is_file());
-        fs::remove_dir_all(&root).ok();
     }
 }

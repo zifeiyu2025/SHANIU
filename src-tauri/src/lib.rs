@@ -26,6 +26,9 @@ pub mod session_title;
 pub mod skills;
 pub mod subagent_registry;
 pub mod text_encoding;
+/// 测试夹具公共设施（自删临时目录）。`#[doc(hidden)]`：不是产品 API，只为单测/集成测试共用。
+#[doc(hidden)]
+pub mod test_support;
 pub mod tool_router;
 pub mod tools;
 pub mod workspace_files;
@@ -2150,7 +2153,7 @@ mod session_projection_tests {
         // SH-110 随批：注册表/会话 cwd/界面显示共用普通拼写。canonicalize 在
         // Windows 上必产 \\?\ 前缀，不还原就会同一目录两种字符串（会话错组 +
         // tooltip 露出 verbatim）。不存在的路径如实回 None，不猜拼写。
-        let root = std::env::temp_dir().join(format!("shaniu-cwp-{}", ulid::Ulid::generate()));
+        let root = crate::test_support::TestTempDir::new("cwp");
         let nested = root.join("子目录");
         std::fs::create_dir_all(&nested).expect("临时目录可建");
         let resolved = super::canonical_workspace_path(&nested).expect("存在的路径可规范");
@@ -2167,7 +2170,6 @@ mod session_projection_tests {
             Some(resolved),
         );
         assert_eq!(super::canonical_workspace_path(&root.join("不存在")), None);
-        std::fs::remove_dir_all(&root).ok();
     }
 
     fn msg(role: Role, text: &str) -> RolloutItem {

@@ -390,16 +390,14 @@ mod tests {
         }
     }
 
-    fn temp_dir() -> PathBuf {
-        let dir = std::env::temp_dir().join(format!("shaniu-gw-{}-{}", std::process::id(), ulid::Ulid::generate()));
-        std::fs::create_dir_all(&dir).unwrap();
-        dir
+    fn temp_dir() -> crate::test_support::TestTempDir {
+        crate::test_support::TestTempDir::new("gw")
     }
 
     /// 起一个真实 loopback server，返回 (hub, url, journal_dir)。
-    async fn spawn_server() -> (GatewayHub, String, PathBuf) {
+    async fn spawn_server() -> (GatewayHub, String, crate::test_support::TestTempDir) {
         let dir = temp_dir();
-        let hub = GatewayHub::new(dir.clone());
+        let hub = GatewayHub::new(dir.to_path_buf());
         let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
         let port = listener.local_addr().unwrap().port();
         let server_hub = hub.clone();
@@ -425,7 +423,7 @@ mod tests {
 
     #[tokio::test]
     async fn wrong_token_is_rejected() {
-        let (_hub, url, dir) = spawn_server().await;
+        let (_hub, url, _dir) = spawn_server().await;
         let (mut ws, _) = connect_async(&url).await.unwrap();
         ws.send(Message::text(r#"{"type":"hello","token":"bogus"}"#)).await.unwrap();
         let msg = ws.next().await.unwrap().unwrap();
@@ -434,7 +432,6 @@ mod tests {
         // 随后连接被关闭
         let closed = ws.next().await;
         assert!(closed.is_none() || matches!(closed, Some(Ok(Message::Close(_)))));
-        std::fs::remove_dir_all(&dir).ok();
     }
 
     #[tokio::test]
@@ -462,7 +459,6 @@ mod tests {
         ws.send(Message::text(r#"{"type":"credit","session_id":"s1","credits":1}"#)).await.unwrap();
         let second = next_event(&mut ws).await;
         assert_eq!(second.event_id, "03");
-        std::fs::remove_dir_all(&dir).ok();
     }
 
     #[tokio::test]
@@ -483,7 +479,6 @@ mod tests {
         hub.publish(&event("s1", "04"));
         let c = next_event(&mut ws).await;
         assert_eq!(c.event_id, "04");
-        std::fs::remove_dir_all(&dir).ok();
     }
 
     /// 续播超过队列上限时必须停下、等 credit 腾空间后从 `last_id` 继续，不能留下缺口。
@@ -506,6 +501,5 @@ mod tests {
         }
         let expected: Vec<String> = (0..10).map(|index| format!("{index:02}")).collect();
         assert_eq!(seen, expected);
-        std::fs::remove_dir_all(&dir).ok();
     }
 }
