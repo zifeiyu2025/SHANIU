@@ -344,7 +344,7 @@ fn spawn_reader(
         let mut reader = BufReader::new(pipe);
         let mut decoder = crate::text_encoding::StreamDecoder::with_system_oem();
         let mut raw: Vec<u8> = Vec::new();
-        loop {
+        'read: loop {
             raw.clear();
             match reader.read_until(b'\n', &mut raw).await {
                 Ok(0) | Err(_) => break,
@@ -353,10 +353,16 @@ fn spawn_reader(
             while matches!(raw.last(), Some(b'\n') | Some(b'\r')) {
                 raw.pop();
             }
-            let decoded = decoder.decode_line(&raw);
+            for decoded in decoder.push_line(&raw) {
+                if tx.send((channel, decoded)).await.is_err() {
+                    break 'read;
+                }
+            }
             if let Some(encoding) = decoder.decision() {
                 encodings.record(channel, encoding);
             }
+        }
+        for decoded in decoder.finish() {
             if tx.send((channel, decoded)).await.is_err() {
                 break;
             }
@@ -595,8 +601,8 @@ impl ToolExecutor for UnifiedExec {
                         text.push_str(note.as_str());
                     }
                     text.push_str(&format!("\n[exit code: {code}]"));
-                    // 输出编码元数据：不许无痕猜测——这条流最终按 UTF-8 还是 OEM 代码页
-                    // （中文 Windows = 936）还原，明确写进模型可见的输出。
+                    // 输出编码元数据：只在回退到 OEM 代码页（中文 Windows = 936）时写。
+                    // UTF-8/ASCII 是常态，不占位、不加噪；回退则必须明示，不许无痕猜测。
                     let encoding_note = match &waiter {
                         Waiter::Tokio(_) => encodings.note(),
                         Waiter::Restricted(child) => child.encoding_note(),

@@ -7,42 +7,60 @@
 //! 等于读不到中文系统的报错。
 //!
 //! 判定口径（每条流各一次，不做逐行混合解码）：
-//! - 纯 ASCII 在两种编码下字节相同，先放行、不落判定；
-//! - 出现第一个非 ASCII 行时，对这一行做**严格 UTF-8** 校验并定下整条流的编码：
-//!   通过（或只有末尾不完整的多字节序列）→ UTF-8；不通过 → 系统 OEM 代码页；
-//! - 判定一旦落下，后续行一律按同一编码解码。流中途再多出一种编码属于无解输入，
+//! - 纯 ASCII 在两种编码下字节相同，直接放行、不落判定；
+//! - 首个非 ASCII 行严格 UTF-8 通过时**只算暂定**：原始行先扣在手里，继续累计
+//!   非 ASCII 字节；累计到 [`DECISION_SAMPLE_BYTES`] 仍合法才转正为 UTF-8。
+//!   期间任一行严格 UTF-8 失败 → 整条流翻转为 OEM 代码页，扣住的原始行**整段重解**；
+//! - 首个非 ASCII 行就不合法 → 立刻按系统 OEM 代码页，后续行不再改判；
+//! - 判定一旦转正，后续行一律按同一编码解码。流中途再多出另一种编码属于无解输入，
 //!   这里选择"保持已判定的编码、非法序列替换为 U+FFFD"，**绝不逐行翻转**；
 //! - 末尾被截断的多字节序列：不 panic、不吞后续内容（UTF-8 侧 lossy 收尾，
 //!   OEM 侧由 `MultiByteToWideChar` 自己替换）。
 //!
-//! 最终采用的编码经 [`EncodingLedger`] 回写，由调用方写进工具输出元数据——
-//! 不做无痕猜测。
+//! 已知边界（有意保留，不要当成无懈可击）：GBK 双字节偶尔也能拼出合法 UTF-8——
+//! 例如「一」的 GBK 是 `D2 BB`，恰是合法 UTF-8 的 U+04BB。单行巧合由上面的
+//! 累计样本兜住；只有"整条流 ≥256 个非 ASCII 字节全是这种巧合"才会误判成 UTF-8。
+//! 真遇到时输出会是乱码，但不会 panic、不会丢内容。
+//!
+//! 最终采用的编码经 [`EncodingLedger`] 回写。**只有回退到 OEM 代码页时才**把
+//! 编码写进工具输出元数据——UTF-8/ASCII 是绝大多数情况，不占位、不加噪。
 
 use std::sync::{Arc, Mutex};
+
+/// 暂定 UTF-8 转正所需的累计非 ASCII 字节数。样本越大，GBK 巧合越难整体骗过。
+const DECISION_SAMPLE_BYTES: usize = 256;
+
+/// 暂定期最多扣住多少原始字节；超过就按 UTF-8 转正并全部放行（防无界缓冲）。
+const PENDING_LIMIT_BYTES: usize = 64 * 1024;
 
 /// 一条输出流最终采用的编码。
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum StreamEncoding {
-    /// 严格 UTF-8（纯 ASCII 流也算这一类，字节相同）。
+    /// 严格 UTF-8。
     Utf8,
     /// 系统 OEM 代码页（中文 Windows = 936/GBK）。
     Oem(u32),
 }
 
-impl StreamEncoding {
-    /// 元数据里的短标签。
-    pub fn label(self) -> String {
-        match self {
-            StreamEncoding::Utf8 => "utf-8".to_string(),
-            StreamEncoding::Oem(codepage) => format!("oem-{codepage}"),
-        }
-    }
-}
-
 /// 单条输出流的判定器：流内只判定一次。
 pub struct StreamDecoder {
     oem_codepage: u32,
-    decision: Option<StreamEncoding>,
+    state: State,
+}
+
+enum State {
+    /// 至今只见过纯 ASCII（两种编码无差别），尚未判定。
+    Ascii,
+    /// 暂定 UTF-8：原始行先扣住，等样本攒够或出现解码失败再定。
+    ProvisionalUtf8 {
+        pending: Vec<Vec<u8>>,
+        pending_bytes: usize,
+        non_ascii: usize,
+    },
+    /// 已转正：UTF-8。
+    Utf8,
+    /// 已转正：OEM 代码页。
+    Oem(u32),
 }
 
 impl StreamDecoder {
@@ -50,7 +68,7 @@ impl StreamDecoder {
     pub fn new(oem_codepage: u32) -> Self {
         Self {
             oem_codepage,
-            decision: None,
+            state: State::Ascii,
         }
     }
 
@@ -59,43 +77,122 @@ impl StreamDecoder {
         Self::new(system_oem_codepage())
     }
 
-    /// 已落定的编码；`None` = 至今只见过纯 ASCII（两种编码无差别）。
+    /// 已落定的编码；`None` = 至今只见过纯 ASCII。
+    /// 暂定 UTF-8 也报 `Utf8`（此刻的输出确实是按 UTF-8 解的）。
     pub fn decision(&self) -> Option<StreamEncoding> {
-        self.decision
+        match self.state {
+            State::Ascii => None,
+            State::ProvisionalUtf8 { .. } | State::Utf8 => Some(StreamEncoding::Utf8),
+            State::Oem(codepage) => Some(StreamEncoding::Oem(codepage)),
+        }
     }
 
-    /// 解码一行（不含行尾 `\r\n`）。
-    pub fn decode_line(&mut self, line: &[u8]) -> String {
-        let encoding = match self.decision {
-            Some(encoding) => encoding,
-            None => {
+    /// 输入一行（不含行尾 `\r\n`），返回**此刻可以放行**的解码结果。
+    ///
+    /// 暂定期返回空：那些行会被扣住，等判定转正或翻转后按最终编码一次性放行。
+    pub fn push_line(&mut self, line: &[u8]) -> Vec<String> {
+        match std::mem::replace(&mut self.state, State::Ascii) {
+            State::Ascii => {
                 if line.is_ascii() {
-                    // ASCII 在 UTF-8 与 OEM 代码页下同字节：先放行，不下判定。
-                    return String::from_utf8_lossy(line).into_owned();
+                    // ASCII 在两种编码下同字节：直接放行，不落判定。
+                    self.state = State::Ascii;
+                    return vec![ascii_text(line)];
                 }
-                let encoding = classify(line, self.oem_codepage);
-                self.decision = Some(encoding);
-                encoding
+                if utf8_ok_or_truncated(line) {
+                    let non_ascii = count_non_ascii(line);
+                    if non_ascii >= DECISION_SAMPLE_BYTES {
+                        self.state = State::Utf8;
+                        return vec![decode_utf8_line(line)];
+                    }
+                    self.state = State::ProvisionalUtf8 {
+                        pending: vec![line.to_vec()],
+                        pending_bytes: line.len(),
+                        non_ascii,
+                    };
+                    Vec::new()
+                } else {
+                    self.state = State::Oem(self.oem_codepage);
+                    vec![decode_codepage(self.oem_codepage, line)]
+                }
             }
-        };
-        match encoding {
-            StreamEncoding::Utf8 => match std::str::from_utf8(line) {
-                Ok(text) => text.to_string(),
-                // 判定时已排除非法序列，这里只可能是末尾截断：lossy 用 U+FFFD 收尾。
-                Err(_) => String::from_utf8_lossy(line).into_owned(),
-            },
-            StreamEncoding::Oem(codepage) => decode_codepage(codepage, line),
+            State::ProvisionalUtf8 {
+                mut pending,
+                mut pending_bytes,
+                mut non_ascii,
+            } => {
+                if !utf8_ok_or_truncated(line) {
+                    // 判定翻转：扣住的原始行整段按 OEM 重解——绝不逐行混合。
+                    self.state = State::Oem(self.oem_codepage);
+                    let mut out: Vec<String> = pending
+                        .iter()
+                        .map(|buffered| decode_codepage(self.oem_codepage, buffered))
+                        .collect();
+                    out.push(decode_codepage(self.oem_codepage, line));
+                    return out;
+                }
+                pending.push(line.to_vec());
+                pending_bytes += line.len();
+                non_ascii += count_non_ascii(line);
+                if non_ascii >= DECISION_SAMPLE_BYTES || pending_bytes >= PENDING_LIMIT_BYTES {
+                    self.state = State::Utf8;
+                    return pending.iter().map(|buffered| decode_utf8_line(buffered)).collect();
+                }
+                self.state = State::ProvisionalUtf8 {
+                    pending,
+                    pending_bytes,
+                    non_ascii,
+                };
+                Vec::new()
+            }
+            State::Utf8 => {
+                self.state = State::Utf8;
+                vec![decode_utf8_line(line)]
+            }
+            State::Oem(codepage) => {
+                self.state = State::Oem(codepage);
+                vec![decode_codepage(codepage, line)]
+            }
+        }
+    }
+
+    /// 流结束：把暂定期扣住的行按暂定编码放行。
+    pub fn finish(&mut self) -> Vec<String> {
+        match std::mem::replace(&mut self.state, State::Ascii) {
+            State::ProvisionalUtf8 { pending, .. } => {
+                // EOF 仍没攒够样本：按 UTF-8 收尾（尾部截断由 lossy 兜住）。
+                self.state = State::Utf8;
+                pending.iter().map(|buffered| decode_utf8_line(buffered)).collect()
+            }
+            other => {
+                self.state = other;
+                Vec::new()
+            }
         }
     }
 }
 
-/// 首个非 ASCII 行的判定：严格 UTF-8 通过就是 UTF-8；否则整条流按 OEM 代码页。
-fn classify(line: &[u8], oem_codepage: u32) -> StreamEncoding {
+/// 严格 UTF-8，或只有末尾不完整的多字节序列（等后续字节再判）。
+fn utf8_ok_or_truncated(line: &[u8]) -> bool {
     match std::str::from_utf8(line) {
-        Ok(_) => StreamEncoding::Utf8,
-        // error_len() == None：只有末尾不完整的多字节序列，前缀全部合法。
-        Err(error) if error.error_len().is_none() => StreamEncoding::Utf8,
-        Err(_) => StreamEncoding::Oem(oem_codepage),
+        Ok(_) => true,
+        Err(error) => error.error_len().is_none(),
+    }
+}
+
+fn count_non_ascii(line: &[u8]) -> usize {
+    line.iter().filter(|byte| **byte >= 0x80).count()
+}
+
+fn ascii_text(line: &[u8]) -> String {
+    // ASCII 字节一定是合法 UTF-8。
+    String::from_utf8_lossy(line).into_owned()
+}
+
+fn decode_utf8_line(line: &[u8]) -> String {
+    match std::str::from_utf8(line) {
+        Ok(text) => text.to_string(),
+        // 判定已转正 UTF-8，这里只可能是末尾截断：lossy 用 U+FFFD 收尾。
+        Err(_) => String::from_utf8_lossy(line).into_owned(),
     }
 }
 
@@ -119,19 +216,18 @@ impl EncodingLedger {
         }
     }
 
-    /// 工具输出里的元数据行；只见过纯 ASCII 的流不占位，全都没有则返回 `None`。
+    /// 工具输出里的元数据行：**只有回退到 OEM 代码页时才写**。
+    /// UTF-8/ASCII 是常态，不占位；全都没有回退则返回 `None`。
     pub fn note(&self) -> Option<String> {
         let slots = self.slots.lock().ok()?;
         let parts: Vec<String> = ["stdout", "stderr"]
             .iter()
             .enumerate()
-            .filter_map(|(index, name)| {
-                slots[index].map(|encoding| match encoding {
-                    StreamEncoding::Utf8 => format!("{name}=utf-8"),
-                    StreamEncoding::Oem(codepage) => format!(
-                        "{name}=oem-{codepage}（非 UTF-8，已按系统 OEM 代码页 {codepage} 还原）"
-                    ),
-                })
+            .filter_map(|(index, name)| match slots[index] {
+                Some(StreamEncoding::Oem(codepage)) => Some(format!(
+                    "{name}=oem-{codepage}（非 UTF-8，已按系统 OEM 代码页 {codepage} 还原）"
+                )),
+                _ => None,
             })
             .collect();
         if parts.is_empty() {
@@ -201,7 +297,7 @@ mod tests {
         assert!(String::from_utf8(bytes).is_err());
 
         let mut decoder = StreamDecoder::new(936);
-        assert_eq!(decoder.decode_line(&GBK_ACCESS_DENIED), "拒绝访问。");
+        assert_eq!(decoder.push_line(&GBK_ACCESS_DENIED), vec!["拒绝访问。"]);
         assert_eq!(decoder.decision(), Some(StreamEncoding::Oem(936)));
     }
 
@@ -210,35 +306,80 @@ mod tests {
         let mut raw = b"type missing.txt: ".to_vec();
         raw.extend_from_slice(&GBK_ACCESS_DENIED);
         let mut decoder = StreamDecoder::new(936);
-        assert_eq!(
-            decoder.decode_line(&raw),
-            "type missing.txt: 拒绝访问。"
-        );
-    }
-
-    #[test]
-    fn utf8_stream_stays_utf8() {
-        let mut decoder = StreamDecoder::new(936);
-        assert_eq!(decoder.decode_line("拒绝访问。".as_bytes()), "拒绝访问。");
-        assert_eq!(decoder.decision(), Some(StreamEncoding::Utf8));
+        assert_eq!(decoder.push_line(&raw), vec!["type missing.txt: 拒绝访问。"]);
     }
 
     #[test]
     fn ascii_only_stream_makes_no_decision() {
         let mut decoder = StreamDecoder::new(936);
-        assert_eq!(decoder.decode_line(b"hello world"), "hello world");
+        assert_eq!(decoder.push_line(b"hello world"), vec!["hello world"]);
         assert_eq!(decoder.decision(), None);
+        assert!(decoder.finish().is_empty());
     }
 
-    /// 判定按整条流做一次：先落定 UTF-8 后，后续 GBK 行不许翻转（也不许逐行混解）。
+    /// UTF-8 中文先暂定、攒够样本后转正；转正前扣住，转正后一次放行。
+    #[test]
+    fn utf8_stream_finalizes_after_sample_window() {
+        let mut decoder = StreamDecoder::new(936);
+        // 单行 15 个非 ASCII 字节 < 256：暂定，先不放行。
+        assert!(decoder.push_line("拒绝访问。".as_bytes()).is_empty());
+        assert_eq!(decoder.decision(), Some(StreamEncoding::Utf8));
+
+        // 继续补到 ≥256 个非 ASCII 字节后转正，扣住的行整段放行。
+        let filler = "中文输出".repeat(9); // 4 字 × 3 字节 × 9 = 108 字节
+        let mut released = decoder.push_line(filler.as_bytes());
+        while released.is_empty() {
+            released = decoder.push_line(filler.as_bytes());
+        }
+        assert_eq!(released.first().unwrap(), "拒绝访问。");
+        assert!(released.len() >= 3, "扣住的行应整段放行: {}", released.len());
+    }
+
+    /// 判定按整条流做一次：先转正 UTF-8 后，后续 GBK 行不许翻转（也不许逐行混解）。
     #[test]
     fn decision_never_flips_per_line() {
         let mut decoder = StreamDecoder::new(936);
-        assert_eq!(decoder.decode_line("中文".as_bytes()), "中文");
+        let utf8 = "中文".repeat(64); // 384 字节非 ASCII，直接转正
+        assert_eq!(decoder.push_line(utf8.as_bytes()), vec![utf8.clone()]);
         assert_eq!(decoder.decision(), Some(StreamEncoding::Utf8));
 
-        let text = decoder.decode_line(&GBK_ACCESS_DENIED);
+        let text = decoder.push_line(&GBK_ACCESS_DENIED).remove(0);
         assert_ne!(text, "拒绝访问。");
+        assert!(text.contains('\u{FFFD}'));
+        assert_eq!(decoder.decision(), Some(StreamEncoding::Utf8));
+    }
+
+    /// 关键补充：GBK 双字节偶合合法 UTF-8（「一」= D2 BB = U+04BB）。
+    /// 首行巧合只算暂定，下一行解码失败即整段翻回 OEM，缓冲行一并重解。
+    #[test]
+    fn gbk_coincidence_is_caught_after_the_sample_window() {
+        let coincidence = [0xD2, 0xBB]; // 「一」的 GBK，恰好是合法 UTF-8
+        assert!(std::str::from_utf8(&coincidence).is_ok());
+
+        let mut decoder = StreamDecoder::new(936);
+        assert!(decoder.push_line(&coincidence).is_empty());
+        assert_eq!(decoder.decision(), Some(StreamEncoding::Utf8)); // 暂定
+
+        let released = decoder.push_line(&GBK_ACCESS_DENIED);
+        assert_eq!(decoder.decision(), Some(StreamEncoding::Oem(936)));
+        assert_eq!(released, vec!["一".to_string(), "拒绝访问。".to_string()]);
+    }
+
+    /// 已知残余边界（文档化，不修）：整条流的 ≥256 个非 ASCII 字节全是 GBK 巧合时，
+    /// 与 UTF-8 无法区分，会误判成 UTF-8。至少不会 panic、不会丢内容。
+    #[test]
+    fn pure_coincidence_beyond_sample_window_is_a_documented_boundary() {
+        let coincidence = [0xD2, 0xBB]; // 「一」
+        let mut decoder = StreamDecoder::new(936);
+        // 先攒过 256 字节门槛。
+        let mut released = Vec::new();
+        for _ in 0..200 {
+            released.extend(decoder.push_line(&coincidence));
+        }
+        assert_eq!(decoder.decision(), Some(StreamEncoding::Utf8));
+        assert!(!released.is_empty());
+        // 之后再来普通 GBK 也不会翻转——这就是边界本身。
+        let text = decoder.push_line(&GBK_ACCESS_DENIED).remove(0);
         assert!(text.contains('\u{FFFD}'));
         assert_eq!(decoder.decision(), Some(StreamEncoding::Utf8));
     }
@@ -248,31 +389,47 @@ mod tests {
     fn truncated_multibyte_tail_does_not_swallow_following_lines() {
         let mut decoder = StreamDecoder::new(936);
         // "拒" 的 UTF-8 是 E6 8B 92，这里只给前两字节（模拟进程被杀时写了一半）。
-        let text = decoder.decode_line(&[0xE6, 0x8B]);
-        assert_eq!(decoder.decision(), Some(StreamEncoding::Utf8));
-        assert!(text.contains('\u{FFFD}'));
-        assert_eq!(decoder.decode_line("后续内容".as_bytes()), "后续内容");
+        assert!(decoder.push_line(&[0xE6, 0x8B]).is_empty());
+        let released = decoder.finish();
+        assert_eq!(released.len(), 1);
+        assert!(released[0].contains('\u{FFFD}'));
+
+        let mut decoder = StreamDecoder::new(936);
+        assert!(decoder.push_line(&[0xE6, 0x8B]).is_empty());
+        // 暂定期：合法行也被扣住，但不会丢——finish 时按顺序放行。
+        assert!(decoder.push_line("后续内容".as_bytes()).is_empty());
+        let released = decoder.finish();
+        assert_eq!(released.len(), 2);
+        assert!(released[0].contains('\u{FFFD}'));
+        assert_eq!(released[1], "后续内容");
     }
 
     /// 截断的 GBK 双字节：同样不 panic，后续行照常解出。
     #[test]
     fn truncated_oem_tail_does_not_swallow_following_lines() {
         let mut decoder = StreamDecoder::new(936);
-        let text = decoder.decode_line(&[0xBE]);
+        let released = decoder.push_line(&[0xBE]);
         assert_eq!(decoder.decision(), Some(StreamEncoding::Oem(936)));
-        assert!(!text.is_empty());
-        assert_eq!(decoder.decode_line(&GBK_ACCESS_DENIED), "拒绝访问。");
+        assert_eq!(released.len(), 1);
+        assert!(!released[0].is_empty());
+        assert_eq!(
+            decoder.push_line(&GBK_ACCESS_DENIED),
+            vec!["拒绝访问。"]
+        );
     }
 
     #[test]
-    fn ledger_reports_only_streams_that_were_decided() {
+    fn ledger_reports_only_oem_fallbacks() {
         let ledger = EncodingLedger::new();
         assert!(ledger.note().is_none());
 
-        ledger.record(0, StreamEncoding::Oem(936));
+        // UTF-8 是常态：不写元数据。
         ledger.record(1, StreamEncoding::Utf8);
-        let note = ledger.note().expect("两条流都落定了判定");
+        assert!(ledger.note().is_none());
+
+        ledger.record(0, StreamEncoding::Oem(936));
+        let note = ledger.note().expect("有 OEM 回退就要写元数据");
         assert!(note.contains("stdout=oem-936"), "实际: {note}");
-        assert!(note.contains("stderr=utf-8"), "实际: {note}");
+        assert!(!note.contains("stderr"), "UTF-8 流不该出现在元数据里: {note}");
     }
 }

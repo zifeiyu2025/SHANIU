@@ -204,7 +204,7 @@ unsafe impl Send for RestrictedChild {}
 pub type ExecLine = (u8, String);
 
 impl RestrictedChild {
-    /// 本次 exec 实际采用的输出编码（只报落定过判定的流）；供调用方写进工具输出元数据。
+    /// 本次 exec 回退到 OEM 代码页的流（UTF-8 不报）；供调用方写进工具输出元数据。
     pub fn encoding_note(&self) -> Option<String> {
         self.encodings.note()
     }
@@ -441,7 +441,7 @@ fn spawn_pipe_reader(
         let mut reader = std::io::BufReader::new(read);
         let mut decoder = crate::text_encoding::StreamDecoder::with_system_oem();
         let mut raw: Vec<u8> = Vec::new();
-        loop {
+        'read: loop {
             raw.clear();
             match reader.read_until(b'\n', &mut raw) {
                 Ok(0) | Err(_) => break,
@@ -450,10 +450,16 @@ fn spawn_pipe_reader(
             while matches!(raw.last(), Some(b'\n') | Some(b'\r')) {
                 raw.pop();
             }
-            let decoded = decoder.decode_line(&raw);
+            for decoded in decoder.push_line(&raw) {
+                if tx.blocking_send((channel, decoded)).is_err() {
+                    break 'read;
+                }
+            }
             if let Some(encoding) = decoder.decision() {
                 encodings.record(channel, encoding);
             }
+        }
+        for decoded in decoder.finish() {
             if tx.blocking_send((channel, decoded)).is_err() {
                 break;
             }
