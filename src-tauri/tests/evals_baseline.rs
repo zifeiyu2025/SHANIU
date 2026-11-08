@@ -467,8 +467,17 @@ async fn evals_baseline_v0() {
         .map(|run| run["summary"]["passed"].as_f64().unwrap_or(0.0))
         .collect();
     let median_success = median(&success_rates);
+    // 判定只在「同日、同端点、同参数」的两臂之间做：判定的分母是**当日对照**，
+    // 不是冻结基线。冻结基线会被端点漂移整体抬升（实测 32%/轮），拿它当分母结论永远红。
+    let ablated = std::env::var("SHANIU_EVAL_ABLATE_AR6")
+        .ok()
+        .is_some_and(|value| value.trim() == "1");
+    let role = std::env::var("SHANIU_EVAL_ROLE").unwrap_or_else(|_| "treatment".to_string());
+    let arm = if ablated { "ar6_off" } else { "ar6_on" };
     let report = json!({
         "version": spec.version,
+        "arm": arm,
+        "role": role,
         "epoch_ms": SystemTime::now().duration_since(UNIX_EPOCH).unwrap().as_millis(),
         "provider": provider.provider,
         "base_url": provider.base_url,
@@ -504,9 +513,10 @@ async fn evals_baseline_v0() {
         max(&tokens),
     );
     if only.is_empty() {
-        let out_path = repo_root().join("evals").join("latest.json");
+        let file = if role == "control" { "control.json" } else { "latest.json" };
+        let out_path = repo_root().join("evals").join(file);
         std::fs::write(&out_path, serde_json::to_string_pretty(&report).unwrap()).unwrap();
-        println!("[evals] 基线报告已写入 {}", out_path.display());
+        println!("[evals] 报告已写入 {}（arm={arm} role={role}）", out_path.display());
     } else {
         // 单任务调试绝不能覆写 latest.json：否则一次调试跑就把基线门禁的参照物换掉
         println!("[evals] 调试模式（SHANIU_EVAL_ONLY={only}）：不写 latest.json，不影响门禁");

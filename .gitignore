@@ -53,3 +53,4 @@ artifacts/
 
 # 评估运行产物（每次跑覆盖，入库会churn；基线看 evals/baseline.json）
 evals/latest.json
+evals/control.json
