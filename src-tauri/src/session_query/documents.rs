@@ -113,6 +113,18 @@ pub fn build_documents(items: &[RolloutItem], created_at: u64) -> Vec<SearchDoc>
                     &mut documents,
                 );
             }
+            // 带图消息只索引文字与图片路径：字节不在档案里，索引也没得可索引。
+            RolloutItem::ResponseItem {
+                item: HistoryItem::ImageMessage { role, text, images },
+            } => {
+                let paths = images
+                    .iter()
+                    .map(|image| image.path.as_str())
+                    .collect::<Vec<_>>();
+                let mut parts = vec![text.trim()];
+                parts.extend(paths);
+                push(join_text(&parts), role_doc_type(*role), base_seq, &mut documents);
+            }
             // 首行 meta 与子代理引用不是可搜索内容。
             RolloutItem::SessionMeta { .. } | RolloutItem::SubagentRef { .. } => {}
         }

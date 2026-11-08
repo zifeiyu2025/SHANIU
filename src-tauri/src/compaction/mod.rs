@@ -62,6 +62,10 @@ pub fn item_tokens(item: &HistoryItem) -> usize {
             approx_tokens(name) + approx_tokens(arguments)
         }
         HistoryItem::FunctionCallOutput { output, .. } => approx_tokens(output),
+        // 图片字节不在历史里，按 view_image 记下的分辨率估算值计入预算。
+        HistoryItem::ImageMessage { text, images, .. } => {
+            approx_tokens(text) + images.iter().map(|image| image.tokens as usize).sum::<usize>()
+        }
     }
 }
 

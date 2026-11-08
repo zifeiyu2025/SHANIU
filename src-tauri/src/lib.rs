@@ -347,6 +347,29 @@ fn project_entries(items: &[rollout::RolloutItem]) -> Vec<SessionEntry> {
                 text: summary.clone(),
                 reasoning: None,
             }),
+            // 带图消息按普通消息回放：只展示文字与图片路径引用，绝不还原字节
+            // （UI 取字节有独立预览通道，不走会话档案）。
+            rollout::RolloutItem::ResponseItem {
+                item: model_client::HistoryItem::ImageMessage { role, text, images },
+            } => {
+                let mut shown = text.clone();
+                for image in images {
+                    shown.push_str(&format!(
+                        "\n[图片: {}（{}×{}，约 {} tokens）]",
+                        image.path, image.width, image.height, image.tokens
+                    ));
+                }
+                out.push(SessionEntry::Message {
+                    role: match role {
+                        model_client::Role::User => "user",
+                        model_client::Role::Assistant => "assistant",
+                        model_client::Role::System => "system",
+                    }
+                    .to_string(),
+                    text: shown,
+                    reasoning: None,
+                });
+            }
             // 首行 meta 不是历史；子代理引用要等 SH-056 的泳道 UI 才有展示形态。
             rollout::RolloutItem::SessionMeta { .. } | rollout::RolloutItem::SubagentRef { .. } => {}
         }

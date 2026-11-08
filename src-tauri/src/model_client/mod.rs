@@ -4,6 +4,7 @@
 //! 不含鉴权存储（provider.rs / config::SecretStore）、不含会话历史管理（agent_loop）。
 //! 取消语义：drop 返回的 Stream 即中断底层连接（agent_loop 的 CancellationToken 据此传播）。
 
+pub mod image_store;
 pub mod provider;
 
 use eventsource_stream::{Event, Eventsource};
@@ -67,6 +68,29 @@ pub enum HistoryItem {
     },
     FunctionCall { name: String, arguments: String, call_id: String },
     FunctionCallOutput { call_id: String, output: String },
+    /// 带图片的用户消息（`view_image` 回填专用）。
+    ///
+    /// 图片以 [`ImageRef`] 引用形式**持久化**，真实字节只活在
+    /// [`image_store`] 的内存缓存里——这是「base64 不进 rollout」的落点。
+    ImageMessage {
+        role: Role,
+        text: String,
+        images: Vec<ImageRef>,
+    },
+}
+
+/// 图片引用：rollout / 事件日志里只允许出现这份元数据，永远不含字节。
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ImageRef {
+    /// 工作区相对路径（展示与重新读取用）。
+    pub path: String,
+    /// 内容 sha256，[`image_store`] 的键。
+    pub sha256: String,
+    pub width: u32,
+    pub height: u32,
+    /// 按分辨率估算的输入 token（不是字节数）。
+    pub tokens: u32,
+    pub mime: String,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -166,7 +190,7 @@ pub fn build_responses_request(
     let mut body = serde_json::json!({
         "model": provider.model,
         "instructions": instructions,
-        "input": history,
+        "input": responses_input(history),
         "stream": true,
         "tools": tools.iter().map(|t| serde_json::json!({
             "type": "function",
@@ -181,6 +205,67 @@ pub fn build_responses_request(
         body["reasoning"] = serde_json::json!({ "effort": effort });
     }
     body
+}
+
+/// history → Responses `input` 数组。
+///
+/// 除图片消息外一律沿用 serde 的既有形状（`message` / `function_call` /
+/// `function_call_output`），不顺手改协议。图片消息必须发成
+/// `{"role","content":[{"type":"input_text"},{"type":"input_image","image_url":"data:…"}]}`：
+/// 真机探针验证过，`image_url` 写成对象会 400（`image_url is required`）。
+fn responses_input(history: &[HistoryItem]) -> Vec<serde_json::Value> {
+    history
+        .iter()
+        .map(|item| match item {
+            HistoryItem::ImageMessage { role, text, images } => {
+                let mut content = Vec::new();
+                if !text.trim().is_empty() {
+                    content.push(serde_json::json!({ "type": "input_text", "text": text }));
+                }
+                for image in images {
+                    match image_store::data_url(&image.sha256) {
+                        Some(url) => content
+                            .push(serde_json::json!({ "type": "input_image", "image_url": url })),
+                        None => content.push(serde_json::json!({
+                            "type": "input_text",
+                            "text": missing_image_note(image),
+                        })),
+                    }
+                }
+                serde_json::json!({ "role": role, "content": content })
+            }
+            other => serde_json::to_value(other).expect("HistoryItem 序列化不应失败"),
+        })
+        .collect()
+}
+
+/// 缓存里没有图片字节时的替代文本（进程重启或缓存淘汰）。
+fn missing_image_note(image: &ImageRef) -> String {
+    format!(
+        "[图片不可用：{}（{}×{}）。会话重启或缓存淘汰后不再保留字节，需要时请重新调用 view_image]",
+        image.path, image.width, image.height
+    )
+}
+
+/// 图片消息 → ChatCompletions `content` 数组（文本在前，图片在后）。
+fn chat_image_content(text: &str, images: &[ImageRef]) -> serde_json::Value {
+    let mut parts = Vec::new();
+    if !text.trim().is_empty() {
+        parts.push(serde_json::json!({ "type": "text", "text": text }));
+    }
+    for image in images {
+        match image_store::data_url(&image.sha256) {
+            Some(url) => parts.push(serde_json::json!({
+                "type": "image_url",
+                "image_url": { "url": url },
+            })),
+            None => parts.push(serde_json::json!({
+                "type": "text",
+                "text": missing_image_note(image),
+            })),
+        }
+    }
+    serde_json::Value::Array(parts)
 }
 
 /// 构造 ChatCompletions API 请求体（stream:true；工具为 function 包装）。
@@ -262,6 +347,13 @@ pub fn chat_messages(instructions: &str, history: &[HistoryItem]) -> Vec<serde_j
                     m["reasoning_content"] = serde_json::Value::String(r.to_string());
                 }
                 messages.push(m);
+                i += 1;
+            }
+            HistoryItem::ImageMessage { role, text, images } => {
+                messages.push(serde_json::json!({
+                    "role": role,
+                    "content": chat_image_content(text, images),
+                }));
                 i += 1;
             }
             // 落单的 tool 输出：只有外部裁剪/重排历史才会出现，按 call_id 原样发出
@@ -550,6 +642,103 @@ pub async fn stream_body(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn provider(protocol: &str) -> ProviderConfig {
+        ProviderConfig {
+            provider: protocol.into(),
+            base_url: "https://x/v1".into(),
+            model: "m1".into(),
+            reasoning_effort: None,
+            headers: Default::default(),
+        }
+    }
+
+    fn image_ref(hash: &str) -> ImageRef {
+        ImageRef {
+            path: "shots/screen.png".into(),
+            sha256: hash.into(),
+            width: 128,
+            height: 128,
+            tokens: 25,
+            mime: "image/png".into(),
+        }
+    }
+
+    #[test]
+    fn responses_request_sends_image_as_input_image_string() {
+        image_store::put("resp-hash", "image/png", b"\x89PNG");
+        let history = vec![HistoryItem::ImageMessage {
+            role: Role::User,
+            text: "图里是什么".into(),
+            images: vec![image_ref("resp-hash")],
+        }];
+        let body = build_responses_request(&provider("openai-responses"), &history, &[], "SYS");
+        assert_eq!(body["input"][0]["role"], "user");
+        assert_eq!(body["input"][0]["content"][0]["type"], "input_text");
+        assert_eq!(body["input"][0]["content"][1]["type"], "input_image");
+        // 真机探针：`image_url` 必须是字符串，写成对象端点报 400。
+        let url = body["input"][0]["content"][1]["image_url"]
+            .as_str()
+            .expect("image_url 必须是字符串");
+        assert!(url.starts_with("data:image/png;base64,"), "{url}");
+        // 带图消息不能带 `type: message`，那是纯文本消息的形状。
+        assert!(body["input"][0].get("type").is_none());
+    }
+
+    #[test]
+    fn chat_request_sends_image_as_image_url_object() {
+        image_store::put("chat-hash", "image/jpeg", b"\xff\xd8");
+        let history = vec![HistoryItem::ImageMessage {
+            role: Role::User,
+            text: "图里是什么".into(),
+            images: vec![ImageRef {
+                mime: "image/jpeg".into(),
+                ..image_ref("chat-hash")
+            }],
+        }];
+        let body = build_chat_request(&provider("openai-chat"), &history, &[], "SYS");
+        let content = &body["messages"][1]["content"];
+        assert_eq!(content[0]["type"], "text");
+        assert_eq!(content[1]["type"], "image_url");
+        let url = content[1]["image_url"]["url"].as_str().expect("url 字段");
+        assert!(url.starts_with("data:image/jpeg;base64,"), "{url}");
+    }
+
+    #[test]
+    fn missing_image_bytes_degrade_to_text_note() {
+        let history = vec![HistoryItem::ImageMessage {
+            role: Role::User,
+            text: String::new(),
+            images: vec![image_ref("hash-never-stored")],
+        }];
+        let chat = build_chat_request(&provider("openai-chat"), &history, &[], "SYS");
+        let text = chat["messages"][1]["content"][0]["text"]
+            .as_str()
+            .expect("应退化为文本说明");
+        assert!(text.contains("图片不可用"), "{text}");
+        let responses = build_responses_request(&provider("openai-responses"), &history, &[], "SYS");
+        let text = responses["input"][0]["content"][0]["text"]
+            .as_str()
+            .expect("应退化为文本说明");
+        assert!(text.contains("图片不可用"), "{text}");
+    }
+
+    #[test]
+    fn image_message_serializes_without_bytes() {
+        image_store::put("serialize-hash", "image/png", b"\x89PNG-body");
+        let item = HistoryItem::ImageMessage {
+            role: Role::User,
+            text: "看图".into(),
+            images: vec![image_ref("serialize-hash")],
+        };
+        let json = serde_json::to_string(&item).expect("序列化");
+        // rollout 只能落引用：出现 base64 / data: 就说明图片字节漏进了档案。
+        assert!(!json.contains("base64"), "{json}");
+        assert!(!json.contains("data:image"), "{json}");
+        assert!(json.contains("serialize-hash"), "{json}");
+        let back: HistoryItem = serde_json::from_str(&json).expect("反序列化");
+        assert_eq!(back, item);
+    }
 
     fn event(name: &str, data: &str) -> Event {
         Event {
