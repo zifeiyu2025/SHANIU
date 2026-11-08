@@ -1,5 +1,8 @@
-// 由 scratch/copy-dsh.ps1 + gen 脚本生成的 DSH 包名 → 源码别名表（随上游同步重新生成）
+// DSH 包名 → 源码别名表（Vite 构建时解析用，生成脚本不在本仓库，现为手工维护）。
 // 规则：精确名 → src/index.ts(x)；子路径 → src/*（vite 自行补扩展名与 /index）
+// 维护约定：只留指向真实存在源码的条目，并与 src/dsh/tsconfig.base.json 的 paths 对齐；
+// 唯一例外是 landlock-run 的显式防护（见末尾注释）。裁剪依据见
+// docs/06-DSH裁剪决策记录.md，src/dsh-mapping.spec.ts 会校验这条约束。
 export const dshAliases: { find: RegExp; replacement: string }[] = [
   { find: /^@deepseek-ai\/cordis$/, replacement: '/src/dsh/vendor/cordis/src/index.ts' },
   { find: /^@deepseek-ai\/cordis\/(.*)$/, replacement: '/src/dsh/vendor/cordis/src/$1' },
@@ -496,4 +499,8 @@ export const dshAliases: { find: RegExp; replacement: string }[] = [
   { find: /^@deepseek-ai\/dsh-client-ui-settings-general\/(.*)$/, replacement: '/src/dsh/packages/client/ui-settings-general/src/$1' },
   { find: /^@deepseek-ai\/dsh-client-ui-settings-models$/, replacement: '/src/dsh/packages/client/ui-settings-models/src/index.ts' },
   { find: /^@deepseek-ai\/dsh-client-ui-settings-models\/(.*)$/, replacement: '/src/dsh/packages/client/ui-settings-models/src/$1' },
+  // Windows 不提供 landlock（Linux 专有 LSM），landlock-run 的原生平台包故意不 vendor：
+  // 这里用显式防护桩替代别名，让任何 import 解析到桩上并得到一句说得清的错误，
+  // 而不是晦涩的模块解析失败。见 docs/06-DSH裁剪决策记录.md「已知残缺与例外」。
+  { find: /^@deepseek-ai\/node-addon-system\/landlock-run$/, replacement: '/src/dsh/shims/landlock-run.ts' },
 ]
