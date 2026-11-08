@@ -30,10 +30,16 @@ pub struct AppState {
     /// 活动任务的子代理注册表（SH-053 批 3）：UI steering/中断的命令面入口。
     /// 与任务同生命周期——`end_task` 清空，避免把消息投进已收口的僵尸任务。
     active_subagents: Mutex<Option<Arc<crate::subagent_registry::SubagentRegistry>>>,
+    /// MCP 运行时（SH-063）：信任记录、首连审查、已批准执行器。
+    pub mcp: Arc<crate::mcp_client::runtime::McpRuntime>,
 }
 
 impl AppState {
     pub fn new(config: AppConfig, config_path: PathBuf, data_root: PathBuf) -> Self {
+        let config_root = config_path
+            .parent()
+            .map(PathBuf::from)
+            .unwrap_or_else(std::env::temp_dir);
         Self {
             config: RwLock::new(config),
             config_path: RwLock::new(config_path),
@@ -44,6 +50,7 @@ impl AppState {
             plan_state: Arc::new(PlanState::new()),
             jobs: Arc::new(crate::jobs::JobRegistry::new()),
             active_subagents: Mutex::new(None),
+            mcp: Arc::new(crate::mcp_client::runtime::McpRuntime::new(&config_root)),
         }
     }
 

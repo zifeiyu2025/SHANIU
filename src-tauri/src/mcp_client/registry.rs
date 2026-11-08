@@ -8,6 +8,7 @@
 //! （裁决只在 `agent_loop`），也**不**向模型注入任何未经 `ToolSpec` 的声明。
 
 use std::collections::BTreeMap;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 
 use async_trait::async_trait;
@@ -46,6 +47,8 @@ pub struct McpToolExecutor {
     raw_name: String,
     session: Arc<Mutex<McpSession>>,
     wrapper: Arc<OutputWrapper>,
+    /// 撤销开关（SH-063）：撤销信任或豁免时翻转它，已下发给任务的执行器副本立即失效。
+    enabled: Arc<AtomicBool>,
 }
 
 impl McpToolExecutor {
@@ -61,6 +64,11 @@ impl ToolExecutor for McpToolExecutor {
     }
 
     async fn execute(&self, args: Value, ctx: &ToolContext) -> Result<ToolOutput, ToolError> {
+        if !self.enabled.load(Ordering::SeqCst) {
+            return Err(ToolError::Execution(
+                "该 MCP 工具的授权已被撤销，需重新审查批准后才能调用".into(),
+            ));
+        }
         if ctx.cancel.is_cancelled() {
             return Err(ToolError::Cancelled);
         }
@@ -122,10 +130,70 @@ pub struct ApprovedTool {
     pub risk: RiskLevel,
 }
 
-/// 转换 + 过滤 + 事务化注册。
+/// 构建结果：执行器副本 + 撤销开关 + 审计结果。
+pub struct BuiltTools {
+    pub executors: Vec<Arc<dyn ToolExecutor>>,
+    /// `dispatch_name → 撤销开关`：撤销信任/豁免时翻转对应开关。
+    pub revocation: BTreeMap<String, Arc<AtomicBool>>,
+    pub outcome: RegistrationOutcome,
+}
+
+/// 转换 + 过滤（不碰注册表）：注入判定 → 用户批准位，通过者生成执行器。
 ///
-/// 过滤顺序是刻意的：**注入判定 → 用户批准位**。两者都通过才注册；
+/// 过滤顺序是刻意的：**注入判定 → 用户批准位**。两者都通过才生成执行器；
 /// 通过注入判定但用户没勾选，仍然不注册；用户勾选但没过注入判定（无豁免），也不注册。
+pub fn build_executors(
+    server_id: &str,
+    fingerprint: &str,
+    tools: &[RemoteTool],
+    approved: &[ApprovedTool],
+    session: Arc<Mutex<McpSession>>,
+    exemptions: &ExemptionStore,
+) -> BuiltTools {
+    let plan = manifest::plan_registration(server_id, tools);
+    let (allowed, guard_rejected) = partition_by_guard(&plan, server_id, fingerprint, exemptions);
+    let approved_map: BTreeMap<&str, RiskLevel> = approved
+        .iter()
+        .map(|tool| (tool.dispatch_name.as_str(), tool.risk))
+        .collect();
+    let wrapper = Arc::new(OutputWrapper::new());
+    let mut revocation = BTreeMap::new();
+
+    let executors: Vec<Arc<dyn ToolExecutor>> = allowed
+        .into_iter()
+        .filter(|tool| approved_map.contains_key(tool.dispatch_name.as_str()))
+        .map(|mut tool| {
+            // 风险只能来自用户批准记录（ADR-107），server annotations 不参与。
+            tool.spec.risk = approved_map.get(tool.dispatch_name.as_str()).copied();
+            let enabled = Arc::new(AtomicBool::new(true));
+            revocation.insert(tool.dispatch_name.clone(), enabled.clone());
+            Arc::new(McpToolExecutor {
+                spec: tool.spec,
+                raw_name: tool.raw_name,
+                session: session.clone(),
+                wrapper: wrapper.clone(),
+                enabled,
+            }) as Arc<dyn ToolExecutor>
+        })
+        .collect();
+    let registered: Vec<String> = executors
+        .iter()
+        .map(|executor| executor.spec().name.clone())
+        .collect();
+
+    BuiltTools {
+        executors,
+        revocation,
+        outcome: RegistrationOutcome {
+            registered,
+            rejected: plan.rejected,
+            guard_rejected,
+            collisions: plan.collisions,
+        },
+    }
+}
+
+/// 构建并事务化注册。
 ///
 /// 任一名称与已注册工具冲突（含大小写差异）→ 返回错误且**一个都不注册**（B-R3）。
 pub fn register_server(
@@ -137,42 +205,10 @@ pub fn register_server(
     session: Arc<Mutex<McpSession>>,
     exemptions: &ExemptionStore,
 ) -> Result<RegistrationOutcome, RegisterError> {
-    let plan = manifest::plan_registration(server_id, tools);
-    let (allowed, guard_rejected) = partition_by_guard(&plan, server_id, fingerprint, exemptions);
-    let approved_map: BTreeMap<&str, RiskLevel> = approved
-        .iter()
-        .map(|tool| (tool.dispatch_name.as_str(), tool.risk))
-        .collect();
-    let wrapper = Arc::new(OutputWrapper::new());
-
-    let executors: Vec<Arc<dyn ToolExecutor>> = allowed
-        .into_iter()
-        .filter(|tool| approved_map.contains_key(tool.dispatch_name.as_str()))
-        .map(|mut tool| {
-            // 风险只能来自用户批准记录（ADR-107），server annotations 不参与。
-            tool.spec.risk = approved_map.get(tool.dispatch_name.as_str()).copied();
-            Arc::new(McpToolExecutor {
-                spec: tool.spec,
-                raw_name: tool.raw_name,
-                session: session.clone(),
-                wrapper: wrapper.clone(),
-            }) as Arc<dyn ToolExecutor>
-        })
-        .collect();
-    let registered: Vec<String> = executors
-        .iter()
-        .map(|executor| executor.spec().name.clone())
-        .collect();
-
+    let built = build_executors(server_id, fingerprint, tools, approved, session, exemptions);
     // 先提交注册再返回结果：冲突时注册表保持原样，结果对象不会被误当成「已注册」。
-    router.try_register_all(executors)?;
-
-    Ok(RegistrationOutcome {
-        registered,
-        rejected: plan.rejected,
-        guard_rejected,
-        collisions: plan.collisions,
-    })
+    router.try_register_all(built.executors)?;
+    Ok(built.outcome)
 }
 
 #[cfg(test)]

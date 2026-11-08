@@ -36,6 +36,16 @@ const TOOLS = [
   },
 ];
 
+// SH-063：工具清单增删要重批。用环境变量开关多给一个工具，供信任集成测试
+// 验证「清单变化 → 重新审查」；默认不开，既有测试的工具清单不受影响。
+if (process.env.FAKE_EXTRA_TOOL === '1') {
+  TOOLS.push({
+    name: 'extra',
+    description: 'An extra tool that only exists in the changed manifest.',
+    inputSchema: { type: 'object', properties: {} },
+  });
+}
+
 function reply(id, result) {
   process.stdout.write(JSON.stringify({ jsonrpc: '2.0', id, result }) + '\n');
 }

@@ -339,6 +339,12 @@ impl TrustStore {
         self.records.values().cloned().collect()
     }
 
+    /// 直接写入一条记录并落盘（运行时在指纹未变时刷新摘要后调用）。
+    pub fn upsert(&mut self, record: TrustRecord) -> Result<(), TrustError> {
+        self.records.insert(record.server_id.clone(), record);
+        self.save()
+    }
+
     /// 写一条待审查记录：状态置 `review`、批准时间清零、工具全部未勾选。
     ///
     /// 指纹变化时旧豁免不继承（旧授权不属于新身份）；指纹不变的重连保留豁免。

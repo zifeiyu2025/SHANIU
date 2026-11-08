@@ -36,7 +36,7 @@ use std::sync::Arc;
 use tauri::{
     menu::{Menu, MenuItem},
     tray::{MouseButton, MouseButtonState, TrayIconBuilder, TrayIconEvent},
-    Manager,
+    Emitter, Manager,
 };
 
 use agent_loop::ModelBackend;
@@ -1096,6 +1096,13 @@ fn build_agent_with(
     let backend: Arc<dyn ModelBackend> = Arc::new(agent_loop::ResponsesBackend { provider, api_key });
     let mut router = tool_router::ToolRouter::new();
     tools::register_builtin(&mut router, state.plan_state.clone());
+    // MCP 已批准工具（SH-063）：同一批执行器副本进每个任务的 router；
+    // 撤销在运行时翻转执行器开关，已下发副本随之失效。
+    for executor in state.mcp.executors() {
+        if let Err(error) = router.try_register(executor) {
+            tracing::warn!("MCP 工具注册冲突（已跳过）: {error}");
+        }
+    }
     let agent = agent_loop::AgentLoop::from_config(
         backend,
         Arc::new(router),
@@ -1571,6 +1578,124 @@ fn write_clipboard_text(text: String) -> Result<(), String> {
     }
 }
 
+/// 事件接收方：把 MCP 应用级事件发到独立通道（无会话归属）。
+struct TauriMcpSink {
+    app: tauri::AppHandle,
+}
+
+impl crate::mcp_client::runtime::McpEventSink for TauriMcpSink {
+    fn emit(&self, event: &crate::mcp_client::runtime::McpEvent) {
+        if let Err(error) = self.app.emit(crate::mcp_client::runtime::MCP_EVENT_CHANNEL, event) {
+            tracing::warn!("MCP 事件发送失败: {error}");
+        }
+    }
+}
+
+/// 设置页的 MCP 服务器列表项（配置 + 运行时状态合并）。
+#[derive(serde::Serialize)]
+struct McpServerSummary {
+    id: String,
+    enabled: bool,
+    command: String,
+    args: Vec<String>,
+    unsandboxed: bool,
+    allow_network: bool,
+    status: String,
+    fingerprint: Option<String>,
+    approved_tools: Vec<crate::mcp_client::runtime::ApprovedToolView>,
+    reason: Option<String>,
+}
+
+/// 列出配置中的 MCP server（含信任状态与已批准工具）。
+#[tauri::command]
+async fn mcp_list_servers(app: tauri::AppHandle) -> Result<Vec<McpServerSummary>, String> {
+    let state = app.state::<AppState>();
+    let cfg = state.config();
+    let statuses = state.mcp.statuses().await;
+    Ok(cfg
+        .mcp
+        .servers
+        .iter()
+        .map(|server| {
+            let status = statuses.iter().find(|item| item.server_id == server.id);
+            McpServerSummary {
+                id: server.id.clone(),
+                enabled: server.enabled,
+                command: server.command.clone(),
+                args: server.args.clone(),
+                unsandboxed: server.unsandboxed,
+                allow_network: server.allow_network,
+                status: status
+                    .map(|item| item.status.as_str().to_string())
+                    .unwrap_or_else(|| {
+                        if server.enabled {
+                            "idle".to_string()
+                        } else {
+                            "disabled".to_string()
+                        }
+                    }),
+                fingerprint: status.map(|item| item.fingerprint.clone()),
+                approved_tools: status
+                    .map(|item| item.approved_tools.clone())
+                    .unwrap_or_default(),
+                reason: status.and_then(|item| item.reason.clone()),
+            }
+        })
+        .collect())
+}
+
+/// 首连审查：启动 server、读取清单、计算指纹；未批准前不注册任何工具。
+#[tauri::command]
+async fn mcp_connect_and_review(
+    app: tauri::AppHandle,
+    server_id: String,
+) -> Result<crate::mcp_client::runtime::ReviewPayload, String> {
+    let state = app.state::<AppState>();
+    let cfg = state.config();
+    let server = cfg
+        .mcp
+        .servers
+        .iter()
+        .find(|server| server.id == server_id)
+        .cloned()
+        .ok_or_else(|| format!("配置里没有 MCP server: {server_id}"))?;
+    let workspace = state.workspace_root();
+    state.mcp.connect_and_review(&server, &workspace).await
+}
+
+/// 应用首连审查的逐工具裁决（批准位 + 风险档位 + 注入工具显式启用）。
+#[tauri::command]
+async fn mcp_resolve_trust(
+    app: tauri::AppHandle,
+    server_id: String,
+    fingerprint: String,
+    decisions: Vec<crate::mcp_client::runtime::TrustDecisionInput>,
+) -> Result<crate::mcp_client::runtime::ReviewPayload, String> {
+    let state = app.state::<AppState>();
+    state
+        .mcp
+        .resolve_trust(&server_id, &fingerprint, &decisions)
+        .await
+}
+
+/// 撤销整个 server 的信任与豁免（立即失效 + 下次连接重新审查）。
+#[tauri::command]
+async fn mcp_revoke_trust(app: tauri::AppHandle, server_id: String) -> Result<(), String> {
+    let state = app.state::<AppState>();
+    state.mcp.revoke_trust(&server_id).await
+}
+
+/// 撤销单个注入豁免（工具立即不可调用，下次连接不再注册）。
+#[tauri::command]
+async fn mcp_revoke_exemption(
+    app: tauri::AppHandle,
+    server_id: String,
+    dispatch_name: String,
+) -> Result<(), String> {
+    let state = app.state::<AppState>();
+    state.mcp.revoke_exemption(&server_id, &dispatch_name).await
+}
+
 /// 从托盘恢复主窗口：取消最小化 + 显示 + 聚焦。
 fn show_main_window(app: &tauri::AppHandle) {
     if let Some(window) = app.get_webview_window("main") {
@@ -1686,7 +1811,12 @@ pub fn run() {
             goals::goal_clear,
             jobs::job_list,
             jobs::job_read,
-            jobs::job_kill
+            jobs::job_kill,
+            mcp_list_servers,
+            mcp_connect_and_review,
+            mcp_resolve_trust,
+            mcp_revoke_trust,
+            mcp_revoke_exemption
         ])
         .on_window_event(|window, event| {
             // 关闭 = 隐藏到系统托盘（不退出）；真正退出只走托盘菜单「退出」
@@ -1698,6 +1828,14 @@ pub fn run() {
             }
         })
         .setup(|app| {
+            // MCP 应用级事件通道（SH-063）：运行时在 setup 前已随 AppState 构造，
+            // 这里补上真正的发送端。
+            {
+                let state = app.state::<AppState>();
+                state.mcp.set_sink(Arc::new(TauriMcpSink {
+                    app: app.handle().clone(),
+                }));
+            }
             // 延迟显示窗口的兜底（tauri.conf.json 的 visible:false）：前端脚本崩溃、
             // 页面加载失败或就绪信号丢失时，3 秒后强制显示，保证不存在"窗口永不出现"。
             //

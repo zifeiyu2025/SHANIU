@@ -20,5 +20,6 @@ pub mod output;
 pub mod process;
 pub mod registry;
 pub mod rpc;
+pub mod runtime;
 pub mod session;
 pub mod trust;
