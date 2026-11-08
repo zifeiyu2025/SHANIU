@@ -53,7 +53,7 @@ pub enum Access {
 }
 
 impl Access {
-    fn mask(self) -> u32 {
+    pub(crate) fn mask(self) -> u32 {
         match self {
             // 读：文件读 + 执行/遍历（目录列举走 FILE_READ_DATA）。
             Access::Read => FILE_GENERIC_READ.0 | FILE_GENERIC_EXECUTE.0,
@@ -451,7 +451,7 @@ fn read_dacl_snapshot(path: &Path) -> Result<Vec<u8>, String> {
 
 /// 目录上是否已存在容器 SID 的**显式**（非继承）允许 ACE，且掩码覆盖我们要求的全部权限。
 /// 幂等判定用：已存在就不再改写 DACL（改写会触发文件监听器重扫，见 docs/04 §1.5）。
-fn has_explicit_grant(path: &Path, sid: PSID, mask: u32) -> Result<bool, String> {
+pub(crate) fn has_explicit_grant(path: &Path, sid: PSID, mask: u32) -> Result<bool, String> {
     let name = wide(path.as_os_str());
     let mut descriptor = PSECURITY_DESCRIPTOR(std::ptr::null_mut());
     let mut dacl: *mut ACL = std::ptr::null_mut();

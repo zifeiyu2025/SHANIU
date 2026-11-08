@@ -585,6 +585,7 @@ fn spawn_mcp_in_app_container(
     let temp_text = server_temp.to_string_lossy().to_string();
     env.insert("TEMP".to_string(), temp_text.clone());
     env.insert("TMP".to_string(), temp_text);
+    add_node_symlink_flags(&mut env, request.program, &server_temp)?;
 
     let (sid, internet) = {
         let runtimes = mcp_lock()?;
@@ -626,6 +627,69 @@ fn acl_access(access: WorkspaceAccess) -> acl::Access {
     }
 }
 
+/// AppContainer 里跑 node 的 loader 需要额外开关。
+///
+/// node 的 `fs.realpathSync`（loader 用的 JS 版本）会逐级 lstat 到**盘符根**；AppContainer
+/// 令牌对本机数据盘根（如 `D:\`，归 SYSTEM 所有）没有读属性权限，非提权也改不了它的
+/// DACL，于是 entry 解析直接 EPERM（`lstat 'D:\'`）。MXC/codex 的做法是给卷根只读授权，
+/// 但那需要提权；非提权下用官方开关让 loader 跳过 realpath，再由预加载 shim 兜住
+/// user code 里对 `fs.realpathSync` 的直接调用（如 server-filesystem 的 `isEntryPoint`）。
+/// 只改模块路径缓存/身份语义，不放松文件系统边界：真正读写在目标路径上仍按 ACL 判定。
+#[cfg(windows)]
+const NODE_PRELOAD_SHIM: &str = include_str!("../../assets/sandbox/node-preload.cjs");
+
+#[cfg(windows)]
+fn add_node_symlink_flags(
+    env: &mut BTreeMap<String, String>,
+    program: &str,
+    shim_dir: &Path,
+) -> Result<(), SandboxError> {
+    let stem = Path::new(program)
+        .file_stem()
+        .and_then(|stem| stem.to_str())
+        .unwrap_or_default();
+    if !stem.eq_ignore_ascii_case("node") && !stem.eq_ignore_ascii_case("nodejs") {
+        return Ok(());
+    }
+    // 逐 server 落一份 shim（server_temp 已可写/可读，无需额外授权）。
+    let preload = shim_dir.join("node-preload.cjs");
+    std::fs::write(&preload, NODE_PRELOAD_SHIM).map_err(|error| {
+        SandboxError::CreateFailed(format!(
+            "写入 node 兼容 shim {} 失败: {error}",
+            preload.display()
+        ))
+    })?;
+    let existing_key = env
+        .keys()
+        .find(|key| key.eq_ignore_ascii_case("NODE_OPTIONS"))
+        .cloned();
+    let mut options = existing_key
+        .as_ref()
+        .and_then(|key| env.remove(key))
+        .unwrap_or_default();
+    for flag in ["--preserve-symlinks", "--preserve-symlinks-main"] {
+        if !options.split_whitespace().any(|token| token == flag) {
+            if !options.trim().is_empty() {
+                options.push(' ');
+            }
+            options.push_str(flag);
+        }
+    }
+    // node 解析 NODE_OPTIONS 时把反斜杠当转义符，路径必须用正斜杠并加引号。
+    let require_flag = format!(
+        "--require \"{}\"",
+        preload.to_string_lossy().replace('\\', "/")
+    );
+    if !options.contains(&require_flag) {
+        if !options.trim().is_empty() {
+            options.push(' ');
+        }
+        options.push_str(&require_flag);
+    }
+    env.insert("NODE_OPTIONS".to_string(), options);
+    Ok(())
+}
+
 /// 容器内启动 server 需要的**只读**工具链目录：可执行文件所在目录、venv 根、
 /// 解释器型启动时代码包根。没有它们，server 连自己的运行时与模块都读不到。
 ///
@@ -641,7 +705,14 @@ fn toolchain_roots(program: &str, args: &[&str]) -> Vec<PathBuf> {
         }
         if let Some(venv) = find_ancestor(parent, "pyvenv.cfg") {
             if !is_os_owned(&venv) {
-                roots.push(venv);
+                roots.push(venv.clone());
+            }
+            // venv 的 python.exe 只是壳：stdlib/标准库在 `pyvenv.cfg` 的 home 指向的
+            // 基础解释器目录里。只授权 venv 会让 python 启动阶段就 EPERM 退出。
+            if let Some(home) = venv_runtime_home(&venv) {
+                if !is_os_owned(&home) {
+                    roots.push(home);
+                }
             }
         }
     }
@@ -659,8 +730,31 @@ fn toolchain_roots(program: &str, args: &[&str]) -> Vec<PathBuf> {
         if !is_os_owned(&root) {
             roots.push(root);
         }
+        // node 的依赖解析走 `node_modules` 链：entry 自己的包根读得到还不够，
+        // npm `--prefix` 安装时依赖被提升到安装前缀下的 `node_modules`，那里也必须
+        // 可读，否则 server 起得来但 import 依赖时 EPERM。
+        if let Some(prefix) = find_node_modules_prefix(dir) {
+            if !is_os_owned(&prefix) {
+                roots.push(prefix);
+            }
+        }
     }
     roots
+}
+
+/// 从 entry 所在目录向上找 `node_modules`，返回它的父目录（= 安装前缀）。
+fn find_node_modules_prefix(start: &Path) -> Option<PathBuf> {
+    let mut current = Some(start);
+    while let Some(dir) = current {
+        if dir
+            .file_name()
+            .is_some_and(|name| name.eq_ignore_ascii_case("node_modules"))
+        {
+            return dir.parent().map(Path::to_path_buf);
+        }
+        current = dir.parent();
+    }
+    None
 }
 
 /// 是否是 OS 自有目录（AppContainer 默认可读，且加 ACE 会被拒绝访问）。
@@ -686,6 +780,15 @@ fn find_ancestor(start: &Path, marker: &str) -> Option<PathBuf> {
         current = dir.parent();
     }
     None
+}
+
+/// 读 `pyvenv.cfg` 的 `home = ...`：venv 里 python 的 stdlib 实际装在这里。
+fn venv_runtime_home(venv: &Path) -> Option<PathBuf> {
+    let text = std::fs::read_to_string(venv.join("pyvenv.cfg")).ok()?;
+    text.lines().find_map(|line| {
+        let (key, value) = line.split_once('=')?;
+        (key.trim().eq_ignore_ascii_case("home")).then(|| PathBuf::from(value.trim()))
+    })
 }
 
 #[cfg(test)]
@@ -812,6 +915,47 @@ mod tests {
             !appcontainer::list_mcp_profiles().contains(&profile),
             "释放后 profile 应被删除"
         );
+    }
+
+    /// 每 server 的目录授权：ACE 加在该 server 自己的容器 SID 上，释放时按
+    /// `(路径, SID)` 精确撤销，并且释放本身幂等。
+    #[cfg(windows)]
+    #[test]
+    fn mcp_acl_grant_is_exact_and_release_revokes_it() {
+        let _serial = appcontainer::PROFILE_TEST_MUTEX.blocking_lock();
+        set_os_mode(OsSandbox::AppContainer);
+        let dir = ws();
+        let target = dir.join("granted");
+        std::fs::create_dir_all(&target).unwrap();
+        let id = format!("acl-{}", std::process::id());
+        ensure_mcp_container(&id).expect("建立 per-server 容器");
+        let sid = {
+            let runtimes = mcp_lock().unwrap();
+            runtimes.get(&id).expect("容器应已登记").container.sid()
+        };
+        let profile = appcontainer::mcp_profile_name(&id).unwrap();
+
+        grant_mcp_paths(&id, &[(target.clone(), acl::Access::Read)]).expect("授权读");
+        assert!(
+            acl::has_explicit_grant(&target, sid, acl::Access::Read.mask()).unwrap(),
+            "容器 SID 应有显式读 ACE"
+        );
+        // 幂等：重复授权不报错，ACE 仍在。
+        grant_mcp_paths(&id, &[(target.clone(), acl::Access::Read)]).expect("重复授权应幂等");
+        assert!(acl::has_explicit_grant(&target, sid, acl::Access::Read.mask()).unwrap());
+
+        release_mcp_server(&id);
+        assert!(
+            !acl::has_explicit_grant(&target, sid, acl::Access::Read.mask()).unwrap(),
+            "释放后必须精确撤销该容器 SID 的 ACE"
+        );
+        assert!(
+            !appcontainer::list_mcp_profiles().contains(&profile),
+            "释放后 profile 应被删除"
+        );
+        // 重复释放是 no-op，不得 panic。
+        release_mcp_server(&id);
+        std::fs::remove_dir_all(&dir).ok();
     }
 
     /// 真机：容器内启动 cmd，并读取工作区里的文件（验证 ACE 真的生效）。
