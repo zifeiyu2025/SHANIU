@@ -511,6 +511,28 @@ mod tests {
             .expect("src-tauri 的上一级是仓库根");
         let rules = discover(repo);
 
+        // 诊断输出（`--nocapture` 时可见）：直接报"这 1000 tokens 装进了哪几节"，
+        // 不必再靠外部脚本复刻分类器去猜。放在断言**之前**：断言失败时最需要这份
+        // 分节账单，否则只能看到一个"某节不见了"的结论而无从知道是谁挤掉的。
+        let mut heading = String::from("（文首导语）");
+        let mut cost = 0usize;
+        for line in rules.text.lines() {
+            // 小节渲染时标题降一级（`## x` → `### x`），嵌在「## 项目规则」之下。
+            if let Some(title) = line.strip_prefix("### ") {
+                eprintln!("[rules] {heading} → {cost} tokens");
+                heading = title.trim().to_string();
+                cost = 0;
+            }
+            cost += estimate_tokens(line) + 1;
+        }
+        eprintln!("[rules] {heading} → {cost} tokens");
+        eprintln!(
+            "[rules] 合计 {} tokens；未注入 {} 节：{}",
+            estimate_tokens(&rules.text),
+            rules.dropped.len(),
+            rules.dropped.join("、")
+        );
+
         assert!(
             rules.text.contains("### 0. 铁律") && rules.text.contains("不可接受的变更"),
             "铁律必须完整出现在注入正文里（当前注入：\n{}）",
