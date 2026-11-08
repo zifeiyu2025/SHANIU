@@ -67,6 +67,10 @@ struct Task {
     title: String,
     prompt: String,
     check: Check,
+    /// 任务级 fixture 覆盖层：与全局 fixture 合并，同名键以任务级为准。
+    /// 失败路径类任务需要自己的工程骨架，不能塞进全局 fixture 去干扰其它任务。
+    #[serde(default)]
+    fixture: BTreeMap<String, String>,
 }
 
 #[derive(Deserialize, Default)]
@@ -77,10 +81,43 @@ struct Check {
     contains_all: Vec<String>,
     #[serde(default)]
     absent_all: Vec<String>,
+    /// 命令式判据：在工作区里执行（`cmd /C`），退出码 0 视为通过。
+    /// 「跑通测试」这类目标没法用文件内容断言，只能真的跑一次。
+    #[serde(default)]
+    command: Option<String>,
+    /// 命令通过时还必须出现的输出片段（stdout + stderr 合并匹配）。
+    #[serde(default)]
+    expect_contains: Vec<String>,
 }
 
 /// 判据求值：Ok(()) = 通过；Err 文本同时进报告和失败原因。
 fn verify(ws: &Path, check: &Check) -> Result<(), String> {
+    if let Some(command) = &check.command {
+        let output = std::process::Command::new("cmd")
+            .arg("/C")
+            .arg(command)
+            .current_dir(ws)
+            .output()
+            .map_err(|e| format!("判据命令无法启动（{e}）"))?;
+        let combined = format!(
+            "{}\n{}",
+            String::from_utf8_lossy(&output.stdout),
+            String::from_utf8_lossy(&output.stderr)
+        );
+        if !output.status.success() {
+            let tail: String = combined.chars().rev().take(400).collect::<String>()
+                .chars().rev().collect();
+            return Err(format!("判据命令 `{command}` 退出码非 0：{tail}"));
+        }
+        for needle in &check.expect_contains {
+            if !combined.contains(needle) {
+                return Err(format!("判据命令 `{command}` 输出缺少 {needle:?}"));
+            }
+        }
+    }
+    if check.path.is_empty() {
+        return Ok(());
+    }
     let target = ws.join(&check.path);
     let text = std::fs::read_to_string(&target)
         .map_err(|e| format!("未产出 {}（{e}）", check.path))?;
@@ -228,6 +265,8 @@ async fn run_one(task: &Task, fixture: &BTreeMap<String, String>, backend: Arc<R
         SEQ.fetch_add(1, Ordering::SeqCst)
     ));
     seed_fixture(&ws, fixture);
+    // 任务级覆盖层：同名键后写覆盖前写。
+    seed_fixture(&ws, &task.fixture);
 
     let plan_state = Arc::new(PlanState::new());
     let mut router = ToolRouter::new();
@@ -473,11 +512,20 @@ async fn evals_baseline_v0() {
     let ablated = std::env::var("SHANIU_EVAL_ABLATE_AR6")
         .ok()
         .is_some_and(|value| value.trim() == "1");
+    // SH-125 成本测量的对照臂：关掉失败自愈闭环，其余参数完全一致。
+    let repair_ablated = std::env::var("SHANIU_EVAL_ABLATE_REPAIR")
+        .ok()
+        .is_some_and(|value| value.trim() == "1");
     let role = std::env::var("SHANIU_EVAL_ROLE").unwrap_or_else(|_| "treatment".to_string());
-    let arm = if ablated { "ar6_off" } else { "ar6_on" };
+    let arm = match (ablated, repair_ablated) {
+        (true, _) => "ar6_off",
+        (false, true) => "repair_off",
+        (false, false) => "ar6_on",
+    };
     let report = json!({
         "version": spec.version,
         "arm": arm,
+        "repair_enabled": !repair_ablated,
         "role": role,
         "epoch_ms": SystemTime::now().duration_since(UNIX_EPOCH).unwrap().as_millis(),
         "provider": provider.provider,
