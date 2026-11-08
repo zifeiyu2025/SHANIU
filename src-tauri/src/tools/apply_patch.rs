@@ -56,7 +56,7 @@ impl ApplyPatch {
         Self {
             spec: ToolSpec::new(
                 "apply_patch",
-                "对工作区文件应用结构化补丁（V4A 格式：Add/Update/Delete File），精确上下文匹配，失败自动回滚。",
+                "对工作区文件应用结构化补丁（V4A 格式：Add/Update/Delete File）。上下文先精确匹配，失败时依次尝试剥离行号前缀、缩进弹性、空白折叠、首尾锚点模糊定位；整单失败自动回滚。",
                 serde_json::json!({
                     "type": "object",
                     "properties": {
@@ -152,49 +152,247 @@ fn parse_patch(patch: &str) -> Result<Vec<PatchOp>, ToolError> {
     Ok(ops)
 }
 
-/// Update 段：keep+remove 序列在文件中做**精确连续匹配**，替换为 keep+add。
-fn apply_hunk_seq(file_lines: &[String], seq: &[HunkLine]) -> Result<Vec<String>, String> {
-    let expected: Vec<&str> = seq
-        .iter()
-        .filter(|h| !matches!(h, HunkLine::Add(_)))
-        .map(|h| match h {
-            HunkLine::Keep(s) | HunkLine::Remove(s) => s.as_str(),
-            HunkLine::Add(_) => unreachable!(),
-        })
-        .collect();
-    let mut replacement: Vec<String> = Vec::new();
-    for h in seq {
-        match h {
-            HunkLine::Keep(s) | HunkLine::Add(s) => replacement.push(s.clone()),
-            HunkLine::Remove(_) => {}
+/// 匹配级别（照 ZCode `tool/edit-matchers.ts` 8 级思路 + codex `seek_sequence` 递减严格度）。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum MatchLevel {
+    Exact,
+    LineNumberStripped,
+    IndentationFlexible,
+    WhitespaceCollapsed,
+    BlockAnchor,
+}
+
+impl MatchLevel {
+    fn label(self) -> &'static str {
+        match self {
+            MatchLevel::Exact => "精确",
+            MatchLevel::LineNumberStripped => "剥离行号前缀",
+            MatchLevel::IndentationFlexible => "缩进弹性",
+            MatchLevel::WhitespaceCollapsed => "空白折叠",
+            MatchLevel::BlockAnchor => "首尾锚点",
         }
     }
+}
+
+/// 块锚点级别要求首尾行之外的中段平均相似度不低于此值（同 ZCode）。
+const BLOCK_ANCHOR_MIN_SIMILARITY: f64 = 0.8;
+
+/// 剥离 Read 输出的行号前缀：`12: x` / `12\tx` / `12→x`（模型照抄行号是高频错误）。
+fn strip_line_number_prefix(line: &str) -> Option<&str> {
+    let digits = line.bytes().take_while(|b| b.is_ascii_digit()).count();
+    if digits == 0 {
+        return None;
+    }
+    let rest = &line[digits..];
+    let rest = rest
+        .strip_prefix(':')
+        .or_else(|| rest.strip_prefix('\t'))
+        .or_else(|| rest.strip_prefix('→'))?;
+    Some(rest.strip_prefix(' ').unwrap_or(rest))
+}
+
+/// 仅当**全部**上下文/删除行都带行号前缀时才剥离（避免误伤代码里形如 `1: x` 的字面量）。
+fn strip_line_number_prefixes(lines: &[String]) -> Option<Vec<String>> {
+    lines
+        .iter()
+        .map(|line| strip_line_number_prefix(line).map(str::to_string))
+        .collect()
+}
+
+fn leading_indent(line: &str) -> Option<usize> {
+    if line.trim().is_empty() {
+        return None;
+    }
+    Some(line.len() - line.trim_start_matches([' ', '\t']).len())
+}
+
+/// 去掉整块的公共缩进（相对缩进保留）。
+fn remove_common_indent(lines: &[String]) -> Vec<String> {
+    let min = lines.iter().filter_map(|l| leading_indent(l)).min().unwrap_or(0);
+    lines
+        .iter()
+        .map(|line| match leading_indent(line) {
+            Some(_) => line[min..].to_string(),
+            None => line.trim_end().to_string(),
+        })
+        .collect()
+}
+
+/// 空白折叠：行首尾裁剪 + 行内连续空白压成一个空格。
+fn collapse_whitespace(line: &str) -> String {
+    line.split_whitespace().collect::<Vec<_>>().join(" ")
+}
+
+fn levenshtein(left: &str, right: &str) -> usize {
+    let a: Vec<char> = left.chars().collect();
+    let b: Vec<char> = right.chars().collect();
+    let mut previous: Vec<usize> = (0..=b.len()).collect();
+    let mut current = vec![0usize; b.len() + 1];
+    for i in 1..=a.len() {
+        current[0] = i;
+        for j in 1..=b.len() {
+            let cost = usize::from(a[i - 1] != b[j - 1]);
+            current[j] = (previous[j] + 1).min(current[j - 1] + 1).min(previous[j - 1] + cost);
+        }
+        std::mem::swap(&mut previous, &mut current);
+    }
+    previous[b.len()]
+}
+
+fn line_similarity(left: &str, right: &str) -> f64 {
+    if left == right {
+        return 1.0;
+    }
+    let max_len = left.chars().count().max(right.chars().count());
+    if max_len == 0 {
+        return 1.0;
+    }
+    1.0 - levenshtein(left, right) as f64 / max_len as f64
+}
+
+/// 返回首个匹配起点（codex 语义：从文件头向下找第一条，不猜多解）。
+fn first_match(file: &[String], width: usize, at: impl Fn(usize) -> bool) -> Option<usize> {
+    if width == 0 || width > file.len() {
+        return None;
+    }
+    (0..=file.len() - width).find(|&start| at(start))
+}
+
+fn anchor_similarity(block: &[String], expected: &[String]) -> f64 {
+    if block.len() <= 2 {
+        return 1.0;
+    }
+    let middle = 1..block.len() - 1;
+    let count = middle.len();
+    let total: f64 = middle
+        .map(|i| line_similarity(block[i].trim(), expected[i].trim()))
+        .sum();
+    total / count as f64
+}
+
+/// Update 段：keep+remove 序列在文件中按递减严格度定位，替换为 keep+add。
+///
+/// Keep 行一律取**文件原文**（保留原缩进/空白），只有 Add 行用补丁文本。
+fn apply_hunk_seq(
+    file_lines: &[String],
+    seq: &[HunkLine],
+) -> Result<(Vec<String>, MatchLevel), String> {
+    let expected: Vec<String> = seq
+        .iter()
+        .filter_map(|h| match h {
+            HunkLine::Keep(s) | HunkLine::Remove(s) => Some(s.clone()),
+            HunkLine::Add(_) => None,
+        })
+        .collect();
     if expected.is_empty() {
         return Err("Update 段需要至少一行上下文或删除行".into());
     }
-    if file_lines.len() < expected.len() {
+    let width = expected.len();
+    if file_lines.len() < width {
         return Err(format!(
-            "上下文不匹配：文件仅 {} 行，补丁期望 {} 行",
-            file_lines.len(),
-            expected.len()
+            "上下文不匹配：文件仅 {} 行，补丁期望 {width} 行",
+            file_lines.len()
         ));
     }
-    for start in 0..=file_lines.len() - expected.len() {
-        if file_lines[start..start + expected.len()]
+
+    let found: Option<(usize, MatchLevel)> = None
+        .or_else(|| {
+            first_match(file_lines, width, |start| file_lines[start..start + width] == expected[..])
+                .map(|start| (start, MatchLevel::Exact))
+        })
+        .or_else(|| {
+            let stripped = strip_line_number_prefixes(&expected)?;
+            first_match(file_lines, width, |start| {
+                file_lines[start..start + width] == stripped[..]
+            })
+            .map(|start| (start, MatchLevel::LineNumberStripped))
+        })
+        .or_else(|| {
+            let normalized = remove_common_indent(&expected);
+            first_match(file_lines, width, |start| {
+                remove_common_indent(&file_lines[start..start + width]) == normalized
+            })
+            .map(|start| (start, MatchLevel::IndentationFlexible))
+        })
+        .or_else(|| {
+            let collapsed: Vec<String> = expected.iter().map(|l| collapse_whitespace(l)).collect();
+            first_match(file_lines, width, |start| {
+                let actual: Vec<String> = file_lines[start..start + width]
+                    .iter()
+                    .map(|l| collapse_whitespace(l))
+                    .collect();
+                actual == collapsed
+            })
+            .map(|start| (start, MatchLevel::WhitespaceCollapsed))
+        })
+        .or_else(|| {
+            if width < 3 {
+                return None;
+            }
+            let first = expected[0].trim();
+            let last = expected[width - 1].trim();
+            first_match(file_lines, width, |start| {
+                let block = &file_lines[start..start + width];
+                block[0].trim() == first
+                    && block[width - 1].trim() == last
+                    && anchor_similarity(block, &expected) >= BLOCK_ANCHOR_MIN_SIMILARITY
+            })
+            .map(|start| (start, MatchLevel::BlockAnchor))
+        });
+
+    let Some((start, level)) = found else {
+        return Err(format!(
+            "上下文不匹配：未找到补丁期望的 {width} 行序列（已尝试：{}）。请先读取文件当前内容再重试",
+            [
+                MatchLevel::Exact,
+                MatchLevel::LineNumberStripped,
+                MatchLevel::IndentationFlexible,
+                MatchLevel::WhitespaceCollapsed,
+                MatchLevel::BlockAnchor,
+            ]
             .iter()
-            .map(String::as_str)
-            .eq(expected.iter().copied())
-        {
-            let mut out = file_lines[..start].to_vec();
-            out.extend(replacement);
-            out.extend(file_lines[start + expected.len()..].to_vec());
-            return Ok(out);
+            .map(|l| l.label())
+            .collect::<Vec<_>>()
+            .join("、")
+        ));
+    };
+
+    // 缩进弹性级别下，新增行按「文件块公共缩进 - 补丁块公共缩进」补齐缩进，
+    // 否则模型整块降级缩进时会把代码插到第 0 列。
+    let indent_delta = if level == MatchLevel::IndentationFlexible {
+        let file_min = file_lines[start..start + width]
+            .iter()
+            .filter_map(|l| leading_indent(l))
+            .min()
+            .unwrap_or(0);
+        let patch_min = expected.iter().filter_map(|l| leading_indent(l)).min().unwrap_or(0);
+        file_min.saturating_sub(patch_min)
+    } else {
+        0
+    };
+
+    let mut replacement: Vec<String> = Vec::new();
+    let mut cursor = start;
+    for h in seq {
+        match h {
+            HunkLine::Keep(_) => {
+                replacement.push(file_lines[cursor].clone());
+                cursor += 1;
+            }
+            HunkLine::Remove(_) => cursor += 1,
+            HunkLine::Add(s) => {
+                if indent_delta > 0 && !s.trim().is_empty() {
+                    replacement.push(format!("{}{s}", " ".repeat(indent_delta)));
+                } else {
+                    replacement.push(s.clone());
+                }
+            }
         }
     }
-    Err(format!(
-        "上下文不匹配：未在文件中找到补丁期望的 {} 行序列",
-        expected.len()
-    ))
+    let mut out = file_lines[..start].to_vec();
+    out.extend(replacement);
+    out.extend(file_lines[start + width..].to_vec());
+    Ok((out, level))
 }
 
 // ============================== 执行 ==============================
@@ -272,7 +470,7 @@ impl ToolExecutor for ApplyPatch {
                     let text = String::from_utf8(original.clone())
                         .map_err(|_| ToolError::Execution(format!("非 UTF-8 文本文件: {path}")))?;
                     let had_trailing_newline = text.ends_with('\n');
-                    let new_lines = apply_hunk_seq(
+                    let (new_lines, level) = apply_hunk_seq(
                         &text.lines().map(String::from).collect::<Vec<_>>(),
                         seq,
                     )
@@ -289,7 +487,11 @@ impl ToolExecutor for ApplyPatch {
                         return Err(ToolError::Execution(format!("写入失败: {path}")));
                     }
                     snapshot.entry(full.to_string_lossy().to_string()).or_insert(Some(original));
-                    summary.push(format!("~ {path}"));
+                    summary.push(if level == MatchLevel::Exact {
+                        format!("~ {path}")
+                    } else {
+                        format!("~ {path}（{}匹配）", level.label())
+                    });
                 }
                 PatchOp::Delete { path } => {
                     let full = resolve_for_write(&ctx.workspace_root, path)?;
@@ -413,6 +615,131 @@ mod tests {
             .await
             .unwrap_err();
         assert!(matches!(err, ToolError::InvalidArgs(_)));
+        std::fs::remove_dir_all(&ws).ok();
+    }
+
+    // ---------- SH-123 匹配级别：8 类样本 ----------
+
+    #[tokio::test]
+    async fn strips_colon_line_number_prefixes() {
+        let ws = workspace();
+        let patch = "*** Begin Patch\n*** Update File: a.txt\n 1: line1\n-2: line2\n+第二行(改)\n 3: line3\n*** End Patch";
+        let out = ApplyPatch::new()
+            .execute(serde_json::json!({"patch": patch}), &ctx(&ws))
+            .await
+            .unwrap();
+        assert!(out.output.contains("剥离行号前缀匹配"), "{}", out.output);
+        assert_eq!(
+            std::fs::read_to_string(ws.join("a.txt")).unwrap(),
+            "line1\n第二行(改)\nline3\n"
+        );
+        std::fs::remove_dir_all(&ws).ok();
+    }
+
+    #[tokio::test]
+    async fn strips_tab_line_number_prefixes() {
+        let ws = workspace();
+        let patch = "*** Begin Patch\n*** Update File: a.txt\n 1\tline1\n-2\tline2\n+第二行(改)\n 3\tline3\n*** End Patch";
+        let out = ApplyPatch::new()
+            .execute(serde_json::json!({"patch": patch}), &ctx(&ws))
+            .await
+            .unwrap();
+        assert!(out.output.contains("剥离行号前缀匹配"), "{}", out.output);
+        assert_eq!(
+            std::fs::read_to_string(ws.join("a.txt")).unwrap(),
+            "line1\n第二行(改)\nline3\n"
+        );
+        std::fs::remove_dir_all(&ws).ok();
+    }
+
+    #[tokio::test]
+    async fn indentation_flexible_preserves_file_indent() {
+        let ws = workspace();
+        std::fs::write(ws.join("b.txt"), "        alpha();\n        beta();\n        gamma();\n").unwrap();
+        // 补丁整块少 8 个空格（模型抄写时降级缩进）
+        let patch = "*** Begin Patch\n*** Update File: b.txt\n alpha();\n-beta();\n+BETA();\n gamma();\n*** End Patch";
+        let out = ApplyPatch::new()
+            .execute(serde_json::json!({"patch": patch}), &ctx(&ws))
+            .await
+            .unwrap();
+        assert!(out.output.contains("缩进弹性匹配"), "{}", out.output);
+        // 未改动的行保留文件原缩进；新增行补齐到同级缩进
+        assert_eq!(
+            std::fs::read_to_string(ws.join("b.txt")).unwrap(),
+            "        alpha();\n        BETA();\n        gamma();\n"
+        );
+        std::fs::remove_dir_all(&ws).ok();
+    }
+
+    #[tokio::test]
+    async fn whitespace_collapsed_matches_internal_spacing() {
+        let ws = workspace();
+        std::fs::write(ws.join("c.txt"), "let x =    1;\nlet y =\t2;\n").unwrap();
+        let patch = "*** Begin Patch\n*** Update File: c.txt\n let x = 1;\n-let y = 2;\n+let y = 3;\n*** End Patch";
+        let out = ApplyPatch::new()
+            .execute(serde_json::json!({"patch": patch}), &ctx(&ws))
+            .await
+            .unwrap();
+        assert!(out.output.contains("空白折叠匹配"), "{}", out.output);
+        assert_eq!(
+            std::fs::read_to_string(ws.join("c.txt")).unwrap(),
+            "let x =    1;\nlet y = 3;\n"
+        );
+        std::fs::remove_dir_all(&ws).ok();
+    }
+
+    #[tokio::test]
+    async fn block_anchor_matches_similar_middle_line() {
+        let ws = workspace();
+        std::fs::write(ws.join("d.txt"), "begin();\nhandle(item_a);\nfinish();\n").unwrap();
+        // 中段一行与文件不一致（相似度 >= 0.8），首尾锚点确定位置
+        let patch = "*** Begin Patch\n*** Update File: d.txt\n begin();\n-handle(item_b);\n+handle(item_c);\n finish();\n*** End Patch";
+        let out = ApplyPatch::new()
+            .execute(serde_json::json!({"patch": patch}), &ctx(&ws))
+            .await
+            .unwrap();
+        assert!(out.output.contains("首尾锚点匹配"), "{}", out.output);
+        assert_eq!(
+            std::fs::read_to_string(ws.join("d.txt")).unwrap(),
+            "begin();\nhandle(item_c);\nfinish();\n"
+        );
+        std::fs::remove_dir_all(&ws).ok();
+    }
+
+    #[tokio::test]
+    async fn no_match_reports_tried_levels_and_writes_nothing() {
+        let ws = workspace();
+        let patch = "*** Begin Patch\n*** Add File: temp2.txt\n+x\n*** Update File: a.txt\n nope1\n-nope2\n nope3\n*** End Patch";
+        let err = ApplyPatch::new()
+            .execute(serde_json::json!({"patch": patch}), &ctx(&ws))
+            .await
+            .unwrap_err();
+        let message = err.to_string();
+        assert!(message.contains("已尝试"), "{message}");
+        assert!(message.contains("首尾锚点"), "{message}");
+        assert!(!ws.join("temp2.txt").exists(), "失败不得留下半截写入");
+        assert_eq!(
+            std::fs::read_to_string(ws.join("a.txt")).unwrap(),
+            "line1\nline2\nline3\n"
+        );
+        std::fs::remove_dir_all(&ws).ok();
+    }
+
+    #[tokio::test]
+    async fn later_update_failure_restores_earlier_update() {
+        let ws = workspace();
+        std::fs::write(ws.join("c.txt"), "line1\nline2\nline3\n").unwrap();
+        let patch = "*** Begin Patch\n*** Update File: a.txt\n line1\n-line2\n+改过\n line3\n*** Update File: c.txt\n 不存在的上下文\n-x\n*** End Patch";
+        let err = ApplyPatch::new()
+            .execute(serde_json::json!({"patch": patch}), &ctx(&ws))
+            .await
+            .unwrap_err();
+        assert!(matches!(err, ToolError::Execution(_)));
+        assert_eq!(
+            std::fs::read_to_string(ws.join("a.txt")).unwrap(),
+            "line1\nline2\nline3\n",
+            "前一个 Update 必须回滚"
+        );
         std::fs::remove_dir_all(&ws).ok();
     }
 }
