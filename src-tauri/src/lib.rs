@@ -119,10 +119,12 @@ fn send_task(
             let orchestrator = build_orchestrator(agent.clone());
             app.state::<AppState>().set_subagents(Some(orchestrator.registry().clone()));
             tauri::async_runtime::spawn(async move {
+                // Drop 守卫：正常结束、取消、panic 三条路径都释放任务槽（审计 H2）。
+                let _task_slot =
+                    app_state::TaskSlotGuard::new(move || app.state::<AppState>().end_task());
                 let _ = agent
                     .run_task_with_orchestrator(&task, sink, cancel, Some(orchestrator))
                     .await;
-                app.state::<AppState>().end_task();
             });
             Ok(new_id)
         }
@@ -188,10 +190,13 @@ fn continue_session(
     let orchestrator = build_orchestrator(agent.clone());
     app.state::<AppState>().set_subagents(Some(orchestrator.registry().clone()));
     tauri::async_runtime::spawn(async move {
+        // Drop 守卫：正常结束、取消、panic 三条路径都释放任务槽（审计 H2）。
+        let _task_slot = app_state::TaskSlotGuard::new(move || {
+            app_handle.state::<AppState>().end_task()
+        });
         let _ = agent
             .run_with_history_and_orchestrator(history, persisted, sink, cancel, Some(orchestrator))
             .await;
-        app_handle.state::<AppState>().end_task();
     });
     Ok(())
 }

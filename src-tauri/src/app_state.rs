@@ -241,10 +241,35 @@ impl AppState {
     }
 }
 
+/// 任务槽 Drop 守卫：无论任务 future 正常结束、被取消（abort/drop）还是 **panic**，
+/// 都执行收尾（释放活动任务与子代理注册表）。
+///
+/// 原先的 `let _ = agent.run(...).await; end_task();` 在 future panic 时根本走不到
+/// `end_task()`：任务槽被永久占住，`begin_task` 此后一直返回 false——进程看起来空闲，
+/// 却再也接不了任何任务。把收尾放进 `Drop`，展开路径与取消路径都会执行。
+pub struct TaskSlotGuard<F: FnOnce()> {
+    on_drop: Option<F>,
+}
+
+impl<F: FnOnce()> TaskSlotGuard<F> {
+    pub fn new(on_drop: F) -> Self {
+        Self { on_drop: Some(on_drop) }
+    }
+}
+
+impl<F: FnOnce()> Drop for TaskSlotGuard<F> {
+    fn drop(&mut self) {
+        if let Some(on_drop) = self.on_drop.take() {
+            on_drop();
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
     use crate::config::AppConfig;
+    use std::time::Duration;
 
     /// 返回 `(临时目录守卫, AppState)`：守卫必须绑定到变量活到测试结束，
     /// 否则临时目录会被立即删掉（2026-11-09 夹具规矩）。
@@ -351,6 +376,46 @@ mod tests {
         assert!(Arc::ptr_eq(&s.subagents().expect("任务期应能取到注册表"), &registry));
         s.end_task();
         assert!(s.subagents().is_none(), "任务收口必须释放注册表，否则 steering 会投进僵尸任务");
+    }
+
+    /// 审计 H2：任务 future panic 时也必须释放任务槽，否则 `begin_task` 永久返回
+    /// false——进程卡在"有任务在跑"的假象里，后续任务全部被拒。
+    #[tokio::test]
+    async fn task_slot_is_released_when_task_panics() {
+        let (_dir, s) = state();
+        let state = Arc::new(s);
+        let worker = state.clone();
+        let handle = tokio::spawn(async move {
+            assert!(worker.begin_task("sess-1", CancellationToken::new()));
+            let _guard = TaskSlotGuard::new(move || worker.end_task());
+            panic!("模拟 agent future panic");
+        });
+        assert!(handle.await.is_err(), "任务 future 应以 panic 结束");
+        assert!(!state.has_active_task(), "panic 后任务槽必须释放");
+        assert!(
+            state.begin_task("sess-2", CancellationToken::new()),
+            "下一个任务必须能拿到槽，否则就是永久卡死"
+        );
+    }
+
+    /// 审计 H2：任务被取消（`abort` 直接 drop future）时也必须释放任务槽。
+    #[tokio::test]
+    async fn task_slot_is_released_when_task_is_aborted() {
+        let (_dir, s) = state();
+        let state = Arc::new(s);
+        let worker = state.clone();
+        let handle = tokio::spawn(async move {
+            assert!(worker.begin_task("sess-1", CancellationToken::new()));
+            let _guard = TaskSlotGuard::new(move || worker.end_task());
+            futures::future::pending::<()>().await;
+        });
+        // 等任务真的登记完再取消，避免测成"还没开始就 abort"
+        tokio::time::sleep(Duration::from_millis(50)).await;
+        assert!(state.has_active_task(), "任务应已登记");
+        handle.abort();
+        let _ = handle.await;
+        assert!(!state.has_active_task(), "取消/abort 后任务槽必须释放");
+        assert!(state.begin_task("sess-2", CancellationToken::new()));
     }
 
     #[test]

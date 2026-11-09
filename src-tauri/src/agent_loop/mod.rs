@@ -582,12 +582,22 @@ impl AgentLoop {
             if !skill_injections.is_empty() {
                 request_history.extend(skill_injections);
             }
-            let mut stream = match self.backend.stream(&request_history, &declarations, &instructions).await {
-                Ok(s) => s,
-                Err(e) => {
-                    emit(&sink, EventMsg::Error { message: e });
-                    reason = TurnEndReasonLocal::Failed;
+            // 建立流本身也要能被取消（审计 H1）：端点迟迟不回响应头时，
+            // 只在流建立之后检查取消等于"取消点永远到不了"。
+            let mut stream = tokio::select! {
+                _ = cancel.cancelled() => {
+                    reason = TurnEndReasonLocal::Cancelled;
                     break 'outer;
+                }
+                opened = self.backend.stream(&request_history, &declarations, &instructions) => {
+                    match opened {
+                        Ok(s) => s,
+                        Err(e) => {
+                            emit(&sink, EventMsg::Error { message: e });
+                            reason = TurnEndReasonLocal::Failed;
+                            break 'outer;
+                        }
+                    }
                 }
             };
 
@@ -598,11 +608,24 @@ impl AgentLoop {
             let mut calls: Vec<(String, String, String)> = Vec::new(); // (name, arguments, call_id)
             let mut usage: Option<Usage> = None;
             loop {
+                // 流空闲/首包上限（审计 H1）：每个分片都重置计时，超过它说明连接已僵死。
+                let idle = tokio::time::sleep(crate::model_client::STREAM_IDLE_TIMEOUT);
+                tokio::pin!(idle);
                 let mut stream_pin = stream.as_mut(); // Pin<&mut dyn S>，Next 借用其存活
                 let next_item = stream_pin.next();
                 tokio::select! {
                     _ = cancel.cancelled() => {
                         reason = TurnEndReasonLocal::Cancelled;
+                        break 'outer;
+                    }
+                    _ = &mut idle => {
+                        emit(&sink, EventMsg::Error {
+                            message: format!(
+                                "模型流空闲超过 {}s 未收到数据，已中断",
+                                crate::model_client::STREAM_IDLE_TIMEOUT.as_secs()
+                            ),
+                        });
+                        reason = TurnEndReasonLocal::Failed;
                         break 'outer;
                     }
                     item = next_item => match item {
@@ -1142,6 +1165,22 @@ mod tests {
         }
     }
 
+    /// 与 [`ScriptedBackend`] 的"空脚本"不同：这里连**流都不会建立**——
+    /// 用于验证取消能在 `stream().await` 阶段生效（审计 H1）。
+    struct HangingBackend;
+
+    #[async_trait::async_trait]
+    impl ModelBackend for HangingBackend {
+        async fn stream(
+            &self,
+            _history: &[HistoryItem],
+            _tools: &[ToolDeclaration],
+            _instructions: &str,
+        ) -> Result<ModelStream, String> {
+            futures::future::pending().await
+        }
+    }
+
     struct EchoTool {
         spec: ToolSpec,
     }
@@ -1173,12 +1212,23 @@ mod tests {
         CancellationToken,
         Arc<ApprovalBroker>,
     ) {
+        make_loop_with_backend(Arc::new(ScriptedBackend::new(turns)))
+    }
+
+    fn make_loop_with_backend(
+        backend: Arc<dyn ModelBackend>,
+    ) -> (
+        AgentLoop,
+        Arc<Mutex<Vec<EventMsg>>>,
+        CancellationToken,
+        Arc<ApprovalBroker>,
+    ) {
         let mut router = ToolRouter::new();
         router.register(Arc::new(EchoTool::default()));
         let (_sink, store) = CapturingSink::new();
         let broker = Arc::new(ApprovalBroker::new());
         let agent = AgentLoop {
-            backend: Arc::new(ScriptedBackend::new(turns)),
+            backend,
             router: Arc::new(router),
             broker: broker.clone(),
             plan_state: Arc::new(PlanState::new()),
@@ -1445,6 +1495,29 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn cancel_while_opening_stream_stops_promptly() {
+        // 端点连响应头都不回：修复前 `stream().await` 不参与取消竞争，任务永久卡死
+        // （任务槽不释放、后续任务全被拒）。这里 2s 内必须收口为 Cancelled。
+        let (agent, store, cancel, _broker) = make_loop_with_backend(Arc::new(HangingBackend));
+        let summary = tokio::time::timeout(std::time::Duration::from_secs(2), async {
+            let trigger = async {
+                tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+                cancel.cancel();
+            };
+            let run = agent.run_task(
+                "任务",
+                Arc::new(CapturingSink(store.clone())),
+                cancel.clone(),
+            );
+            let (summary, ()) = tokio::join!(run, trigger);
+            summary
+        })
+        .await
+        .expect("取消必须能打断 stream() 的等待；超时 = 任务槽被永久占用");
+        assert_eq!(summary.reason, TurnEndReason::Cancelled);
+    }
+
+    #[tokio::test]
     async fn model_failure_maps_to_failed() {
         let (agent, store, cancel, _broker) = make_loop(vec![vec![ModelStreamEvent::Failed { message: "boom".into() }]]);
         let summary = agent.run_task("任务", Arc::new(CapturingSink(store.clone())), cancel).await;

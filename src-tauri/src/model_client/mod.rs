@@ -9,10 +9,23 @@ pub mod provider;
 use eventsource_stream::{Event, Eventsource};
 use futures::{Stream, StreamExt};
 use serde::{Deserialize, Serialize};
+use std::time::Duration;
 
 use crate::images::{image_store, ImageRef};
 
 pub use provider::ProviderConfig;
+
+// ============================== 传输时限（审计 H1） ==============================
+
+/// 建连超时：TCP/TLS 握手必须在此时限内完成。
+const CONNECT_TIMEOUT: Duration = Duration::from_secs(15);
+/// 首包超时：从发出请求到收到响应头（TTFB）的上限。不设的话端点挂起会让任务永久卡住。
+const FIRST_BYTE_TIMEOUT: Duration = Duration::from_secs(120);
+/// 流空闲超时：两个 SSE 分片之间的最长间隔。reqwest 的 `read_timeout` 按"每次读取"
+/// 计时，服务端持续滴答但每条都很慢时靠它兜底；也能在思考阶段长时间无输出时中断。
+pub const STREAM_IDLE_TIMEOUT: Duration = Duration::from_secs(120);
+/// 整请求硬上限：防止服务端持续滴答却永不结束（`read_timeout` 每片都重置，管不住）。
+const REQUEST_TIMEOUT: Duration = Duration::from_secs(900);
 
 // ============================== 协议类型（纯数据，可测试） ==============================
 
@@ -584,19 +597,30 @@ pub async fn stream_body(
     api_key: &str,
     body: serde_json::Value,
 ) -> Result<ModelStream, String> {
-    let client = reqwest::Client::new();
+    // 审计 H1：`Client::new()` 没有任何时限——端点不响应时请求会永久挂起，
+    // 连取消都进不去。三个时限各管一段：建连、每次读取、整请求。
+    let client = reqwest::Client::builder()
+        .connect_timeout(CONNECT_TIMEOUT)
+        .read_timeout(STREAM_IDLE_TIMEOUT)
+        .timeout(REQUEST_TIMEOUT)
+        .build()
+        .map_err(|e| format!("构造模型 HTTP 客户端失败: {e}"))?;
     let url = if provider.is_responses() { provider.responses_url() } else { chat_url(provider) };
     // 自定义请求头（SH-097）先放：bearer_auth 后到，authorization 冲突时认证头获胜
     let mut request = client.post(url);
     for (name, value) in &provider.headers {
         request = request.header(name.as_str(), value.as_str());
     }
-    let response = request
-        .bearer_auth(api_key)
-        .json(&body)
-        .send()
-        .await
-        .map_err(|e| format!("模型请求失败: {e}"))?;
+    // 首包（响应头）单独设限：`read_timeout` 只作用于响应体，管不到 TTFB。
+    let response = tokio::time::timeout(
+        FIRST_BYTE_TIMEOUT,
+        request.bearer_auth(api_key).json(&body).send(),
+    )
+    .await
+    .map_err(|_| {
+        format!("模型请求首包超时（{}s 内未收到响应头）", FIRST_BYTE_TIMEOUT.as_secs())
+    })?
+    .map_err(|e| format!("模型请求失败: {e}"))?;
     if !response.status().is_success() {
         let status = response.status();
         let body_text = response.text().await.unwrap_or_default();
