@@ -81,6 +81,11 @@ fn fixture_path() -> String {
 }
 
 /// 复制一份用户可写的 node（见文件头说明）。已复制且大小一致就复用。
+///
+/// **不要直接覆盖已存在的 node.exe**：并行的其它用例可能正从同一个路径起进程，
+/// 覆盖会撞 `ERROR_SHARING_VIOLATION`（os error 32，CI 上偶发红）。
+/// 改为"写唯一临时文件再 rename"——rename 到已存在的目标在 Windows 上会失败，
+/// 失败即说明别的线程已经放好了，视为成功；最后统一校验大小，对不上就 fail。
 fn staged_node() -> PathBuf {
     let dir = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
         .join("target")
@@ -88,12 +93,24 @@ fn staged_node() -> PathBuf {
     std::fs::create_dir_all(&dir).expect("创建 node staging 目录");
     let exe = dir.join("node.exe");
     let source = command::resolve_executable("node").expect("解析 node 可执行文件");
+    let expected = std::fs::metadata(&source).map(|meta| meta.len()).ok();
     let same = exe.is_file()
-        && std::fs::metadata(&exe).map(|meta| meta.len()).ok()
-            == std::fs::metadata(&source).map(|meta| meta.len()).ok();
+        && std::fs::metadata(&exe).map(|meta| meta.len()).ok() == expected;
     if !same {
-        std::fs::copy(&source, &exe).expect("复制 node 到 staging 目录");
+        let staged = dir.join(format!("node-{}-{:?}.tmp", std::process::id(), std::thread::current().id()));
+        std::fs::copy(&source, &staged).expect("复制 node 到临时 staging 文件");
+        if std::fs::rename(&staged, &exe).is_err() {
+            // 目标已存在（别的用例先到）：临时文件作废，改用已有的那份。
+            let _ = std::fs::remove_file(&staged);
+        }
     }
+    let actual = std::fs::metadata(&exe).map(|meta| meta.len()).ok();
+    assert_eq!(
+        actual, expected,
+        "staging 的 node.exe 大小与源不一致（{} vs {:?}），可能是上一次复制被中断",
+        exe.display(),
+        expected
+    );
     exe
 }
 
