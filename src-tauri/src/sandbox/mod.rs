@@ -254,7 +254,7 @@ fn app_container_scope(
             let is_workspace_root = dir == *workspace_root;
             with_acl(|acl| {
                 if is_workspace_root {
-                    acl.grant_workspace(&dir, sid, acl::Access::Write)
+                    acl.grant_guarded(&dir, sid, acl::Access::Write)
                 } else {
                     acl.grant(&dir, sid, acl::Access::Write)
                 }
@@ -517,25 +517,21 @@ fn ensure_mcp_container(server_id: &str, trusted_server_ids: &[String]) -> Resul
 
 fn grant_mcp_paths(
     server_id: &str,
-    workspace_root: &Path,
-    desired: &[(PathBuf, acl::Access)],
+    desired: &[(PathBuf, acl::Access, acl::RootRole)],
 ) -> Result<(), SandboxError> {
     let mut runtimes = mcp_lock()?;
     let runtime = runtimes.get_mut(server_id).ok_or_else(|| {
         SandboxError::CreateFailed(format!("MCP server {server_id} 的容器尚未建立"))
     })?;
     let sid = runtime.container.sid();
-    for (path, access) in desired {
+    for (path, access, role) in desired {
         if runtime.granted.iter().any(|(granted, level)| granted == path && level == access) {
             continue;
         }
-        let is_workspace_root = acl::same_path(path, workspace_root);
-        with_acl(|acl| {
-            if is_workspace_root {
-                acl.grant_workspace(path, sid, *access)
-            } else {
-                acl.grant(path, sid, *access)
-            }
+        with_acl(|acl| match role {
+            // 用户指定的根（工作区、cwd、allowed_roots）过宽即拒；程序推导的目录放行。
+            acl::RootRole::UserPicked => acl.grant_guarded(path, sid, *access),
+            acl::RootRole::Derived => acl.grant(path, sid, *access),
         }).map_err(|error| {
             // 常见根因：运行时装在管理员所有的目录（普通用户改不了它的 DACL，
             // 容器也没读到它的权限）。给出能照做的两个出口。
@@ -756,21 +752,27 @@ fn spawn_mcp_in_app_container(
     })?;
 
     let workspace_access = acl_access(request.workspace_access);
-    let mut desired: Vec<(PathBuf, acl::Access)> = vec![
+    // 角色决定是否受过宽约束：用户指定的一律判，程序推导的（临时目录、工具链）不判。
+    let mut desired: Vec<(PathBuf, acl::Access, acl::RootRole)> = vec![
         // 工作区按用户所选档位；cwd 单独列出（可能在工作区之外）。
-        (request.workspace_root.to_path_buf(), workspace_access),
-        (request.cwd.to_path_buf(), workspace_access),
+        (request.workspace_root.to_path_buf(), workspace_access, acl::RootRole::UserPicked),
+        (request.cwd.to_path_buf(), workspace_access, acl::RootRole::UserPicked),
         // 临时目录必须可写：TEMP/TMP 会在下面改指到这里。
-        (server_temp.clone(), acl::Access::Write),
+        (server_temp.clone(), acl::Access::Write, acl::RootRole::Derived),
     ];
     for root in request.allowed_roots {
-        desired.push((PathBuf::from(root.path.trim()), acl_access(root.access)));
+        // `allowed_roots` 与工作区根同一套判定：换个键不该能绕过。
+        desired.push((
+            PathBuf::from(root.path.trim()),
+            acl_access(root.access),
+            acl::RootRole::UserPicked,
+        ));
     }
     for root in toolchain_roots(request.program, request.args) {
-        desired.push((root, acl::Access::Read));
+        desired.push((root, acl::Access::Read, acl::RootRole::Derived));
     }
     let desired = acl::collapse(desired);
-    grant_mcp_paths(request.server_id, request.workspace_root, &desired)?;
+    grant_mcp_paths(request.server_id, &desired)?;
 
     let mut env = request.env.clone();
     let temp_text = server_temp.to_string_lossy().to_string();
@@ -1182,13 +1184,14 @@ mod tests {
         };
         let profile = appcontainer::mcp_profile_name(&id).unwrap();
 
-        grant_mcp_paths(&id, &target, &[(target.clone(), acl::Access::Read)]).expect("授权读");
+        grant_mcp_paths(&id, &[(target.clone(), acl::Access::Read, acl::RootRole::UserPicked)])
+            .expect("授权读");
         assert!(
             acl::has_explicit_grant(&target, sid, acl::Access::Read.mask()).unwrap(),
             "容器 SID 应有显式读 ACE"
         );
         // 幂等：重复授权不报错，ACE 仍在。
-        grant_mcp_paths(&id, &target, &[(target.clone(), acl::Access::Read)])
+        grant_mcp_paths(&id, &[(target.clone(), acl::Access::Read, acl::RootRole::UserPicked)])
             .expect("重复授权应幂等");
         assert!(acl::has_explicit_grant(&target, sid, acl::Access::Read.mask()).unwrap());
 
@@ -1202,6 +1205,45 @@ mod tests {
             "释放后 profile 应被删除"
         );
         // 重复释放是 no-op，不得 panic。
+        release_mcp_server(&id);
+    }
+
+    /// `allowed_roots` 与工作区根共用同一套过宽判定：换个配置键不该能绕过去。
+    #[cfg(windows)]
+    #[test]
+    fn overbroad_allowed_root_is_refused_and_audited() {
+        let _serial = appcontainer::PROFILE_TEST_MUTEX.blocking_lock();
+        set_os_mode(OsSandbox::AppContainer);
+        let dir = ws();
+        let sub = dir.join("allowed-sub");
+        std::fs::create_dir_all(&sub).unwrap();
+        let id = format!("acl-wide-{}", std::process::id());
+        ensure_mcp_container(&id, &[]).expect("建立 per-server 容器");
+
+        let audit_path = acl_backup_dir()
+            .parent()
+            .expect("备份目录应位于 sandbox/ 下")
+            .join("acl-audit.jsonl");
+        let before = std::fs::read_to_string(&audit_path).map(|text| text.len()).unwrap_or(0);
+
+        let home = crate::config::home_dir();
+        let error = grant_mcp_paths(
+            &id,
+            &[(home.clone(), acl::Access::Read, acl::RootRole::UserPicked)],
+        )
+        .expect_err("allowed_roots 里放用户主目录必须拒绝");
+        assert!(error.to_string().contains("用户主目录"), "{error}");
+
+        let audit = std::fs::read_to_string(&audit_path).unwrap();
+        let appended = audit.get(before..).unwrap_or("");
+        assert!(
+            appended.contains("refused") && appended.contains("用户主目录"),
+            "拒绝必须落进审计，本次追加内容：{appended}"
+        );
+
+        // 主目录的子目录放行（临时目录本身就在用户主目录下）。
+        grant_mcp_paths(&id, &[(sub.clone(), acl::Access::Read, acl::RootRole::UserPicked)])
+            .expect("主目录的子目录不应被拦");
         release_mcp_server(&id);
     }
 

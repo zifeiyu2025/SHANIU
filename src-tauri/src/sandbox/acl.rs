@@ -145,34 +145,51 @@ impl Access {
     }
 }
 
-/// 收敛一份授权清单：同路径取最强档位，被祖先目录以「不更弱」权限覆盖的条目去掉。
+/// 授权清单里每一项的角色：决定它是否受「过宽根」约束。
+///
+/// 宽不宽看**目录本身**，不看它从哪个配置键写进来：主目录当工作区根太宽，
+/// 当 `allowed_roots` 一样宽——换个键就能绕过的守卫等于没有守卫。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum RootRole {
+    /// 用户自己指定的目录（工作区根、cwd、`allowed_roots`）：过宽即拒。
+    UserPicked,
+    /// 程序推导出来的目录（工具链、MCP 临时目录）：本来就可能落在
+    /// `Program Files` 这类系统目录下，不受过宽约束。
+    Derived,
+}
+
+/// 收敛一份授权清单：同路径取最强档位与**最严角色**，被祖先目录以「不更弱」权限覆盖的条目去掉。
 ///
 /// 只为少改 DACL 与少绕一层锁：每个 MCP server 的清单会同时包含工作区根、
 /// 其子目录与工具链目录，逐条授权会重复改写同一个安全描述符。
-pub fn collapse(entries: Vec<(PathBuf, Access)>) -> Vec<(PathBuf, Access)> {
-    let mut merged: Vec<(PathBuf, Access)> = Vec::new();
-    for (path, access) in entries {
+pub fn collapse(entries: Vec<(PathBuf, Access, RootRole)>) -> Vec<(PathBuf, Access, RootRole)> {
+    let mut merged: Vec<(PathBuf, Access, RootRole)> = Vec::new();
+    for (path, access, role) in entries {
         let path = normalize(&path);
-        match merged.iter_mut().find(|(existing, _)| *existing == path) {
-            Some((_, existing)) => {
+        match merged.iter_mut().find(|(existing, _, _)| *existing == path) {
+            Some((_, existing, existing_role)) => {
                 if !existing.covers(access) {
                     *existing = access;
                 }
+                // 同一路径既被用户指定又被程序推导：按用户指定判（更严）。
+                if role == RootRole::UserPicked {
+                    *existing_role = RootRole::UserPicked;
+                }
             }
-            None => merged.push((path, access)),
+            None => merged.push((path, access, role)),
         }
     }
-    merged.retain(|(path, _)| path.is_dir());
-    merged.sort_by_key(|(path, _)| path.components().count());
-    let mut kept: Vec<(PathBuf, Access)> = Vec::new();
-    for (path, access) in merged {
+    merged.retain(|(path, _, _)| path.is_dir());
+    merged.sort_by_key(|(path, _, _)| path.components().count());
+    let mut kept: Vec<(PathBuf, Access, RootRole)> = Vec::new();
+    for (path, access, role) in merged {
         let covered = kept
             .iter()
-            .any(|(parent, parent_access)| {
+            .any(|(parent, parent_access, _)| {
                 path != *parent && path.starts_with(parent) && parent_access.covers(access)
             });
         if !covered {
-            kept.push((path, access));
+            kept.push((path, access, role));
         }
     }
     kept
@@ -230,12 +247,12 @@ impl AclManager {
         Ok(restored)
     }
 
-    /// 给**工作区根**加 ACE：先挡住过宽根，再走普通授权。
+    /// 给**用户指定的根**加 ACE：先挡住过宽根，再走普通授权。
     ///
-    /// 为什么要单独一个入口：过宽根只对「工作区根」这一角色成立。工具链目录
-    /// （`node.exe` 所在目录、`.cargo` 等）本来就可能落在 `C:\Program Files` 下，
-    /// 那条授权路径不受这里影响。
-    pub fn grant_workspace(&mut self, dir: &Path, sid: PSID, access: Access) -> Result<(), String> {
+    /// 覆盖三类用户指定入口（工作区根、cwd、`allowed_roots`）——它们共用同一套判定，
+    /// 否则换个配置键就能绕过。工具链目录走 `grant`：`node.exe` 在
+    /// `Program Files\nodejs` 是子目录，只有 `Program Files` 本身作为根才拒。
+    pub fn grant_guarded(&mut self, dir: &Path, sid: PSID, access: Access) -> Result<(), String> {
         let normalized = normalize(dir);
         if let Some(reason) = overbroad_root_reason(&normalized) {
             let sid_text = sid_to_string(sid)?;
@@ -1009,26 +1026,36 @@ mod tests {
         std::fs::create_dir_all(&child).unwrap();
 
         let collapsed = collapse(vec![
-            (root.to_path_buf(), Access::Read),
-            (child.clone(), Access::Read),
-            (child.clone(), Access::Write),
+            (root.to_path_buf(), Access::Read, RootRole::UserPicked),
+            (child.clone(), Access::Read, RootRole::UserPicked),
+            (child.clone(), Access::Write, RootRole::UserPicked),
         ]);
-        assert!(collapsed.contains(&(normalize(&root), Access::Read)));
+        assert!(collapsed.contains(&(normalize(&root), Access::Read, RootRole::UserPicked)));
         assert!(
-            collapsed.contains(&(normalize(&child), Access::Write)),
+            collapsed.contains(&(normalize(&child), Access::Write, RootRole::UserPicked)),
             "子目录的 Write 不得被父目录的 Read 吞掉: {collapsed:?}"
         );
 
-        let collapsed = collapse(vec![(root.to_path_buf(), Access::Write), (child.clone(), Access::Read)]);
+        let collapsed = collapse(vec![
+            (root.to_path_buf(), Access::Write, RootRole::UserPicked),
+            (child.clone(), Access::Read, RootRole::UserPicked),
+        ]);
         assert_eq!(
             collapsed,
-            vec![(normalize(&root), Access::Write)],
+            vec![(normalize(&root), Access::Write, RootRole::UserPicked)],
             "父 Write 已覆盖子 Read，子项应被收敛掉"
         );
 
         // 同一路径两次不同档位：取更强的一档。
-        let same = collapse(vec![(child.clone(), Access::Read), (child.clone(), Access::Write)]);
-        assert_eq!(same, vec![(normalize(&child), Access::Write)]);
+        let same = collapse(vec![
+            (child.clone(), Access::Read, RootRole::Derived),
+            (child.clone(), Access::Write, RootRole::UserPicked),
+        ]);
+        assert_eq!(
+            same,
+            vec![(normalize(&child), Access::Write, RootRole::UserPicked)],
+            "同路径同时是用户指定与程序推导时，按更严的角色判"
+        );
     }
 
     #[test]
@@ -1334,14 +1361,14 @@ mod tests {
     }
 
     #[test]
-    fn grant_workspace_refuses_home_and_leaves_audit() {
+    fn grant_guarded_refuses_home_and_leaves_audit() {
         let ws = temp_dir("refuse");
         let backups = ws.join("backups");
         let mut manager = AclManager::new(backups.clone());
         let sid = super::super::appcontainer::internet_client_capability().unwrap();
         let home = crate::config::home_dir();
         let error = manager
-            .grant_workspace(&home, sid.as_psid(), Access::Read)
+            .grant_guarded(&home, sid.as_psid(), Access::Read)
             .expect_err("用户主目录必须拒绝授权");
         assert!(error.contains("用户主目录"), "{error}");
         assert!(error.contains("请改选它下面的具体项目目录"), "{error}");
@@ -1349,12 +1376,12 @@ mod tests {
         assert!(audit.contains("refused"), "拒绝必须落进审计：{audit}");
         assert!(audit.contains("用户主目录"), "{audit}");
 
-        // 正常目录照旧放行（守卫不能把普通人挡在外面）。
+        // 主目录的子目录照旧放行（临时目录本身就在用户主目录下）。
         let work = ws.join("work");
         std::fs::create_dir_all(&work).unwrap();
         manager
-            .grant_workspace(&work, sid.as_psid(), Access::Read)
-            .expect("主目录之外的目录不应被拦");
+            .grant_guarded(&work, sid.as_psid(), Access::Read)
+            .expect("主目录的子目录不是过宽根，不应被拦");
         assert!(has_explicit_grant(&work, sid.as_psid(), Access::Read.mask()).unwrap());
     }
 }
