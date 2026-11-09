@@ -40,6 +40,7 @@ import {
   type ReviewPayloadWire,
   type ReviewToolWire,
 } from '../transport/mcp-wire'
+import { ConfigReadOnlyNotice, useConfigReadOnly } from '../config-readonly/ConfigReadOnly'
 import { NS } from './locales'
 import {
   approvedCount,
@@ -186,26 +187,6 @@ function useMcpTick(): readonly [number, () => void] {
 }
 
 /**
- * 配置只读原因（`get_settings.configReadOnly`）。非空 = 启动时 `config.toml`
- * 解析失败、应用按只读运行：界面必须说出来，否则用户会以为「配置里的 server 消失了」。
- */
-function useConfigReadOnly(tick: number): string | null {
-  const [reason, setReason] = useState<string | null>(null)
-  useEffect(() => {
-    let live = true
-    tauriBridge()
-      .invoke<{ configReadOnly?: string | null }>('get_settings')
-      .then(
-        (settings) => { if (live) setReason(settings.configReadOnly ?? null) },
-        // 读不到设置不是本面板的错误：不把「配置只读」误报出来。
-        () => { if (live) setReason(null) },
-      )
-    return () => { live = false }
-  }, [tick])
-  return reason
-}
-
-/**
  * `plugins.item` 入口：按上游契约分流卡片摘要与详情页主体。
  * @param props - `view`、未使用的 `form` 与本命名空间 `t`。
  * @returns 摘要文本或详情页主体。
@@ -227,7 +208,7 @@ function McpConnectorSummary({ t }: { t: McpConnectorProps['t'] }): ReactNode {
 function McpConnectorPage({ t }: { t: McpConnectorProps['t'] }): ReactNode {
   const [tick, reload] = useMcpTick()
   const { servers, error } = useServers(tick)
-  const configReadOnly = useConfigReadOnly(tick)
+  const configReadOnly = useConfigReadOnly()
   const [tab, setTab] = useState<ConnectorTab>('servers')
   const [exemptions, setExemptions] = useState<readonly ExemptionWire[] | null>(null)
   const [openId, setOpenId] = useState<string | null>(null)
@@ -337,10 +318,7 @@ function McpConnectorPage({ t }: { t: McpConnectorProps['t'] }): ReactNode {
     <div className="mcp-connector">
       <p className="mcp-connector-intro">{t('description')}</p>
       {configReadOnly !== null && (
-        <p className="mcp-connector-config-readonly" role="alert">
-          <StateDot state="error" />
-          {t('configReadOnly', { reason: configReadOnly })}
-        </p>
+        <ConfigReadOnlyNotice message={t('configReadOnly', { reason: configReadOnly })} />
       )}
       {failure !== null && (
         <p className="mcp-connector-alert" role="alert">

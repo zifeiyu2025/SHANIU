@@ -12,8 +12,9 @@
  * 容器隔离与 fail-closed 由 Rust 侧探针测试负责。
  */
 import { beforeEach, describe, expect, it, vi } from 'vitest'
-import { render, screen } from '@testing-library/react'
+import { act, render, screen } from '@testing-library/react'
 import type { McpServerSummaryWire } from '../transport/mcp-wire'
+import { GeneralConfigReadOnlyRow } from '../config-readonly/ConfigReadOnly'
 import { McpConnector } from './McpConnector'
 import { zh, type McpTrustKey } from './locales'
 
@@ -121,5 +122,27 @@ describe('MCP 连接器：配置只读', () => {
 
     expect(await screen.findByText(zh['empty'])).toBeTruthy()
     expect(screen.queryByText(/配置读取失败/)).toBeNull()
+  })
+})
+
+/** 通用设置页那一行用的是同一个组件，只需要按它自己的入参类型包一层。 */
+const rowT = (key: 'configReadOnly', params: { reason: string }): string => translate(key, params)
+
+describe('通用设置页：配置只读横幅', () => {
+  it('与 MCP 页用同一段文案，且指向出错行', async () => {
+    state.settings = { configReadOnly: '解析配置失败: TOML parse error at line 3, column 1' }
+    render(<GeneralConfigReadOnlyRow t={rowT} />)
+
+    const banner = await screen.findByRole('alert')
+    expect(banner.textContent).toContain('配置读取失败，已按只读运行')
+    expect(banner.textContent).toContain('line 3')
+  })
+
+  it('配置可写时这一行不渲染', async () => {
+    state.settings = { configReadOnly: null }
+    const { container } = render(<GeneralConfigReadOnlyRow t={rowT} />)
+    await act(async () => { await Promise.resolve() })
+
+    expect(container.textContent).toBe('')
   })
 })

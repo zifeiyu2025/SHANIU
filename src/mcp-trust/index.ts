@@ -23,6 +23,7 @@ import type {} from '@deepseek-ai/dsh-client-ui-renderer/client'
 import type {} from '@deepseek-ai/dsh-client-ui-slots'
 import { McpConnector } from './McpConnector'
 import { en, NS, zh } from './locales'
+import { GeneralConfigReadOnlyRow } from '../config-readonly/ConfigReadOnly'
 
 /** 必需服务：槽位与词典。 */
 export const inject = ['slots', 'locale']
@@ -49,4 +50,12 @@ export function apply(ctx: Context): void {
     label: () => t('label'),
     locale: NS,
   }, McpConnector))
+  // 配置只读是全局状态：通用设置页也挂同一条横幅（同一组件、同一词典键），
+  // 只在 MCP 页显示会让人以为「只有 MCP 坏了」，比没有提示更误导。
+  ctx.slots.inject('settings.general.item', () => ctx.slots.register({
+    name: 'settings.general.item',
+    id: 'config-readonly',
+    order: -100,
+    locale: NS,
+  }, GeneralConfigReadOnlyRow))
 }

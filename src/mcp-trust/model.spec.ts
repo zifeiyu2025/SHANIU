@@ -6,6 +6,7 @@
  */
 import { describe, expect, it } from 'vitest'
 import { apply } from './index'
+import { GeneralConfigReadOnlyRow } from '../config-readonly/ConfigReadOnly'
 import { McpConnector } from './McpConnector'
 import {
   approvedCount,
@@ -184,12 +185,16 @@ describe('条目注册', () => {
       },
     }
     apply(ctx as never)
-    expect(registered.map((entry) => entry.options.name)).toEqual(['plugins.item', 'settings.section'])
-    for (const entry of registered) {
+    // 两个挂载点挂同一组件定义 = 同一份数据源与状态，不是复制一份列表 UI。
+    const connector = registered.filter((entry) => entry.component === McpConnector)
+    expect(connector.map((entry) => entry.options.name)).toEqual(['plugins.item', 'settings.section'])
+    for (const entry of connector) {
       expect(entry.options).toMatchObject({ id: 'mcp', locale: 'shaniuMcp' })
       expect((entry.options.label as () => string)()).toBe('label')
-      // 同一组件定义 = 同一份数据源与状态，不是复制一份列表 UI。
-      expect(entry.component).toBe(McpConnector)
     }
+    // 配置只读是全局状态：通用设置页那一行是共享横幅，不是第三个「连接器挂载点」。
+    const banner = registered.filter((entry) => entry.component === GeneralConfigReadOnlyRow)
+    expect(banner.map((entry) => entry.options.name)).toEqual(['settings.general.item'])
+    expect(banner[0]?.options).toMatchObject({ id: 'config-readonly', locale: 'shaniuMcp' })
   })
 })

@@ -1,0 +1,21 @@
+/*
+ * 配置只读提示的样式（MCP 连接器页与通用设置页共用同一份）。
+ * 只补排版：颜色、换行、行内边距；容器与图标由上游组件负责。
+ */
+
+.config-readonly-notice {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: flex-start;
+  gap: 8px;
+  margin: 0;
+  color: var(--dsw-alias-state-error-primary, #d1242f);
+  line-height: 1.55;
+  overflow-wrap: anywhere;
+}
+
+/* 通用设置页的行：与相邻行同一节奏（16px 上下 + 一条分隔线）。 */
+.config-readonly-row {
+  padding: 16px 0;
+  border-bottom: 0.5px solid var(--dsw-alias-border-l2);
+}

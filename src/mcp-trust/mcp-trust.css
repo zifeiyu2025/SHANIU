@@ -80,18 +80,6 @@
   overflow-wrap: anywhere;
 }
 
-/* 配置只读：启动时 config.toml 解析失败，界面必须说出来（否则用户以为配置丢了）。 */
-.mcp-connector-config-readonly {
-  display: flex;
-  flex-wrap: wrap;
-  align-items: flex-start;
-  gap: 8px;
-  margin: 0;
-  color: var(--dsw-alias-state-error-primary, #d1242f);
-  line-height: 1.55;
-  overflow-wrap: anywhere;
-}
-
 /* 折叠行是固定 24px 的单行：计数不换行、命令单行省略，否则长 argv 会换行
    溢出到下一行上面（真机截图中出现过的重叠）。 */
 .mcp-connector-row-note {
