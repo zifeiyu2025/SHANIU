@@ -299,21 +299,66 @@ fn is_safe_redirect(word: &str) -> bool {
 
 /// 参数级只读守卫：前缀命中之后再过一道，防止"程序名对、参数越界"的调用免审。
 ///
-/// 目前只有 `findstr` 需要守卫（`docs/05` SH-119 降噪 (c)）：它的搜索目标可能是指向
-/// 工作区外的绝对路径或 `..`，那种形态必须落回审批。没注册守卫的命令不受影响。
+/// 按**参数形态**统一校验，不再按程序名特判：任何参数 token 指向工作区外
+/// ——盘符（`C:`）、UNC（`\\server\share`）、`..` 上跳、以分隔符开头的绝对/
+/// 根相对路径——一律落回审批。`type C:\Users\<u>\.ssh\id_rsa`、`dir C:\Users`
+/// 这类"程序名在只读白名单里、参数却指向工作区外"的调用由此被拦下。
+///
+/// 在通用形态之上保留两条程序级加严：
+/// - `findstr`：开关必须在白名单内（`/G`、`/F`、`/D` 能读其它文件）；
+/// - `git`：拒绝 `--output*` / `-O*`——它们会把 diff/log/show 的结果写成文件。
 fn readonly_guard_allows(tokens: &[String]) -> bool {
-    let program = tokens[0].to_ascii_lowercase();
-    match program.trim_end_matches(".exe") {
-        "findstr" => findstr_allows(&tokens[1..]),
+    let program = program_name(&tokens[0]);
+    if tokens[1..].iter().any(|arg| escapes_workspace(arg)) {
+        return false;
+    }
+    match program.as_str() {
+        "findstr" => findstr_flag_allows(&tokens[1..]),
+        "git" => !tokens[1..].iter().any(|arg| is_git_output_arg(arg)),
         _ => true,
     }
 }
 
-/// `findstr` 的许可形态：白名单开关 + 不指向工作区外的搜索目标。
+/// 程序名归一化：取最后一段路径、去 `.exe`、小写（Windows 下大小写不敏感）。
+fn program_name(token: &str) -> String {
+    let lower = token.to_ascii_lowercase();
+    let base = lower.rsplit(['\\', '/']).next().unwrap_or(lower.as_str());
+    base.trim_end_matches(".exe").to_string()
+}
+
+/// 单个参数是否指向工作区外。
 ///
-/// 开关只在白名单里（`/G`、`/F`、`/D` 这些能读其它文件的组合一律不放行）；
-/// 非开关 token 不得含盘符、路径分隔符或 `..`，否则可能命中工作区外的文件。
-fn findstr_allows(args: &[String]) -> bool {
+/// 判据只认"能不能落到工作区外"，不认"看起来像路径"：
+/// - 盘符：`C:`、`d:`（`/C:literal` 首字符不是字母，不会误判）；
+/// - UNC：`\\server\share`；
+/// - `..` 上跳；
+/// - 根相对/绝对路径：以 `\` 开头的视为越过当前盘根。
+///
+/// `/` 开头在 cmd 里通常是开关（`/b`、`/S`、`/C:TODO`），不能一概当成绝对路径；
+/// 只有含第二个分隔符（`/etc/passwd`）或除开关名外还带路径的才按越界处理。
+fn escapes_workspace(arg: &str) -> bool {
+    let bytes = arg.as_bytes();
+    if bytes.len() >= 2 && bytes[0].is_ascii_alphabetic() && bytes[1] == b':' {
+        return true;
+    }
+    // 以 `\` 开头 = 从当前盘根出发（UNC 的 `\\server` 也落在这里）。
+    if arg.starts_with('\\') {
+        return true;
+    }
+    if arg.contains("..") {
+        return true;
+    }
+    if let Some(rest) = arg.strip_prefix('/') {
+        if rest.is_empty() || rest.contains(['/', '\\']) {
+            return true;
+        }
+    }
+    false
+}
+
+/// `findstr` 的开关白名单：只有列出的开关与 `/c:字面量` 免问；
+/// `/G`、`/F`、`/D` 这类能读其它文件的组合一律落回审批。
+fn findstr_flag_allows(args: &[String]) -> bool {
     const FLAGS: &[&str] = &[
         "/b", "/e", "/i", "/l", "/m", "/n", "/o", "/p", "/r", "/s", "/v",
     ];
@@ -322,8 +367,13 @@ fn findstr_allows(args: &[String]) -> bool {
         if lower.starts_with('/') {
             return FLAGS.contains(&lower.as_str()) || lower.starts_with("/c:");
         }
-        !arg.contains(['\\', ':', '/']) && !arg.contains("..")
+        true
     })
+}
+
+/// `git` 的输出类参数：会把结果写进文件，绕过只读语义。
+fn is_git_output_arg(arg: &str) -> bool {
+    arg.starts_with("--output") || arg.starts_with("-O")
 }
 
 /// 极简分词：只服务前缀匹配。返回 `None` = 不可安全匹配（元字符/未闭合引号/空）。
@@ -628,6 +678,40 @@ mod tests {
             "findstr TODO D:notes.txt",
         ] {
             assert!(rules.match_command(command).is_none(), "越界搜索不得命中: {command}");
+        }
+    }
+
+    /// 审计 H4：守卫按参数形态统一校验，`type`/`dir`/`git diff` 三条
+    /// "程序名在只读白名单、参数却越界"的零提示路径必须落回审批。
+    #[test]
+    fn readonly_guard_blocks_out_of_workspace_arguments() {
+        let (rules, rejected) =
+            PrefixAllowlist::from_config(&crate::config::default_allow_prefixes());
+        assert!(rejected.is_empty(), "{rejected:?}");
+        for command in [
+            r"type C:\Users\alice\.ssh\id_rsa",
+            r"dir C:\Users",
+            r"git diff --output=C:\x.txt",
+            r"git log -OC:\x.txt",
+            r"git show --output=out.txt",
+            r"type ..\..\secret.txt",
+            r"dir \\server\share",
+            r"type \Windows\win.ini",
+            r"findstr TODO C:\Windows\win.ini",
+        ] {
+            assert!(rules.match_command(command).is_none(), "越界参数不得命中: {command}");
+        }
+        // 工作区内的相对参数仍免问（守卫不能把正常只读调用一并拦掉）
+        for command in [
+            "dir",
+            "dir src",
+            "dir /b",
+            "type README.md",
+            "git diff",
+            "git diff --stat",
+            "git log --oneline",
+        ] {
+            assert!(rules.match_command(command).is_some(), "工作区内只读应命中: {command}");
         }
     }
 
