@@ -2489,17 +2489,24 @@ mod tests {
             .await;
         let captured = seen.lock().unwrap();
         let request = captured.first().expect("后端应收到请求");
-        assert_eq!(request.len(), 2, "原消息 + 引用上下文");
+        // 任务开始时的环境快照（DSH in-history）+ 原消息 + 引用上下文
+        assert_eq!(request.len(), 3, "环境快照 + 原消息 + 引用上下文");
         match &request[0] {
-            HistoryItem::Message { text, .. } => assert_eq!(text, "请参考 @旧会话 回答"),
-            _ => panic!("首条应是剥离 mention 的用户消息"),
+            HistoryItem::Message { role: Role::System, text, .. } => {
+                assert!(text.starts_with("## 环境快照"), "首条是任务开始时的环境快照");
+            }
+            other => panic!("首条应是环境快照 system 消息，实际 {other:?}"),
         }
         match &request[1] {
+            HistoryItem::Message { text, .. } => assert_eq!(text, "请参考 @旧会话 回答"),
+            _ => panic!("第二条应是剥离 mention 的用户消息"),
+        }
+        match &request[2] {
             HistoryItem::Message { role: Role::User, text, .. } => {
                 assert!(text.starts_with("## Referenced sessions"));
                 assert!(text.contains("被引用的回答"));
             }
-            _ => panic!("第二条应是引用上下文"),
+            _ => panic!("第三条应是引用上下文"),
         }
     }
 
@@ -2604,8 +2611,8 @@ mod tests {
         child_cancel.cancel();
         let (child_summary, child) = handle.await.expect("子代理任务不应 panic");
         assert_eq!(child_summary.reason, TurnEndReason::Cancelled);
-        // 取消的轮次不追加 assistant 消息，实例历史停在 task 那一条。
-        assert_eq!(child.history.len(), 1);
+        // 取消的轮次不追加 assistant 消息；历史停在「环境快照 + task」两条。
+        assert_eq!(child.history.len(), 2, "环境快照 + task，取消不追加 assistant");
 
         let mut root = AgentInstance::root(
             vec![HistoryItem::Message { role: Role::User, text: "root-task".into(), reasoning: None }],
