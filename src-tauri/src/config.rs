@@ -838,12 +838,18 @@ pub enum OsSandbox {
     Logical,
 }
 
-/// M0 默认只读：真实沙箱 M2 落地，fail-closed 语义见 ADR-002。
+/// 三档文件效果（对齐 DSH `SandboxMode`，docs/04 §4 `[sandbox] mode`）。
+///
+/// 默认 `WorkspaceWrite`（有意偏离 DSH 的 `read-only`）：默认只读会让每个新会话的
+/// 第一步就撞墙，而工作区写入本来就在沙箱边界内。解析优先级（对齐 DSH
+/// `SandboxPolicyService.resolve`）：**本次调用显式指定 > 会话设置 > 部署默认**——
+/// 显式指定只有 on-failure 提权那一条（单次调用），会话设置是运行中切换的
+/// `SessionPolicyHandle`，部署默认是 config.toml。fail-closed 语义见 ADR-002。
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum SandboxMode {
-    #[default]
     ReadOnly,
+    #[default]
     WorkspaceWrite,
     DangerFullAccess,
 }
@@ -2044,7 +2050,7 @@ mod tests {
         let base = crate::test_support::TestTempDir::new("cfg");
         let root = base.join("cfg");
         let (cfg, path) = AppConfig::load_or_create(&root).unwrap();
-        assert_eq!(cfg.sandbox.mode, SandboxMode::ReadOnly);
+        assert_eq!(cfg.sandbox.mode, SandboxMode::WorkspaceWrite);
         assert_eq!(cfg.approval.mode, ApprovalMode::OnRequest);
         assert_eq!(cfg.model.max_turns, 32);
 
@@ -2054,7 +2060,7 @@ mod tests {
         let (cfg2, _) = AppConfig::load_or_create(&root).unwrap();
         assert_eq!(cfg2.model.provider, "openai-chat");
         assert_eq!(cfg2.model.max_turns, 32);
-        assert_eq!(cfg2.sandbox.mode, SandboxMode::ReadOnly);
+        assert_eq!(cfg2.sandbox.mode, SandboxMode::WorkspaceWrite);
         assert_eq!(cfg2.sandbox.os, OsSandbox::AppContainer, "OS 沙箱默认必须是 AppContainer");
     }
 

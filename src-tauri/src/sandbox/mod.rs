@@ -88,6 +88,66 @@ pub fn current_os_mode() -> OsSandbox {
     }
 }
 
+/// 强制完整度自报（对齐 DSH `SandboxEnforcement = 'full' | 'partial'`）。
+///
+/// 判据是「宿主能不能真的把声明的档位强制到位」，不是「隔离有多强」：
+/// - AppContainer 打底：读隔离 + 路径写入边界都由容器强制 → `full`；
+/// - logical 回退：只有受限令牌 + Job，**没有路径级边界** → 写入类档位只能是 `partial`；
+/// - logical + `danger_full_access`：本来就没有边界要强制，声明与事实一致 → `full`。
+///
+/// 只有真的覆盖到才许写 `full`：这里不做「大概能拦住」的乐观判断。
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum SandboxEnforcement {
+    Full,
+    Partial,
+}
+
+impl SandboxEnforcement {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Full => "full",
+            Self::Partial => "partial",
+        }
+    }
+}
+
+pub fn enforcement_of(os: OsSandbox, mode: SandboxMode) -> SandboxEnforcement {
+    match (os, mode) {
+        (OsSandbox::AppContainer, _) => SandboxEnforcement::Full,
+        (OsSandbox::Logical, SandboxMode::DangerFullAccess) => SandboxEnforcement::Full,
+        (OsSandbox::Logical, _) => SandboxEnforcement::Partial,
+    }
+}
+
+/// 当前进程的强制完整度（状态条与工具结果共用同一处判定）。
+pub fn current_enforcement(mode: SandboxMode) -> SandboxEnforcement {
+    enforcement_of(current_os_mode(), mode)
+}
+
+/// 会真正落下执行副作用的工具：只有它们的输出才需要带上沙箱自报。
+/// 读写文件类工具的结果里塞这行只是噪声，模型也拿它做不了判断。
+const EXEC_TOOLS: &[&str] = &["unified_exec", "terminal"];
+
+/// 给模型看的沙箱自报（拼在工具结果末尾）。非执行类工具返回 `None`。
+///
+/// 措辞固定为 `[sandbox] mode=… enforcement=…`：机器可读，不随界面文案漂移。
+pub fn execution_note(tool: &str, mode: SandboxMode) -> Option<String> {
+    if !EXEC_TOOLS.contains(&tool) {
+        return None;
+    }
+    let name = match mode {
+        SandboxMode::ReadOnly => "read_only",
+        SandboxMode::WorkspaceWrite => "workspace_write",
+        SandboxMode::DangerFullAccess => "danger_full_access",
+    };
+    Some(format!(
+        "[sandbox] mode={name} enforcement={}",
+        current_enforcement(mode).as_str()
+    ))
+}
+
+
 /// 按策略准备子进程（Windows 实现）。tx 供受限路径的读线程回传 stdio 行。
 pub fn prepare_spawn(
     policy: SandboxMode,
@@ -623,6 +683,8 @@ pub struct SandboxStatus {
     pub os: &'static str,
     /// 是否真的启用了 OS 级隔离；false 时 UI 必须常驻标注。
     pub os_enabled: bool,
+    /// 强制完整度自报（`full` / `partial`），与工具结果里的同一判定。
+    pub enforcement: &'static str,
     /// 容器 profile 名（UI 常驻展示"跑的到底是哪个容器"）；logical 模式为空串。
     pub profile: String,
     pub note: String,
@@ -649,6 +711,7 @@ pub fn status(mode: SandboxMode, os: OsSandbox) -> SandboxStatus {
         },
         os: os_name,
         os_enabled,
+        enforcement: enforcement_of(os, mode).as_str(),
         profile: match os {
             OsSandbox::AppContainer => appcontainer::PROFILE_NAME.to_string(),
             OsSandbox::Logical => String::new(),
@@ -1049,6 +1112,45 @@ mod tests {
         let container = status(SandboxMode::WorkspaceWrite, OsSandbox::AppContainer);
         assert!(container.os_enabled);
         assert_eq!(container.os, "app_container");
+    }
+
+    /// 强制完整度只看「宿主能不能真的把声明的档位强制到位」：
+    /// logical 下写入类档位必须是 partial，不许自报 full。
+    #[test]
+    fn enforcement_is_honest_about_logical_fallback() {
+        assert_eq!(
+            enforcement_of(OsSandbox::AppContainer, SandboxMode::ReadOnly),
+            SandboxEnforcement::Full
+        );
+        assert_eq!(
+            enforcement_of(OsSandbox::AppContainer, SandboxMode::WorkspaceWrite),
+            SandboxEnforcement::Full
+        );
+        assert_eq!(
+            enforcement_of(OsSandbox::Logical, SandboxMode::WorkspaceWrite),
+            SandboxEnforcement::Partial
+        );
+        assert_eq!(
+            enforcement_of(OsSandbox::Logical, SandboxMode::ReadOnly),
+            SandboxEnforcement::Partial
+        );
+        // danger_full_access 在 logical 下没有边界要强制，声明与事实一致。
+        assert_eq!(
+            enforcement_of(OsSandbox::Logical, SandboxMode::DangerFullAccess),
+            SandboxEnforcement::Full
+        );
+        let status = status(SandboxMode::WorkspaceWrite, OsSandbox::Logical);
+        assert_eq!(status.enforcement, "partial");
+    }
+
+    /// 自报只挂在真的执行了子进程的工具上，且字段名固定。
+    #[test]
+    fn execution_note_only_for_exec_tools() {
+        assert!(execution_note("read_file", SandboxMode::WorkspaceWrite).is_none());
+        let note = execution_note("unified_exec", SandboxMode::WorkspaceWrite).expect("应有自报");
+        assert!(note.starts_with("[sandbox] mode=workspace_write enforcement="), "实际: {note}");
+        let escalated = execution_note("terminal", SandboxMode::DangerFullAccess).unwrap();
+        assert!(escalated.contains("mode=danger_full_access"), "实际: {escalated}");
     }
 
     /// 非法 server id 派生不出容器名：必须**直接失败**，不能悄悄退回受限令牌。

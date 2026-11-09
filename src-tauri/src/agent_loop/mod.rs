@@ -845,6 +845,8 @@ impl AgentLoop {
                     None => tool_ctx,
                 };
                 let mut result = self.router.execute(name, args_val.clone(), &tool_ctx).await;
+                // 自报用的实际档位：提权重跑后必须跟着变，不能谎报成会话档位。
+                let mut effective_sandbox = tool_ctx.sandbox;
                 // on-failure 提权（SH-120 / ADR-007②）：只有**沙箱拒绝**这一类失败才值得问一次
                 // 「是否以 full-access 重跑」——普通非零退出重跑结果一样，问了只是多一次打断。
                 // 提权必须用户点头：不问就放宽就是静默降级（AGENTS §11.3 退化红线）。
@@ -870,6 +872,7 @@ impl AgentLoop {
                                     sandbox: crate::config::SandboxMode::DangerFullAccess,
                                     ..tool_ctx
                                 };
+                                effective_sandbox = retry_ctx.sandbox;
                                 result = self.router.execute(name, args_val, &retry_ctx).await;
                             }
                             crate::permission::GateOutcome::Cancelled => {
@@ -924,7 +927,10 @@ impl AgentLoop {
                 };
                 history.push(HistoryItem::FunctionCallOutput {
                     call_id: call_id.clone(),
-                    output: output_text.clone(),
+                    output: match crate::sandbox::execution_note(name, effective_sandbox) {
+                        Some(note) => format!("{output_text}\n{note}"),
+                        None => output_text.clone(),
+                    },
                 });
                 // SH-072：view_image 的图片以引用形式回填成一条用户消息——Chat 协议不允许
                 // 图片挂在 tool 消息里，模型只能从用户消息里看到它。字节取自进程内缓存，

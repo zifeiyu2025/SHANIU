@@ -118,17 +118,26 @@ export function SandboxStatusBar({ t, wire = DEFAULT_WIRE }: SandboxStatusBarPro
             ? <span className="shaniu-sandbox-bar-muted">{loadError ?? '…'}</span>
             : (
               <>
+                {/* 档位是主：先给出用户选的那一档，机制与 profile 是实现细节，排在后面。 */}
                 <Tag tone={status.mode === 'danger_full_access' ? 'danger' : 'neutral'}>
                   {t(modeKey(status.mode))}
                 </Tag>
-                <Tag tone={status.os_enabled ? 'success' : 'warning'}>
-                  {t(osKey(status.os))}
-                </Tag>
-                {status.profile !== '' && (
-                  <span className="shaniu-sandbox-bar-profile" title={t('profile', { profile: status.profile })}>
-                    {status.profile}
+                <Tag tone={status.enforcement === 'full' ? 'success' : 'warning'}>
+                  <span title={t(status.enforcement === 'full' ? 'enforcement.fullHint' : 'enforcement.partialHint')}>
+                    {t(status.enforcement === 'full' ? 'enforcement.full' : 'enforcement.partial')}
                   </span>
-                )}
+                </Tag>
+                <span className="shaniu-sandbox-bar-mechanism">
+                  <span className="shaniu-sandbox-bar-label">{t('label.mechanism')}</span>
+                  <Tag tone={status.os_enabled ? 'success' : 'warning'}>
+                    {t(osKey(status.os))}
+                  </Tag>
+                  {status.profile !== '' && (
+                    <span className="shaniu-sandbox-bar-profile" title={t('profile', { profile: status.profile })}>
+                      {status.profile}
+                    </span>
+                  )}
+                </span>
               </>
             )}
         </span>

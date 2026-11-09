@@ -33,9 +33,10 @@ export const SANDBOX_TO_PRESET: Record<string, string> = Object.fromEntries(
 export const PERMISSION_PRESETS: readonly string[] = Object.keys(PRESET_TO_SANDBOX)
 
 /**
- * `presetOfSandbox` 认不出沙箱档时的回落档。`config.rs` 里 `SandboxMode` 的
- * `#[default]` 就是 ReadOnly，表首项与之同义；回落取权限最小的一档——宁可显示
- * "只读"，也不显示一个用户从没开过的宽松档。
+ * `presetOfSandbox` 认不出沙箱档时的回落档。**不是产品默认档**：产品默认是
+ * `config.rs` 里 `SandboxMode::default()` 的 `workspace_write`（2026-11-09 起，
+ * 有意偏离 DSH 的 `read-only`）。这里只在配置读不到/值非法时兜底，取权限最小的
+ * 一档——宁可显示"只读"，也不显示一个用户从没开过的宽松档。
  */
 export const DEFAULT_PERMISSION_PRESET: string = PERMISSION_PRESETS[0] ?? 'read-only'
 

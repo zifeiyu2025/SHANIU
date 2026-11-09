@@ -34,6 +34,7 @@ const OS_STATUS: SandboxStatusWire = {
   mode: 'workspace_write',
   os: 'app_container',
   os_enabled: true,
+  enforcement: 'full',
   profile: 'Shaniu.Sandbox.v1',
   note: 'AppContainer 路径/读隔离 + 网络默认拒绝；受限令牌与 Job 作为纵深保留',
 }
@@ -42,6 +43,7 @@ const LOGICAL_STATUS: SandboxStatusWire = {
   mode: 'workspace_write',
   os: 'logical',
   os_enabled: false,
+  enforcement: 'partial',
   profile: '',
   note: '当前未启用 OS 沙箱：仅受限令牌 + Job（逻辑隔离），没有路径级写入边界',
 }
@@ -129,6 +131,7 @@ describe('src/sandbox-status：常驻状态呈现', () => {
     await screen.findByText('OS 沙箱（AppContainer）')
     expect(screen.getByText('Shaniu.Sandbox.v1')).toBeTruthy()
     expect(screen.getByText('工作区可写')).toBeTruthy()
+    expect(screen.getByText(zh['enforcement.full'])).toBeTruthy()
     expect(screen.getByText(zh['network.denied'])).toBeTruthy()
     expect(document.body.textContent).not.toContain('当前未启用 OS 沙箱')
     expect(document.querySelector('.shaniu-sandbox-bar')?.getAttribute('data-os')).toBe('os')
@@ -141,6 +144,8 @@ describe('src/sandbox-status：常驻状态呈现', () => {
     expect(warning.closest('.shaniu-sandbox-bar-warning')).toBeTruthy()
     expect(document.querySelector('.shaniu-sandbox-bar')?.getAttribute('data-os')).toBe('logical')
     expect(document.body.textContent).not.toContain('Shaniu.Sandbox.v1')
+    // 逻辑沙箱没有路径级边界：强制完整度必须自报 partial，不许随机制一起"看着还行"。
+    expect(screen.getByText(zh['enforcement.partial'])).toBeTruthy()
     // 网络在逻辑沙箱下没有 OS 拦截：状态条不能说「已断（默认拒绝）」。
     expect(screen.getByText(zh['network.notEffective'])).toBeTruthy()
   })

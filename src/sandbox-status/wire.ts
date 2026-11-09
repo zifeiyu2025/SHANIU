@@ -19,6 +19,8 @@ export interface SandboxStatusWire {
   readonly os: OsSandboxWire
   /** false = 没有 OS 级隔离，界面必须常驻标注。 */
   readonly os_enabled: boolean
+  /** 强制完整度自报（Rust `sandbox::SandboxEnforcement`），与工具结果里同一判定。 */
+  readonly enforcement: 'full' | 'partial'
   /** 容器 profile 名；logical 模式为空串。 */
   readonly profile: string
   readonly note: string

@@ -54,6 +54,15 @@
   color: var(--dsw-alias-label-tertiary);
 }
 
+/* 机制是实现细节：整组降一档亮度，不与主档位争夺注意力。 */
+.shaniu-sandbox-bar-mechanism {
+  display: inline-flex;
+  align-items: center;
+  gap: 6px;
+  min-width: 0;
+  opacity: 0.85;
+}
+
 .shaniu-sandbox-bar-profile {
   max-width: 220px;
   overflow: hidden;
