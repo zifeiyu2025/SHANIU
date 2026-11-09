@@ -1,9 +1,9 @@
-//! Windows 沙箱实现（ADR-002 M2）：受限令牌（剥离全部特权）+ JobObject。
+//! Windows 沙箱实现（ADR-002 M2）：受限令牌（剥离特权，仅留 SeChangeNotifyPrivilege）+ JobObject。
 //!
 //! 全部 Win32 unsafe 隔离在本文件。流程（蒸馏自 codex windows-sandbox 的 M2 子集）：
 //! 1. OpenProcessToken 取自身主令牌（TOKEN_DUPLICATE/QUERY/ASSIGN_PRIMARY/ADJUST_*）；
 //! 2. GetTokenInformation(TokenPrivileges) 枚举全部特权；
-//! 3. CreateRestrictedToken 以 SE_PRIVILEGE_REMOVED **删除全部特权**
+//! 3. CreateRestrictedToken 以 SE_PRIVILEGE_REMOVED **删除除 SeChangeNotifyPrivilege 外的全部特权**
 //!    （删除而非禁用：子进程拿不到 SeDebug/SeBackup 等任何提权能力）；
 //! 4. CreateJobObject + KILL_ON_JOB_CLOSE（应用崩溃/退出兜底回收子进程树）；
 //! 5. 手工匿名管道（写端可继承）+ STARTF_USESTDHANDLES 接管子进程 stdio；
@@ -27,9 +27,9 @@ use windows::Win32::Foundation::{
     CloseHandle, HANDLE, HANDLE_FLAGS, HANDLE_FLAG_INHERIT, SetHandleInformation,
 };
 use windows::Win32::Security::{
-    CreateRestrictedToken, GetTokenInformation, LUID_AND_ATTRIBUTES,
+    CreateRestrictedToken, GetTokenInformation, LookupPrivilegeValueW, LUID_AND_ATTRIBUTES,
     SECURITY_ATTRIBUTES, SECURITY_CAPABILITIES, SE_PRIVILEGE_REMOVED, SID_AND_ATTRIBUTES,
-    TOKEN_ACCESS_MASK, TOKEN_PRIVILEGES, TokenPrivileges, PSID,
+    TOKEN_ACCESS_MASK, TokenPrivileges, PSID,
 };
 use windows::Win32::System::Console::{
     ClosePseudoConsole, CreatePseudoConsole, COORD, HPCON,
@@ -114,12 +114,19 @@ unsafe fn open_current_token() -> Result<HandleGuard, String> {
     Ok(HandleGuard::new(token))
 }
 
-/// 枚举令牌全部特权 → SE_PRIVILEGE_REMOVED 删除清单。
+/// 枚举令牌特权 → SE_PRIVILEGE_REMOVED 删除清单（**保留 `SeChangeNotifyPrivilege`**）。
 ///
-/// 5b 现场核对过：祖先目录的遍历不依赖 `SeChangeNotifyPrivilege`——
-/// 叶子目录授权后，删掉全部特权也能在容器内列出/读取/写入（见
-/// `appcontainer_leaf_grant_allows_list_read_write_then_revoke_denies`）。
+/// 为什么留这一个：它是「绕过目录遍历检查」的能力，进程加载 DLL、打开路径都依赖它。
+/// 2026-11-09 实测（本机 + CI）：删除清单真正生效后，连它一起删会让容器内
+/// `whoami /priv`、工作区写入、`for /r` 列举全部失败——此前「删全部特权也能跑」
+/// 的结论是建立在**删除清单只有第 1 条生效**的缺陷上的，不成立。
+/// 与 codex 的 `DISABLE_MAX_PRIVILEGE` 同面：只保留它，其余一律删除。
 unsafe fn privileges_to_remove(token: HANDLE) -> Result<Vec<LUID_AND_ATTRIBUTES>, String> {
+    let name = wide("SeChangeNotifyPrivilege");
+    let mut keep = windows::Win32::Foundation::LUID::default();
+    let keep = LookupPrivilegeValueW(PCWSTR::null(), PCWSTR(name.as_ptr()), &mut keep)
+        .ok()
+        .map(|()| keep);
     let mut needed = 0u32;
     let _ = GetTokenInformation(
         token,
@@ -140,19 +147,27 @@ unsafe fn privileges_to_remove(token: HANDLE) -> Result<Vec<LUID_AND_ATTRIBUTES>
         &mut needed,
     )
     .map_err(|e| format!("GetTokenInformation(TokenPrivileges) 失败: {e}"))?;
-    let privileges = *(buffer.as_ptr() as *const TOKEN_PRIVILEGES);
-    let count = privileges.PrivilegeCount as usize;
-    let items = std::slice::from_raw_parts(privileges.Privileges.as_ptr(), count);
-    Ok(items
-        .iter()
-        .map(|luid_attr| LUID_AND_ATTRIBUTES {
-            Luid: luid_attr.Luid,
-            Attributes: SE_PRIVILEGE_REMOVED,
-        })
-        .collect())
+    // `TOKEN_PRIVILEGES::Privileges` 是 `[LUID_AND_ATTRIBUTES; 1]` 的定长数组：
+    // 按值解引用只会复制**第 1 个**元素，`Privileges.as_ptr()` 指向栈上副本，
+    // 从第 2 个起读到的是栈垃圾（2026-11-09 CI 实证：5 个特权只删掉 1 个）。
+    // 必须在缓冲区上按「DWORD 计数 + 12 字节步长」自己切片。
+    let count = std::ptr::read_unaligned(buffer.as_ptr().cast::<u32>()) as usize;
+    let mut to_remove = Vec::with_capacity(count);
+    for index in 0..count {
+        let offset = std::mem::size_of::<u32>() + index * std::mem::size_of::<LUID_AND_ATTRIBUTES>();
+        let item =
+            std::ptr::read_unaligned(buffer.as_ptr().add(offset).cast::<LUID_AND_ATTRIBUTES>());
+        if keep.is_some_and(|keep| {
+            item.Luid.LowPart == keep.LowPart && item.Luid.HighPart == keep.HighPart
+        }) {
+            continue;
+        }
+        to_remove.push(LUID_AND_ATTRIBUTES { Luid: item.Luid, Attributes: SE_PRIVILEGE_REMOVED });
+    }
+    Ok(to_remove)
 }
 
-/// 创建「删除全部特权」的受限令牌。
+/// 创建「仅留 SeChangeNotifyPrivilege」的受限令牌。
 unsafe fn create_restricted_token() -> Result<HandleGuard, String> {
     let base = open_current_token()?;
     let to_remove = privileges_to_remove(base.handle())?;
@@ -242,7 +257,7 @@ impl RestrictedChild {
     }
 }
 
-/// 以「删除全部特权的受限令牌 + JobObject」启动子进程。
+/// 以「仅留 SeChangeNotifyPrivilege 的受限令牌 + JobObject」启动子进程。
 /// stdout/stderr 由 std::thread 读线程逐行送入 tx（blocking_send 桥接 tokio）。
 pub fn spawn_restricted_command(
     program: &str,
@@ -259,7 +274,7 @@ pub fn spawn_restricted_command(
     let cwd_wide = wide(cwd.as_os_str());
 
     unsafe {
-        // 1-3) 受限令牌（删除全部特权）
+        // 1-3) 受限令牌（仅留 SeChangeNotifyPrivilege）
         let token_guard = create_restricted_token()?;
 
         // 4) Job 对象：KILL_ON_JOB_CLOSE
@@ -326,7 +341,7 @@ pub fn spawn_restricted_command(
     }
 }
 
-/// 以「删除全部特权的受限令牌 + JobObject + **AppContainer**」启动子进程（SH-021）。
+/// 以「仅留 SeChangeNotifyPrivilege 的受限令牌 + JobObject + **AppContainer**」启动子进程（SH-021）。
 ///
 /// 与 `spawn_restricted_command` 的区别：
 ///  - 进程在 AppContainer 里运行，默认只能读写被授予容器 SID 的目录（ACE 由 `acl` 管理）；
@@ -363,7 +378,7 @@ pub fn spawn_appcontainer_command(
     let env_wide = wide(&env_block);
 
     unsafe {
-        // 纵深第 1 层：删除全部特权的受限令牌（提权面）
+        // 纵深第 1 层：剥离特权的受限令牌（仅留 SeChangeNotifyPrivilege）
         let token_guard = create_restricted_token()?;
 
         // 纵深第 2 层：Job（进程树回收 / 资源边界）
@@ -449,7 +464,7 @@ pub fn spawn_appcontainer_command(
 // 与上面两条一次性命令路径的区别：
 //  - stdio 不是管道，而是 `PROC_THREAD_ATTRIBUTE_PSEUDOCONSOLE` 注入的伪控制台；
 //  - 因此**不设** `STARTF_USESTDHANDLES`，`bInheritHandles=FALSE`（一个句柄都不漏给子进程）；
-//  - 仍在同一套三层边界内：受限令牌（删全部特权）+ JobObject（KILL_ON_JOB_CLOSE）
+//  - 仍在同一套三层边界内：受限令牌（仅留 SeChangeNotifyPrivilege）+ JobObject（KILL_ON_JOB_CLOSE）
 //    + AppContainer（路径/网络）。terminal 不新开一条无沙箱的旁路。
 //  - R106：Job 随会话结构释放 → 整棵进程树被内核回收，不依赖 shell 自觉退出。
 
@@ -1465,7 +1480,7 @@ fn spawn_stderr_reader(mut read: std::fs::File, tail: Arc<Mutex<StderrTail>>) {
 /// 启动身份：决定用哪几层隔离（沙箱机制与身份一一对应）。
 #[derive(Clone, Copy)]
 enum StdioIdentity<'a> {
-    /// 删除全部特权的受限令牌 + Job + 句柄白名单（默认）。
+    /// 仅留 SeChangeNotifyPrivilege 的受限令牌 + Job + 句柄白名单（默认）。
     RestrictedToken,
     /// 逐服务器显式豁免（X10）：仅 Job + 句柄白名单。
     Unsandboxed,
@@ -1625,7 +1640,7 @@ fn spawn_stdio(spec: &StdioSpawnSpec<'_>, tx: mpsc::Sender<StdioEvent>) -> Resul
     }
 }
 
-/// 以「删除全部特权的受限令牌 + Job Object + 句柄白名单」启动 MCP stdio server。
+/// 以「仅留 SeChangeNotifyPrivilege 的受限令牌 + Job Object + 句柄白名单」启动 MCP stdio server。
 pub fn spawn_restricted_stdio(
     program: &str,
     args: &[&str],
@@ -1646,7 +1661,7 @@ pub fn spawn_restricted_stdio(
     )
 }
 
-/// 以「AppContainer + 删除全部特权的受限令牌 + Job Object + 句柄白名单」启动 MCP stdio server。
+/// 以「AppContainer + 仅留 SeChangeNotifyPrivilege 的受限令牌 + Job Object + 句柄白名单」启动 MCP stdio server。
 ///
 /// `capabilities` 为空 = 不授予 `internetClient`，出站网络由容器边界默认拒绝；
 /// 只在会话级网络授权批准时传 `internet_client_capability()`。

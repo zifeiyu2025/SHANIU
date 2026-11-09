@@ -321,6 +321,30 @@ async fn restricted_token_layer_strips_privileges_independently() {
     let code = child.wait().await.expect("等待子进程失败");
     let output = collector.await.expect("读线程不应 panic");
     assert_eq!(code, 0, "whoami 应成功：{output}");
+    // 2026-11-09 加固：原断言只查 3 个高危特权，在**非提权**环境下等于空转
+    // （普通用户令牌本来就没有 SeDebug/SeBackup/SeImpersonate），删除逻辑失效也照样绿。
+    // 现在要求「只剩 SeChangeNotifyPrivilege」：它是绕过目录遍历检查的能力，
+    // 进程加载/开路径依赖它，必须保留；其余特权一条都不许留。
+    let leftover: Vec<&str> = output
+        .lines()
+        .filter(|line| line.trim_start().starts_with("Se") && line.contains("Privilege"))
+        .collect();
+    let unexpected: Vec<&str> = leftover
+        .iter()
+        .copied()
+        .filter(|line| !line.trim_start().starts_with("SeChangeNotifyPrivilege"))
+        .collect();
+    assert!(
+        unexpected.is_empty(),
+        "受限令牌仍有应被删除的特权：{}",
+        unexpected.join(" | ")
+    );
+    assert!(
+        leftover.len() <= 1,
+        "受限令牌特权数应至多 1（仅 SeChangeNotifyPrivilege），实际 {} 条：{}",
+        leftover.len(),
+        leftover.join(" | ")
+    );
     for privileged in ["SeDebugPrivilege", "SeBackupPrivilege", "SeImpersonatePrivilege"] {
         assert!(
             !output.contains(privileged),
