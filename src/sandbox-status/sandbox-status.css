@@ -1,107 +1,43 @@
 /*
- * 沙箱状态条（宿主插件样式）。
+ * 沙箱异常提示（宿主插件样式）。
  *
- * 只引用真实存在的主题令牌（`src/theme-tokens.spec.ts` 会机检）：颜色一律走
- * `--dsw-alias-*`，容器/按钮/徽章本身由上游 `Button` / `Tag` 负责，这里不重造。
+ * 只在 `enforcement = partial` 或状态读取失败时渲染，所以这是一条**异常条**，
+ * 不是常驻状态栏：没有档位、没有机制、没有 profile，只有一条要用户知道的事实 + 刷新。
  *
- * 视觉分档（AGENTS §11.3 的可见性要求）：
- *  - OS 沙箱：中性底色，一条细分隔线，与普通状态栏无异；
- *  - 逻辑沙箱：警示底色 + 2px 警示上边线 + 左侧色条 + 粗体警告文字，
- *    **不能**与 OS 态看起来一样。
+ * 只引用真实存在的主题令牌（`src/theme-tokens.spec.ts` 会机检）。
  */
 
-.shaniu-sandbox-bar {
+.shaniu-sandbox-notice {
   display: flex;
-  flex-direction: column;
-  gap: 2px;
-  padding: 4px 12px;
+  align-items: center;
+  gap: 8px;
+  padding: 6px 12px;
   font-size: 12px;
   line-height: 18px;
-  color: var(--dsw-alias-label-secondary);
-  background: var(--dsw-alias-bg-base);
-  border-top: 1px solid var(--dsw-alias-border-l2);
-}
-
-.shaniu-sandbox-bar[data-os='logical'] {
   background: var(--dsw-alias-state-warn-tertiary);
-  border-top: 2px solid var(--dsw-alias-state-warn-primary);
-  box-shadow: inset 3px 0 0 var(--dsw-alias-state-warn-primary);
-  color: var(--dsw-alias-label-primary);
+  border-top: 1px solid var(--dsw-alias-state-warn-primary);
+  color: var(--dsw-alias-state-warn-label);
 }
 
-.shaniu-sandbox-bar-main {
-  display: flex;
-  flex-wrap: wrap;
-  align-items: center;
-  gap: 8px 14px;
-  min-width: 0;
+.shaniu-sandbox-notice[data-tone='error'] {
+  background: var(--dsw-alias-bg-base);
+  border-top: 1px solid var(--dsw-alias-state-error-primary);
+  color: var(--dsw-alias-state-error-primary);
 }
 
-.shaniu-sandbox-bar-group {
-  display: inline-flex;
-  align-items: center;
-  gap: 6px;
-  min-width: 0;
-}
-
-.shaniu-sandbox-bar-group svg {
+.shaniu-sandbox-notice-icon {
   flex: none;
   width: 14px;
   height: 14px;
 }
 
-.shaniu-sandbox-bar-label {
-  color: var(--dsw-alias-label-tertiary);
-}
-
-/* 机制是实现细节：整组降一档亮度，不与主档位争夺注意力。 */
-.shaniu-sandbox-bar-mechanism {
-  display: inline-flex;
-  align-items: center;
-  gap: 6px;
+.shaniu-sandbox-notice-text {
+  flex: 1;
   min-width: 0;
-  opacity: 0.85;
+  font-weight: 500;
 }
 
-.shaniu-sandbox-bar-profile {
-  max-width: 220px;
-  overflow: hidden;
-  white-space: nowrap;
-  text-overflow: ellipsis;
-  font-family: ui-monospace, SFMono-Regular, Consolas, monospace;
-  color: var(--dsw-alias-label-secondary);
-}
-
-.shaniu-sandbox-bar-warning {
-  display: inline-flex;
-  align-items: center;
-  gap: 6px;
-  font-weight: 600;
-  color: var(--dsw-alias-state-warn-label);
-}
-
-.shaniu-sandbox-bar-warning svg {
+.shaniu-sandbox-notice-refresh {
   flex: none;
-  width: 15px;
-  height: 15px;
-}
-
-/* 刷新按钮推到右侧；窄窗口下允许换行，不挤压模式信息。 */
-.shaniu-sandbox-bar-actions {
   margin-left: auto;
-}
-
-.shaniu-sandbox-bar-muted {
-  color: var(--dsw-alias-label-tertiary);
-}
-
-.shaniu-sandbox-bar-notes {
-  display: flex;
-  flex-wrap: wrap;
-  gap: 4px 14px;
-  min-width: 0;
-}
-
-.shaniu-sandbox-bar-notes [data-tone='error'] {
-  color: var(--dsw-alias-state-error-primary);
 }

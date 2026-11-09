@@ -1,19 +1,20 @@
 // @vitest-environment jsdom
 /**
- * 沙箱可见面契约测试。
+ * 沙箱可见面契约测试（2026-11-11 起：降级为**异常提示**）。
  *
- * 覆盖本卡（SH-021 UI 可见性）承诺的三件事：
- *  1. 插件只占 `shell.bottom`（常驻），**不再有**会话头部网络开关；
- *  2. OS 沙箱态如实显示模式 / 强制完整度 / 机制 / profile，且**不**出现「未启用 OS 沙箱」；
- *  3. 逻辑沙箱态必须出现显眼警告与不同的数据属性（视觉分档由 CSS 承担）。
+ * 承诺四件事：
+ *  1. 插件只占 `shell.bottom`，不再有会话头部网络开关；
+ *  2. 强制完整（常态）时**整条不渲染**——档位归输入区的访问模式 chip；
+ *  3. 逻辑沙箱（`enforcement = partial`）与读取失败两种异常必须可见；
+ *  4. 任何状态都不许出现第二套档位词（只读 / 工作区可写 / 完全放开），
+ *     也不许把机制 / profile 这类实现细节重新搬回来。
  *
- * 网络不再是策略维度（2026-11-10），所以这里还多一条反向对照：**状态条不许再出现
- * 任何网络字样**，数据面也只允许调 `sandbox_status`。只断言"新东西在"是不够的——
- * 旧文案留着不会让任何正向断言变红，却会让用户以为还有一道可开的闸。
+ * 第 4 条是反向对照：只断言"新文案在"不够——旧词留着不会让正向断言变红，
+ * 却正是用户看到的「同一档位两套词」。
  */
 import { describe, expect, it } from 'vitest'
 import type { ReactNode } from 'react'
-import { render, screen } from '@testing-library/react'
+import { act, render, screen } from '@testing-library/react'
 import { Context } from '@deepseek-ai/cordis'
 import { apply as sandboxApply, inject as sandboxInject } from './index'
 import { SandboxStatusBar } from './SandboxStatusBar'
@@ -44,6 +45,9 @@ const LOGICAL_STATUS: SandboxStatusWire = {
   note: '当前未启用 OS 沙箱：仅受限令牌 + Job（逻辑隔离），没有路径级写入边界',
 }
 
+/** 档位词的两种写法都必须绝迹：自造词与 chip 词都不该由本组件输出。 */
+const TIER_WORDS = ['只读', '工作区可写', '完全放开', '仅可查看', '工作区内修改', '完全权限'] as const
+
 /** 脚本化的数据面：只实现状态查询。 */
 function fakeWire(status: SandboxStatusWire | Error = OS_STATUS): SandboxWire {
   return {
@@ -60,8 +64,13 @@ function barElement(wire: SandboxWire): ReactNode {
   return <Bar t={translate} wire={wire} />
 }
 
+/** 让挂载后的异步状态查询落地。 */
+async function flush(): Promise<void> {
+  await act(async () => { await Promise.resolve() })
+}
+
 describe('src/sandbox-status：插件接缝', () => {
-  it('只依赖 slots 与 locale，且只占常驻状态条（会话头部开关已删）', () => {
+  it('只依赖 slots 与 locale，且只占 shell.bottom（会话头部开关已删）', () => {
     expect(sandboxInject).toEqual(['slots', 'locale'])
 
     const waited: string[] = []
@@ -94,47 +103,52 @@ describe('src/sandbox-status：插件接缝', () => {
   })
 })
 
-describe('src/sandbox-status：常驻状态呈现', () => {
-  it('OS 沙箱态显示 AppContainer 与 profile，且没有任何"未启用"警告', async () => {
-    render(barElement(fakeWire()))
-    await screen.findByText('OS 沙箱（AppContainer）')
-    expect(screen.getByText('Shaniu.Sandbox.v1')).toBeTruthy()
-    expect(screen.getByText('工作区可写')).toBeTruthy()
-    expect(screen.getByText(zh['enforcement.full'])).toBeTruthy()
-    expect(document.body.textContent).not.toContain('当前未启用 OS 沙箱')
-    expect(document.querySelector('.shaniu-sandbox-bar')?.getAttribute('data-os')).toBe('os')
+describe('src/sandbox-status：异常才出现的提示条', () => {
+  it('强制完整时整条不渲染（档位交还输入区 chip）', async () => {
+    const { container } = render(barElement(fakeWire()))
+    await flush()
+    expect(container.innerHTML).toBe('')
+    for (const word of TIER_WORDS) expect(document.body.textContent).not.toContain(word)
   })
 
-  it('逻辑沙箱态必须显眼：警告文字 + 不同的 data-os', async () => {
+  it('逻辑沙箱：出现一条警示提示，且不带档位 / 机制 / profile', async () => {
     render(barElement(fakeWire(LOGICAL_STATUS)))
-    await screen.findByText('逻辑沙箱')
-    const warning = screen.getByText(zh['os.logicalWarning'])
-    expect(warning.closest('.shaniu-sandbox-bar-warning')).toBeTruthy()
-    expect(document.querySelector('.shaniu-sandbox-bar')?.getAttribute('data-os')).toBe('logical')
-    expect(document.body.textContent).not.toContain('Shaniu.Sandbox.v1')
-    // 逻辑沙箱没有路径级边界：强制完整度必须自报 partial，不许随机制一起"看着还行"。
-    expect(screen.getByText(zh['enforcement.partial'])).toBeTruthy()
+    const notice = await screen.findByText(zh['notice.partial'])
+
+    const bar = notice.closest('.shaniu-sandbox-notice')
+    expect(bar).toBeTruthy()
+    expect(bar?.getAttribute('data-tone')).toBe('warn')
+
+    const text = document.body.textContent ?? ''
+    for (const word of TIER_WORDS) expect(text).not.toContain(word)
+    for (const detail of ['AppContainer', '逻辑沙箱', '机制', 'Shaniu.Sandbox.v1']) {
+      expect(text).not.toContain(detail)
+    }
+
+    // 只剩刷新按钮（aria-label 是"刷新沙箱状态"），没有授权 / 切换入口。
+    const buttons = screen.getAllByRole('button')
+    expect(buttons).toHaveLength(1)
+    expect(buttons[0]?.getAttribute('aria-label')).toBe(zh['refresh'])
+  })
+
+  it('状态读取失败要变成可见反馈，而不是留一条"看着正常"的空白', async () => {
+    render(barElement(fakeWire(new Error('status unavailable'))))
+    const bar = await screen.findByRole('status')
+    expect(bar.getAttribute('data-tone')).toBe('error')
+    expect(bar.textContent).toContain('status unavailable')
+    for (const word of TIER_WORDS) expect(document.body.textContent).not.toContain(word)
   })
 
   /** §4.2 反向对照：网络维度删掉之后，界面不许残留任何网络口径。 */
-  it('状态条不出现任何网络字样，也没有联网/撤销按钮', async () => {
-    for (const status of [OS_STATUS, LOGICAL_STATUS]) {
+  it('三种状态下都不出现网络字样', async () => {
+    for (const status of [OS_STATUS, LOGICAL_STATUS, new Error('boom')]) {
       const { unmount } = render(barElement(fakeWire(status)))
-      await screen.findByText(zh['label.sandbox'])
+      await flush()
       const text = document.body.textContent ?? ''
       for (const stale of ['网络', '已断', '已放行', '默认拒绝', '允许联网', '撤销联网', '未生效（无 OS 隔离）']) {
         expect(text).not.toContain(stale)
       }
-      // 只剩刷新按钮（aria-label 是"刷新沙箱状态"），没有授权入口。
-      const buttons = screen.getAllByRole('button')
-      expect(buttons).toHaveLength(1)
-      expect(buttons[0]?.getAttribute('aria-label')).toBe(zh['refresh'])
       unmount()
     }
-  })
-
-  it('状态读取失败要变成可见反馈，而不是留一条"看着正常"的空白条', async () => {
-    render(barElement(fakeWire(new Error('status unavailable'))))
-    await screen.findByText(/status unavailable/, { selector: '[data-tone="error"]' })
   })
 })
