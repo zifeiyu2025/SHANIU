@@ -313,6 +313,10 @@ mod tests {
 
     #[test]
     fn profile_lifecycle_create_reuse_delete() {
+        // 与其它建/删 profile 的用例串行：`CreateAppContainerProfile` 会写
+        // `%LOCALAPPDATA%\Packages` 与注册表，多个用例并行时陈旧 profile 判定
+        // （注册在、目录无）会互相误判成「陈旧」而删掉对方刚建的容器。
+        let _serial = PROFILE_TEST_MUTEX.blocking_lock();
         let name = format!("Shaniu.Test.{}.{}", std::process::id(), line!());
         let first = AppContainer::ensure_named(&name).expect("首次应创建 profile");
         assert!(first.created(), "首次 ensure 应标记为创建");

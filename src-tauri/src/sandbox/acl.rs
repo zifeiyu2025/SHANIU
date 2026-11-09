@@ -28,7 +28,8 @@ use windows::Win32::Security::Authorization::{
 use windows::Win32::Security::{
     AclSizeInformation, EqualSid, GetAce, GetAclInformation, GetSecurityDescriptorDacl,
     GetSecurityDescriptorLength, ACCESS_ALLOWED_ACE, ACL, ACL_SIZE_INFORMATION,
-    DACL_SECURITY_INFORMATION, INHERITED_ACE, PSID, PSECURITY_DESCRIPTOR,
+    DACL_SECURITY_INFORMATION, INHERITED_ACE, PROTECTED_DACL_SECURITY_INFORMATION, PSID,
+    PSECURITY_DESCRIPTOR,
     SUB_CONTAINERS_AND_OBJECTS_INHERIT, UNPROTECTED_DACL_SECURITY_INFORMATION,
 };
 use windows::Win32::Storage::FileSystem::{
@@ -423,6 +424,17 @@ fn hash_path(path: &str) -> u64 {
     hash
 }
 
+/// `SE_DACL_PROTECTED`（winnt.h）：DACL 已保护，父目录的继承 ACE 不再灌入。
+const SE_DACL_PROTECTED: u16 = 0x1000;
+
+/// 读取自相对安全描述符头里的控制位（`SECURITY_DESCRIPTOR_RELATIVE.Control`，偏移 2）。
+fn snapshot_control(snapshot: &[u8]) -> Result<u16, String> {
+    snapshot
+        .get(2..4)
+        .map(|bytes| u16::from_le_bytes([bytes[0], bytes[1]]))
+        .ok_or_else(|| format!("安全描述符过短（{} 字节），无法读取控制位", snapshot.len()))
+}
+
 /// 读取命名对象的安全描述符（自相对格式）并复制成字节，供备份/回滚使用。
 pub(crate) fn read_dacl_snapshot(path: &Path) -> Result<Vec<u8>, String> {
     let name = wide(path.as_os_str());
@@ -775,11 +787,21 @@ pub(crate) fn restore_from_snapshot(path: &Path, snapshot: &[u8]) -> Result<(), 
     unsafe { GetSecurityDescriptorDacl(descriptor, &mut present, &mut dacl, &mut defaulted) }
         .map_err(|e| format!("解析备份的安全描述符失败: {e}"))?;
 
+    // 还原必须连「DACL 是否保护」一起还原：2026-11-09 实测，快照带
+    // SE_DACL_PROTECTED（`icacls /inheritance:r` 后的目录就是这种）时，若按
+    // UNPROTECTED 写回，父目录的继承 ACE 会被重新灌入——28 字节的空 DACL
+    // 还原成 4572 字节，等于**凭空多给出一批权限**。
+    let protection = if snapshot_control(snapshot)? & SE_DACL_PROTECTED != 0 {
+        PROTECTED_DACL_SECURITY_INFORMATION
+    } else {
+        UNPROTECTED_DACL_SECURITY_INFORMATION
+    };
+
     let status = unsafe {
         SetNamedSecurityInfoW(
             PCWSTR(name.as_ptr()),
             SE_FILE_OBJECT,
-            DACL_SECURITY_INFORMATION | UNPROTECTED_DACL_SECURITY_INFORMATION,
+            DACL_SECURITY_INFORMATION | protection,
             None,
             None,
             if present.as_bool() { Some(dacl as *const ACL) } else { None },
@@ -938,6 +960,87 @@ mod tests {
         );
     }
 
+    /// 从快照里取出 DACL 的原始字节（ACL 结构本身：修订/大小/计数/ACE 序列）。
+    fn dacl_bytes(snapshot: &[u8]) -> Option<Vec<u8>> {
+        let descriptor = PSECURITY_DESCRIPTOR(snapshot.as_ptr() as *mut c_void);
+        let mut present = windows::core::BOOL(0);
+        let mut defaulted = windows::core::BOOL(0);
+        let mut dacl: *mut ACL = std::ptr::null_mut();
+        unsafe { GetSecurityDescriptorDacl(descriptor, &mut present, &mut dacl, &mut defaulted) }
+            .unwrap();
+        if !present.as_bool() {
+            return None;
+        }
+        let mut info = ACL_SIZE_INFORMATION::default();
+        unsafe {
+            GetAclInformation(
+                dacl,
+                &mut info as *mut ACL_SIZE_INFORMATION as *mut c_void,
+                std::mem::size_of::<ACL_SIZE_INFORMATION>() as u32,
+                AclSizeInformation,
+            )
+        }
+        .unwrap();
+        Some(unsafe { std::slice::from_raw_parts(dacl as *const u8, info.AclBytesInUse as usize) }.to_vec())
+    }
+
+    fn header_word(snapshot: &[u8], offset: usize) -> u32 {
+        u32::from_le_bytes([
+            snapshot[offset],
+            snapshot[offset + 1],
+            snapshot[offset + 2],
+            snapshot[offset + 3],
+        ])
+    }
+
+    /// 还原结果与备份的等价判定（白名单式，2026-11-09 用户定）。
+    ///
+    /// 只允许两类头部差异，其余任何头部差异都算失败：
+    /// 1. `SE_DACL_AUTO_INHERITED` 由无变有——`SetNamedSecurityInfoW` 重算继承的
+    ///    **固定**行为（非时序），本机与 CI 的初始 DACL 形态不同才会只在 CI 出现；
+    /// 2. owner/group 偏移一侧为 0——`GetNamedSecurityInfoW` 只取 DACL 时返回的描述符
+    ///    可能不带这两块，两个平台的返回形态不同。
+    ///
+    /// DACL 本体（含 ACE 顺序）必须逐字节一致；DACL 的存在性也必须一致。
+    fn compare_restored(before: &[u8], after: &[u8]) -> Result<(), String> {
+        const SE_DACL_AUTO_INHERITED: u16 = 0x0400;
+        let (before_control, after_control) = (snapshot_control(before)?, snapshot_control(after)?);
+        let normalized = after_control & !SE_DACL_AUTO_INHERITED;
+        if normalized != before_control & !SE_DACL_AUTO_INHERITED {
+            return Err(format!(
+                "控制位差异超出白名单：before=0x{before_control:04x} after=0x{after_control:04x}"
+            ));
+        }
+        if after_control & SE_DACL_AUTO_INHERITED != 0
+            && before_control & SE_DACL_AUTO_INHERITED == 0
+        {
+            // 允许：Windows 重算继承时置位。反向（丢掉该位）不允许，单测覆盖。
+        } else if after_control != before_control {
+            return Err(format!(
+                "控制位不允许的差异：before=0x{before_control:04x} after=0x{after_control:04x}"
+            ));
+        }
+        for (name, offset) in [("owner", 4usize), ("group", 8usize)] {
+            let (old, new) = (header_word(before, offset), header_word(after, offset));
+            if old != new && old != 0 && new != 0 {
+                return Err(format!("{name} 偏移差异超出白名单：before={old} after={new}"));
+            }
+        }
+        if header_word(before, 12) != header_word(after, 12) {
+            return Err("SACL 偏移不应被还原流程改变".to_string());
+        }
+        match (dacl_bytes(before), dacl_bytes(after)) {
+            (None, None) => Ok(()),
+            (Some(old), Some(new)) if old == new => Ok(()),
+            (Some(_), Some(_)) => Err("DACL 本体与备份不一致".to_string()),
+            (old, new) => Err(format!(
+                "DACL 存在性不一致：before={} after={}",
+                old.is_some(),
+                new.is_some()
+            )),
+        }
+    }
+
     #[test]
     fn grant_and_restore_round_trip_changes_dacl() {
         let ws = temp_dir("roundtrip");
@@ -956,7 +1059,86 @@ mod tests {
         let restored = manager.restore_all().unwrap();
         assert_eq!(restored, 1);
         let final_snapshot = read_dacl_snapshot(&target).unwrap();
-        assert_eq!(final_snapshot, before, "还原后 DACL 应与备份完全一致");
+        compare_restored(&before, &final_snapshot).unwrap();
+        // 负向：还原后 DACL 仍在，且容器 SID 的 ACE 确实没了。
+        assert!(dacl_bytes(&final_snapshot).is_some(), "还原后 DACL 不应消失");
+        assert!(
+            !has_explicit_grant(&target, sid.as_psid(), Access::Write.mask()).unwrap(),
+            "还原后不应残留容器 SID 的 ACE"
+        );
+    }
+
+    /// 真实还原牙齿（本机可跑）：目录带 `SE_DACL_PROTECTED` 时，还原必须连保护位
+    /// 一起还原。2026-11-09 之前按 `UNPROTECTED` 写回，父目录的继承 ACE 会被重新
+    /// 灌入（本机实测 28 字节 → 4572 字节），等于凭空多给权限。
+    #[test]
+    fn restore_preserves_protected_dacl() {
+        let ws = temp_dir("protected");
+        let target = ws.join("target");
+        std::fs::create_dir_all(&target).unwrap();
+        let status = std::process::Command::new("icacls")
+            .arg(&target)
+            .arg("/inheritance:r")
+            .status()
+            .expect("需要 icacls 才能构造无继承的目录");
+        assert!(status.success(), "icacls /inheritance:r 失败：{status}");
+
+        let before = read_dacl_snapshot(&target).unwrap();
+        assert!(
+            snapshot_control(&before).unwrap() & SE_DACL_PROTECTED != 0,
+            "前置条件不成立：icacls /inheritance:r 后 DACL 应受保护（control=0x{:04x}）",
+            snapshot_control(&before).unwrap()
+        );
+
+        let sid = super::super::appcontainer::internet_client_capability().unwrap();
+        let mut manager = AclManager::new(ws.join("backups"));
+        manager.grant(&target, sid.as_psid(), Access::Write).unwrap();
+        assert_eq!(manager.restore_all().unwrap(), 1);
+
+        let final_snapshot = read_dacl_snapshot(&target).unwrap();
+        compare_restored(&before, &final_snapshot).unwrap();
+        assert!(
+            snapshot_control(&final_snapshot).unwrap() & SE_DACL_PROTECTED != 0,
+            "还原后 DACL 保护位丢失（继承 ACE 会被重新灌入）"
+        );
+    }
+
+    /// 比较器自身的单测：白名单只放行两类差异，其它头部差异与 DACL 差异必须失败。
+    #[test]
+    fn restore_comparator_whitelists_only_known_normalizations() {
+        let ws = temp_dir("compare");
+        let target = ws.join("target");
+        std::fs::create_dir_all(&target).unwrap();
+        let base = read_dacl_snapshot(&target).unwrap();
+        compare_restored(&base, &base).expect("同一份快照必须判等");
+
+        let control = snapshot_control(&base).unwrap();
+        let dacl_offset = header_word(&base, 16) as usize;
+
+        // 放行：只多了 SE_DACL_AUTO_INHERITED。
+        let mut added = base.clone();
+        added[2..4].copy_from_slice(&(control | 0x0400).to_le_bytes());
+        compare_restored(&base, &added).expect("AUTO_INHERITED 置位属白名单");
+
+        // 拒绝：其它控制位变化。
+        let mut other_bit = base.clone();
+        other_bit[2..4].copy_from_slice(&(control | 0x1000).to_le_bytes());
+        assert!(compare_restored(&base, &other_bit).is_err(), "其它控制位变化必须失败");
+
+        // 拒绝：owner 偏移两侧都非零且不相等。
+        let mut left = base.clone();
+        let mut right = base.clone();
+        left[4..8].copy_from_slice(&8u32.to_le_bytes());
+        right[4..8].copy_from_slice(&12u32.to_le_bytes());
+        assert!(compare_restored(&left, &right).is_err(), "owner 偏移非零且不同必须失败");
+
+        // 拒绝：DACL 本体哪怕差一个字节。
+        let mut dacl_flipped = base.clone();
+        let dacl_len = dacl_bytes(&base).unwrap().len();
+        let last = dacl_offset + dacl_len - 1;
+        assert!(last < dacl_flipped.len(), "DACL 越过描述符边界，前置条件不成立");
+        dacl_flipped[last] ^= 0xFF;
+        assert!(compare_restored(&base, &dacl_flipped).is_err(), "DACL 本体差异必须失败");
     }
 
     /// 撤销必须按 `(路径, SID)` 精确删：另一个 SID 的 ACE 一个都不许动。

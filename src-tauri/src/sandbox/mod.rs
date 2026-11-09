@@ -977,6 +977,7 @@ mod tests {
     #[cfg(windows)]
     #[test]
     fn invalid_server_id_fails_closed_instead_of_token_fallback() {
+        let _serial = appcontainer::PROFILE_TEST_MUTEX.blocking_lock();
         set_os_mode(OsSandbox::AppContainer);
         let dir = ws();
         let (tx, _rx) = mpsc::channel(4);
@@ -1120,6 +1121,10 @@ mod tests {
     #[cfg(windows)]
     #[tokio::test]
     async fn workspace_write_runs_sandboxed_and_succeeds() {
+        // 与 MCP 容器用例共用一把锁：它们会把全局 `OS_MODE` 设成 AppContainer，
+        // 并行跑到这里会让 `prepare_spawn` 返回 AppContainer 变体而不是 Restricted
+        // （2026-11-09 全量跑实测踩到一次）。
+        let _serial = appcontainer::PROFILE_TEST_MUTEX.lock().await;
         // 真实 Win32 沙箱 smoke：受限令牌 + Job + AppContainer 下运行 echo，退出码必须为 0
         let dir = ws();
         let (tx, mut rx) = mpsc::channel(64);
