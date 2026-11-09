@@ -1139,9 +1139,10 @@ fn build_agent_with(
             token_budget_hint: row.max_tokens,
         };
         let data_root = state.data_root().to_path_buf();
+        let probing = state.probing.clone();
         let row = row.clone();
         tauri::async_runtime::spawn(async move {
-            capability::ensure_probed(data_root, target, row).await;
+            capability::ensure_probed(data_root, target, row, &probing).await;
         });
     }
 
@@ -1234,6 +1235,57 @@ fn get_settings(app: tauri::AppHandle) -> Result<serde_json::Value, String> {
     let probe_cache = capability::ProbeCache::load(&state.data_root());
     for p in &cfg.providers {
         let stored_key = secret.load_key(&p.secret_name())?;
+        let models = p
+            .models
+            .iter()
+            .map(|m| {
+                // 缓存键三处共用：取结论、判断"是否正在测"。各算各的必然漂移。
+                let cache_key = stored_key
+                    .as_deref()
+                    .map(|key| capability::cache_key(&p.base_url, &p.provider, &m.id, key));
+                let probed = cache_key
+                    .as_deref()
+                    .and_then(|key| probe_cache.entries.get(key));
+                let mut probing = cache_key
+                    .as_deref()
+                    .is_some_and(|key| state.probing.contains(key));
+                // 打开设置页时给「当前生效模型」补一次后台探测：否则它要等用户第一次
+                // 发消息才开测，设置页会长期停在「未验证」。只探生效模型——一次打开
+                // 就探全部模型等于替用户烧 token。去重与缓存命中都在 probe_and_cache 里。
+                if !probing && probed.is_none() && m.id == p.model {
+                    if let Some(api_key) = stored_key.clone() {
+                        let target = capability::ProbeTarget {
+                            base_url: p.base_url.clone(),
+                            protocol: p.provider.clone(),
+                            model: m.id.clone(),
+                            headers: p.headers.clone(),
+                            api_key,
+                            token_budget_hint: m.max_tokens,
+                        };
+                        let data_root = state.data_root().to_path_buf();
+                        let inflight = state.probing.clone();
+                        let row = m.clone();
+                        tauri::async_runtime::spawn(async move {
+                            capability::ensure_probed(data_root, target, row, &inflight).await;
+                        });
+                        probing = true;
+                    }
+                }
+                serde_json::json!({
+                    "id": m.id,
+                    "name": m.name,
+                    "contextWindow": m.context_window,
+                    "maxTokens": m.max_tokens,
+                    "input": m.input,
+                    // 推理档声明（SH-096）：档位 → wire 值；空串 = off 档（不发字段）。
+                    // 前端视图把它翻成 null，写回时再归一成空串。
+                    "reasoningEfforts": m.reasoning_efforts,
+                    // 能力视图（SH-132）：值 + 来源 + 实测四态（已验证/不符/检测中/未验证）。
+                    // 实测结论按 (端点, 协议, 模型, 密钥指纹) 取缓存，换任一项自然失效。
+                    "capabilities": capability::model_view(m, &p.base_url, probed, probing),
+                })
+            })
+            .collect::<Vec<_>>();
         profiles.push(serde_json::json!({
             "id": p.id,
             "label": p.label,
@@ -1244,26 +1296,7 @@ fn get_settings(app: tauri::AppHandle) -> Result<serde_json::Value, String> {
             "hasApiKey": stored_key.is_some(),
             // 模型清单原样回显，空清单不替 `model` 补一行：补出来的那行看起来像
             // "用户自己加的"，设置页就会给一个根本没被声明过的档位提供删除按钮。
-            "models": p.models.iter().map(|m| serde_json::json!({
-                "id": m.id,
-                "name": m.name,
-                "contextWindow": m.context_window,
-                "maxTokens": m.max_tokens,
-                "input": m.input,
-                // 推理档声明（SH-096）：档位 → wire 值；空串 = off 档（不发字段）。
-                // 前端视图把它翻成 null，写回时再归一成空串。
-                "reasoningEfforts": m.reasoning_efforts,
-                // 能力视图（SH-132）：值 + 来源 + 三态（已验证/不符/未验证）。
-                // 实测结论按 (端点, 协议, 模型, 密钥指纹) 取缓存，换任一项自然失效。
-                "capabilities": capability::model_view(
-                    m,
-                    &p.base_url,
-                    stored_key.as_deref().and_then(|key| {
-                        let key = capability::cache_key(&p.base_url, &p.provider, &m.id, key);
-                        probe_cache.entries.get(&key)
-                    }),
-                ),
-            })).collect::<Vec<_>>(),
+            "models": models,
             // 席位选中的推理档位（档位名；空 = 服务商默认）
             "reasoningEffort": p.reasoning_effort,
             // 自定义请求头（SH-097）：设置页可编辑的部署头，原样回显

@@ -63,7 +63,12 @@ async fn deepseek_triple_probe_with_cache() {
     let root = temp_root("triple");
 
     let started = std::time::Instant::now();
-    capability::ensure_probed(root.clone(), target.clone(), row.clone()).await;
+    let inflight = capability::Inflight::default();
+    capability::ensure_probed(root.clone(), target.clone(), row.clone(), &inflight).await;
+    assert!(
+        !inflight.contains(&target.cache_key()),
+        "探针跑完必须清掉「检测中」登记，否则设置页会永远停在检测中"
+    );
     println!("\n== 首次实测（含落盘）总耗时 {}ms ==", started.elapsed().as_millis());
 
     let cache = ProbeCache::load(&root);
@@ -110,12 +115,18 @@ async fn deepseek_triple_probe_with_cache() {
     // 缓存命中：第二次 ensure_probed 不得重写缓存（checked_at_ms 会变），也不得再打请求。
     let before = std::fs::read(cache_path(&root)).expect("首次实测必须落盘缓存");
     let second = std::time::Instant::now();
-    capability::ensure_probed(root.clone(), target.clone(), row.clone()).await;
-    let after = std::fs::read(cache_path(&root)).expect("缓存文件必须仍在");
+    capability::ensure_probed(
+        root.clone(),
+        target.clone(),
+        row.clone(),
+        &capability::Inflight::default(),
+    )
+    .await;
     println!(
         "== 第二次 ensure_probed 耗时 {}ms（缓存命中，未重探）==",
         second.elapsed().as_millis()
     );
+    let after = std::fs::read(cache_path(&root)).expect("缓存文件必须仍在");
     assert_eq!(before, after, "第二次调用重写了缓存：缓存没有生效");
     let checked: Vec<u64> = outcomes.values().map(|o| o.checked_at_ms).collect();
     println!("== 缓存 checked_at_ms = {checked:?} ==");
@@ -146,7 +157,13 @@ async fn declared_vision_on_text_model_reports_mismatch() {
         .with_max_level(tracing::Level::WARN)
         .try_init();
 
-    capability::ensure_probed(root.clone(), target.clone(), row.clone()).await;
+    capability::ensure_probed(
+        root.clone(),
+        target.clone(),
+        row.clone(),
+        &capability::Inflight::default(),
+    )
+    .await;
 
     let cache = ProbeCache::load(&root);
     let outcomes = cache.get(&target.cache_key()).expect("缓存里必须有本次实测结果");
@@ -164,7 +181,7 @@ async fn declared_vision_on_text_model_reports_mismatch() {
     assert!(vision.evidence.contains('红') && vision.evidence.contains('绿'), "证据里缺少两问结果");
 
     // 设置页拿到的是 model_view，这里直接断言同一份视图。
-    let view = capability::model_view(&row, &base_url, Some(outcomes));
+    let view = capability::model_view(&row, &base_url, Some(outcomes), false);
     println!("设置页视图: state={} source={} value={}", view["vision"]["state"], view["vision"]["source"], view["vision"]["value"]);
     assert_eq!(view["vision"]["state"], "mismatch", "设置页必须显示『与声明不符』");
     assert_eq!(view["vision"]["source"], "manual", "来源仍应是声明它的那一层");

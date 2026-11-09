@@ -44,8 +44,12 @@ const SOURCE_LABEL: Record<string, CapabilitiesKey> = {
 const STATE_LABEL: Record<string, CapabilitiesKey> = {
   verified: 'state.verified',
   mismatch: 'state.mismatch',
+  probing: 'state.probing',
   unverified: 'state.unverified',
 }
+
+/** 「检测中」的轮询间隔：探针本身有 30s 总超时，2s 一取不会打爆宿主命令。 */
+const PROBING_POLL_MS = 2_000
 
 type Props = PropsRuntime<'settings.models.provider-card'> & PropsLocale<typeof NS> & {
   readonly wire: CapabilitiesWire
@@ -84,6 +88,7 @@ export function CapabilityPanel(props: Props): ReactNode {
   const { provider, t, wire, subscribe } = props
   const [models, setModels] = useState<readonly CapabilityModelWire[]>()
   const [error, setError] = useState<string>()
+  const [tick, setTick] = useState(0)
 
   useEffect(() => {
     let alive = true
@@ -107,7 +112,18 @@ export function CapabilityPanel(props: Props): ReactNode {
       alive = false
       off()
     }
-  }, [wire, subscribe, provider.provider, provider.displayName])
+  }, [wire, subscribe, provider.provider, provider.displayName, tick])
+
+  // 探针在后台跑，宿主不会为"测完了"发广播（那会把 UI 绑到后台任务上），
+  // 所以只要还有项在「检测中」，就自己轮询到结论回来为止。
+  const probing = models?.some(model =>
+    Object.values(model.capabilities ?? {}).some(view => view.state === 'probing'),
+  ) ?? false
+  useEffect(() => {
+    if (!probing) return
+    const timer = setTimeout(() => setTick(value => value + 1), PROBING_POLL_MS)
+    return () => clearTimeout(timer)
+  }, [probing, models, tick])
 
   if (error !== undefined) {
     return <p className="shaniu-capabilities-error" role="status">{t('loadFailed', { error })}</p>
@@ -120,6 +136,8 @@ export function CapabilityPanel(props: Props): ReactNode {
         <span className="shaniu-capabilities-title">{t('title')}</span>
         <span className="shaniu-capabilities-hint">{t('hint')}</span>
       </div>
+      {/* 检测会真打请求、烧 token：成本量级必须写在用户看得见的地方，不能默认"免费"。 */}
+      <p className="shaniu-capabilities-cost" title={t('costDetail')}>{t('cost')}</p>
       {models.map(model => {
         const capabilities = model.capabilities ?? {}
         const date = dateOf(

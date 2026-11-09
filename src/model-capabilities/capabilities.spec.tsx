@@ -9,9 +9,9 @@
  *  4. 设置写入广播后重新读取（否则徽标停在保存前）；
  *  5. 读取失败如实显示，不粉饰成"没有能力"。
  */
-import { describe, expect, it } from 'vitest'
+import { describe, expect, it, vi } from 'vitest'
 import type { ReactNode } from 'react'
-import { render, screen, waitFor } from '@testing-library/react'
+import { act, render, screen, waitFor } from '@testing-library/react'
 import { Context } from '@deepseek-ai/cordis'
 import { apply as capabilitiesApply, inject as capabilitiesInject } from './index'
 import { CapabilityPanel } from './CapabilityPanel'
@@ -133,6 +133,45 @@ describe('src/model-capabilities：值 + 来源 + 三态', () => {
     expect(manual).toHaveLength(1)
     expect(manual[0]?.closest('.shaniu-capabilities-chip')?.getAttribute('data-item')).toBe('vision')
     expect(document.querySelectorAll('.shaniu-capabilities-source[data-source="builtin"]').length).toBe(3)
+  })
+
+  it('检测中：显示「检测中」而非「未验证」，轮询到结论后自行更新', async () => {
+    vi.useFakeTimers()
+    try {
+      const PROBING: CapabilityProviderWire = {
+        id: 'deepseek',
+        label: 'DeepSeek',
+        models: [{
+          id: 'deepseek-flash',
+          name: 'DeepSeek Flash',
+          capabilities: {
+            vision: { value: true, source: 'manual', state: 'probing' },
+            tools: { value: true, source: 'endpoint', state: 'probing' },
+          },
+        }],
+      }
+      let calls = 0
+      const Panel = CapabilityPanel as unknown as (props: Record<string, unknown>) => ReactNode
+      render(
+        <Panel
+          t={translate}
+          wire={{ providers: async () => { calls += 1; return calls === 1 ? [PROBING] : [FLASH] } }}
+          subscribe={() => () => {}}
+          provider={{ provider: 'deepseek', displayName: 'DeepSeek' }}
+        />,
+      )
+      await act(async () => { await vi.advanceTimersByTimeAsync(0) })
+      const chip = document.querySelector('.shaniu-capabilities-chip[data-state="probing"]')
+      expect(chip?.textContent).toContain(zh['state.probing'])
+      // 成本量级必须在界面上，不能被当成免费操作。
+      expect(screen.getByText(zh.cost)).toBeTruthy()
+
+      await act(async () => { await vi.advanceTimersByTimeAsync(2_000) })
+      expect(document.querySelector('.shaniu-capabilities-chip[data-state="probing"]')).toBeNull()
+      expect(document.querySelector('.shaniu-capabilities-chip[data-state="verified"]')).toBeTruthy()
+    } finally {
+      vi.useRealTimers()
+    }
   })
 
   it('读取失败如实显示，不显示成"没有能力"', async () => {

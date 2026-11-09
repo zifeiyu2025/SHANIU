@@ -38,6 +38,9 @@ pub struct AppState {
     active_subagents: Mutex<Option<Arc<crate::subagent_registry::SubagentRegistry>>>,
     /// MCP 运行时（SH-063）：信任记录、首连审查、已批准执行器。
     pub mcp: Arc<crate::mcp_client::runtime::McpRuntime>,
+    /// 正在跑的能力探针（SH-132）：设置页据此显示「检测中」而不是「未验证」。
+    /// 与任务生命周期无关——探针是后台增强，任务结束不该打断它。
+    pub probing: Arc<crate::capability::Inflight>,
 }
 
 impl AppState {
@@ -66,6 +69,7 @@ impl AppState {
             jobs: Arc::new(crate::jobs::JobRegistry::new()),
             active_subagents: Mutex::new(None),
             mcp: Arc::new(crate::mcp_client::runtime::McpRuntime::new(&config_root)),
+            probing: Arc::new(crate::capability::Inflight::default()),
         };
         state.refresh_derived_policy();
         state

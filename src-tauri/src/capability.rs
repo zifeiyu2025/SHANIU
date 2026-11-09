@@ -14,9 +14,10 @@
 //! 自然失效并重探；同一组合只探一次，不每次启动都打请求。密钥只以 SHA-256 前
 //! 16 位十六进制参与键，明文不进缓存、不进日志。
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, HashSet};
 use std::io::Cursor;
 use std::path::{Path, PathBuf};
+use std::sync::Mutex;
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use base64::Engine;
@@ -33,6 +34,9 @@ pub const CACHE_FILE: &str = "capabilities.json";
 pub const REASONING_NOISE_RATIO: f64 = 0.05;
 /// 两次推理探针请求的最小间隔。同端点连着打两发容易被限流，实测 1s 以上稳定。
 pub const PROBE_INTERVAL_MS: u64 = 1_100;
+/// 单模型一次检测的总超时。超时记 `verified=None` + 原因、**不无限等**：
+/// 探针是后台增强，任何用户路径都不该被它拖住。
+pub const PROBE_TOTAL_TIMEOUT_SECS: u64 = 30;
 
 /// 能力项种类。开放集合：新增能力（`audio`/`embeddings`/`prompt_caching`…）
 /// 只需加一行 [`ITEMS`]，配置与界面都按 id 泛化，不需要改结构体。
@@ -150,6 +154,42 @@ impl ProbeCache {
 
     pub fn put(&mut self, key: String, outcomes: BTreeMap<String, ProbeOutcome>) {
         self.entries.insert(key, outcomes);
+    }
+}
+
+/// 正在跑的探针（按缓存键）。设置页据此把「检测中」与「未验证」分开：
+/// 前者是还没测完，后者是测过但没测成——混成一个词，用户会读成"能力不可用"。
+#[derive(Default)]
+pub struct Inflight {
+    keys: Mutex<HashSet<String>>,
+}
+
+impl Inflight {
+    /// 登记一次探测；已在跑时返回 `false`。重复点击 / 重复启动都走这里，
+    /// 因此不会对同一模型并发打两轮请求、烧两份 token。
+    pub fn begin(&self, key: &str) -> bool {
+        self.keys.lock().expect("探针在跑集合锁中毒").insert(key.to_string())
+    }
+
+    pub fn end(&self, key: &str) {
+        self.keys.lock().expect("探针在跑集合锁中毒").remove(key);
+    }
+
+    pub fn contains(&self, key: &str) -> bool {
+        self.keys.lock().expect("探针在跑集合锁中毒").contains(key)
+    }
+}
+
+/// 提前返回（缓存命中 / 超时 / panic 展开）时也要擦掉登记，
+/// 否则设置页会永远停在「检测中」。
+struct InflightGuard<'a> {
+    inflight: &'a Inflight,
+    key: &'a str,
+}
+
+impl Drop for InflightGuard<'_> {
+    fn drop(&mut self) {
+        self.inflight.end(self.key);
     }
 }
 
@@ -434,6 +474,7 @@ pub fn model_view(
     row: &ModelProfile,
     base_url: &str,
     probed: Option<&BTreeMap<String, ProbeOutcome>>,
+    probing: bool,
 ) -> serde_json::Value {
     let builtin = builtin_of(row, base_url);
     let builtin_source = builtin.as_ref().map(|(source, _)| *source);
@@ -542,6 +583,10 @@ pub fn model_view(
         let state = match verified {
             Some(true) => "verified",
             Some(false) => "mismatch",
+            // 「检测中」不是「未验证」：前者还没测完，后者测过但没测成。
+            // 手动的项不采纳探针结论，对它显示"检测中"只会误导；没有探针的项
+            // （上下文窗口 / 输出上限 / 托管搜索）永远是「未验证」，不能装作在测。
+            None if probing && !manual_record && item.probe => "probing",
             None => "unverified",
         };
         entry.insert("state".into(), serde_json::Value::String(state.into()));
@@ -1071,10 +1116,11 @@ fn solid_png_data_url(color: image::Rgb<u8>) -> Result<String, String> {
 
 // ============================== 宿主命令 ==============================
 
-/// 探测某个服务商当前生效模型的能力（设置页"重新探测"与首次使用自动触发）。
+/// 触发一次能力探测（设置页"重新探测"按钮）。
 ///
-/// 返回设置页可直接渲染的能力视图。网络失败不会让命令整体失败——每项如实回
-/// "未验证 + 原因"，只有"读不到密钥"才报错（那是配置问题，不是能力问题）。
+/// **不等结果**：命令只负责把探测丢进后台并立刻返回当前视图（`probing = true`），
+/// 设置页照常渲染、轮询到结论再更新。用户点一次不该罚站 10 秒。
+/// 只有"读不到密钥"这类配置问题当场报错——那是发送前就该知道的。
 #[tauri::command]
 pub async fn probe_capabilities(
     app: tauri::AppHandle,
@@ -1087,7 +1133,8 @@ pub async fn probe_capabilities(
         .providers
         .iter()
         .find(|p| p.id == provider)
-        .ok_or_else(|| format!("服务商 {provider} 不在配置里"))?;
+        .ok_or_else(|| format!("服务商 {provider} 不在配置里"))?
+        .clone();
     let model_id = model.filter(|m| !m.trim().is_empty()).unwrap_or_else(|| row.model.clone());
     let model_row = row
         .models
@@ -1107,26 +1154,17 @@ pub async fn probe_capabilities(
         token_budget_hint: model_row.max_tokens,
     };
     let key = target.cache_key();
-    tracing::info!(provider = %row.id, model = %model_row.id, "开始能力实测");
-    let outcomes = probe_all(&target, &model_row).await;
     let data_root = state.data_root();
-    let mut cache = ProbeCache::load(&data_root);
-    let view = model_view(&model_row, &row.base_url, Some(&outcomes));
-    // 只播报"与声明不符"：这是用户最需要知道、也最容易静默失败的一类。
-    for (item, outcome) in &outcomes {
-        if outcome.verified == Some(false) {
-            tracing::warn!(
-                provider = %row.id,
-                model = %model_row.id,
-                capability = %item,
-                evidence = %outcome.evidence,
-                "能力实测与声明不符"
-            );
-        }
-    }
-    cache.put(key, outcomes);
-    cache.save(&data_root);
-    Ok(view)
+    let probing = state.probing.clone();
+    tracing::info!(provider = %row.id, model = %model_row.id, "开始能力实测");
+    let row_for_task = model_row.clone();
+    tauri::async_runtime::spawn(async move {
+        let _ = probe_and_cache(&data_root, &target, &row_for_task, &probing).await;
+    });
+    // 返回当前已知结论 + 检测中标记；结论由设置页轮询取回。
+    let cache = ProbeCache::load(&state.data_root());
+    let cached = cache.get(&key);
+    Ok(model_view(&model_row, &row.base_url, cached, true))
 }
 
 /// 拉取端点给出的能力元数据（`GET /models/{id}`）。返回视图供设置页预填；
@@ -1203,20 +1241,68 @@ async fn fetch_endpoint_metadata(
     Ok(parse_metadata(item))
 }
 
-/// 首次使用时确保该模型有实测记录：缓存命中直接返回，不重复打请求。
-/// 只用于后台预热——失败只记日志，不影响任务。
-pub async fn ensure_probed(
-    data_root: PathBuf,
-    target: ProbeTarget,
-    row: ModelProfile,
-) {
-    let mut cache = ProbeCache::load(&data_root);
-    let key = target.cache_key();
-    if cache.get(&key).is_some_and(|entry| !entry.is_empty()) {
-        return;
+/// 总超时后的结论：每一项都记「未验证」并写明原因。
+/// **绝不记成「不生效」**——超时是我们没测成，不是端点不支持；两者后果完全不同。
+fn timeout_outcomes(row: &ModelProfile, base_url: &str) -> BTreeMap<String, ProbeOutcome> {
+    let evidence = format!(
+        "能力实测超时（{PROBE_TOTAL_TIMEOUT_SECS} 秒未完成）：本次未验证，不影响模型可用性"
+    );
+    let outcome = || ProbeOutcome {
+        verified: None,
+        evidence: evidence.clone(),
+        checked_at_ms: now_ms(),
+        ..Default::default()
+    };
+    let mut out = BTreeMap::new();
+    out.insert("vision".to_string(), outcome());
+    out.insert("tools".to_string(), outcome());
+    if !row.declared_reasoning_levels(base_url).is_empty() {
+        out.insert("reasoning".to_string(), outcome());
     }
+    out
+}
+
+/// 跑一次探针并落缓存，带总超时与去重。
+///
+/// 三条纪律：
+/// 1. **只在后台任务里跑**——调用方要么 `spawn`，要么是用户手动点的检测；
+///    任何回合启动路径都不 await 它。
+/// 2. 同一缓存键已在跑就立刻返回（不排队、不重复烧 token）；
+///    已有缓存记录就直接返回记录。
+/// 3. 失败（网络断 / 429 / 超时）只影响 `verified`，**不影响模型可用性**——
+///    这里从不修改声明值，也从不把模型标成不可用。
+pub async fn probe_and_cache(
+    data_root: &Path,
+    target: &ProbeTarget,
+    row: &ModelProfile,
+    inflight: &Inflight,
+) -> BTreeMap<String, ProbeOutcome> {
+    let key = target.cache_key();
+    if let Some(hit) = ProbeCache::load(data_root).get(&key).filter(|entry| !entry.is_empty()) {
+        return hit.clone();
+    }
+    if !inflight.begin(&key) {
+        // 另一轮正在跑：它测完会把结论写进缓存，这里不排队也不等。
+        return ProbeCache::load(data_root).get(&key).cloned().unwrap_or_default();
+    }
+    let _guard = InflightGuard { inflight, key: &key };
     tracing::info!(model = %target.model, "首次使用该模型，后台跑一次能力实测");
-    let outcomes = probe_all(&target, &row).await;
+    let outcomes = match tokio::time::timeout(
+        std::time::Duration::from_secs(PROBE_TOTAL_TIMEOUT_SECS),
+        probe_all(target, row),
+    )
+    .await
+    {
+        Ok(outcomes) => outcomes,
+        Err(_) => {
+            tracing::warn!(
+                model = %target.model,
+                seconds = PROBE_TOTAL_TIMEOUT_SECS,
+                "能力实测超时：本次记未验证，不影响模型可用性"
+            );
+            timeout_outcomes(row, &target.base_url)
+        }
+    };
     for (item, outcome) in &outcomes {
         if outcome.verified == Some(false) {
             tracing::warn!(
@@ -1227,8 +1313,21 @@ pub async fn ensure_probed(
             );
         }
     }
-    cache.put(key, outcomes);
-    cache.save(&data_root);
+    // 重新读一次再写：别的模型可能同时在探，别把它的记录覆盖掉。
+    let mut cache = ProbeCache::load(data_root);
+    cache.put(key.clone(), outcomes.clone());
+    cache.save(data_root);
+    outcomes
+}
+
+/// 首次使用时确保该模型有实测记录。只用于后台预热——失败只记日志，不影响任务。
+pub async fn ensure_probed(
+    data_root: PathBuf,
+    target: ProbeTarget,
+    row: ModelProfile,
+    inflight: &Inflight,
+) {
+    let _ = probe_and_cache(&data_root, &target, &row, inflight).await;
 }
 
 #[cfg(test)]
@@ -1260,7 +1359,7 @@ mod tests {
     fn view_reports_source_and_three_states() {
         let mut r = row();
         r.capabilities.insert("tools".into(), CapabilityRecord::declared(true, CapabilitySource::Endpoint));
-        let view = model_view(&r, BASE, None);
+        let view = model_view(&r, BASE, None, false);
         assert_eq!(view["vision"]["value"], true);
         // 值来自 input 字段、没有能力项记录 → 推断为手动声明
         assert_eq!(view["vision"]["source"], "manual");
@@ -1294,7 +1393,7 @@ mod tests {
                 elapsed_ms: Some(42),
             },
         );
-        let view = model_view(&r, BASE, Some(&outcomes));
+        let view = model_view(&r, BASE, Some(&outcomes), false);
         assert_eq!(view["vision"]["state"], "mismatch");
         assert_eq!(view["vision"]["evidence"], "回复：蓝色");
         assert_eq!(view["reasoning"]["verifiedLevels"], serde_json::json!(["low"]));
@@ -1318,7 +1417,7 @@ mod tests {
     fn builtin_layer_fills_values_with_source_and_date() {
         let base = "https://api.longcat.chat/openai/v1";
         let mut r = ModelProfile { id: "LongCat-2.5".into(), ..Default::default() };
-        let view = model_view(&r, base, None);
+        let view = model_view(&r, base, None, false);
         assert_eq!(view["vision"]["value"], true);
         assert_eq!(view["vision"]["source"], "builtin");
         assert_eq!(
@@ -1331,7 +1430,7 @@ mod tests {
 
         // 本行手填 > 内置表：用户填的值不能被表覆盖
         r.context_window = 128_000;
-        let view = model_view(&r, base, None);
+        let view = model_view(&r, base, None, false);
         assert_eq!(view["context_window"]["value"], 128_000);
         assert_eq!(view["context_window"]["source"], "manual");
     }
@@ -1340,7 +1439,7 @@ mod tests {
     fn family_hit_is_inferred_and_stays_conservative() {
         let base = "https://api.longcat.chat/openai/v1";
         let r = ModelProfile { id: "LongCat-2.7".into(), ..Default::default() };
-        let view = model_view(&r, base, None);
+        let view = model_view(&r, base, None, false);
         assert_eq!(view["context_window"]["source"], "inferred", "家族命中必须标「推测」");
         // 家族只声明 text，等于推测"这一代没有视觉"：值 false、来源仍是推测而不是未知
         assert_eq!(view["vision"]["value"], false);
@@ -1351,7 +1450,7 @@ mod tests {
     fn undeclared_value_is_absent_and_builtin_source_has_value() {
         // 没人声明（未知端点、本行空）时，布尔项不能写成 false——那会被读成"明确没有"。
         let r = ModelProfile { id: "some-unknown-model".into(), ..Default::default() };
-        let view = model_view(&r, "https://example.invalid/v1", None);
+        let view = model_view(&r, "https://example.invalid/v1", None, false);
         assert!(view["tools"].get("value").is_none(), "未声明写成了 false: {}", view["tools"]);
         assert_eq!(view["tools"]["source"], "unknown");
         assert!(view["max_output"].get("value").is_none(), "没有来源的 0 不是声明值");
@@ -1359,7 +1458,7 @@ mod tests {
         // 来源是内置表，值就必须来自同一张表（不能出现「内置表 + 未声明」）。
         let base = "https://api.deepseek.com";
         let flash = ModelProfile { id: "deepseek-flash".into(), ..Default::default() };
-        let view = model_view(&flash, base, None);
+        let view = model_view(&flash, base, None, false);
         let builtin = crate::model_catalog::lookup(base, "deepseek-flash").expect("内置表命中");
         assert_eq!(view["max_output"]["source"], "builtin");
         assert_eq!(
@@ -1447,9 +1546,57 @@ mod tests {
             "context_window".to_string(),
             ProbeOutcome { verified: Some(false), ..Default::default() },
         );
-        let view = model_view(&r, BASE, Some(&outcomes));
+        let view = model_view(&r, BASE, Some(&outcomes), false);
         assert_eq!(view["context_window"]["source"], "manual");
         assert_eq!(view["context_window"]["state"], "unverified", "手改之后探针不再覆盖");
+    }
+
+    #[test]
+    fn probing_is_its_own_state_not_unverified() {
+        // 「检测中」与「未验证」必须分开：前者还没测完，用户应该等；后者测过没测成。
+        let r = ModelProfile { id: "m-probing".into(), ..Default::default() };
+        let view = model_view(&r, BASE, None, true);
+        assert_eq!(view["vision"]["state"], "probing");
+        assert_eq!(view["tools"]["state"], "probing");
+        // 没有探针的项不能被写成「检测中」——它永远测不出来，装作在测就是撒谎。
+        assert_eq!(view["context_window"]["state"], "unverified");
+        assert_eq!(view["builtin_web_search"]["state"], "unverified");
+        // 已经测出结论的项不受"正在测"影响。
+        let mut outcomes = std::collections::BTreeMap::new();
+        outcomes.insert(
+            "vision".to_string(),
+            ProbeOutcome { verified: Some(true), ..Default::default() },
+        );
+        let view = model_view(&r, BASE, Some(&outcomes), true);
+        assert_eq!(view["vision"]["state"], "verified");
+        assert_eq!(view["tools"]["state"], "probing");
+        // 手动记录不采信探针，也就不该显示成"检测中"。
+        let mut manual = r.clone();
+        manual.capabilities.insert(
+            "vision".into(),
+            CapabilityRecord { source: CapabilitySource::Manual, ..Default::default() },
+        );
+        let view = model_view(&manual, BASE, None, true);
+        assert_eq!(view["vision"]["state"], "unverified");
+    }
+
+    #[test]
+    fn timeout_is_unverified_with_reason_never_unsupported() {
+        let r = ModelProfile {
+            id: "m-timeout".into(),
+            reasoning_efforts: [("low".to_string(), "low".to_string())].into_iter().collect(),
+            ..Default::default()
+        };
+        let outcomes = timeout_outcomes(&r, BASE);
+        for item in ["vision", "tools", "reasoning"] {
+            let outcome = &outcomes[item];
+            assert_eq!(outcome.verified, None, "{item} 超时不能记成「不生效」");
+            assert!(outcome.evidence.contains("超时"), "{}", outcome.evidence);
+            assert_eq!(outcome.elapsed_ms, None, "没测完就没有耗时，不能写 0");
+        }
+        // 没声明推理档就不探推理，也就不该凭空多出一条结论。
+        let plain = ModelProfile { id: "m-plain".into(), ..Default::default() };
+        assert!(!timeout_outcomes(&plain, BASE).contains_key("reasoning"));
     }
 
     #[test]

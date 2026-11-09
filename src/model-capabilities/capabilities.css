@@ -7,6 +7,7 @@
  * 三态的视觉分档（AGENTS §11.3「不静默降级」的可见性要求）：
  *  - verified：中性，靠文字区分；
  *  - mismatch：警示底色 + 警示描边，**不能**和"未验证"长得一样；
+ *  - probing：呼吸描边——「正在测」既不是结论也不是失败，别用警示色吓人；
  *  - unverified：虚线描边（表示"还没测"，不是"测过不行"）。
  */
 
@@ -36,8 +37,14 @@
 }
 
 .shaniu-capabilities-hint,
-.shaniu-capabilities-date {
+.shaniu-capabilities-date,
+.shaniu-capabilities-cost {
   color: var(--dsw-alias-label-secondary);
+}
+
+.shaniu-capabilities-cost {
+  margin: 0;
+  font-size: 11px;
 }
 
 .shaniu-capabilities-model {
@@ -83,6 +90,22 @@
 
 .shaniu-capabilities-chip[data-state='unverified'] {
   border-style: dashed;
+}
+
+.shaniu-capabilities-chip[data-state='probing'] {
+  border-style: dotted;
+  animation: shaniu-capabilities-pulse 1.6s ease-in-out infinite;
+}
+
+@keyframes shaniu-capabilities-pulse {
+  0%, 100% { opacity: 1; }
+  50% { opacity: 0.55; }
+}
+
+@media (prefers-reduced-motion: reduce) {
+  .shaniu-capabilities-chip[data-state='probing'] {
+    animation: none;
+  }
 }
 
 .shaniu-capabilities-chip[data-state='verified'] {
