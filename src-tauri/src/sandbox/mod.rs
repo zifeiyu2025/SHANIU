@@ -14,6 +14,7 @@
 
 pub mod acl;
 pub mod appcontainer;
+mod device_acl;
 pub mod msvc;
 pub mod network;
 pub mod windows_impl;
@@ -269,6 +270,11 @@ static ACL: OnceLock<Mutex<Option<acl::AclManager>>> = OnceLock::new();
 /// 上次异常退出遗留的备份还原条数（用于判断是否需要接管旧 profile）。
 static ACL_RECOVERED: AtomicUsize = AtomicUsize::new(0);
 
+/// ACL 备份目录（目录 DACL 与 NUL 设备 DACL 共用）。
+fn acl_backup_dir() -> PathBuf {
+    crate::config::resolve_dirs_from_env().data_root.join("sandbox").join("acl")
+}
+
 /// 懒初始化：只跑一次 `recover_pending`，失败即 fail-closed 返回错误。
 fn ensure_acl() -> Result<(), SandboxError> {
     let mutex = ACL.get_or_init(|| Mutex::new(None));
@@ -278,13 +284,45 @@ fn ensure_acl() -> Result<(), SandboxError> {
     if guard.is_some() {
         return Ok(());
     }
-    let data_root = crate::config::resolve_dirs_from_env().data_root;
-    let mut manager = acl::AclManager::new(data_root.join("sandbox").join("acl"));
+    let backup_dir = acl_backup_dir();
+    let mut manager = acl::AclManager::new(backup_dir.clone());
     // 先还原上次异常退出留下的 DACL，再允许新的授权，避免在被污染的 ACL 上继续。
     let restored = manager.recover_pending().map_err(SandboxError::CreateFailed)?;
+    // 设备对象的备份独立存放（设备路径没有 exists()，不能进目录备份的回收分支）。
+    match device_acl::restore_null_device(&backup_dir) {
+        Ok(true) => tracing::info!("已还原上次异常退出遗留的 NUL 设备 DACL 备份"),
+        Ok(false) => {}
+        Err(error) => {
+            return Err(SandboxError::CreateFailed(format!(
+                "上次异常退出留下的 NUL 设备 DACL 还原失败（拒绝在未还原的设备 ACL 上继续）：{error}"
+            )))
+        }
+    }
     ACL_RECOVERED.store(restored, Ordering::Relaxed);
     *guard = Some(manager);
     Ok(())
+}
+
+/// 让容器能打开 `\Device\Null`（SH-133）。
+///
+/// 失败**不** fail-closed：路径隔离本身仍成立，只是依赖 null stdio 的程序会在容器内
+/// 报 `Access is denied` —— 这条必须喊出来，不能静默。
+fn ensure_null_device(sid: PSID) {
+    match device_acl::ensure_container_can_open_null(sid, &acl_backup_dir()) {
+        Ok(device_acl::NullDeviceAccess::AlreadyAccessible) => {}
+        Ok(device_acl::NullDeviceAccess::Granted) => tracing::info!(
+            "已给容器 SID 补 `\\Device\\Null` 读写 ACE（该 OS 默认不给受限应用包授权，退出时还原）"
+        ),
+        Ok(device_acl::NullDeviceAccess::NoPermission(detail)) => tracing::warn!(
+            %detail,
+            "容器打不开 `\\Device\\Null`，且当前进程没有写设备 DACL 的权限（设备只有管理员可改）。\
+             容器内依赖 null stdio 的命令（cargo/node/python 派生进程）会报 Access denied"
+        ),
+        Err(error) => tracing::warn!(
+            %error,
+            "补 `\\Device\\Null` 授权时出错：容器内依赖 null stdio 的命令可能报 Access denied"
+        ),
+    }
 }
 
 fn with_acl<R>(f: impl FnOnce(&mut acl::AclManager) -> Result<R, String>) -> Result<R, SandboxError> {
@@ -316,6 +354,7 @@ fn build_runtime() -> Result<Runtime, SandboxError> {
 
     let container =
         appcontainer::AppContainer::ensure().map_err(SandboxError::CreateFailed)?;
+    ensure_null_device(container.sid());
     let capability_internet = appcontainer::internet_client_capability()
         .map_err(SandboxError::CreateFailed)?;
     let owns_profile = container.created() || recovered > 0;
@@ -341,6 +380,7 @@ pub fn shutdown() {
             }
         }
     }
+    restore_null_device_on_exit();
     let Some(mutex) = RUNTIME.get() else {
         return;
     };
@@ -356,6 +396,15 @@ pub fn shutdown() {
             Ok(()) => tracing::info!("沙箱退出：AppContainer profile 已删除"),
             Err(error) => tracing::error!(%error, "沙箱退出：AppContainer profile 删除失败"),
         }
+    }
+}
+
+/// 退出路径的设备 DACL 还原：失败只记录，下次启动的 `recover_pending` 会兜底。
+fn restore_null_device_on_exit() {
+    match device_acl::restore_null_device(&acl_backup_dir()) {
+        Ok(true) => tracing::info!("沙箱退出：NUL 设备 DACL 已按备份还原"),
+        Ok(false) => {}
+        Err(error) => tracing::error!(%error, "沙箱退出：NUL 设备 DACL 还原失败"),
     }
 }
 
@@ -409,6 +458,7 @@ fn ensure_mcp_container(server_id: &str) -> Result<(), SandboxError> {
     }
     let container =
         appcontainer::AppContainer::ensure_named(&profile).map_err(SandboxError::CreateFailed)?;
+    ensure_null_device(container.sid());
     let capability_internet =
         appcontainer::internet_client_capability().map_err(SandboxError::CreateFailed)?;
     runtimes.insert(

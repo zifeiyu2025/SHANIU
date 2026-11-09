@@ -271,13 +271,25 @@ impl AclManager {
             true
         };
 
-        if let Err(error) = apply_grant(&normalized, sid, mask) {
+        if let Err(error) = apply_grant(
+            &normalized,
+            sid,
+            mask,
+            SUB_CONTAINERS_AND_OBJECTS_INHERIT,
+        ) {
             // 已经改了一半：立刻按备份还原，再报错。
             let restore = restore_from_snapshot(&normalized, &snapshot);
             if wrote_backup {
                 let _ = std::fs::remove_file(&backup_path);
             }
-            self.audit("grant", &normalized, &sid_text, access.label(), "error", Some(&error));
+            self.audit(
+                "grant",
+                &normalized,
+                &sid_text,
+                access.label(),
+                "error",
+                Some(&error.message),
+            );
             return Err(match restore {
                 Ok(()) => format!("给「{}」加沙箱 ACE 失败，已按备份还原：{error}", normalized.display()),
                 Err(restore_error) => format!(
@@ -412,7 +424,7 @@ fn hash_path(path: &str) -> u64 {
 }
 
 /// 读取命名对象的安全描述符（自相对格式）并复制成字节，供备份/回滚使用。
-fn read_dacl_snapshot(path: &Path) -> Result<Vec<u8>, String> {
+pub(crate) fn read_dacl_snapshot(path: &Path) -> Result<Vec<u8>, String> {
     let name = wide(path.as_os_str());
     let mut descriptor = PSECURITY_DESCRIPTOR(std::ptr::null_mut());
     let mut dacl: *mut ACL = std::ptr::null_mut();
@@ -522,7 +534,29 @@ unsafe fn scan_acl_for_grant(dacl: *mut ACL, sid: PSID, mask: u32) -> Result<boo
     Ok(false)
 }
 
-fn apply_grant(path: &Path, sid: PSID, mask: u32) -> Result<(), String> {
+/// `apply_grant` 的失败：`access_denied` 让调用方区分「没有写 DACL 的权限」
+/// （设备对象只有管理员能改，可降级上报）与真正的错误（fail-closed）。
+pub(crate) struct GrantFailure {
+    pub(crate) access_denied: bool,
+    pub(crate) message: String,
+}
+
+impl std::fmt::Display for GrantFailure {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(&self.message)
+    }
+}
+
+pub(crate) fn apply_grant(
+    path: &Path,
+    sid: PSID,
+    mask: u32,
+    inheritance: windows::Win32::Security::ACE_FLAGS,
+) -> Result<(), GrantFailure> {
+    let denied = |message: String, status: windows::Win32::Foundation::WIN32_ERROR| GrantFailure {
+        access_denied: status == windows::Win32::Foundation::ERROR_ACCESS_DENIED,
+        message,
+    };
     let name = wide(path.as_os_str());
     let mut descriptor = PSECURITY_DESCRIPTOR(std::ptr::null_mut());
     let mut old_dacl: *mut ACL = std::ptr::null_mut();
@@ -539,13 +573,13 @@ fn apply_grant(path: &Path, sid: PSID, mask: u32) -> Result<(), String> {
         )
     };
     if status != ERROR_SUCCESS {
-        return Err(format!("读取 DACL 失败（Win32 错误 {}）", status.0));
+        return Err(denied(format!("读取 DACL 失败（Win32 错误 {}）", status.0), status));
     }
 
     let entry = EXPLICIT_ACCESS_W {
         grfAccessPermissions: mask,
         grfAccessMode: GRANT_ACCESS,
-        grfInheritance: SUB_CONTAINERS_AND_OBJECTS_INHERIT,
+        grfInheritance: inheritance,
         Trustee: TRUSTEE_W {
             pMultipleTrustee: std::ptr::null_mut(),
             MultipleTrusteeOperation: NO_MULTIPLE_TRUSTEE,
@@ -564,7 +598,7 @@ fn apply_grant(path: &Path, sid: PSID, mask: u32) -> Result<(), String> {
         unsafe {
             let _ = LocalFree(Some(HLOCAL(descriptor.0)));
         }
-        return Err(format!("构造新 DACL 失败（Win32 错误 {}）", status.0));
+        return Err(denied(format!("构造新 DACL 失败（Win32 错误 {}）", status.0), status));
     }
 
     let status = unsafe {
@@ -583,10 +617,9 @@ fn apply_grant(path: &Path, sid: PSID, mask: u32) -> Result<(), String> {
         let _ = LocalFree(Some(HLOCAL(descriptor.0)));
     }
     if status != ERROR_SUCCESS {
-        return Err(format!(
-            "写入「{}」的新 DACL 失败（Win32 错误 {}）",
-            path.display(),
-            status.0
+        return Err(denied(
+            format!("写入「{}」的新 DACL 失败（Win32 错误 {}）", path.display(), status.0),
+            status,
         ));
     }
     Ok(())
@@ -676,7 +709,7 @@ fn revoke_ace(path: &Path, sid: PSID) -> Result<bool, String> {
     Ok(read_dacl_snapshot(path).map(|after| after != before).unwrap_or(true))
 }
 
-fn write_backup_file(path: &Path, object: &Path, snapshot: &[u8]) -> Result<(), String> {
+pub(crate) fn write_backup_file(path: &Path, object: &Path, snapshot: &[u8]) -> Result<(), String> {
     if let Some(parent) = path.parent() {
         std::fs::create_dir_all(parent)
             .map_err(|e| format!("创建 ACL 备份目录失败（{}）: {e}", parent.display()))?;
@@ -710,7 +743,7 @@ fn restore_backup_file(path: &Path) -> Result<(), String> {
     Ok(())
 }
 
-fn parse_backup(blob: &[u8]) -> Result<(PathBuf, &[u8]), String> {
+pub(crate) fn parse_backup(blob: &[u8]) -> Result<(PathBuf, &[u8]), String> {
     if blob.len() < 16 || &blob[..8] != BACKUP_MAGIC {
         return Err("备份文件头不合法（不是 SHANIU 的 DACL 备份）".into());
     }
@@ -733,7 +766,7 @@ fn parse_backup(blob: &[u8]) -> Result<(PathBuf, &[u8]), String> {
     ))
 }
 
-fn restore_from_snapshot(path: &Path, snapshot: &[u8]) -> Result<(), String> {
+pub(crate) fn restore_from_snapshot(path: &Path, snapshot: &[u8]) -> Result<(), String> {
     let name = wide(path.as_os_str());
     let descriptor = PSECURITY_DESCRIPTOR(snapshot.as_ptr() as *mut c_void);
     let mut present = windows::core::BOOL(0);
