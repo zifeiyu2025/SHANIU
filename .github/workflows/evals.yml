@@ -39,7 +39,8 @@ jobs:
       group: evals-${{ github.ref }}
       cancel-in-progress: true
     runs-on: windows-latest
-    timeout-minutes: 40
+    # 8 题难样本 × 5 次 = 每臂 40 样本（两臂共 80），实测 ~55s/题，留足编译与重试余量。
+    timeout-minutes: 120
 
     env:
       SHANIU_TEST_PROVIDER: openai-chat
@@ -67,10 +68,27 @@ jobs:
         with:
           workspaces: src-tauri
 
-      - name: 跑 5 任务基线（evals/tasks.json）
+      # 分母必须是**当日对照**，不是冻结基线：端点漂移实测能把整份基线抬升 32%/轮
+      # （evals/score.mjs 文件头已写明），冻结点不是同一把尺子。所以这里跑两臂、
+      # 显式把两份报告交给 score.mjs——不再依赖永不入库的 evals/control.json。
+      # 只跑难样本子集：6 道易题长期 100%，对退化没有分辨力，白烧额度。
+      - name: 跑对照臂（关自愈）
         working-directory: src-tauri
         env:
           SHANIU_TEST_API_KEY: ${{ secrets.SHANIU_EVAL_API_KEY }}
+          SHANIU_EVAL_ROLE: control
+          SHANIU_EVAL_ABLATE_AR6: "1"
+          SHANIU_EVAL_HARD_ONLY: "1"
+          SHANIU_EVAL_REPEATS: "5"
+        run: cargo test --test evals_baseline -- --ignored --nocapture
+
+      - name: 跑实验臂（开自愈）
+        working-directory: src-tauri
+        env:
+          SHANIU_TEST_API_KEY: ${{ secrets.SHANIU_EVAL_API_KEY }}
+          SHANIU_EVAL_ROLE: treatment
+          SHANIU_EVAL_HARD_ONLY: "1"
+          SHANIU_EVAL_REPEATS: "5"
         run: cargo test --test evals_baseline -- --ignored --nocapture
 
       - name: 跑 FF-5 真实端点首增量口径
@@ -87,15 +105,21 @@ jobs:
         with:
           node-version: 22
 
-      # 零依赖脚本，只读两份 JSON 判退化；退化 >10% 直接让本条 workflow 变红
-      - name: 对基线判退化（success_rate 降幅 / 轮数与 token 增幅 >10% 阻断）
-        run: node evals/score.mjs
+      # 两臂报告按 role 后缀区分；显式传路径，避免"读最新那份"掩盖并发写错
+      - name: 对当日对照判退化（success_rate 降幅 / 轮数与 token 增幅 >10% 阻断）
+        shell: bash
+        run: |
+          treatment=$(ls -t evals/results/*-treatment.json | head -1)
+          control=$(ls -t evals/results/*-control.json | head -1)
+          echo "实验臂=$treatment 对照臂=$control"
+          node evals/score.mjs "$treatment" "$control"
 
       - name: 上传本轮报告
         if: always()
         uses: actions/upload-artifact@v4
         with:
-          name: evals-latest
-          path: evals/latest.json
+          name: evals-results
+          # 运行器写的是 evals/results/<epoch>-<pid>-<role>.json；latest.json 从不存在
+          path: evals/results/*.json
           if-no-files-found: warn
           retention-days: 30
