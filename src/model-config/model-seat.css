@@ -2,8 +2,8 @@
  * 模型席位（宿主插件样式）。
  *
  * 取值逐条对齐 DSH 原件，**不要各写各的**：
- *  - 输入区模型 chip：src/dsh/**/ui-model-selection/src/client/ModelSelect.module.css:9-47
- *  - 同排访问模式 chip：src/dsh/**/ui-permission-presets/src/client/PermissionSelect.module.css:1-34
+ *  - 输入区模型 chip：src/dsh/packages/client/ui-model-selection/src/client/ModelSelect.module.css:9-47
+ *  - 同排访问模式 chip：src/dsh/packages/client/ui-permission-presets/src/client/PermissionSelect.module.css:1-34
  *    （两者几何完全一致：28px / 13px / 20px / gap 4 / padding 0 4px 0 8px / radius-sm）
  *
  * `model-config.spec` 会解析这三份 CSS 做数值一致性断言，改这里必须同步上游或改测试。
