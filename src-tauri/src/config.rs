@@ -315,6 +315,18 @@ impl ModelProfile {
             .unwrap_or(0)
     }
 
+    /// 输出上限：本行填了就用本行的，否则用内置表。与 [`Self::context_window_effective`]
+    /// 同口径——视图里「来源：内置表、值：未声明」是自相矛盾的组合，必须同源。
+    pub fn max_tokens_effective(&self, base_url: &str) -> u32 {
+        if self.max_tokens > 0 {
+            return self.max_tokens;
+        }
+        self.builtin(base_url)
+            .and_then(|builtin| builtin.max_output)
+            .map(|limit| limit.min(u32::MAX as u64) as u32)
+            .unwrap_or(0)
+    }
+
     /// 能力项在界面上的三态：`verified` / `mismatch` / `unverified`。
     /// 只用于展示——**不**参与运行期放行（那用 `vision_effective` 这类显式判据）。
     pub fn capability_state(&self, item: &str) -> &'static str {

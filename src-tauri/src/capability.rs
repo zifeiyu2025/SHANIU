@@ -85,6 +85,9 @@ pub struct ProbeOutcome {
     pub verified_levels: Vec<String>,
     pub evidence: String,
     pub checked_at_ms: u64,
+    /// 本项探针实际耗时（毫秒）。`None` = 没测到（历史缓存、请求失败、图片编码失败），
+    /// 不是 0ms——真机取证要按项贴耗时，混进"0"会被读成"没打请求"。
+    pub elapsed_ms: Option<u64>,
 }
 
 /// 缓存文件：`{ version, entries: { cache_key: { item: ProbeOutcome } } }`。
@@ -443,6 +446,10 @@ pub fn model_view(
         let record = row.capabilities.get(item.id);
         let mut entry = serde_json::Map::new();
         let local;
+        // 布尔项的声明值先算出来，等来源解析完再决定写不写进视图：
+        // 「来源：未声明、值：无」会把"没人说过"读成"明确没有"。
+        let mut flag_value: Option<bool> = None;
+        let mut number_value: Option<u32> = None;
         match item.kind {
             CapabilityKind::Flag => {
                 let (value, local_value) = match item.id {
@@ -463,7 +470,7 @@ pub fn model_view(
                     }
                 };
                 local = local_value;
-                entry.insert("value".into(), serde_json::Value::Bool(value));
+                flag_value = Some(value);
             }
             CapabilityKind::Levels => {
                 let levels = row.declared_reasoning_levels(base_url);
@@ -484,13 +491,13 @@ pub fn model_view(
             CapabilityKind::Number => {
                 let value = match item.id {
                     "context_window" => row.context_window_effective(base_url),
-                    _ => row.max_tokens,
+                    _ => row.max_tokens_effective(base_url),
                 };
                 local = match item.id {
                     "context_window" => row.context_window > 0,
                     _ => row.max_tokens > 0,
                 };
-                entry.insert("value".into(), serde_json::Value::from(value));
+                number_value = Some(value);
             }
         }
         let source = declared_source(
@@ -499,6 +506,17 @@ pub fn model_view(
             local,
             builtin_source.filter(|_| builtin_declares(item.id, builtin_fields)),
         );
+        if let Some(value) = flag_value {
+            if source != CapabilitySource::Unknown {
+                entry.insert("value".into(), serde_json::Value::Bool(value));
+            }
+        }
+        // 数值项同口径：没人声明、也没内置值时值为 0，但 0 不是声明值。
+        if let Some(value) = number_value {
+            if value > 0 || source != CapabilitySource::Unknown {
+                entry.insert("value".into(), serde_json::Value::from(value));
+            }
+        }
         entry.insert(
             "source".into(),
             serde_json::to_value(source).unwrap_or(serde_json::Value::Null),
@@ -656,6 +674,7 @@ fn endpoint_url(target: &ProbeTarget) -> String {
 /// 太小的图会制造"不支持视觉"的假阴性。正文上限给 512——推理型模型会先花 token
 /// 思考，给 64 会被截断成空正文；正文为空时 [`extract_text`] 回读 `reasoning_content`。
 async fn probe_vision(client: &reqwest::Client, target: &ProbeTarget) -> ProbeOutcome {
+    let started = std::time::Instant::now();
     const IMAGES: [(image::Rgb<u8>, &str, &str); 2] = [
         (image::Rgb([200, 20, 20]), "红", "red"),
         (image::Rgb([20, 140, 40]), "绿", "green"),
@@ -704,6 +723,7 @@ async fn probe_vision(client: &reqwest::Client, target: &ProbeTarget) -> ProbeOu
         verified: Some(all_correct),
         evidence: evidence.join("；"),
         checked_at_ms: now_ms(),
+        elapsed_ms: Some(started.elapsed().as_millis() as u64),
         ..Default::default()
     }
 }
@@ -736,6 +756,7 @@ fn image_probe_body(target: &ProbeTarget, question: &str, data_url: &str) -> ser
 
 /// 工具探针：一个空 tool 声明 + "调用它"，看有没有 `tool_call` 结构回来。
 async fn probe_tools(client: &reqwest::Client, target: &ProbeTarget) -> ProbeOutcome {
+    let started = std::time::Instant::now();
     let tool = serde_json::json!({
         "type": "function",
         "function": {
@@ -783,6 +804,7 @@ async fn probe_tools(client: &reqwest::Client, target: &ProbeTarget) -> ProbeOut
                     "端点没有返回 tool_call（声明被忽略或模型未调用）".into()
                 },
                 checked_at_ms: now_ms(),
+                elapsed_ms: Some(started.elapsed().as_millis() as u64),
                 ..Default::default()
             }
         }
@@ -840,6 +862,7 @@ pub fn judge_reasoning(low: u64, high: u64) -> (ReasoningVerdict, f64) {
 ///
 /// 判据见 [`judge_reasoning`]；两次请求间隔 [`PROBE_INTERVAL_MS`]，避免触发限流。
 async fn probe_reasoning(client: &reqwest::Client, target: &ProbeTarget, row: &ModelProfile) -> ProbeOutcome {
+    let started = std::time::Instant::now();
     let levels = row.declared_reasoning_levels(&target.base_url);
     let Some(low) = levels.first() else {
         return ProbeOutcome {
@@ -902,7 +925,13 @@ async fn probe_reasoning(client: &reqwest::Client, target: &ProbeTarget, row: &M
             "{low}档 {low_metric}，{high}档反而 {high_metric}（{change}）：端点未识别该参数"
         ),
     };
-    ProbeOutcome { verified: Some(effective), verified_levels, evidence, checked_at_ms: now_ms() }
+    ProbeOutcome {
+        verified: Some(effective),
+        verified_levels,
+        evidence,
+        checked_at_ms: now_ms(),
+        elapsed_ms: Some(started.elapsed().as_millis() as u64),
+    }
 }
 
 /// 发一次带档位的最小请求，返回（指标值，指标名）。指标优先级：
@@ -1262,6 +1291,7 @@ mod tests {
                 verified_levels: vec!["low".into()],
                 evidence: "低 10 / 高 200".into(),
                 checked_at_ms: 7,
+                elapsed_ms: Some(42),
             },
         );
         let view = model_view(&r, BASE, Some(&outcomes));
@@ -1315,6 +1345,28 @@ mod tests {
         // 家族只声明 text，等于推测"这一代没有视觉"：值 false、来源仍是推测而不是未知
         assert_eq!(view["vision"]["value"], false);
         assert_eq!(view["vision"]["source"], "inferred");
+    }
+
+    #[test]
+    fn undeclared_value_is_absent_and_builtin_source_has_value() {
+        // 没人声明（未知端点、本行空）时，布尔项不能写成 false——那会被读成"明确没有"。
+        let r = ModelProfile { id: "some-unknown-model".into(), ..Default::default() };
+        let view = model_view(&r, "https://example.invalid/v1", None);
+        assert!(view["tools"].get("value").is_none(), "未声明写成了 false: {}", view["tools"]);
+        assert_eq!(view["tools"]["source"], "unknown");
+        assert!(view["max_output"].get("value").is_none(), "没有来源的 0 不是声明值");
+
+        // 来源是内置表，值就必须来自同一张表（不能出现「内置表 + 未声明」）。
+        let base = "https://api.deepseek.com";
+        let flash = ModelProfile { id: "deepseek-flash".into(), ..Default::default() };
+        let view = model_view(&flash, base, None);
+        let builtin = crate::model_catalog::lookup(base, "deepseek-flash").expect("内置表命中");
+        assert_eq!(view["max_output"]["source"], "builtin");
+        assert_eq!(
+            view["max_output"]["value"].as_u64(),
+            builtin.capabilities().max_output,
+            "来源是内置表但值不是表里的值"
+        );
     }
 
     #[test]
