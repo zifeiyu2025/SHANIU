@@ -600,7 +600,13 @@ impl AgentLoop {
             };
             if session_prompt.is_none() {
                 let (assembled, note) = prompt::SessionPrompt::assemble(&prompt_ctx);
-                if let Some(note) = note {
+                // 快照只服务"这一轮的新任务"：历史末尾必须是**尚未落盘**的用户消息
+                // （`run_task` 即 [user]；resume 由调用方先追加新用户消息）。
+                // 续跑若尾部停在助手消息上（无新输入），插到 `recorded` 之前会把已落盘
+                // 条目整体后移——游标之后多写一条旧条目、新快照反而永远写不进档案。
+                let fresh_task = *recorded < history.len()
+                    && matches!(history.last(), Some(HistoryItem::Message { role: Role::User, .. }));
+                if let Some(note) = note.filter(|_| fresh_task) {
                     insert_prompt_note(history, note);
                 }
                 session_prompt = Some(assembled);
