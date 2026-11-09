@@ -15,7 +15,7 @@ use std::time::Duration;
 
 use async_trait::async_trait;
 use serde_json::Value;
-use tokio::io::{AsyncBufReadExt, BufReader};
+use tokio::io::{AsyncBufReadExt, AsyncReadExt, BufReader};
 use tokio::sync::mpsc;
 
 use crate::events::EventMsg;
@@ -27,6 +27,12 @@ use crate::tool_router::{
 const DEFAULT_TIMEOUT_MS: u64 = 120_000;
 const MAX_TIMEOUT_MS: u64 = 600_000;
 const MAX_COLLECTED_BYTES: usize = 128 * 1024;
+/// 单行原始字节上限（`read_until` 本身无界）。
+///
+/// 一条永远不换行的输出（`printf` 几百 MB、`yes` 被截断在半行）会把行缓冲撑到 OOM，
+/// 而总量上限 `MAX_COLLECTED_BYTES` 是**收集之后**才生效，救不了读取阶段。
+/// 超限按一行先发出去、继续读下一段：内容不丢、行序不变，只是超长行会被切成多条。
+const MAX_LINE_BYTES: usize = 64 * 1024;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum IoChannel {
@@ -393,7 +399,12 @@ fn spawn_reader(
         let mut raw: Vec<u8> = Vec::new();
         'read: loop {
             raw.clear();
-            match reader.read_until(b'\n', &mut raw).await {
+            // 有界读取：`take` 封顶后 `read_until` 到上限即返回（不带换行），下一轮接着读。
+            let read = {
+                let mut limited = (&mut reader).take(MAX_LINE_BYTES as u64);
+                limited.read_until(b'\n', &mut raw).await
+            };
+            match read {
                 Ok(0) | Err(_) => break,
                 Ok(_) => {}
             }
@@ -740,6 +751,7 @@ mod tests {
     use crate::tool_router::ToolRouter;
     use std::path::Path;
     use std::sync::Arc;
+    use tokio::io::AsyncWriteExt;
     
     fn ctx(ws: &Path) -> ToolContext {
         static SINK: std::sync::OnceLock<Arc<dyn crate::events::EventSink>> = std::sync::OnceLock::new();
@@ -752,6 +764,36 @@ mod tests {
     fn workspace() -> crate::test_support::TestTempDir {
         // 自删临时目录：panic 也会清（2026-11-09 夹具规矩）。
         crate::test_support::TestTempDir::new("exec")
+    }
+
+    #[tokio::test]
+    async fn overlong_line_is_split_instead_of_unbounded_buffering() {
+        let (mut client, server) = tokio::io::duplex(1024);
+        let (tx, mut rx) = mpsc::channel::<sandbox::ExecLine>(16);
+        let reader = spawn_reader(
+            Box::new(server),
+            0,
+            tx,
+            crate::text_encoding::EncodingLedger::new(),
+        );
+        let total = MAX_LINE_BYTES * 3 + 7;
+        let payload = vec![b'a'; total];
+        let writer = tokio::spawn(async move {
+            AsyncWriteExt::write_all(&mut client, &payload).await.unwrap();
+            AsyncWriteExt::shutdown(&mut client).await.unwrap();
+        });
+
+        let mut received = 0usize;
+        let mut lines = 0usize;
+        while let Some((_channel, line)) = rx.recv().await {
+            lines += 1;
+            assert!(line.len() <= MAX_LINE_BYTES, "单条输出不得超过单行上限");
+            received += line.len();
+        }
+        writer.await.unwrap();
+        reader.await.unwrap();
+        assert_eq!(received, total, "超长行被切成多条，但字节一个不能丢");
+        assert!(lines >= 3, "超过上限的行必须分段送出而不是缓冲到 OOM，实际 {lines} 段");
     }
 
     #[tokio::test]
