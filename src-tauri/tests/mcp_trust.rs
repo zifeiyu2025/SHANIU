@@ -907,6 +907,36 @@ async fn wait_for_status(
     }
 }
 
+/// 等状态原因里出现指定文本，返回该 reason。
+///
+/// 崩溃→重启成功这段窗口里 `status` 一律是 `Trusted`（会话原地替换），所以状态本身
+/// 不能当同步点；必须等到 supervisor 把重启结论写进 `live_reason` 才读得到新原因。
+async fn wait_for_reason(
+    runtime: &Arc<McpRuntime>,
+    needle: &str,
+    limit: Duration,
+) -> String {
+    let deadline = tokio::time::Instant::now() + limit;
+    loop {
+        let status = runtime
+            .statuses()
+            .await
+            .into_iter()
+            .find(|status| status.server_id == SERVER)
+            .expect("服务器状态应存在");
+        let reason = status.reason.unwrap_or_default();
+        if reason.contains(needle) {
+            return reason;
+        }
+        assert!(
+            tokio::time::Instant::now() < deadline,
+            "等待原因包含「{needle}」超时，当前 {:?}（{reason}）",
+            status.status
+        );
+        tokio::time::sleep(Duration::from_millis(50)).await;
+    }
+}
+
 /// 调 `crash` 工具把真实进程打死（调用本身必然失败，结果不重要）。
 async fn crash(runtime: &Arc<McpRuntime>) {
     let crash = executor(runtime, "mcp__fake__crash");
@@ -951,8 +981,10 @@ async fn crash_restarts_once_with_backoff_then_degrades_without_more_spawns() {
     assert_eq!(spawn_count(&marker), 1, "退避期内不得立刻重启");
 
     wait_for_spawn_count(&marker, 2, Duration::from_secs(15)).await;
-    let status = wait_for_status(&runtime, McpStatus::Trusted, Duration::from_secs(5)).await;
-    let reason = status.reason.unwrap_or_default();
+    // 崩溃到重启成功之间状态始终是 `Trusted`（会话原地替换，`active` 不摘除），
+    // 所以「等 Trusted」等于没等：fixture 在进程启动首行就写 marker，握手可能还没完，
+    // 此刻读到的 reason 仍是首连原因。这里等的是**重启结论真正落地**。
+    let reason = wait_for_reason(&runtime, "第 1 次自动重启成功", Duration::from_secs(10)).await;
     assert!(
         reason.contains("第 1 次自动重启成功"),
         "重启后 reason 必须说清第几次重启: {reason}"
