@@ -134,6 +134,8 @@ async fn sandbox_denies_read_outside_workspace() {
 /// 必须**先读掉请求再回写**：如果 accept 后不回读就 `write_all` 并立刻 close，
 /// curl 会拿到 RST（exit 56），对照组就变成假红——而对照组一红，断网用例的结论
 /// 就不可信了（分不清"被沙箱拦"还是"服务本身没通"）。
+/// 同理，accept 出来的 socket 必须显式切回阻塞：Windows 会让它继承监听端的非阻塞标志，
+/// 「看起来读了」其实立刻 WouldBlock，等价于没读（CI `42600499992` 的假红来源）。
 struct LocalServer {
     port: u16,
     stop: Arc<AtomicBool>,
@@ -151,15 +153,36 @@ impl LocalServer {
                 match listener.accept() {
                     Ok((mut stream, _)) => {
                         use std::io::Read as _;
+                        // Windows 上 accept 出来的 socket 会继承监听端的非阻塞标志：
+                        // 不显式切回阻塞，`read` 会立刻 WouldBlock，请求还留在内核缓冲里就去写响应并关闭。
+                        // 带未读数据 close 时 Windows 发 RST，curl 报 56——对照组变成假红
+                        // （CI `42600499992` 就是这么红的：`status 56, stdout "000"`）。
+                        let _ = stream.set_nonblocking(false);
                         let _ = stream.set_read_timeout(Some(Duration::from_secs(1)));
                         let mut request = [0u8; 2048];
-                        let _ = stream.read(&mut request);
+                        let mut filled = 0usize;
+                        // 读到请求头结束再回写：只读一次会在慢一点的环境里读到半个请求。
+                        while filled < request.len() {
+                            match stream.read(&mut request[filled..]) {
+                                Ok(0) => break,
+                                Ok(read) => {
+                                    filled += read;
+                                    if request[..filled].windows(4).any(|part| part == b"\r\n\r\n") {
+                                        break;
+                                    }
+                                }
+                                Err(_) => break,
+                            }
+                        }
                         let _ = stream.write_all(
                             b"HTTP/1.1 200 OK\r\nContent-Length: 2\r\nConnection: close\r\n\r\nok",
                         );
                         let _ = stream.flush();
                         // 半关闭写方向：让 curl 先读到完整响应与 EOF，再随 drop 收尾。
                         let _ = stream.shutdown(std::net::Shutdown::Write);
+                        // 关之前把客户端余下数据读干净：还有未读数据就 close，同样会发 RST。
+                        let mut sink = [0u8; 512];
+                        while matches!(stream.read(&mut sink), Ok(read) if read > 0) {}
                     }
                     Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => {
                         std::thread::sleep(Duration::from_millis(10));
