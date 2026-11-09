@@ -1,6 +1,6 @@
 {
-  "version": 0,
-  "note": "评估基线 v0（docs/05 SH-028）。任务集是数据不是代码：SH-073 扩集合无需改 Rust。判据必须是机械可核验的文件断言，禁止'看一眼觉得对'。",
+  "version": 1,
+  "note": "评估基线 v0（docs/05 SH-028）。任务集是数据不是代码：SH-073 扩集合无需改 Rust。判据必须是机械可核验的文件断言，禁止'看一眼觉得对'。v1 = SH-073 增加 8 个难样本（跨文件定位、错误不明显、多代理）。",
   "fixture": {
     "README.md": "# eval fixture\n\n这是 SHANIU 评估基线的临时工作区，每次任务重建。\n",
     "config.toml": "port = 8080\nhost = \"127.0.0.1\"\n",
@@ -66,6 +66,145 @@
       "check": {
         "command": "cargo test --offline --quiet",
         "expect_contains": ["test result: ok"]
+      }
+    },
+    {
+      "id": "xfile-rename-symbol",
+      "title": "难样本：跨文件重命名并修好所有调用点",
+      "hard": true,
+      "prompt": "工作区里是一个 Rust 小工程。把 src/store.rs 里的函数 load 重命名为 read_items，并同步所有调用点（src/lib.rs、src/report.rs 都要改），直到 cargo test 全部通过。只允许修改实现代码，禁止修改或删除任何测试断言。",
+      "fixture": {
+        "Cargo.toml": "[package]\nname = \"eval_rename\"\nversion = \"0.1.0\"\nedition = \"2021\"\n\n[dependencies]\n",
+        "src/lib.rs": "pub mod report;\npub mod store;\n\npub fn total() -> i32 {\n    store::load() + report::extra()\n}\n",
+        "src/store.rs": "pub fn load() -> i32 {\n    40\n}\n",
+        "src/report.rs": "use crate::store::load;\n\npub fn extra() -> i32 {\n    load() / 20\n}\n",
+        "tests/spec.rs": "#[test]\nfn total_is_42() {\n    assert_eq!(eval_rename::total(), 42);\n}\n\n#[test]\nfn new_name_is_public() {\n    assert_eq!(eval_rename::store::read_items(), 40);\n}\n"
+      },
+      "check": {
+        "command": "cargo test --offline --quiet",
+        "expect_contains": ["test result: ok"]
+      }
+    },
+    {
+      "id": "xfile-bug-localize",
+      "title": "难样本：故障点与报错点不在同一文件",
+      "hard": true,
+      "prompt": "工作区里是一个 Rust 小工程，cargo test 会失败。请定位根因并修好实现，直到全部测试通过。只允许修改实现代码，禁止修改或删除任何测试断言。",
+      "fixture": {
+        "Cargo.toml": "[package]\nname = \"eval_price\"\nversion = \"0.1.0\"\nedition = \"2021\"\n\n[dependencies]\n",
+        "src/lib.rs": "pub mod cart;\npub mod price;\n",
+        "src/price.rs": "pub fn unit_price(qty: u32) -> u32 {\n    match qty {\n        0..=3 => 100,\n        4..=9 => 90,\n        _ => 80,\n    }\n}\n",
+        "src/cart.rs": "pub fn total(qty: u32) -> u32 {\n    crate::price::unit_price(qty) * qty\n}\n",
+        "tests/spec.rs": "#[test]\nfn tiers() {\n    assert_eq!(eval_price::price::unit_price(2), 100);\n    assert_eq!(eval_price::price::unit_price(3), 90);\n    assert_eq!(eval_price::price::unit_price(9), 90);\n    assert_eq!(eval_price::price::unit_price(10), 80);\n}\n\n#[test]\nfn totals() {\n    assert_eq!(eval_price::cart::total(3), 270);\n    assert_eq!(eval_price::cart::total(10), 800);\n}\n"
+      },
+      "check": {
+        "command": "cargo test --offline --quiet",
+        "expect_contains": ["test result: ok"]
+      }
+    },
+    {
+      "id": "trait-impl-missing",
+      "title": "难样本：报错指在调用处，修复点在另一个模块",
+      "hard": true,
+      "prompt": "工作区里是一个 Rust 小工程，cargo test 编译不过。请定位原因并修好实现，直到全部测试通过。只允许修改实现代码，禁止修改或删除任何测试断言。",
+      "fixture": {
+        "Cargo.toml": "[package]\nname = \"eval_shape\"\nversion = \"0.1.0\"\nedition = \"2021\"\n\n[dependencies]\n",
+        "src/lib.rs": "pub mod area;\npub mod shape;\n",
+        "src/shape.rs": "pub trait Shape {\n    fn area(&self) -> f64;\n}\n\npub struct Rect {\n    pub w: f64,\n    pub h: f64,\n}\n",
+        "src/area.rs": "use crate::shape::Rect;\n\npub fn total(shapes: &[Rect]) -> f64 {\n    shapes.iter().map(|shape| shape.area()).sum()\n}\n",
+        "tests/spec.rs": "use eval_shape::area;\nuse eval_shape::shape::Rect;\n\n#[test]\nfn total_area() {\n    let shapes = vec![Rect { w: 2.0, h: 3.0 }, Rect { w: 1.0, h: 4.0 }];\n    assert_eq!(area::total(&shapes), 10.0);\n}\n"
+      },
+      "check": {
+        "command": "cargo test --offline --quiet",
+        "expect_contains": ["test result: ok"]
+      }
+    },
+    {
+      "id": "dedupe-cross-file",
+      "title": "难样本：把三处重复实现收敛到一个共享模块",
+      "hard": true,
+      "prompt": "工作区里是一个 Rust 小工程：a/b/c 三个模块各自复制了一份 clamp 实现。请新建 src/util.rs 提供 pub fn clamp，把三处调用改成共用它（并补上 mod 声明），直到 cargo test 全部通过。只允许修改实现代码，禁止修改或删除任何测试断言。",
+      "fixture": {
+        "Cargo.toml": "[package]\nname = \"eval_dedupe\"\nversion = \"0.1.0\"\nedition = \"2021\"\n\n[dependencies]\n",
+        "src/lib.rs": "pub mod a;\npub mod b;\npub mod c;\n",
+        "src/a.rs": "fn clamp(value: i32) -> i32 {\n    if value < 0 {\n        0\n    } else if value > 100 {\n        100\n    } else {\n        value\n    }\n}\n\npub fn run(value: i32) -> i32 {\n    clamp(value)\n}\n",
+        "src/b.rs": "fn clamp(value: i32) -> i32 {\n    if value < 0 {\n        0\n    } else if value > 100 {\n        100\n    } else {\n        value\n    }\n}\n\npub fn run(value: i32) -> i32 {\n    clamp(value)\n}\n",
+        "src/c.rs": "fn clamp(value: i32) -> i32 {\n    if value < 0 {\n        0\n    } else if value > 100 {\n        100\n    } else {\n        value\n    }\n}\n\npub fn run(value: i32) -> i32 {\n    clamp(value)\n}\n",
+        "tests/spec.rs": "#[test]\nfn shared_helper_exists() {\n    assert_eq!(eval_dedupe::util::clamp(150), 100);\n    assert_eq!(eval_dedupe::util::clamp(-5), 0);\n}\n\n#[test]\nfn call_sites_agree() {\n    assert_eq!(eval_dedupe::a::run(150), 100);\n    assert_eq!(eval_dedupe::b::run(-5), 0);\n    assert_eq!(eval_dedupe::c::run(42), 42);\n}\n"
+      },
+      "check": {
+        "command": "cargo test --offline --quiet",
+        "expect_contains": ["test result: ok"]
+      }
+    },
+    {
+      "id": "config-doc-sync",
+      "title": "难样本：代码配置与文档同步修改",
+      "hard": true,
+      "prompt": "把超时配置的统一值从 30000 改成 45000：settings.toml 与 docs/settings.md 必须一致，其它键与文案结构保持不动。",
+      "fixture": {
+        "settings.toml": "[remote]\ntimeout_ms = 30000\nretries = 3\n",
+        "docs/settings.md": "# 设置\n\n- remote.timeout_ms 默认 30000\n- remote.retries 默认 3\n"
+      },
+      "check": {
+        "files": [
+          {
+            "path": "settings.toml",
+            "contains_all": ["timeout_ms = 45000"],
+            "absent_all": ["timeout_ms = 30000"]
+          },
+          {
+            "path": "docs/settings.md",
+            "contains_all": ["45000"],
+            "absent_all": ["30000"]
+          }
+        ]
+      }
+    },
+    {
+      "id": "off-by-one-cross-module",
+      "title": "难样本：panic 的根因在另一个模块",
+      "hard": true,
+      "prompt": "工作区里是一个 Rust 小工程，cargo test 会失败（含 panic）。请定位根因并修好实现，直到全部测试通过。只允许修改实现代码，禁止修改或删除任何测试断言。",
+      "fixture": {
+        "Cargo.toml": "[package]\nname = \"eval_bounds\"\nversion = \"0.1.0\"\nedition = \"2021\"\n\n[dependencies]\n",
+        "src/lib.rs": "pub mod queue;\npub mod worker;\n",
+        "src/queue.rs": "pub fn slice(items: &[u8]) -> &[u8] {\n    if items.is_empty() {\n        items\n    } else {\n        &items[..items.len() - 1]\n    }\n}\n",
+        "src/worker.rs": "pub fn last(items: &[u8]) -> u8 {\n    let sliced = crate::queue::slice(items);\n    sliced[sliced.len() - 1]\n}\n",
+        "tests/spec.rs": "#[test]\nfn last_single() {\n    assert_eq!(eval_bounds::worker::last(&[7]), 7);\n}\n\n#[test]\nfn last_three() {\n    assert_eq!(eval_bounds::worker::last(&[1, 2, 3]), 3);\n}\n"
+      },
+      "check": {
+        "command": "cargo test --offline --quiet",
+        "expect_contains": ["test result: ok"]
+      }
+    },
+    {
+      "id": "swallowed-error",
+      "title": "难样本：没有编译错误，只有被吞掉的失败",
+      "hard": true,
+      "prompt": "工作区里是一个 Rust 小工程，cargo test 有一个用例失败。describe 对非法输入必须返回 invalid，不能把解析失败伪装成 0。只允许修改实现代码，禁止修改或删除任何测试断言。",
+      "fixture": {
+        "Cargo.toml": "[package]\nname = \"eval_swallow\"\nversion = \"0.1.0\"\nedition = \"2021\"\n\n[dependencies]\n",
+        "src/lib.rs": "pub mod config;\n",
+        "src/config.rs": "pub fn port(text: &str) -> u16 {\n    text.trim().parse().unwrap_or(0)\n}\n\npub fn describe(text: &str) -> String {\n    format!(\"port={}\", port(text))\n}\n",
+        "tests/spec.rs": "#[test]\nfn valid_port() {\n    assert_eq!(eval_swallow::config::describe(\"8080\"), \"port=8080\");\n}\n\n#[test]\nfn invalid_port_is_reported() {\n    assert_eq!(eval_swallow::config::describe(\"abc\"), \"invalid\");\n}\n"
+      },
+      "check": {
+        "command": "cargo test --offline --quiet",
+        "expect_contains": ["test result: ok"]
+      }
+    },
+    {
+      "id": "multi-agent-two-files",
+      "title": "多代理：派两个子代理各写一个文件",
+      "hard": true,
+      "prompt": "用 orchestrate 工具派两个子代理并行工作：一个创建 out/left.txt（内容包含 LEFTSIDE），另一个创建 out/right.txt（内容包含 RIGHTSIDE）。用 wait_agents 等到两个都结束再汇报结果。不要自己直接写这两个文件。",
+      "multi_agent": true,
+      "check": {
+        "files": [
+          { "path": "out/left.txt", "contains_all": ["LEFTSIDE"] },
+          { "path": "out/right.txt", "contains_all": ["RIGHTSIDE"] }
+        ]
       }
     }
   ]

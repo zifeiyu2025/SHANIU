@@ -45,7 +45,7 @@ use serde::Deserialize;
 use serde_json::json;
 use shaniu_lib::agent_loop::{AgentLoop, ResponsesBackend};
 use shaniu_lib::config::{ApprovalMode, SandboxMode};
-use shaniu_lib::events::{ApprovalDecision, EventMsg, EventSink};
+use shaniu_lib::events::{ApprovalDecision, EventMsg, EventSink, ToolCallResult};
 use shaniu_lib::model_client::provider::ProviderConfig;
 use shaniu_lib::permission::{policy, ApprovalBroker};
 use shaniu_lib::tool_router::{PlanState, ToolRouter};
@@ -53,7 +53,18 @@ use shaniu_lib::tools;
 use tokio_util::sync::CancellationToken;
 
 const PER_TASK_TIMEOUT: Duration = Duration::from_secs(180);
+/// 单任务轮数上限。默认 8 保持既有基线口径；SH-073 的多文件难样本需要为
+/// 「编译失败→读错→再改」的修复循环留余量，可用 `SHANIU_EVAL_MAX_TURNS` 提高。
+/// 两臂必须用同一个值，否则比的不是自愈而是预算。
 const MAX_TURNS_PER_TASK: u32 = 8;
+
+fn max_turns_per_task() -> u32 {
+    std::env::var("SHANIU_EVAL_MAX_TURNS")
+        .ok()
+        .and_then(|value| value.parse::<u32>().ok())
+        .filter(|value| *value > 0)
+        .unwrap_or(MAX_TURNS_PER_TASK)
+}
 static SEQ: AtomicUsize = AtomicUsize::new(0);
 
 fn repo_root() -> PathBuf {
@@ -182,6 +193,14 @@ struct Task {
     /// 失败路径类任务需要自己的工程骨架，不能塞进全局 fixture 去干扰其它任务。
     #[serde(default)]
     fixture: BTreeMap<String, String>,
+    /// 是否给 root 注入编排能力（SH-073 多代理场景）。
+    /// 默认 false：既有任务继续保持"没有 orchestrate 工具"的装配，工具面不变。
+    #[serde(default)]
+    multi_agent: bool,
+    /// 是否计入「难样本子集」（SH-073）。汇总数字会被简单任务稀释，
+    /// 判断"自愈值不值"只看这个子集，故它必须在报告里单独成列。
+    #[serde(default)]
+    hard: bool,
 }
 
 #[derive(Deserialize, Default)]
@@ -199,6 +218,20 @@ struct Check {
     /// 命令通过时还必须出现的输出片段（stdout + stderr 合并匹配）。
     #[serde(default)]
     expect_contains: Vec<String>,
+    /// 多文件断言：`path` 只能查一个文件，而"代码与文档同步改"这类任务必须同时验证
+    /// 两个文件。**不要**改用 shell 命令带引号实现——`cmd /C` 会吃掉内层引号
+    /// （2026-11-09 实测 `findstr /c:"a b"` 退化为 `Cannot open =`），判据会假红。
+    #[serde(default)]
+    files: Vec<FileCheck>,
+}
+
+#[derive(Deserialize, Default)]
+struct FileCheck {
+    path: String,
+    #[serde(default)]
+    contains_all: Vec<String>,
+    #[serde(default)]
+    absent_all: Vec<String>,
 }
 
 /// 判据求值：Ok(()) = 通过；Err 文本同时进报告和失败原因。
@@ -226,20 +259,32 @@ fn verify(ws: &Path, check: &Check) -> Result<(), String> {
             }
         }
     }
-    if check.path.is_empty() {
-        return Ok(());
+    if !check.path.is_empty() {
+        verify_file(ws, &check.path, &check.contains_all, &check.absent_all)?;
     }
-    let target = ws.join(&check.path);
+    for file in &check.files {
+        verify_file(ws, &file.path, &file.contains_all, &file.absent_all)?;
+    }
+    Ok(())
+}
+
+fn verify_file(
+    ws: &Path,
+    path: &str,
+    contains_all: &[String],
+    absent_all: &[String],
+) -> Result<(), String> {
+    let target = ws.join(path);
     let text = std::fs::read_to_string(&target)
-        .map_err(|e| format!("未产出 {}（{e}）", check.path))?;
-    for needle in &check.contains_all {
+        .map_err(|e| format!("未产出 {path}（{e}）"))?;
+    for needle in contains_all {
         if !text.contains(needle) {
-            return Err(format!("{} 缺少必含内容 {needle:?}", check.path));
+            return Err(format!("{path} 缺少必含内容 {needle:?}"));
         }
     }
-    for banned in &check.absent_all {
+    for banned in absent_all {
         if text.contains(banned) {
-            return Err(format!("{} 仍含应被清除的内容 {banned:?}", check.path));
+            return Err(format!("{path} 仍含应被清除的内容 {banned:?}"));
         }
     }
     Ok(())
@@ -275,6 +320,12 @@ struct Agg {
     /// 每一次审批打断的归因（工具 + 风险档 + 原因，上限 12 条）：SH-119 要求报告
     /// 「每次打断的工具、原因、是否本可降噪」，只给总数无法回答"该不该降噪"。
     prompts: Vec<String>,
+    /// 当前轮次（`TurnStarted` 更新）：事件级指标要按轮次划恢复窗口。
+    turn: u32,
+    /// call_id → (起始轮次, 累积输出)：输出只在终态时用来抽错误签名。
+    inflight: BTreeMap<String, (u32, String)>,
+    /// 全部工具终态（上限 200，防长任务把内存撑爆）。
+    tool_events: Vec<ToolEvent>,
 }
 
 /// 参数摘要：够认出模型发了什么，又不至于把报告撑爆。
@@ -311,13 +362,44 @@ impl EventSink for EvalSink {
                 agg.input_tokens += u64::from(*input_tokens);
                 agg.output_tokens += u64::from(*output_tokens);
             }
-            EventMsg::ToolCallBegin { tool, args, .. } => {
+            EventMsg::TurnStarted { turn } => {
+                agg.turn = *turn;
+            }
+            EventMsg::ToolCallBegin { call_id, tool, args } => {
                 agg.tool_calls += 1;
+                if agg.inflight.len() < 64 {
+                    let turn = agg.turn;
+                    agg.inflight.insert(call_id.clone(), (turn, String::new()));
+                }
                 if agg.trace.len() < 10 {
                     agg.trace.push(format!("{tool} {}", args_summary(args)));
                 }
             }
-            EventMsg::ToolCallEnd { result, error, .. } => {
+            EventMsg::ToolCallEnd { call_id, exit_code, error, result } => {
+                // 事件级（SH-073）：失败 = 终态 Error。Denied/Cancelled 是审批与取消，
+                // 不是"改坏了要修"，计进去会把审批摩擦伪装成自愈信号。
+                let ok = match result {
+                    Some(ToolCallResult::Ok) => true,
+                    Some(_) => false,
+                    None => *exit_code == Some(0) && error.is_none(),
+                };
+                if let Some((turn, output)) = agg.inflight.remove(call_id) {
+                    if !ok && agg.tool_events.len() < 200 {
+                        let mut body = output;
+                        if let Some(err) = error {
+                            body.push('\n');
+                            body.push_str(err);
+                        }
+                        agg.tool_events.push(ToolEvent {
+                            turn,
+                            ok,
+                            signature: failure_signature(&body),
+                        });
+                    } else if ok && agg.tool_events.len() < 200 {
+                        // 成功事件也留：恢复轮次要靠它算"什么时候开始不失败了"。
+                        agg.tool_events.push(ToolEvent { turn, ok: true, signature: String::new() });
+                    }
+                }
                 if let Some(last) = agg.trace.last_mut() {
                     let outcome = match (result, error) {
                         (Some(r), None) => format!("→ {r:?}"),
@@ -330,13 +412,19 @@ impl EventSink for EvalSink {
                     last.push_str(&outcome);
                 }
             }
-            EventMsg::ToolCallOutputDelta { delta, .. } => {
+            EventMsg::ToolCallOutputDelta { call_id, delta, .. } => {
                 // 输出正文是归因的关键：只看命令会误判成"模型没写文件"，
                 // 实际可能是它看到的 cwd/结果与预期不符。每条轨迹限 240 字符。
                 if let Some(last) = agg.trace.last_mut() {
                     if last.matches("｜输出=").count() < 1 {
                         let head: String = delta.chars().take(240).collect();
                         last.push_str(&format!("｜输出={head:?}"));
+                    }
+                }
+                if let Some((_, output)) = agg.inflight.get_mut(call_id) {
+                    // 签名只需要报错头部；8KB 足够覆盖 cargo 的错误块，又不至于吃内存。
+                    if output.len() < 8192 {
+                        output.push_str(delta);
                     }
                 }
             }
@@ -369,8 +457,190 @@ impl EventSink for EvalSink {
 
 // ============================== 单任务执行 ==============================
 
+/// 自愈闭环的现场证据（SH-073）：失败样本必须能回答三件事——
+/// ① 有没有触发自愈；② 触发后有没有救回来；③ 那次"绿"是不是靠改测试换来的。
+///
+/// 数据源是落地档案里的 `Role::System` 条目：`RepairController` 的四种动作都以
+/// 独立 System 消息进历史（文案见 `agent_loop/repair.rs`），因此无需给 events
+/// 协议加字段就能复盘。前缀与 repair.rs 同源——改那边文案，这里要一起改。
+#[derive(Default, Clone, serde::Serialize)]
+struct RepairSignals {
+    /// 「自动修复提醒」：确实触发过自愈。
+    nudge: u32,
+    /// 「失败自愈已停止」：触发过但没救回来（次数用尽 / 同一错误重复）。
+    give_up: u32,
+    /// 「修复被拒绝」：靠删/放宽断言变绿，按失败处理（SH-126）。
+    rejected: u32,
+    /// 「可疑修复」：改了测试文件但未检出断言放宽。
+    suspicious: u32,
+}
+
+impl RepairSignals {
+    fn scan(items: &[shaniu_lib::rollout::RolloutItem]) -> Self {
+        use shaniu_lib::model_client::{HistoryItem, Role};
+        use shaniu_lib::rollout::RolloutItem;
+        let mut signals = Self::default();
+        for item in items {
+            let RolloutItem::ResponseItem { item } = item else { continue };
+            let HistoryItem::Message { role, text, .. } = item else { continue };
+            if *role != Role::System {
+                continue;
+            }
+            if text.starts_with("自动修复提醒") {
+                signals.nudge += 1;
+            } else if text.starts_with("失败自愈已停止") {
+                signals.give_up += 1;
+            } else if text.starts_with("修复被拒绝") {
+                signals.rejected += 1;
+            } else if text.starts_with("可疑修复") {
+                signals.suspicious += 1;
+            }
+        }
+        signals
+    }
+
+    /// 是否触发过自愈（任一动作都算：触发过才有"机制值不值"的问题）。
+    fn triggered(&self) -> bool {
+        self.nudge + self.give_up + self.rejected + self.suspicious > 0
+    }
+
+    /// 一句人话归因，直接进失败行：把"无增益"拆成"没触发"与"触发没救回来"。
+    fn note(&self, success: bool) -> String {
+        if !self.triggered() {
+            return if success { "未触发".to_string() } else { "未触发（失败与自愈无关）".to_string() };
+        }
+        format!(
+            "自愈触发: 提醒{} 放弃{} 拒绝{} 可疑{}｜{}",
+            self.nudge,
+            self.give_up,
+            self.rejected,
+            self.suspicious,
+            if success { "最终成功" } else { "触发后仍未成功" },
+        )
+    }
+}
+
+/// 单次工具调用的终态（事件级指标用）。
+struct ToolEvent {
+    turn: u32,
+    ok: bool,
+    /// 失败签名：优先 `文件:行`（跨轮次稳定），否则取首行（去杂讯）。
+    /// 判"同一错误"只认签名——同一 fixture 的错误文案逐轮略有差异，位置才稳定。
+    signature: String,
+}
+
+/// 事件级指标（SH-073）：自愈的作用对象是"失败之后的行为"，任务级成功率会把它稀释。
+/// 口径写死，避免事后解释：
+/// - 失败事件 = 工具终态为 `Error`（`Denied`/`Cancelled` 是审批与取消，不计）；
+/// - 恢复 = 该失败后 **3 轮内**没有出现同签名失败；
+/// - 恢复轮次 = 失败轮次到其后首个成功工具结果所在轮次的间隔（无成功记 3，上限）。
+///
+/// 适用范围：事件级只回答"机制有没有工作"，**不能**用来宣称任务成功率提升。
+#[derive(Default, Clone, serde::Serialize)]
+struct EventStats {
+    failures: u32,
+    recovered: u32,
+    recovery_rate: f64,
+    median_recovery_turns: f64,
+    /// 失败签名直方图：只留前 5 个，够归因又不撑爆报告。
+    top_signatures: Vec<String>,
+}
+
+impl EventStats {
+    const WINDOW: u32 = 3;
+
+    fn from_events(events: &[ToolEvent]) -> Self {
+        let mut failures = 0u32;
+        let mut recovered = 0u32;
+        let mut latencies: Vec<u32> = Vec::new();
+        let mut counts: BTreeMap<&str, u32> = BTreeMap::new();
+        for (i, event) in events.iter().enumerate() {
+            if event.ok {
+                continue;
+            }
+            failures += 1;
+            *counts.entry(event.signature.as_str()).or_insert(0) += 1;
+            let recurred = events[i + 1..].iter().any(|next| {
+                !next.ok
+                    && next.signature == event.signature
+                    && next.turn > event.turn
+                    && next.turn <= event.turn + Self::WINDOW
+            });
+            if !recurred {
+                recovered += 1;
+                let latency = events[i + 1..]
+                    .iter()
+                    .find(|next| {
+                        next.ok
+                            && next.turn > event.turn
+                            && next.turn <= event.turn + Self::WINDOW
+                    })
+                    .map(|next| next.turn - event.turn)
+                    .unwrap_or(Self::WINDOW);
+                latencies.push(latency);
+            }
+        }
+        latencies.sort_unstable();
+        let median = if latencies.is_empty() {
+            0.0
+        } else if latencies.len().is_multiple_of(2) {
+            let mid = latencies.len() / 2;
+            f64::from(latencies[mid - 1] + latencies[mid]) / 2.0
+        } else {
+            f64::from(latencies[latencies.len() / 2])
+        };
+        let mut ranked: Vec<(&str, u32)> = counts.into_iter().collect();
+        ranked.sort_by_key(|entry| std::cmp::Reverse(entry.1));
+        Self {
+            failures,
+            recovered,
+            recovery_rate: if failures == 0 { 0.0 } else { f64::from(recovered) / f64::from(failures) },
+            median_recovery_turns: median,
+            top_signatures: ranked
+                .iter()
+                .take(5)
+                .map(|(sig, n)| format!("{sig} ×{n}"))
+                .collect(),
+        }
+    }
+}
+
+/// 从输出里抽 `文件:行`：Rust 报错（`--> src/x.rs:12:5`）、`path:line` 都覆盖。
+/// 抽不到就退回首行——但首行含数字（例如 "error: 3 errors"）会漂，故优先位置。
+fn failure_signature(output: &str) -> String {
+    for line in output.lines() {
+        for token in line.split_whitespace() {
+            let token = token.trim_matches(|c: char| {
+                matches!(c, '`' | '\'' | '"' | '(' | ')' | ',' | ';' | '[' | ']')
+            });
+            let token = token.strip_prefix("-->").unwrap_or(token);
+            let mut parts = token.rsplitn(3, ':');
+            let (Some(col), Some(line_no), Some(path)) =
+                (parts.next(), parts.next(), parts.next())
+            else {
+                continue;
+            };
+            if col.parse::<u32>().is_err() || line_no.parse::<u32>().is_err() {
+                continue;
+            }
+            if path.contains('.') && (path.contains('/') || path.contains('\\')) {
+                return format!("{path}:{line_no}");
+            }
+        }
+    }
+    let first = output.lines().map(str::trim).find(|line| !line.is_empty()).unwrap_or("");
+    let first: String = first.chars().take(120).collect();
+    if first.is_empty() {
+        "（无输出）".to_string()
+    } else {
+        first
+    }
+}
+
 struct Outcome {
     success: bool,
+    /// 零轮结束（端点/装配问题）：计入失败但单独统计，归因时不能算成模型能力。
+    infra: bool,
     detail: String,
     trace: Vec<String>,
     prompts: Vec<String>,
@@ -381,6 +651,8 @@ struct Outcome {
     approvals: u32,
     unresolved: u32,
     ms: u128,
+    repair: RepairSignals,
+    events: EventStats,
 }
 
 /// 评估用的 broker：默认装**生产语义**（同 turn 批量确认 + 前缀白名单都在），
@@ -460,13 +732,13 @@ async fn run_one(
         )
         .expect("评估档案应可创建（同名旧档已先删除）"),
     );
-    let agent = AgentLoop {
+    let agent = Arc::new(AgentLoop {
         backend,
         router: Arc::new(router),
         broker: broker.clone(),
         plan_state,
         workspace_root: ws.clone(),
-        max_turns: MAX_TURNS_PER_TASK,
+        max_turns: max_turns_per_task(),
         // 压缩默认关闭，由 `SHANIU_EVAL_TOKEN_BUDGET` 显式打开。
         // 必须能分别跑"禁用/启用"两档：SH-032 的验收是"长会话不丢上下文"，
         // 而基线退化判定要能归因到压缩本身——混在一起就分不清是端点波动还是压缩代价。
@@ -484,19 +756,36 @@ async fn run_one(
         session_id: None,
         jobs: None,
         stop_hook: None,
-    };
+    });
+    // 多代理场景（SH-073）：只有标了 `multi_agent` 的任务才注入编排器。
+    // 其余任务保持原装配（不声明 orchestrate），避免工具面变化污染既有基线。
+    let orchestrator: Option<Arc<dyn shaniu_lib::tool_router::orchestration::AgentOrchestrator>> =
+        task.multi_agent.then(|| {
+            let registry = Arc::new(shaniu_lib::subagent_registry::SubagentRegistry::new(2));
+            let orchestrator =
+                shaniu_lib::subagent_registry::orchestrator::RegistryOrchestrator::new(
+                    registry,
+                    agent.clone(),
+                );
+            Arc::new(orchestrator) as Arc<dyn shaniu_lib::tool_router::orchestration::AgentOrchestrator>
+        });
 
     let started = Instant::now();
     let summary = tokio::time::timeout(
         PER_TASK_TIMEOUT,
-        agent.run_task(&task.prompt, sink.clone(), CancellationToken::new()),
+        agent.run_task_with_orchestrator(
+            &task.prompt,
+            sink.clone(),
+            CancellationToken::new(),
+            orchestrator,
+        ),
     )
     .await;
     let ms = started.elapsed().as_millis();
 
     let (turns, reason) = match &summary {
         Ok(s) => (s.turns, format!("{:?}", s.reason)),
-        Err(_) => (MAX_TURNS_PER_TASK, "超时被丢弃（>180s）".to_string()),
+        Err(_) => (max_turns_per_task(), "超时被丢弃（>180s）".to_string()),
     };
     let agg = sink.agg.lock().unwrap();
     let verdict = verify(&ws, &task.check);
@@ -507,8 +796,24 @@ async fn run_one(
     if !agg.errors.is_empty() {
         detail.push_str(&format!("｜错误=[{}]", agg.errors.join(" / ")));
     }
+    // 档案契约（SH-030 的真机一侧）：真实端点跑完必须留下可读回的档案。
+    // 断言放在这里而不是另开单测——单测造得出历史，造不出真实端点的时序与取消路径。
+    let archive = shaniu_lib::rollout::read(&rollout_dir.join(format!("{session_id}.jsonl")))
+        .unwrap_or_else(|e| panic!("任务 {session_id} 的档案读回失败：{e}"));
+    // 自愈现场（SH-073）：从同一条档案里数 System 条目，失败样本因此能回答
+    // 「没触发」还是「触发了没救回来」——这两种结论完全不同。
+    let repair = RepairSignals::scan(&archive.items);
+    // 端点抖动可能让第一个 turn 都没开始（turns=0），此时档案只有 SessionMeta 是合法的。
+    // 此前这里一律 assert，一次抖动就把整轮实验连同其它样本一起炸掉（2026-11-09 实测：
+    // control 臂 run 1 第 8 题，档案 349 字节只有 SessionMeta）。现在标记 infra 继续跑，
+    // 该样本仍以"失败"计入（保守，不排除噪声），报告里单列 infra 数量。
+    let infra = turns == 0 && archive.items.is_empty();
+    if infra {
+        detail = format!("[infra] 零轮结束（端点或装配失败，非模型能力）｜{detail}");
+    }
     let out = Outcome {
-        success: verdict.is_ok(),
+        success: verdict.is_ok() && !infra,
+        infra,
         detail,
         trace: agg.trace.clone(),
         prompts: agg.prompts.clone(),
@@ -519,13 +824,11 @@ async fn run_one(
         approvals: agg.approvals,
         unresolved: agg.unresolved,
         ms,
+        repair,
+        events: EventStats::from_events(&agg.tool_events),
     };
-    // 档案契约（SH-030 的真机一侧）：真实端点跑完必须留下可读回的档案。
-    // 断言放在这里而不是另开单测——单测造得出历史，造不出真实端点的时序与取消路径。
-    let archive = shaniu_lib::rollout::read(&rollout_dir.join(format!("{session_id}.jsonl")))
-        .unwrap_or_else(|e| panic!("任务 {session_id} 的档案读回失败：{e}"));
     assert!(
-        archive.items.len() >= 2,
+        infra || archive.items.len() >= 2,
         "档案至少要有用户任务与一条助手输出，实际 {} 条：{:?}",
         archive.items.len(),
         archive.items
@@ -558,16 +861,23 @@ async fn evals_baseline_v0() {
     let raw = std::fs::read_to_string(repo_root().join("evals").join("tasks.json"))
         .expect("evals/tasks.json 必须存在");
     let spec: TasksFile = serde_json::from_str(&raw).expect("evals/tasks.json 解析失败");
-    // 单任务调试用（SHANIU_EVAL_ONLY=create-note）：全量一轮要几分钟与真实额度，
-    // 归因时只需要重跑失败那一个
+    // 任务筛选：
+    // - `SHANIU_EVAL_ONLY` 支持逗号分隔多 id（归因时重跑失败的那几个）；
+    // - `SHANIU_EVAL_HARD_ONLY=1` 只跑难样本子集——对照组自身的波动必须单独量，
+    //   混进简单任务会把离散度摊薄，看不出真实范围（SH-073）。
     let only = std::env::var("SHANIU_EVAL_ONLY").unwrap_or_default();
+    let only_ids: Vec<&str> =
+        only.split(',').map(str::trim).filter(|id| !id.is_empty()).collect();
+    let hard_only = std::env::var("SHANIU_EVAL_HARD_ONLY")
+        .ok()
+        .is_some_and(|value| value.trim() == "1");
     let selected: Vec<&Task> = spec
         .tasks
         .iter()
-        .filter(|t| only.is_empty() || t.id == only)
+        .filter(|t| (only_ids.is_empty() || only_ids.contains(&t.id.as_str())) && (!hard_only || t.hard))
         .collect();
     if selected.is_empty() {
-        panic!("SHANIU_EVAL_ONLY={only} 在 tasks.json 里没有对应任务 id");
+        panic!("任务筛选后为空（SHANIU_EVAL_ONLY={only} SHANIU_EVAL_HARD_ONLY={hard_only}）");
     }
 
     // 单次运行不足以判定退化：端点抖动能轻易造成 30% 级别的 token 偏移（实测 32%/轮）。
@@ -607,6 +917,7 @@ async fn evals_baseline_v0() {
             );
             if !out.success {
                 // 失败必带轨迹：没有"模型实际发了什么"，归因只能靠猜
+                println!("    · {}", out.repair.note(false));
                 for line in &out.trace {
                     println!("    · {line}");
                 }
@@ -614,7 +925,9 @@ async fn evals_baseline_v0() {
             rows.push(json!({
                 "id": task.id,
                 "title": task.title,
+                "hard": task.hard,
                 "success": out.success,
+                "infra": out.infra,
                 "turns": out.turns,
                 "tool_calls": out.tool_calls,
                 "trace": out.trace,
@@ -624,6 +937,9 @@ async fn evals_baseline_v0() {
                 "approvals": out.approvals,
                 "unresolved_approvals": out.unresolved,
                 "ms": out.ms,
+                "repair": out.repair,
+                "repair_note": out.repair.note(out.success),
+                "events": out.events,
                 "detail": out.detail,
             }));
         }
@@ -634,14 +950,78 @@ async fn evals_baseline_v0() {
             .iter()
             .map(|r| r["input_tokens"].as_u64().unwrap_or(0) + r["output_tokens"].as_u64().unwrap_or(0))
             .sum();
+        // 难样本子集单独成列（SH-073）：8 个难任务被 6 个简单任务稀释后，
+        // 汇总成功率看不出自愈有没有用；判断"值不值"只能看这一行。
+        let hard_rows: Vec<&serde_json::Value> =
+            rows.iter().filter(|r| r["hard"].as_bool().unwrap_or(false)).collect();
+        let hard_n = hard_rows.len();
+        let hard_passed = hard_rows.iter().filter(|r| r["success"].as_bool().unwrap_or(false)).count();
+        let hard_turns: u32 =
+            hard_rows.iter().filter_map(|r| r["turns"].as_u64()).map(|t| t as u32).sum();
+        let hard_tokens: u64 = hard_rows
+            .iter()
+            .map(|r| r["input_tokens"].as_u64().unwrap_or(0) + r["output_tokens"].as_u64().unwrap_or(0))
+            .sum();
+        let hard_hit = hard_rows
+            .iter()
+            .filter(|r| r["repair"]["nudge"].as_u64().unwrap_or(0) > 0
+                || r["repair"]["give_up"].as_u64().unwrap_or(0) > 0)
+            .count();
+        // 事件级聚合（SH-073）：样本量比任务级多一个数量级，用来回答"机制有没有工作"。
+        // 注意它**不能**用来宣称任务成功率提升——两件事各管各的。
+        let ev_failures: u64 = rows
+            .iter()
+            .map(|r| r["events"]["failures"].as_u64().unwrap_or(0))
+            .sum();
+        let ev_recovered: u64 = rows
+            .iter()
+            .map(|r| r["events"]["recovered"].as_u64().unwrap_or(0))
+            .sum();
+        let mut ev_latencies: Vec<f64> = rows
+            .iter()
+            .filter(|r| r["events"]["failures"].as_u64().unwrap_or(0) > 0)
+            .filter_map(|r| r["events"]["median_recovery_turns"].as_f64())
+            .collect();
+        ev_latencies.sort_by(|a, b| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal));
+        // infra = 零轮结束的样本数：端点抖动留下的噪声，不能算进"模型能力"的归因。
+        let infra_count = rows
+            .iter()
+            .filter(|r| r["infra"].as_bool().unwrap_or(false))
+            .count();
         println!(
-            "[evals] run {run}/{repeats} 小计 成功率={passed}/{count}，平均轮数={:.2}，平均 token={:.0}，平均打断={:.2}",
+            "[evals] run {run}/{repeats} 小计 成功率={passed}/{count}，平均轮数={:.2}，平均 token={:.0}，平均打断={:.2}{}",
             f64::from(sum_turns) / n,
             sum_tokens as f64 / n,
             if count == 0 {
                 0.0
             } else {
                 rows.iter().filter_map(|r| r["approvals"].as_u64()).sum::<u64>() as f64 / n
+            },
+            if infra_count == 0 {
+                String::new()
+            } else {
+                format!("｜infra={infra_count}（零轮噪声，计入失败）")
+            },
+        );
+        println!(
+            "[evals] run {run}/{repeats} 难样本 成功率={hard_passed}/{hard_n}，平均轮数={:.2}，平均 token={:.0}，自愈触发={hard_hit}",
+            if hard_n == 0 { 0.0 } else { f64::from(hard_turns) / hard_n as f64 },
+            if hard_n == 0 { 0.0 } else { hard_tokens as f64 / hard_n as f64 },
+        );
+        println!(
+            "[evals] run {run}/{repeats} 事件级 失败={ev_failures} 恢复={ev_recovered}/{ev_failures} {} 恢复轮次中位数={:.1}",
+            if ev_failures == 0 {
+                "（无失败事件）".to_string()
+            } else {
+                format!("({:.0}%)", 100.0 * ev_recovered as f64 / ev_failures as f64)
+            },
+            if ev_latencies.is_empty() {
+                0.0
+            } else if ev_latencies.len().is_multiple_of(2) {
+                let mid = ev_latencies.len() / 2;
+                (ev_latencies[mid - 1] + ev_latencies[mid]) / 2.0
+            } else {
+                ev_latencies[ev_latencies.len() / 2]
             },
         );
         if first_rows.is_none() {
@@ -661,6 +1041,35 @@ async fn evals_baseline_v0() {
                 } else {
                     rows.iter().filter_map(|r| r["approvals"].as_u64()).sum::<u64>() as f64 / n
                 },
+                // 难样本子集（SH-073）：每一轮独立留档——对照组自身的波动范围
+                // 就靠这几次的离散度来量，混进汇总数字里就看不出来了。
+                "hard": {
+                    "n": hard_n,
+                    "passed": hard_passed,
+                    "success_rate": if hard_n == 0 { 0.0 } else { hard_passed as f64 / hard_n as f64 },
+                    "avg_turns": if hard_n == 0 { 0.0 } else { f64::from(hard_turns) / hard_n as f64 },
+                    "avg_total_tokens": if hard_n == 0 { 0.0 } else { hard_tokens as f64 / hard_n as f64 },
+                    "repair_triggered": hard_hit,
+                    "infra": infra_count,
+                },
+                // 事件级（SH-073）：只看"失败之后有没有恢复"，与任务级并列但不能互相解释。
+                "events": {
+                    "failures": ev_failures,
+                    "recovered": ev_recovered,
+                    "recovery_rate": if ev_failures == 0 {
+                        0.0
+                    } else {
+                        ev_recovered as f64 / ev_failures as f64
+                    },
+                    "median_recovery_turns": if ev_latencies.is_empty() {
+                        0.0
+                    } else if ev_latencies.len().is_multiple_of(2) {
+                        let mid = ev_latencies.len() / 2;
+                        (ev_latencies[mid - 1] + ev_latencies[mid]) / 2.0
+                    } else {
+                        ev_latencies[ev_latencies.len() / 2]
+                    },
+                },
             },
             "tasks": rows,
         }));
@@ -676,6 +1085,31 @@ async fn evals_baseline_v0() {
     let success_rates = metric("success_rate");
     let turns = metric("avg_turns");
     let tokens = metric("avg_total_tokens");
+    // 难样本子集的中位数与区间（SH-073）：判断"自愈值不值"的唯一口径。
+    let hard_metric = |key: &str| -> Vec<f64> {
+        runs.iter().map(|run| run["summary"]["hard"][key].as_f64().unwrap_or(0.0)).collect()
+    };
+    let hard_success = hard_metric("success_rate");
+    let hard_turns = hard_metric("avg_turns");
+    let hard_tokens = hard_metric("avg_total_tokens");
+    let hard_passed_values: Vec<f64> = runs
+        .iter()
+        .map(|run| run["summary"]["hard"]["passed"].as_f64().unwrap_or(0.0))
+        .collect();
+    let hard_total = selected.iter().filter(|task| task.hard).count();
+    // 事件级（SH-073）：各轮失败数、恢复率、恢复轮次，取中位数留档。
+    let ev_failures: Vec<f64> = runs
+        .iter()
+        .map(|run| run["summary"]["events"]["failures"].as_f64().unwrap_or(0.0))
+        .collect();
+    let ev_rates: Vec<f64> = runs
+        .iter()
+        .map(|run| run["summary"]["events"]["recovery_rate"].as_f64().unwrap_or(0.0))
+        .collect();
+    let ev_latencies: Vec<f64> = runs
+        .iter()
+        .map(|run| run["summary"]["events"]["median_recovery_turns"].as_f64().unwrap_or(0.0))
+        .collect();
     let passed_values: Vec<f64> = runs
         .iter()
         .map(|run| run["summary"]["passed"].as_f64().unwrap_or(0.0))
@@ -715,7 +1149,7 @@ async fn evals_baseline_v0() {
         "provider": provider.provider,
         "base_url": provider.base_url,
         "model": provider.model,
-        "max_turns_per_task": MAX_TURNS_PER_TASK,
+        "max_turns_per_task": max_turns_per_task(),
         "repeats": repeats,
         "aggregate": "median-of-runs",
         // 来源自证：谁跑的、什么时候、哪份提交、写到了哪个文件。
@@ -744,6 +1178,24 @@ async fn evals_baseline_v0() {
             "success_rate_range": [min(&success_rates), max(&success_rates)],
             "avg_turns_range": [min(&turns), max(&turns)],
             "avg_total_tokens_range": [min(&tokens), max(&tokens)],
+            // 难样本子集（SH-073）：与全量并列，单独看这一行才知道自愈有没有用。
+            "hard": {
+                "n": hard_total,
+                "passed": median(&hard_passed_values) as u32,
+                "success_rate": median(&hard_success),
+                "avg_turns": median(&hard_turns),
+                "avg_total_tokens": median(&hard_tokens),
+                "success_rate_range": [min(&hard_success), max(&hard_success)],
+                "avg_turns_range": [min(&hard_turns), max(&hard_turns)],
+            },
+            // 事件级（SH-073）：回答"失败之后机制有没有工作"，不是"任务交付有没有变好"。
+            "events": {
+                "failures": median(&ev_failures) as u64,
+                "failures_range": [min(&ev_failures) as u64, max(&ev_failures) as u64],
+                "recovery_rate": median(&ev_rates),
+                "recovery_rate_range": [min(&ev_rates), max(&ev_rates)],
+                "median_recovery_turns": median(&ev_latencies),
+            },
         },
         "runs": runs,
         // 逐任务差异对比用第一次运行；完整数据在 runs 里。
@@ -760,6 +1212,16 @@ async fn evals_baseline_v0() {
         median(&tokens),
         min(&tokens),
         max(&tokens),
+    );
+    println!(
+        "[evals] 难样本汇总（{repeats} 次中位数，n={hard_total}）成功率={:.0}%（区间 {:.0}%–{:.0}%），平均轮数={:.2}（{:.2}–{:.2}），平均 token={:.0}",
+        median(&hard_success) * 100.0,
+        min(&hard_success) * 100.0,
+        max(&hard_success) * 100.0,
+        median(&hard_turns),
+        min(&hard_turns),
+        max(&hard_turns),
+        median(&hard_tokens),
     );
     println!(
         "[evals] 样本校验：期望 {expected_samples} 份档案，实际 {actual_sessions} 份 → {}",
@@ -989,4 +1451,75 @@ fn min(values: &[f64]) -> f64 {
 
 fn max(values: &[f64]) -> f64 {
     values.iter().copied().fold(f64::NEG_INFINITY, f64::max)
+}
+
+// ============================== 判据自身的反向验证 ==============================
+//
+// 两题从假红改为 PASS 只证明「不再误判」，**没证明判据能红**。一个永远返回 Ok 的
+// `verify`、一个把缺文件当静默通过的分支，会让整套评估变成"全绿"而无人察觉——
+// 那比模型答错严重得多。下面四条是探针：该绿的一条必须绿，三条红的路必须
+// 各自红在不同的原因上（缺内容 / 有残留 / 没产出），且失败原因可定位。
+
+fn verify_scratch_dir(tag: &str) -> PathBuf {
+    let dir = std::env::temp_dir().join(format!("shaniu-verify-{}-{}-{tag}", id(), now_ms()));
+    std::fs::create_dir_all(&dir).expect("创建判据探针临时目录");
+    dir
+}
+
+fn files_check(path: &str, contains: &[&str], absent: &[&str]) -> Check {
+    Check {
+        files: vec![FileCheck {
+            path: path.to_string(),
+            contains_all: contains.iter().map(|s| (*s).to_string()).collect(),
+            absent_all: absent.iter().map(|s| (*s).to_string()).collect(),
+        }],
+        ..Check::default()
+    }
+}
+
+#[test]
+fn verify_accepts_when_every_assertion_holds() {
+    let ws = verify_scratch_dir("green");
+    std::fs::write(ws.join("settings.toml"), "timeout_ms = 45000\n").unwrap();
+    let verdict = verify(&ws, &files_check("settings.toml", &["45000"], &["30000"]));
+    std::fs::remove_dir_all(&ws).ok();
+    assert!(verdict.is_ok(), "合法产物必须通过：{verdict:?}");
+}
+
+#[test]
+fn verify_rejects_when_contains_all_missing() {
+    let ws = verify_scratch_dir("missing");
+    std::fs::write(ws.join("settings.toml"), "timeout_ms = 30000\n").unwrap();
+    let verdict = verify(&ws, &files_check("settings.toml", &["45000"], &[]));
+    std::fs::remove_dir_all(&ws).ok();
+    let reason = verdict.expect_err("目标串缺失时必须判红，否则检查形同虚设");
+    assert!(
+        reason.contains("缺少必含内容"),
+        "失败原因必须指向缺失项，实际：{reason}"
+    );
+}
+
+#[test]
+fn verify_rejects_when_absent_all_still_present() {
+    let ws = verify_scratch_dir("stale");
+    std::fs::write(ws.join("settings.toml"), "timeout_ms = 30000\n").unwrap();
+    let verdict = verify(&ws, &files_check("settings.toml", &[], &["30000"]));
+    std::fs::remove_dir_all(&ws).ok();
+    let reason = verdict.expect_err("应被清除的内容仍在时必须判红");
+    assert!(
+        reason.contains("仍含应被清除的内容"),
+        "失败原因必须指向残留项，实际：{reason}"
+    );
+}
+
+#[test]
+fn verify_rejects_when_file_missing() {
+    let ws = verify_scratch_dir("absent");
+    let verdict = verify(&ws, &files_check("settings.toml", &[], &[]));
+    std::fs::remove_dir_all(&ws).ok();
+    let reason = verdict.expect_err("文件不存在时必须判红，不能静默通过");
+    assert!(
+        reason.contains("未产出"),
+        "失败原因必须指向未产出文件，实际：{reason}"
+    );
 }
