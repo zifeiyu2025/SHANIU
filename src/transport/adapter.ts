@@ -3340,6 +3340,13 @@ export function createAdapter(options: AdapterOptions): { remote: unknown; dispo
    * 进程退出即清空（`docs/05` SH-089 注）。
    */
   const JOB_POLL_MS = 400
+  /**
+   * 列表轮询的静默退避：行集合连续多次不变就降到 2s 一次，变化即回 400ms。
+   * 只用在 `list`（花名册，平时不动）上；`follow` 不退避——它的轮询延迟直接变成
+   * 终端输出的观感，宁可多问几次宿主。
+   */
+  const JOB_IDLE_POLL_MS = 2000
+  const JOB_IDLE_AFTER = 3
   const JOB_TERMINAL = new Set(['completed', 'killed', 'failed'])
   interface JobRowWire {
     readonly id: string
@@ -3378,14 +3385,18 @@ export function createAdapter(options: AdapterOptions): { remote: unknown; dispo
       signal?: AbortSignal,
     ): AsyncGenerator<Record<string, unknown>> {
       let previous = ''
+      let idle = 0
       while (signal?.aborted !== true) {
         const jobs = await bridge.invoke<JobRowWire[]>('job_list', { sessionId: request.sessionId })
         const signature = JSON.stringify(jobs)
         if (signature !== previous) {
           previous = signature
+          idle = 0
           yield { type: 'rows', jobs }
+        } else {
+          idle += 1
         }
-        await waitAbortable(JOB_POLL_MS, signal)
+        await waitAbortable(idle >= JOB_IDLE_AFTER ? JOB_IDLE_POLL_MS : JOB_POLL_MS, signal)
       }
     },
     follow: async function* (
