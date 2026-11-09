@@ -7,12 +7,15 @@
 //! - **声明**（`ModelProfile::capabilities`）：值取模型行既有字段，记录"谁说的"
 //!   （端点元数据 / 手动）。
 //! - **实测**（本模块的探针 + `<data_root>\cache\capabilities.json` 缓存）：只记录
-//!   "测出来是什么"。两者不互相覆盖，设置页并列显示三态（已验证 / 与声明不符 /
-//!   未验证）。
+//!   "测出来是什么"。两者不互相覆盖，设置页并列显示四态（检测中 / 已验证 /
+//!   与声明不符 / 未验证）。
 //!
-//! 缓存键 = `base_url + 协议 + model id + 密钥指纹`：换 key / 换端点 / 换模型即
-//! 自然失效并重探；同一组合只探一次，不每次启动都打请求。密钥只以 SHA-256 前
-//! 16 位十六进制参与键，明文不进缓存、不进日志。
+//! 缓存键 = `base_url + 协议 + model id + 密钥指纹 + 探针版本`：换 key / 换端点 /
+//! 换模型 / 改探针即自然失效并重探；同一组合只探一次，不每次启动都打请求。密钥
+//! 只以 SHA-256 前 16 位十六进制参与键，明文不进缓存、不进日志。
+//!
+//! 探针版本进键的原因：改了题面 / 判据 / 采样次数却不作废旧结论，等于拿旧尺子量
+//! 新东西——改进本身没法被验证，还会让"探针已改好"与"缓存里还是旧答案"长期共存。
 
 use std::collections::{BTreeMap, HashSet};
 use std::io::Cursor;
@@ -28,10 +31,46 @@ use tauri::Manager;
 use crate::config::{CapabilityRecord, CapabilitySource, ModelProfile, ProviderProfile};
 
 pub const CACHE_FILE: &str = "capabilities.json";
-/// 实测判「不生效」的相对阈值（用户拍板）：最高档与最低档的 reasoning 指标差异
-/// 小于 5% 就是噪声内，判"不生效"，而不是"生效但模型没怎么想"。判反了会让用户
-/// 以为自己开了高档思考，而端点其实一个字段都没读。
-pub const REASONING_NOISE_RATIO: f64 = 0.05;
+/// 推理探针版本号：题面 + 判据 + 每档采样次数 + 输出上限一起算出的常量。
+/// **它必须进缓存键**：改探针就等于换了一把尺子，旧结论一律作废重测。
+/// 否则改进探针只是对着旧答案自欺——"探针已修好"与"缓存里还是旧结论"会长期共存。
+pub const PROBE_VERSION: &str = "2026-11-09/arith-selfcheck/cap512/n3/r15/k2/threshold3";
+/// 推理指标（`reasoning_tokens`）的相对噪声**下限**：噪声带至少占两档较大中位数的
+/// 15%。
+///
+/// 为什么是 15% 而不是 5%：5% 是按**单样本**噪声定的，约束不了**跨轮**漂移。
+/// 2026-11-09 同一配置连续多轮实测里，同一端点的两档中位数本身就在 low 69–92 /
+/// high 113–136 之间漂移（约为量级的 ±20%）。单轮 3 个样本看不见这种漂移：
+/// round 1 的高档三样本恰好是 [104,124,125]，MAD 只有 1，于是 6.5 的效应/噪声比
+/// 把一次幸运采成了「生效」，而其余各轮全是「数据不足」。下限抬到 15% 之后，
+/// 判据要求高档/低档 ≥ 约 1.82× 才敢说"生效"——低于它就如实说不可判。
+/// 这个数不是拍的，是"跨轮中位数漂移实测 ~20%，取下界 15%"。
+pub const REASONING_NOISE_RATIO: f64 = 0.15;
+/// 每档采样次数。偶数样本的中位数取中间两值均值，稳定性差；3 是能取中位数的
+/// 最小奇数，也是"一次请求失败还剩下 2 个"之外的硬门槛——少于 3 个直接判数据不足。
+pub const REASONING_SAMPLES: usize = 3;
+/// 噪声带对档内离散度的放大系数：噪声带 = max(15% × 规模, 2 × 档内极差)。
+///
+/// 用极差、不用 MAD：n=3 时 MAD 只取"中间那个偏差"，一次幸运的紧采样就能把它压到
+/// 0/1（round 1 的高档 [104,124,125] 正是如此）。极差不会低估这组样本自身的波动。
+/// 乘 2 是因为 3 个样本的极差仍只是整体波动的下界估计，再留一倍余量。
+pub const NOISE_DISPERSION_K: f64 = 2.0;
+/// 档内相对离散度上限：极差 / 中位数 > 50% 说明这一档自己就抖得说不出话，
+/// 直接判「数据不足」，不许拿它去比方向。
+pub const MAX_RELATIVE_DISPERSION: f64 = 0.5;
+/// 允许下**确定结论**的最小「效应/噪声」比。
+///
+/// 门槛从 2 抬到 3 的不对称理由：声称"这个功能可用"需要的证据，比声称"我不知道"
+/// 多。2026-11-09 概率题一轮比值 10.28 判生效、另一轮 0.79 判不足——把 10.28 那轮
+/// 固化，运气好的一次就被写成事实，而且它不会自己暴露（不像"不可判"可以重测）。
+/// 所以宁可多落「不可判」，也不让一次侥幸变成永久结论。
+pub const EFFECT_NOISE_MIN: f64 = 3.0;
+/// 推理探针每次请求的输出上限。短算式题（low 实测 78–91、max 91–116）零触顶；
+/// 旧版用长链题时 low 就贴到 507/1022，截断会伪造结论，所以上限不是越小越省。
+pub const REASONING_MAX_TOKENS: u32 = 512;
+/// 推理段单独的时间预算（秒）。6 次请求在 ~1.2s/次的端点上约 7s；超预算记
+/// 「数据不足」而不是让整卡 30s 总超时把视觉/工具的结论一起吞掉。
+pub const REASONING_BUDGET_SECS: u64 = 20;
 /// 两次推理探针请求的最小间隔。同端点连着打两发容易被限流，实测 1s 以上稳定。
 pub const PROBE_INTERVAL_MS: u64 = 1_100;
 /// 单模型一次检测的总超时。超时记 `verified=None` + 原因、**不无限等**：
@@ -87,6 +126,16 @@ pub struct ProbeOutcome {
     pub verified: Option<bool>,
     /// 实测通过的推理档（仅 `reasoning`）。
     pub verified_levels: Vec<String>,
+    /// 推理探针每次采样的原始指标值，按档位分组（如 `{"low": [56, 61, 60]}`）。
+    /// **不存结论了事**：出现翻案时，要能一眼分出是数据抖了还是判据写错了。
+    pub samples: BTreeMap<String, Vec<u64>>,
+    /// 推理探针每档**触顶**（`completion_tokens >= max_tokens`）的样本数。
+    /// 截断会伪造结论：贴顶的样本数值不可信，必须进缓存、进证据文案。
+    pub censored: BTreeMap<String, u32>,
+    /// 「不可判」终态：数据已采完，但判据给不出确定结论（比值不足 / 触顶）。
+    /// 与瞬时失败（网络 / 429 / 超时）严格区分：只有它才是终态、不再自动重探；
+    /// 瞬时失败下一轮还会再试。设置页可对终态手动重探一次。
+    pub unjudgeable: bool,
     pub evidence: String,
     pub checked_at_ms: u64,
     /// 本项探针实际耗时（毫秒）。`None` = 没测到（历史缓存、请求失败、图片编码失败），
@@ -155,6 +204,11 @@ impl ProbeCache {
     pub fn put(&mut self, key: String, outcomes: BTreeMap<String, ProbeOutcome>) {
         self.entries.insert(key, outcomes);
     }
+
+    /// 手动重探前清掉该键：只作废这一条，不牵连别的模型。
+    pub fn remove(&mut self, key: &str) {
+        self.entries.remove(key);
+    }
 }
 
 /// 正在跑的探针（按缓存键）。设置页据此把「检测中」与「未验证」分开：
@@ -193,10 +247,16 @@ impl Drop for InflightGuard<'_> {
     }
 }
 
-/// 缓存键：端点 + 协议 + 模型 + 密钥指纹。任何一项变了就是另一条记录，
-/// 旧结论自然失效——不用额外写"失效条件"的代码，键本身就是失效条件。
+/// 缓存键：端点 + 协议 + 模型 + 密钥指纹 + **探针版本**。任何一项变了就是另一条
+/// 记录，旧结论自然失效——不用额外写"失效条件"的代码，键本身就是失效条件。
 pub fn cache_key(base_url: &str, protocol: &str, model: &str, api_key: &str) -> String {
-    format!("{base_url}\u{1f}{protocol}\u{1f}{model}\u{1f}{}", key_fingerprint(api_key))
+    cache_key_for(base_url, protocol, model, api_key, PROBE_VERSION)
+}
+
+/// 带版本参数的键构造。生产走 [`cache_key`]；这里单独留一个口子，单测才能证明
+/// "版本变了就落到另一条记录"，而不是只在注释里声称。
+fn cache_key_for(base_url: &str, protocol: &str, model: &str, api_key: &str, version: &str) -> String {
+    format!("{base_url}\u{1f}{protocol}\u{1f}{model}\u{1f}{}\u{1f}{version}", key_fingerprint(api_key))
 }
 
 fn key_fingerprint(api_key: &str) -> String {
@@ -466,7 +526,7 @@ fn declared_source(
     builtin.unwrap_or(CapabilitySource::Unknown)
 }
 
-/// 设置页看到的一行能力：值 + 来源 + 三态。
+/// 设置页看到的一行能力：值 + 来源 + 四态（检测中 / 已验证 / 不符 / 未验证）。
 ///
 /// 来源优先级（高 → 低）：手动 > 端点 > 内置表 > 推测 > 未知。实测只改 `state`，
 /// **从不改**声明值——"填错了"必须被保留在界面上，而不是被一次探测洗成"对的"。
@@ -580,6 +640,10 @@ pub fn model_view(
         let verified = outcome
             .and_then(|o| o.verified)
             .or_else(|| record.and_then(|r| r.verified));
+        // 「不可判」是**终态**：数据采完了但判据给不出结论（比值不足 / 触顶），
+        // 不是"没测过"。它与 `unverified` 必须分开，否则用户会以为探针坏了或者
+        // 能力不可用——实际上它只是这个问题在这个端点上没法回答。
+        let unjudgeable = outcome.is_some_and(|o| o.unjudgeable);
         let state = match verified {
             Some(true) => "verified",
             Some(false) => "mismatch",
@@ -587,6 +651,7 @@ pub fn model_view(
             // 手动的项不采纳探针结论，对它显示"检测中"只会误导；没有探针的项
             // （上下文窗口 / 输出上限 / 托管搜索）永远是「未验证」，不能装作在测。
             None if probing && !manual_record && item.probe => "probing",
+            None if unjudgeable && !manual_record && item.probe => "unjudgeable",
             None => "unverified",
         };
         entry.insert("state".into(), serde_json::Value::String(state.into()));
@@ -857,59 +922,166 @@ async fn probe_tools(client: &reqwest::Client, target: &ProbeTarget) -> ProbeOut
     }
 }
 
-/// 推理档判据的三态（用户拍板）。**为什么必须分三态**：
+/// 推理档判据的三态 + 「不可判」。**为什么必须留第四态**：
 ///
-/// - 高档明显高于低档 = 参数生效；
-/// - 两档在噪声内 = 参数被忽略，或该模型本来就不区分档位；
-/// - 高档明显**低于**低档 = 端点根本没识别这个字段。
+/// - 高档中位数**显著**高于低档（效应/噪声 ≥ [`EFFECT_NOISE_MIN`] 且零触顶）= 参数生效；
+/// - 高档中位数**显著**低于低档 = 端点根本没识别这个字段；
+/// - **不可判 = 我不知道**：效应/噪声不足、任一档触顶、样本不够、档内抖得离谱。
 ///
-/// 后两种都判"不生效"，但原因不同，文案必须分开——否则排查时会把"字段没被识别"
-/// 误读成"模型行为如此"。
+/// 只有"生效/不生效"两个出口时，任何不稳定数据都得被强行归到一边，于是必然翻案。
+/// 2026-11-09 同一端点先判 56→191「生效」、再判 98→66「未识别」——两次相反的确定结论。
+/// 因此「不生效」不再是一个可下结论的出口：说"它没用"和说"它有用"一样需要证据。
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ReasoningVerdict {
     Effective,
-    Ignored,
     NotRecognized,
+    Insufficient,
+}
+
+/// 第四态的具体成因。判据与证据文案共用同一份判断，避免两处各写一套顺序、
+/// 各说各话（2026-11-09 就出现过"判不足、文案却写噪声带"的错位）。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum InsufficientReason {
+    /// 每档样本少于 [`REASONING_SAMPLES`]。
+    NotEnoughSamples,
+    /// 档内相对离散度过大（极差 / 中位数 > [`MAX_RELATIVE_DISPERSION`]）。
+    TooDispersed,
+    /// 噪声带被档内离散度撑起，差异与抖动分不开。
+    BandDominated,
+    /// 效应/噪声比低于 [`EFFECT_NOISE_MIN`]：不足以声称"生效"，也不足以声称"没用"。
+    BelowThreshold,
+    /// 任一档有样本触顶（`completion_tokens >= max_tokens`）：截断会伪造结论。
+    Censored,
+    /// 推理段预算用尽。属**瞬时**失手，不是终态，下一轮还会重试。
+    BudgetExhausted,
+}
+
+impl InsufficientReason {
+    /// 是否是可以写死的「不可判」终态。
+    ///
+    /// 与瞬时失败的分界：数据采完、结论由判据给出 → 终态；请求没跑完（预算 / 样本
+    /// 不足）→ 下一轮还能再试。把两者混成一个"数据不足"，就分不清"这个端点测不出"
+    /// 与"这次运气不好"。
+    fn is_terminal(self) -> bool {
+        !matches!(self, Self::NotEnoughSamples | Self::BudgetExhausted)
+    }
+}
+
+/// 判据的全部中间量。单测拿它验数值，界面/日志拿它写证据。
+#[derive(Debug, Clone, PartialEq)]
+pub struct ReasoningJudgement {
+    pub verdict: ReasoningVerdict,
+    /// 仅 `Insufficient` 时有值：这次为什么判不出来。
+    pub reason: Option<InsufficientReason>,
+    pub low_median: f64,
+    pub high_median: f64,
+    /// 噪声带（指标绝对值）：|中位数差| 小于它就不可判方向。
+    pub band: f64,
+    /// 两档里较大的档内极差。
+    pub dispersion: f64,
+    /// 相对变化（高档中位数 / 低档中位数 - 1）；低档为 0 时是 `INFINITY`。
+    pub ratio: f64,
+    /// 效应/噪声比：`|中位数差| / 噪声带`。只有它 ≥ [`EFFECT_NOISE_MIN`] 才允许下
+    /// 确定结论——它同时约束了效应量与抖动，比单看差多少更稳。
+    pub effect_over_noise: f64,
+}
+
+/// 取中位数（样本为空时 0）。
+fn median_of(mut values: Vec<f64>) -> f64 {
+    if values.is_empty() {
+        return 0.0;
+    }
+    values.sort_by(|a, b| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal));
+    let mid = values.len() / 2;
+    if values.len() % 2 == 1 {
+        values[mid]
+    } else {
+        (values[mid - 1] + values[mid]) / 2.0
+    }
+}
+
+/// 档内离散度：极差（max − min）。
+///
+/// 为什么不用 MAD：n=3 时 MAD 只取"中间那个偏差"，[104,124,125] 的 MAD 是 1，
+/// 会把一次幸运的紧采样误当成"稳定"。极差不会低估这组样本自身的波动。
+fn range_of(samples: &[u64]) -> f64 {
+    match (samples.iter().min(), samples.iter().max()) {
+        (Some(min), Some(max)) => (*max as f64) - (*min as f64),
+        _ => 0.0,
+    }
 }
 
 /// 判据本体（纯函数，单测直接验它，不在测试里另抄一份公式）。
 ///
-/// 阈值 [`REASONING_NOISE_RATIO`]（5%）以**低档为基准**，正反两个方向同阈值：
-/// 涨幅 ≥5% 算生效，跌幅 ≥5% 算"字段未被识别"，其余都算噪声内。
-/// 返回 `(判定, 相对变化)`；反向时变化为负值。
-pub fn judge_reasoning(low: u64, high: u64) -> (ReasoningVerdict, f64) {
-    if low == 0 && high == 0 {
-        return (ReasoningVerdict::Ignored, 0.0);
-    }
-    if high < low {
-        let drop = (low - high) as f64 / low as f64;
-        let verdict = if drop >= REASONING_NOISE_RATIO {
-            ReasoningVerdict::NotRecognized
-        } else {
-            ReasoningVerdict::Ignored
-        };
-        return (verdict, -drop);
-    }
-    let rise = if low == 0 {
+/// 噪声带 = `max(15% × 规模, 2 × 档内极差)`，规模取两档中位数较大者。
+/// 这样"模型想多深"本身带来的抖动会被算进噪声，而不是被当成效果。
+///
+/// 顺序即优先级：**先证明数据可信（样本够、不抖、没触顶），再看效应是否大过噪声**。
+/// `censored` 是两档触顶样本的总数——只要有一个，数值就被截断过，结论不可信。
+pub fn judge_reasoning_samples(low: &[u64], high: &[u64], censored: u32) -> ReasoningJudgement {
+    let low_median = median_of(low.iter().map(|v| *v as f64).collect());
+    let high_median = median_of(high.iter().map(|v| *v as f64).collect());
+    let low_dispersion = range_of(low);
+    let high_dispersion = range_of(high);
+    let dispersion = low_dispersion.max(high_dispersion);
+    let scale = low_median.max(high_median);
+    let band = (REASONING_NOISE_RATIO * scale).max(NOISE_DISPERSION_K * dispersion);
+    let difference = high_median - low_median;
+    let ratio = if low_median > 0.0 {
+        difference / low_median
+    } else if high_median > 0.0 {
         f64::INFINITY
     } else {
-        (high - low) as f64 / low as f64
+        0.0
     };
-    let verdict = if rise >= REASONING_NOISE_RATIO {
-        ReasoningVerdict::Effective
+    let effect_over_noise = if band > 0.0 { difference.abs() / band } else { f64::INFINITY };
+    let judgement = |verdict, reason| ReasoningJudgement {
+        verdict,
+        reason,
+        low_median,
+        high_median,
+        band,
+        dispersion,
+        ratio,
+        effect_over_noise,
+    };
+    if low.len() < REASONING_SAMPLES || high.len() < REASONING_SAMPLES {
+        return judgement(ReasoningVerdict::Insufficient, Some(InsufficientReason::NotEnoughSamples));
+    }
+    // 触顶的样本数值不可信：截断会把"预算不够"伪装成"想得少"。
+    if censored > 0 {
+        return judgement(ReasoningVerdict::Insufficient, Some(InsufficientReason::Censored));
+    }
+    // 档内自己就抖得说不清话，拿它去比方向只会得到随机结论。
+    let noisy = |median: f64, spread: f64| median > 0.0 && spread / median > MAX_RELATIVE_DISPERSION;
+    if noisy(low_median, low_dispersion) || noisy(high_median, high_dispersion) {
+        return judgement(ReasoningVerdict::Insufficient, Some(InsufficientReason::TooDispersed));
+    }
+    // 证据门槛：比值不足时，"生效"与"没用"都不许说。
+    if effect_over_noise < EFFECT_NOISE_MIN {
+        // 噪声带主要是被档内离散度撑起来的：连"差异是否存在"都说不清。
+        if NOISE_DISPERSION_K * dispersion > REASONING_NOISE_RATIO * scale {
+            return judgement(ReasoningVerdict::Insufficient, Some(InsufficientReason::BandDominated));
+        }
+        return judgement(ReasoningVerdict::Insufficient, Some(InsufficientReason::BelowThreshold));
+    }
+    if difference > 0.0 {
+        judgement(ReasoningVerdict::Effective, None)
     } else {
-        ReasoningVerdict::Ignored
-    };
-    (verdict, rise)
+        judgement(ReasoningVerdict::NotRecognized, None)
+    }
 }
 
-/// 推理探针：同一问题分别用最低档与最高档，比较 reasoning 指标。
+/// 推理探针：同一问题在最低档 / 最高档各采 [`REASONING_SAMPLES`] 次，**交错发**，
+/// 用中位数比较；判据见 [`judge_reasoning_samples`]。
 ///
-/// 判据见 [`judge_reasoning`]；两次请求间隔 [`PROBE_INTERVAL_MS`]，避免触发限流。
+/// 交错采样而不是"先测完低档再测高档"：模型有预热效应，同一批请求越往后答案往往
+/// 越长，分组采样会把这种漂移记到高档头上，凭空造出"生效"。
+/// 整段受 [`REASONING_BUDGET_SECS`] 预算约束，超预算记「数据不足」，已采样本照样留档。
 async fn probe_reasoning(client: &reqwest::Client, target: &ProbeTarget, row: &ModelProfile) -> ProbeOutcome {
     let started = std::time::Instant::now();
     let levels = row.declared_reasoning_levels(&target.base_url);
-    let Some(low) = levels.first() else {
+    let Some(low) = levels.first().cloned() else {
         return ProbeOutcome {
             verified: None,
             evidence: "只声明了一档推理等级，无法比较".into(),
@@ -917,7 +1089,7 @@ async fn probe_reasoning(client: &reqwest::Client, target: &ProbeTarget, row: &M
             ..Default::default()
         };
     };
-    let high = levels.last().unwrap();
+    let high = levels.last().cloned().unwrap_or_default();
     if low == high {
         return ProbeOutcome {
             verified: None,
@@ -927,73 +1099,183 @@ async fn probe_reasoning(client: &reqwest::Client, target: &ProbeTarget, row: &M
         };
     }
     let wire_of = |level: &str| row.reasoning_wire(&target.base_url, level).unwrap_or_default();
-    let question = "用一句话说明：为什么天空看起来是蓝色的？";
-    let (low_wire, high_wire) = (wire_of(low), wire_of(high));
-    let low_result = reasoning_request(client, target, question, &low_wire).await;
-    tokio::time::sleep(std::time::Duration::from_millis(PROBE_INTERVAL_MS)).await;
-    let high_result = reasoning_request(client, target, question, &high_wire).await;
-    let (low_metric, high_metric) = match (low_result, high_result) {
-        (Ok((low_metric, low_name)), Ok((high_metric, high_name))) if low_name == high_name => {
-            (low_metric, high_metric)
+    // 短算式 + 自检：题面必须**只需要短链推理**，低档才不会被预算截断；同时要求
+    // 自检一遍，让"多想想"有可观测的落点。旧长链题 low 实测 507/1022，贴顶后
+    // 截断会伪造结论——题面与上限是一起定的，不能单改一个。
+    // 答案 162（17×23−19×19=30；30×4=120；7!÷5!=42）。
+    let question = "请先计算，再自检一遍，只输出最终数字：((17×23−19×19)×4+7!÷5!)";
+    let (low_wire, high_wire) = (wire_of(&low), wire_of(&high));
+    let mut low_samples: Vec<u64> = Vec::with_capacity(REASONING_SAMPLES);
+    let mut high_samples: Vec<u64> = Vec::with_capacity(REASONING_SAMPLES);
+    let mut low_censored = 0u32;
+    let mut high_censored = 0u32;
+    let mut metric_name: Option<&'static str> = None;
+
+    let sampling = async {
+        for round in 0..REASONING_SAMPLES {
+            let gap = std::time::Duration::from_millis(PROBE_INTERVAL_MS);
+            if round > 0 {
+                tokio::time::sleep(gap).await;
+            }
+            let low_sample = reasoning_request(client, target, question, &low_wire).await?;
+            tokio::time::sleep(gap).await;
+            let high_sample = reasoning_request(client, target, question, &high_wire).await?;
+            if low_sample.metric != high_sample.metric {
+                return Err("两档回复暴露的推理指标形态不同，无法同口径比较".to_string());
+            }
+            if metric_name.is_some_and(|existing| existing != low_sample.metric) {
+                return Err("多轮采样暴露的推理指标形态不一致，无法同口径比较".to_string());
+            }
+            metric_name = Some(low_sample.metric);
+            if low_sample.censored {
+                low_censored += 1;
+            }
+            if high_sample.censored {
+                high_censored += 1;
+            }
+            low_samples.push(low_sample.value);
+            high_samples.push(high_sample.value);
         }
-        (Err(error), _) | (_, Err(error)) => {
-            return ProbeOutcome { verified: None, evidence: error, checked_at_ms: now_ms(), ..Default::default() };
-        }
-        _ => {
+        Ok(())
+    };
+
+    let budget = std::time::Duration::from_secs(REASONING_BUDGET_SECS);
+    let budget_hit = match tokio::time::timeout(budget, sampling).await {
+        Ok(Ok(())) => false,
+        Ok(Err(error)) => {
             return ProbeOutcome {
                 verified: None,
-                evidence: "两档回复暴露的推理指标形态不同，无法同口径比较".into(),
+                evidence: error,
                 checked_at_ms: now_ms(),
+                elapsed_ms: Some(started.elapsed().as_millis() as u64),
                 ..Default::default()
             };
         }
+        Err(_) => true,
     };
-    let (verdict, ratio) = judge_reasoning(low_metric, high_metric);
-    let effective = verdict == ReasoningVerdict::Effective;
-    // 单调上升说明"这个字段被读了"，因此声明里的其余档一并视为可用；
-    // 判不生效时一个档都不给（选择器不该让人选一个没反应的档）。
-    let verified_levels = if effective { levels.clone() } else { Vec::new() };
-    let change = if ratio.is_finite() {
-        format!("{:+.1}%", ratio * 100.0)
+
+    let censored_total = low_censored + high_censored;
+    let mut judgement = judge_reasoning_samples(&low_samples, &high_samples, censored_total);
+    if budget_hit && judgement.reason.is_none() {
+        // 预算用尽但样本恰好采满：仍按"这次没测成"处理，不把半程数据当结论。
+        judgement.verdict = ReasoningVerdict::Insufficient;
+        judgement.reason = Some(InsufficientReason::BudgetExhausted);
+    }
+    let samples = BTreeMap::from([
+        (low.clone(), low_samples.clone()),
+        (high.clone(), high_samples.clone()),
+    ]);
+    let censored = BTreeMap::from([(low.clone(), low_censored), (high.clone(), high_censored)]);
+    let change = if judgement.ratio.is_finite() {
+        format!("{:+.1}%", judgement.ratio * 100.0)
     } else {
         "低档为 0".to_string()
     };
-    let evidence = match verdict {
-        ReasoningVerdict::Effective => format!(
-            "{low}档 {low_metric} → {high}档 {high_metric}（{change}，超出噪声阈值 {:.0}%）",
-            REASONING_NOISE_RATIO * 100.0
-        ),
-        ReasoningVerdict::Ignored => format!(
-            "{low}档 {low_metric} 与 {high}档 {high_metric} 差异 {change} 在噪声内：参数被忽略或该模型不区分档位"
-        ),
-        ReasoningVerdict::NotRecognized => format!(
-            "{low}档 {low_metric}，{high}档反而 {high_metric}（{change}）：端点未识别该参数"
-        ),
+    // 证据里必须同时有中位数、原始样本、噪声带、效应/噪声比和触顶数——只给结论
+    // 等于要求用户相信一个无法复核的断言。
+    let numbers = format!(
+        "{low}档 中位 {:.0}（样本 {low_samples:?}） / {high}档 中位 {:.0}（样本 {high_samples:?}），噪声带 ±{:.1}，效应/噪声 {:.1}{}",
+        judgement.low_median,
+        judgement.high_median,
+        judgement.band,
+        judgement.effect_over_noise,
+        if censored_total > 0 {
+            format!("，触顶 {censored_total} 个（{low} {low_censored} / {high} {high_censored}）")
+        } else {
+            String::new()
+        }
+    );
+    let evidence = match judgement.verdict {
+        ReasoningVerdict::Effective => {
+            format!("{numbers}：{change} 显著超出噪声带，参数生效")
+        }
+        ReasoningVerdict::NotRecognized => {
+            format!("{numbers}：{change}，方向为负且显著超出噪声带——端点未识别该参数")
+        }
+        ReasoningVerdict::Insufficient => {
+            // 成因由判据给出，不在这里另写一套顺序：两处各判一次必然走样。
+            let reason = match judgement.reason {
+                Some(InsufficientReason::NotEnoughSamples) => format!(
+                    "样本不足（各档需 {REASONING_SAMPLES} 个，实得 {}/{}）",
+                    low_samples.len(),
+                    high_samples.len()
+                ),
+                Some(InsufficientReason::TooDispersed) => format!(
+                    "档内离散度过大（极差 {:.1}，中位 {:.0}/{:.0}，上限 {:.0}%）",
+                    judgement.dispersion,
+                    judgement.low_median,
+                    judgement.high_median,
+                    MAX_RELATIVE_DISPERSION * 100.0
+                ),
+                Some(InsufficientReason::BandDominated) => format!(
+                    "噪声带被档内极差撑起（极差 {:.1}，噪声带 ±{:.1}），分不清「没效果」与「数据太抖」",
+                    judgement.dispersion, judgement.band
+                ),
+                Some(InsufficientReason::BelowThreshold) => format!(
+                    "效应/噪声 {:.1} 低于门槛 {EFFECT_NOISE_MIN:.0}：证据不足以声称「生效」，也不足以声称「没用」",
+                    judgement.effect_over_noise
+                ),
+                Some(InsufficientReason::Censored) => format!(
+                    "有 {censored_total} 个样本触顶（上限 {REASONING_MAX_TOKENS}），截断的数据不可信"
+                ),
+                Some(InsufficientReason::BudgetExhausted) => {
+                    format!("推理段 {REASONING_BUDGET_SECS}s 预算用尽")
+                }
+                None => "判据未给出成因".to_string(),
+            };
+            format!("{numbers}：{reason}——数据不足，无法判定")
+        }
     };
+    let effective = judgement.verdict == ReasoningVerdict::Effective;
+    let unjudgeable = judgement
+        .reason
+        .is_some_and(InsufficientReason::is_terminal)
+        && judgement.verdict == ReasoningVerdict::Insufficient;
     ProbeOutcome {
-        verified: Some(effective),
-        verified_levels,
+        // 「不可判」必须是 `None`：它既不是"生效"也不是"不生效"。
+        verified: if judgement.verdict == ReasoningVerdict::Insufficient {
+            None
+        } else {
+            Some(effective)
+        },
+        // 单调上升说明"这个字段被读了"，因此声明里的其余档一并视为可用；
+        // 判不生效或不可判时一个档都不给（选择器不该让人选一个没反应/没验证过的档）。
+        verified_levels: if effective { levels.clone() } else { Vec::new() },
+        samples,
+        censored,
+        unjudgeable,
         evidence,
         checked_at_ms: now_ms(),
         elapsed_ms: Some(started.elapsed().as_millis() as u64),
     }
 }
 
-/// 发一次带档位的最小请求，返回（指标值，指标名）。指标优先级：
+/// 一次推理采样的结果。`censored` = 本次输出贴到上限，数值已被截断。
+struct ReasoningSample {
+    value: u64,
+    metric: &'static str,
+    censored: bool,
+}
+
+/// 发一次带档位的最小请求。指标优先级：
 /// `reasoning_tokens` → 推理文本长度 → 输出 token 数。三者都拿不到算失败，
 /// 不能把「拿不到」当成「两档都是 0」。
+///
+/// **触顶判定用 `completion_tokens`，不是 `reasoning_tokens`**：推理 token 只占
+/// 输出的一部分，正文也吃预算。只有总输出贴到 `max_tokens` 才说明这次被截断。
 async fn reasoning_request(
     client: &reqwest::Client,
     target: &ProbeTarget,
     question: &str,
     effort: &str,
-) -> Result<(u64, &'static str), String> {
+) -> Result<ReasoningSample, String> {
+    let cap = REASONING_MAX_TOKENS;
     let body = if target.protocol == "openai-responses" {
         serde_json::json!({
             "model": target.model,
             "input": [{ "role": "user", "content": question }],
             "reasoning": { "effort": effort },
-            "max_output_tokens": 512,
+            "max_output_tokens": cap,
             "stream": false,
         })
     } else {
@@ -1001,18 +1283,24 @@ async fn reasoning_request(
             "model": target.model,
             "messages": [{ "role": "user", "content": question }],
             "reasoning_effort": effort,
-            "max_tokens": 512,
+            "max_tokens": cap,
             "stream": false,
         })
     };
     let json = send(client, target, body).await?;
+    // 截断会伪造结论：贴顶样本的方向和幅度都不可信，必须显式标出来。
+    let completion = json
+        .pointer("/usage/completion_tokens")
+        .or_else(|| json.pointer("/usage/output_tokens"))
+        .and_then(serde_json::Value::as_u64);
+    let censored = completion.is_some_and(|tokens| tokens >= u64::from(cap));
     let reasoning_tokens = json
         .pointer("/usage/completion_tokens_details/reasoning_tokens")
         .or_else(|| json.pointer("/usage/output_tokens_details/reasoning_tokens"))
         .or_else(|| json.pointer("/usage/reasoning_tokens"))
         .and_then(serde_json::Value::as_u64);
     if let Some(tokens) = reasoning_tokens {
-        return Ok((tokens, "reasoning_tokens"));
+        return Ok(ReasoningSample { value: tokens, metric: "reasoning_tokens", censored });
     }
     let reasoning_text = if target.protocol == "openai-responses" {
         json.get("output")
@@ -1036,14 +1324,10 @@ async fn reasoning_request(
             .unwrap_or(0)
     };
     if reasoning_text > 0 {
-        return Ok((reasoning_text as u64, "推理文本长度"));
+        return Ok(ReasoningSample { value: reasoning_text as u64, metric: "推理文本长度", censored });
     }
-    let output_tokens = json
-        .pointer("/usage/completion_tokens")
-        .or_else(|| json.pointer("/usage/output_tokens"))
-        .and_then(serde_json::Value::as_u64);
-    match output_tokens {
-        Some(tokens) => Ok((tokens, "输出 token 数")),
+    match completion {
+        Some(tokens) => Ok(ReasoningSample { value: tokens, metric: "输出 token 数", censored }),
         None => Err("端点既没有 reasoning_tokens，也没有推理文本或 usage：无法同口径比较".into()),
     }
 }
@@ -1121,11 +1405,16 @@ fn solid_png_data_url(color: image::Rgb<u8>) -> Result<String, String> {
 /// **不等结果**：命令只负责把探测丢进后台并立刻返回当前视图（`probing = true`），
 /// 设置页照常渲染、轮询到结论再更新。用户点一次不该罚站 10 秒。
 /// 只有"读不到密钥"这类配置问题当场报错——那是发送前就该知道的。
+///
+/// `force = true` 是「不可判」终态的唯一出口：先作废这一条缓存再重探。终态之所以
+/// 要能手动打破，是因为端点/模型会升级，而自动重探会把"测不出来"变成每次启动都
+/// 烧一轮 token 的常态。
 #[tauri::command]
 pub async fn probe_capabilities(
     app: tauri::AppHandle,
     provider: String,
     model: Option<String>,
+    force: Option<bool>,
 ) -> Result<serde_json::Value, String> {
     let state = app.state::<crate::app_state::AppState>();
     let cfg = state.config();
@@ -1155,6 +1444,13 @@ pub async fn probe_capabilities(
     };
     let key = target.cache_key();
     let data_root = state.data_root();
+    // 手动重探先作废这一条：否则后台任务立刻命中缓存、什么都没重测，
+    // 用户会以为"点了没用"。
+    if force.unwrap_or(false) {
+        let mut cache = ProbeCache::load(&data_root);
+        cache.remove(&key);
+        cache.save(&data_root);
+    }
     let probing = state.probing.clone();
     tracing::info!(provider = %row.id, model = %model_row.id, "开始能力实测");
     let row_for_task = model_row.clone();
@@ -1262,6 +1558,15 @@ fn timeout_outcomes(row: &ModelProfile, base_url: &str) -> BTreeMap<String, Prob
     out
 }
 
+/// 缓存条目能否直接复用：结论（无论生效还是不生效）与「不可判」终态都算测过；
+/// 只有**瞬时失败**（网络 / 429 / 超时 / 预算用尽）才留待下一轮重试。
+///
+/// 这条区分是「不可判终态」与「粘性缓存」的分水岭：终态是明确结论、一次写定；
+/// 把瞬时失败也永久缓存，等于让一次网络抖动冒充结论。
+fn reusable(entry: &BTreeMap<String, ProbeOutcome>) -> bool {
+    !entry.is_empty() && entry.values().all(|outcome| outcome.verified.is_some() || outcome.unjudgeable)
+}
+
 /// 跑一次探针并落缓存，带总超时与去重。
 ///
 /// 三条纪律：
@@ -1278,7 +1583,7 @@ pub async fn probe_and_cache(
     inflight: &Inflight,
 ) -> BTreeMap<String, ProbeOutcome> {
     let key = target.cache_key();
-    if let Some(hit) = ProbeCache::load(data_root).get(&key).filter(|entry| !entry.is_empty()) {
+    if let Some(hit) = ProbeCache::load(data_root).get(&key).filter(|entry| reusable(entry)) {
         return hit.clone();
     }
     if !inflight.begin(&key) {
@@ -1391,6 +1696,7 @@ mod tests {
                 evidence: "低 10 / 高 200".into(),
                 checked_at_ms: 7,
                 elapsed_ms: Some(42),
+                ..Default::default()
             },
         );
         let view = model_view(&r, BASE, Some(&outcomes), false);
@@ -1664,19 +1970,126 @@ mod tests {
         assert_ne!(a, cache_key("https://x/v1", "openai-chat", "m2", "sk-secret-aaaa"));
     }
 
+    /// 等长三样本的判定快捷方式，避免每个用例手写 `judge_reasoning_samples(..).verdict`。
+    fn verdict_of(low: [u64; 3], high: [u64; 3]) -> ReasoningVerdict {
+        judge_reasoning_samples(&low, &high, 0).verdict
+    }
+
     #[test]
-    fn reasoning_verdict_is_three_state_and_monotonic() {
-        // 阈值 5% 以低档为基准：4% 噪声内，5% 起算超出。
-        assert_eq!(judge_reasoning(0, 0), (ReasoningVerdict::Ignored, 0.0));
-        assert_eq!(judge_reasoning(100, 104).0, ReasoningVerdict::Ignored, "4% 差异在噪声内");
-        assert_eq!(judge_reasoning(100, 105).0, ReasoningVerdict::Effective, "5% 算生效");
-        assert_eq!(judge_reasoning(10, 200).0, ReasoningVerdict::Effective);
-        assert_eq!(judge_reasoning(0, 50).0, ReasoningVerdict::Effective, "低档 0、高档有推理也算生效");
-        // Sensenova 实测 254 → 7：高档反而更少 = 字段没被识别，不能报成「模型不区分档位」。
-        let (verdict, ratio) = judge_reasoning(254, 7);
-        assert_eq!(verdict, ReasoningVerdict::NotRecognized);
-        assert!(ratio < 0.0, "反向时变化量为负，文案据此写成「反而」");
-        assert_eq!(judge_reasoning(100, 97).0, ReasoningVerdict::Ignored, "3% 反向仍在噪声内");
+    fn reasoning_verdict_needs_evidence_for_both_directions() {
+        // 生效：两档各自稳定，高档中位数明显更高（效应/噪声远超门槛 3）。
+        assert_eq!(verdict_of([100, 101, 100], [300, 305, 300]), ReasoningVerdict::Effective);
+        // 方向为负且显著 → 字段未被识别（Sensenova 实测 254 → 7 的量级）。
+        let reversed = judge_reasoning_samples(&[250, 254, 252], &[7, 8, 7], 0);
+        assert_eq!(reversed.verdict, ReasoningVerdict::NotRecognized);
+        assert!(reversed.ratio < 0.0, "反向时变化量为负，文案据此写成「方向为负」");
+        // 低档为 0、高档有推理也算生效。
+        assert_eq!(verdict_of([0, 0, 0], [50, 52, 51]), ReasoningVerdict::Effective);
+    }
+
+    #[test]
+    fn ratio_below_threshold_is_insufficient_not_ignored() {
+        // +4% 差异：既不足以说"生效"，也不足以说"没用"——只能落「不可判」。
+        // 这正是"声称可用需要更多证据"的不对称门槛：门槛 3 之下，两个方向都不许下结论。
+        let weak = judge_reasoning_samples(&[100, 100, 100], &[104, 104, 104], 0);
+        assert_eq!(weak.verdict, ReasoningVerdict::Insufficient);
+        assert_eq!(weak.reason, Some(InsufficientReason::BelowThreshold));
+        assert!(weak.effect_over_noise < EFFECT_NOISE_MIN, "比值 {:.2}", weak.effect_over_noise);
+        // 门槛之上一档：同样的方向，比值够就允许下结论。
+        let strong = judge_reasoning_samples(&[100, 100, 100], &[200, 200, 200], 0);
+        assert_eq!(strong.verdict, ReasoningVerdict::Effective);
+        assert!(strong.effect_over_noise >= EFFECT_NOISE_MIN);
+    }
+
+    #[test]
+    fn censored_samples_never_produce_a_conclusion() {
+        // 只要有一个样本触顶，数值就被截断过：**不许用截断数据算出生效**。
+        let capped = judge_reasoning_samples(&[100, 101, 100], &[300, 305, 300], 1);
+        assert_eq!(capped.verdict, ReasoningVerdict::Insufficient);
+        assert_eq!(capped.reason, Some(InsufficientReason::Censored));
+        // 这组数据的比值本来足以判"生效"；触顶守卫必须把它拦下来——这正是
+        // "截断会伪造结论"的可执行证据，而不是只在注释里写一句规则。
+        assert!(
+            capped.effect_over_noise > EFFECT_NOISE_MIN,
+            "用例前提：触顶前比值确实够大（{:.1}）",
+            capped.effect_over_noise
+        );
+        assert!(InsufficientReason::Censored.is_terminal(), "触顶是终态，要写进缓存");
+        // 低档触顶同样作废：低档贴顶说明题目对它也过难，效应量会失真。
+        assert_eq!(
+            judge_reasoning_samples(&[500, 502, 512], &[900, 900, 900], 2).reason,
+            Some(InsufficientReason::Censored)
+        );
+    }
+
+    #[test]
+    fn reasoning_verdict_says_insufficient_instead_of_guessing() {
+        // 样本不足：2 个样本取中位数不稳，直接第四态，不许硬判。
+        let short = judge_reasoning_samples(&[100, 100], &[200, 200, 200], 0);
+        assert_eq!(short.verdict, ReasoningVerdict::Insufficient);
+        assert_eq!(short.reason, Some(InsufficientReason::NotEnoughSamples));
+        assert_eq!((short.low_median, short.high_median), (100.0, 200.0));
+        assert!(!InsufficientReason::NotEnoughSamples.is_terminal(), "样本不足是瞬时失手，下一轮还要试");
+        // 档内相对离散度超 50%：这一档自己就说不清话。
+        let dispersed = judge_reasoning_samples(&[10, 100, 300], &[300, 300, 300], 0);
+        assert_eq!(dispersed.verdict, ReasoningVerdict::Insufficient);
+        assert_eq!(dispersed.reason, Some(InsufficientReason::TooDispersed));
+        // 差异只有 12，但两档极差都是 20 → 噪声带被撑到 40：分不清「没效果」与「太抖」。
+        let band = judge_reasoning_samples(&[100, 110, 120], &[112, 122, 132], 0);
+        assert_eq!(band.verdict, ReasoningVerdict::Insufficient);
+        assert_eq!(band.reason, Some(InsufficientReason::BandDominated));
+        assert!(band.band >= NOISE_DISPERSION_K * band.dispersion, "噪声带必须由极差撑起");
+    }
+
+    #[test]
+    fn unjudgeable_is_its_own_state_with_evidence() {
+        // 「不可判」不是「未验证」：前者数据采完了、只是判不出来；后者是没测成。
+        let r = ModelProfile { id: "m-unjudgeable".into(), ..Default::default() };
+        let mut outcomes = BTreeMap::new();
+        outcomes.insert(
+            "reasoning".to_string(),
+            ProbeOutcome {
+                verified: None,
+                unjudgeable: true,
+                evidence: "效应/噪声 0.8 低于门槛 3——数据不足，无法判定".into(),
+                checked_at_ms: 9,
+                ..Default::default()
+            },
+        );
+        let view = model_view(&r, BASE, Some(&outcomes), false);
+        assert_eq!(view["reasoning"]["state"], "unjudgeable");
+        assert!(view["reasoning"]["evidence"].as_str().unwrap_or_default().contains("门槛 3"));
+        // 瞬时失败（unjudgeable=false）仍显示「未验证」——两者不能混成一个词。
+        let transient = BTreeMap::from([(
+            "reasoning".to_string(),
+            ProbeOutcome { verified: None, evidence: "429 限流".into(), ..Default::default() },
+        )]);
+        assert_eq!(model_view(&r, BASE, Some(&transient), false)["reasoning"]["state"], "unverified");
+    }
+
+    #[test]
+    fn probe_version_change_invalidates_old_conclusion() {
+        let dir = crate::test_support::TestTempDir::new("capability-version");
+        let old_key = cache_key_for(BASE, "openai-chat", "m", "k", "old-probe");
+        let mut cache = ProbeCache::default();
+        cache.put(
+            old_key,
+            BTreeMap::from([(
+                "reasoning".to_string(),
+                ProbeOutcome { verified: Some(true), ..Default::default() },
+            )]),
+        );
+        cache.save(&dir);
+        let loaded = ProbeCache::load(&dir);
+        // 当前版本的键查不到旧结论：改题面/判据/采样后必须重测，不能拿旧答案当真。
+        assert!(loaded.get(&cache_key(BASE, "openai-chat", "m", "k")).is_none());
+        // 版本确实参与键：只改版本就会落到另一条记录。
+        assert_ne!(
+            cache_key_for(BASE, "openai-chat", "m", "k", "v1"),
+            cache_key_for(BASE, "openai-chat", "m", "k", "v2")
+        );
+        assert!(cache_key(BASE, "openai-chat", "m", "k").ends_with(PROBE_VERSION));
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[test]

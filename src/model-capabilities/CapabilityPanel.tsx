@@ -46,6 +46,7 @@ const STATE_LABEL: Record<string, CapabilitiesKey> = {
   mismatch: 'state.mismatch',
   probing: 'state.probing',
   unverified: 'state.unverified',
+  unjudgeable: 'state.unjudgeable',
 }
 
 /** 「检测中」的轮询间隔：探针本身有 30s 总超时，2s 一取不会打爆宿主命令。 */
@@ -125,6 +126,26 @@ export function CapabilityPanel(props: Props): ReactNode {
     return () => clearTimeout(timer)
   }, [probing, models, tick])
 
+  // 「检测中」必须看得出在动：一个静态文字会让人以为卡死。这里给已耗时计数，
+  // 1s 一跳；再配合 CSS 的脉冲样式，两种信号都能说明它还活着。
+  const [elapsed, setElapsed] = useState(0)
+  useEffect(() => {
+    if (!probing) {
+      setElapsed(0)
+      return
+    }
+    const startedAt = Date.now()
+    setElapsed(0)
+    const timer = setInterval(() => setElapsed(Math.round((Date.now() - startedAt) / 1000)), 1_000)
+    return () => clearInterval(timer)
+  }, [probing])
+
+  // 手动重探：「不可判」是终态，只在这里（以及换 key/端点）才重测。
+  const reprobe = async (model: string): Promise<void> => {
+    await wire.reprobe?.(provider.provider, model)
+    setTick(value => value + 1)
+  }
+
   if (error !== undefined) {
     return <p className="shaniu-capabilities-error" role="status">{t('loadFailed', { error })}</p>
   }
@@ -138,11 +159,15 @@ export function CapabilityPanel(props: Props): ReactNode {
       </div>
       {/* 检测会真打请求、烧 token：成本量级必须写在用户看得见的地方，不能默认"免费"。 */}
       <p className="shaniu-capabilities-cost" title={t('costDetail')}>{t('cost')}</p>
+      {probing
+        ? <p className="shaniu-capabilities-progress" role="status">{t('probingProgress', { seconds: elapsed })}</p>
+        : null}
       {models.map(model => {
         const capabilities = model.capabilities ?? {}
         const date = dateOf(
           ITEMS.map(item => capabilities[item]?.catalogUpdatedAt).find(value => value !== undefined),
         )
+        const hasUnjudgeable = ITEMS.some(item => capabilities[item]?.state === 'unjudgeable')
         return (
           <div className="shaniu-capabilities-model" key={model.id}>
             <div className="shaniu-capabilities-model-head">
@@ -151,6 +176,17 @@ export function CapabilityPanel(props: Props): ReactNode {
               </span>
               {date !== undefined
                 ? <span className="shaniu-capabilities-date">{t('dataDate', { date })}</span>
+                : null}
+              {hasUnjudgeable && wire.reprobe !== undefined
+                ? (
+                  <button
+                    type="button"
+                    className="shaniu-capabilities-retry"
+                    onClick={() => { void reprobe(model.id) }}
+                  >
+                    {t('retry')}
+                  </button>
+                )
                 : null}
             </div>
             <div className="shaniu-capabilities-items">
@@ -179,6 +215,9 @@ export function CapabilityPanel(props: Props): ReactNode {
                 )
               })}
             </div>
+            {hasUnjudgeable
+              ? <p className="shaniu-capabilities-note">{t('unjudgeableHint')}</p>
+              : null}
           </div>
         )
       })}

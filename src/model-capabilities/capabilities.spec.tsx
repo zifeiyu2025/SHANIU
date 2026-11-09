@@ -165,13 +165,60 @@ describe('src/model-capabilities：值 + 来源 + 三态', () => {
       expect(chip?.textContent).toContain(zh['state.probing'])
       // 成本量级必须在界面上，不能被当成免费操作。
       expect(screen.getByText(zh.cost)).toBeTruthy()
+      // 「检测中」必须看得出在动：要有已耗时计数与预计时长，不能只显示一个静态词。
+      expect(screen.getByText(/预计 10–20 秒/)).toBeTruthy()
 
       await act(async () => { await vi.advanceTimersByTimeAsync(2_000) })
       expect(document.querySelector('.shaniu-capabilities-chip[data-state="probing"]')).toBeNull()
       expect(document.querySelector('.shaniu-capabilities-chip[data-state="verified"]')).toBeTruthy()
+      expect(screen.queryByText(/预计 10–20 秒/)).toBeNull()
     } finally {
       vi.useRealTimers()
     }
+  })
+
+  it('不可判：独立状态、说明文案与手动重探入口', async () => {
+    const UNJUDGEABLE: CapabilityProviderWire = {
+      id: 'deepseek',
+      label: 'DeepSeek',
+      models: [{
+        id: 'deepseek-flash',
+        name: 'DeepSeek Flash',
+        capabilities: {
+          vision: { value: true, source: 'builtin', state: 'verified', catalogUpdatedAt: DATA_DATE },
+          tools: { value: true, source: 'builtin', state: 'verified', catalogUpdatedAt: DATA_DATE },
+          reasoning: {
+            levels: ['low', 'high', 'max'],
+            source: 'builtin',
+            state: 'unjudgeable',
+            evidence: '效应/噪声 0.8 低于门槛 3——数据不足，无法判定',
+            catalogUpdatedAt: DATA_DATE,
+          },
+        },
+      }],
+    }
+    const reprobe = vi.fn(async () => {})
+    const Panel = CapabilityPanel as unknown as (props: Record<string, unknown>) => ReactNode
+    render(
+      <Panel
+        t={translate}
+        wire={{ providers: async () => [UNJUDGEABLE], reprobe }}
+        subscribe={() => () => {}}
+        provider={{ provider: 'deepseek', displayName: 'DeepSeek' }}
+      />,
+    )
+    await screen.findByText('DeepSeek Flash')
+    const chip = document.querySelector('.shaniu-capabilities-chip[data-item="reasoning"]')
+    // 「不可判」不能显示成「未验证」：前者是测过之后的结论，后者是没测成。
+    expect(chip?.getAttribute('data-state')).toBe('unjudgeable')
+    expect(chip?.textContent).toContain(zh['state.unjudgeable'])
+    expect(chip?.getAttribute('title')).toContain('门槛 3')
+    // 文案要告诉用户"不影响使用"，避免被读成能力不可用。
+    expect(screen.getByText(zh.unjudgeableHint)).toBeTruthy()
+    // 终态只能手动打破：按钮存在，点击走 force 重探。
+    const button = screen.getByRole('button', { name: zh.retry })
+    await act(async () => { button.click() })
+    expect(reprobe).toHaveBeenCalledWith('deepseek', 'deepseek-flash')
   })
 
   it('读取失败如实显示，不显示成"没有能力"', async () => {

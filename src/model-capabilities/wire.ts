@@ -18,7 +18,7 @@ export interface CapabilityViewWire {
   readonly default?: string
   /** unknown / endpoint / builtin / inferred / probe / manual。 */
   readonly source?: string
-  /** verified / mismatch / unverified。 */
+  /** verified / mismatch / probing / unverified / unjudgeable。 */
   readonly state?: string
   /** 实测证据原文（"红图→红色"这类），悬浮可见。 */
   readonly evidence?: string
@@ -47,6 +47,11 @@ export interface CapabilityProviderWire {
 /** 能力区块的数据面；测试注入脚本化实现，运行时走 `hostCapabilitiesWire()`。 */
 export interface CapabilitiesWire {
   providers(): Promise<readonly CapabilityProviderWire[]>
+  /**
+   * 手动重探（`probe_capabilities(force=true)`）。「不可判」是终态、不会自动重试，
+   * 这是它唯一的出口；可选是为了让只读场景（测试夹具）不必实现它。
+   */
+  reprobe?(provider: string, model: string): Promise<void>
 }
 
 /** 桌面运行时实现（命令名与 Rust `generate_handler!` 逐字对应）。 */
@@ -55,6 +60,10 @@ export function hostCapabilitiesWire(bridge: HostBridge = tauriBridge()): Capabi
     providers: async () => {
       const snapshot = await bridge.invoke<{ providers?: readonly CapabilityProviderWire[] }>('get_settings')
       return snapshot.providers ?? []
+    },
+    reprobe: async (provider, model) => {
+      // 先作废这一条缓存再重探；后台任务不等结果，轮询自然会把「检测中」翻过去。
+      await bridge.invoke('probe_capabilities', { provider, model, force: true })
     },
   }
 }

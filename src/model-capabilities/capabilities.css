@@ -8,7 +8,8 @@
  *  - verified：中性，靠文字区分；
  *  - mismatch：警示底色 + 警示描边，**不能**和"未验证"长得一样；
  *  - probing：呼吸描边——「正在测」既不是结论也不是失败，别用警示色吓人；
- *  - unverified：虚线描边（表示"还没测"，不是"测过不行"）。
+ *  - unverified：虚线描边（表示"还没测"，不是"测过不行"）；
+ *  - unjudgeable：点线描边 + 次要文字（"测过了，只是判不出来"），与"未验证"分开。
  */
 
 .shaniu-capabilities {
@@ -45,6 +46,36 @@
 .shaniu-capabilities-cost {
   margin: 0;
   font-size: 11px;
+}
+
+/* 「检测中」的可见活性：文字计数（1s 一跳）+ 轻微呼吸，避免看起来像卡死。 */
+.shaniu-capabilities-progress {
+  margin: 0;
+  color: var(--dsw-alias-label-secondary);
+  font-size: 11px;
+  font-variant-numeric: tabular-nums;
+  animation: shaniu-capabilities-pulse 2s ease-in-out infinite;
+}
+
+.shaniu-capabilities-note {
+  margin: 0;
+  color: var(--dsw-alias-label-secondary);
+  font-size: 11px;
+}
+
+.shaniu-capabilities-retry {
+  padding: 0 8px;
+  border: 1px solid var(--dsw-alias-border-l2);
+  border-radius: 999px;
+  background: var(--dsw-alias-bg-layer-2);
+  color: var(--dsw-alias-label-primary);
+  font-size: 11px;
+  line-height: 18px;
+  cursor: pointer;
+}
+
+.shaniu-capabilities-retry:hover {
+  border-color: var(--dsw-alias-label-secondary);
 }
 
 .shaniu-capabilities-model {
@@ -90,6 +121,14 @@
 
 .shaniu-capabilities-chip[data-state='unverified'] {
   border-style: dashed;
+}
+
+/* 「不可判」不是「未验证」：数据采完了，只是判据给不出结论。点线 + 次要色，
+   与未验证的虚线区分开，也不使用警示色（它不影响模型可用）。 */
+.shaniu-capabilities-chip[data-state='unjudgeable'] {
+  border-style: dotted;
+  border-color: var(--dsw-alias-label-secondary);
+  background: var(--dsw-alias-bg-layer-2);
 }
 
 .shaniu-capabilities-chip[data-state='probing'] {
