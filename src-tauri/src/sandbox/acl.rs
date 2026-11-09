@@ -292,10 +292,15 @@ impl AclManager {
                 Some(&error.message),
             );
             return Err(match restore {
-                Ok(()) => format!("给「{}」加沙箱 ACE 失败，已按备份还原：{error}", normalized.display()),
+                Ok(()) => format!(
+                    "给「{}」加沙箱 ACE 失败，已按备份还原：{error}{}",
+                    normalized.display(),
+                    grant_hint(error.access_denied)
+                ),
                 Err(restore_error) => format!(
-                    "给「{}」加沙箱 ACE 失败，且按备份还原也失败（需人工检查 DACL）：{error}；{restore_error}",
-                    normalized.display()
+                    "给「{}」加沙箱 ACE 失败，且按备份还原也失败（需人工检查 DACL）：{error}{}；{restore_error}",
+                    normalized.display(),
+                    grant_hint(error.access_denied)
                 ),
             });
         }
@@ -556,6 +561,19 @@ pub(crate) struct GrantFailure {
 impl std::fmt::Display for GrantFailure {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.write_str(&self.message)
+    }
+}
+
+/// 授权被拒时补一句「用户能照做什么」。只影响报错文案，不改授权流程：
+/// 失败仍然 fail-closed，也不会为了让命令跑起来而绕过沙箱。
+fn grant_hint(access_denied: bool) -> &'static str {
+    if access_denied {
+        "。原因：这个目录的权限当前用户改不了——它通常属于系统目录，或是由管理员权限安装的软件\
+         （Windows 错误 5 = 拒绝访问）。可行的做法：把要运行的程序连同它依赖的解释器复制到你自己的\
+         目录（例如工作区或用户目录），再把配置里的 command 指到新位置后重试；如果必须用现在这个\
+         目录，需要请管理员给当前用户加上修改权限。"
+    } else {
+        ""
     }
 }
 

@@ -624,8 +624,8 @@ impl McpRuntime {
                 // 沙箱/容器准备失败就是失败：**不回退到受限令牌**（那会让用户以为它在
                 // 容器里），如实置 blocked 并把原因留给界面与模型。
                 let reason = format!(
-                    "启动 MCP server 失败（{error}）：已置为 blocked，未回退到受限令牌；\
-                     修正沙箱配置后请显式重连"
+                    "启动 MCP server 失败（{error}）：已置为 blocked，未回退到受限令牌（不会在容器外悄悄运行）。\
+                     按上面的原因处理后，点「连接并审查」重试。"
                 );
                 self.mark_blocked(&config.id, reason.clone()).await;
                 // 置 blocked 的 server 不会被自动重试，容器/ACE 不能等退出才收：
