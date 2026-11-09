@@ -39,11 +39,32 @@ pub struct UnifiedExec {
     /// 已经提示过"改用 read_file"的会话（SH-126①）：同一会话只提示一次，
     /// 连续 `type` 不会把提示刷满上下文。
     hinted_read: std::sync::Mutex<std::collections::HashSet<String>>,
+    /// 已经提示过"改用 apply_patch"的会话（SH-126①写入侧），口径同 `hinted_read`。
+    hinted_write: std::sync::Mutex<std::collections::HashSet<String>>,
 }
 
 /// 用 shell 读文件的命令（SH-126①）。它们能跑通，但绕过了 `read_file` 的截断、
 /// 行号与读状态登记——后续写同一文件时会被"未读先写"拦下，所以值得提示一次。
 const SHELL_READERS: &[&str] = &["cat", "type", "get-content", "gc"];
+
+/// 取被执行的**第一条命令**的程序名（去掉外层引号与 `.exe`）。
+///
+/// 允许 `cmd /c ...`、`powershell -Command ...` 这类外壳。读误用、写误用与
+/// 卷信息探测共用这一个口径，否则同一句命令在三个探测里会得到三种答案。
+fn first_program<'a>(words: &'a [&'a str]) -> Option<&'a str> {
+    let mut index = 0;
+    if matches!(
+        words.first().copied(),
+        Some("cmd" | "cmd.exe" | "powershell" | "powershell.exe" | "pwsh" | "pwsh.exe")
+    ) {
+        index = words
+            .iter()
+            .position(|word| matches!(*word, "/c" | "/k" | "-c" | "-command"))
+            .map(|at| at + 1)
+            .unwrap_or(0);
+    }
+    words.get(index).map(|word| word.trim_matches('"').trim_end_matches(".exe"))
+}
 
 /// 认出"用 shell 读文件"的形态，返回命中的程序名（None = 不是这类命令）。
 ///
@@ -52,16 +73,29 @@ const SHELL_READERS: &[&str] = &["cat", "type", "get-content", "gc"];
 fn shell_reader_program(command: &str) -> Option<&'static str> {
     let lower = command.to_ascii_lowercase();
     let words: Vec<&str> = lower.split_whitespace().collect();
-    let mut index = 0;
-    if matches!(words.first().copied(), Some("cmd" | "powershell" | "pwsh")) {
-        index = words
-            .iter()
-            .position(|word| matches!(*word, "/c" | "/k" | "-c" | "-command"))
-            .map(|at| at + 1)
-            .unwrap_or(0);
-    }
-    let program = words.get(index)?.trim_matches('"').trim_end_matches(".exe");
+    let program = first_program(&words)?;
     SHELL_READERS.iter().copied().find(|known| *known == program)
+}
+
+/// 认出"用 shell 原地改文件"的形态（SH-126①写入侧），返回命中的写法。
+///
+/// 只覆盖显式的原地编辑：`sed -i`、`perl -i/-pi`、`Set-Content`/`Add-Content`/`Out-File`。
+/// **不把 `>` 重定向算进来**——`cargo test > out.log` 是正常用法，误提示会盖过收益。
+fn shell_writer_program(command: &str) -> Option<&'static str> {
+    let lower = command.to_ascii_lowercase();
+    let words: Vec<&str> = lower.split_whitespace().collect();
+    let program = first_program(&words)?;
+    let in_place = words
+        .iter()
+        .any(|word| word.starts_with("-i") || *word == "-pi" || word.starts_with("--in-place"));
+    match program {
+        "sed" if in_place => Some("sed -i"),
+        "perl" if in_place => Some("perl -i"),
+        "set-content" => Some("Set-Content"),
+        "add-content" => Some("Add-Content"),
+        "out-file" => Some("Out-File"),
+        _ => None,
+    }
 }
 
 /// 依赖卷信息、在 AppContainer 下会静默退出的 cmd 命令（SH-021 实测：退出码 1、零输出）。
@@ -74,15 +108,7 @@ const VOLUME_DEPENDENT: &[&str] = &["dir", "vol", "tree"];
 fn volume_dependent_program(command: &str) -> Option<&'static str> {
     let lower = command.to_ascii_lowercase();
     let words: Vec<&str> = lower.split_whitespace().collect();
-    let mut index = 0;
-    if matches!(words.first().copied(), Some("cmd" | "cmd.exe")) {
-        index = words
-            .iter()
-            .position(|word| matches!(*word, "/c" | "/k" | "-c" | "-command"))
-            .map(|at| at + 1)
-            .unwrap_or(0);
-    }
-    let program = words.get(index)?.trim_matches('"').trim_end_matches(".exe");
+    let program = first_program(&words)?;
     VOLUME_DEPENDENT.iter().copied().find(|known| *known == program)
 }
 
@@ -293,6 +319,7 @@ impl UnifiedExec {
                 }),
             ),
             hinted_read: std::sync::Mutex::new(std::collections::HashSet::new()),
+            hinted_write: std::sync::Mutex::new(std::collections::HashSet::new()),
         }
     }
 
@@ -312,6 +339,26 @@ impl UnifiedExec {
         Some(format!(
             "\n[提示] `{program}` 读文件绕过了 read_file 的截断、行号与读状态登记，\
              后续写同一文件可能被判为「未读先写」；改用 read_file 更稳（本会话只提示这一次）。"
+        ))
+    }
+
+    /// SH-126①（写入侧）：用 `sed -i` / `perl -pi` / `Set-Content` 改文件时，
+    /// 在结果尾部追加一条改用编辑工具的提示。口径同读侧：**同一会话只提示一次**，
+    /// 只改文本、不改 `success`，因此不计入工具失败率。
+    fn write_file_hint(&self, ctx: &ToolContext, command: &str) -> Option<String> {
+        let program = shell_writer_program(command)?;
+        let key = ctx
+            .session_id
+            .clone()
+            .unwrap_or_else(|| "__sessionless__".to_string());
+        let mut hinted = self.hinted_write.lock().expect("hinted_write 锁中毒");
+        if !hinted.insert(key) {
+            return None;
+        }
+        Some(format!(
+            "\n[提示] `{program}` 直接改文件绕过了 apply_patch 的 diff 展示与读状态登记：\
+             改错无法按补丁撤回，之后再用 apply_patch 改同一文件容易被判「未读先写」。\
+             改用 apply_patch 更稳（本会话只提示这一次）。"
         ))
     }
 
@@ -627,6 +674,10 @@ impl ToolExecutor for UnifiedExec {
                     }
                     // SH-126①：`type`/`cat`/`Get-Content` 这类读文件形态，提示一次改用 read_file。
                     if let Some(hint) = self.read_file_hint(ctx, command) {
+                        text.push_str(&hint);
+                    }
+                    // SH-126①（写入侧）：`sed -i`/`perl -pi`/`Set-Content` 绕过 apply_patch。
+                    if let Some(hint) = self.write_file_hint(ctx, command) {
                         text.push_str(&hint);
                     }
                     break if code == 0 {
@@ -1000,6 +1051,42 @@ mod tests {
         assert_eq!(shell_reader_program("cmd /c type x"), Some("type"));
         assert_eq!(shell_reader_program("powershell -Command Get-Content x"), Some("get-content"));
         assert_eq!(shell_reader_program("TYPE.EXE x"), Some("type"));
+    }
+
+    /// SH-126①（写入侧）：只认显式原地编辑，别把正常重定向也当成误用。
+    #[test]
+    fn shell_writer_program_recognizes_in_place_editors_only() {
+        assert_eq!(shell_writer_program("sed -i s/a/b/ src/x.rs"), Some("sed -i"));
+        assert_eq!(shell_writer_program("sed --in-place s/a/b/ src/x.rs"), Some("sed -i"));
+        assert_eq!(shell_writer_program("perl -pi -e 's/a/b/' src/x.rs"), Some("perl -i"));
+        assert_eq!(
+            shell_writer_program("powershell -Command Set-Content -Path a.txt -Value b"),
+            Some("Set-Content")
+        );
+        assert_eq!(shell_writer_program("pwsh -c Add-Content a.txt b"), Some("Add-Content"));
+        // 只读 / 只打印，不是写入：不提示
+        assert_eq!(shell_writer_program("sed -n 1,10p src/x.rs"), None);
+        assert_eq!(shell_writer_program("perl -e 'print 1'"), None);
+        // 重定向是正常用法（跑测试存日志），刻意不提示
+        assert_eq!(shell_writer_program("cargo test > out.log"), None);
+        assert_eq!(shell_writer_program("echo hi"), None);
+    }
+
+    /// 提示只加文本、不改 success，且同一会话只出现一次。
+    #[test]
+    fn shell_write_hint_fires_once_per_session_and_keeps_success() {
+        let ws = workspace();
+        let exec = UnifiedExec::new();
+        let first = exec
+            .write_file_hint(&ctx(&ws), "sed -i s/a/b/ src/x.rs")
+            .expect("sed -i 应提示改用 apply_patch");
+        assert!(first.contains("apply_patch"), "{first}");
+        assert!(
+            exec.write_file_hint(&ctx(&ws), "perl -pi -e 's/a/b/' src/y.rs").is_none(),
+            "同会话第二次不再提示"
+        );
+        // 读误用与写误用是两类，互不吞掉对方的提示额度
+        assert!(exec.read_file_hint(&ctx(&ws), "type note.txt").is_some());
     }
 
     #[tokio::test]
