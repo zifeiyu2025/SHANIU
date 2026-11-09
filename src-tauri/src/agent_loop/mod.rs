@@ -157,6 +157,51 @@ pub struct AgentLoop {
     pub stop_hook: Option<Arc<dyn StopHook>>,
 }
 
+/// 档案写入的连续失败阈值：同一条目重试这么多次仍失败，视为档案不可写。
+///
+/// 不看单次抖动（杀毒软件短暂占用文件句柄可以自愈），只看"同一条目连续失败"——
+/// 磁盘满/权限错这类持续性故障会在第一次 flush 就触顶。
+const MAX_ROLLOUT_WRITE_ATTEMPTS: u32 = 3;
+
+/// 把 `history[*recorded..]` 逐条追加进档案，成功一条推进一格。
+///
+/// **失败时游标停在失败条目前**（审计 H3）：已成功写入的前缀不回退，失败条目与它之后
+/// 的条目也不会被误记为已落盘。原先无条件 `*recorded = history.len()` 会让这些条目
+/// 永远不再写入，resume 时历史凭空少一段——档案看起来完整，实际与运行态分叉。
+///
+/// 同一条目连续失败达到 [`MAX_ROLLOUT_WRITE_ATTEMPTS`] → 返回硬错误，由调用方中止本轮；
+/// 不再"发一次 Error 事件继续跑"。
+fn append_pending<F>(
+    history: &[HistoryItem],
+    recorded: &mut usize,
+    mut append: F,
+) -> Result<(), String>
+where
+    F: FnMut(&crate::rollout::RolloutItem) -> Result<(), crate::rollout::RolloutError>,
+{
+    while *recorded < history.len() {
+        let entry =
+            crate::rollout::RolloutItem::ResponseItem { item: history[*recorded].clone() };
+        let mut last_error = None;
+        for _ in 0..MAX_ROLLOUT_WRITE_ATTEMPTS {
+            match append(&entry) {
+                Ok(()) => {
+                    last_error = None;
+                    break;
+                }
+                Err(e) => last_error = Some(e),
+            }
+        }
+        if let Some(e) = last_error {
+            return Err(format!(
+                "会话档案写入失败（同一条目连续 {MAX_ROLLOUT_WRITE_ATTEMPTS} 次），已停止本轮：{e}"
+            ));
+        }
+        *recorded += 1;
+    }
+    Ok(())
+}
+
 impl AgentLoop {
     /// 注入会话作用域与作业注册表（SH-089）；装配层在构造后调用。
     pub fn with_jobs(
@@ -178,29 +223,19 @@ impl AgentLoop {
 
     /// 把 `history` 里尚未落盘的尾部条目补写进档案。
     ///
-    /// 失败不中断本轮执行——工具与模型都不依赖档案；但必须**播报**：
-    /// 静默降级会让用户以为"会话有存档、可以 resume"，而实际没有。
+    /// 返回 `Err` = 档案已不可写（连续失败触顶），调用方必须中止本轮并标 Failed——
+    /// 继续跑只会让内存历史与档案进一步分叉。游标推进规则见 [`append_pending`]。
     fn flush_history(
         &self,
         rollout: &Option<Arc<crate::rollout::RolloutWriter>>,
-        sink: &Arc<dyn crate::events::EventSink>,
         history: &[HistoryItem],
         recorded: &mut usize,
-    ) {
-        let Some(writer) = rollout else { *recorded = history.len(); return };
-        for item in &history[*recorded..] {
-            let entry = crate::rollout::RolloutItem::ResponseItem { item: item.clone() };
-            if let Err(e) = writer.append(&entry) {
-                if !self.rollout_broke.swap(true, std::sync::atomic::Ordering::Relaxed) {
-                    let _ = sink.emit(&EventMsg::Error {
-                        message: format!("会话档案写入失败（后续不再重复播报）：{e}"),
-                    });
-                }
-                // 失败后不再重试剩余条目：同一块盘继续试只会刷更多错误
-                break;
-            }
-        }
-        *recorded = history.len();
+    ) -> Result<(), String> {
+        let Some(writer) = rollout else {
+            *recorded = history.len();
+            return Ok(());
+        };
+        append_pending(history, recorded, |entry| writer.append(entry))
     }
 
     /// 就地压缩一段历史：发一次不带工具的总结请求 → 写 `Compacted` 锚点 → 用摘要替换区间。
@@ -1031,12 +1066,24 @@ impl AgentLoop {
                     reasoning: None,
                 });
             }
-            // 轮末落盘：崩溃只丢当前轮，之前各轮的档案已经 flush 到位
-            self.flush_history(rollout, &sink, history, recorded);
+            // 轮末落盘：崩溃只丢当前轮，之前各轮的档案已经 flush 到位。
+            // 档案不可写 = 硬错误：继续跑只会让档案与运行态分叉（审计 H3）。
+            if let Err(message) = self.flush_history(rollout, history, recorded) {
+                if !self.rollout_broke.swap(true, std::sync::atomic::Ordering::Relaxed) {
+                    emit(&sink, EventMsg::Error { message });
+                }
+                reason = TurnEndReasonLocal::Failed;
+                break 'outer;
+            }
         }
 
         // 覆盖所有 break 路径（取消/失败/预算耗尽）——它们都从这里收口
-        self.flush_history(rollout, &sink, history, recorded);
+        if let Err(message) = self.flush_history(rollout, history, recorded) {
+            if !self.rollout_broke.swap(true, std::sync::atomic::Ordering::Relaxed) {
+                emit(&sink, EventMsg::Error { message });
+            }
+            reason = TurnEndReasonLocal::Failed;
+        }
 
         emit(&sink, EventMsg::TurnCompleted {
             turn: last_turn,
@@ -1517,7 +1564,52 @@ mod tests {
         assert_eq!(summary.reason, TurnEndReason::Cancelled);
     }
 
-    #[tokio::test]
+    /// 审计 H3：写入失败时游标必须停在失败条目前；连续失败触顶后返回硬错误，
+    /// 而不是把游标推到 `history.len()` 让这些条目永久不落盘。
+    #[test]
+    fn archive_cursor_stops_at_the_failed_item_and_hard_fails_at_threshold() {
+        let history = vec![
+            HistoryItem::Message { role: Role::User, text: "a".into(), reasoning: None },
+            HistoryItem::Message { role: Role::User, text: "b".into(), reasoning: None },
+        ];
+        let mut recorded = 0usize;
+        let mut calls = 0u32;
+        let err = append_pending(&history, &mut recorded, |_item| {
+            calls += 1;
+            // 第一条成功，第二条永久失败
+            if calls == 1 {
+                Ok(())
+            } else {
+                Err(crate::rollout::RolloutError::Io("磁盘满".into()))
+            }
+        })
+        .unwrap_err();
+        assert_eq!(recorded, 1, "游标必须停在失败条目前，不能越过它");
+        assert_eq!(calls, 1 + MAX_ROLLOUT_WRITE_ATTEMPTS, "失败条目应按阈值重试");
+        assert!(err.contains("连续 3 次"), "{err}");
+    }
+
+    /// 单次抖动（文件被短暂占用）重试成功后必须继续推进游标，不能把瞬时故障当永久损坏。
+    #[test]
+    fn archive_write_retries_transient_failure_then_advances() {
+        let history =
+            vec![HistoryItem::Message { role: Role::User, text: "a".into(), reasoning: None }];
+        let mut recorded = 0usize;
+        let mut calls = 0u32;
+        append_pending(&history, &mut recorded, |_| {
+            calls += 1;
+            if calls == 1 {
+                Err(crate::rollout::RolloutError::Io("瞬时占用".into()))
+            } else {
+                Ok(())
+            }
+        })
+        .unwrap();
+        assert_eq!(recorded, 1, "重试成功后游标必须前进");
+        assert_eq!(calls, 2);
+    }
+
+    #[tokio::test]
     async fn model_failure_maps_to_failed() {
         let (agent, store, cancel, _broker) = make_loop(vec![vec![ModelStreamEvent::Failed { message: "boom".into() }]]);
         let summary = agent.run_task("任务", Arc::new(CapturingSink(store.clone())), cancel).await;

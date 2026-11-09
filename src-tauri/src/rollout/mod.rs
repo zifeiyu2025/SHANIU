@@ -193,7 +193,13 @@ pub struct Rollout {
 pub fn read(path: &Path) -> Result<Rollout, RolloutError> {
     let file = File::open(path).map_err(|e| RolloutError::Io(format!("{path:?}: {e}")))?;
     let reader = BufReader::new(file);
-    let mut raw_lines: Vec<String> = reader.lines().map(|l| l.unwrap_or_default()).collect();
+    // 读错误必须原样上报（审计 M6）：`unwrap_or_default()` 会把中段的 IO/编码错误
+    // 变成空行再被静默跳过，于是"档案损坏"被伪装成"这一行本来就没有"——
+    // 与文件头"中间坏行直接报错"的契约正好相反。
+    let mut raw_lines: Vec<String> = Vec::new();
+    for line in reader.lines() {
+        raw_lines.push(line.map_err(|e| RolloutError::Io(format!("{path:?}: {e}")))?);
+    }
 
     // 半截写判定看**文件末尾有没有换行**，而不是看 JSON 能不能解析：
     // 崩溃时最后一段可能恰好是合法 JSON 的前缀，也可能碰巧完整——只有换行位置是可靠信号。
@@ -607,6 +613,37 @@ mod tests {
         .unwrap();
         let err = read(&path).unwrap_err();
         assert!(matches!(err, RolloutError::Corrupted { .. }), "中间坏行必须报错：{err}");
+    }
+
+    /// 审计 M6：读取层面的 IO/编码错误必须转成 `RolloutError::Io`。
+    /// 修复前 `unwrap_or_default()` 把它变成空行再被静默跳过——档案损坏被伪装成
+    /// "这一行本来就没有"，与"中间坏行直接报错"的契约相反。
+    #[test]
+    fn read_io_error_in_the_middle_is_reported_not_swallowed() {
+        let dir = temp_dir();
+        let path = dir.join("agent-io-error.jsonl");
+        let mut bytes = Vec::new();
+        bytes.extend_from_slice(serde_json::to_string(&meta("io")).unwrap().as_bytes());
+        bytes.push(b'\n');
+        // 非法 UTF-8：`lines()` 读取该行时返回 InvalidData
+        bytes.extend_from_slice(&[0xff, 0xfe]);
+        bytes.push(b'\n');
+        bytes.extend_from_slice(
+            serde_json::to_string(&RolloutItem::ResponseItem {
+                item: HistoryItem::Message {
+                    role: Role::Assistant,
+                    text: "答".into(),
+                    reasoning: None,
+                },
+            })
+            .unwrap()
+            .as_bytes(),
+        );
+        bytes.push(b'\n');
+        std::fs::write(&path, bytes).unwrap();
+
+        let err = read(&path).unwrap_err();
+        assert!(matches!(err, RolloutError::Io(_)), "中段读错误必须报 Io，不能吞成空行：{err}");
     }
 
     #[test]
