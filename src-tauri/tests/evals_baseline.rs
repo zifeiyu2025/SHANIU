@@ -47,6 +47,7 @@ use shaniu_lib::agent_loop::{AgentLoop, ResponsesBackend};
 use shaniu_lib::config::{ApprovalMode, SandboxMode};
 use shaniu_lib::events::{ApprovalDecision, EventMsg, EventSink, ToolCallResult};
 use shaniu_lib::model_client::provider::ProviderConfig;
+use shaniu_lib::model_client::{HistoryItem, Role};
 use shaniu_lib::permission::{policy, ApprovalBroker};
 use shaniu_lib::tool_router::{PlanState, ToolRouter};
 use shaniu_lib::tools;
@@ -477,7 +478,6 @@ struct RepairSignals {
 
 impl RepairSignals {
     fn scan(items: &[shaniu_lib::rollout::RolloutItem]) -> Self {
-        use shaniu_lib::model_client::{HistoryItem, Role};
         use shaniu_lib::rollout::RolloutItem;
         let mut signals = Self::default();
         for item in items {
@@ -803,13 +803,24 @@ async fn run_one(
     // 自愈现场（SH-073）：从同一条档案里数 System 条目，失败样本因此能回答
     // 「没触发」还是「触发了没救回来」——这两种结论完全不同。
     let repair = RepairSignals::scan(&archive.items);
-    // 端点抖动可能让第一个 turn 都没开始（turns=0），此时档案只有 SessionMeta 是合法的。
-    // 此前这里一律 assert，一次抖动就把整轮实验连同其它样本一起炸掉（2026-11-09 实测：
-    // control 臂 run 1 第 8 题，档案 349 字节只有 SessionMeta）。现在标记 infra 继续跑，
-    // 该样本仍以"失败"计入（保守，不排除噪声），报告里单列 infra 数量。
-    let infra = turns == 0 && archive.items.is_empty();
+    // 端点抖动可能让第一个模型请求直接失败：档案里只剩用户任务（0 条或 1 条），
+    // 没有一条助手侧产出。此前这里一律 assert，一次抖动就把整轮实验连同其它样本
+    // 一起炸掉（2026-11-09 两次实测：一次只剩 SessionMeta，一次有用户消息但没有回复）。
+    // 判据因此不能用"档案条数"，必须用"有没有助手产出"：零轮空档案与"跑了 1 轮但
+    // 请求就失败"是同一种噪声。现在标记 infra 继续跑，该样本仍以"失败"计入
+    // （保守，不排除噪声），报告里单列 infra 数量。
+    let has_assistant_output = archive.items.iter().any(|item| {
+        let shaniu_lib::rollout::RolloutItem::ResponseItem { item } = item else { return false; };
+        match item {
+            HistoryItem::Message { role, .. } => *role != Role::User,
+            HistoryItem::ImageMessage { role, .. } => *role != Role::User,
+            _ => true,
+        }
+    });
+    let infra = !has_assistant_output;
     if infra {
-        detail = format!("[infra] 零轮结束（端点或装配失败，非模型能力）｜{detail}");
+        println!("[evals]  {session_id} 无助手产出（首个模型请求失败，记 infra）");
+        detail = format!("[infra] 无助手产出（端点或装配失败，非模型能力）｜{detail}");
     }
     let out = Outcome {
         success: verdict.is_ok() && !infra,
@@ -840,6 +851,22 @@ async fn run_one(
 
 // ============================== 入口 ==============================
 
+/// 密钥形态的前置校验（AGENTS §4.1：只输出布尔与长度，绝不输出内容）。
+///
+/// 2026-11-09 事故：启动命令把行尾中文备注一起带进了密钥，`HeaderValue` 校验失败，
+/// 请求根本没发出去，却跑完 24 个零 token 样本、产出一份「成功率 0%」的合法报告。
+/// 形态错误必须在第一个样本之前炸掉，而不是留给报告去解释。
+fn assert_key_sane(api_key: &str) {
+    let len = api_key.len();
+    let ascii = api_key.is_ascii();
+    let has_blank = api_key.chars().any(char::is_whitespace);
+    assert!(
+        ascii && !has_blank && (16..=512).contains(&len),
+        "SHANIU_TEST_API_KEY 形态不合法（长度={len}，纯 ASCII={ascii}，含空白={has_blank}）：\
+         密钥只从环境变量读，检查提取命令是否把行尾备注/换行一起带进来了"
+    );
+}
+
 #[tokio::test]
 #[ignore = "SH-028 评估基线需要真实端点密钥与外网，按里程碑/变更回归手动或定时运行"]
 async fn evals_baseline_v0() {
@@ -848,6 +875,7 @@ async fn evals_baseline_v0() {
     let started_ms = now_ms();
     let api_key = std::env::var("SHANIU_TEST_API_KEY")
         .expect("评估基线必须配真实端点：设置 SHANIU_TEST_API_KEY（勿把密钥写进仓库）");
+    assert_key_sane(&api_key);
     let provider = ProviderConfig {
         provider: std::env::var("SHANIU_TEST_PROVIDER").unwrap_or_else(|_| "openai-chat".into()),
         base_url: std::env::var("SHANIU_TEST_BASE_URL")
@@ -1140,6 +1168,17 @@ async fn evals_baseline_v0() {
         })
         .unwrap_or(0);
     let samples_match = expected_samples == actual_sessions;
+    // 门禁（2026-11-09）：整轮空跑不是「成功率 0%」，是密钥/端点装配失败。
+    // 把 `assert!(archive.items.len() >= 2)` 放宽成 infra 继续跑，曾让 24 个零 token
+    // 样本产出一份 valid=true 的报告——那是把红灯改成黄灯。现在：
+    // 全部 infra → 直接 panic（点名密钥/端点）；部分 infra → valid:false，禁止当基线。
+    let infra_total = runs
+        .iter()
+        .flat_map(|run| run["tasks"].as_array().cloned().unwrap_or_default())
+        .filter(|row| row["infra"].as_bool().unwrap_or(false))
+        .count();
+    let all_infra = expected_samples > 0 && infra_total == expected_samples;
+    let valid = samples_match && infra_total == 0;
     let report = json!({
         "version": spec.version,
         "arm": arm,
@@ -1163,10 +1202,12 @@ async fn evals_baseline_v0() {
         },
         // 样本数 == 实际档案数，是"这份报告确实跑满了"的唯一硬证据；
         // 对不上说明有样本丢失或被别的进程删改，整份报告标无效。
-        "valid": samples_match,
+        // infra 样本同理：只要存在"没有任何助手产出"的样本，这份报告就不能当基线。
+        "valid": valid,
         "samples": {
             "expected": expected_samples,
             "actual_sessions": actual_sessions,
+            "infra": infra_total,
         },
         "summary": {
             "n": selected.len(),
@@ -1227,6 +1268,11 @@ async fn evals_baseline_v0() {
         "[evals] 样本校验：期望 {expected_samples} 份档案，实际 {actual_sessions} 份 → {}",
         if samples_match { "一致" } else { "不一致（报告已标记 valid:false，禁止据此下结论）" }
     );
+    if infra_total > 0 {
+        println!(
+            "[evals] 警告：{infra_total}/{expected_samples} 个样本无助手产出（infra），报告已标记 valid:false，禁止当基线用"
+        );
+    }
     // 一进程一份，文件名带时间戳与 pid：不存在"谁覆盖谁"，也不再写 latest.json。
     let out_path = result_path(&role);
     std::fs::write(&out_path, serde_json::to_string_pretty(&report).unwrap()).unwrap();
@@ -1252,6 +1298,11 @@ async fn evals_baseline_v0() {
 
     // 运行器自身的底线：全 0 分通常是环境坏了（端点/密钥/沙箱），不是"模型笨"，
     // 必须让跑的人立刻分辨这两种情况，否则基线报告会被当成可信数据用。
+    assert!(
+        !all_infra,
+        "本轮 {infra_total}/{expected_samples} 个样本没有任何助手产出：密钥或端点装配失败，\
+         不是模型能力。先查 SHANIU_TEST_API_KEY 形态（长度/ASCII）与 SHANIU_TEST_BASE_URL 可达性"
+    );
     assert!(
         median(&passed_values) > 0.0,
         "多次运行的中位数仍是 0 分：先怀疑环境（端点可达性/沙箱创建/审批代答），再怀疑模型能力"
