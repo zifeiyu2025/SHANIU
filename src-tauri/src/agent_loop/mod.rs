@@ -163,6 +163,25 @@ pub struct AgentLoop {
 /// 磁盘满/权限错这类持续性故障会在第一次 flush 就触顶。
 const MAX_ROLLOUT_WRITE_ATTEMPTS: u32 = 3;
 
+/// 模型行未声明 `context_window` 时用于推导压缩阈值的保守窗口。
+///
+/// 取 128K 而不是乐观值：窗口未知时宁可早压（多花一次摘要），也不能沿用 50 万预算——
+/// 那等于永不压缩，128K 模型跑到一半直接 400，代价比多压几次大得多。
+const FALLBACK_CONTEXT_WINDOW: usize = 128_000;
+
+/// 压缩触发阈值：`min(配置预算, 窗口 × 80%)`。
+///
+/// - `configured == 0`：显式关闭压缩，保持 0（不替用户改主意）；
+/// - `window == 0`（模型未声明）：按 [`FALLBACK_CONTEXT_WINDOW`] 推导，调用方负责告警；
+/// - 其余：留 20% 给下一轮回复与工具结果。
+fn compact_token_budget(configured: usize, window: usize) -> usize {
+    if configured == 0 {
+        return 0;
+    }
+    let window = if window == 0 { FALLBACK_CONTEXT_WINDOW } else { window };
+    configured.min(window.saturating_mul(4) / 5)
+}
+
 /// 把 `history[*recorded..]` 逐条追加进档案，成功一条推进一格。
 ///
 /// **失败时游标停在失败条目前**（审计 H3）：已成功写入的前缀不回退，失败条目与它之后
@@ -346,16 +365,18 @@ impl AgentLoop {
             max_turns: TurnBudget::from_config(cfg).max_turns,
             // 压缩触发点（SH-132）：能力声明的 `context_window` 一旦已知，就不能再让
             // 固定预算吃到底——128K 窗口配 500K 预算等于永远不压缩，等端点溢出才报错。
-            // 取 `min(token_budget, context_window * 4/5)`：留 20% 给下一轮的回复与
-            // 工具结果，0 预算（显式关闭压缩）保持关闭，不替用户改主意。
+            // 窗口未知时同样不能退化成「50 万才压」：过去 `window == 0` 直接返回配置预算，
+            // 配置里 context_window 缺省即 0，压缩于是永不触发（2026-11-10 修复）。
             token_budget: {
                 let window = cfg.effective_model().context_window as usize;
-                if window == 0 || cfg.agent.token_budget == 0 {
-                    cfg.agent.token_budget
-                } else {
-                    let window_budget = window.saturating_mul(4) / 5;
-                    cfg.agent.token_budget.min(window_budget)
+                if window == 0 && cfg.agent.token_budget != 0 {
+                    tracing::warn!(
+                        configured = cfg.agent.token_budget,
+                        fallback_window = FALLBACK_CONTEXT_WINDOW,
+                        "模型未声明 context_window：压缩阈值按保守窗口推导，请在模型行补全该字段"
+                    );
                 }
+                compact_token_budget(cfg.agent.token_budget, window)
             },
             tree_budget: TreeBudget::unlimited(),
             policy: Arc::new(policy::SessionPolicyHandle::new(policy::SessionPolicy {
@@ -1537,6 +1558,21 @@ mod tests {
             EventMsg::ToolCallEnd { call_id, exit_code: None, result: Some(ToolCallResult::Cancelled), .. }
                 if call_id == "c1"
         )));
+    }
+
+    /// 压缩阈值必须跟着窗口走：`context_window = 0` 曾被短路成"照用 50 万预算"，
+    /// 128K 模型跑满也不会压缩，等端点 400 才暴露（2026-11-10 修复）。
+    #[test]
+    fn compact_budget_follows_window_and_never_uses_configured_limit_blindly() {
+        // 已知窗口：80% 封顶，配置更小时以配置为准
+        assert_eq!(compact_token_budget(500_000, 128_000), 102_400);
+        assert_eq!(compact_token_budget(50_000, 128_000), 50_000);
+        // 未知窗口：按保守窗口推导，而不是退回到 50 万
+        assert_eq!(compact_token_budget(500_000, 0), 102_400);
+        assert!(compact_token_budget(500_000, 0) < 500_000);
+        // 显式关闭压缩仍然是关闭
+        assert_eq!(compact_token_budget(0, 128_000), 0);
+        assert_eq!(compact_token_budget(0, 0), 0);
     }
 
     #[tokio::test]

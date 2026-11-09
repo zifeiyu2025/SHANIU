@@ -309,7 +309,8 @@ impl ModelProfile {
     }
 
     /// 上下文窗口：本行填了就用本行的（手动/端点写入），否则用内置表的。
-    /// 0 = 未知（不拿 0 当"无限"，压缩仍走固定预算）。
+    /// 0 = 未知（不拿 0 当"无限"；压缩阈值由 `agent_loop::compact_token_budget`
+    /// 按保守窗口推导并告警，不会退回固定预算）。
     pub fn context_window_effective(&self, base_url: &str) -> u32 {
         if self.context_window > 0 {
             return self.context_window;
