@@ -209,6 +209,20 @@ fn read_session_events(
     )
 }
 
+/// 某会话事件日志里最新的一条 `event_id`（SH-129 M3）。
+///
+/// 用途：事件通道的订阅引用归零、但这次订阅一条事件都没收到时，没有游标可续。
+/// 让它向宿主取一个「当前最新」当游标（语义是"这之前都算看过了"），这样既能正常
+/// 退订、又能保证重进时补齐期间的帧；取不到就如实返回 `None`，由调用方降级为全量补播。
+#[tauri::command]
+fn latest_session_event_id(
+    app: tauri::AppHandle,
+    session_id: String,
+) -> Result<Option<String>, String> {
+    let state = app.state::<AppState>();
+    event_journal::latest_event_id(&state.data_root().join(config::SESSIONS_DIR), &session_id)
+}
+
 /// 反查子代理事件归属的父会话（SH-056 批 2）。
 ///
 /// 重启后前端直接打开泳道时只有泳道 id（子代理的 `agent_id`）；子代理没有独立
@@ -2007,6 +2021,7 @@ pub fn run() {
             set_plan_mode,
             get_product_dirs,
             read_session_events,
+            latest_session_event_id,
             session_of_agent,
             gateway_info,
             upload_attachment,

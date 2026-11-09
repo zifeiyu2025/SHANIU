@@ -25,7 +25,8 @@
  *   生命周期配对调用；归零后保留游标转 dormant（`DORMANT_LIMIT=32`，满了淘汰最久未用）
  *   并给服务端发 `unsubscribe`。被淘汰的条目下次进入**不用老游标、走全量补播**——
  *   拿一个可能错的游标去续比没有游标更糟，它会让你以为接上了，实际缺一段。
- *   没有游标可续的订阅（live-only 且一条事件都没收到）不回收：退了只能全量重播或留缺口。
+ *   一条事件都没收到的订阅同样退订：向宿主取该会话当前最新 `event_id` 当游标
+ *   （"这之前都算看过了"），取不到才降级为全量补播并留日志——不允许"留着不回收"。
  *
  * 测试注入 `socketFactory` 脚本化 socket；桌面默认用全局 WebSocket。
  */
@@ -72,6 +73,8 @@ interface Subscription {
   credits: number
   /** 观察者引用计数：follow 进入 +1、退出 -1；归零转 dormant 并通知服务端退订。 */
   refs: number
+  /** 正在向宿主取「当前最新 event_id」当游标：期间又有人进来就取消退役。 */
+  retiring?: boolean
 }
 
 /** 引用归零后仍保留游标的条目：下次进入用 lastEventId 续播（直接删就永久缺一段）。 */
@@ -200,6 +203,16 @@ export function createWsBridge(base: HostBridge, options: WsBridgeOptions = {}):
     return freshSessions.has(sessionId) ? '' : null
   }
 
+  /** 记下「该会话游标已不可信」：下次进入一律全量补播（上限 64 条，用掉即删）。 */
+  const markLostCursor = (sessionId: string): void => {
+    lostCursor.add(sessionId)
+    lostCursorOrder.push(sessionId)
+    while (lostCursorOrder.length > LOST_CURSOR_LIMIT) {
+      const gone = lostCursorOrder.shift()
+      if (gone !== undefined) lostCursor.delete(gone)
+    }
+  }
+
   /** dormant 超上限：淘汰最久未用，并记下「该会话游标已丢」。 */
   const evictDormant = (): void => {
     while (dormant.size > DORMANT_LIMIT) {
@@ -213,12 +226,7 @@ export function createWsBridge(base: HostBridge, options: WsBridgeOptions = {}):
       }
       if (victim === undefined) return
       dormant.delete(victim)
-      lostCursor.add(victim)
-      lostCursorOrder.push(victim)
-      while (lostCursorOrder.length > LOST_CURSOR_LIMIT) {
-        const gone = lostCursorOrder.shift()
-        if (gone !== undefined) lostCursor.delete(gone)
-      }
+      markLostCursor(victim)
       if (diagnosticsOn) delete diagnostics.sessions[victim]
     }
   }
@@ -245,11 +253,30 @@ export function createWsBridge(base: HostBridge, options: WsBridgeOptions = {}):
   }
 
   /**
-   * 观察者退场（引用 -1）。归零转 dormant 并让服务端退订：
+   * 退役收尾：记游标、发 unsubscribe、转 dormant（或标记游标已丢）。
+   * `cursor === null` 表示确实拿不到任何可续位置——那种情况明确降级为全量补播，
+   * 但**照样退订**：留着订阅等于服务端继续给没人看的会话推流。
+   */
+  const retireSubscription = (sessionId: string, cursor: string | null): void => {
+    subscriptions.delete(sessionId)
+    if (cursor === null) {
+      markLostCursor(sessionId)
+    } else {
+      dormant.set(sessionId, { initialCursor: cursor, lastEventId: cursor, usedAt: ++dormantTick })
+    }
+    send({ type: 'unsubscribe', session_id: sessionId })
+    if (diagnosticsOn) diagnostics.unsubscribes += 1
+    evictDormant()
+    syncDiagnostics()
+  }
+
+  /**
+   * 观察者退场（引用 -1）。归零一律退订并转 dormant：
    * 只登记不回收等于把「活跃订阅泄漏」换成「游标泄漏」（M3）。
    *
-   * 例外：live-only 且一条事件都没收到的订阅**不回收**——它没有可续的游标，
-   * 退了下次只能全量重播（会与档案重建重复）或留缺口，留着这条空订阅反而更便宜。
+   * 没有游标不等于回收不了：向宿主取该会话**当前最新 event_id** 当游标
+   * （语义是"这之前都算看过了"，不需要重播），重进时 gateway 从它之后补播。
+   * 连这个都取不到（会话刚建立 / 宿主不可达）才降级为全量补播，并留日志。
    */
   const releaseEvents = (sessionId: string): void => {
     if (sessionId === '') return
@@ -258,13 +285,35 @@ export function createWsBridge(base: HostBridge, options: WsBridgeOptions = {}):
     sub.refs = Math.max(0, sub.refs - 1)
     if (sub.refs > 0) return
     const resumeCursor = sub.lastEventId ?? sub.initialCursor
-    if (resumeCursor === null) return
-    subscriptions.delete(sessionId)
-    dormant.set(sessionId, { initialCursor: sub.initialCursor, lastEventId: sub.lastEventId, usedAt: ++dormantTick })
-    send({ type: 'unsubscribe', session_id: sessionId })
-    if (diagnosticsOn) diagnostics.unsubscribes += 1
-    evictDormant()
-    syncDiagnostics()
+    if (resumeCursor !== null) {
+      retireSubscription(sessionId, resumeCursor)
+      return
+    }
+    if (sub.retiring === true) return
+    sub.retiring = true
+    // 取游标期间保持订阅（还在收帧），拿到后再统一退役；期间又有人进来就放弃退役。
+    void base
+      .invoke<string | null>('latest_session_event_id', { sessionId })
+      .then(latest => {
+        sub.retiring = false
+        if (subscriptions.get(sessionId) !== sub || sub.refs > 0) return
+        const cursor = sub.lastEventId ?? latest ?? null
+        if (cursor === null) {
+          console.warn(
+            `[SHANIU] 会话 ${sessionId} 没有可续游标（latest_session_event_id 为空），重进走全量补播`,
+          )
+        }
+        retireSubscription(sessionId, cursor)
+      })
+      .catch((reason: unknown) => {
+        sub.retiring = false
+        if (subscriptions.get(sessionId) !== sub || sub.refs > 0) return
+        console.warn(
+          `[SHANIU] 会话 ${sessionId} 取 latest_session_event_id 失败，重进走全量补播`,
+          reason,
+        )
+        retireSubscription(sessionId, sub.lastEventId ?? null)
+      })
   }
 
   /** 等连接就绪（或退回 Tauri 兜底/超时）。首次订阅必须在命令之前完成。 */

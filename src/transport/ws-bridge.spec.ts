@@ -58,6 +58,8 @@ interface Harness {
 function harness(options: {
   gatewayInfo?: () => Promise<{ port: number; token: string }>
   onEvent?: (event: AgentEvent) => void
+  /** 宿主 `latest_session_event_id` 替身：默认「日志还没有内容」。 */
+  latestEventId?: () => Promise<string | null>
 } = {}): Harness {
   const log: string[] = []
   const sockets: FakeSocket[] = []
@@ -71,6 +73,9 @@ function harness(options: {
         return (options.gatewayInfo ?? (async () => ({ port: 4567, token: 'test-token' })))() as Promise<T>
       }
       if (command === 'create_session' || command === 'fork_session') return 'new-session' as T
+      if (command === 'latest_session_event_id') {
+        return (options.latestEventId ?? (async () => null))() as Promise<T>
+      }
       if (command === 'send_task' || command === 'resume_session') {
         return (typeof args?.agentId === 'string' && args.agentId !== '' ? args.agentId : 'new-session') as T
       }
@@ -424,20 +429,88 @@ describe('ws-bridge 订阅回收（SH-129 M3）', () => {
     }
   })
 
-  it('无游标可续的 live-only 订阅不回收（否则只能全量重播或留缺口）', async () => {
-    const h = harness()
+  it('空订阅（零事件）：取宿主最新 event_id 当游标后退订，重进补齐期间帧且不重复', async () => {
+    const received: AgentEvent[] = []
+    const h = harness({ onEvent: ev => received.push(ev), latestEventId: async () => 'ev-09' })
     try {
       await tick()
       const ws = h.sockets[0]!
       ws.open()
       ws.message({ type: 'ready' })
 
-      h.bridge.observeEvents?.('old-session')
-      h.bridge.releaseEvents?.('old-session')
-      expect(unsubscribeFrames(h.log)).toHaveLength(0)
-      expect(statsOf().subscriptions).toBe(1)
-      expect(statsOf().dormant).toBe(0)
+      h.bridge.observeEvents?.('s1')
+      // 既有会话 start 是 live-only（不带 after_event_id）。
+      expect(subscribeFrames(h.log)[0]).not.toHaveProperty('after_event_id')
+
+      h.bridge.releaseEvents?.('s1')
+      await tick()
+      expect(unsubscribeFrames(h.log)).toHaveLength(1)
+      expect(statsOf().subscriptions).toBe(0)
+      expect(statsOf().dormant).toBe(1)
+
+      // 休眠期间该会话产生了 3 条事件；重进时从取到的游标之后补播。
+      h.bridge.observeEvents?.('s1')
+      const resub = subscribeFrames(h.log).at(-1)!
+      expect(resub).toMatchObject({ type: 'subscribe', session_id: 's1', after_event_id: 'ev-09' })
+      const before = received.length
+      for (const id of ['ev-10', 'ev-11', 'ev-12']) ws.message({ type: 'event', event: event('s1', id) })
+      expect(received.slice(before).map(ev => ev.event_id)).toEqual(['ev-10', 'ev-11', 'ev-12'])
+      // 游标之前的 ev-09 不该再送（不重复）。
+      expect(received.some(ev => ev.event_id === 'ev-09')).toBe(false)
     } finally {
+      h.dispose()
+    }
+  })
+
+  it('取不到最新 event_id：降级为全量补播并留日志，但照样退订（不许静默不回收）', async () => {
+    const warn = vi.spyOn(console, 'warn').mockImplementation(() => undefined)
+    const h = harness({
+      latestEventId: async () => {
+        throw { code: 'host/unreachable', message: '宿主不可达' }
+      },
+    })
+    try {
+      await tick()
+      const ws = h.sockets[0]!
+      ws.open()
+      ws.message({ type: 'ready' })
+
+      h.bridge.observeEvents?.('s1')
+      h.bridge.releaseEvents?.('s1')
+      await tick()
+      expect(unsubscribeFrames(h.log)).toHaveLength(1)
+      expect(statsOf().subscriptions).toBe(0)
+      expect(statsOf().dormant).toBe(0)
+      expect(warn.mock.calls.some(call => String(call[0]).includes('全量补播'))).toBe(true)
+
+      // 下次进入：明确走全量补播（after_event_id 为空）。
+      h.bridge.observeEvents?.('s1')
+      expect(subscribeFrames(h.log).at(-1)).toMatchObject({
+        type: 'subscribe', session_id: 's1', after_event_id: '',
+      })
+    } finally {
+      warn.mockRestore()
+      h.dispose()
+    }
+  })
+
+  it('latest_session_event_id 为空（会话刚建立）：同样退订并降级全量补播', async () => {
+    const warn = vi.spyOn(console, 'warn').mockImplementation(() => undefined)
+    const h = harness({ latestEventId: async () => null })
+    try {
+      await tick()
+      const ws = h.sockets[0]!
+      ws.open()
+      ws.message({ type: 'ready' })
+
+      h.bridge.observeEvents?.('s1')
+      h.bridge.releaseEvents?.('s1')
+      await tick()
+      expect(unsubscribeFrames(h.log)).toHaveLength(1)
+      expect(statsOf().subscriptions).toBe(0)
+      expect(warn.mock.calls.some(call => String(call[0]).includes('全量补播'))).toBe(true)
+    } finally {
+      warn.mockRestore()
       h.dispose()
     }
   })
