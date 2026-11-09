@@ -24,6 +24,8 @@ pub struct Resumed {
     pub workspace_root: String,
     /// 档案里被应用的压缩锚点数（SH-032 落地后用于核对）。
     pub applied_compactions: usize,
+    /// 会话内最后一次档位切换（无则 None = 跟随部署默认）。
+    pub sandbox_mode: Option<String>,
     /// 末行半截写被丢弃的行数。
     pub torn_tail_lines: usize,
 }
@@ -56,9 +58,12 @@ pub fn resume(path: &Path) -> Result<Resumed, RolloutError> {
 
     let mut history: Vec<HistoryItem> = Vec::new();
     let mut applied = 0usize;
+    // 档位事件不进模型历史，只取最后一条作为本会话的当前档位。
+    let mut sandbox_mode: Option<String> = None;
     for item in &archive.items {
         match item {
             RolloutItem::ResponseItem { item: h } => history.push(h.clone()),
+            RolloutItem::SandboxMode { mode, .. } => sandbox_mode = Some(mode.clone()),
             RolloutItem::Compacted { range_start, range_end, summary } => {
                 let (start, end) = (*range_start, *range_end);
                 if end > history.len() || start > end {
@@ -102,6 +107,7 @@ pub fn resume(path: &Path) -> Result<Resumed, RolloutError> {
         path: path.to_path_buf(),
         workspace_root,
         applied_compactions: applied,
+        sandbox_mode,
         torn_tail_lines: archive.torn_tail_lines,
     })
 }
@@ -227,6 +233,27 @@ mod tests {
         assert_eq!(nearest_safe_cut(&items, 3), 1, "切在调用段中间一律回退");
         assert_eq!(nearest_safe_cut(&items, 0), 0);
         assert_eq!(nearest_safe_cut(&items, 99), 6, "超出长度按末尾处理");
+    }
+
+    #[test]
+    fn sandbox_mode_is_per_session_and_never_leaks_across_sessions() {
+        let dir = temp_dir("sandbox-scope");
+        let a = dir.join("a.jsonl");
+        let b = dir.join("b.jsonl");
+        let wa = RolloutWriter::create(&dir, &meta("a")).unwrap();
+        wa.append(&msg("任务")).unwrap();
+        wa.append(&RolloutItem::SandboxMode { mode: "danger_full_access".into(), at_ms: 1 }).unwrap();
+        drop(wa);
+        let wb = RolloutWriter::create(&dir, &meta("b")).unwrap();
+        wb.append(&msg("任务")).unwrap();
+        drop(wb);
+
+        let ra = resume(&a).unwrap();
+        assert_eq!(ra.sandbox_mode.as_deref(), Some("danger_full_access"));
+        // 反向对照：B 从没切过档，绝不能继承 A 的档位 → None 由调用方回落部署默认。
+        assert_eq!(resume(&b).unwrap().sandbox_mode, None);
+        // 控制面事件不进模型历史：否则模型会读到一行"沙箱切换到……"。
+        assert_eq!(ra.history.len(), 1);
     }
 
     #[test]

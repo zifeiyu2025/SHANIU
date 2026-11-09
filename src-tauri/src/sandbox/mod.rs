@@ -136,11 +136,7 @@ pub fn execution_note(tool: &str, mode: SandboxMode) -> Option<String> {
     if !EXEC_TOOLS.contains(&tool) {
         return None;
     }
-    let name = match mode {
-        SandboxMode::ReadOnly => "read_only",
-        SandboxMode::WorkspaceWrite => "workspace_write",
-        SandboxMode::DangerFullAccess => "danger_full_access",
-    };
+    let name = mode.as_str();
     Some(format!(
         "[sandbox] mode={name} enforcement={}",
         current_enforcement(mode).as_str()
@@ -704,11 +700,7 @@ pub fn status(mode: SandboxMode, os: OsSandbox) -> SandboxStatus {
         ),
     };
     SandboxStatus {
-        mode: match mode {
-            SandboxMode::ReadOnly => "read_only",
-            SandboxMode::WorkspaceWrite => "workspace_write",
-            SandboxMode::DangerFullAccess => "danger_full_access",
-        },
+        mode: mode.as_str(),
         os: os_name,
         os_enabled,
         enforcement: enforcement_of(os, mode).as_str(),

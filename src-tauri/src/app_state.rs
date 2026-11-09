@@ -41,6 +41,9 @@ pub struct AppState {
     /// 正在跑的能力探针（SH-132）：设置页据此显示「检测中」而不是「未验证」。
     /// 与任务生命周期无关——探针是后台增强，任务结束不该打断它。
     pub probing: Arc<crate::capability::Inflight>,
+    /// 会话尚未建档时先切的档位（草稿）：贴到 id 上，等首条任务落盘时写进档案。
+    /// 进程内、不落盘——这份选择本来就没被持久化过，重启丢掉是诚实的。
+    draft_sandbox: Mutex<std::collections::HashMap<String, crate::config::SandboxMode>>,
 }
 
 impl AppState {
@@ -70,8 +73,9 @@ impl AppState {
             active_subagents: Mutex::new(None),
             mcp: Arc::new(crate::mcp_client::runtime::McpRuntime::new(&config_root)),
             probing: Arc::new(crate::capability::Inflight::default()),
+            draft_sandbox: Mutex::new(std::collections::HashMap::new()),
         };
-        state.refresh_derived_policy();
+        state.refresh_derived_policy(None);
         state
     }
 
@@ -137,22 +141,39 @@ impl AppState {
             let mut guard = self.config.write().expect("config 锁中毒");
             *guard = next;
         }
-        self.refresh_derived_policy();
+        self.refresh_derived_policy(None);
         Ok(())
     }
 
-    /// 任务启动时重置会话策略（SH-120）：审批档/沙箱档回到 config，
-    /// 并重新装载前缀白名单——运行中切换过的档位不跨任务泄漏。
-    pub fn reset_policy(&self) {
-        self.refresh_derived_policy();
+    /// 任务启动时重置会话策略（SH-120）：审批档回到 config、沙箱档取
+    /// **本会话档案里的最后一档**（没有则 config 部署默认），并重新装载前缀白名单
+    /// ——运行中切换过的档位不跨任务、不跨会话泄漏。
+    pub fn reset_policy(&self, sandbox: Option<crate::config::SandboxMode>) {
+        self.refresh_derived_policy(sandbox);
+    }
+
+    /// 记下"还没建档的会话"选的档位；首条任务落盘时由调用方取走并写进档案。
+    pub fn put_draft_sandbox(&self, session_id: &str, mode: crate::config::SandboxMode) {
+        self.draft_sandbox
+            .lock()
+            .expect("draft sandbox 锁中毒")
+            .insert(session_id.to_string(), mode);
+    }
+
+    /// 取走草稿档位（取走即清，避免下一次误用）。
+    pub fn take_draft_sandbox(&self, session_id: &str) -> Option<crate::config::SandboxMode> {
+        self.draft_sandbox
+            .lock()
+            .expect("draft sandbox 锁中毒")
+            .remove(session_id)
     }
 
     /// config → 运行时策略的**唯一**同步点（构造、配置变更、任务启动都走这里）。
-    fn refresh_derived_policy(&self) {
+    fn refresh_derived_policy(&self, sandbox: Option<crate::config::SandboxMode>) {
         let cfg = self.config();
         self.policy.reset(crate::permission::SessionPolicy {
             approval: cfg.approval.mode,
-            sandbox: cfg.sandbox.mode,
+            sandbox: sandbox.unwrap_or(cfg.sandbox.mode),
         });
         let (rules, rejected) =
             crate::permission::PrefixAllowlist::from_config(&cfg.approval.allow_prefixes);

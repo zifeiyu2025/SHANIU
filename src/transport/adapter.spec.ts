@@ -72,6 +72,8 @@ function scriptedBridge(
   /** SH-056：宿主父会话事件档案的替身；给了就把 emit 的事件按行累积并支持
    *  `read_session_events` 分页，用来模拟"进程重启后从档案重建泳道"。 */
   journal?: AgentEvent[],
+  /** 会话档位写入的宿主替身（throw = 切档被拒）。放最后，避免挪动既有位置参数。 */
+  sandboxHandler?: (args: Record<string, unknown> | undefined) => unknown,
 ): ScriptedBridge {
   const calls: ScriptedBridge['calls'] = []
   const handlers = new Set<(event: AgentEvent) => void>()
@@ -87,6 +89,8 @@ function scriptedBridge(
   // 测试桥按同一语义模拟（每份桥独立的克隆，避免测试间串味），挡位切换的投影推帧
   // 才能测到"切换后 UI 显示新挡位"而不是停在旧值。
   const state = structuredClone(settings)
+  // 会话档位的宿主替身状态（每份桥独立）：只按会话记，不进 settings——与集成铁律一致。
+  const sessionSandbox = new Map<string, string>()
   return {
     calls,
     async invoke<T>(command: string, args?: Record<string, unknown>): Promise<T> {
@@ -182,6 +186,21 @@ function scriptedBridge(
         state['workspaceRoot'] = args?.['workspaceRoot']
         if (args?.['sandboxMode'] !== undefined) state['sandboxMode'] = args['sandboxMode']
         return undefined as T
+      }
+      // 会话档位（对齐 DSH 的 sandbox/mode 会话事件）：按会话持久，**不碰 settings**。
+      // 替身与宿主同语义：set 只写该会话，read 没切过就回 null（前端回落部署默认）。
+      if (command === 'set_session_sandbox_mode') {
+        if (sandboxHandler !== undefined) return sandboxHandler(args) as T
+        const id = String(args?.['sessionId'] ?? '')
+        const mode = String(args?.['mode'] ?? '')
+        if (!['read_only', 'workspace_write', 'danger_full_access'].includes(mode)) {
+          throw new Error(`未知沙箱档: ${mode}`)
+        }
+        sessionSandbox.set(id, mode)
+        return mode as T
+      }
+      if (command === 'session_sandbox_mode') {
+        return (sessionSandbox.get(String(args?.['sessionId'] ?? '')) ?? null) as T
       }
       if (command === 'create_session') return 'agent-new' as T
       if (command === 'send_task') return (args?.agentId ?? 'agent-new') as T
@@ -1419,7 +1438,7 @@ describe('权限挡位与底部指标的数据面', () => {
 
   const faceOf2 = (remote: unknown): PermissionTestFace => remote as PermissionTestFace
 
-  it('挡位目录随宿主沙箱档反推默认，切换写 save_settings 并让快照/基线显示新挡位', async () => {
+  it('挡位目录反推部署默认；会话内切档只写本会话档案，不写配置也不串会话', async () => {
     const bridge = scriptedBridge()
     const { remote, dispose } = createAdapter({ bridge })
     const face = faceOf2(remote)
@@ -1434,31 +1453,39 @@ describe('权限挡位与底部指标的数据面', () => {
     expect(catalog.defaultOptions.map(option => option.value)).toEqual(['read-only', 'workspace-write', 'danger-full-access'])
     expect(catalog.defaultPreset).toBe('workspace-write')
 
-    // 切挡前的快照基线：挡位投影 = 宿主当前档
+    // 切挡前的快照基线：没有自己的档位事件 → 跟随部署默认
     await face.session.create({})
     const before = face.session.follow({ address: { kind: 'session', sessionId: 'agent-new' } })
     const snap1 = (await before.next()).value as { projections: { values: Record<string, unknown> } }
     expect(snap1.projections.values['permissions']).toEqual({ currentValue: 'workspace-write' })
     await before.return?.(undefined)
 
-    // 提交：/permission 命令 → save_settings，其余必填参数传宿主现值原样写回。
-    // 顶层键是 camelCase（Tauri 形参映射；D-08 真机错误正是拿到了 snake_case）
+    // 提交：/permission → 宿主的 set_session_sandbox_mode（会话事件），**不写 save_settings**。
     const callsBefore = bridge.calls.length
     const result = await face.commands.execute('agent-new', '/permission danger-full-access')
-    // SH-115 起结果走 CommandResult 契约（value.result），与上游宿主命令同形状
     expect(result).toMatchObject({ ok: true, value: { result: { kind: 'success', text: 'preset danger-full-access' } } })
-    expect(bridge.calls.slice(callsBefore).find(call => call.command === 'save_settings')?.args)
-      .toEqual({
-        baseUrl: 'https://lc/v1', model: 'LongCat-2.5', workspaceRoot: 'W', sandboxMode: 'danger_full_access',
-      })
+    const newCalls = bridge.calls.slice(callsBefore)
+    expect(newCalls.find(call => call.command === 'set_session_sandbox_mode')?.args)
+      .toEqual({ sessionId: 'agent-new', mode: 'danger_full_access' })
+    // §4.2 反向对照：没有写回配置文件。只断言"界面变了"是不够的——误点 chip 的
+    // 后果正是永久改了部署默认，这条断言就是防它的。
+    expect(newCalls.some(call => call.command === 'save_settings')).toBe(false)
 
-    // 宿主落盘后 get_settings 回读新值：目录默认与重开快照都反映新挡位
+    // 部署默认没变：目录默认仍是 workspace-write
     const catalog2 = (await face.permissionPresets.catalog())['value'] as { defaultPreset: string }
-    expect(catalog2.defaultPreset).toBe('danger-full-access')
+    expect(catalog2.defaultPreset).toBe('workspace-write')
+
+    // 本会话的芯片变了
     const after = face.session.follow({ address: { kind: 'session', sessionId: 'agent-new' } })
     const snap2 = (await after.next()).value as { projections: { values: Record<string, unknown> } }
     expect(snap2.projections.values['permissions']).toEqual({ currentValue: 'danger-full-access' })
     await after.return?.(undefined)
+
+    // 另一个会话读不到这次切换（档位按会话投影，不按进程共享）
+    const other = face.session.follow({ address: { kind: 'session', sessionId: 'agent-other' } })
+    const otherSnap = (await other.next()).value as { projections: { values: Record<string, unknown> } }
+    expect(otherSnap.projections.values['permissions']).toEqual({ currentValue: 'workspace-write' })
+    await other.return?.(undefined)
 
     // control 基线同样带挡位（客户端重连时不丢当前值）
     const control = face.session.control()
@@ -1498,7 +1525,11 @@ describe('权限挡位与底部指标的数据面', () => {
   it('挡位切换被宿主拒绝时回 CommandResult error（命中命令、草稿保留），目录默认保持旧档', async () => {
     // SH-115 起对齐上游：handler 失败 = CommandResult error（composer 读 result.kind
     // 保留草稿），transport 层的 {ok:false} 留给"调用本身被拒"的场合
-    const bridge = scriptedBridge(HOST_SETTINGS, [], undefined, '沙箱模式取值非法，可用：read_only / workspace_write / danger_full_access')
+    const bridge = scriptedBridge(
+      undefined, [], undefined, undefined, undefined, undefined, undefined, undefined, undefined,
+      undefined, undefined,
+      () => { throw new Error('沙箱模式取值非法，可用：read_only / workspace_write / danger_full_access') },
+    )
     const { remote, dispose } = createAdapter({ bridge })
     const face = faceOf2(remote)
     const result = await face.commands.execute('agent-new', '/permission danger-full-access')
@@ -1545,7 +1576,7 @@ describe('权限挡位与底部指标的数据面', () => {
     dispose()
   })
 
-  it('芯片与设置页写挡位走同一条收尾链：/permission 也让 describe 的 permission 视图前进', async () => {
+  it('芯片切档与设置页写默认是两条链：芯片不推进 permission 视图，设置页才推进', async () => {
     const bridge = scriptedBridge()
     const { remote, dispose } = createAdapter({ bridge })
     const face = faceOf2(remote)
@@ -1559,25 +1590,22 @@ describe('权限挡位与底部指标的数据面', () => {
       const found = described.namespaces.find(entry => entry['ns'] === 'permission')!
       return { value: found.value, revision: found.revision }
     }
-    // 设置页先读一次并缓存（真机 E-06 的起点：缓存里是上一档）
     expect(await permissionView()).toEqual({ value: { defaultPreset: 'workspace-write' }, revision: 0 })
 
-    // ① 芯片路径：/permission 命令。收尾必须广播 + 推进修订号——设置页的 describe 缓存
-    //    只认这条通知重读，缺了它就是"芯片变了、开设置还是旧档"
+    // ① 芯片路径：只写本会话档案。部署默认与设置页视图**都不许动**
+    //    ——反面对照：如果芯片还在写 config，这里 revision 会前进、广播会发出。
     const viaCommand = await face.commands.execute('agent-new', '/permission read-only')
     expect(viaCommand).toMatchObject({ ok: true, value: { result: { kind: 'success', text: 'preset read-only' } } })
-    expect(emitted).toContainEqual(['permission', 1])
-    expect(await permissionView()).toEqual({ value: { defaultPreset: 'read-only' }, revision: 1 })
+    expect(emitted).toEqual([])
+    expect(await permissionView()).toEqual({ value: { defaultPreset: 'workspace-write' }, revision: 0 })
 
-    // ② 设置页路径：mutate。两条路径的最终视图与修订号节奏完全一致
+    // ② 设置页路径：写部署默认，仍然要推进修订号并广播（设置页缓存只认这条通知）
     const viaSettings = await face.settings.mutate('permission', [
       { op: 'set', path: ['defaultPreset'], value: 'danger-full-access' },
-    ], 1)
+    ], 0)
     expect(viaSettings['ok']).toBe(true)
-    const afterMutate = await permissionView()
-    expect(afterMutate).toEqual({ value: { defaultPreset: 'danger-full-access' }, revision: 2 })
-    expect(viaSettings['value']).toMatchObject(afterMutate)
-    expect(emitted).toEqual([['permission', 1], ['permission', 2]])
+    expect(await permissionView()).toEqual({ value: { defaultPreset: 'danger-full-access' }, revision: 1 })
+    expect(emitted).toEqual([['permission', 1]])
     dispose()
   })
 

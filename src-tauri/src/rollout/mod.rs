@@ -66,6 +66,12 @@ pub enum RolloutItem {
     },
     /// 父文件中指向子代理 rollout 的引用（SH-056 用）。
     SubagentRef { child_id: String, rollout_path: String },
+    /// 会话内权限档位切换（对齐 DSH 的 `sandbox/mode` 会话事件）。
+    ///
+    /// **只落档案，不碰 `config.toml`**：会话内切档只影响本会话，重进会话靠这条
+    /// 事件回放当前档位（进程在不在都不影响）。部署默认仍由设置页写 config。
+    /// 最后一条生效——切多次就是多条事件，不做原地改写（档案 append-only）。
+    SandboxMode { mode: String, at_ms: u64 },
 }
 
 #[derive(Debug, thiserror::Error)]
@@ -153,6 +159,25 @@ impl RolloutWriter {
         file.write_all(b"\n").map_err(|e| RolloutError::Io(format!("{}", e)))?;
         file.flush().map_err(|e| RolloutError::Io(format!("flush 失败: {e}")))
     }
+}
+
+/// 读档案里**最后一条**档位事件的 wire 值；没有该事件（旧档案 / 从没切过）返回 None。
+///
+/// 用子串预筛再解析：长会话档案里逐行 `serde_json` 全量解析的代价是 O(全部历史)，
+/// 而这个查询在每次打开会话/读投影时都会发生。
+pub fn last_sandbox_mode(path: &Path) -> Option<String> {
+    let file = File::open(path).ok()?;
+    let mut last = None;
+    for line in BufReader::new(file).lines() {
+        let line = line.ok()?;
+        if !line.contains("\"sandbox_mode\"") {
+            continue;
+        }
+        if let Ok(RolloutItem::SandboxMode { mode, .. }) = serde_json::from_str::<RolloutItem>(&line) {
+            last = Some(mode);
+        }
+    }
+    last
 }
 
 /// 读回来的档案：`items` 含首行 meta 之后的全部条目，`torn_tail_lines` 记录被丢弃的半截写行数。
@@ -487,6 +512,45 @@ mod tests {
         let _w = RolloutWriter::create(&dir, &meta("dup")).unwrap();
         let err = RolloutWriter::create(&dir, &meta("dup")).unwrap_err();
         assert!(matches!(err, RolloutError::AlreadyExists(_)), "覆盖历史档案不可逆，必须拒绝：{err}");
+    }
+
+    /// 会话内切档**只落档案**：配置文件一个字节都不许动。
+    /// 反向对照就是这个断言——没有它，"界面看起来变了"不能证明配置没被写。
+    #[test]
+    fn session_sandbox_event_never_touches_the_config_file() {
+        let dir = temp_dir();
+        let config = dir.join("config.toml");
+        let original = b"[sandbox]\nmode = \"workspace_write\"\n";
+        std::fs::write(&config, original).unwrap();
+
+        let w = RolloutWriter::create(&dir, &meta("agent-mode")).unwrap();
+        let path = w.path().to_path_buf();
+        drop(w);
+        let w = RolloutWriter::open_existing(&path).unwrap();
+        w.append(&RolloutItem::SandboxMode { mode: "danger_full_access".into(), at_ms: 7 }).unwrap();
+        w.append(&RolloutItem::SandboxMode { mode: "read_only".into(), at_ms: 8 }).unwrap();
+        drop(w);
+
+        assert_eq!(std::fs::read(&config).unwrap(), original, "切档写到了配置文件");
+        // 最后一条生效（append-only，不做原地改写）
+        assert_eq!(last_sandbox_mode(&path).as_deref(), Some("read_only"));
+    }
+
+    /// 旧档案里没有档位事件 → None（调用方回落部署默认），不是"读失败"。
+    #[test]
+    fn last_sandbox_mode_is_none_for_archives_without_the_event() {
+        let dir = temp_dir();
+        let w = RolloutWriter::create(&dir, &meta("agent-old")).unwrap();
+        w.append(&RolloutItem::ResponseItem {
+            item: crate::model_client::HistoryItem::Message {
+                role: crate::model_client::Role::User, text: "任务".into(), reasoning: None,
+            },
+        })
+        .unwrap();
+        let path = w.path().to_path_buf();
+        drop(w);
+        assert_eq!(last_sandbox_mode(&path), None);
+        assert_eq!(last_sandbox_mode(&dir.join("missing.jsonl")), None);
     }
 
     #[test]

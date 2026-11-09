@@ -84,18 +84,32 @@ fn frontend_ready(app: tauri::AppHandle) {
 /// 只有后端知道（`next_session_id` 在这里生成），前端拿不到它就无从决定
 /// 下一次提交该续写谁——会话列表也就永远点不回自己刚建的那条。
 #[tauri::command]
-fn send_task(app: tauri::AppHandle, task: String, agent_id: Option<String>) -> Result<String, String> {
+fn send_task(
+    app: tauri::AppHandle,
+    task: String,
+    agent_id: Option<String>,
+    sandbox_mode: Option<String>,
+) -> Result<String, String> {
     if task.trim().is_empty() {
         return Err("任务为空".into());
     }
+    // 只接受已知档位；拼错就拒绝，不静默回落到更宽的档（§11.3 退化红线）。
+    let sandbox = match sandbox_mode.as_deref().map(str::trim).filter(|m| !m.is_empty()) {
+        Some(raw) => Some(
+            config::SandboxMode::parse(raw)
+                .ok_or_else(|| format!("未知沙箱档: {raw}"))?,
+        ),
+        None => None,
+    };
     let state = app.state::<AppState>();
     match agent_id.filter(|id| !id.trim().is_empty()) {
         Some(id) => {
-            continue_session(&app, &state, id.clone(), &task)?;
+            continue_session(&app, &state, id.clone(), &task, sandbox)?;
             Ok(id)
         }
         None => {
-            let (agent, cancel, new_id) = build_new_session(&state, state.workspace_root().as_path())?;
+            let (agent, cancel, new_id) =
+                build_new_session(&state, state.workspace_root().as_path(), sandbox)?;
             // 首条消息 = 标题自动生成的触发点（first-prompt 节奏）：后台辅助请求，
             // 不阻塞主回合；失败/关开关/没密钥都静默保持截断 fallback。
             session_title::spawn_generation(app.clone(), new_id.clone(), task.clone());
@@ -126,6 +140,7 @@ fn continue_session(
     state: &AppState,
     agent_id: String,
     task: &str,
+    draft_sandbox: Option<config::SandboxMode>,
 ) -> Result<(), String> {
     let path = state
         .data_root()
@@ -148,6 +163,16 @@ fn continue_session(
     // 会话绑定的工作区在建档时固化（SH-099）：resume 时从档案 meta 带出来，
     // 工具沙箱与文件工具的作用域跟随原目录而不是全局默认根。
     let session_workspace = PathBuf::from(&resumed.workspace_root);
+    // 会话档位：档案里的最后一条事件优先；草稿态（还没建档时先切了档）次之；
+    // 都没有就跟随部署默认。
+    // 取走草稿（无论是否采用都清掉，避免陈旧选择贴到以后的同名任务上）。
+    let host_draft = state.take_draft_sandbox(&agent_id);
+    let session_sandbox = resumed
+        .sandbox_mode
+        .as_deref()
+        .and_then(config::SandboxMode::parse)
+        .or(draft_sandbox)
+        .or(host_draft);
     let writer = rollout::RolloutWriter::open_existing(&resumed.path)
         .map_err(|e| format!("档案续写打不开: {e}"))?;
     let (agent, cancel) = build_agent_with(
@@ -155,6 +180,7 @@ fn continue_session(
         &agent_id,
         if session_workspace.as_os_str().is_empty() { state.workspace_root() } else { session_workspace },
         Some(Arc::new(writer)),
+        session_sandbox,
     )?;
     let sink: Arc<dyn events::EventSink> = Arc::new(events::TauriEventSink::root(app.clone(), agent_id).with_journal(Arc::new(event_journal::FileEventJournal::new(app.state::<AppState>().data_root().join(config::SESSIONS_DIR)))).with_broadcast(app.state::<gateway::GatewayHub>().broadcast_sender()).with_viewers(app.state::<gateway::GatewayHub>().viewers()));
     // spawn 的 future 必须是 'static：借用的 app 只能换成 owned 句柄再 move 进去。
@@ -177,7 +203,7 @@ fn resume_session(app: tauri::AppHandle, agent_id: String, task: String) -> Resu
         return Err("任务为空".into());
     }
     let state = app.state::<AppState>();
-    continue_session(&app, &state, agent_id, &task)
+    continue_session(&app, &state, agent_id, &task, None)
 }
 
 /// 会话列表（SH-033）：档案目录里的摘要，按更新时间倒序。
@@ -188,6 +214,55 @@ fn resume_session(app: tauri::AppHandle, agent_id: String, task: String) -> Resu
 fn list_sessions(app: tauri::AppHandle) -> Vec<rollout::SessionSummary> {
     let state = app.state::<AppState>();
     rollout::list(&state.data_root().join(rollout::ROLLOUT_DIR))
+}
+
+/// 会话内切档（`/permission` 的宿主面，对齐 DSH 的 `sandbox/mode` 会话事件）。
+///
+/// 只写**本会话档案**，绝不写 `config.toml`——这是会话内切换与设置页默认值的分界线。
+/// 重进会话靠档案里最后一条事件回放当前档位，进程重启也不丢。
+#[tauri::command]
+fn set_session_sandbox_mode(
+    app: tauri::AppHandle,
+    session_id: String,
+    mode: String,
+) -> Result<String, String> {
+    let state = app.state::<AppState>();
+    let parsed = config::SandboxMode::parse(mode.trim())
+        .ok_or_else(|| format!("未知沙箱档: {mode}"))?;
+    let path = state
+        .data_root()
+        .join(rollout::ROLLOUT_DIR)
+        .join(format!("{session_id}.jsonl"));
+    if path.is_file() {
+        let writer = rollout::RolloutWriter::open_existing(&path)
+            .map_err(|e| format!("会话档案打不开: {e}"))?;
+        writer
+            .append(&rollout::RolloutItem::SandboxMode {
+                mode: parsed.as_str().to_string(),
+                at_ms: now_ms(),
+            })
+            .map_err(|e| format!("写入会话档位失败: {e}"))?;
+    } else {
+        // 还没建档（输入框里先切档）：贴到会话 id 上，首条任务落盘时写进档案。
+        state.put_draft_sandbox(&session_id, parsed);
+    }
+    // 只有目标就是当前跑着的会话时才动运行时快照；别的会话等它自己启动时再装载，
+    // 否则 A 会话的切档会借共享句柄泄进 B（§4.2 反向对照要证的就是这条）。
+    if state.active_agent().as_deref() == Some(session_id.as_str()) {
+        state.policy.set_sandbox(parsed);
+    }
+    Ok(parsed.as_str().to_string())
+}
+
+/// 读会话当前档位（未建档 / 从没切过 → None，前端回落部署默认）。
+#[tauri::command]
+fn session_sandbox_mode(app: tauri::AppHandle, session_id: String) -> Option<String> {
+    let state = app.state::<AppState>();
+    let path = state
+        .data_root()
+        .join(rollout::ROLLOUT_DIR)
+        .join(format!("{session_id}.jsonl"));
+    rollout::last_sandbox_mode(&path)
 }
 
 /// 读一页会话事件信封（SH-094 批 1）：`after_event_id` 之后、最多 `limit` 条。
@@ -387,8 +462,11 @@ fn project_entries(items: &[rollout::RolloutItem]) -> Vec<SessionEntry> {
                     reasoning: None,
                 });
             }
-            // 首行 meta 不是历史；子代理引用要等 SH-056 的泳道 UI 才有展示形态。
-            rollout::RolloutItem::SessionMeta { .. } | rollout::RolloutItem::SubagentRef { .. } => {}
+            // 首行 meta 不是历史；子代理引用要等 SH-056 的泳道 UI 才有展示形态；
+            // 档位事件是控制面记录，不进对话历史。
+            rollout::RolloutItem::SessionMeta { .. }
+            | rollout::RolloutItem::SubagentRef { .. }
+            | rollout::RolloutItem::SandboxMode { .. } => {}
         }
     }
     out
@@ -1003,10 +1081,28 @@ fn create_session(
 fn build_new_session(
     state: &AppState,
     workspace_root: &Path,
+    sandbox: Option<config::SandboxMode>,
 ) -> Result<(Arc<agent_loop::AgentLoop>, tokio_util::sync::CancellationToken, String), String> {
     let (writer, agent_id) = new_session_writer(state, workspace_root, None)?;
-    let (agent, cancel) = build_agent_with(state, &agent_id, workspace_root.to_path_buf(), Some(writer))?;
+    if let Some(mode) = sandbox {
+        // 新会话的初始档位（输入框先切档、再发首条消息）：落进档案，跟会话走。
+        writer
+            .append(&rollout::RolloutItem::SandboxMode {
+                mode: mode.as_str().to_string(),
+                at_ms: now_ms(),
+            })
+            .map_err(|e| format!("写入会话档位失败: {e}"))?;
+    }
+    let (agent, cancel) =
+        build_agent_with(state, &agent_id, workspace_root.to_path_buf(), Some(writer), sandbox)?;
     Ok((agent, cancel, agent_id))
+}
+
+fn now_ms() -> u64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_millis() as u64)
+        .unwrap_or_default()
 }
 
 fn new_session_writer(
@@ -1121,6 +1217,7 @@ fn build_agent_with(
     agent_id: &str,
     workspace_root: PathBuf,
     writer: Option<Arc<rollout::RolloutWriter>>,
+    session_sandbox: Option<config::SandboxMode>,
 ) -> Result<(Arc<agent_loop::AgentLoop>, tokio_util::sync::CancellationToken), String> {
     let cfg = state.config();
     // 生效端点由配置层解析（active 服务商命中 → 那家；否则回落 [model]）。
@@ -1175,9 +1272,9 @@ fn build_agent_with(
             tracing::warn!("MCP 工具注册冲突（已跳过）: {error}");
         }
     }
-    // SH-120：任务启动时把会话策略与前缀白名单重置回 config，
-    // 避免上一任务运行中切换的审批档/沙箱档跨任务泄漏。
-    state.reset_policy();
+    // SH-120 + 档位会话化：任务启动时把审批档重置回 config，沙箱档取本会话档案里的
+    // 最后一档（没有则部署默认）。
+    state.reset_policy(session_sandbox);
     let agent = agent_loop::AgentLoop::from_config(
         backend,
         Arc::new(router),
@@ -2004,6 +2101,8 @@ pub fn run() {
             cancel_task,
             approve,
             set_approval_mode,
+            set_session_sandbox_mode,
+            session_sandbox_mode,
             send_subagent_message,
             interrupt_subagent,
             store_api_key,

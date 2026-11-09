@@ -785,22 +785,44 @@ export function createAdapter(options: AdapterOptions): { remote: unknown; dispo
   })
 
   /**
-   * `permissions` 投影（{currentValue}）：挡位全局共享，所有会话读同一份宿主沙箱档。
-   * 快照里给不出映射（快照读失败回落 read_only）也照实给——UI 的芯片要有一个确定态。
-   * 反推复用 `./permission-presets` 的同一张表，与设置页 `permission` 域的读视图同源。
+   * `permissions` 投影（{currentValue}）：**按会话**读宿主档案里的最后一档，
+   * 没有则回落部署默认（`config.toml`）。会话内切档只写本会话档案，不写配置
+   * ——这是与设置页那行的分界线（对齐 DSH 的 `sandbox/mode` 会话事件）。
    */
-  const currentPermission = (): string => presetOfSandbox(face.sandboxMode())
-  const permissionsProjection = (): Record<string, unknown> => ({ currentValue: currentPermission() })
+  const sessionPresetLoaded = new Set<string>()
+  const sessionPresetCache = new Map<string, string>()
+  /** 还没建档的会话里选的档：首条任务提交时带给宿主，让它写进新档案。 */
+  let pendingNewSessionSandbox: string | undefined
 
-  /** 挡位切换成功后向所有已知会话广播一帧（值来自刚刷新的 face，照 selectModel 的广播方式）。 */
-  const pushPermissionToAll = (): void => {
-    projectionSeq += 1
-    for (const id of journals.keys()) {
-      projectionLog.append({
-        type: 'projection', sessionId: id, seq: projectionSeq,
-        changes: [{ key: 'permissions', val: permissionsProjection() }],
-      })
+  /** 读宿主 durable 的本会话档位；读失败回落部署默认（不伪造一个档）。 */
+  const loadSessionPermission = async (sessionId: string): Promise<string> => {
+    if (sessionPresetLoaded.has(sessionId)) {
+      return sessionPresetCache.get(sessionId) ?? presetOfSandbox(face.sandboxMode())
     }
+    try {
+      const mode = await bridge.invoke<string | null>('session_sandbox_mode', { sessionId })
+      const preset = presetOfSandbox(mode ?? face.sandboxMode())
+      sessionPresetCache.set(sessionId, preset)
+      sessionPresetLoaded.add(sessionId)
+      return preset
+    } catch {
+      return presetOfSandbox(face.sandboxMode())
+    }
+  }
+
+  const currentPermission = (sessionId: string): string =>
+    sessionPresetCache.get(sessionId) ?? presetOfSandbox(face.sandboxMode())
+  const permissionsProjection = (sessionId: string): Record<string, unknown> => ({
+    currentValue: currentPermission(sessionId),
+  })
+
+  /** 只给**目标会话**推一帧：A 会话切档不许改到 B 的芯片（§4.2 反向对照）。 */
+  const pushPermission = (sessionId: string): void => {
+    projectionSeq += 1
+    projectionLog.append({
+      type: 'projection', sessionId, seq: projectionSeq,
+      changes: [{ key: 'permissions', val: permissionsProjection(sessionId) }],
+    })
   }
 
   /**
@@ -1170,7 +1192,7 @@ export function createAdapter(options: AdapterOptions): { remote: unknown; dispo
     projections: {
       asOfSeq: 0,
       values: {
-        modelSelection: currentModelSelection(), title: null, permissions: permissionsProjection(),
+        modelSelection: currentModelSelection(), title: null, permissions: permissionsProjection(id),
         ...(planProjectionValues()),
         // 新会话不可能已有目标；显式 null 让客户端进入"无目标"态而不是加载态。
         goal: null,
@@ -1802,7 +1824,7 @@ export function createAdapter(options: AdapterOptions): { remote: unknown; dispo
         values: {
           modelSelection: currentModelSelection(),
           title: titles.get(sessionId) ?? null,
-          permissions: permissionsProjection(),
+          permissions: { currentValue: await loadSessionPermission(sessionId) },
           ...(planProjectionValues()),
           // 档案重建出的任务清单（todo/write 推导）随快照带出：重开旧会话
           // TodoDock 直接回到最后一份清单（上游回放语义）。
@@ -1837,7 +1859,14 @@ export function createAdapter(options: AdapterOptions): { remote: unknown; dispo
    * 注入面（SH-053），空闲态下等价动作就是走这条与用户输入完全相同的提交链。
    */
   const submitPromptNow = async (sessionId: string | undefined, text: string, rpcId?: string, displayText?: string, images: readonly PromptImageRef[] = []): Promise<void> => {
-    const agentId = await bridge.invoke<string>('send_task', { task: text, agentId: sessionId })
+    // 新会话（还没有 id）在输入框里先切了档：把这个档带进建档，宿主写进新档案。
+    const draftSandbox = sessionId === undefined ? pendingNewSessionSandbox : undefined
+    pendingNewSessionSandbox = undefined
+    const agentId = await bridge.invoke<string>('send_task', {
+      task: text,
+      agentId: sessionId,
+      ...(draftSandbox === undefined ? {} : { sandboxMode: draftSandbox }),
+    })
     const journal = journalOf(agentId)
     const shown = displayText ?? text
     if (!titles.has(agentId)) pushTitle(agentId, shown.trim().slice(0, 12) || '新会话')
@@ -2090,7 +2119,7 @@ export function createAdapter(options: AdapterOptions): { remote: unknown; dispo
             values: {
               modelSelection: currentModelSelection(),
               title: titles.get(sessionId) ?? null,
-              permissions: permissionsProjection(),
+              permissions: { currentValue: await loadSessionPermission(sessionId) },
               ...(planProjectionValues()),
               // 有排队消息才挂 inbox：QueueDock/steer 占位都按投影缺席=无队列判读。
               ...(journal.queue.length > 0
@@ -2140,6 +2169,8 @@ export function createAdapter(options: AdapterOptions): { remote: unknown; dispo
       const goalById = new Map(await Promise.all(
         [...journals.keys()].map(async id => [id, await loadGoal(id)] as const),
       ))
+      // 会话档位同理：每个会话的档位来自它自己的档案，先把缓存读齐再产基线。
+      await Promise.all([...journals.keys()].map(id => loadSessionPermission(id)))
       yield {
         type: 'baseline',
         value: {
@@ -2148,7 +2179,7 @@ export function createAdapter(options: AdapterOptions): { remote: unknown; dispo
             values: {
               modelSelection: currentModelSelection(),
               title: titles.get(id) ?? null,
-              permissions: permissionsProjection(),
+              permissions: permissionsProjection(id),
               ...(planProjectionValues()),
               ...(journal.queue.length > 0
                 ? { inbox: { 'next-turn': journal.queue.map(queueRowOf) } }
@@ -2750,7 +2781,7 @@ export function createAdapter(options: AdapterOptions): { remote: unknown; dispo
       return OK({
         options,
         defaultOptions: options.map(option => ({ ...option })),
-        defaultPreset: currentPermission(),
+        defaultPreset: presetOfSandbox(face.sandboxMode()),
       })
     },
   }
@@ -3015,7 +3046,7 @@ export function createAdapter(options: AdapterOptions): { remote: unknown; dispo
         if (requested === undefined) {
           result = {
             kind: 'success',
-            text: `current preset ${currentPermission()} (available: ${PERMISSION_PRESETS.join(', ')})`,
+            text: `current preset ${await loadSessionPermission(sessionId)} (available: ${PERMISSION_PRESETS.join(', ')})`,
           }
         } else {
           const sandbox = sandboxOfPreset(requested)
@@ -3026,7 +3057,15 @@ export function createAdapter(options: AdapterOptions): { remote: unknown; dispo
             }
           } else {
             try {
-              await face.applySandboxMode(sandbox)
+              // 会话内切档只写本会话档案（宿主 `set_session_sandbox_mode`）：
+              // **绝不写 config.toml**——那是设置页的职责。重进会话靠档案事件回放。
+              const applied = await bridge.invoke<string>('set_session_sandbox_mode', {
+                sessionId,
+                mode: sandbox,
+              })
+              sessionPresetCache.set(sessionId, presetOfSandbox(applied))
+              sessionPresetLoaded.add(sessionId)
+              pendingNewSessionSandbox = sandbox
               result = { kind: 'success', text: `preset ${requested}` }
             } catch (reason) {
               // wire 契约：失败以 result.error 回给客户端，不是 rejection——UI 的错误
@@ -3036,11 +3075,7 @@ export function createAdapter(options: AdapterOptions): { remote: unknown; dispo
           }
         }
         if (result.kind === 'success' && requested !== undefined) {
-          pushPermissionToAll()
-          // 与设置页写挡位走**同一条**收尾链（修订 +1 + `settings/document-updated`
-          // 广播）：少了这次广播，设置页的 describe 缓存不失效——芯片切完再打开设置，
-          // 权限行还显示上一档（真机 E-06）。
-          face.commitPermissionPreset()
+          pushPermission(sessionId)
         }
         pushCommandDone(sessionId, run.commandId, result)
         return OK({ result })
@@ -3147,16 +3182,23 @@ export function createAdapter(options: AdapterOptions): { remote: unknown; dispo
   }
 
   /**
-   * `remote.settings` 面：设置面本体直连，唯一例外是 `permission` 域写入成功后补一帧
-   * 挡位投影。设置页的挡位行写的是宿主 `[sandbox] mode`，而对话页的挡位芯片读的是
-   * 会话 `permissions` 投影——两条链不共享状态。少了这一帧，用户在设置页改完档回到
-   * 对话页，芯片上还是旧档（`/permission` 命令路径本来就推，两条写面必须行为一致）。
+   * `remote.settings` 面：设置面本体直连，唯一例外是 `permission` 域写入成功后刷新
+   * 各会话的挡位投影。设置页写的是**部署默认**（`config.toml`），会话内切档写的是
+   * 本会话档案——两者是两条链。默认变了要让**没有自己事件**的会话跟着变，所以这里
+   * 清缓存重读（有事件的会话仍读回自己的档），再逐会话推帧。
    */
+  const refreshPermissionsAll = async (): Promise<void> => {
+    sessionPresetLoaded.clear()
+    sessionPresetCache.clear()
+    await Promise.all([...journals.keys()].map(id => loadSessionPermission(id)))
+    for (const id of journals.keys()) pushPermission(id)
+  }
+
   const settingsNamespace = {
     describe: (): ReturnType<typeof face.settings.describe> => face.settings.describe(),
     mutate: async (ns: string, ops: readonly SettingsPathOpView[], expectedRevision?: number) => {
       const result = await face.settings.mutate(ns, ops, expectedRevision)
-      if (result.ok && ns === 'permission') pushPermissionToAll()
+      if (result.ok && ns === 'permission') await refreshPermissionsAll()
       return result
     },
   }

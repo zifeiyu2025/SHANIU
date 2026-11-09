@@ -854,6 +854,27 @@ pub enum SandboxMode {
     DangerFullAccess,
 }
 
+impl SandboxMode {
+    /// wire 值（与 `serde(rename_all = "snake_case")` 一致，供状态条/会话事件复用）。
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::ReadOnly => "read_only",
+            Self::WorkspaceWrite => "workspace_write",
+            Self::DangerFullAccess => "danger_full_access",
+        }
+    }
+
+    /// 解析 wire 值；未知值返回 None（调用方决定拒绝还是回落，不在这里猜）。
+    pub fn parse(value: &str) -> Option<Self> {
+        match value {
+            "read_only" => Some(Self::ReadOnly),
+            "workspace_write" => Some(Self::WorkspaceWrite),
+            "danger_full_access" => Some(Self::DangerFullAccess),
+            _ => None,
+        }
+    }
+}
+
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(default)]
 pub struct ApprovalConfig {
