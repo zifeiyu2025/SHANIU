@@ -10,6 +10,11 @@ name: CI
 on:
   push:
   pull_request:
+  # 每日一次（UTC 19:00 = 北京 03:00 低峰）：验证"没人动代码时也绿"，专抓随时间漂移的
+  # 依赖/环境问题（runner 镜像更新、上游 action 行为变化）。只此一条定时；
+  # evals.yml **不加** schedule——它要真实端点与用户 API key，定时就是每天烧钱。
+  schedule:
+    - cron: '0 19 * * *'
 
 jobs:
   gate:
