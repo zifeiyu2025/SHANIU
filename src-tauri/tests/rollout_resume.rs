@@ -310,7 +310,7 @@ async fn resume_continues_real_work_on_a_real_endpoint() {
 
     let build = |writer: Arc<RolloutWriter>| -> (AgentLoop, Arc<ApprovalBroker>) {
         let mut router = ToolRouter::new();
-        tools::register_builtin(&mut router, Arc::new(PlanState::new()));
+        tools::register_builtin(&mut router, Arc::new(PlanState::new()), true);
         let broker = Arc::new(ApprovalBroker::new());
         let agent = AgentLoop {
             backend: Arc::new(ResponsesBackend {

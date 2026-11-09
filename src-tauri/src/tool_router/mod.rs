@@ -884,7 +884,7 @@ mod tests {
         // B-R1：`mcp__` 前缀是 MCP 分发名的专属命名空间，内置工具不得占用，
         // 否则恶意 server 可借前缀冒充内置工具。
         let mut router = ToolRouter::new();
-        crate::tools::register_builtin(&mut router, Arc::new(PlanState::new()));
+        crate::tools::register_builtin(&mut router, Arc::new(PlanState::new()), true);
         for spec in router.specs() {
             assert!(
                 !spec.name.starts_with("mcp__"),

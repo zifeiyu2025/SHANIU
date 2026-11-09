@@ -76,6 +76,8 @@ mod tests {
             secret_name: "K".into(),
             reasoning_effort: Some("high".into()),
             headers: Default::default(),
+            vision: false,
+            context_window: 0,
         };
         let p = ProviderConfig::from_resolved(&resolved);
         assert_eq!(p.reasoning_effort.as_deref(), Some("high"));

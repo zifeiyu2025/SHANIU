@@ -88,7 +88,7 @@ impl AgentOrchestrator for NoopOrchestrator {
 
 fn router() -> ToolRouter {
     let mut router = ToolRouter::new();
-    shaniu_lib::tools::register_builtin(&mut router, Arc::new(PlanState::new()));
+    shaniu_lib::tools::register_builtin(&mut router, Arc::new(PlanState::new()), true);
     router
 }
 

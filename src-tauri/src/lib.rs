@@ -2,6 +2,8 @@
 pub mod agent_loop;
 pub mod app_state;
 pub mod attachments;
+/// 模型能力声明与实测探针（SH-132，docs/04 §4.1）。
+pub mod capability;
 pub mod config;
 pub mod compaction;
 pub mod event_journal;
@@ -12,9 +14,9 @@ pub mod gateway;
 pub mod goals;
 pub mod jobs;
 pub mod mcp_client;
+pub mod model_client;
 /// 内置模型能力表（SH-132 第一层，`resources/model-catalog.json`）。
 pub mod model_catalog;
-pub mod model_client;
 pub mod model_discovery;
 pub mod open_in_app;
 pub mod sandbox;
@@ -1119,6 +1121,30 @@ fn build_agent_with(
         .load_key(&active.secret_name)?
         .ok_or_else(|| format!("未配置 {} 的 API Key，请先在设置中保存", active.id))?;
 
+    // 首次使用该模型时后台补一次能力实测（SH-132）：缓存按
+    // (端点, 协议, 模型, 密钥指纹) 命中就直接返回，不阻塞回合、不重复打请求。
+    // 换 key / 换端点 / 换模型自然落到另一条缓存记录上，等价于失效重探。
+    if let Some(row) = cfg
+        .providers
+        .iter()
+        .find(|p| p.id == active.id)
+        .and_then(|p| p.models.iter().find(|m| m.id == active.model))
+    {
+        let target = capability::ProbeTarget {
+            base_url: active.base_url.clone(),
+            protocol: active.provider.clone(),
+            model: active.model.clone(),
+            headers: active.headers.clone(),
+            api_key: api_key.clone(),
+            token_budget_hint: row.max_tokens,
+        };
+        let data_root = state.data_root().to_path_buf();
+        let row = row.clone();
+        tauri::async_runtime::spawn(async move {
+            capability::ensure_probed(data_root, target, row).await;
+        });
+    }
+
     let cancel = tokio_util::sync::CancellationToken::new();
     if !state.begin_task(agent_id, cancel.clone()) {
         return Err("已有任务在运行".into());
@@ -1126,7 +1152,8 @@ fn build_agent_with(
 
     let backend: Arc<dyn ModelBackend> = Arc::new(agent_loop::ResponsesBackend { provider, api_key });
     let mut router = tool_router::ToolRouter::new();
-    tools::register_builtin(&mut router, state.plan_state.clone());
+    // 工具面跟随能力（SH-132）：视觉未生效的模型不注册 `view_image`。
+    tools::register_builtin(&mut router, state.plan_state.clone(), active.vision);
     // MCP 已批准工具（SH-063）：同一批执行器副本进每个任务的 router；
     // 撤销在运行时翻转执行器开关，已下发副本随之失效。
     for executor in state.mcp.executors() {
@@ -1204,7 +1231,9 @@ fn get_settings(app: tauri::AppHandle) -> Result<serde_json::Value, String> {
     // 逐服务商报告"是否已配 Key"：界面只问生效那家的话，切换按钮就会在一个根本没密钥的
     // 服务商上显示可用，第一次发送才失败——失败点离原因越远越难归因。
     let mut profiles = Vec::with_capacity(cfg.providers.len());
+    let probe_cache = capability::ProbeCache::load(&state.data_root());
     for p in &cfg.providers {
+        let stored_key = secret.load_key(&p.secret_name())?;
         profiles.push(serde_json::json!({
             "id": p.id,
             "label": p.label,
@@ -1212,7 +1241,7 @@ fn get_settings(app: tauri::AppHandle) -> Result<serde_json::Value, String> {
             "baseUrl": p.base_url,
             "model": p.model,
             "secretRef": p.secret_name(),
-            "hasApiKey": secret.load_key(&p.secret_name())?.is_some(),
+            "hasApiKey": stored_key.is_some(),
             // 模型清单原样回显，空清单不替 `model` 补一行：补出来的那行看起来像
             // "用户自己加的"，设置页就会给一个根本没被声明过的档位提供删除按钮。
             "models": p.models.iter().map(|m| serde_json::json!({
@@ -1224,6 +1253,16 @@ fn get_settings(app: tauri::AppHandle) -> Result<serde_json::Value, String> {
                 // 推理档声明（SH-096）：档位 → wire 值；空串 = off 档（不发字段）。
                 // 前端视图把它翻成 null，写回时再归一成空串。
                 "reasoningEfforts": m.reasoning_efforts,
+                // 能力视图（SH-132）：值 + 来源 + 三态（已验证/不符/未验证）。
+                // 实测结论按 (端点, 协议, 模型, 密钥指纹) 取缓存，换任一项自然失效。
+                "capabilities": capability::model_view(
+                    m,
+                    &p.base_url,
+                    stored_key.as_deref().and_then(|key| {
+                        let key = capability::cache_key(&p.base_url, &p.provider, &m.id, key);
+                        probe_cache.entries.get(&key)
+                    }),
+                ),
             })).collect::<Vec<_>>(),
             // 席位选中的推理档位（档位名；空 = 服务商默认）
             "reasoningEffort": p.reasoning_effort,
@@ -1236,6 +1275,11 @@ fn get_settings(app: tauri::AppHandle) -> Result<serde_json::Value, String> {
         "baseUrl": active.base_url,
         "model": active.model,
         "maxTurns": cfg.model.max_turns,
+        // 推理档位清单与默认档的唯一真源（SH-132 收敛）：前端不再自带一份
+        // `THINKING_LEVELS`。之前两处各写一份，`path`/`title` 才会被当成档位写进
+        // `reasoning_efforts`——那块字段只认这张表里的名字。
+        "thinkingLevels": config::THINKING_LEVELS,
+        "defaultReasoningLevel": config::DEFAULT_REASONING_LEVEL,
         "workspaceRoot": state.workspace_root().to_string_lossy(),
         "hasApiKey": secret.load_key(&active.secret_name)?.is_some(),
         // 安全面两档的回显。序列化直接走 serde（枚举本身是 snake_case），
@@ -1287,6 +1331,10 @@ fn save_providers(
             ));
         }
     }
+    // 能力来源维护（SH-132）：继承旧记录 + 把用户手改过的项标成手动。
+    let previous = cfg.providers.clone();
+    let mut providers = providers;
+    capability::carry_sources(&previous, &mut providers);
     cfg.providers = providers;
     cfg.active_provider = active_provider;
     cfg.provider_revision = cfg.provider_revision.saturating_add(1);
@@ -1914,6 +1962,8 @@ pub fn run() {
             sandbox_network_grant,
             sandbox_network_revoke,
             model_discovery::discover_models,
+            capability::probe_capabilities,
+            capability::fetch_model_metadata,
             delete_api_key,
             open_in_explorer,
             pick_folder,

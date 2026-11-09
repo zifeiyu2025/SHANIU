@@ -296,7 +296,19 @@ impl AgentLoop {
             plan_state,
             workspace_root,
             max_turns: TurnBudget::from_config(cfg).max_turns,
-            token_budget: cfg.agent.token_budget,
+            // 压缩触发点（SH-132）：能力声明的 `context_window` 一旦已知，就不能再让
+            // 固定预算吃到底——128K 窗口配 500K 预算等于永远不压缩，等端点溢出才报错。
+            // 取 `min(token_budget, context_window * 4/5)`：留 20% 给下一轮的回复与
+            // 工具结果，0 预算（显式关闭压缩）保持关闭，不替用户改主意。
+            token_budget: {
+                let window = cfg.effective_model().context_window as usize;
+                if window == 0 || cfg.agent.token_budget == 0 {
+                    cfg.agent.token_budget
+                } else {
+                    let window_budget = window.saturating_mul(4) / 5;
+                    cfg.agent.token_budget.min(window_budget)
+                }
+            },
             tree_budget: TreeBudget::unlimited(),
             policy: Arc::new(policy::SessionPolicyHandle::new(policy::SessionPolicy {
                 approval: cfg.approval.mode,
@@ -1989,7 +2001,7 @@ mod tests {
     #[test]
     fn plan_mode_declarations_hide_write_and_execute_tools() {
         let mut router = ToolRouter::new();
-        crate::tools::register_builtin(&mut router, Arc::new(PlanState::new()));
+        crate::tools::register_builtin(&mut router, Arc::new(PlanState::new()), true);
 
         let names = |plan: bool| -> Vec<String> {
             declarations_for(&router, plan, true, 0, false, None).into_iter().map(|d| d.name).collect()

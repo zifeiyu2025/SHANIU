@@ -428,7 +428,7 @@ async fn run_one(
 
     let plan_state = Arc::new(PlanState::new());
     let mut router = ToolRouter::new();
-    tools::register_builtin(&mut router, plan_state.clone());
+    tools::register_builtin(&mut router, plan_state.clone(), true);
     let broker = eval_broker();
     let decision = eval_decision();
     let sink = Arc::new(EvalSink {
@@ -904,7 +904,7 @@ async fn repair_loop_fixes_broken_rust_project_until_cargo_test_green() {
 
     let plan_state = Arc::new(PlanState::new());
     let mut router = ToolRouter::new();
-    tools::register_builtin(&mut router, plan_state.clone());
+    tools::register_builtin(&mut router, plan_state.clone(), true);
     let broker = eval_broker();
     let decision = eval_decision();
     let sink = Arc::new(EvalSink {

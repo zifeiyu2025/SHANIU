@@ -37,6 +37,11 @@ interface HostModelRow {
    * TOML 没有 null，宿主文档用空串承载上游的 null，视图与写面在此双向翻译。
    */
   readonly reasoningEfforts?: Readonly<Record<string, string>>
+  /**
+   * 能力来源视图（视图专用，不属于 config.toml）：宿主按「值 + 来源 + 三态」
+   * 给出每个能力项谁说的、测过没有，这里原样透传，写面逐字段挑时丢弃。
+   */
+  readonly capabilities?: Readonly<Record<string, unknown>>
 }
 
 /** `get_settings` 里一家服务商的完整回显。 */
@@ -79,6 +84,10 @@ interface SettingsSnapshot {
   readonly workspaceHidden?: boolean
   /** 工作区展示顺序（SH-111，[workspace].order）：空/缺 = 未拖拽过，按派生序。 */
   readonly workspaceOrder?: readonly string[]
+  /** 生效的推理档位顺序（宿主给出）；缺 = 用本地兜底全集。 */
+  readonly thinkingLevels?: readonly string[]
+  /** 默认推理档位；缺 = 不做预选。 */
+  readonly defaultReasoningLevel?: string
 }
 
 /** `save_providers` 写入的一行：04 §4 的落盘名。Tauri 只转顶层参数名，嵌套结构体按 serde 名走。 */
@@ -180,14 +189,19 @@ const refused = <T>(error: RemoteError): FaceResult<T> => ({ ok: false, error })
 /** 设置页写面里一个服务商 profile 允许的键；其余一律拒绝（见 PROFILE_KEYS 的注释）。 */
 const PROFILE_KEYS = new Set(['displayName', 'apiKeyEnv', 'api', 'baseURL', 'models', 'headers'])
 /**
- * 一行模型允许的键（SH-096 起 `reasoningEfforts` 接线）。不含 `description`：
- * schema 里没声明的字段界面不会给，真给了就报错而不是收下再丢。
+ * 一行模型允许的键（SH-096 起 `reasoningEfforts` 接线）。`capabilities` 是视图
+ * 透传字段：视图把它带回写面时这里收下不报错，但 parseModelRow 仍逐字段挑，
+ * 不会把它写进 config.toml。不含 `description`：schema 里没声明的字段界面不会给，
+ * 真给了就报错而不是收下再丢。
  */
-const MODEL_KEYS = new Set(['id', 'name', 'contextWindow', 'maxTokens', 'input', 'reasoningEfforts'])
+const MODEL_KEYS = new Set(['id', 'name', 'contextWindow', 'maxTokens', 'input', 'reasoningEfforts', 'capabilities'])
 
-/** 推理档位全集（SH-096，上游 THINKING_LEVELS；后端校验/展示顺序共用）。 */
-const THINKING_LEVELS = ['off', 'minimal', 'low', 'medium', 'high', 'xhigh', 'max'] as const
-const THINKING_LEVEL_SET = new Set<string>(THINKING_LEVELS)
+/**
+ * 推理档位的兜底全集：仅当宿主没返回 `thinkingLevels` 时使用。实际生效档位以
+ * 宿主 `get_settings` 的 `thinkingLevels` 为准（见 createSettingsFace 里的
+ * `thinkingLevels()`），避免前端再维护一份"当前生效档"。
+ */
+const THINKING_LEVEL_FALLBACK = ['off', 'minimal', 'low', 'medium', 'high', 'xhigh', 'max'] as const
 
 /** 宿主协议族 ⇄ DSH 的 `api` 名。两边都只认这两个值，其余按"未实现"处理。 */
 const API_OF_HOST: Record<string, string> = { 'openai-chat': 'openai-completions', 'openai-responses': 'openai-responses' }
@@ -208,9 +222,13 @@ const modelRowSchema = z.object({
   contextWindow: z.number().step(1).min(1),
   maxTokens: z.number().step(1).min(1),
   input: z.array(z.union(['text', 'image'])),
+  // 能力来源视图透传（不落盘）：`z.any()` = 不校验、原样接受。
+  capabilities: z.any(),
   // 推理档位（SH-096）：值是 string 或 null（off 档）。schema 与上游
   // llm-pi-ai config.ts 同构——设置页的档位编辑器从这里的键 union 取可选档。
-  reasoningEfforts: z.union([z.const(false), z.dict(z.union([z.string(), z.const(null)]), z.union(THINKING_LEVELS as unknown as string[]))]),
+  // 这里写的是**协议允许的全集**（静态 schema 不能依赖运行期数据）；实际显示/
+  // 校验顺序以宿主 `thinkingLevels` 为准，避免两处各写一份"当前生效档"。
+  reasoningEfforts: z.union([z.const(false), z.dict(z.union([z.string(), z.const(null)]), z.union(THINKING_LEVEL_FALLBACK as unknown as string[]))]),
 })
 
 const piAiSchema = z.object({
@@ -298,6 +316,8 @@ function applyOps(root: JsonValue, ops: readonly SettingsPathOpView[]): JsonValu
 
 export function createSettingsFace(bridge: HostBridge, options: SettingsFaceOptions): SettingsFace {
   let snapshot: SettingsSnapshot | undefined
+  /** 推理档位的真源：宿主 `thinkingLevels`；未返回时才用兜底全集。 */
+  const thinkingLevels = (): readonly string[] => snapshot?.thinkingLevels ?? THINKING_LEVEL_FALLBACK
   /** `ui-settings-general` 的用户层只在进程内留存，理由见 viewGeneral 的注释。 */
   let generalUser: JsonValue = {}
   let generalRevision = 0
@@ -355,13 +375,15 @@ export function createSettingsFace(bridge: HostBridge, options: SettingsFaceOpti
         if (model.contextWindow > 0) entry.contextWindow = model.contextWindow
         if (model.maxTokens > 0) entry.maxTokens = model.maxTokens
         if (model.input.length > 0) entry.input = [...model.input]
+        // 能力来源视图透传：只给界面看，写面（parseModelRow）逐字段挑时丢弃。
+        if (model.capabilities !== undefined) entry.capabilities = model.capabilities as unknown as JsonValue
         // 推理档声明（SH-096）：空串翻回 null（off 档的上游形态），键按全集顺序
         // 排——设置页的档位编辑器按 dict 条目顺序渲染，BTreeMap 的字母序会让
         // off 排在 low 后面，视觉上像"档位乱序"。
         const declared = model.reasoningEfforts
         if (declared !== undefined && Object.keys(declared).length > 0) {
           const efforts: Record<string, JsonValue> = {}
-          for (const level of THINKING_LEVELS) {
+          for (const level of thinkingLevels()) {
             if (!(level in declared)) continue
             const wire = declared[level]
             efforts[level] = wire === '' ? null : wire
@@ -542,9 +564,10 @@ export function createSettingsFace(bridge: HostBridge, options: SettingsFaceOpti
     const reasoning_efforts: Record<string, string> = {}
     if (rawEfforts !== undefined && rawEfforts !== false) {
       if (!isRecord(rawEfforts)) throw new Refusal(`服务商 ${route} 的模型 ${id} 的 reasoningEfforts 必须是档位到 wire 值的映射`)
+      const levels = thinkingLevels()
       for (const [level, wire] of Object.entries(rawEfforts)) {
-        if (!THINKING_LEVEL_SET.has(level)) {
-          throw new Refusal(`服务商 ${route} 的模型 ${id} 有未知推理档位 ${level}（可用：${THINKING_LEVELS.join('/')}）`)
+        if (!levels.includes(level)) {
+          throw new Refusal(`服务商 ${route} 的模型 ${id} 有未知推理档位 ${level}（可用：${levels.join('/')}）`)
         }
         const value = wire === null || wire === undefined ? '' : wire
         if (typeof value !== 'string') {
@@ -640,7 +663,7 @@ export function createSettingsFace(bridge: HostBridge, options: SettingsFaceOpti
         // 模型没声明 high（或其 wire 值为空）就不给 defaultEffort，不发明档位。
         const declared = row.models.find(candidate => candidate.id === out.id)?.reasoningEfforts
         if (declared !== undefined && Object.keys(declared).length > 0) {
-          const efforts = THINKING_LEVELS.filter(level => level in declared)
+          const efforts = thinkingLevels().filter(level => level in declared)
             .map(level => ({ id: level, name: level }))
           const selected = row.reasoningEffort ?? ''
           const highDeclared = declared['high'] !== undefined && declared['high'].trim() !== ''

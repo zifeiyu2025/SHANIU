@@ -7,7 +7,7 @@
 //! 3. **单张与会话上限**：超限明确拒绝，不偷偷截断——截断后的图模型看的是另一张图。
 //!
 //! 与视觉无关的判断（比如「该模型是否支持图片」）不在这里：那是能力声明的事，
-//! 没通过实测的模型不应该注册这个工具（能力卡 SH-072b）。
+//! 没通过实测的模型不应该注册这个工具（能力卡 SH-132）。
 
 use async_trait::async_trait;
 use image::{DynamicImage, GenericImageView, ImageFormat, RgbImage};

@@ -30,6 +30,11 @@ pub struct DiscoveredModel {
     pub context_window: Option<u64>,
     pub max_tokens: Option<u64>,
     pub input_modalities: Vec<String>,
+    /// 端点声明的工具调用能力（SH-132）。`None` = 端点没给，按未知处理，
+    /// 交给实测探针——不要拿模型名去猜。
+    pub tools: Option<bool>,
+    /// 端点是否原生支持托管搜索（SH-132）。同样是 `None` = 不知道。
+    pub builtin_web_search: Option<bool>,
 }
 
 /// 拉取模型列表的核心实现。`api_key` 调用方已保证非空；错误消息永不携带密钥。
@@ -94,18 +99,25 @@ pub async fn discover_endpoint_models(
             .filter(|n| !n.is_empty());
         let context_window = first_number(item, &["context_window", "context_length"]);
         let max_tokens = first_number(item, &["max_output_tokens", "max_completion_tokens"]);
-        let input_modalities = item
-            .get("input_modalities")
-            .and_then(serde_json::Value::as_array)
-            .map(|list| {
-                list.iter()
-                    .filter_map(serde_json::Value::as_str)
-                    .map(str::to_string)
-                    .collect::<Vec<_>>()
-            })
-            .filter(|list| !list.is_empty())
-            .unwrap_or_else(|| vec!["text".to_string()]);
-        out.push(DiscoveredModel { id, name, context_window, max_tokens, input_modalities });
+        // 能力线索与能力模块共用同一套防御性解析（两种字段形状、类型不符按缺失）。
+        let meta = crate::capability::parse_metadata(item);
+        let input_modalities = meta
+            .input_modalities
+            .unwrap_or_else(|| vec!["text".to_string()])
+            // 只保留我们真支持的模态：端点声明的 `video` 不能变成能力。
+            .into_iter()
+            .filter(|m| matches!(m.as_str(), "text" | "image"))
+            .collect::<Vec<_>>();
+        let input_modalities = if input_modalities.is_empty() { vec!["text".to_string()] } else { input_modalities };
+        out.push(DiscoveredModel {
+            id,
+            name,
+            context_window,
+            max_tokens,
+            input_modalities,
+            tools: meta.supports_tools,
+            builtin_web_search: meta.builtin_web_search,
+        });
     }
     if out.is_empty() {
         return Err(format!("{url} 的响应里没有可用模型行（缺 id 字段），请手工填写"));

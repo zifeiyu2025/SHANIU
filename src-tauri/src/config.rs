@@ -91,6 +91,80 @@ impl WorkspaceProfile {
 /// 与后端校验共用这一份清单——两处各写一份迟早漂移。
 pub const THINKING_LEVELS: [&str; 7] = ["off", "minimal", "low", "medium", "high", "xhigh", "max"];
 
+/// 推理档位的默认预选档（没选过档位时回落这一档）。
+///
+/// 这是**唯一**的默认档真源：后端 `effective_model` 的请求侧回落、席位的
+/// `defaultEffort`、设置页的档位编辑器都从这里来（经 `get_settings` 的
+/// `thinkingLevels`/`defaultReasoningLevel` 下发），不再各处写一个 "high" 字面量。
+pub const DEFAULT_REASONING_LEVEL: &str = "high";
+
+/// 能力项来源（SH-132，04 §4 `[providers.models.capabilities.<item>].source`）。
+///
+/// 声明值的优先级（高 → 低）：**手动 > 端点元数据 > 内置表 > 推测（家族）**。
+/// 探针不参与声明排位，它只写 `verified`——两者不能互相覆盖，否则"填错了"会被
+/// 一次探测洗成"对的"。
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum CapabilitySource {
+    /// 没人声明过（旧配置、自动获取失败）。
+    #[default]
+    Unknown,
+    /// 端点元数据（`GET /models` 或 `/models/{id}`）。
+    Endpoint,
+    /// 随仓库发布的内置表精确命中（`resources/model-catalog.json`）。
+    Builtin,
+    /// 内置表家族正则命中：**推测**，与「内置表」区分；探针结论优先于它。
+    Inferred,
+    /// 实测探针写入（只作声明外的补充，不覆盖声明值）。
+    Probe,
+    /// 用户在设置页手填，覆盖一切自动来源。
+    Manual,
+}
+
+/// 一项能力的声明与实测记录（SH-132）。
+///
+/// **值只有一份**：`vision` 取模型行的 `input` 含不含 `image`，
+/// `context_window`/`max_output` 取 `context_window`/`max_tokens`，`reasoning`
+/// 的档位取 `reasoning_efforts`。这里只存"谁说它行、测过没有"，避免同一事实
+/// 落两处后各自漂移（SH-096 的串段事故就是这么来的）。
+///
+/// 唯一例外是 `tools` / `builtin_web_search` 这类**没有专属字段**的布尔项：
+/// 它们的声明值存在 `value`。以后新增 `audio` / `embeddings` / `prompt_caching`
+/// 同理——map 的键不做白名单，未知项原样保留并透传到设置页，新增能力不需要
+/// 改配置结构。
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(default)]
+pub struct CapabilityRecord {
+    /// 无专属字段的布尔项声明值。`false` 也是有效声明（"明确没有"），
+    /// 与 `None`（没声明）在界面上必须能区分。
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub value: Option<bool>,
+    pub source: CapabilitySource,
+    /// 实测结论：`None` = 未验证，`Some(true)` = 实测通过，`Some(false)` = 与声明不符。
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub verified: Option<bool>,
+    /// 实测通过的推理档（仅 `reasoning` 项）：档位选择器只列这些档。
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    pub verified_levels: Vec<String>,
+    /// 端点声明的可用档位（仅 `reasoning` 项，来自 `effort.supported_levels`）。
+    /// 可选档 = 声明 ∩ 端点这份清单——端点明说没这档，界面上就不该给。
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    pub endpoint_levels: Vec<String>,
+    /// 最近一次实测时间（Unix 毫秒），供界面显示"上次实测"。
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub checked_at_ms: Option<u64>,
+    /// 实测证据的人话摘要（"两档 reasoning_tokens 均为 0"这类），写日志与界面都直接用它。
+    #[serde(skip_serializing_if = "String::is_empty")]
+    pub evidence: String,
+}
+
+impl CapabilityRecord {
+    /// 端点/手动写入一条布尔声明。`Probe` 来源不允许走这里——探针只写 `verified`。
+    pub fn declared(value: bool, source: CapabilitySource) -> Self {
+        Self { value: Some(value), source, ..Default::default() }
+    }
+}
+
 /// 设置页里一行模型档位（04 §4 `[[providers.models]]`）。
 ///
 /// 运行期消费 `id`（`ProviderProfile::model` 就是它当前选中的那一行）与
@@ -121,6 +195,135 @@ pub struct ModelProfile {
     /// 可继承的目录，false 与缺席等价，前端写面把 false 归一成空 map。
     #[serde(alias = "reasoningEfforts")]
     pub reasoning_efforts: std::collections::BTreeMap<String, String>,
+    /// 能力声明与实测记录（SH-132）：能力项 id → 来源/实测结论。
+    /// 键不做白名单（扩展位：`audio`/`embeddings`/`prompt_caching` 以后直接加），
+    /// 值本身取本行的 `input`/`context_window`/`max_tokens`/`reasoning_efforts`。
+    #[serde(default)]
+    pub capabilities: std::collections::BTreeMap<String, CapabilityRecord>,
+}
+
+impl ModelProfile {
+    /// 内置表命中（精确或家族）。`base_url` 必填：同一个模型 id 在不同端点上
+    /// 能力并不相同（`deepseek-flash` 在 DeepSeek 有视觉、在 Sensenova 没有）。
+    fn builtin(&self, base_url: &str) -> Option<crate::model_catalog::BuiltinCapabilities> {
+        crate::model_catalog::lookup(base_url, &self.id).map(|hit| hit.capabilities())
+    }
+
+    /// 声明的视觉能力。优先级：能力项显式值 > `input` 字段 > 内置表。
+    ///
+    /// 为什么保留三条来源：`input` 是设置页既有的"输入模态"字段（旧配置全靠它），
+    /// 能力项是端点/手动覆盖的写入点，内置表是没配过也没抓过元数据时的兜底。
+    /// 三者都不成立 = 没声明。
+    pub fn declared_vision(&self, base_url: &str) -> bool {
+        if let Some(value) = self.capabilities.get("vision").and_then(|cap| cap.value) {
+            return value;
+        }
+        if self.input.iter().any(|m| m == "image") {
+            return true;
+        }
+        self.builtin(base_url)
+            .and_then(|builtin| builtin.input)
+            .is_some_and(|input| input.iter().any(|m| m == "image"))
+    }
+
+    /// 视觉是否**生效**：声明有且实测没否定。未验证不拦（用户可用），实测不符才拦。
+    pub fn vision_effective(&self, base_url: &str) -> bool {
+        self.declared_vision(base_url)
+            && self.capabilities.get("vision").and_then(|cap| cap.verified) != Some(false)
+    }
+
+    /// 可选的推理档，按 `THINKING_LEVELS` 顺序。
+    ///
+    /// 唯一真源仍是 `reasoning_efforts`（档位 → wire 值）；内置表只在**本行没声明**
+    /// 时给出档位名。最后与端点 `effort.supported_levels` 取交集：端点明说没这档，
+    /// 界面上就不该给，选了也不该发出去被静默忽略。
+    pub fn declared_reasoning_levels(&self, base_url: &str) -> Vec<String> {
+        let mut levels: Vec<String> = THINKING_LEVELS
+            .iter()
+            .copied()
+            .filter(|level| *level != "off")
+            .filter(|level| {
+                self.reasoning_efforts
+                    .get(*level)
+                    .is_some_and(|wire| !wire.trim().is_empty())
+            })
+            .map(str::to_string)
+            .collect();
+        if levels.is_empty() {
+            if let Some(builtin) = self.builtin(base_url).and_then(|b| b.reasoning_levels) {
+                levels = THINKING_LEVELS
+                    .iter()
+                    .copied()
+                    .filter(|level| builtin.iter().any(|l| l == *level))
+                    .map(str::to_string)
+                    .collect();
+            }
+        }
+        if let Some(endpoint) = self
+            .capabilities
+            .get("reasoning")
+            .map(|cap| &cap.endpoint_levels)
+            .filter(|list| !list.is_empty())
+        {
+            levels.retain(|level| endpoint.iter().any(|l| l == level));
+        }
+        levels
+    }
+
+    /// 某个档位发往 `reasoning_effort` 的 wire 值。`None` = 这一档不发字段。
+    ///
+    /// 真源是 `reasoning_efforts`（本行声明）；本行没声明任何档位时，用内置表的档位名
+    /// 做恒等映射——OpenAI 兼容端点的 `reasoning_effort` 取值就是这些名字。端点
+    /// `effort.supported_levels` 明说没这档就不给，避免"界面上选了、请求里没有"。
+    pub fn reasoning_wire(&self, base_url: &str, level: &str) -> Option<String> {
+        let level = level.trim();
+        if level.is_empty() {
+            return None;
+        }
+        if !self.reasoning_efforts.is_empty() {
+            return self
+                .reasoning_efforts
+                .get(level)
+                .filter(|wire| !wire.trim().is_empty())
+                .cloned();
+        }
+        if let Some(endpoint) = self
+            .capabilities
+            .get("reasoning")
+            .map(|cap| &cap.endpoint_levels)
+            .filter(|list| !list.is_empty())
+        {
+            if !endpoint.iter().any(|l| l == level) {
+                return None;
+            }
+        }
+        self.builtin(base_url)
+            .and_then(|builtin| builtin.reasoning_levels)
+            .filter(|levels| levels.iter().any(|l| l == level))
+            .map(|_| level.to_string())
+    }
+
+    /// 上下文窗口：本行填了就用本行的（手动/端点写入），否则用内置表的。
+    /// 0 = 未知（不拿 0 当"无限"，压缩仍走固定预算）。
+    pub fn context_window_effective(&self, base_url: &str) -> u32 {
+        if self.context_window > 0 {
+            return self.context_window;
+        }
+        self.builtin(base_url)
+            .and_then(|builtin| builtin.context_window)
+            .map(|window| window.min(u32::MAX as u64) as u32)
+            .unwrap_or(0)
+    }
+
+    /// 能力项在界面上的三态：`verified` / `mismatch` / `unverified`。
+    /// 只用于展示——**不**参与运行期放行（那用 `vision_effective` 这类显式判据）。
+    pub fn capability_state(&self, item: &str) -> &'static str {
+        match self.capabilities.get(item).and_then(|cap| cap.verified) {
+            Some(true) => "verified",
+            Some(false) => "mismatch",
+            None => "unverified",
+        }
+    }
 }
 
 /// 一家可切换的服务商（04 §4 `[[providers]]` 的一行）。
@@ -228,6 +431,13 @@ pub struct ResolvedModel {
     pub reasoning_effort: Option<String>,
     /// 该服务商的自定义请求头（SH-097），原样带到模型请求。
     pub headers: std::collections::BTreeMap<String, String>,
+    /// 视觉能力是否生效（SH-132）：声明有视觉（`input` 含 `image`，或能力项显式
+    /// 覆盖）且没有被实测否定。`view_image` 只在这个值为真时注册——模型看不到
+    /// 工具，就不会乱调，也不会幻觉"我看过截图了"。
+    pub vision: bool,
+    /// 上下文窗口（SH-132）：0 = 未知。已知时压缩触发点取
+    /// `min(token_budget, context_window * 4/5)`，不再一个固定预算吃到底。
+    pub context_window: u32,
 }
 
 impl AppConfig {
@@ -350,23 +560,21 @@ impl AppConfig {
                 let level = p.reasoning_effort.trim();
                 let reasoning_effort = if level.is_empty() {
                     // 初始默认（用户拍板，2026-11-07）：没选择过档位时回落声明的
-                    // `high`，与席位 catalog 的 defaultEffort 预选同一规则；模型没
-                    // 声明 high（或其 wire 值为空）就维持不发，不发明一个档位。
-                    // 显式选过 off 的（reasoning_effort = "off"）不进这一支。
+                    // 默认档（`DEFAULT_REASONING_LEVEL`），与席位 catalog 的
+                    // defaultEffort 预选同一规则；模型没声明这一档（或其 wire 值为空）
+                    // 就维持不发，不发明一个档位。显式选过 off 的（reasoning_effort =
+                    // "off"）不进这一支。
                     p.models
                         .iter()
                         .find(|m| m.id == p.model)
-                        .and_then(|m| m.reasoning_efforts.get("high"))
-                        .filter(|wire| !wire.is_empty())
-                        .cloned()
+                        .and_then(|m| m.reasoning_wire(&p.base_url, DEFAULT_REASONING_LEVEL))
                 } else {
                     p.models
                         .iter()
                         .find(|m| m.id == p.model)
-                        .and_then(|m| m.reasoning_efforts.get(level))
-                        .filter(|wire| !wire.is_empty())
-                        .cloned()
+                        .and_then(|m| m.reasoning_wire(&p.base_url, level))
                 };
+                let row = p.models.iter().find(|m| m.id == p.model);
                 ResolvedModel {
                     id: p.id.clone(),
                     provider: p.provider.clone(),
@@ -376,6 +584,10 @@ impl AppConfig {
                     secret_name: p.secret_name(),
                     reasoning_effort,
                     headers: p.headers.clone(),
+                    vision: row.map(|m| m.vision_effective(&p.base_url)).unwrap_or(false),
+                    context_window: row
+                        .map(|m| m.context_window_effective(&p.base_url))
+                        .unwrap_or(0),
                 }
             }
             None => ResolvedModel {
@@ -388,6 +600,10 @@ impl AppConfig {
                 // 回落段没有档位清单，推理档无从谈起（04 §4 兼容姿态的一部分）
                 reasoning_effort: None,
                 headers: Default::default(),
+                // 回落段没有能力声明：视觉不生效、窗口未知。宁可少注册一个工具，
+                // 也不要在没声明的地方假装能用。
+                vision: false,
+                context_window: 0,
             },
         }
     }
@@ -450,6 +666,27 @@ impl AppConfig {
                         p.id, row.id
                     ));
                 }
+                // 能力项（SH-132）：键不设白名单（扩展位），但已识别的项要守住语义。
+                // `verified_levels` 是探针写入的实测档，出现未知档位说明来源可疑或
+                // 手改坏了——按拒绝处理，而不是让档位选择器列出一个不存在的档。
+                for (item, cap) in &row.capabilities {
+                    for level in &cap.verified_levels {
+                        if !THINKING_LEVELS.contains(&level.as_str()) {
+                            return Err(format!(
+                                "服务商 {} 的模型 {} 的能力项 {item} 含未知实测档位 {level}（可用：{}）",
+                                p.id,
+                                row.id,
+                                THINKING_LEVELS.join("/")
+                            ));
+                        }
+                    }
+                    if item == "reasoning" && cap.value.is_some() {
+                        return Err(format!(
+                            "服务商 {} 的模型 {} 的能力项 reasoning 不能写布尔值：档位以 reasoning_efforts 为准",
+                            p.id, row.id
+                        ));
+                    }
+                }
             }
             // 清单非空时当前生效行必须在里面：不在的话席位下拉里没有它，用户看不到
             // 自己正在跑的模型，随手点一下别的行就把运行档换掉了。
@@ -467,7 +704,7 @@ impl AppConfig {
                     .models
                     .iter()
                     .find(|m| m.id == p.model)
-                    .is_some_and(|m| m.reasoning_efforts.contains_key(level));
+                    .is_some_and(|m| m.reasoning_wire(&p.base_url, level).is_some());
                 if !declared {
                     return Err(format!(
                         "服务商 {} 的选中推理档位 {level} 不在生效模型 {} 的档位声明里",
@@ -1890,6 +2127,7 @@ mod provider_tests {
             max_tokens: 8_192,
             input: vec!["text".into()],
             reasoning_efforts: std::collections::BTreeMap::new(),
+            capabilities: std::collections::BTreeMap::new(),
         }
     }
 

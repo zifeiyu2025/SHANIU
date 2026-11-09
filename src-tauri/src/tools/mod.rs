@@ -21,7 +21,11 @@ use std::sync::Arc;
 use crate::tool_router::{PlanState, ToolRouter};
 
 /// 注册全部内置工具（Plan Mode 工具对共享 PlanState）。
-pub fn register_builtin(router: &mut ToolRouter, plan_state: Arc<PlanState>) {
+///
+/// `vision` 来自能力声明（SH-132）：`view_image` 只在视觉**生效**时注册。注册层
+/// 而不是声明层拦，是因为模型看不到工具就不会乱调，也不会幻觉"我看了截图"——
+/// 声明层过滤只影响提示词，分发层仍然认得这个名字。
+pub fn register_builtin(router: &mut ToolRouter, plan_state: Arc<PlanState>, vision: bool) {
     router.register(Arc::new(fs_read::ReadFile::new()));
     router.register(Arc::new(fs_read::ListDir::new()));
     router.register(Arc::new(fs_read::Search::new()));
@@ -48,5 +52,8 @@ pub fn register_builtin(router: &mut ToolRouter, plan_state: Arc<PlanState>) {
     router.register(Arc::new(web::WebFetch::new(web_client)));
 
     // SH-072：看工作区内的图片。只读；字节只进进程内缓存，会话档案只落引用。
-    router.register(Arc::new(view_image::ViewImage::new()));
+    // 视觉未生效的模型不注册——工具面即能力面。
+    if vision {
+        router.register(Arc::new(view_image::ViewImage::new()));
+    }
 }

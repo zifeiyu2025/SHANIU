@@ -109,7 +109,7 @@ async fn real_model_is_blocked_when_it_reaches_outside_the_narrowed_allowlist() 
     );
 
     let mut router = ToolRouter::new();
-    shaniu_lib::tools::register_builtin(&mut router, Arc::new(PlanState::new()));
+    shaniu_lib::tools::register_builtin(&mut router, Arc::new(PlanState::new()), true);
     let workspace = shaniu_lib::test_support::TestTempDir::new("permission-real");
 
     let engine = Arc::new(AgentLoop {
