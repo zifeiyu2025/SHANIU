@@ -186,6 +186,12 @@ type FaceResult<T> = { readonly ok: true; readonly value: T } | { readonly ok: f
 const ok = <T>(value: T): FaceResult<T> => ({ ok: true, value })
 const refused = <T>(error: RemoteError): FaceResult<T> => ({ ok: false, error })
 
+/** 目录里的显式展示次序；缺省排在内置之后（数据层排序，不靠数组下标）。 */
+const catalogPriority = (route: string): number =>
+  PROVIDER_CATALOG[route]?.priority ?? Number.MAX_SAFE_INTEGER
+/** 是否为 SHANIU 出厂内置服务商（内置商允许在未填密钥时作为默认档展示）。 */
+const isBuiltinRoute = (route: string): boolean => PROVIDER_CATALOG[route]?.builtin === true
+
 /** 设置页写面里一个服务商 profile 允许的键；其余一律拒绝（见 PROFILE_KEYS 的注释）。 */
 const PROFILE_KEYS = new Set(['displayName', 'apiKeyEnv', 'api', 'baseURL', 'models', 'headers'])
 /**
@@ -707,7 +713,14 @@ export function createSettingsFace(bridge: HostBridge, options: SettingsFaceOpti
     const view = snapshot
     if (view === undefined || view.providers.length === 0) return { provider: '', model: '' }
     const row = view.providers.find(candidate => candidate.id === view.activeProvider)
-    if (row === undefined || routeState(row).failure !== undefined) return { provider: '', model: '' }
+    if (row === undefined) return { provider: '', model: '' }
+    // 内置服务商（DeepSeek）在还没填密钥时也作为默认档展示：产品要求是
+    // 「全新安装 / 无配置时默认选中它」，用户先去设置页补 Key 即可。自定义
+    // 服务商维持旧判据——不显示一个跑不通的模型（历史缺陷的既有防线，不放宽）。
+    const failure = routeState(row).failure
+    if (failure !== undefined && !(isBuiltinRoute(row.id) && row.models.length > 0)) {
+      return { provider: '', model: '' }
+    }
     // 选中档位随档回显：席位据此预选推理档（ModelSelect 的 effectiveEffort 链）
     const effort = row.reasoningEffort ?? ''
     return { provider: row.id, model: row.model, ...(effort === '' ? {} : { reasoningEffort: effort }) }
@@ -903,7 +916,10 @@ export function createSettingsFace(bridge: HostBridge, options: SettingsFaceOpti
               : { declared: false, defaultBaseURL: catalogEntry.defaultBaseURL }),
           })
         }
-        return ok([...directory.values()])
+        // 顺序按目录的显式 priority 稳定排序：DeepSeek（0）在最前，其余保持文档顺序。
+        return ok([...directory.values()].toSorted(
+          (left, right) => catalogPriority(left.provider) - catalogPriority(right.provider),
+        ))
       },
       discoverModels: async (settingsNs, request) => {
         if (settingsNs !== 'llm-pi-ai') {
@@ -916,7 +932,7 @@ export function createSettingsFace(bridge: HostBridge, options: SettingsFaceOpti
             name: model.name,
             contextWindow: model.contextWindow,
             maxTokens: model.maxTokens,
-            inputModalities: ['text'],
+            inputModalities: [...(model.input ?? ['text'])],
           })))
         }
         // 自建端点（SH-098）：宿主带密钥访问 GET {baseURL}/models。探针密钥

@@ -1341,9 +1341,12 @@ fn get_settings(app: tauri::AppHandle) -> Result<serde_json::Value, String> {
     let secret = config::SecretStore::new(&state.config_root());
     // 逐服务商报告"是否已配 Key"：界面只问生效那家的话，切换按钮就会在一个根本没密钥的
     // 服务商上显示可用，第一次发送才失败——失败点离原因越远越难归因。
-    let mut profiles = Vec::with_capacity(cfg.providers.len());
+    // 内置服务商置顶（数据层次序）：`get_settings` 是设置页与席位共用的唯一来源，
+    // 排序放在这里而不是前端数组下标——前端只消费顺序，不再维护一份置顶特判。
+    let ordered_providers = config::builtin_providers::ordered_profiles(&cfg.providers);
+    let mut profiles = Vec::with_capacity(ordered_providers.len());
     let probe_cache = capability::ProbeCache::load(&state.data_root());
-    for p in &cfg.providers {
+    for p in ordered_providers {
         let stored_key = secret.load_key(&p.secret_name())?;
         let models = p
             .models

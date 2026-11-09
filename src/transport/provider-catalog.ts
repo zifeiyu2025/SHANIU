@@ -17,6 +17,8 @@ export interface CatalogModelRow {
   readonly contextWindow: number
   readonly maxTokens: number
   readonly reasoning: boolean
+  /** 输入模态；缺省 = 仅 text（模型发现回显用）。 */
+  readonly input?: readonly ('text' | 'image')[]
 }
 
 /** 一个内建服务商（官方 llm-pi-ai 目录项的精简面）。 */
@@ -26,9 +28,29 @@ export interface CatalogProviderEntry {
   /** 适配器原生读取的密钥环境变量（第一个作为首选提示）。 */
   readonly env: readonly string[]
   readonly models: readonly CatalogModelRow[]
+  /**
+   * 展示次序：越小越靠前；缺省排在内置之后。排序在数据层显式声明，
+   * 不在界面里按数组下标或 id 特判置顶。
+   */
+  readonly priority?: number
+  /** 是否为 SHANIU 出厂内置服务商（区别于「目录里可添加的第三方」）。 */
+  readonly builtin?: boolean
 }
 
 export const PROVIDER_CATALOG: Record<string, CatalogProviderEntry> = {
+  deepseek: {
+    displayName: 'DeepSeek',
+    defaultBaseURL: 'https://api.deepseek.com',
+    env: ['DEEPSEEK_API_KEY'],
+    // 与 Rust `config/builtin_providers.rs`、`resources/model-catalog.json`
+    // （2026-11-09 端点实测）保持同一份数值。
+    priority: 0,
+    builtin: true,
+    models: [
+      { id: 'deepseek-flash', name: 'DeepSeek-V4.1-Flash', contextWindow: 1_048_576, maxTokens: 393_216, reasoning: true, input: ['text', 'image'] },
+      { id: 'deepseek-v4-pro', name: 'DeepSeek-V4-Pro', contextWindow: 1_048_576, maxTokens: 393_216, reasoning: true },
+    ],
+  },
   openai: {
     displayName: 'OpenAI',
     defaultBaseURL: 'https://api.openai.com/v1',

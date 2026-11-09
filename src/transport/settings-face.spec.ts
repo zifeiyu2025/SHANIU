@@ -252,6 +252,20 @@ const LONGCAT_EFFORTS_NO_HIGH: Row = {
   }],
 }
 
+/** 出厂内置的 DeepSeek（与 Rust `builtin_providers`、`model-catalog.json` 同数值）。 */
+const DEEPSEEK: Row = {
+  id: 'deepseek',
+  label: 'DeepSeek',
+  provider: 'openai-chat',
+  base_url: 'https://api.deepseek.com',
+  model: 'deepseek-flash',
+  secret_ref: 'DEEPSEEK_API_KEY',
+  models: [{
+    id: 'deepseek-flash', name: 'DeepSeek-V4.1-Flash', context_window: 1_048_576, max_tokens: 393_216,
+    input: ['text', 'image'], reasoning_efforts: { low: 'low', high: 'high', max: 'max' },
+  }],
+}
+
 function profileValue(overrides: Record<string, unknown> = {}): Record<string, unknown> {
   return {
     displayName: 'MiniMax',
@@ -827,6 +841,19 @@ describe('llm 面', () => {
     expect(wrongNs['ok']).toBe(false)
   })
 
+  it('内置 DeepSeek 排在可配置清单第一位（数据层 priority，不靠数组下标）', async () => {
+    // 宿主文档里自定义商排在前面：排序仍必须把内置商提到最前
+    const host = fakeHost([LONGCAT, DEEPSEEK])
+    const listed = await faceOf(host).llm.listConfigurableProviders()
+    const entries = listed['value'] as { provider: string; displayName: string; declared?: boolean }[]
+    expect(entries[0]).toMatchObject({ provider: 'deepseek', displayName: 'DeepSeek', declared: false })
+    // 模型发现按实测模态回显：deepseek-flash 支持图片输入
+    const discovered = await faceOf(host).llm.discoverModels('llm-pi-ai', { provider: 'deepseek' })
+    const flash = (discovered['value'] as { id: string; inputModalities: string[] }[])
+      .find(model => model.id === 'deepseek-flash')
+    expect(flash?.inputModalities).toEqual(['text', 'image'])
+  })
+
   it('自建端点模型发现（SH-098）：探针密钥透传宿主，失败按 llm/model-discovery-rejected 回显', async () => {
     const host = fakeHost([])
     const face = faceOf(host)
@@ -901,5 +928,21 @@ describe('席位的生效档', () => {
     expect(face.activeSelection()).toEqual({ provider: '', model: '' })
     const catalog = await face.session.modelCatalog()
     expect((catalog['value'] as { failures: { id: string }[] }).failures.map(item => item.id)).toEqual(['longcat'])
+  })
+
+  it('内置 DeepSeek 未填密钥也作为默认档展示；补上密钥后目录里出现它', async () => {
+    const host = fakeHost([DEEPSEEK])
+    host.active = 'deepseek'
+    const face = faceOf(host)
+    // 未配置时仍如实报告失败（不假装可用），只是默认档位已经指向它
+    const before = await face.session.modelCatalog()
+    expect(face.activeSelection()).toEqual({ provider: 'deepseek', model: 'deepseek-flash' })
+    expect((before['value'] as { groups: unknown[] }).groups).toEqual([])
+    expect((before['value'] as { failures: { id: string; message: string }[] }).failures[0]!.message)
+      .toContain('未配置密钥')
+    await face.credentials.set('DEEPSEEK_API_KEY', 'k')
+    const catalog = await face.session.modelCatalog()
+    expect((catalog['value'] as { routableProviders: string[] }).routableProviders).toEqual(['deepseek'])
+    expect(face.activeSelection()).toEqual({ provider: 'deepseek', model: 'deepseek-flash' })
   })
 })

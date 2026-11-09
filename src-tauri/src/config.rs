@@ -21,6 +21,8 @@ use tracing_subscriber::fmt::MakeWriter;
 
 /// 内置模型能力表（SH-132）：`config` 层的默认值数据表，不是业务模块。
 pub mod model_catalog;
+/// 内置服务商表：出厂默认服务商与展示次序的数据层来源。
+pub mod builtin_providers;
 
 pub const DATA_DIR_ENV: &str = "SHANIU_DATA_DIR";
 pub const PORTABLE_MARKER: &str = "portable.marker";
@@ -456,6 +458,17 @@ pub struct ResolvedModel {
 }
 
 impl AppConfig {
+    /// 全新安装的出厂配置：内置服务商（DeepSeek 置顶）直接进 `[[providers]]`
+    /// 并由它生效。只在配置文件**不存在**时使用；已有配置（哪怕 providers 为空）
+    /// 一个字节都不改——用户删光了服务商是用户的决定，不能被"默认值"复活。
+    pub fn fresh_install() -> Self {
+        Self {
+            providers: builtin_providers::default_profiles(),
+            active_provider: builtin_providers::default_active_id().to_string(),
+            ..Self::default()
+        }
+    }
+
     /// 校验额外工作区清单（SH-099）：id 唯一非空、路径唯一非空且是绝对路径。
     /// 存在性/目录类型在创建命令里即时校验（配置里存的是用户意图，目录后来被删
     /// 不该让整个 config.toml 拒载）。
@@ -1360,11 +1373,11 @@ impl AppConfig {
             }
         }
         if !path.exists() {
-            let default = Self::default();
+            let default = Self::fresh_install();
             return match default.save(&path) {
                 Ok(()) => LoadedConfig { config: default, path, outcome: ConfigLoadOutcome::Clean },
                 Err(error) => LoadedConfig {
-                    config: Self::default(),
+                    config: Self::fresh_install(),
                     path,
                     outcome: ConfigLoadOutcome::ReadOnly { reason: error },
                 },
