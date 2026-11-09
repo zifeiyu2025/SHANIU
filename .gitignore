@@ -51,8 +51,10 @@ scratch/
 # 真机验收截图/取证产物（体积大、可复现，状态记在 docs/05）
 artifacts/
 
-# 评估运行产物（一进程一份，入库会churn；基线看 evals/baseline.<model>.json）
+# 评估运行产物（一进程一份，入库会churn）
 evals/latest.json
+# 已无消费方：workflow 改为跑当日两臂并显式传路径（分母必须是同日对照，
+# 冻结基线会因端点漂移失真）。仅作历史保留，删不删都不影响任何门禁。
 evals/control.json
 evals/results/
 evals/.eval.lock
