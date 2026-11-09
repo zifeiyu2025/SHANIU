@@ -1174,8 +1174,8 @@ impl DataDirs {
             config_root: self.config_root.display().to_string(),
             data_root: self.data_root.display().to_string(),
             workspace_root: self.workspace_root().display().to_string(),
-            // 界面上"显示路径缩写"用的家目录必须与运行时的回落工作区同源，
-            // 否则同一份文档在界面里会被缩成另一个前缀。
+            // 界面"显示路径缩写"用的家目录。回落工作区已改为数据根下的 Workspace，
+            // 不再与家目录同源；这个字段只影响 `~` 缩写的来源，两处不要混用。
             home_dir: home_dir().display().to_string(),
         }
     }

@@ -249,7 +249,16 @@ fn app_container_scope(
     if !runtime.resolved_roots.contains(workspace_root) {
         let sid = runtime.container.sid();
         for dir in acl::write_scope(workspace_root) {
-            with_acl(|acl| acl.grant(&dir, sid, acl::Access::Write))?;
+            // 工作区根与工具链目录走同一份清单，但只有前者受「过宽根」约束：
+            // 工具链本来就可能在 Program Files 下。
+            let is_workspace_root = dir == *workspace_root;
+            with_acl(|acl| {
+                if is_workspace_root {
+                    acl.grant_workspace(&dir, sid, acl::Access::Write)
+                } else {
+                    acl.grant(&dir, sid, acl::Access::Write)
+                }
+            })?;
         }
         runtime.resolved_roots.insert(workspace_root.to_path_buf());
     }
@@ -508,6 +517,7 @@ fn ensure_mcp_container(server_id: &str, trusted_server_ids: &[String]) -> Resul
 
 fn grant_mcp_paths(
     server_id: &str,
+    workspace_root: &Path,
     desired: &[(PathBuf, acl::Access)],
 ) -> Result<(), SandboxError> {
     let mut runtimes = mcp_lock()?;
@@ -519,13 +529,24 @@ fn grant_mcp_paths(
         if runtime.granted.iter().any(|(granted, level)| granted == path && level == access) {
             continue;
         }
-        with_acl(|acl| acl.grant(path, sid, *access)).map_err(|error| {
+        let is_workspace_root = acl::same_path(path, workspace_root);
+        with_acl(|acl| {
+            if is_workspace_root {
+                acl.grant_workspace(path, sid, *access)
+            } else {
+                acl.grant(path, sid, *access)
+            }
+        }).map_err(|error| {
             // 常见根因：运行时装在管理员所有的目录（普通用户改不了它的 DACL，
             // 容器也没读到它的权限）。给出能照做的两个出口。
             let detail = match &error {
                 SandboxError::CreateFailed(message) => message.clone(),
                 other => other.to_string(),
             };
+            // 过宽根拒绝自带完整说明（为什么、怎么办），不再拼「管理员安装」那套。
+            if detail.starts_with("拒绝把「") {
+                return SandboxError::CreateFailed(detail);
+            }
             SandboxError::CreateFailed(format!(
                 "{detail}。若该目录或运行时由管理员安装，容器读不到它：\
                  请把运行时装到用户可写目录，或在配置里为这个 server 显式设置 \
@@ -749,7 +770,7 @@ fn spawn_mcp_in_app_container(
         desired.push((root, acl::Access::Read));
     }
     let desired = acl::collapse(desired);
-    grant_mcp_paths(request.server_id, &desired)?;
+    grant_mcp_paths(request.server_id, request.workspace_root, &desired)?;
 
     let mut env = request.env.clone();
     let temp_text = server_temp.to_string_lossy().to_string();
@@ -1161,13 +1182,14 @@ mod tests {
         };
         let profile = appcontainer::mcp_profile_name(&id).unwrap();
 
-        grant_mcp_paths(&id, &[(target.clone(), acl::Access::Read)]).expect("授权读");
+        grant_mcp_paths(&id, &target, &[(target.clone(), acl::Access::Read)]).expect("授权读");
         assert!(
             acl::has_explicit_grant(&target, sid, acl::Access::Read.mask()).unwrap(),
             "容器 SID 应有显式读 ACE"
         );
         // 幂等：重复授权不报错，ACE 仍在。
-        grant_mcp_paths(&id, &[(target.clone(), acl::Access::Read)]).expect("重复授权应幂等");
+        grant_mcp_paths(&id, &target, &[(target.clone(), acl::Access::Read)])
+            .expect("重复授权应幂等");
         assert!(acl::has_explicit_grant(&target, sid, acl::Access::Read.mask()).unwrap());
 
         release_mcp_server(&id);

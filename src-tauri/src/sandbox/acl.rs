@@ -230,6 +230,22 @@ impl AclManager {
         Ok(restored)
     }
 
+    /// 给**工作区根**加 ACE：先挡住过宽根，再走普通授权。
+    ///
+    /// 为什么要单独一个入口：过宽根只对「工作区根」这一角色成立。工具链目录
+    /// （`node.exe` 所在目录、`.cargo` 等）本来就可能落在 `C:\Program Files` 下，
+    /// 那条授权路径不受这里影响。
+    pub fn grant_workspace(&mut self, dir: &Path, sid: PSID, access: Access) -> Result<(), String> {
+        let normalized = normalize(dir);
+        if let Some(reason) = overbroad_root_reason(&normalized) {
+            let sid_text = sid_to_string(sid)?;
+            // 拒绝必须落进审计：只 warn 一行日志，用户与后来人都看不到它发生过。
+            self.audit("grant", &normalized, &sid_text, access.label(), "refused", Some(&reason));
+            return Err(reason);
+        }
+        self.grant(dir, sid, access)
+    }
+
     /// 给目录加容器 SID 的 ACE。备份失败 → 直接失败，**不改安全描述符**。
     pub fn grant(&mut self, dir: &Path, sid: PSID, access: Access) -> Result<(), String> {
         let normalized = normalize(dir);
@@ -418,6 +434,82 @@ fn normalize(path: &Path) -> PathBuf {
         Some(stripped) => PathBuf::from(stripped),
         None => canonical,
     }
+}
+
+/// 同一路径？两侧都先规范化（`..`、尾斜杠、`\\?\`、junction 会收敛到同一形态），
+/// 再按 Windows 口径忽略大小写——`canonicalize` 对不存在的路径会原样返回，
+/// 那时大小写不一定与磁盘一致，不能只靠字符串相等。
+pub fn same_path(a: &Path, b: &Path) -> bool {
+    normalize(a).to_string_lossy().to_lowercase() == normalize(b).to_string_lossy().to_lowercase()
+}
+
+/// 过宽根判定（对外：读环境变量取主目录与系统目录）。
+///
+/// 过宽根不是「慢」，是**范围错**：把它授给容器等于把凭据、浏览器数据、
+/// 整盘内容一起交出去，远远超过工具需要。
+fn overbroad_root_reason(path: &Path) -> Option<String> {
+    let home = crate::config::home_dir();
+    let mut system_dirs: Vec<PathBuf> = Vec::new();
+    for (key, fallback) in [
+        ("SystemRoot", Some("C:\\Windows")),
+        ("ProgramFiles", Some("C:\\Program Files")),
+        ("ProgramFiles(x86)", Some("C:\\Program Files (x86)")),
+    ] {
+        match std::env::var_os(key).filter(|value| !value.is_empty()) {
+            Some(value) => system_dirs.push(PathBuf::from(value)),
+            None => {
+                if let Some(value) = fallback {
+                    system_dirs.push(PathBuf::from(value));
+                }
+            }
+        }
+    }
+    overbroad_root_reason_with(path, Some(&home), &system_dirs)
+}
+
+/// 纯函数部分：调用方给出主目录与系统目录，便于测试不依赖真实环境。
+///
+/// **只比规范化后的最终路径**，不做字符串前缀匹配——前缀匹配漏掉的形态
+/// （`C:\Users\jun\`、`C:\Users\jun\..\jun`、`\\?\C:\Users\jun`、指向主目录的
+/// junction）都会在 [`normalize`] 里收敛成同一形态。
+fn overbroad_root_reason_with(
+    path: &Path,
+    home: Option<&Path>,
+    system_dirs: &[PathBuf],
+) -> Option<String> {
+    if home.is_some_and(|home| same_path(path, home)) {
+        return Some(format!(
+            "拒绝把「{}」作为工作区根授权：这是用户主目录，下面有凭据（.ssh、\
+             浏览器与 AppData 里的登录态）等与工具无关的数据，授出去的范围远超工具需要。\
+             请改选它下面的具体项目目录，例如「{}\\work」。这不是权限不足，是本工具的边界。",
+            path.display(),
+            path.display()
+        ));
+    }
+    if is_drive_or_share_root(path) {
+        return Some(format!(
+            "拒绝把「{}」作为工作区根授权：这是盘符/共享根，等于把整块盘的内容都交给容器。\
+             请改选具体的项目目录。这不是权限不足，是本工具的边界。",
+            path.display()
+        ));
+    }
+    if system_dirs.iter().any(|dir| same_path(path, dir)) {
+        return Some(format!(
+            "拒绝把「{}」作为工作区根授权：这是 Windows 系统目录（Windows / Program Files），\
+             不是项目目录；其中的程序与数据不属于本工具的作用面。请改选你自己的项目目录。",
+            path.display()
+        ));
+    }
+    None
+}
+
+/// 盘符根（`C:\`）或 UNC 共享根（`\\server\share`）：只有前缀 + 根，没有下级成分。
+fn is_drive_or_share_root(path: &Path) -> bool {
+    use std::path::Component;
+    let mut components = path.components();
+    let prefixed = matches!(components.next(), Some(Component::Prefix(_)));
+    let rooted = matches!(components.next(), Some(Component::RootDir));
+    prefixed && rooted && components.next().is_none()
 }
 
 fn hash_path(path: &str) -> u64 {
@@ -1198,5 +1290,71 @@ mod tests {
             !has_explicit_grant(&target, sid_b.as_psid(), Access::Write.mask()).unwrap(),
             "还原后另一个 SID 的 ACE 也应消失"
         );
+    }
+
+    #[test]
+    fn overbroad_roots_are_judged_after_normalization() {
+        let ws = temp_dir("overbroad");
+        let home = ws.join("home");
+        let work = home.join("work");
+        std::fs::create_dir_all(&work).unwrap();
+        let home_normalized = normalize(&home);
+
+        // 尾斜杠
+        let trailing = PathBuf::from(format!("{}\\", home.display()));
+        assert!(
+            overbroad_root_reason_with(&normalize(&trailing), Some(&home_normalized), &[]).is_some(),
+            "尾斜杠不能绕过"
+        );
+        // `..` 绕行
+        let dotted = work.join("..");
+        assert!(
+            overbroad_root_reason_with(&normalize(&dotted), Some(&home_normalized), &[]).is_some(),
+            ".. 绕行不能绕过"
+        );
+        // `\\?\` 前缀
+        let verbatim = PathBuf::from(format!("\\\\?\\{}", home.display()));
+        assert!(
+            overbroad_root_reason_with(&normalize(&verbatim), Some(&home_normalized), &[]).is_some(),
+            "\\\\?\\ 前缀不能绕过"
+        );
+        // 盘符根 / UNC 共享根
+        assert!(overbroad_root_reason_with(Path::new(r"C:\"), None, &[]).is_some());
+        assert!(overbroad_root_reason_with(Path::new(r"\\server\share"), None, &[]).is_some());
+        // 系统目录
+        let system = vec![PathBuf::from(r"C:\Windows")];
+        assert!(
+            overbroad_root_reason_with(&normalize(Path::new(r"C:\Windows")), None, &system).is_some()
+        );
+        // 主目录下的子目录必须放行——否则把所有人都挡在外面。
+        assert!(
+            overbroad_root_reason_with(&normalize(&work), Some(&home_normalized), &[]).is_none(),
+            "主目录的子目录不是过宽根"
+        );
+    }
+
+    #[test]
+    fn grant_workspace_refuses_home_and_leaves_audit() {
+        let ws = temp_dir("refuse");
+        let backups = ws.join("backups");
+        let mut manager = AclManager::new(backups.clone());
+        let sid = super::super::appcontainer::internet_client_capability().unwrap();
+        let home = crate::config::home_dir();
+        let error = manager
+            .grant_workspace(&home, sid.as_psid(), Access::Read)
+            .expect_err("用户主目录必须拒绝授权");
+        assert!(error.contains("用户主目录"), "{error}");
+        assert!(error.contains("请改选它下面的具体项目目录"), "{error}");
+        let audit = std::fs::read_to_string(ws.join("acl-audit.jsonl")).unwrap();
+        assert!(audit.contains("refused"), "拒绝必须落进审计：{audit}");
+        assert!(audit.contains("用户主目录"), "{audit}");
+
+        // 正常目录照旧放行（守卫不能把普通人挡在外面）。
+        let work = ws.join("work");
+        std::fs::create_dir_all(&work).unwrap();
+        manager
+            .grant_workspace(&work, sid.as_psid(), Access::Read)
+            .expect("主目录之外的目录不应被拦");
+        assert!(has_explicit_grant(&work, sid.as_psid(), Access::Read.mask()).unwrap());
     }
 }

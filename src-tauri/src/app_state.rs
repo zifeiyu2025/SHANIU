@@ -96,15 +96,17 @@ impl AppState {
         self.data_root.clone()
     }
 
-    /// 工作区根目录：配置优先，空则回落用户主目录（docs §9.1）。
+    /// 工作区根目录：配置优先，空则回落**应用自有目录**（`<data_root>\Workspace`）。
+    ///
+    /// 为什么不回落到用户主目录：工作区根会被授给沙箱容器，主目录下是凭据、
+    /// 浏览器数据与整份用户资料——范围远超工具需要（B 轮 105 秒只是它的症状）。
+    /// 口径与 `get_product_dirs` 回给界面的 `workspaceRoot` 一致，两处不分叉。
     pub fn workspace_root(&self) -> PathBuf {
         let configured = self.config().workspace.root.trim().to_string();
         if !configured.is_empty() {
             return PathBuf::from(configured);
         }
-        // 与 `get_product_dirs` 回给界面的 homeDir 同一个来源：两处各读各的环境变量，
-        // 就会出现"工作区建在 A、界面按 B 缩写路径"。
-        crate::config::home_dir()
+        self.data_root().join(crate::config::WORKSPACE_DIR)
     }
 
     /// 标记配置只读（启动时坏配置无法安全修复）。之后所有写回都被拒绝，
@@ -331,9 +333,15 @@ mod tests {
     }
 
     #[test]
-    fn workspace_root_falls_back_to_user_profile() {
+    fn workspace_root_falls_back_to_app_owned_directory() {
         let (_dir, s) = state();
-        assert!(s.workspace_root().starts_with(std::env::var_os("USERPROFILE").map(PathBuf::from).unwrap_or_default()));
+        // 回落的是应用自有目录，**不是**用户主目录：主目录授给容器范围过大。
+        assert_eq!(s.workspace_root(), s.data_root().join(crate::config::WORKSPACE_DIR));
+        assert_ne!(
+            s.workspace_root(),
+            std::env::var_os("USERPROFILE").map(PathBuf::from).unwrap_or_default(),
+            "默认工作区不能是用户主目录"
+        );
         let mut cfg = s.config();
         cfg.workspace.root = "D:/tmp/ws".into();
         s.update_config(cfg).unwrap();
