@@ -56,7 +56,7 @@ jobs:
       SHANIU_TEST_MODEL: ${{ github.event.inputs.model || 'LongCat-2.5' }}
 
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
 
       - name: 校验评估密钥存在（缺失即失败，不给假绿）
         env:
@@ -109,7 +109,7 @@ jobs:
         run: cargo test --test latency_budget -- --ignored --nocapture
 
       - name: 装 Node（评分脚本用）
-        uses: actions/setup-node@v4
+        uses: actions/setup-node@v7
         with:
           node-version: 22
 
