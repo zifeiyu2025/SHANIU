@@ -7,9 +7,16 @@
 //!
 //! 已知限制（批 1 明示）：没有落盘保留策略/压缩，长会话会持续增长（批 2 的 gateway
 //! 需要时再加轮转）；本模块不负责广播传输，只负责持久化与读取。
-use std::fs::OpenOptions;
+//!
+//! 写路径（SH-127 M1）：同一 `FileEventJournal` 内每会话复用一条常驻写句柄（上限 8 条 LRU），
+//! 不再每事件 open/close；被淘汰的句柄下次以 **append** 模式重开，绝不截断。
+//! 落盘仍在编号锁内——文件行序必须等于 event_id 序，挪出锁会让 `read_after` 读错（见 M1b）。
+use std::collections::HashMap;
+use std::fs::{File, OpenOptions};
 use std::io::{BufRead, BufReader, Write};
 use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::Mutex;
 
 use serde::{Deserialize, Serialize};
 
@@ -38,19 +45,31 @@ fn log_path(dir: &Path, session_id: &str) -> Result<PathBuf, String> {
     Ok(dir.join(format!("{session_id}{EVENT_LOG_SUFFIX}")))
 }
 
-/// 追加一条信封。调用方在广播出口内按 event_id 顺序调用（编号锁内），因此文件行序即编号序。
+/// 信封序列化成一行 NDJSON（含行尾换行）。
+fn encode(event: &AgentEvent) -> Result<String, String> {
+    let mut line = serde_json::to_string(event).map_err(|e| format!("事件信封序列化失败: {e}"))?;
+    line.push('\n');
+    Ok(line)
+}
+
+/// 写一行并 flush：`flush` 保留原语义（先落盘再广播，客户端续播时日志里一定已有它）。
+fn write_line(file: &mut File, line: &str, path: &Path) -> Result<(), String> {
+    file.write_all(line.as_bytes())
+        .and_then(|_| file.flush())
+        .map_err(|e| format!("事件日志写入失败（{}）: {e}", path.display()))
+}
+
+/// 一次性追加：每调用 open/close 一次。生产路径走 `FileEventJournal`（复用句柄），
+/// 这里保留给「无状态一次写入」的调用点与测试基座。
 pub fn append(dir: &Path, event: &AgentEvent) -> Result<(), String> {
     let path = log_path(dir, &event.session_id)?;
+    let line = encode(event)?;
     let mut file = OpenOptions::new()
         .create(true)
         .append(true)
         .open(&path)
         .map_err(|e| format!("事件日志打开失败（{}）: {e}", path.display()))?;
-    let line = serde_json::to_string(event).map_err(|e| format!("事件信封序列化失败: {e}"))?;
-    file.write_all(line.as_bytes())
-        .and_then(|_| file.write_all(b"\n"))
-        .and_then(|_| file.flush())
-        .map_err(|e| format!("事件日志写入失败（{}）: {e}", path.display()))
+    write_line(&mut file, &line, &path)
 }
 
 /// 读取日志最后一条合法事件 id（只用于 live-only 订阅的游标种子，不重放大历史）。
@@ -159,29 +178,121 @@ pub fn owner_session_of_agent(dir: &Path, agent_id: &str) -> Result<Option<Strin
     Ok(None)
 }
 
+/// 常驻写句柄上限。事件按会话分文件；一个任务里通常是「父会话 + 若干子代理」共用一份日志，
+/// 8 条足够覆盖相邻打开的会话，超了按最久未用淘汰（淘汰 = 关闭句柄，不影响文件内容）。
+const HANDLE_CACHE_LIMIT: usize = 8;
+
+struct CachedFile {
+    file: File,
+    last_used: u64,
+}
+
+#[derive(Default)]
+struct HandleCache {
+    entries: HashMap<String, CachedFile>,
+    tick: u64,
+}
+
+impl HandleCache {
+    /// 命中则刷新最近使用时间。未命中返回 false，调用方负责打开并 `insert`。
+    fn hit(&mut self, session_id: &str) -> bool {
+        self.tick += 1;
+        match self.entries.get_mut(session_id) {
+            Some(cached) => {
+                cached.last_used = self.tick;
+                true
+            }
+            None => false,
+        }
+    }
+
+    /// 放入新句柄。满了先淘汰最久未用的那条（drop = 关闭句柄）。
+    /// **下次 `append` 走 `OpenOptions::append(true)` 重开**，不截断既有内容。
+    fn insert(&mut self, session_id: &str, file: File) {
+        if self.entries.len() >= HANDLE_CACHE_LIMIT {
+            if let Some(victim) = self
+                .entries
+                .iter()
+                .min_by_key(|(_, cached)| cached.last_used)
+                .map(|(id, _)| id.clone())
+            {
+                self.entries.remove(&victim);
+            }
+        }
+        self.tick += 1;
+        self.entries
+            .insert(session_id.to_owned(), CachedFile { file, last_used: self.tick });
+    }
+
+    fn write(&mut self, session_id: &str, line: &str, path: &Path) -> Result<(), String> {
+        let cached = self
+            .entries
+            .get_mut(session_id)
+            .ok_or_else(|| "事件日志句柄缓存未命中".to_string())?;
+        write_line(&mut cached.file, line, path)
+    }
+
+    fn discard(&mut self, session_id: &str) {
+        self.entries.remove(session_id);
+    }
+}
+
 /// 落盘到固定目录的事件日志实现：组合根把它注入 `TauriEventSink`（依赖倒置，
-/// `events` 不反向依赖本模块）。线程安全由 `append` 自身的打开-追加-Flush 保证，
-/// 调用方在编号锁内串行调用，故无需额外锁。
+/// `events` 不反向依赖本模块）。调用方在编号锁内串行调用，故这里的锁不会争用；
+/// 它存在只是为了满足 `EventJournal: Send + Sync`。
+///
+/// M1（SH-127）：每会话复用一条常驻写句柄，省掉每事件的 open/close 与路径解析；
+/// 写入仍是「write + flush」，行序仍由编号锁保证。
 pub struct FileEventJournal {
     dir: PathBuf,
+    handles: Mutex<HandleCache>,
+    /// 打开次数。验收指标：N 条事件应只有 1 次打开，而不是 N 次。
+    opens: AtomicU64,
 }
 
 impl FileEventJournal {
     pub fn new(dir: PathBuf) -> Self {
-        Self { dir }
+        Self {
+            dir,
+            handles: Mutex::new(HandleCache::default()),
+            opens: AtomicU64::new(0),
+        }
+    }
+
+    /// 累计打开文件次数（只用于验收与基准，不影响行为）。
+    pub fn opens(&self) -> u64 {
+        self.opens.load(Ordering::Relaxed)
     }
 }
 
 impl crate::events::EventJournal for FileEventJournal {
     fn append(&self, event: &AgentEvent) -> Result<(), String> {
-        append(&self.dir, event)
+        let path = log_path(&self.dir, &event.session_id)?;
+        let line = encode(event)?;
+        let mut handles = self.handles.lock().map_err(|e| format!("事件日志句柄表不可用: {e}"))?;
+        if !handles.hit(&event.session_id) {
+            let file = OpenOptions::new()
+                .create(true)
+                .append(true)
+                .open(&path)
+                .map_err(|e| format!("事件日志打开失败（{}）: {e}", path.display()))?;
+            self.opens.fetch_add(1, Ordering::Relaxed);
+            handles.insert(&event.session_id, file);
+        }
+        let result = handles.write(&event.session_id, &line, &path);
+        if result.is_err() {
+            // 句柄可能已经写不进去（文件被删/被轮转/磁盘满）：丢掉它，
+            // 下一条事件重开一次即可，不要攥着一个坏句柄把后面的事件全丢光。
+            handles.discard(&event.session_id);
+        }
+        result
     }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::events::EventMsg;
+    use crate::events::{EventJournal, EventMsg};
 
     fn event(session: &str, id: &str, turn: u32) -> AgentEvent {
         AgentEvent {
@@ -255,6 +366,87 @@ mod tests {
         let page = read_after(&dir, "s1", None, 10).unwrap();
         let ids: Vec<&str> = page.events.iter().map(|e| e.event_id.as_str()).collect();
         assert_eq!(ids, vec!["01", "03"]);
+    }
+
+    #[test]
+    fn reuses_one_handle_for_many_appends() {
+        let dir = temp_dir();
+        let journal = FileEventJournal::new(dir.path().to_path_buf());
+        for index in 0..200u32 {
+            journal.append(&event("s1", &format!("{index:03}"), index)).unwrap();
+        }
+        // M1 验收：200 条事件只应打开文件 1 次（改前是 200 次）。
+        assert_eq!(journal.opens(), 1, "同一会话的 200 条事件应复用同一条写句柄");
+        let page = read_after(&dir, "s1", None, 500).unwrap();
+        assert_eq!(page.events.len(), 200);
+        let ids: Vec<&str> = page.events.iter().map(|e| e.event_id.as_str()).collect();
+        let expected: Vec<String> = (0..200u32).map(|i| format!("{i:03}")).collect();
+        assert_eq!(ids, expected.iter().map(String::as_str).collect::<Vec<_>>());
+    }
+
+    #[test]
+    fn evicted_handle_reopens_in_append_mode_without_truncating() {
+        let dir = temp_dir();
+        let journal = FileEventJournal::new(dir.path().to_path_buf());
+        // 写满句柄表再超一条：容量 8，第 9 个会话会把最久未用的 s1 挤掉。
+        for index in 1..=9 {
+            let session = format!("s{index}");
+            journal.append(&event(&session, "01", 1)).unwrap();
+        }
+        assert_eq!(journal.opens(), 9);
+        // s1 的句柄已被淘汰；再写一条必须重开并**追加**，不能截断已有内容。
+        journal.append(&event("s1", "02", 2)).unwrap();
+        assert_eq!(journal.opens(), 10, "淘汰后应重新打开一次，而不是永久丢句柄");
+
+        let page = read_after(&dir, "s1", None, 10).unwrap();
+        let ids: Vec<&str> = page.events.iter().map(|e| e.event_id.as_str()).collect();
+        assert_eq!(ids, vec!["01", "02"], "淘汰再写回后必须仍按序完整");
+        let raw = std::fs::read_to_string(dir.path().join("s1.events.jsonl")).unwrap();
+        assert_eq!(raw.lines().count(), 2, "重开必须是 append，不能把旧行覆盖掉");
+        assert!(raw.contains("\"event_id\":\"01\""), "首条事件的内容必须还在");
+    }
+
+    /// 基准（不参与门禁）：`cargo test --lib bench_append -- --ignored --nocapture`
+    /// 同一临时目录、同一组 N=1000 条固定信封、debug 构建，各跑 5 轮取中位数。
+    #[test]
+    #[ignore = "基准用例，手动运行：cargo test --lib bench_append -- --ignored --nocapture"]
+    fn bench_append_open_each_vs_reused_handle() {
+        use std::time::{Duration, Instant};
+        const N: u32 = 1000;
+        const ROUNDS: usize = 5;
+        let events: Vec<AgentEvent> =
+            (0..N).map(|index| event("bench", &format!("{index:06}"), index)).collect();
+        let median = |mut values: Vec<Duration>| -> Duration {
+            values.sort();
+            values[values.len() / 2]
+        };
+        let mut each = Vec::new();
+        let mut reused = Vec::new();
+        let mut opens = 0;
+        for _ in 0..ROUNDS {
+            let dir = temp_dir();
+            let start = Instant::now();
+            for e in &events {
+                append(&dir, e).unwrap();
+            }
+            each.push(start.elapsed());
+
+            let dir = temp_dir();
+            let journal = FileEventJournal::new(dir.path().to_path_buf());
+            let start = Instant::now();
+            for e in &events {
+                journal.append(e).unwrap();
+            }
+            reused.push(start.elapsed());
+            opens = journal.opens();
+        }
+        let each_ms = median(each).as_secs_f64() * 1000.0;
+        let reused_ms = median(reused).as_secs_f64() * 1000.0;
+        println!(
+            "[bench] N={N} 每事件 open/close: {each_ms:.1} ms（open {N} 次） | 复用句柄: {reused_ms:.1} ms（open {opens} 次） | 提速 {:.2}x",
+            each_ms / reused_ms
+        );
+        assert_eq!(opens, 1);
     }
 
     #[test]
