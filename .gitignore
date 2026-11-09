@@ -3,6 +3,8 @@ node_modules/
 dist/
 dist-ssr/
 dist-portable/
+# 交付产物（MSI / 便携 ZIP）：体积大、可复现，不入库；路径与大小记在 docs/08
+dist-release/
 *.local
 *.tsbuildinfo
 node_modules/.cache/
