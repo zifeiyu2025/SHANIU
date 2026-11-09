@@ -1,0 +1,167 @@
+{
+  "schema_version": 1,
+  "data_updated_at": "2026-11-09",
+  "note": "来源：各端点 GET /models（及 /models/{id}）实测取回，2026-11-09。只收实测过的模型条目，不抄不确定的数字；端点没给的字段留空，交给探针与用户手填。SiliconFlow 端点返回 401，未取得任何数据，因此不收录。tools 只记端点明确声明的（DeepSeek 端点未声明，留空由探针补）。",
+  "models": [
+    {
+      "host": "api.deepseek.com",
+      "id": "deepseek-flash",
+      "context_window": 1048576,
+      "max_output": 393216,
+      "input": ["text", "image"],
+      "reasoning_levels": ["low", "high", "max"],
+      "default_reasoning_level": "high",
+      "note": "端点 effort={supported_levels:[low,high,max],default_level:high}，input_modalities 含 image"
+    },
+    {
+      "host": "api.deepseek.com",
+      "id": "deepseek-v4-pro",
+      "context_window": 1048576,
+      "max_output": 393216,
+      "input": ["text"],
+      "reasoning_levels": ["low", "high", "max"],
+      "default_reasoning_level": "high",
+      "note": "端点 effort={supported_levels:[low,high,max],default_level:high}，input_modalities 仅 text"
+    },
+    {
+      "host": "token.sensenova.cn",
+      "id": "deepseek-flash",
+      "context_window": 1048576,
+      "max_output": 65536,
+      "input": ["text"],
+      "tools": true,
+      "note": "同一个 id 在 DeepSeek 端点是 text+image、393216 输出——模型名相同、能力不同，所以匹配必须带 host"
+    },
+    {
+      "host": "token.sensenova.cn",
+      "id": "deepseek-v4-flash",
+      "context_window": 1048576,
+      "max_output": 65536,
+      "input": ["text"],
+      "tools": true,
+      "note": "supported_features=[tools,json_mode,reasoning]，未给档位名"
+    },
+    {
+      "host": "token.sensenova.cn",
+      "id": "glm-5.2",
+      "context_window": 1048576,
+      "max_output": 131072,
+      "input": ["text"],
+      "tools": true,
+      "note": "supported_features=[tools,json_mode,reasoning]，未给档位名"
+    },
+    {
+      "host": "token.sensenova.cn",
+      "id": "glm-5.3",
+      "context_window": 1048576,
+      "max_output": 131072,
+      "input": ["text"],
+      "tools": true,
+      "note": "supported_features=[tools,json_mode,reasoning]，未给档位名"
+    },
+    {
+      "host": "token.sensenova.cn",
+      "id": "kimi-k3",
+      "context_window": 1048576,
+      "max_output": 65536,
+      "input": ["text"],
+      "tools": true,
+      "note": "supported_features=[tools,json_mode,reasoning]，未给档位名"
+    },
+    {
+      "host": "token.sensenova.cn",
+      "id": "sensenova-6.8-flash",
+      "context_window": 262144,
+      "max_output": 65536,
+      "input": ["text", "image"],
+      "tools": true,
+      "note": "input_modalities 含 image"
+    },
+    {
+      "host": "token.sensenova.cn",
+      "id": "sensenova-6.8-flash-lite",
+      "context_window": 262144,
+      "max_output": 65536,
+      "input": ["text", "image"],
+      "tools": true,
+      "note": "input_modalities 含 image"
+    },
+    {
+      "host": "token.sensenova.cn",
+      "id": "sensenova-u1.5-lite",
+      "context_window": 262144,
+      "max_output": 65536,
+      "input": ["text"],
+      "tools": true,
+      "note": "output_modalities 为 image，但输入仍只有 text"
+    },
+    {
+      "host": "api.longcat.chat",
+      "id": "LongCat-2.5-Preview",
+      "context_window": 1048576,
+      "max_output": 262144,
+      "input": ["text", "image"],
+      "tools": true,
+      "note": "/models/{id} 的 supported_parameters 含 tools/tool_choice/thinking"
+    },
+    {
+      "host": "api.longcat.chat",
+      "id": "LongCat-2.5",
+      "context_window": 1048576,
+      "max_output": 262144,
+      "input": ["text", "image"],
+      "tools": true,
+      "note": "/models/{id} 声明 input_modalities 含 video，本项目只映射 text/image"
+    },
+    {
+      "host": "api.longcat.chat",
+      "id": "LongCat-2.0",
+      "context_window": 1048576,
+      "max_output": 131072,
+      "input": ["text"],
+      "note": "2.0 的 /models 条目未声明 supported_parameters，tools 留空"
+    }
+  ],
+  "families": [
+    {
+      "id": "longcat-2x",
+      "host": "api.longcat.chat",
+      "pattern": "^LongCat-2\\.[0-9]+$",
+      "context_window": 1048576,
+      "max_output": 131072,
+      "input": ["text"],
+      "note": "2.0/2.5 的公共下限：窗口 1M、输出至少 131072；vision 只在 2.5 起有，家族不声明"
+    },
+    {
+      "id": "sensenova-68-flash",
+      "host": "token.sensenova.cn",
+      "pattern": "^sensenova-6\\.8-flash(-[a-z0-9]+)?$",
+      "context_window": 262144,
+      "max_output": 65536,
+      "input": ["text", "image"],
+      "tools": true,
+      "note": "6.8-flash 与 6.8-flash-lite 实测同值"
+    },
+    {
+      "id": "sensenova-glm-5",
+      "host": "token.sensenova.cn",
+      "pattern": "^glm-5\\.[0-9]+$",
+      "context_window": 1048576,
+      "max_output": 131072,
+      "input": ["text"],
+      "tools": true,
+      "note": "glm-5.2/5.3 实测同值"
+    },
+    {
+      "id": "deepseek-v4",
+      "host": "api.deepseek.com",
+      "pattern": "^deepseek-v4(-[a-z0-9.]+)?$",
+      "context_window": 1048576,
+      "max_output": 393216,
+      "input": ["text"],
+      "reasoning_levels": ["low", "high", "max"],
+      "default_reasoning_level": "high",
+      "note": "v4 家族共用端点 effort 声明；vision 不继承（v4-pro 实测仅 text）"
+    }
+  ]
+}
