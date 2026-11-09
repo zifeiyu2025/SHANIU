@@ -1635,26 +1635,31 @@ mod tests {
         )));
     }
 
-    #[tokio::test]
+    #[tokio::test(start_paused = true)]
     async fn cancel_while_opening_stream_stops_promptly() {
         // 端点连响应头都不回：修复前 `stream().await` 不参与取消竞争，任务永久卡死
-        // （任务槽不释放、后续任务全被拒）。这里 2s 内必须收口为 Cancelled。
+        // （任务槽不释放、后续任务全被拒）。
+        //
+        // 时序走**虚拟时钟**而不是墙钟：CI 的 windows-latest 上 732 个用例并行，测试线程
+        // 被饿住时墙钟照样走，2s 预算会假红（run 42715231949 就是这么红的）。
+        // 判断强度不降——两段互为反向对照：
+        //   ① 无取消信号：推 10 分钟虚拟时间也不许返回（提前返回 = 测的不是建连阶段）；
+        //   ② 注入取消：必须收口为 Cancelled，且不靠时钟推进。
+        // 这里敢用虚拟时钟，是因为 `HangingBackend` 是纯内存的 `pending()`，
+        // 没有 socket 一类真实 I/O——否则时间会被瞬间跳完，用例变成空转。
         let (agent, store, cancel, _broker) = make_loop_with_backend(Arc::new(HangingBackend));
-        let summary = tokio::time::timeout(std::time::Duration::from_secs(2), async {
-            let trigger = async {
-                tokio::time::sleep(std::time::Duration::from_millis(50)).await;
-                cancel.cancel();
-            };
-            let run = agent.run_task(
-                "任务",
-                Arc::new(CapturingSink(store.clone())),
-                cancel.clone(),
-            );
-            let (summary, ()) = tokio::join!(run, trigger);
-            summary
-        })
-        .await
-        .expect("取消必须能打断 stream() 的等待；超时 = 任务槽被永久占用");
+        let run = agent.run_task("任务", Arc::new(CapturingSink(store.clone())), cancel.clone());
+        tokio::pin!(run);
+
+        assert!(
+            tokio::time::timeout(std::time::Duration::from_secs(600), &mut run).await.is_err(),
+            "无取消信号时必须一直挂在 stream() 上；提前返回说明断言打在了错的阶段"
+        );
+
+        cancel.cancel();
+        let summary = tokio::time::timeout(std::time::Duration::from_secs(1), run)
+            .await
+            .expect("取消必须能打断 stream() 的等待；超时 = 任务槽被永久占用");
         assert_eq!(summary.reason, TurnEndReason::Cancelled);
     }
 

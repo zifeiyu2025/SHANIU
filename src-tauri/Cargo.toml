@@ -113,6 +113,12 @@ unicode-normalization = "0.1"
 # MIT/Apache-2.0；lock 里已有同名 crate（0.3.4），这里提升为直接依赖。
 getrandom = "0.3"
 
+[dev-dependencies]
+# 取消类用例的时序断言改走虚拟时钟（`#[tokio::test(start_paused = true)]`，SH-134 的
+# 墙钟假红）：只在测试构建里启用 test-util，不进发布二进制。feature 是叠加的，
+# 上面的 [dependencies] 条目不需要改动。
+tokio = { version = "1", features = ["test-util"] }
+
 [profile.release]
 codegen-units = 1
 lto = true
