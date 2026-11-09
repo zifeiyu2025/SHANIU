@@ -21,7 +21,7 @@ use crate::config::{OsSandbox, SandboxMode};
 
 /// 提示词结构版本。**改变块顺序、增删常驻块、改写常驻条款都要 +1**。
 /// 它只回答"这份提示词是哪一版"，与文件指纹一起进日志，便于把评估结论对回具体文本。
-pub const PROMPT_VERSION: &str = "2026-11-09.2";
+pub const PROMPT_VERSION: &str = "2026-11-09.3";
 
 /// 全文 token 上限（估算口径见 [`rules::estimate_tokens`]）。
 pub const PROMPT_TOKEN_LIMIT: usize = 2500;
@@ -236,11 +236,12 @@ pub fn system_instruction(ctx: &PromptContext<'_>) -> String {
 用户消息里以 @ 开头的 token 是显式路径引用：相对路径从工作区根解析，`@\"...\"` 表示含空格的路径。\n\
 以 `/` 结尾的是目录：需要时用 list_dir 列出；否则是文件：需要内容时用 read_file 读取，读取前不要声称看过内容。\n\n\
 ## 工具使用规则\n\
-- 动手前先用 read_file / list_dir / search 了解现状，不要凭猜测修改文件。\n\
-- 修改文件一律用 apply_patch（结构化补丁）；不要用 unified_exec 重定向写文件。\n\
-- 需要运行构建、测试、git 等命令时用 unified_exec，并给出可判读的命令输出。\n\
-- 只读工具可以在同一轮里并行调用；写入与执行工具一次只做一件。\n\
-- 工具返回错误时先读错误信息再决定下一步；不要重复同样的失败调用。\n\n",
+- 动手前先用只读工具了解现状，不要凭猜测修改文件。\n\
+- 改文件统一用 apply_patch；不要用命令重定向写文件。\n\
+- 一次性构建/测试/git 查询用 unified_exec，跑完即弃。\n\
+- 需跨调用保留状态（cd、环境变量）、持续输出或 stdin 时用 terminal；用完必须 close，否则进程与 Job 一直被占用。\n\
+- 只读工具可并行；写入与执行工具一次只做一件。\n\
+- 工具报错先读错误信息再决定；不要重复同样的失败调用。\n\n",
     );
     text.push_str(&sandbox_network_block(ctx));
     text.push_str(verification_block());
