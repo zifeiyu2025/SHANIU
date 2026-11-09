@@ -1,9 +1,12 @@
 //! 沙箱策略入口（docs §8 sandbox/mod.rs，ADR-002 三级策略，fail-closed）。
 //!
 //! 两层机制（用户 2026-11-08 定：AppContainer 打底 + 受限令牌/Job 保留做纵深）：
-//!  1. **AppContainer**（`appcontainer`）负责路径/读隔离与网络默认拒绝；
+//!  1. **AppContainer**（`appcontainer`）负责路径/读隔离；
 //!  2. **RestrictedToken + JobObject**（`windows_impl`）继续管提权面与进程树/资源。
 //!     两层各自可独立验证：探针既验证容器内越界写被拒，也验证受限令牌仍生效。
+//!
+//! **网络不是策略维度**（2026-11-10 定，对齐 DSH）：容器一律带 `internetClient`，
+//! 没有会话级网络闸、没有网络审计。档位只管文件效果；出不出网不随档位变化。
 //!
 //! - read-only：纯策略拒绝（不经子进程，双保险）；
 //! - workspace-write：容器内启动子进程；`sandbox.os = "logical"` 时**显式**回退到
@@ -16,7 +19,6 @@ pub mod acl;
 pub mod appcontainer;
 mod device_acl;
 pub mod msvc;
-pub mod network;
 pub mod windows_impl;
 
 use std::collections::{BTreeMap, HashMap, HashSet};
@@ -57,15 +59,7 @@ pub struct SpawnRequest<'a> {
     pub program: &'a str,
     pub args: &'a [&'a str],
     pub cwd: &'a Path,
-    pub network: NetworkAccess,
     pub os: OsSandbox,
-}
-
-/// 会话级网络授权结果（默认 Deny）。
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum NetworkAccess {
-    Deny,
-    Allow,
 }
 
 /// 进程级 OS 沙箱机制（启动时由 `[sandbox] os` 注入；默认 AppContainer）。
@@ -159,15 +153,13 @@ pub fn prepare_spawn(
             program,
             args,
             cwd,
-            // 便捷入口默认断网；生产路径（unified_exec）按会话授权传 Allow。
-            network: NetworkAccess::Deny,
             os: current_os_mode(),
         },
         tx,
     )
 }
 
-/// 带工作区根与网络策略的完整入口。
+/// 带工作区根的完整入口。
 pub fn prepare_spawn_with(
     request: SpawnRequest<'_>,
     tx: mpsc::Sender<ExecLine>,
@@ -216,7 +208,6 @@ pub fn prepare_spawn_with(
 pub struct TerminalRequest<'a> {
     pub policy: SandboxMode,
     pub os: OsSandbox,
-    pub network: NetworkAccess,
     pub workspace_root: &'a Path,
     pub program: &'a str,
     pub args: &'a [&'a str],
@@ -249,7 +240,7 @@ pub fn prepare_terminal(
         }
         SandboxMode::WorkspaceWrite => match request.os {
             OsSandbox::AppContainer => {
-                let (sid, capabilities) = app_container_scope(request.workspace_root, request.network)?;
+                let (sid, capabilities) = app_container_scope(request.workspace_root)?;
                 windows_impl::spawn_appcontainer_terminal(
                     launch,
                     sid,
@@ -271,7 +262,7 @@ fn spawn_in_app_container(
     request: &SpawnRequest<'_>,
     tx: mpsc::Sender<ExecLine>,
 ) -> Result<PreparedSpawn, SandboxError> {
-    let (sid, capabilities) = app_container_scope(request.workspace_root, request.network)?;
+    let (sid, capabilities) = app_container_scope(request.workspace_root)?;
     let child = windows_impl::spawn_appcontainer_command(
         request.program,
         request.args,
@@ -288,11 +279,11 @@ fn spawn_in_app_container(
 /// 容器运行时 + 工作区写 ACE 的公共准备步骤。
 /// ACE 只加三类位置：工作区根 / temp / 工具链目录；授权对象是容器 SID。
 /// 每个工作区根在进程内只解析一次 scope：重复 exec / 终端不再碰 DACL（docs/04 §1.5）。
+///
+/// 能力列表恒为 `internetClient`：网络不是策略维度，容器一律可出网（2026-11-10）。
+/// 仍走 AppContainer 的意义在文件/进程边界与 loopback 隔离，不在断网。
 #[cfg(windows)]
-fn app_container_scope(
-    workspace_root: &Path,
-    network: NetworkAccess,
-) -> Result<(PSID, Vec<PSID>), SandboxError> {
+fn app_container_scope(workspace_root: &Path) -> Result<(PSID, Vec<PSID>), SandboxError> {
     let mutex = RUNTIME.get_or_init(|| Mutex::new(None));
     let mut guard = mutex
         .lock()
@@ -319,11 +310,10 @@ fn app_container_scope(
         runtime.resolved_roots.insert(workspace_root.to_path_buf());
     }
 
-    let capabilities = match network {
-        NetworkAccess::Allow => vec![runtime.capability_internet.as_psid()],
-        NetworkAccess::Deny => Vec::new(),
-    };
-    Ok((runtime.container.sid(), capabilities))
+    Ok((
+        runtime.container.sid(),
+        vec![runtime.capability_internet.as_psid()],
+    ))
 }
 
 /// 进程内唯一的目录 ACL 管理器。
@@ -691,7 +681,7 @@ pub fn status(mode: SandboxMode, os: OsSandbox) -> SandboxStatus {
         OsSandbox::AppContainer => (
             "app_container",
             true,
-            "AppContainer 路径/读隔离 + 网络默认拒绝；受限令牌与 Job 作为纵深保留",
+            "AppContainer 路径/读隔离；受限令牌与 Job 作为纵深保留",
         ),
         OsSandbox::Logical => (
             "logical",

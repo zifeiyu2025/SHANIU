@@ -522,10 +522,6 @@ impl AgentLoop {
                 os: crate::sandbox::current_os_mode(),
                 plan_mode: self.plan_state.is_active(),
                 skill_catalog: &skill_catalog,
-                network_granted: crate::sandbox::network::global().is_granted(
-                    session_id.as_deref(),
-                    crate::sandbox::network::NetworkScope::Shell,
-                ),
                 env: prompt::EnvironmentFacts::detect(&self.workspace_root),
             });
             // 计划态下只向模型声明只读工具 + exit_plan_mode（ADR-003 双层防御第一层）

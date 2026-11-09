@@ -343,7 +343,7 @@ pub fn spawn_restricted_command(
 ///
 /// 与 `spawn_restricted_command` 的区别：
 ///  - 进程在 AppContainer 里运行，默认只能读写被授予容器 SID 的目录（ACE 由 `acl` 管理）；
-///  - `capabilities` 为空 = 没有 `internetClient`，出站网络被系统拒绝（v1 默认断网）；
+///  - `capabilities` 是容器能力列表（exec 路径恒带 `internetClient`；MCP 路径按 server 配置）；
 ///  - 句柄白名单只放两根管道，避免把父进程其它可继承句柄漏给沙箱子进程。
 pub fn spawn_appcontainer_command(
     program: &str,
@@ -394,7 +394,7 @@ pub fn spawn_appcontainer_command(
         let (out_read, out_write) = create_inheritable_pipe()?;
         let (err_read, err_write) = create_inheritable_pipe()?;
 
-        // 纵深第 3 层：容器（路径/读隔离 + 网络默认拒绝）；
+        // 纵深第 3 层：容器（路径/读隔离，能力列表决定出网）；
         // 属性表：句柄白名单 + Job + 容器 SID/能力，创建即入容器、入 Job。
         let mut attributes = AttrList::new(3)?;
         attributes.set_handle_list(vec![out_write.handle(), err_write.handle()])?;
@@ -461,7 +461,7 @@ pub fn spawn_appcontainer_command(
 //  - stdio 不是管道，而是 `PROC_THREAD_ATTRIBUTE_PSEUDOCONSOLE` 注入的伪控制台；
 //  - 因此**不设** `STARTF_USESTDHANDLES`，`bInheritHandles=FALSE`（一个句柄都不漏给子进程）；
 //  - 仍在同一套三层边界内：受限令牌（仅留 SeChangeNotifyPrivilege）+ JobObject（KILL_ON_JOB_CLOSE）
-//    + AppContainer（路径/网络）。terminal 不新开一条无沙箱的旁路。
+//    + AppContainer（路径/读隔离）。terminal 不新开一条无沙箱的旁路。
 //  - R106：Job 随会话结构释放 → 整棵进程树被内核回收，不依赖 shell 自觉退出。
 
 /// 伪控制台持有者：失败路径必须关闭，否则句柄与 conhost 进程泄漏。
@@ -700,7 +700,7 @@ fn spawn_terminal_impl(
         // 官方样例也是先 CreateProcess、后 CloseHandle 这两个 PTY 端。
         // 这里不提前 drop，交给作用域结束（CreateProcess 之后）释放。
 
-        // 纵深第 3 层：AppContainer（路径/网络）。
+        // 纵深第 3 层：AppContainer（路径/读隔离）。
         let attribute_count: u32 = match &mode {
             TerminalMode::AppContainer { .. } => 3,
             _ => 2,
@@ -1095,8 +1095,8 @@ impl AttrList {
     /// 挂 AppContainer 身份（`PROC_THREAD_ATTRIBUTE_SECURITY_CAPABILITIES`）。
     ///
     /// 这是官方「Launch an AppContainer」样例的路径：容器 SID 与能力 SID 一起交给
-    /// 进程创建属性，由内核在建进程时打标。**传空能力列表 = 无 `internetClient`**，
-    /// 出站网络即被容器边界默认拒绝（v1 默认断网就靠这一点，不是靠额外代码拦）。
+    /// 进程创建属性，由内核在建进程时打标。能力列表决定出网——exec 路径恒带
+    /// `internetClient`，MCP 路径按 server 的 `allow_network` 传；空列表即断网。
     fn set_security_capabilities(
         &mut self,
         app_container_sid: PSID,
@@ -1675,8 +1675,8 @@ pub fn spawn_restricted_stdio(
 
 /// 以「AppContainer + 仅留 SeChangeNotifyPrivilege 的受限令牌 + Job Object + 句柄白名单」启动 MCP stdio server。
 ///
-/// `capabilities` 为空 = 不授予 `internetClient`，出站网络由容器边界默认拒绝；
-/// 只在会话级网络授权批准时传 `internet_client_capability()`。
+/// `capabilities` 为空 = 不授予 `internetClient`，出站网络由容器边界拒绝；
+/// MCP 由 server 自己的 `allow_network` 决定是否传 `internet_client_capability()`。
 /// 目录访问由 `acl` 按容器 SID 授权，未授权的路径在容器内不可读写。
 pub fn spawn_appcontainer_stdio(
     program: &str,
@@ -2221,7 +2221,7 @@ mod stdio_tests {
     //  · 该代码路径与受限令牌路径共用（`set_handle_list`），已由既有用例覆盖。
     //  · argv 转义是 `build_command_line` 的纯函数，已由 `quoted_args_follow_command_line_rules`
     //    锁定；容器路径复用它，没有第二套拼装逻辑。
-    // 真机（5d）补容器内越界读写、断网/放行与 DACL 精确撤销。
+    // 真机（5d）补容器内越界读写与 DACL 精确撤销。
 
     /// 真机：父进程关闭 Job 句柄后，server 派生的孙进程也必须消失。
     #[ignore = "真机用例：需要 PowerShell；验证 Job 关闭即杀树"]

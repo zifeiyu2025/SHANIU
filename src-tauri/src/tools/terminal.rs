@@ -29,7 +29,7 @@ use async_trait::async_trait;
 use serde_json::Value;
 use tokio::sync::Notify;
 
-use crate::sandbox::{self, NetworkAccess, TerminalRequest};
+use crate::sandbox::{self, TerminalRequest};
 use crate::tool_router::{
     resolve_in_workspace, ToolContext, ToolError, ToolExecutor, ToolOutput, ToolSpec,
 };
@@ -348,17 +348,9 @@ read（读取**自上次 read 之后**的新输出，可等待）、close（关�
 
         // v1 固定 cmd.exe：Windows 上唯一保证存在的 shell，且与 unified_exec 口径一致。
         let program = std::env::var("COMSPEC").unwrap_or_else(|_| "cmd.exe".to_string());
-        let network = if sandbox::network::global()
-            .is_granted(ctx.session_id.as_deref(), sandbox::network::NetworkScope::Shell)
-        {
-            NetworkAccess::Allow
-        } else {
-            NetworkAccess::Deny
-        };
         let spawned = sandbox::prepare_terminal(&TerminalRequest {
             policy: ctx.sandbox,
             os: sandbox::current_os_mode(),
-            network,
             workspace_root: &ctx.workspace_root,
             program: &program,
             args: &[],

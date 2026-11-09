@@ -4,7 +4,8 @@
 //! 1) 工作区内写入应成功——证明沙箱本身可用（否则"越界被拒"可能是沙箱根本没跑起来）；
 //! 2) 工作区外写入应失败——FF-3 的核心不变量；
 //! 3) 工作区外读取应失败——AppContainer 的读隔离（SH-021）；
-//! 4) 默认断网——没有会话级授权时不能建立出站连接；
+//! 4) loopback 隔离——容器连不回宿主 127.0.0.1 端口（与网络能力无关的另一条边界）；
+//!    出网本身是默认能力，正向证据见 `container_reaches_internet_without_any_grant`；
 //! 5) 受限令牌层独立生效——逻辑沙箱路径同样剥离特权（纵深两层各自可验证）。
 //!
 //! 允许位置按用户 2026-11-08 的决定：工作区根 / temp / 工具链目录。
@@ -129,10 +130,10 @@ async fn sandbox_denies_read_outside_workspace() {
     std::fs::remove_dir_all(&outside).ok();
 }
 
-/// 一个人工的 HTTP 服务：用于验证「默认断网」不是靠猜。
+/// 一个人工的 HTTP 服务：用于验证「容器连不回宿主 loopback」不是靠猜。
 ///
 /// 必须**先读掉请求再回写**：如果 accept 后不回读就 `write_all` 并立刻 close，
-/// curl 会拿到 RST（exit 56），对照组就变成假红——而对照组一红，断网用例的结论
+/// curl 会拿到 RST（exit 56），对照组就变成假红——而对照组一红，隔离用例的结论
 /// 就不可信了（分不清"被沙箱拦"还是"服务本身没通"）。
 /// 同理，accept 出来的 socket 必须显式切回阻塞：Windows 会让它继承监听端的非阻塞标志，
 /// 「看起来读了」其实立刻 WouldBlock，等价于没读（CI `42600499992` 的假红来源）。
@@ -201,10 +202,14 @@ impl Drop for LocalServer {
     }
 }
 
-/// 默认断网：未授权的会话连 loopback 都出不去；对照组（非沙箱进程）必须能连通，
-/// 否则这条用例就成了"服务没起来"的假绿。
+/// AppContainer 的 loopback 隔离：容器内进程连不到宿主的 127.0.0.1 服务。
+///
+/// 注意这条**不是**「默认断网」的证据——网络已不是策略维度，容器一律带
+/// `internetClient`（出网见 `container_reaches_internet_without_any_grant`）。
+/// 这里证明的是另一条独立边界：容器不能回连宿主本机端口，宿主服务不被容器探测。
+/// 对照组（非沙箱进程）必须能连通，否则这条用例就成了"服务没起来"的假绿。
 #[tokio::test]
-async fn sandbox_denies_network_without_session_grant() {
+async fn appcontainer_isolates_host_loopback() {
     let server = LocalServer::start();
     let url = format!("http://127.0.0.1:{}/", server.port);
 
@@ -215,7 +220,7 @@ async fn sandbox_denies_network_without_session_grant() {
         .expect("需要系统 curl 做对照");
     assert!(
         control.status.success() && String::from_utf8_lossy(&control.stdout).trim() == "200",
-        "对照组 curl 未连通本地服务，断网用例结论不可信：{control:?}"
+        "对照组 curl 未连通本地服务，loopback 隔离用例结论不可信：{control:?}"
     );
 
     let ws = unique_dir("net");
@@ -227,30 +232,29 @@ async fn sandbox_denies_network_without_session_grant() {
         ),
     )
     .await;
-    assert_ne!(code, 0, "未授权会话不应能出站（输出：{output}）");
+    assert_ne!(code, 0, "容器内进程不应能回连宿主 loopback（输出：{output}）");
     std::fs::remove_dir_all(&ws).ok();
 }
 
-/// 会话级网络授权的真机证据（SH-021 网络决定）。
+/// 容器出网的**正向**证据：没有任何授权动作，workspace-write 容器直接能打外网。
 ///
-/// 为什么必须打外网而不是 loopback：AppContainer 的 loopback 隔离是**另一条**限制
-/// （即使带着 `internetClient` 也连不上 127.0.0.1，除非 CheckNetIsolation 豁免），
-/// 拿 loopback 当"放行后应该通"的靶子会得到一个与授权无关的假红。所以这里打真实
-/// HTTPS 端点，并用普通进程 curl 做对照组——对照组不通就说明是网络本身的问题。
+/// 这是删掉网络闸之后的反向对照——旧用例证明「不授权就连不上」，本用例证明
+/// 「不授权也能连上」。两条不能同时存在，所以旧用例被这条替换，而不是被删掉后
+/// 什么都不留。
 ///
-/// 走的是与 UI 完全相同的两条路径：
-///  - 授权表 = `sandbox::network::global()`（`sandbox_network_grant` 命令的实现）；
-///  - 出站判定 = `unified_exec` 里 `is_granted(session, Shell)` → `NetworkAccess::Allow`。
+/// 为什么打外网而不是 loopback：AppContainer 的 loopback 隔离是另一条限制
+/// （带不带 `internetClient` 都连不上 127.0.0.1），拿 loopback 当靶子会得到
+/// 与网络能力无关的结论。对照组用普通进程 curl——对照组不通说明是网络本身的问题。
 ///
 /// 标 `#[ignore]`：需要外网，不进 CI；跑法是
-/// `cargo test --offline --test sandbox_probe -- --ignored network_grant --nocapture`。
+/// `cargo test --offline --test sandbox_probe -- --ignored container_reaches_internet --nocapture`。
 #[tokio::test]
-#[ignore = "需要外网：会话级网络放行/撤销的真机验证"]
-async fn network_grant_allows_curl_and_revoke_cuts_it_off() {
+#[ignore = "需要外网：容器默认出网的真机验证"]
+async fn container_reaches_internet_without_any_grant() {
     let url = std::env::var("SHANIU_NETWORK_PROBE_URL")
         .unwrap_or_else(|_| "https://www.baidu.com/".to_string());
 
-    // 对照组：普通进程能连通，否则下面的"放行应成功"是假绿。
+    // 对照组：普通进程能连通，否则下面的"容器应成功"是假红。
     let control = std::process::Command::new("curl")
         .args(["-s", "-o", "NUL", "-w", "%{http_code}", "--max-time", "10", &url])
         .output()
@@ -258,46 +262,25 @@ async fn network_grant_allows_curl_and_revoke_cuts_it_off() {
     assert_eq!(
         String::from_utf8_lossy(&control.stdout).trim(),
         "200",
-        "对照组 curl 未连通 {url}，网络授权用例结论不可信：{control:?}"
+        "对照组 curl 未连通 {url}，出网用例结论不可信：{control:?}"
     );
 
     let ws = unique_dir("netgrant");
-    let session = format!("probe-session-{}", id());
-
-    let (code_denied, out_denied) = run_sandboxed_https(&ws, &url, false).await;
-    assert_ne!(code_denied, 0, "未授权时不应能出站（输出：{out_denied}）");
-
-    // 与 UI 的"允许本会话联网"同一条实现路径。
-    let grants = shaniu_lib::sandbox::network::global();
-    grants
-        .grant(
-            &session,
-            shaniu_lib::sandbox::network::NetworkScope::Shell,
-            "探针：验证放行后出站可达",
-        )
-        .expect("授权应成功（内存表，无审计落盘）");
-    assert!(
-        grants.is_granted(Some(&session), shaniu_lib::sandbox::network::NetworkScope::Shell),
-        "授权后该会话应处于放行态"
+    let (code, output) = run_sandboxed_https(&ws, &url).await;
+    assert_eq!(
+        code, 0,
+        "网络不再受策略控制，容器应能直接出网（输出：{output}）"
     );
-
-    let (code_allowed, out_allowed) = run_sandboxed_https(&ws, &url, true).await;
-    assert_eq!(code_allowed, 0, "放行后 curl 应成功（输出：{out_allowed}）");
-
-    assert!(grants.revoke(&session).expect("撤销应成功"), "撤销应报告原本存在该授权");
     assert!(
-        !grants.is_granted(Some(&session), shaniu_lib::sandbox::network::NetworkScope::Shell),
-        "撤销后授权应立即失效"
+        output.contains("200"),
+        "curl 应返回 200，实际输出：{output}"
     );
-
-    let (code_revoked, out_revoked) = run_sandboxed_https(&ws, &url, false).await;
-    assert_ne!(code_revoked, 0, "撤销后必须重新断开（输出：{out_revoked}）");
 
     std::fs::remove_dir_all(&ws).ok();
 }
 
-/// 在 workspace-write 沙箱里跑一次 HTTPS 请求；`allow` 决定是否携带 `internetClient`。
-async fn run_sandboxed_https(cwd: &Path, url: &str, allow: bool) -> (i32, String) {
+/// 在 workspace-write 沙箱里跑一次 HTTPS 请求。
+async fn run_sandboxed_https(cwd: &Path, url: &str) -> (i32, String) {
     let (tx, mut rx) = mpsc::channel::<shaniu_lib::sandbox::ExecLine>(256);
     let collector = tokio::spawn(async move {
         let mut output = String::new();
@@ -315,11 +298,6 @@ async fn run_sandboxed_https(cwd: &Path, url: &str, allow: bool) -> (i32, String
             program: "curl",
             args: &args,
             cwd,
-            network: if allow {
-                shaniu_lib::sandbox::NetworkAccess::Allow
-            } else {
-                shaniu_lib::sandbox::NetworkAccess::Deny
-            },
             os: shaniu_lib::sandbox::current_os_mode(),
         },
         tx,

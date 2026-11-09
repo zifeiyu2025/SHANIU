@@ -2,27 +2,23 @@
 /**
  * 沙箱可见面契约测试。
  *
- * 覆盖本卡（SH-021 UI 可见性）承诺的四件事：
- *  1. 插件占的是 `shell.bottom`（常驻）与 `conversation.session.header.utilities`（会话级）；
- *  2. OS 沙箱态如实显示模式 / 机制 / profile，且**不**出现「未启用 OS 沙箱」；
- *  3. 逻辑沙箱态必须出现显眼警告与不同的数据属性（视觉分档由 CSS 承担）；
- *  4. 会话头部的批准与撤销各走一次宿主命令，并把结果同时写进两处可见面。
+ * 覆盖本卡（SH-021 UI 可见性）承诺的三件事：
+ *  1. 插件只占 `shell.bottom`（常驻），**不再有**会话头部网络开关；
+ *  2. OS 沙箱态如实显示模式 / 强制完整度 / 机制 / profile，且**不**出现「未启用 OS 沙箱」；
+ *  3. 逻辑沙箱态必须出现显眼警告与不同的数据属性（视觉分档由 CSS 承担）。
  *
- * 真实出站是否真的被放行/切断，由真机探针 `network_grant_allows_curl_and_revoke_cuts_it_off`
- * 验证，不在这里假装断言。
+ * 网络不再是策略维度（2026-11-10），所以这里还多一条反向对照：**状态条不许再出现
+ * 任何网络字样**，数据面也只允许调 `sandbox_status`。只断言"新东西在"是不够的——
+ * 旧文案留着不会让任何正向断言变红，却会让用户以为还有一道可开的闸。
  */
-import { beforeEach, describe, expect, it, vi } from 'vitest'
+import { describe, expect, it } from 'vitest'
 import type { ReactNode } from 'react'
-import { fireEvent, render, screen, waitFor } from '@testing-library/react'
+import { render, screen } from '@testing-library/react'
 import { Context } from '@deepseek-ai/cordis'
 import { apply as sandboxApply, inject as sandboxInject } from './index'
 import { SandboxStatusBar } from './SandboxStatusBar'
-import { NetworkToggle } from './NetworkToggle'
 import { zh } from './locales'
-import { getState, refreshGrants, setNotice } from './state'
-import type { NetworkGrantWire, SandboxStatusWire, SandboxWire } from './wire'
-
-const SESSION = 'sess-0123456789'
+import { hostSandboxWire, type SandboxStatusWire, type SandboxWire } from './wire'
 
 /** 词典直译（测试只关心键是否被用到，不关心八语种）。 */
 function translate(key: string, params?: Record<string, unknown>): string {
@@ -36,7 +32,7 @@ const OS_STATUS: SandboxStatusWire = {
   os_enabled: true,
   enforcement: 'full',
   profile: 'Shaniu.Sandbox.v1',
-  note: 'AppContainer 路径/读隔离 + 网络默认拒绝；受限令牌与 Job 作为纵深保留',
+  note: 'AppContainer 路径/读隔离；受限令牌与 Job 作为纵深保留',
 }
 
 const LOGICAL_STATUS: SandboxStatusWire = {
@@ -48,45 +44,12 @@ const LOGICAL_STATUS: SandboxStatusWire = {
   note: '当前未启用 OS 沙箱：仅受限令牌 + Job（逻辑隔离），没有路径级写入边界',
 }
 
-interface FakeWire extends SandboxWire {
-  readonly granted: string[]
-  readonly revoked: string[]
-}
-
-/** 脚本化的数据面：记录调用并维护一份内存授权表。 */
-function fakeWire(options: {
-  status?: SandboxStatusWire
-  grants?: readonly NetworkGrantWire[]
-  revokeResult?: boolean
-  grantsError?: string
-}): FakeWire {
-  const granted: string[] = []
-  const revoked: string[] = []
-  let grants = [...(options.grants ?? [])]
+/** 脚本化的数据面：只实现状态查询。 */
+function fakeWire(status: SandboxStatusWire | Error = OS_STATUS): SandboxWire {
   return {
-    granted,
-    revoked,
-    status: async () => options.status ?? OS_STATUS,
-    grants: async () => {
-      if (options.grantsError !== undefined) throw new Error(options.grantsError)
-      return grants
-    },
-    grant: async (sessionId: string) => {
-      granted.push(sessionId)
-      const grant: NetworkGrantWire = {
-        session_id: sessionId,
-        scope: 'shell',
-        granted_by: 'tester',
-        granted_at_ms: 1,
-        reason: '用户在 UI 批准：本会话允许网络',
-      }
-      grants = [...grants, grant]
-      return grant
-    },
-    revoke: async (sessionId: string) => {
-      revoked.push(sessionId)
-      grants = grants.filter((grant) => grant.session_id !== sessionId)
-      return options.revokeResult ?? true
+    status: async () => {
+      if (status instanceof Error) throw status
+      return status
     },
   }
 }
@@ -97,19 +60,8 @@ function barElement(wire: SandboxWire): ReactNode {
   return <Bar t={translate} wire={wire} />
 }
 
-function toggleElement(wire: SandboxWire, sessionId: string = SESSION): ReactNode {
-  const Toggle = NetworkToggle as unknown as (props: Record<string, unknown>) => ReactNode
-  return <Toggle sessionId={sessionId} t={translate} wire={wire} />
-}
-
-beforeEach(async () => {
-  vi.restoreAllMocks()
-  setNotice(null)
-  await refreshGrants(fakeWire({ grants: [] }))
-})
-
 describe('src/sandbox-status：插件接缝', () => {
-  it('只依赖 slots 与 locale，同时占常驻状态条与会话头部开关', () => {
+  it('只依赖 slots 与 locale，且只占常驻状态条（会话头部开关已删）', () => {
     expect(sandboxInject).toEqual(['slots', 'locale'])
 
     const waited: string[] = []
@@ -121,24 +73,40 @@ describe('src/sandbox-status：插件接缝', () => {
     } as never)
 
     sandboxApply(ctx)
-    expect(waited).toEqual(['shell.bottom', 'conversation.session.header.utilities'])
+    expect(waited).toEqual(['shell.bottom'])
+    // 反向对照：网络开关曾经挂在会话头部，必须确认它没有偷偷回来。
+    expect(waited).not.toContain('conversation.session.header.utilities')
+  })
+
+  it('数据面只允许调 sandbox_status，网络三命令不许残留', async () => {
+    const invoked: string[] = []
+    const bridge = {
+      invoke: async (command: string) => {
+        invoked.push(command)
+        return OS_STATUS
+      },
+    }
+    const wire = hostSandboxWire(bridge as never)
+    await wire.status()
+    expect(invoked).toEqual(['sandbox_status'])
+    // 类型面也锁住：SandboxWire 上没有 grants/grant/revoke 可用。
+    expect(Object.keys(wire)).toEqual(['status'])
   })
 })
 
 describe('src/sandbox-status：常驻状态呈现', () => {
   it('OS 沙箱态显示 AppContainer 与 profile，且没有任何"未启用"警告', async () => {
-    render(barElement(fakeWire({ status: OS_STATUS })))
+    render(barElement(fakeWire()))
     await screen.findByText('OS 沙箱（AppContainer）')
     expect(screen.getByText('Shaniu.Sandbox.v1')).toBeTruthy()
     expect(screen.getByText('工作区可写')).toBeTruthy()
     expect(screen.getByText(zh['enforcement.full'])).toBeTruthy()
-    expect(screen.getByText(zh['network.denied'])).toBeTruthy()
     expect(document.body.textContent).not.toContain('当前未启用 OS 沙箱')
     expect(document.querySelector('.shaniu-sandbox-bar')?.getAttribute('data-os')).toBe('os')
   })
 
   it('逻辑沙箱态必须显眼：警告文字 + 不同的 data-os', async () => {
-    render(barElement(fakeWire({ status: LOGICAL_STATUS })))
+    render(barElement(fakeWire(LOGICAL_STATUS)))
     await screen.findByText('逻辑沙箱')
     const warning = screen.getByText(zh['os.logicalWarning'])
     expect(warning.closest('.shaniu-sandbox-bar-warning')).toBeTruthy()
@@ -146,80 +114,27 @@ describe('src/sandbox-status：常驻状态呈现', () => {
     expect(document.body.textContent).not.toContain('Shaniu.Sandbox.v1')
     // 逻辑沙箱没有路径级边界：强制完整度必须自报 partial，不许随机制一起"看着还行"。
     expect(screen.getByText(zh['enforcement.partial'])).toBeTruthy()
-    // 网络在逻辑沙箱下没有 OS 拦截：状态条不能说「已断（默认拒绝）」。
-    expect(screen.getByText(zh['network.notEffective'])).toBeTruthy()
   })
 
-  it('已放行时状态条列出被放行的会话，撤销后从列表消失', async () => {
-    const wire = fakeWire({
-      status: OS_STATUS,
-      grants: [{ session_id: SESSION, granted_by: 'tester', granted_at_ms: 1, scope: 'shell', reason: '测试' }],
-    })
-    render(barElement(wire))
-    await screen.findByText(/^已放行：sess-0123/)
-
-    await wire.revoke(SESSION)
-    await refreshGrants(wire)
-    await waitFor(() => expect(screen.getByText(zh['network.denied'])).toBeTruthy())
+  /** §4.2 反向对照：网络维度删掉之后，界面不许残留任何网络口径。 */
+  it('状态条不出现任何网络字样，也没有联网/撤销按钮', async () => {
+    for (const status of [OS_STATUS, LOGICAL_STATUS]) {
+      const { unmount } = render(barElement(fakeWire(status)))
+      await screen.findByText(zh['label.sandbox'])
+      const text = document.body.textContent ?? ''
+      for (const stale of ['网络', '已断', '已放行', '默认拒绝', '允许联网', '撤销联网', '未生效（无 OS 隔离）']) {
+        expect(text).not.toContain(stale)
+      }
+      // 只剩刷新按钮（aria-label 是"刷新沙箱状态"），没有授权入口。
+      const buttons = screen.getAllByRole('button')
+      expect(buttons).toHaveLength(1)
+      expect(buttons[0]?.getAttribute('aria-label')).toBe(zh['refresh'])
+      unmount()
+    }
   })
 
-  it('授权列表拉取失败要变成可见反馈，而不是假装"没放行"', async () => {
-    render(barElement(fakeWire({ status: OS_STATUS, grantsError: 'audit unavailable' })))
-    await screen.findByText(/audit unavailable/)
-  })
-})
-
-describe('src/sandbox-status：会话级网络开关', () => {
-  it('未放行时点击即批准本会话，并把反馈写进共享状态', async () => {
-    const wire = fakeWire({ status: OS_STATUS })
-    render(toggleElement(wire))
-
-    fireEvent.click(screen.getByRole('button'))
-
-    await waitFor(() => expect(wire.granted).toEqual([SESSION]))
-    await waitFor(() => expect(getState().grants.map((g) => g.session_id)).toEqual([SESSION]))
-    expect(getState().notice?.text).toBe(zh['feedback.granted'])
-  })
-
-  it('已放行时点击即撤销，反馈写明后续命令将断网', async () => {
-    const wire = fakeWire({
-      status: OS_STATUS,
-      grants: [{ session_id: SESSION, granted_by: 'tester', granted_at_ms: 1, scope: 'shell', reason: '测试' }],
-    })
-    await refreshGrants(wire)
-    render(toggleElement(wire))
-    await screen.findByLabelText(zh['action.revokeTooltip'])
-
-    fireEvent.click(screen.getByRole('button'))
-
-    await waitFor(() => expect(wire.revoked).toEqual([SESSION]))
-    await waitFor(() => expect(getState().grants).toEqual([]))
-    expect(getState().notice?.text).toBe(zh['feedback.revoked'])
-  })
-
-  it('逻辑沙箱下开关显示「未生效」并禁用，点击不产生授权', async () => {
-    const wire = fakeWire({ status: LOGICAL_STATUS })
-    render(toggleElement(wire))
-    await screen.findByLabelText(zh['network.notEffective'])
-
-    const button = screen.getByRole('button') as HTMLButtonElement
-    expect(button.disabled).toBe(true)
-    fireEvent.click(button)
-    expect(wire.granted).toEqual([])
-  })
-
-  it('后端说"本来就没有授权"时不假装撤销成功', async () => {
-    const wire = fakeWire({
-      status: OS_STATUS,
-      grants: [{ session_id: SESSION, granted_by: 'tester', granted_at_ms: 1, scope: 'shell', reason: '测试' }],
-      revokeResult: false,
-    })
-    await refreshGrants(wire)
-    render(toggleElement(wire))
-    await screen.findByLabelText(zh['action.revokeTooltip'])
-
-    fireEvent.click(screen.getByRole('button'))
-
-    await waitFor(() => expect(getState().notice?.text).toBe(zh['feedback.notGranted']))
+  it('状态读取失败要变成可见反馈，而不是留一条"看着正常"的空白条', async () => {
+    render(barElement(fakeWire(new Error('status unavailable'))))
+    await screen.findByText(/status unavailable/, { selector: '[data-tone="error"]' })
   })
 })

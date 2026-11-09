@@ -549,14 +549,7 @@ impl ToolExecutor for UnifiedExec {
         let encodings = crate::text_encoding::EncodingLedger::new();
 
         // 按沙箱策略启动（fail-closed：沙箱准备失败 → Execution，执行数为 0）
-        // 网络：v1 默认断；只有该会话在 UI 上批准过「允许网络」才带 internetClient 能力。
-        let network = if sandbox::network::global()
-            .is_granted(ctx.session_id.as_deref(), sandbox::network::NetworkScope::Shell)
-        {
-            sandbox::NetworkAccess::Allow
-        } else {
-            sandbox::NetworkAccess::Deny
-        };
+        // 网络不是策略维度（2026-11-10）：容器一律带 internetClient，不再按会话存授权。
         let mut waiter = match sandbox::prepare_spawn_with(
             sandbox::SpawnRequest {
                 policy: ctx.sandbox,
@@ -564,7 +557,6 @@ impl ToolExecutor for UnifiedExec {
                 program: "cmd",
                 args: &["/C", command],
                 cwd: &cwd,
-                network,
                 os: sandbox::current_os_mode(),
             },
             tx.clone(),
@@ -854,8 +846,8 @@ mod tests {
     }
 
     /// 不碰网络、不碰文件系统的「长命令」：超时 / 取消 / 后台终止用例的样本。
-    /// SH-022 之后默认断网，`ping 127.0.0.1` 在沙箱里会立刻失败退出（exit 1），
-    /// 再拿它当"跑得够久"的样本，超时与取消用例就会因为"进程早退了"而失真。
+    /// 之所以不用 `ping` 之类：这类外部命令的可用性依赖网络与 PATH，样本一早就退出时，
+    /// 超时与取消用例会变成"进程早退了"的假绿/假红。纯 shell 循环不受环境影响。
     const SLOW_COMMAND: &str = "for /L %i in (1,1,400000000) do @rem";
 
     #[tokio::test]

@@ -830,7 +830,7 @@ pub struct SandboxConfig {
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum OsSandbox {
-    /// AppContainer 打底：路径/读隔离 + 网络默认拒绝（默认值）。
+    /// AppContainer 打底：路径/读隔离（默认值）。网络不是策略维度，容器一律可出网。
     #[default]
     AppContainer,
     /// **显式回退**：只有受限令牌 + Job 的逻辑沙箱，没有路径级边界。
@@ -2447,6 +2447,33 @@ mod provider_tests {
             .filter(|e| e.file_name().to_string_lossy().contains(".bak-"))
             .count();
         assert_eq!(backups, 1, "二次启动不应新增备份文件");
+    }
+
+    /// 旧配置兼容（2026-11-10 删网络维度）：历史 config.toml 可能带 `[sandbox] network`
+    /// 这类已废弃键。删能力不许把旧配置打废——加载必须成功（未知键忽略，不进只读），
+    /// 且**加载不改写文件字节**（不许自动删改旧字段）。
+    #[test]
+    fn deprecated_sandbox_network_key_loads_and_file_bytes_stay_untouched() {
+        let base = crate::test_support::TestTempDir::new("legacy-key");
+        let path = base.join(CONFIG_FILE);
+        let legacy = "[sandbox]\n\
+mode = \"workspace_write\"\n\
+os = \"app_container\"\n\
+network = \"restricted\"\n";
+        fs::write(&path, legacy).unwrap();
+        let before = fs::read(&path).unwrap();
+
+        let loaded = AppConfig::load_or_create_diagnosed(&base);
+        assert_eq!(
+            loaded.outcome,
+            ConfigLoadOutcome::Clean,
+            "旧字段必须被忽略，而不是让整份配置进只读: {:?}",
+            loaded.outcome
+        );
+        // 能力确实未生效：档位仍按文件里的 mode 解析，且没有任何网络开关被读出来
+        assert_eq!(loaded.config.sandbox.mode, SandboxMode::WorkspaceWrite);
+        assert_eq!(loaded.config.sandbox.os, OsSandbox::AppContainer);
+        assert_eq!(fs::read(&path).unwrap(), before, "加载不得改写配置文件字节");
     }
 
     /// 修不了（解析就失败）必须进只读：原文件一个字节不动，并给出路径。

@@ -86,13 +86,9 @@
   height: 15px;
 }
 
-/* 网络这一组推到右侧；窄窗口下允许换行，不挤压模式信息。 */
-.shaniu-sandbox-bar-network {
+/* 刷新按钮推到右侧；窄窗口下允许换行，不挤压模式信息。 */
+.shaniu-sandbox-bar-actions {
   margin-left: auto;
-}
-
-.shaniu-sandbox-bar-network-state {
-  color: var(--dsw-alias-label-primary);
 }
 
 .shaniu-sandbox-bar-muted {
@@ -104,10 +100,6 @@
   flex-wrap: wrap;
   gap: 4px 14px;
   min-width: 0;
-}
-
-.shaniu-sandbox-bar-notes [data-tone='success'] {
-  color: var(--dsw-alias-state-success-primary);
 }
 
 .shaniu-sandbox-bar-notes [data-tone='error'] {

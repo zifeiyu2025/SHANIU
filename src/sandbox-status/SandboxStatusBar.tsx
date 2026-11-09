@@ -6,16 +6,15 @@
  * `shell.bottom` 是 DSH 自带的整行常驻槽位（AppFrame 直接渲染，无会话也有），
  * 不新造外壳、不挤占会话区，是最贴合上游信息架构的落位。
  *
- * 职责边界（重要）：这里**只展示，不操作**。网络授权按会话生效，而根作用域槽位
- * 拿不到"当前会话"——`retainedBy.mainView` 指向的是仍被保留的那一条，用户开一个
- * 新草稿时它会落在上一条历史会话上（实测：批准按钮会把授权记到昨天的会话头上）。
- * 因此会话级的批准/撤销放在 `conversation.session.header.utilities`（见 NetworkToggle），
- * 本组件只负责常驻状态与"哪些会话已放行"。
+ * 职责边界（重要）：这里**只展示，不操作**。
  *
  * 三件事必须一眼看到：
- *  1. 当前模式（read_only / workspace_write / danger_full_access）与 OS 机制；
- *  2. 容器 profile 名（OS 模式下才有）；
- *  3. 网络是断还是已放行，放行给了哪些会话。
+ *  1. 当前模式（read_only / workspace_write / danger_full_access）；
+ *  2. 强制完整度（full / partial）——与工具结果里回填给模型的是同一判定；
+ *  3. 机制与容器 profile 名（降权展示：档位才是用户能理解的那一层）。
+ *
+ * **不显示网络**（2026-11-10 定，对齐 DSH）：网络不是策略维度，容器一律可出网，
+ * 一条恒为「可联网」的状态既不能反映档位、也不能反映风险，留着只会误导。
  *
  * 逻辑沙箱（`os_enabled=false`）整条变成警示底色 + 左侧粗边 + 警告图标 + 显眼文字，
  * 与 OS 沙箱态在视觉上**不能**长得一样——这正是 §11.3 的可见性要求。
@@ -31,7 +30,6 @@ import {
   Tag,
 } from '@deepseek-ai/dsh-client-ui-primitives'
 import { NS } from './locales'
-import { refreshGrants, useSandboxState } from './state'
 import {
   hostSandboxWire,
   type OsSandboxWire,
@@ -63,11 +61,6 @@ function osKey(os: OsSandboxWire): 'os.app_container' | 'os.logical' {
   return os === 'app_container' ? 'os.app_container' : 'os.logical'
 }
 
-/** 会话 id 的短形：审计里也是全 id，这里只求「看得出是哪一条」。 */
-function shortId(id: string): string {
-  return id.length > 12 ? `${id.slice(0, 12)}…` : id
-}
-
 /**
  * 渲染常驻沙箱状态条。
  * @param props.t - 本命名空间词典。
@@ -75,11 +68,10 @@ function shortId(id: string): string {
  * @returns 状态条。
  */
 export function SandboxStatusBar({ t, wire = DEFAULT_WIRE }: SandboxStatusBarProps): ReactNode {
-  const { grants, notice } = useSandboxState()
   const [status, setStatus] = useState<SandboxStatusWire | null>(null)
   const [loadError, setLoadError] = useState<string | null>(null)
 
-  const refreshStatus = useCallback(async () => {
+  const refresh = useCallback(async () => {
     try {
       setStatus(await wire.status())
       setLoadError(null)
@@ -88,20 +80,9 @@ export function SandboxStatusBar({ t, wire = DEFAULT_WIRE }: SandboxStatusBarPro
     }
   }, [wire])
 
-  const refresh = useCallback(() => {
-    void refreshStatus()
-    void refreshGrants(wire)
-  }, [refreshStatus, wire])
-
-  useEffect(() => { refresh() }, [refresh])
+  useEffect(() => { void refresh() }, [refresh])
 
   const logical = status !== null && !status.os_enabled
-  // 逻辑沙箱没有 OS 级网络拦截：授权记录仍在，但实际可达性不变，不能显示「已断/已放行」。
-  const networkText = logical
-    ? t('network.notEffective')
-    : grants.length === 0
-      ? t('network.denied')
-      : t('network.grantedSessions', { sessions: grants.map((grant) => shortId(grant.session_id)).join('、') })
 
   return (
     <div
@@ -149,25 +130,22 @@ export function SandboxStatusBar({ t, wire = DEFAULT_WIRE }: SandboxStatusBarPro
           </span>
         )}
 
-        <span className="shaniu-sandbox-bar-group shaniu-sandbox-bar-network">
-          <span className="shaniu-sandbox-bar-label">{t('label.network')}</span>
-          <span className="shaniu-sandbox-bar-network-state">{networkText}</span>
+        <span className="shaniu-sandbox-bar-group shaniu-sandbox-bar-actions">
           <Button
             size="sm"
             variant="ghost"
             aria-label={t('refresh')}
             title={t('refresh')}
-            onClick={refresh}
+            onClick={() => void refresh()}
           >
             <IconRefreshOutlineRegular />
           </Button>
         </span>
       </div>
 
-      {(notice !== null || loadError !== null) && (
+      {loadError !== null && (
         <div className="shaniu-sandbox-bar-notes">
-          {notice !== null && <span data-tone={notice.tone}>{notice.text}</span>}
-          {loadError !== null && <span data-tone="error">{t('error.status', { error: loadError })}</span>}
+          <span data-tone="error">{t('error.status', { error: loadError })}</span>
         </div>
       )}
     </div>

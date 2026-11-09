@@ -1500,31 +1500,6 @@ fn sandbox_status(app: tauri::AppHandle) -> sandbox::SandboxStatus {
     sandbox::status(cfg.sandbox.mode, cfg.sandbox.os)
 }
 
-/// 当前进程内的会话级网络授权（按会话，重启清零）。
-#[tauri::command]
-fn sandbox_network_grants() -> Vec<sandbox::network::NetworkGrant> {
-    sandbox::network::global().list()
-}
-
-/// 批准某个会话的网络访问（一次性，作用于该会话内指定执行面）。
-///
-/// `scope` 省略或空串 = `shell`（命令/终端），保持旧界面语义；浏览器渲染要显式
-/// 传 `browser`，两者互不顶替（`sandbox/network.rs`）。
-#[tauri::command]
-fn sandbox_network_grant(
-    session_id: String,
-    scope: Option<String>,
-) -> Result<sandbox::network::NetworkGrant, String> {
-    let scope = sandbox::network::NetworkScope::parse(scope.as_deref().unwrap_or(""))?;
-    sandbox::network::global().grant(&session_id, scope, "用户在 UI 批准：本会话允许网络")
-}
-
-/// 撤销某个会话的网络访问。
-#[tauri::command]
-fn sandbox_network_revoke(session_id: String) -> Result<bool, String> {
-    sandbox::network::global().revoke(&session_id)
-}
-
 /// 报错时列给用户的合法档位名。它必须与 `config.rs` 的枚举同源——
 /// `safety_mode_names_match_enums` 用穷举后的序列化结果逐字比对，加一档忘改这里会直接红。
 const SANDBOX_MODE_NAMES: &str = "read_only / workspace_write / danger_full_access";
@@ -2048,12 +2023,9 @@ pub fn run() {
         }
     }
 
-    // SH-021/022：OS 沙箱机制与会话级网络授权的进程级装配。
+    // SH-021/022：OS 沙箱机制的进程级装配。
     // 回退到 logical 必须是配置里显式写的——这里只负责把它标出来，绝不自动回退。
     sandbox::set_os_mode(app_config.sandbox.os);
-    sandbox::network::init(Some(
-        dirs.data_root.join("sandbox").join("network-audit.jsonl"),
-    ));
     if app_config.sandbox.mode == config::SandboxMode::WorkspaceWrite
         && app_config.sandbox.os == config::OsSandbox::Logical
     {
@@ -2111,9 +2083,6 @@ pub fn run() {
             save_settings,
             save_providers,
             sandbox_status,
-            sandbox_network_grants,
-            sandbox_network_grant,
-            sandbox_network_revoke,
             model_discovery::discover_models,
             capability::probe_capabilities,
             capability::fetch_model_metadata,

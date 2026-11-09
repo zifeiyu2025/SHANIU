@@ -1,7 +1,7 @@
 //! AppContainer 容器 profile 生命周期（SH-021，ADR-002 M2）。
 //!
 //! 职责边界（用户 2026-11-08 定的机制选型）：
-//!  - **AppContainer 打底**：路径/读隔离、网络默认拒绝；
+//!  - **AppContainer 打底**：路径/读隔离（网络能力由调用方按执行路径传入）；
 //!  - 现有 `CreateRestrictedToken` + JobObject **保留做纵深**，两层各自可独立验证。
 //!
 //! 生命周期：
@@ -165,7 +165,8 @@ impl AppContainer {
     }
 }
 
-/// `internetClient` 能力 SID（仅当会话级网络授权被批准时使用）。
+/// `internetClient` 能力 SID。
+/// exec/终端路径恒带（网络不是策略维度）；MCP 路径按 server 的 `allow_network` 决定。
 pub fn internet_client_capability() -> Result<Sid, String> {
     capability_sid(INTERNET_CLIENT_SID)
 }
@@ -259,7 +260,7 @@ unsafe fn create_profile(name: &str) -> Result<Sid, i32> {
             PCWSTR(name.as_ptr()),
             PCWSTR(display.as_ptr()),
             PCWSTR(description.as_ptr()),
-            // 能力不写在 profile 上：网络授权按会话生效，逐次进程创建时传入。
+            // 能力不写在 profile 上：逐次进程创建时按执行路径传入（exec 恒带，MCP 按配置）。
             None,
         )
     }

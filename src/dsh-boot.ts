@@ -273,7 +273,7 @@ export async function bootShaniu(container: HTMLElement, options: BootOptions = 
     { inject: modelCapabilitiesInject, apply: modelCapabilitiesApply },
     // MCP 信任页（SH-063）：首连指纹审查 / 逐工具风险 / 撤销信任与豁免。
     { inject: mcpTrustInject, apply: mcpTrustApply },
-    // 沙箱状态条（SH-021）：常驻展示 OS/逻辑沙箱与网络授权，提供放行/撤销入口。
+    // 沙箱状态条（SH-021）：常驻展示权限档 / 强制完整度 / OS 机制（网络不参与档位，不展示）。
     { inject: sandboxStatusInject, apply: sandboxStatusApply },
     { inject: uiChatInject, apply: uiChatApply },
     // 子代理泳道 UI（SH-109）：会话头目录树/面包屑切换/侧栏子会话聊天。

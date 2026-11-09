@@ -1,9 +1,12 @@
 /**
- * 沙箱状态条的数据面：3 组宿主命令的前端镜像。
+ * 沙箱状态条的数据面：宿主 `sandbox_status` 命令的前端镜像。
  *
  * 字段名跟 Rust serde 的 snake_case 走（与 `transport/mcp-wire.ts` 同一约定）。
- * 这些命令是只读查询 + 会话级授权，不碰审批面；失败一律如实抛出，
+ * 这些命令是只读查询，不碰审批面；失败一律如实抛出，
  * 由界面转成可见文字——「用户看得见」是 AGENTS §11.3 的前提，不能静默吞掉。
+ *
+ * **没有网络面**（2026-11-10 定，对齐 DSH）：网络不是策略维度，容器一律可出网，
+ * 所以没有 grants/grant/revoke 三个命令，也没有会话级网络开关。
  */
 import { tauriBridge, type HostBridge } from '../transport/tauri'
 
@@ -26,36 +29,14 @@ export interface SandboxStatusWire {
   readonly note: string
 }
 
-/**
- * 一条会话级网络授权（Rust `sandbox::network::NetworkGrant`）。
- *
- * 键是 `(session_id, scope)`：`shell`（命令/终端）与 `browser`（浏览器渲染）
- * 互不顶替——批了浏览器不等于批了 shell，反之亦然。
- */
-export interface NetworkGrantWire {
-  readonly session_id: string
-  readonly scope: 'shell' | 'browser'
-  readonly granted_by: string
-  readonly granted_at_ms: number
-  /** 授权原因，只进审计。 */
-  readonly reason: string
-}
-
 /** 状态条用到的全部宿主调用；测试注入脚本化实现，运行时走 `hostSandboxWire()`。 */
 export interface SandboxWire {
   status(): Promise<SandboxStatusWire>
-  grants(): Promise<readonly NetworkGrantWire[]>
-  grant(sessionId: string): Promise<NetworkGrantWire>
-  revoke(sessionId: string): Promise<boolean>
 }
 
 /** 桌面运行时的实现（命令名与 `lib.rs` 的 `generate_handler!` 逐字对应）。 */
 export function hostSandboxWire(bridge: HostBridge = tauriBridge()): SandboxWire {
   return {
     status: () => bridge.invoke<SandboxStatusWire>('sandbox_status'),
-    grants: () => bridge.invoke<NetworkGrantWire[]>('sandbox_network_grants'),
-    grant: (sessionId) =>
-      bridge.invoke<NetworkGrantWire>('sandbox_network_grant', { sessionId }),
-    revoke: (sessionId) => bridge.invoke<boolean>('sandbox_network_revoke', { sessionId }),
   }
 }

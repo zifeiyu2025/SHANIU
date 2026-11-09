@@ -11,7 +11,7 @@ use std::path::PathBuf;
 use tokio::sync::mpsc;
 
 use shaniu_lib::config::{OsSandbox, SandboxMode};
-use shaniu_lib::sandbox::{self, NetworkAccess};
+use shaniu_lib::sandbox;
 
 fn make_broken_project(root: &std::path::Path) {
     std::fs::create_dir_all(root.join("src")).unwrap();
@@ -50,7 +50,6 @@ async fn cargo_test_inside_appcontainer_links_and_runs_the_tests() {
             program: "cmd",
             args: &["/C", "cargo test --offline --quiet"],
             cwd: &root,
-            network: NetworkAccess::Deny,
             os: sandbox::current_os_mode(),
         },
         tx.clone(),
