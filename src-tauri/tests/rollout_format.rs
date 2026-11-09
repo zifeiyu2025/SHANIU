@@ -142,7 +142,33 @@ async fn rollout_file_matches_history_after_one_task() {
             other => panic!("本轮不该出现 {other:?}"),
         })
         .collect();
-    assert!(matches!(items.first(), Some(HistoryItem::Message { role: Role::User, text, .. }) if text == "读 a.txt"), "首条应为用户任务：{items:?}");
+    // 任务开始时的环境快照（`5344f43`）插在**最后一条用户消息之前**：新会话首条就是
+    // 用户消息，所以它必然落在位置 0、用户任务紧随其后。这里原先断言"首条是用户任务"，
+    // 正是 `5344f43` 的契约变更没有同步到集成测试面的后果。
+    let (snapshot, rest) = items.split_first().expect("档案不该是空的");
+    let snapshot_text = match snapshot {
+        HistoryItem::Message { role: Role::System, text, .. } => text.as_str(),
+        other => panic!("首条必须是任务开始时的环境快照 system 消息，实际 {other:?}"),
+    };
+    // 只断言"有这么一条 system 消息"不够：快照退化成空壳也必须红，所以连内容结构一起锁。
+    let mut snapshot_lines = snapshot_text.lines();
+    assert_eq!(snapshot_lines.next(), Some("## 环境快照"), "快照首行必须是标题：{snapshot_text:?}");
+    let facts: Vec<&str> = snapshot_lines.filter(|l| !l.trim().is_empty()).collect();
+    assert!(!facts.is_empty(), "快照不能只有标题没有事实：{snapshot_text:?}");
+    for fact in &facts {
+        assert!(
+            fact.starts_with("- 当前时间：") || fact.starts_with("- Git："),
+            "快照只允许「当前时间 / Git」两类事实（探测失败的整行省略），收到 {fact:?}"
+        );
+    }
+    assert!(
+        facts.iter().any(|f| f.starts_with("- 当前时间：")),
+        "当前时间必然探测成功，快照里必须有它：{snapshot_text:?}"
+    );
+    assert!(
+        matches!(rest.first(), Some(HistoryItem::Message { role: Role::User, text, .. }) if text == "读 a.txt"),
+        "环境快照之后必须紧跟用户任务：{rest:?}"
+    );
     // 两条助手正文都在档里（第一轮 "我来读文件"、第二轮 "读完了"）
     let assistant_texts: Vec<&str> = items
         .iter()

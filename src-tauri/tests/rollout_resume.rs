@@ -188,7 +188,10 @@ async fn restart_then_resume_continues_the_same_archive() {
     // 且合并后的条数不作定值断言——文本与同轮调用本就该合成一条 assistant
     let msgs = shaniu_lib::model_client::chat_messages("SYS", &resumed.history);
     assert_eq!(msgs.first().unwrap()["role"], "system");
-    assert_eq!(msgs[1]["content"], "第一轮任务", "用户任务应是第一条非 system 消息");
+    // `5344f43` 起历史首位是环境快照（system），与 SYS 合成后 system 消息不止一条：
+    // 这里锁的是"第一条非 system 消息是用户任务"，不再假设它固定在下标 1。
+    let first_user = msgs.iter().find(|m| m["role"] != "system").expect("重放历史里必须有用户任务");
+    assert_eq!(first_user["content"], "第一轮任务", "用户任务应是第一条非 system 消息");
     assert!(
         msgs.iter().any(|m| m["role"] == "assistant" && m["tool_calls"].is_array()),
         "重放历史里必须带工具调用的 assistant 消息：{msgs:?}"
