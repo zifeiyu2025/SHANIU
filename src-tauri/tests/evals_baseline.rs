@@ -919,6 +919,18 @@ async fn evals_baseline_v0() {
         println!("[evals] 警告：SHANIU_EVAL_REPEATS={repeats} < 5，样本不足，score.mjs 会拒绝下结论");
     }
 
+    // CI 冒烟/回归探针（2026-11-09 角色分离）：易题不是能力指标，是"还能不能干活"
+    // 的报警器——工具链断了、读文件坏了、审批炸了，最先红的必须是它们。
+    // smoke 模式下跑全集但只有非 hard 题允许失败：易题红 = 拦；难题红 = 只记录。
+    let smoke = std::env::var("SHANIU_EVAL_SMOKE")
+        .ok()
+        .is_some_and(|value| value.trim() == "1");
+    if smoke {
+        println!(
+            "[evals] 冒烟模式：非基线、不做统计结论、不用于判退化；只拦易题（非 hard）失败"
+        );
+    }
+
     let mut runs = Vec::new();
     let mut first_rows: Option<Vec<serde_json::Value>> = None;
     let rollout_dir = rollout_dir();
@@ -1204,6 +1216,8 @@ async fn evals_baseline_v0() {
         // 对不上说明有样本丢失或被别的进程删改，整份报告标无效。
         // infra 样本同理：只要存在"没有任何助手产出"的样本，这份报告就不能当基线。
         "valid": valid,
+        // smoke = CI 回归探针（1 轮、全集、只拦易题）；statistical = 本地手动统计实验。
+        "mode": if smoke { "smoke" } else { "statistical" },
         "samples": {
             "expected": expected_samples,
             "actual_sessions": actual_sessions,
@@ -1295,6 +1309,26 @@ async fn evals_baseline_v0() {
         "样本数与实际档案数不一致（期望 {expected_samples}，实际 {actual_sessions}）：\
 这份报告不可信，先查是否有并发进程或档案目录被清理"
     );
+
+    // smoke 门禁：易题（非 hard）失败 = 工具链/读文件/审批断了，必须拦。
+    // 难题失败不拦——它们只在有分辨力时才用于能力对比，不属于回归探针。
+    if smoke {
+        let mut failed_easy: Vec<&str> = Vec::new();
+        for run in &runs {
+            for row in run["tasks"].as_array().into_iter().flatten() {
+                let Some(id) = row["id"].as_str() else { continue };
+                let is_hard = selected.iter().any(|task| task.id == id && task.hard);
+                if !is_hard && !row["success"].as_bool().unwrap_or(false) {
+                    failed_easy.push(id);
+                }
+            }
+        }
+        assert!(
+            failed_easy.is_empty(),
+            "冒烟门禁：易题失败 {:?}（易题不用于区分能力，但代表「还能不能干活」，红了必须拦）",
+            failed_easy
+        );
+    }
 
     // 运行器自身的底线：全 0 分通常是环境坏了（端点/密钥/沙箱），不是"模型笨"，
     // 必须让跑的人立刻分辨这两种情况，否则基线报告会被当成可信数据用。
