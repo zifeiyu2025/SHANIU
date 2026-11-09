@@ -550,7 +550,9 @@ impl ToolExecutor for UnifiedExec {
 
         // 按沙箱策略启动（fail-closed：沙箱准备失败 → Execution，执行数为 0）
         // 网络：v1 默认断；只有该会话在 UI 上批准过「允许网络」才带 internetClient 能力。
-        let network = if sandbox::network::global().is_granted(ctx.session_id.as_deref()) {
+        let network = if sandbox::network::global()
+            .is_granted(ctx.session_id.as_deref(), sandbox::network::NetworkScope::Shell)
+        {
             sandbox::NetworkAccess::Allow
         } else {
             sandbox::NetworkAccess::Deny

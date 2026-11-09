@@ -240,7 +240,7 @@ async fn sandbox_denies_network_without_session_grant() {
 ///
 /// 走的是与 UI 完全相同的两条路径：
 ///  - 授权表 = `sandbox::network::global()`（`sandbox_network_grant` 命令的实现）；
-///  - 出站判定 = `unified_exec` 里 `is_granted(session)` → `NetworkAccess::Allow`。
+///  - 出站判定 = `unified_exec` 里 `is_granted(session, Shell)` → `NetworkAccess::Allow`。
 ///
 /// 标 `#[ignore]`：需要外网，不进 CI；跑法是
 /// `cargo test --offline --test sandbox_probe -- --ignored network_grant --nocapture`。
@@ -269,14 +269,26 @@ async fn network_grant_allows_curl_and_revoke_cuts_it_off() {
 
     // 与 UI 的"允许本会话联网"同一条实现路径。
     let grants = shaniu_lib::sandbox::network::global();
-    grants.grant(&session, "探针：验证放行后出站可达").expect("授权应成功（内存表，无审计落盘）");
-    assert!(grants.is_granted(Some(&session)), "授权后该会话应处于放行态");
+    grants
+        .grant(
+            &session,
+            shaniu_lib::sandbox::network::NetworkScope::Shell,
+            "探针：验证放行后出站可达",
+        )
+        .expect("授权应成功（内存表，无审计落盘）");
+    assert!(
+        grants.is_granted(Some(&session), shaniu_lib::sandbox::network::NetworkScope::Shell),
+        "授权后该会话应处于放行态"
+    );
 
     let (code_allowed, out_allowed) = run_sandboxed_https(&ws, &url, true).await;
     assert_eq!(code_allowed, 0, "放行后 curl 应成功（输出：{out_allowed}）");
 
     assert!(grants.revoke(&session).expect("撤销应成功"), "撤销应报告原本存在该授权");
-    assert!(!grants.is_granted(Some(&session)), "撤销后授权应立即失效");
+    assert!(
+        !grants.is_granted(Some(&session), shaniu_lib::sandbox::network::NetworkScope::Shell),
+        "撤销后授权应立即失效"
+    );
 
     let (code_revoked, out_revoked) = run_sandboxed_https(&ws, &url, false).await;
     assert_ne!(code_revoked, 0, "撤销后必须重新断开（输出：{out_revoked}）");

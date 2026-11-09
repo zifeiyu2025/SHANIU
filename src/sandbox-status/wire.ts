@@ -24,12 +24,19 @@ export interface SandboxStatusWire {
   readonly note: string
 }
 
-/** 一条会话级网络授权（Rust `sandbox::network::NetworkGrant`）。 */
+/**
+ * 一条会话级网络授权（Rust `sandbox::network::NetworkGrant`）。
+ *
+ * 键是 `(session_id, scope)`：`shell`（命令/终端）与 `browser`（浏览器渲染）
+ * 互不顶替——批了浏览器不等于批了 shell，反之亦然。
+ */
 export interface NetworkGrantWire {
   readonly session_id: string
+  readonly scope: 'shell' | 'browser'
   readonly granted_by: string
   readonly granted_at_ms: number
-  readonly scope: string
+  /** 授权原因，只进审计。 */
+  readonly reason: string
 }
 
 /** 状态条用到的全部宿主调用；测试注入脚本化实现，运行时走 `hostSandboxWire()`。 */

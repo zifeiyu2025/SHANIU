@@ -1409,12 +1409,17 @@ fn sandbox_network_grants() -> Vec<sandbox::network::NetworkGrant> {
     sandbox::network::global().list()
 }
 
-/// 批准某个会话的网络访问（一次性，作用于该会话内全部子进程）。
+/// 批准某个会话的网络访问（一次性，作用于该会话内指定执行面）。
+///
+/// `scope` 省略或空串 = `shell`（命令/终端），保持旧界面语义；浏览器渲染要显式
+/// 传 `browser`，两者互不顶替（`sandbox/network.rs`）。
 #[tauri::command]
 fn sandbox_network_grant(
     session_id: String,
+    scope: Option<String>,
 ) -> Result<sandbox::network::NetworkGrant, String> {
-    sandbox::network::global().grant(&session_id, "用户在 UI 批准：本会话允许网络")
+    let scope = sandbox::network::NetworkScope::parse(scope.as_deref().unwrap_or(""))?;
+    sandbox::network::global().grant(&session_id, scope, "用户在 UI 批准：本会话允许网络")
 }
 
 /// 撤销某个会话的网络访问。

@@ -71,7 +71,13 @@ function fakeWire(options: {
     },
     grant: async (sessionId: string) => {
       granted.push(sessionId)
-      const grant: NetworkGrantWire = { session_id: sessionId, granted_by: 'tester', granted_at_ms: 1, scope: 'test' }
+      const grant: NetworkGrantWire = {
+        session_id: sessionId,
+        scope: 'shell',
+        granted_by: 'tester',
+        granted_at_ms: 1,
+        reason: '用户在 UI 批准：本会话允许网络',
+      }
       grants = [...grants, grant]
       return grant
     },
@@ -142,7 +148,7 @@ describe('src/sandbox-status：常驻状态呈现', () => {
   it('已放行时状态条列出被放行的会话，撤销后从列表消失', async () => {
     const wire = fakeWire({
       status: OS_STATUS,
-      grants: [{ session_id: SESSION, granted_by: 'tester', granted_at_ms: 1, scope: 'test' }],
+      grants: [{ session_id: SESSION, granted_by: 'tester', granted_at_ms: 1, scope: 'shell', reason: '测试' }],
     })
     render(barElement(wire))
     await screen.findByText(/^已放行：sess-0123/)
@@ -173,7 +179,7 @@ describe('src/sandbox-status：会话级网络开关', () => {
   it('已放行时点击即撤销，反馈写明后续命令将断网', async () => {
     const wire = fakeWire({
       status: OS_STATUS,
-      grants: [{ session_id: SESSION, granted_by: 'tester', granted_at_ms: 1, scope: 'test' }],
+      grants: [{ session_id: SESSION, granted_by: 'tester', granted_at_ms: 1, scope: 'shell', reason: '测试' }],
     })
     await refreshGrants(wire)
     render(toggleElement(wire))
@@ -200,7 +206,7 @@ describe('src/sandbox-status：会话级网络开关', () => {
   it('后端说"本来就没有授权"时不假装撤销成功', async () => {
     const wire = fakeWire({
       status: OS_STATUS,
-      grants: [{ session_id: SESSION, granted_by: 'tester', granted_at_ms: 1, scope: 'test' }],
+      grants: [{ session_id: SESSION, granted_by: 'tester', granted_at_ms: 1, scope: 'shell', reason: '测试' }],
       revokeResult: false,
     })
     await refreshGrants(wire)
