@@ -128,7 +128,7 @@ jobs:
 
       - name: 上传本轮报告
         if: always()
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@v7
         with:
           name: evals-results
           # 运行器写的是 evals/results/<epoch>-<pid>-<role>.json；latest.json 从不存在
