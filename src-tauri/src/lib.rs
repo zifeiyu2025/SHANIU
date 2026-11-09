@@ -1693,31 +1693,31 @@ fn export_session_log(
     session_export::write_zip(std::path::Path::new(&dest), &entries)
 }
 
-/// SH-115：`/plan` 命令的宿主面——直接置位/清位进程级 PlanState。
+/// SH-115：`/plan` 命令的宿主面——直接置位/清位**该会话**的 PlanState。
 ///
 /// 上游 `/plan` 注册在 host 插件（`plan-mode/src/index.ts`，inject `['commands']`），
 /// 语义就是「直接改计划态」而不是走模型工具：`/plan off` 由 PlanChip 的退出路径
 /// 调用（`ui-plan/client/index.ts` 的 `exitPlanMode`），`/plan` 进入后模型在**下一轮**
-/// 只见只读工具。SHANIU 的 `PlanState` 挂在 `AppState`（进程级、跨任务持久），与
-/// 工具路径（`enter_plan_mode`/`exit_plan_mode`）写同一份状态，两条入口天然一致。
+/// 只见只读工具。计划态按 `session_id` 存（审计 M2）：会话 A 开计划态不再把会话 B
+/// 一并锁成只读。与工具路径（`enter_plan_mode`/`exit_plan_mode`）写同一份状态。
 /// 返回置位后的状态，前端据此推 `plan` 投影（芯片随行）。
 #[tauri::command]
-fn set_plan_mode(app: tauri::AppHandle, active: bool) -> bool {
+fn set_plan_mode(app: tauri::AppHandle, session_id: String, active: bool) -> bool {
     let state = app.state::<AppState>();
     if active {
-        state.plan_state.activate();
+        state.plan_state.activate_for(Some(&session_id));
     } else {
-        state.plan_state.deactivate();
+        state.plan_state.deactivate_for(Some(&session_id));
     }
-    state.plan_state.is_active()
+    state.plan_state.is_active_for(Some(&session_id))
 }
 
 /// SH-115：计划态查询面。补 SH-106 已知缺口（适配层重启丢 plan 态而宿主持久，
 /// 宿主无查询面）——前端跟随/重开 会话时据此重建投影，芯片不再依赖"本轮恰好有
-/// enter/exit 工具执行事件"才亮。
+/// enter/exit 工具执行事件"才亮。按会话查询（审计 M2）。
 #[tauri::command]
-fn get_plan_mode(app: tauri::AppHandle) -> bool {
-    app.state::<AppState>().plan_state.is_active()
+fn get_plan_mode(app: tauri::AppHandle, session_id: String) -> bool {
+    app.state::<AppState>().plan_state.is_active_for(Some(&session_id))
 }
 
 /// SH-115：`/compact` 的宿主面——回合外按需压缩。

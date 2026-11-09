@@ -29,7 +29,8 @@ pub struct AppState {
     /// 会话策略句柄（SH-120）：任务运行中切换审批档，下一 turn 生效。
     /// 任务启动时由 `reset_policy` 从 config 重新装载，避免上一任务的选择泄漏。
     pub policy: Arc<crate::permission::SessionPolicyHandle>,
-    /// 计划态标志（Plan Mode，跨任务保留：同一会话内后续任务仍在计划态时继续只读）。
+    /// 计划态标志（Plan Mode）：**按会话**存，跨任务保留——同一会话内后续任务仍在
+    /// 计划态时继续只读，切到别的会话不受影响（审计 M2 之前是进程级全局）。
     pub plan_state: Arc<PlanState>,
     /// 进程级后台作业注册表（SH-089）：跨任务保留，进程退出即清空。
     pub jobs: Arc<crate::jobs::JobRegistry>,

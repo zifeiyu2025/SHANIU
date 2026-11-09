@@ -80,8 +80,9 @@ function scriptedBridge(
   let counter = 0
   // SH-100 的侧车状态（每份桥独立克隆，避免测试间串味）
   const workspaceFlags = { archived: [] as string[], pinned: [] as string[], order: [] as string[] }
-  // SH-115：进程级 PlanState 的替身（set/get 共用同一份布尔，模拟宿主持久态）
-  let planActive = false
+  // SH-115：PlanState 的替身（set/get 共用同一份状态，模拟宿主持久态）
+  // 计划态按会话存（审计 M2）：替身同样以 sessionId 为键
+  const planActive = new Set<string>()
   // SH-088：目标 durable 投影的替身（revision CAS 语义对齐 goals.rs）
   let goalState: Record<string, unknown> | null = null
   let goalSeq = 0
@@ -107,10 +108,12 @@ function scriptedBridge(
       }
       // SH-115：计划态命令面的替身
       if (command === 'set_plan_mode') {
-        planActive = args?.['active'] === true
-        return planActive as T
+        const sessionId = String(args?.['sessionId'] ?? '')
+        if (args?.['active'] === true) planActive.add(sessionId)
+        else planActive.delete(sessionId)
+        return planActive.has(sessionId) as T
       }
-      if (command === 'get_plan_mode') return planActive as T
+      if (command === 'get_plan_mode') return planActive.has(String(args?.['sessionId'] ?? '')) as T
       if (command === 'compact_session') {
         if (compactHandler === undefined) return null as T
         return compactHandler(args) as T
@@ -1764,8 +1767,10 @@ describe('Plan 芯片与客户端排队', () => {
     const activate = await face.commands.execute('agent-new', '/plan')
     expect(activate).toMatchObject({ ok: true, value: { result: { kind: 'success', text: 'Plan mode on. Use /plan off to leave.' } } })
     expect(await projectionValuesOf(session, 'agent-new')).toMatchObject({ plan: { active: true, pending: false } })
-    // 宿主替身确实被置位（进程级状态，与工具路径同源）
+    // 宿主替身确实被置位（按会话，与工具路径同源）
     expect(bridge.calls.some(call => call.command === 'set_plan_mode' && call.args?.['active'] === true)).toBe(true)
+    // 宿主按会话置位（审计 M2）：命令必须带上当前会话 id
+    expect(bridge.calls.some(call => call.command === 'set_plan_mode' && call.args?.['sessionId'] === 'agent-new')).toBe(true)
 
     // /plan off：真实退出（替换 SH-106 期间的"指引"方案，对齐上游 PlanChip 退出路径）
     const off = await face.commands.execute('agent-new', '/plan off')

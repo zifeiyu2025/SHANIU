@@ -555,14 +555,14 @@ impl AgentLoop {
                 workspace_root: &self.workspace_root,
                 sandbox: turn_policy.sandbox,
                 os: crate::sandbox::current_os_mode(),
-                plan_mode: self.plan_state.is_active(),
+                plan_mode: self.plan_state.is_active_for(session_id.as_deref()),
                 skill_catalog: &skill_catalog,
                 env: prompt::EnvironmentFacts::detect(&self.workspace_root),
             });
             // 计划态下只向模型声明只读工具 + exit_plan_mode（ADR-003 双层防御第一层）
             let declarations = declarations_for(
                 &self.router,
-                self.plan_state.is_active(),
+                self.plan_state.is_active_for(session_id.as_deref()),
                 has_model_skills,
                 scope.depth,
                 orchestrator.is_some(),
@@ -723,7 +723,7 @@ impl AgentLoop {
                         history,
                         last_text: &text,
                         turn,
-                        plan_active: self.plan_state.is_active(),
+                        plan_active: self.plan_state.is_active_for(session_id.as_deref()),
                     })
                 })
             } else {
@@ -804,7 +804,7 @@ impl AgentLoop {
                 });
 
                 // 计划态执行守卫（双层防御；声明已收窄，此处兜底）
-                if self.plan_state.is_active() && !policy::plan_mode_allows(name) {
+                if self.plan_state.is_active_for(session_id.as_deref()) && !policy::plan_mode_allows(name) {
                     emit(&sink, EventMsg::ToolCallEnd {
                         call_id: call_id.clone(),
                         exit_code: None,

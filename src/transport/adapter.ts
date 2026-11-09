@@ -2871,20 +2871,20 @@ export function createAdapter(options: AdapterOptions): { remote: unknown; dispo
 
       // ---- /plan：进入/退出计划态（真实退出，替换 SH-106 期间的"指引"方案）----
       // 上游 handler（plan-mode host 插件）逐字对齐：off → 置假；带消息 → 进入并把
-      // 消息交给模型；bare → 进入。PlanState 进程级全局，工具路径（enter/exit_
-      // plan_mode）与命令路径写同一份状态，芯片投影经 setPlanActive 即时随行。
+      // 消息交给模型；bare → 进入。PlanState 按会话存（宿主以 sessionId 为键），
+      // 工具路径与命令路径写同一份状态，芯片投影经 setPlanActive 即时随行。
       if (/^\/plan\b/.test(input)) {
         const message = input.replace(/^\/plan\b/, '').trim()
         if (message === 'off') {
           const run = pushCommandRun(sessionId, 'plan', 'off')
-          const active = await bridge.invoke<boolean>('set_plan_mode', { active: false })
+          const active = await bridge.invoke<boolean>('set_plan_mode', { sessionId, active: false })
           setPlanActive(active)
           const result = { kind: 'success' as const, text: 'Plan mode off.' }
           pushCommandDone(sessionId, run.commandId, result)
           return OK({ result })
         }
         const run = pushCommandRun(sessionId, 'plan', message)
-        const active = await bridge.invoke<boolean>('set_plan_mode', { active: true })
+        const active = await bridge.invoke<boolean>('set_plan_mode', { sessionId, active: true })
         setPlanActive(active)
         if (message !== '') {
           const busy = journals.get(sessionId)

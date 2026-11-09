@@ -38,9 +38,9 @@ impl ToolExecutor for EnterPlanMode {
         &self.spec
     }
 
-    async fn execute(&self, _args: Value, _ctx: &ToolContext) -> Result<ToolOutput, ToolError> {
-        // 免确认（ADR-003）；重复进入幂等
-        self.state.activate();
+    async fn execute(&self, _args: Value, ctx: &ToolContext) -> Result<ToolOutput, ToolError> {
+        // 免确认（ADR-003）；重复进入幂等。按会话置位（审计 M2），不污染其它会话。
+        self.state.activate_for(ctx.session_id.as_deref());
         Ok(ToolOutput::ok(
             "已进入计划模式：仅只读工具（read_file/list_dir/search）可用。请完成调研后调用 exit_plan_mode 提交计划。",
         ))
@@ -92,8 +92,8 @@ impl ToolExecutor for ExitPlanMode {
         std::fs::create_dir_all(&plan_dir).map_err(|e| ToolError::Execution(format!("创建 .shaniu 失败: {e}")))?;
         std::fs::write(plan_dir.join("plan.md"), plan)
             .map_err(|e| ToolError::Execution(format!("写入 plan.md 失败: {e}")))?;
-        // 恢复完整能力
-        self.state.deactivate();
+        // 恢复完整能力（只清本会话的计划态，审计 M2）
+        self.state.deactivate_for(ctx.session_id.as_deref());
         Ok(ToolOutput::ok(
             "计划已获用户批准，保存至 .shaniu/plan.md。计划模式已退出，全部工具恢复可用。",
         ))

@@ -7,10 +7,9 @@
 pub mod orchestration;
 pub mod spec;
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
-use std::sync::atomic::{AtomicBool, Ordering};
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
 
 use async_trait::async_trait;
 use serde_json::Value;
@@ -21,13 +20,17 @@ use crate::model_client::ToolDeclaration;
 
 pub use spec::ToolSpec;
 
-/// 计划态共享标志。
+/// 计划态共享标志：**按会话存**。
 ///
 /// 放在共享内核（与 `ToolSpec` 同层）而非 `tools/plan`：`agent_loop` 要读它做
 /// 计划态门控，若留在 `tools/*` 会逼出 `agent_loop → tools` 的反向依赖（docs §2.3）。
+///
+/// 审计 M2：原先是一个进程级 `AtomicBool`，会话 A 开计划态后切到 B 发任务，B 也被
+/// 强制只读且无任何提示。现在以 `session_id` 为键，缺省（测试/无会话路径）落到空串
+/// 桶，语义等价于原来的进程级单例，但会话之间不再互相污染。
 #[derive(Debug, Default)]
 pub struct PlanState {
-    active: AtomicBool,
+    active: Mutex<HashSet<String>>,
 }
 
 impl PlanState {
@@ -35,22 +38,50 @@ impl PlanState {
         Self::default()
     }
 
+    pub fn is_active_for(&self, session: Option<&str>) -> bool {
+        self.lock().contains(Self::key(session))
+    }
+
+    fn set_for(&self, session: Option<&str>, active: bool) {
+        let key = Self::key(session).to_string();
+        let mut set = self.lock();
+        if active {
+            set.insert(key);
+        } else {
+            set.remove(&key);
+        }
+    }
+
+    /// 激活该会话的计划态（enter_plan_mode 调用；测试与恢复路径同样走此入口）。
+    pub fn activate_for(&self, session: Option<&str>) {
+        self.set_for(session, true);
+    }
+
+    /// 退出该会话的计划态（exit_plan_mode 获批准后调用）。
+    pub fn deactivate_for(&self, session: Option<&str>) {
+        self.set_for(session, false);
+    }
+
+    /// 无会话标识的便捷入口：等价于空串桶（测试与无会话装配路径）。
     pub fn is_active(&self) -> bool {
-        self.active.load(Ordering::SeqCst)
+        self.is_active_for(None)
     }
 
-    fn set(&self, active: bool) {
-        self.active.store(active, Ordering::SeqCst);
-    }
-
-    /// 激活计划态（enter_plan_mode 调用；测试与恢复路径同样走此入口）。
     pub fn activate(&self) {
-        self.set(true);
+        self.activate_for(None);
     }
 
-    /// 退出计划态（exit_plan_mode 获批准后调用）。
     pub fn deactivate(&self) {
-        self.set(false);
+        self.deactivate_for(None);
+    }
+
+    fn key(session: Option<&str>) -> &str {
+        session.unwrap_or("")
+    }
+
+    fn lock(&self) -> std::sync::MutexGuard<'_, HashSet<String>> {
+        // 计划态只是观测值；锁中毒不该让整个工具门控失败。
+        self.active.lock().unwrap_or_else(|e| e.into_inner())
     }
 }
 
@@ -760,6 +791,21 @@ pub fn resolve_for_write(workspace_root: &Path, path: &str) -> Result<PathBuf, T
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// 审计 M2：计划态按会话隔离，A 的置位/退出都不能波及 B。
+    #[test]
+    fn plan_state_is_scoped_per_session() {
+        let state = PlanState::new();
+        state.activate_for(Some("sess-a"));
+        assert!(state.is_active_for(Some("sess-a")));
+        assert!(!state.is_active_for(Some("sess-b")), "会话 A 的计划态不能污染 B");
+        assert!(!state.is_active(), "无会话桶不应被 A 的置位影响");
+
+        state.activate_for(Some("sess-b"));
+        state.deactivate_for(Some("sess-a"));
+        assert!(!state.is_active_for(Some("sess-a")), "退出只影响本会话");
+        assert!(state.is_active_for(Some("sess-b")));
+    }
 
     // 工具级单测的最小上下文（sink 丢弃事件）
     pub fn test_context(workspace_root: &Path) -> ToolContext {
