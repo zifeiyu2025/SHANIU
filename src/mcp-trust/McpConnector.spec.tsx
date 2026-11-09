@@ -12,7 +12,7 @@
  * 容器隔离与 fail-closed 由 Rust 侧探针测试负责。
  */
 import { beforeEach, describe, expect, it, vi } from 'vitest'
-import { act, render, screen } from '@testing-library/react'
+import { act, fireEvent, render, screen } from '@testing-library/react'
 import type { McpServerSummaryWire } from '../transport/mcp-wire'
 import { GeneralConfigReadOnlyRow } from '../config-readonly/ConfigReadOnly'
 import { McpConnector } from './McpConnector'
@@ -21,6 +21,7 @@ import { zh, type McpTrustKey } from './locales'
 const state = vi.hoisted(() => ({
   servers: [] as McpServerSummaryWire[],
   settings: { configReadOnly: null as string | null },
+  connect: (async () => { throw new Error('本测试不发起连接') }) as () => Promise<unknown>,
 }))
 
 vi.mock('../transport/tauri', () => ({
@@ -33,7 +34,7 @@ vi.mock('../transport/tauri', () => ({
 vi.mock('../transport/mcp-wire', () => ({
   mcpListServers: async () => state.servers,
   mcpListExemptions: async () => [],
-  mcpConnectAndReview: async () => { throw new Error('本测试不发起连接') },
+  mcpConnectAndReview: () => state.connect(),
   mcpResolveTrust: async () => { throw new Error('本测试不提交裁决') },
   mcpRevokeTrust: async () => {},
   mcpRevokeExemption: async () => {},
@@ -75,7 +76,12 @@ function blockedServer(): McpServerSummaryWire {
 beforeEach(() => {
   state.servers = []
   state.settings = { configReadOnly: null }
+  state.connect = async () => { throw new Error('本测试不发起连接') }
 })
+
+function idleServer(): McpServerSummaryWire {
+  return { ...blockedServer(), id: 'bench-echo', status: 'idle', reason: null, command: 'node.exe' }
+}
 
 describe('MCP 连接器：blocked 的提示', () => {
   it('同时显示原因与可行做法，而不是只有「已阻止」', async () => {
@@ -122,6 +128,26 @@ describe('MCP 连接器：配置只读', () => {
 
     expect(await screen.findByText(zh['empty'])).toBeTruthy()
     expect(screen.queryByText(/配置读取失败/)).toBeNull()
+  })
+})
+
+describe('MCP 连接器：等待期间的状态说明', () => {
+  it('点了连接后立刻说明在准备沙箱容器，结束后撤掉', async () => {
+    state.servers = [idleServer()]
+    let finish: (reason: Error) => void = () => {}
+    state.connect = () => new Promise((_resolve, reject) => { finish = reject })
+    render(<McpConnector t={t} />)
+
+    // 动作区在展开区里：先展开这一行。
+    fireEvent.click(await screen.findByText('bench-echo'))
+    await act(async () => { fireEvent.click(screen.getByText(zh['connect'])) })
+
+    // 等待期间用户看到的不是「按钮点了没反应」，而是这一步在做什么、为什么慢。
+    expect(screen.getByText(/正在准备沙箱容器并写入目录授权/)).toBeTruthy()
+    expect(screen.getByText(/请勿关闭窗口/)).toBeTruthy()
+
+    await act(async () => { finish(new Error('测试结束')); await Promise.resolve() })
+    expect(screen.queryByText(/正在准备沙箱容器并写入目录授权/)).toBeNull()
   })
 })
 

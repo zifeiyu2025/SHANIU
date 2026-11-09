@@ -202,6 +202,11 @@
   gap: 8px;
 }
 
+/* 等待说明要独占一行：它解释的是「为什么按钮点了没动静」，不能挤在按钮中间。 */
+.mcp-connector-busy {
+  flex-basis: 100%;
+}
+
 .mcp-connector-table {
   width: 100%;
   border-collapse: collapse;

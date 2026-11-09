@@ -499,6 +499,11 @@ function McpConnectorPage({ t }: { t: McpConnectorProps['t'] }): ReactNode {
                               )
                               : (
                                 <div className="mcp-connector-actions">
+                                  {busy && (
+                                    <p className="mcp-connector-note mcp-connector-busy" aria-live="polite">
+                                      <TextShimmer active>{t('busyHint')}</TextShimmer>
+                                    </p>
+                                  )}
                                   <Button
                                     size="sm"
                                     variant="primary"
