@@ -218,6 +218,8 @@ impl ViewerGuard {
         if !self.counted {
             self.counted = true;
             self.count.enter();
+            // 计数是「Tauri 通道是否静默」的唯一判据，变化必须可在日志里事后核对。
+            tracing::info!(viewers = self.count.get(), "gateway 在线订阅计数 +1");
         }
     }
 
@@ -230,6 +232,7 @@ impl Drop for ViewerGuard {
     fn drop(&mut self) {
         if self.counted {
             self.count.leave();
+            tracing::info!(viewers = self.count.get(), "gateway 在线订阅计数 -1");
         }
     }
 }
@@ -473,7 +476,8 @@ fn replay_into(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::events::EventMsg;
+    use crate::events::{EventMsg, EventSink};
+    use std::sync::atomic::AtomicUsize;
     use tokio_tungstenite::connect_async;
 
     fn event(session: &str, id: &str) -> AgentEvent {
@@ -665,5 +669,69 @@ mod tests {
         }
         let expected: Vec<String> = (0..10).map(|index| format!("{index:02}")).collect();
         assert_eq!(seen, expected);
+    }
+
+    struct CountingIpc(AtomicUsize);
+
+    impl crate::events::IpcEmitter for CountingIpc {
+        fn emit(&self, _event: &AgentEvent) -> Result<(), String> {
+            self.0.fetch_add(1, Ordering::SeqCst);
+            Ok(())
+        }
+    }
+
+    /// 真机时序（`#[ignore]`，约 70 秒）：**真实 TCP** 上的半死连接——握手 + 订阅后
+    /// 把 socket 挂住却永不读、不回 Pong——必须在生产常量 60s 空闲超时后释放在线计数，
+    /// 让 Tauri 通道恢复投递。用真实 socket 与真实时限，不用 `with_liveness` 缩短。
+    ///
+    /// 跑法：cargo test --lib zombie -- --ignored --nocapture
+    #[tokio::test]
+    #[ignore = "真实 60s 空闲超时，约 70 秒"]
+    async fn zombie_connection_releases_viewer_and_ipc_after_real_idle_timeout() {
+        let dir = temp_dir();
+        let hub = GatewayHub::new(dir.to_path_buf());
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let port = listener.local_addr().unwrap().port();
+        let server_hub = hub.clone();
+        tokio::spawn(async move { serve(server_hub, listener).await.unwrap() });
+
+        let (mut ws, _) = connect_async(format!("ws://127.0.0.1:{port}")).await.unwrap();
+        ws.send(Message::text(format!(r#"{{"type":"hello","token":"{}"}}"#, hub.token())))
+            .await
+            .unwrap();
+        let _ready = ws.next().await;
+        ws.send(Message::text(r#"{"type":"subscribe","session_id":"zombie","credits":8}"#))
+            .await
+            .unwrap();
+        tokio::time::sleep(Duration::from_millis(300)).await;
+        assert_eq!(hub.viewers().get(), 1, "订阅一次就该计为 1 个在线订阅者");
+
+        let ipc = Arc::new(CountingIpc(AtomicUsize::new(0)));
+        let sink = crate::events::TauriEventSink::for_test(ipc.clone())
+            .with_viewers(hub.viewers());
+
+        let started = tokio::time::Instant::now();
+        let mut before_ipc = 0;
+        let mut zero_at = None;
+        while started.elapsed() < Duration::from_secs(90) {
+            sink.emit(&EventMsg::TurnStarted { turn: 1 }).ok();
+            tokio::time::sleep(Duration::from_secs(5)).await;
+            if hub.viewers().get() == 0 {
+                before_ipc = ipc.0.load(Ordering::SeqCst);
+                zero_at = Some(started.elapsed());
+                sink.emit(&EventMsg::TurnStarted { turn: 1 }).ok();
+                break;
+            }
+        }
+        let elapsed = zero_at.expect("60s 空闲超时后在线计数必须归零");
+        let after_ipc = ipc.0.load(Ordering::SeqCst);
+        println!(
+            "[真机] 僵尸连接 {:?} 后计数归零；归零前 IPC 投递 {before_ipc} 次，归零后 {after_ipc} 次",
+            elapsed
+        );
+        assert!(elapsed >= Duration::from_secs(60), "不得早于 60s 空闲时限就断");
+        assert_eq!(before_ipc, 0, "WS 在线期间 Tauri IPC 应完全静默");
+        assert!(after_ipc > 0, "计数归零后 Tauri IPC 必须恢复投递");
+        drop(ws);
     }
 }

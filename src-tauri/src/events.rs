@@ -440,7 +440,7 @@ impl EventSink for TauriEventSink {
 /// 测试缝：不依赖 `AppHandle` 构造 sink，换入计数型 IPC 实现。
 #[cfg(test)]
 impl TauriEventSink {
-    fn for_test(ipc: Arc<dyn IpcEmitter>) -> Self {
+    pub(crate) fn for_test(ipc: Arc<dyn IpcEmitter>) -> Self {
         Self {
             ipc,
             session_id: "test".into(),
