@@ -237,14 +237,12 @@ mod tests {
     use crate::config::SandboxMode;
     use crate::events::NullEventSink;
     use crate::tool_router::attachment;
-    use std::path::{Path, PathBuf};
+    use std::path::Path;
     use std::sync::{Arc, Mutex};
     use tokio_util::sync::CancellationToken;
 
-    fn workspace() -> PathBuf {
-        let dir = std::env::temp_dir().join(format!("shaniu-view-image-{}", ulid::Ulid::generate()));
-        std::fs::create_dir_all(&dir).unwrap();
-        dir
+    fn workspace() -> crate::test_support::TestTempDir {
+        crate::test_support::TestTempDir::new("view-image")
     }
 
     fn write_png(path: &Path, width: u32, height: u32) {

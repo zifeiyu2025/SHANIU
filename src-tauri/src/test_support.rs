@@ -6,9 +6,18 @@
 //!
 //! 用法：`let ws = TestTempDir::new("sb");` 然后按 `&Path` 用（实现了 `Deref<Target=Path>`）；
 //! panic 时 `Drop` 照样执行，目录不会残留。
+//!
+//! 兜底清扫（2026-11-09 补）：`Drop` 只覆盖正常退出与 panic，`Stop-Process -Force` / 崩溃
+//! 仍然漏。因此每个测试进程**首次**创建夹具时扫一遍 `%TEMP%\shaniu-*`，删掉超过 1 小时的
+//! 陈旧目录（1 小时避免误删并发进程正在用的）——兜底放在下一次启动，而不是逐次清理。
 
 use std::ops::Deref;
 use std::path::{Path, PathBuf};
+use std::sync::Once;
+use std::time::{Duration, SystemTime};
+
+/// 陈旧的判定门槛：超过这个年龄的 `shaniu-*` 目录才允许被清扫。
+const STALE_AFTER: Duration = Duration::from_secs(60 * 60);
 
 /// `%TEMP%/shaniu-<prefix>-<pid>-<ulid>`，离开作用域即整目录删除。
 pub struct TestTempDir {
@@ -18,6 +27,7 @@ pub struct TestTempDir {
 
 impl TestTempDir {
     pub fn new(prefix: &str) -> Self {
+        sweep_stale_dirs_once();
         let path = std::env::temp_dir().join(format!(
             "shaniu-{prefix}-{}-{}",
             std::process::id(),
@@ -75,5 +85,67 @@ impl Drop for TestTempDir {
                 self.path.display()
             );
         }
+    }
+}
+
+/// 每个测试进程只扫一次：多个夹具并行创建时不必重复遍历 `%TEMP%`。
+fn sweep_stale_dirs_once() {
+    static ONCE: Once = Once::new();
+    ONCE.call_once(|| {
+        let removed = sweep_stale_dirs();
+        if removed > 0 {
+            eprintln!(
+                "[test] 清扫陈旧临时目录 {removed} 个（超过 {} 分钟）",
+                STALE_AFTER.as_secs() / 60
+            );
+        }
+    });
+}
+
+/// 删除 `%TEMP%` 下 `shaniu-*` 中修改时间早于 `STALE_AFTER` 的**目录**，返回删除个数。
+/// 单个删除失败静默跳过：清扫只是兜底，不该让测试变红。
+fn sweep_stale_dirs() -> usize {
+    let Ok(entries) = std::fs::read_dir(std::env::temp_dir()) else {
+        return 0;
+    };
+    let now = SystemTime::now();
+    let mut removed = 0;
+    for entry in entries.flatten() {
+        if !entry.file_name().to_string_lossy().starts_with("shaniu-") {
+            continue;
+        }
+        let Ok(metadata) = entry.metadata() else {
+            continue;
+        };
+        if !metadata.is_dir() {
+            continue;
+        }
+        let Ok(modified) = metadata.modified() else {
+            continue;
+        };
+        let Ok(age) = now.duration_since(modified) else {
+            continue;
+        };
+        if age < STALE_AFTER {
+            continue;
+        }
+        if std::fs::remove_dir_all(entry.path()).is_ok() {
+            removed += 1;
+        }
+    }
+    removed
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// 防的是「清扫把并发进程正在用的目录删掉」——门槛没到的一个都不能动。
+    #[test]
+    fn sweep_keeps_fresh_directories() {
+        let fresh = TestTempDir::new("sweep-fresh");
+        std::fs::create_dir_all(fresh.join("keep")).expect("建子目录");
+        let _ = sweep_stale_dirs();
+        assert!(fresh.join("keep").exists(), "新鲜目录不得被清扫");
     }
 }
