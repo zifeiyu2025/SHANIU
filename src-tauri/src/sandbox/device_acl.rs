@@ -31,7 +31,8 @@ use super::acl;
 pub(crate) const NULL_DEVICE: &str = r"\\.\NUL";
 
 /// 容器里任何 `CreateFile("NUL")` 都需要读写两种访问（Rust 的 `Stdio::null()` 就要 `READ|WRITE`）。
-const REQUIRED_MASK: u32 = FILE_GENERIC_READ.0 | FILE_GENERIC_WRITE.0;
+/// `pub(crate)` 是给 `sandbox::tests` 用的：断言必须查**同一个**掩码，另写一份就有漂移空间。
+pub(crate) const REQUIRED_MASK: u32 = FILE_GENERIC_READ.0 | FILE_GENERIC_WRITE.0;
 
 /// 备份文件名：一个设备一份原始 DACL（多个容器 SID 叠加时，保留最早那份）。
 const BACKUP_FILE: &str = "null-device.dacl";

@@ -1183,6 +1183,68 @@ mod tests {
         release_mcp_server(&id);
     }
 
+    /// 「补 NUL ACE → 释放时撤销」整条链路（SH-064 B）。
+    ///
+    /// 这条用例在不同 SKU 上验的不是同一半，必须写清楚：
+    /// - 客户端 SKU（本机 Win11）：令牌自带 `S-1-15-2-2`，容器建起来就是 `AlreadyAccessible`，
+    ///   这里只验「没补过就不许撤别人的」；
+    /// - Server SKU（GitHub runner，Build 26100）：设备 DACL 里没有任何应用包 SID
+    ///   （SH-133 取证），`ensure_mcp_container` 必然走 `Granted`——于是「补上 → 撤掉」
+    ///   在 runner 上真实发生，本用例 `ok` 即证明两件事：ACE 真的落到了设备上，释放真的删掉了它。
+    /// - 若 runner 上补不进（没有设备 `WRITE_DAC`），下面的断言会**红**，而不是留一条只写
+    ///   warn 的日志：容器内所有 `Stdio::null()` 都会 Access denied，这是失效态，不许静默。
+    #[cfg(windows)]
+    #[test]
+    fn mcp_null_device_grant_is_revoked_on_release() {
+        let _serial = appcontainer::PROFILE_TEST_MUTEX.blocking_lock();
+        set_os_mode(OsSandbox::AppContainer);
+        let device = Path::new(device_acl::NULL_DEVICE);
+        let mask = device_acl::REQUIRED_MASK;
+        let shared_present = || {
+            ["S-1-15-2-2", "S-1-15-2-1"].iter().any(|text| {
+                let shared = appcontainer::capability_sid(text).expect("已知 SID 应可解析");
+                acl::has_explicit_grant(device, shared.as_psid(), mask).unwrap_or(false)
+            })
+        };
+
+        let id = format!("nul-{}", std::process::id());
+        ensure_mcp_container(&id, &[]).expect("建立 per-server 容器");
+        let (sid, granted) = {
+            let runtimes = mcp_lock().unwrap();
+            let runtime = runtimes.get(&id).expect("容器应已登记");
+            (runtime.container.sid(), runtime.null_granted)
+        };
+        let profile = appcontainer::mcp_profile_name(&id).unwrap();
+
+        assert!(
+            granted || shared_present(),
+            "容器既没被补上 NUL ACE、设备 DACL 里也没有共享应用包 SID：\
+             容器内所有 `Stdio::null()` / `Command::output()` 都会 Access denied"
+        );
+        if granted {
+            // 「做完了」的另一半由设备 DACL 自己回答：不能只信 `null_granted` 这个布尔。
+            assert!(
+                acl::has_explicit_grant(device, sid, mask).unwrap(),
+                "null_granted = true，但设备 DACL 上查不到该容器 SID 的读写 ACE"
+            );
+        }
+
+        release_mcp_server(&id);
+
+        assert!(
+            !acl::has_explicit_grant(device, sid, mask).unwrap(),
+            "释放后本容器 SID 的 NUL ACE 必须撤销（不撤 = 每换一个 server 就在设备上多留一条）"
+        );
+        if !granted {
+            // 本机口径：什么都没补，就更不许把设备上原有的共享应用包授权删掉。
+            assert!(shared_present(), "释放不得删除设备 DACL 里原有的共享应用包授权");
+        }
+        assert!(
+            !appcontainer::list_mcp_profiles().contains(&profile),
+            "释放后 profile 应被删除"
+        );
+    }
+
     /// 真机：容器内启动 cmd，并读取工作区里的文件（验证 ACE 真的生效）。
     #[cfg(windows)]
     #[test]
