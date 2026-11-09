@@ -4,11 +4,11 @@
 //! 新增事件类型或新增 `Option` 字段；字段命名 snake_case，与 `src/transport/types.ts` 镜像。
 //! 修改本文件必须同步前端镜像并更新 `tests/event_schema.rs`。
 
+use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use serde::{Deserialize, Serialize};
-use tauri::Emitter;
 use tokio::sync::broadcast;
 
 /// 后端 → 前端事件流通道。
@@ -271,6 +271,48 @@ pub trait EventJournal: Send + Sync {
 
 static EVENT_IDS: Mutex<ulid::Generator> = Mutex::new(ulid::Generator::new());
 
+/// WS 在线判据（SH-127 M2）：已鉴权且**至少订阅过一个会话**的 gateway 连接数。
+///
+/// 为什么不只数连接：半死连接（客户端崩了 / 网断了但 TCP 没超时）会让计数恒 > 0，
+/// 于是 Tauri 通道被永久压住、WS 那头也没人收。所以只有真正订阅过的连接才计数，
+/// 且 gateway 对这类连接有空闲超时（60s 无任何帧即断开并减计数）。
+#[derive(Clone, Default)]
+pub struct ViewerCount(Arc<AtomicUsize>);
+
+impl ViewerCount {
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    pub fn enter(&self) {
+        self.0.fetch_add(1, Ordering::SeqCst);
+    }
+
+    pub fn leave(&self) {
+        self.0.fetch_sub(1, Ordering::SeqCst);
+    }
+
+    pub fn get(&self) -> usize {
+        self.0.load(Ordering::SeqCst)
+    }
+
+    pub fn any(&self) -> bool {
+        self.get() > 0
+    }
+}
+
+/// 把事件推给 Tauri 前端（IPC 广播）。抽成 trait 只为可测：
+/// 生产用 `AppHandle`，测试用计数器实现，从而能数出「每条事件实际投递几次」。
+pub trait IpcEmitter: Send + Sync {
+    fn emit(&self, event: &AgentEvent) -> Result<(), String>;
+}
+
+impl IpcEmitter for tauri::AppHandle {
+    fn emit(&self, event: &AgentEvent) -> Result<(), String> {
+        tauri::Emitter::emit(self, EVENT_CHANNEL, event).map_err(|e| format!("事件广播失败: {e}"))
+    }
+}
+
 fn emit_agent_event(
     session_id: &str,
     agent_id: &str,
@@ -294,7 +336,7 @@ fn emit_agent_event(
 }
 
 pub struct TauriEventSink {
-    app: tauri::AppHandle,
+    ipc: Arc<dyn IpcEmitter>,
     session_id: String,
     /// 事件归属（ADR-104）：root 为 `"root"`，子代理为注册表分配的 id。
     agent_id: String,
@@ -304,11 +346,22 @@ pub struct TauriEventSink {
     /// SH-094 批 2：注入的 WS gateway 广播发送端（依赖倒置——events 不引用 gateway 模块，
     /// 只持 tokio Sender）。None = 不喂 gateway。组合根从 GatewayHub 取发送端注入。
     broadcast: Option<broadcast::Sender<AgentEvent>>,
+    /// SH-127 M2：WS 在线连接数。>0 时 Tauri IPC 通道是重复投递，跳过；
+    /// 归零（掉线/回退）即自动恢复。None = 无法判断，按旧行为始终走 IPC。
+    viewers: Option<ViewerCount>,
 }
 
 impl TauriEventSink {
     pub fn root(app: tauri::AppHandle, session_id: String) -> Self {
-        Self { app, session_id, agent_id: "root".into(), parent_id: None, journal: None, broadcast: None }
+        Self {
+            ipc: Arc::new(app),
+            session_id,
+            agent_id: "root".into(),
+            parent_id: None,
+            journal: None,
+            broadcast: None,
+            viewers: None,
+        }
     }
 
     /// 子代理出口：同一会话、同一持久化/广播缝，只改事件归属。
@@ -318,7 +371,15 @@ impl TauriEventSink {
         agent_id: impl Into<String>,
         parent_id: Option<String>,
     ) -> Self {
-        Self { app, session_id, agent_id: agent_id.into(), parent_id, journal: None, broadcast: None }
+        Self {
+            ipc: Arc::new(app),
+            session_id,
+            agent_id: agent_id.into(),
+            parent_id,
+            journal: None,
+            broadcast: None,
+            viewers: None,
+        }
     }
 
     /// 注入持久化实现：信封逐条落盘；广播仍是主通道，日志失败只告警不中断回合。
@@ -332,19 +393,25 @@ impl TauriEventSink {
         self.broadcast = Some(sender);
         self
     }
+
+    /// 注入 WS 在线计数：在线时不再重复投递 Tauri IPC。
+    pub fn with_viewers(mut self, viewers: ViewerCount) -> Self {
+        self.viewers = Some(viewers);
+        self
+    }
 }
 
 impl EventSink for TauriEventSink {
     fn scoped(&self, agent_id: &str, parent_id: Option<&str>) -> Option<Arc<dyn EventSink>> {
-        let mut sink = TauriEventSink::scoped(
-            self.app.clone(),
-            self.session_id.clone(),
-            agent_id,
-            parent_id.map(str::to_owned),
-        );
-        sink.journal = self.journal.clone();
-        sink.broadcast = self.broadcast.clone();
-        Some(Arc::new(sink))
+        Some(Arc::new(TauriEventSink {
+            ipc: self.ipc.clone(),
+            session_id: self.session_id.clone(),
+            agent_id: agent_id.to_owned(),
+            parent_id: parent_id.map(str::to_owned),
+            journal: self.journal.clone(),
+            broadcast: self.broadcast.clone(),
+            viewers: self.viewers.clone(),
+        }))
     }
 
     fn emit(&self, msg: &EventMsg) -> Result<(), String> {
@@ -359,14 +426,39 @@ impl EventSink for TauriEventSink {
             if let Some(sender) = &self.broadcast {
                 let _ = sender.send(event.clone());
             }
-            self.app.emit(EVENT_CHANNEL, event).map_err(|e| format!("事件广播失败: {e}"))
+            // M2：WS 有在线订阅者时，Tauri IPC 那条路没人听（前端 WS 模式不注册 Tauri
+            // 监听），继续发就是同一条事件的第二次投递。跳过它，等计数归零自动恢复。
+            if self.viewers.as_ref().is_some_and(ViewerCount::any) {
+                tracing::debug!(event_id = %event.event_id, "WS 在线，跳过 Tauri IPC 投递");
+                return Ok(());
+            }
+            self.ipc.emit(event)
         })
+    }
+}
+
+/// 测试缝：不依赖 `AppHandle` 构造 sink，换入计数型 IPC 实现。
+#[cfg(test)]
+impl TauriEventSink {
+    fn for_test(ipc: Arc<dyn IpcEmitter>) -> Self {
+        Self {
+            ipc,
+            session_id: "test".into(),
+            agent_id: "root".into(),
+            parent_id: None,
+            journal: None,
+            broadcast: None,
+            viewers: None,
+        }
     }
 }
 
 /// IPC 握手：回显 nonce 证明 invoke → 后端 → 事件通道 → 前端链路连通。
 pub fn emit_pong(app: &tauri::AppHandle, nonce: &str) -> Result<(), String> {
-    app.emit(
+    // 显式限定 trait：本模块新增了 `IpcEmitter for AppHandle`，与 `tauri::Emitter` 同名，
+    // 不写全路径会报 multiple applicable items（E0034）。
+    tauri::Emitter::emit(
+        app,
         PONG_CHANNEL,
         serde_json::json!({ "nonce": nonce }),
     )
@@ -417,6 +509,45 @@ mod envelope_tests {
             Ok(())
         })
         .unwrap();
+    }
+
+    /// M2 验收：WS 有在线订阅者时，同一条事件不再被第二次投递到 Tauri IPC；
+    /// 计数归零（掉线/回退）后 IPC 自动恢复。
+    #[test]
+    fn ws_viewer_presence_skips_duplicate_ipc_delivery() {
+        struct CountingIpc(AtomicUsize);
+        impl IpcEmitter for CountingIpc {
+            fn emit(&self, _: &AgentEvent) -> Result<(), String> {
+                self.0.fetch_add(1, Ordering::SeqCst);
+                Ok(())
+            }
+        }
+        let ipc = Arc::new(CountingIpc(AtomicUsize::new(0)));
+        let viewers = ViewerCount::new();
+        let sink = TauriEventSink::for_test(ipc.clone()).with_viewers(viewers.clone());
+        let msg = EventMsg::TurnStarted { turn: 1 };
+
+        for _ in 0..5 {
+            sink.emit(&msg).unwrap();
+        }
+        assert_eq!(ipc.0.load(Ordering::SeqCst), 5, "无 WS 在线时每条事件都走 IPC");
+        println!("[M2] 无在线订阅者：5 条事件 → IPC 投递 {} 次", ipc.0.load(Ordering::SeqCst));
+
+        viewers.enter();
+        for _ in 0..5 {
+            sink.emit(&msg).unwrap();
+        }
+        assert_eq!(
+            ipc.0.load(Ordering::SeqCst),
+            5,
+            "WS 在线时单条事件只投递一次（WS 侧），不该再走 IPC"
+        );
+        println!("[M2] WS 在线（再发 5 条）→ 累计 IPC 投递 {} 次（增量为 0）", ipc.0.load(Ordering::SeqCst));
+
+        viewers.leave();
+        sink.emit(&msg).unwrap();
+        assert_eq!(ipc.0.load(Ordering::SeqCst), 6, "WS 计数归零后 IPC 必须恢复");
+        println!("[M2] 在线计数归零（再发 1 条）→ 累计 IPC 投递 {} 次（增量 1）", ipc.0.load(Ordering::SeqCst));
     }
 
     #[test]

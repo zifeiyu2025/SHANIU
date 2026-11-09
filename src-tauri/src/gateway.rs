@@ -34,7 +34,7 @@ use tokio_tungstenite::tungstenite::Message;
 use tokio_tungstenite::WebSocketStream;
 
 use crate::event_journal;
-use crate::events::AgentEvent;
+use crate::events::{AgentEvent, ViewerCount};
 
 /// 广播通道容量：覆盖工具输出 burst；消费端 lag 时从日志补齐，不靠无限缓冲。
 const BROADCAST_CAPACITY: usize = 1024;
@@ -42,6 +42,15 @@ const BROADCAST_CAPACITY: usize = 1024;
 const MAX_QUEUE: usize = 8192;
 /// 首帧 hello 的等待时限：idle 连接不占用资源。
 const HELLO_TIMEOUT: Duration = Duration::from_secs(5);
+/// 已订阅连接的空闲时限（SH-127 M2）：超过即断开并释放「在线」计数。
+///
+/// 为什么要这个数：`TauriEventSink` 在「有在线订阅者」时跳过 Tauri IPC 投递。
+/// 半死连接（客户端崩了 / 网断了但 TCP 没超时）会让计数恒 > 0，于是两条通道都没人收，
+/// 界面看着活着却不动。宁可误断一条僵尸，也不让 fallback 被永久压住。
+const VIEWER_IDLE_TIMEOUT: Duration = Duration::from_secs(60);
+/// 主动 Ping 周期：浏览器/HTTP 栈会自动回 Pong，用它把「僵尸」与「安静但健康的客户端」
+/// 区分开。必须显著小于空闲时限，留出一次丢失的余量。
+const VIEWER_PING_INTERVAL: Duration = Duration::from_secs(20);
 /// 续播单页条数（复用事件日志的硬上限）。
 const REPLAY_LIMIT: usize = event_journal::MAX_LIMIT;
 
@@ -53,6 +62,11 @@ pub struct GatewayHub {
     token: String,
     port: Arc<AtomicU16>,
     journal_dir: PathBuf,
+    /// 已鉴权且至少订阅过一个会话的连接数（M2：>0 时 sink 跳过 Tauri IPC）。
+    viewers: ViewerCount,
+    /// 空闲时限与 Ping 周期。测试用 `with_liveness` 缩短，生产用上面的常量。
+    idle_timeout: Duration,
+    ping_interval: Duration,
 }
 
 impl GatewayHub {
@@ -63,7 +77,23 @@ impl GatewayHub {
             token: generate_token(),
             port: Arc::new(AtomicU16::new(0)),
             journal_dir,
+            viewers: ViewerCount::new(),
+            idle_timeout: VIEWER_IDLE_TIMEOUT,
+            ping_interval: VIEWER_PING_INTERVAL,
         }
+    }
+
+    /// 在线订阅者计数句柄：组合根注入 `TauriEventSink`。
+    pub fn viewers(&self) -> ViewerCount {
+        self.viewers.clone()
+    }
+
+    /// 测试用：把空闲时限/Ping 周期压到毫秒级，否则一条超时用例要等 60 秒。
+    #[cfg(test)]
+    fn with_liveness(mut self, idle: Duration, ping: Duration) -> Self {
+        self.idle_timeout = idle;
+        self.ping_interval = ping;
+        self
     }
 
     /// sink 发布一条信封。无接收端时 send 返回 Err（值丢弃）——续播由日志兜底，忽略即可。
@@ -169,6 +199,41 @@ impl SessionState {
     }
 }
 
+/// 在线订阅计数守卫（M2）：连接**订阅过会话**才 +1，drop 时 -1。
+///
+/// 不按「连接建立」计数，是因为未订阅的连接对事件投递毫无用处；按「订阅过」计数再配
+/// 空闲超时，才能既压住重复投递、又不会被半死连接永久卡住。
+struct ViewerGuard {
+    count: ViewerCount,
+    counted: bool,
+}
+
+impl ViewerGuard {
+    fn new(count: ViewerCount) -> Self {
+        Self { count, counted: false }
+    }
+
+    /// 首次订阅成功后调用；幂等（一条连接只占一个名额）。
+    fn mark(&mut self) {
+        if !self.counted {
+            self.counted = true;
+            self.count.enter();
+        }
+    }
+
+    fn counted(&self) -> bool {
+        self.counted
+    }
+}
+
+impl Drop for ViewerGuard {
+    fn drop(&mut self) {
+        if self.counted {
+            self.count.leave();
+        }
+    }
+}
+
 type WsSink = futures::stream::SplitSink<WebSocketStream<TcpStream>, Message>;
 
 async fn send_frame(sink: &mut WsSink, frame: &ServerFrame) -> Result<(), String> {
@@ -205,15 +270,32 @@ async fn handle_connection(hub: GatewayHub, ws: WebSocketStream<TcpStream>) {
 
     let mut rx = hub.receiver();
     let mut sessions: HashMap<String, SessionState> = HashMap::new();
+    // 在线计数守卫：只有订阅过会话的连接才计数；任何退出路径（含超时/协议错/断开）
+    // 都在 drop 时减回去，不让计数漏挂。
+    let mut viewer = ViewerGuard::new(hub.viewers());
+    // 心跳：主动 Ping 诱发 Pong。浏览器/HTTP 栈自动回 Pong，所以「安静但健康」的
+    // 空闲客户端不会被误杀，只有真僵尸（收不到 Pong）才会撞上空闲时限。
+    // 用 `interval_at` 而不是 `interval`：后者首个 tick 立即完成，会在鉴权后立刻吐一个
+    // Ping 帧，破坏「订阅前连接上不该有服务端主动帧」的既有测试契约。
+    let mut ticker = tokio::time::interval_at(
+        tokio::time::Instant::now() + hub.ping_interval,
+        hub.ping_interval,
+    );
+    ticker.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+    let mut last_active = tokio::time::Instant::now();
     loop {
         tokio::select! {
             incoming = stream.next() => {
+                last_active = tokio::time::Instant::now();
                 match incoming {
                     Some(Ok(Message::Text(text))) => {
                         match serde_json::from_str::<ClientFrame>(text.as_str()) {
                             Ok(frame) => {
                                 if handle_frame(&hub, &mut sink, &mut sessions, frame).await.is_err() {
                                     break;
+                                }
+                                if !sessions.is_empty() {
+                                    viewer.mark();
                                 }
                             }
                             Err(e) => {
@@ -229,8 +311,23 @@ async fn handle_connection(hub: GatewayHub, ws: WebSocketStream<TcpStream>) {
                         let _ = send_frame(&mut sink, &ServerFrame::error("protocol", "只接受 text 帧")).await;
                         break;
                     }
-                    Some(Ok(_)) => {} // Ping/Pong 由 tungstenite 自动应答
+                    // Ping/Pong 由 tungstenite 自动应答；这里只需把它算作「连接还活着」。
+                    Some(Ok(_)) => {}
                     Some(Err(_)) => break,
+                }
+            }
+            _ = ticker.tick() => {
+                // 只对订阅过的连接判超时：未订阅的连接不计数，也不该因空闲被反复踢掉
+                // （那会让前端在启动阶段空转重连）。
+                if viewer.counted() && last_active.elapsed() >= hub.idle_timeout {
+                    tracing::info!(
+                        "gateway 连接空闲超时（{}s 无任何帧），断开并释放在线计数",
+                        hub.idle_timeout.as_secs()
+                    );
+                    break;
+                }
+                if sink.send(Message::Ping(Default::default())).await.is_err() {
+                    break;
                 }
             }
             event = rx.recv() => {
@@ -459,6 +556,73 @@ mod tests {
         ws.send(Message::text(r#"{"type":"credit","session_id":"s1","credits":1}"#)).await.unwrap();
         let second = next_event(&mut ws).await;
         assert_eq!(second.event_id, "03");
+    }
+
+    /// 用自定义 hub 起服务（心跳时限被缩短的用例需要它）；临时目录由调用方持有。
+    async fn spawn_server_with(hub: GatewayHub) -> (GatewayHub, String) {
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let port = listener.local_addr().unwrap().port();
+        let server_hub = hub.clone();
+        tokio::spawn(async move { serve(server_hub, listener).await.unwrap() });
+        (hub, format!("ws://127.0.0.1:{port}"))
+    }
+
+    /// M2：只数「订阅过会话」的连接——建连不订阅不算在线订阅者。
+    #[tokio::test]
+    async fn connection_without_subscription_does_not_count_as_viewer() {
+        let (hub, url, _dir) = spawn_server().await;
+        let mut ws = hello_ok(&url, &hub).await;
+        tokio::time::sleep(Duration::from_millis(100)).await;
+        assert_eq!(hub.viewers().get(), 0, "建连未订阅不应计入在线订阅者");
+        ws.send(Message::text(r#"{"type":"subscribe","session_id":"s1","credits":1}"#)).await.unwrap();
+        tokio::time::sleep(Duration::from_millis(100)).await;
+        assert_eq!(hub.viewers().get(), 1, "订阅成功后应计入在线订阅者");
+    }
+
+    /// M2：订阅后的僵尸连接（不回 Pong、不发任何帧）必须在空闲时限后断开并释放计数，
+    /// 否则 Tauri emit 会被永久压住、界面看着活着却收不到事件。
+    #[tokio::test]
+    async fn idle_subscribed_connection_releases_viewer_count() {
+        let dir = temp_dir();
+        let hub = GatewayHub::new(dir.to_path_buf())
+            .with_liveness(Duration::from_millis(400), Duration::from_millis(100));
+        let (_hub, url) = spawn_server_with(hub.clone()).await;
+        let mut ws = hello_ok(&url, &hub).await;
+        ws.send(Message::text(r#"{"type":"subscribe","session_id":"s1","credits":1}"#)).await.unwrap();
+        tokio::time::sleep(Duration::from_millis(100)).await;
+        assert_eq!(hub.viewers().get(), 1);
+
+        // 客户端不再读（Ping 收不到、Pong 不回），服务端应在空闲时限后断开。
+        let deadline = tokio::time::Instant::now() + Duration::from_secs(6);
+        while hub.viewers().get() > 0 && tokio::time::Instant::now() < deadline {
+            tokio::time::sleep(Duration::from_millis(50)).await;
+        }
+        assert_eq!(hub.viewers().get(), 0, "空闲超时必须释放计数");
+    }
+
+    /// M2 反面：健康在线（持续应答 Ping）的连接不能被空闲超时误杀。
+    #[tokio::test]
+    async fn live_connection_survives_idle_timeout_by_pong() {
+        let dir = temp_dir();
+        let hub = GatewayHub::new(dir.to_path_buf())
+            .with_liveness(Duration::from_millis(1000), Duration::from_millis(150));
+        let (_hub, url) = spawn_server_with(hub.clone()).await;
+        let mut ws = hello_ok(&url, &hub).await;
+        ws.send(Message::text(r#"{"type":"subscribe","session_id":"s1","credits":1}"#)).await.unwrap();
+
+        // 持续读并显式回 Pong（tokio-tungstenite 也会自动回，这里写实一点）。
+        let until = tokio::time::Instant::now() + Duration::from_millis(2000);
+        while tokio::time::Instant::now() < until {
+            match timeout(Duration::from_millis(200), ws.next()).await {
+                Ok(Some(Ok(Message::Ping(payload)))) => {
+                    let _ = ws.send(Message::Pong(payload)).await;
+                }
+                Ok(Some(Ok(Message::Close(_))) | None) | Ok(Some(Err(_))) => break,
+                Ok(Some(Ok(_))) => {}
+                Err(_) => {}
+            }
+        }
+        assert_eq!(hub.viewers().get(), 1, "持续应答心跳的连接不该被断开");
     }
 
     #[tokio::test]

@@ -100,7 +100,7 @@ fn send_task(app: tauri::AppHandle, task: String, agent_id: Option<String>) -> R
             // 不阻塞主回合；失败/关开关/没密钥都静默保持截断 fallback。
             session_title::spawn_generation(app.clone(), new_id.clone(), task.clone());
             let sink: Arc<dyn events::EventSink> =
-                Arc::new(events::TauriEventSink::root(app.clone(), new_id.clone()).with_journal(Arc::new(event_journal::FileEventJournal::new(app.state::<AppState>().data_root().join(config::SESSIONS_DIR)))).with_broadcast(app.state::<gateway::GatewayHub>().broadcast_sender()));
+                Arc::new(events::TauriEventSink::root(app.clone(), new_id.clone()).with_journal(Arc::new(event_journal::FileEventJournal::new(app.state::<AppState>().data_root().join(config::SESSIONS_DIR)))).with_broadcast(app.state::<gateway::GatewayHub>().broadcast_sender()).with_viewers(app.state::<gateway::GatewayHub>().viewers()));
             // 注册表在任务启动时挂到 AppState：UI 的 steering/中断命令面要摸到活体注册表。
             let orchestrator = build_orchestrator(agent.clone());
             app.state::<AppState>().set_subagents(Some(orchestrator.registry().clone()));
@@ -156,7 +156,7 @@ fn continue_session(
         if session_workspace.as_os_str().is_empty() { state.workspace_root() } else { session_workspace },
         Some(Arc::new(writer)),
     )?;
-    let sink: Arc<dyn events::EventSink> = Arc::new(events::TauriEventSink::root(app.clone(), agent_id).with_journal(Arc::new(event_journal::FileEventJournal::new(app.state::<AppState>().data_root().join(config::SESSIONS_DIR)))).with_broadcast(app.state::<gateway::GatewayHub>().broadcast_sender()));
+    let sink: Arc<dyn events::EventSink> = Arc::new(events::TauriEventSink::root(app.clone(), agent_id).with_journal(Arc::new(event_journal::FileEventJournal::new(app.state::<AppState>().data_root().join(config::SESSIONS_DIR)))).with_broadcast(app.state::<gateway::GatewayHub>().broadcast_sender()).with_viewers(app.state::<gateway::GatewayHub>().viewers()));
     // spawn 的 future 必须是 'static：借用的 app 只能换成 owned 句柄再 move 进去。
     let app_handle = app.clone();
     let orchestrator = build_orchestrator(agent.clone());
