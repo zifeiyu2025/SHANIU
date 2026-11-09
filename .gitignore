@@ -56,3 +56,4 @@ evals/latest.json
 evals/control.json
 evals/results/
 evals/.eval.lock
+evals/*.log
