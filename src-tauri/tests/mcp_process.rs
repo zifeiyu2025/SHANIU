@@ -66,6 +66,7 @@ async fn started_session() -> (McpSession, McpServerConfig, String) {
         workspace_root: config_cwd(&config),
         approved_sha256: &hash,
         approved_module_tree: None,
+        trusted_server_ids: &[],
     })
     .await
     .expect("受限 stdio 进程应能启动");
@@ -193,6 +194,7 @@ async fn crashed_server_restarts_once_then_degrades() {
                 workspace_root: config_cwd(&config),
                 approved_sha256: &hash,
                 approved_module_tree: None,
+                trusted_server_ids: &[],
             },
             &mut guard,
         )
@@ -213,6 +215,7 @@ async fn crashed_server_restarts_once_then_degrades() {
                 workspace_root: config_cwd(&config),
                 approved_sha256: &hash,
                 approved_module_tree: None,
+                trusted_server_ids: &[],
             },
             &mut guard,
         )

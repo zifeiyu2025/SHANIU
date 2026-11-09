@@ -92,6 +92,21 @@ pub(crate) fn ensure_container_can_open_null(
     }
 }
 
+/// 撤销本进程给某个容器 SID 在 `\Device\Null` 上加的读写 ACE（server 停止 / 撤信时调用）。
+///
+/// **只删这一个 SID 的显式 ACE**，不还原整份备份：其它 server 的 SID 可能还在用同一个设备，
+/// 整份还原留给进程退出（`restore_null_device`）。调用方必须先确认这条 ACE 是本进程加的
+/// （`NullDeviceAccess::Granted`），否则会把系统自带的共享授权删掉。
+pub(crate) fn revoke_container_access(sid: PSID) -> Result<bool, String> {
+    let device = Path::new(NULL_DEVICE);
+    // 先查再写：设备的 `WRITE_DAC` 通常只有管理员有，而「本机没补过 / 重复释放」是常态。
+    // 不查就写会把一次无害的幂等释放变成 Access denied，还会白触发一次 DACL 规范化。
+    if !acl::has_explicit_grant(device, sid, REQUIRED_MASK)? {
+        return Ok(false);
+    }
+    acl::revoke_ace(device, sid)
+}
+
 /// 按备份还原 NUL 设备的 DACL。返回是否真的还原了（没有备份 = 什么都没做）。
 ///
 /// 注意：设备路径 `Path::exists()` 恒为 false，**不能**走目录备份那条"对象不存在就丢弃备份"
@@ -140,5 +155,20 @@ mod tests {
     fn device_path_is_not_a_file_path() {
         assert!(!Path::new(NULL_DEVICE).exists());
         assert_eq!(REQUIRED_MASK, FILE_GENERIC_READ.0 | FILE_GENERIC_WRITE.0);
+    }
+
+    /// 撤销必须幂等：从没补过的 SID 上撤销返回 `false`，不报错、不写 DACL。
+    ///
+    /// 口径说明（SH-064 B）：本机是客户端 SKU，令牌自带 `S-1-15-2-2`，容器走
+    /// `AlreadyAccessible`，`null_granted=false`，**「补 → 撤」这条路径在本机跑不到**；
+    /// 它只在没有共享应用包 SID 的机器（Server runner）才真的发生。这里只钉住
+    /// 「没补过就不许动设备 DACL」这一半，另一半只能在提权 / Server runner 上验。
+    #[test]
+    fn revoke_of_an_absent_grant_is_a_noop() {
+        let sid = crate::sandbox::appcontainer::capability_sid("S-1-15-2-99").unwrap();
+        assert!(
+            !revoke_container_access(sid.as_psid()).unwrap(),
+            "从未授权过的 SID 上撤销必须返回 false（幂等且不报错）"
+        );
     }
 }

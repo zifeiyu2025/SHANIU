@@ -406,6 +406,8 @@ struct RestartParams {
     approved_sha256: String,
     /// 批准记录里的模块代码树摘要（解释器型启动才有）：同样每次重启前重算比对。
     approved_module_tree: Option<String>,
+    /// 配置内所有已信任 server 的 id（容器孤儿回收白名单，SH-064 C）。
+    trusted_server_ids: Vec<String>,
 }
 
 /// 构建 [`ReviewPayload`] 的上下文：状态、来源信任记录与已收集的警告。
@@ -467,6 +469,19 @@ impl McpRuntime {
     fn emit(&self, event: McpEvent) {
         let sink = self.sink.read().expect("MCP sink 锁中毒").clone();
         sink.emit(&event);
+    }
+
+    /// 配置内**所有已信任** server 的 id。用途只有一处：容器孤儿回收的白名单——
+    /// 已信任但当前没连的 server 的容器 profile 不能被当成上次遗留的孤儿删掉。
+    async fn trusted_server_ids(&self) -> Vec<String> {
+        self.trust
+            .lock()
+            .await
+            .records()
+            .into_iter()
+            .filter(|record| record.status == TrustStatus::Trusted)
+            .map(|record| record.server_id)
+            .collect()
     }
 
     /// 首连 / 重连：返回审查载荷。已受信任且指纹未变时直接重建执行器并返回 trusted。
@@ -590,6 +605,9 @@ impl McpRuntime {
         } else {
             SandboxMode::WorkspaceWrite
         };
+        // 容器孤儿回收的白名单：配置内**所有**已信任 server，而不只是当前这一个。
+        // 少了这一项，连 A 的时候会把已信任但当前没连的 B 的容器当孤儿删掉（白删白建）。
+        let trusted_server_ids = self.trusted_server_ids().await;
         let mut session = match McpSession::start(SpawnSpec {
             config,
             sandbox_mode,
@@ -597,6 +615,7 @@ impl McpRuntime {
             workspace_root,
             approved_sha256: &executable_sha256,
             approved_module_tree: module_tree_sha,
+            trusted_server_ids: &trusted_server_ids,
         })
         .await
         {
@@ -609,6 +628,9 @@ impl McpRuntime {
                      修正沙箱配置后请显式重连"
                 );
                 self.mark_blocked(&config.id, reason.clone()).await;
+                // 置 blocked 的 server 不会被自动重试，容器/ACE 不能等退出才收：
+                // 这里立刻撤销（内含 profile 删除），不让失败留下长期残留。
+                crate::sandbox::release_mcp_server(&config.id);
                 return Err(reason);
             }
         };
@@ -622,10 +644,13 @@ impl McpRuntime {
                 if session.is_closed() {
                     tokio::time::sleep(Duration::from_millis(200)).await;
                 }
-                return Err(format!(
-                    "MCP 握手失败: {error}\n{}",
-                    session.crash_report(-1)
-                ));
+                let report = session.crash_report(-1);
+                // 先让进程真正收口再回收容器：profile 被在跑的进程占着时删除会失败。
+                session.shutdown();
+                let _ = tokio::time::timeout(Duration::from_secs(2), session.wait_exit()).await;
+                drop(session);
+                crate::sandbox::release_mcp_server(&config.id);
+                return Err(format!("MCP 握手失败: {error}\n{report}"));
             }
         };
         let remote_tools = session
@@ -771,6 +796,7 @@ impl McpRuntime {
                         workspace_root: workspace_root.to_path_buf(),
                         approved_sha256: executable_sha256.clone(),
                         approved_module_tree: module_tree_sha.map(str::to_string),
+                        trusted_server_ids: trusted_server_ids.clone(),
                     },
                 );
                 self.emit(McpEvent::ServerStatusChanged {
@@ -1215,6 +1241,7 @@ impl McpRuntime {
                         .module_tree
                         .as_ref()
                         .map(|tree| tree.sha256.clone()),
+                    trusted_server_ids: self.trusted_server_ids().await,
                 },
             );
             self.pending.lock().await.remove(server_id);
@@ -1817,6 +1844,7 @@ async fn supervise(
                         workspace_root: &params.workspace_root,
                         approved_sha256: &params.approved_sha256,
                         approved_module_tree: params.approved_module_tree.as_deref(),
+                        trusted_server_ids: &params.trusted_server_ids,
                     },
                     &mut guard,
                 )

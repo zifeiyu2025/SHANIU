@@ -150,6 +150,7 @@ async fn started(config: &McpServerConfig, workspace: &Path) -> McpSession {
         workspace_root: workspace,
         approved_sha256: &hash,
         approved_module_tree: None,
+        trusted_server_ids: &[],
     })
     .await
     .expect("容器内应能启动 node server");

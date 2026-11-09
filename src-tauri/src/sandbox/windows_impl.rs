@@ -265,11 +265,9 @@ pub fn spawn_restricted_command(
     cwd: &Path,
     tx: mpsc::Sender<ExecLine>,
 ) -> Result<RestrictedChild, String> {
-    let mut command_line = program.to_string();
-    for arg in args {
-        command_line.push(' ');
-        command_line.push_str(arg);
-    }
+    // 程序路径统一走共享的引用规则（含空格路径必须被引起来）；参数保持调用方原文，
+    // 见 `shell_command_line` 的说明（SH-064 裁决②：入口不合并，规则共用）。
+    let command_line = shell_command_line(program, args);
     let mut cmdline_wide = wide(&command_line);
     let cwd_wide = wide(cwd.as_os_str());
 
@@ -356,11 +354,9 @@ pub fn spawn_appcontainer_command(
     extra_env: &[(String, String)],
     tx: mpsc::Sender<ExecLine>,
 ) -> Result<RestrictedChild, String> {
-    let mut command_line = program.to_string();
-    for arg in args {
-        command_line.push(' ');
-        command_line.push_str(arg);
-    }
+    // 程序路径统一走共享的引用规则（含空格路径必须被引起来）；参数保持调用方原文，
+    // 见 `shell_command_line` 的说明（SH-064 裁决②：入口不合并，规则共用）。
+    let command_line = shell_command_line(program, args);
     let mut cmdline_wide = wide(&command_line);
     let cwd_wide = wide(cwd.as_os_str());
     // 宿主环境 + 工具链注入（MSVC：PATH/INCLUDE/LIB，见 sandbox::msvc）。按 Windows 惯例
@@ -646,11 +642,9 @@ fn spawn_terminal_impl(
         cols,
         rows,
     } = launch;
-    let mut command_line = program.to_string();
-    for arg in args {
-        command_line.push(' ');
-        command_line.push_str(arg);
-    }
+    // 程序路径统一走共享的引用规则（含空格路径必须被引起来）；参数保持调用方原文，
+    // 见 `shell_command_line` 的说明（SH-064 裁决②：入口不合并，规则共用）。
+    let command_line = shell_command_line(program, args);
     let application_wide = wide(program);
     let mut command_line_wide = wide(&command_line);
     let cwd_wide = wide(cwd.as_os_str());
@@ -1389,6 +1383,24 @@ fn append_quoted_arg(command_line: &mut String, arg: &str) {
         command_line.push('\\');
     }
     command_line.push('"');
+}
+
+/// exec 入口的命令行：**只引用程序路径**，参数按调用方给的原文拼接。
+///
+/// 为什么参数不能按 MSVCRT argv 规则引用：`prepare_spawn*` 的生产调用方是
+/// `unified_exec`，传的是 `cmd /C <整条命令>`，参数里带重定向与引号
+/// （`echo executed> "C:\...\marker.txt"`）。逐参数引用会把它转义成
+/// `"echo executed> \"...\""`，cmd 会把整串当字面量 → 退出码 1、marker 不落盘
+/// （`tests/sandbox_failclosed.rs::control_normal_sandbox_executes_and_writes_marker` 钉住）。
+/// 需要逐参数引用的入口（MCP stdio）走 `build_command_line`。
+fn shell_command_line(program: &str, args: &[&str]) -> String {
+    let mut command_line = String::new();
+    append_quoted_arg(&mut command_line, program);
+    for arg in args {
+        command_line.push(' ');
+        command_line.push_str(arg);
+    }
+    command_line
 }
 
 fn build_command_line(program: &Path, args: &[&str]) -> String {

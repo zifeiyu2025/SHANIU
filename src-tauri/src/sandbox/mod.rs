@@ -307,21 +307,34 @@ fn ensure_acl() -> Result<(), SandboxError> {
 ///
 /// 失败**不** fail-closed：路径隔离本身仍成立，只是依赖 null stdio 的程序会在容器内
 /// 报 `Access is denied` —— 这条必须喊出来，不能静默。
-fn ensure_null_device(sid: PSID) {
+/// 返回**本次**是否真的给容器补了 NUL 设备 ACE。
+///
+/// 只有 `true` 才允许在释放时撤销那条 ACE：`AlreadyAccessible` 说明设备 DACL
+/// 本来就能让这个 SID 打开 NUL（系统共享 SID 或前一次授权），删了会打断别人。
+fn ensure_null_device(sid: PSID) -> bool {
     match device_acl::ensure_container_can_open_null(sid, &acl_backup_dir()) {
-        Ok(device_acl::NullDeviceAccess::AlreadyAccessible) => {}
-        Ok(device_acl::NullDeviceAccess::Granted) => tracing::info!(
-            "已给容器 SID 补 `\\Device\\Null` 读写 ACE（该 OS 默认不给受限应用包授权，退出时还原）"
-        ),
-        Ok(device_acl::NullDeviceAccess::NoPermission(detail)) => tracing::warn!(
-            %detail,
-            "容器打不开 `\\Device\\Null`，且当前进程没有写设备 DACL 的权限（设备只有管理员可改）。\
-             容器内依赖 null stdio 的命令（cargo/node/python 派生进程）会报 Access denied"
-        ),
-        Err(error) => tracing::warn!(
-            %error,
-            "补 `\\Device\\Null` 授权时出错：容器内依赖 null stdio 的命令可能报 Access denied"
-        ),
+        Ok(device_acl::NullDeviceAccess::AlreadyAccessible) => false,
+        Ok(device_acl::NullDeviceAccess::Granted) => {
+            tracing::info!(
+                "已给容器 SID 补 `\\Device\\Null` 读写 ACE（该 OS 默认不给受限应用包授权，退出时还原）"
+            );
+            true
+        }
+        Ok(device_acl::NullDeviceAccess::NoPermission(detail)) => {
+            tracing::warn!(
+                %detail,
+                "容器打不开 `\\Device\\Null`，且当前进程没有写设备 DACL 的权限（设备只有管理员可改）。\
+                 容器内依赖 null stdio 的命令（cargo/node/python 派生进程）会报 Access denied"
+            );
+            false
+        }
+        Err(error) => {
+            tracing::warn!(
+                %error,
+                "补 `\\Device\\Null` 授权时出错：容器内依赖 null stdio 的命令可能报 Access denied"
+            );
+            false
+        }
     }
 }
 
@@ -354,6 +367,7 @@ fn build_runtime() -> Result<Runtime, SandboxError> {
 
     let container =
         appcontainer::AppContainer::ensure().map_err(SandboxError::CreateFailed)?;
+    // exec 容器的 NUL 授权由退出时的整份设备 DACL 还原兜底，不逐个撤销。
     ensure_null_device(container.sid());
     let capability_internet = appcontainer::internet_client_capability()
         .map_err(SandboxError::CreateFailed)?;
@@ -418,6 +432,8 @@ struct McpRuntime {
     capability_internet: appcontainer::Sid,
     /// 本进程给这个容器的 SID 加过的 ACE：释放时按 `(路径, SID)` 精确撤销。
     granted: Vec<(PathBuf, acl::Access)>,
+    /// 本进程是否给这个 SID 补过 `\Device\Null` 的 ACE（释放时要撤）。
+    null_granted: bool,
 }
 
 static MCP_RUNTIMES: OnceLock<Mutex<HashMap<String, McpRuntime>>> = OnceLock::new();
@@ -433,37 +449,59 @@ fn mcp_lock() -> Result<std::sync::MutexGuard<'static, HashMap<String, McpRuntim
         .map_err(|_| SandboxError::CreateFailed("MCP 容器锁已中毒".into()))
 }
 
+/// 孤儿回收的白名单：当前正在连的 server + 配置内所有已信任 server + **本进程正在运行的 server**。
+///
+/// 最后一类是硬约束：删到还在跑的 server 的 profile 会直接打死它的进程（白删白建只是浪费，
+/// 删到在跑的是事故）。因此它不能只写在注释里——`reclaim_never_deletes_a_running_profile`
+/// 用「运行中 + 空白名单」的最坏组合把它钉住。
+fn mcp_reclaim_allowlist(
+    current: &str,
+    trusted: &[String],
+    running: impl IntoIterator<Item = String>,
+) -> HashSet<String> {
+    std::iter::once(current.to_string())
+        .chain(trusted.iter().cloned())
+        .chain(running)
+        .filter_map(|id| appcontainer::mcp_profile_name(&id).ok())
+        .collect()
+}
+
 /// 建立（或复用）某个 server 的容器 profile。
 ///
-/// 数量上限与孤儿回收都在这里做：本进程首次接管容器时，`Shaniu.Mcp.*` 里
-/// 不属于当前 server 的都是上次遗留的孤儿（见 `appcontainer::reclaim_orphans` 的边界）。
-fn ensure_mcp_container(server_id: &str) -> Result<(), SandboxError> {
+/// 数量上限与孤儿回收都在这里做。回收**每次接管新容器都跑**（不再只在「本进程首个容器」时跑）：
+/// 白名单里已经包含正在运行的 server，所以在跑的永远不会被当成孤儿；
+/// 而「配置里已信任但当前没连」的 server 也不再被白删白建。
+/// 不在白名单里的 `Shaniu.Mcp.*` 才是上次遗留的孤儿（见 `appcontainer::reclaim_orphans` 的边界）。
+fn ensure_mcp_container(server_id: &str, trusted_server_ids: &[String]) -> Result<(), SandboxError> {
     let profile = appcontainer::mcp_profile_name(server_id).map_err(SandboxError::CreateFailed)?;
     let mut runtimes = mcp_lock()?;
     if runtimes.contains_key(server_id) {
         return Ok(());
     }
-    if runtimes.is_empty() {
-        let active: HashSet<String> = HashSet::from([profile.clone()]);
-        appcontainer::reclaim_orphans(&active);
-    }
+    let active = mcp_reclaim_allowlist(
+        server_id,
+        trusted_server_ids,
+        runtimes.keys().cloned().collect::<Vec<_>>(),
+    );
+    appcontainer::reclaim_orphans(&active);
     let existing = appcontainer::list_mcp_profiles();
     if !existing.contains(&profile) && existing.len() >= appcontainer::MAX_MCP_PROFILES {
         return Err(SandboxError::CreateFailed(format!(
             "已有 {} 个 MCP 容器 profile，达到上限 {}：请先撤销不再使用的 server 信任\
-             （会同时删除其容器 profile）再连接新的 server",
+             （会同时删除其容器 profile）再连接新的 server。当前 profile：{}",
             existing.len(),
-            appcontainer::MAX_MCP_PROFILES
+            appcontainer::MAX_MCP_PROFILES,
+            existing.join("、")
         )));
     }
     let container =
         appcontainer::AppContainer::ensure_named(&profile).map_err(SandboxError::CreateFailed)?;
-    ensure_null_device(container.sid());
+    let null_granted = ensure_null_device(container.sid());
     let capability_internet =
         appcontainer::internet_client_capability().map_err(SandboxError::CreateFailed)?;
     runtimes.insert(
         server_id.to_string(),
-        McpRuntime { container, capability_internet, granted: Vec::new() },
+        McpRuntime { container, capability_internet, granted: Vec::new(), null_granted },
     );
     Ok(())
 }
@@ -541,6 +579,20 @@ fn revoke_and_delete(runtime: McpRuntime) {
             );
         }
     }
+    // NUL 设备只撤「本进程补过的那条」：设备对象没有 exists()，也没有目录备份可还原，
+    // 只删本 SID 的显式 ACE，其它 server 的 SID 与设备原有 ACE 一个都不碰。
+    if runtime.null_granted {
+        match device_acl::revoke_container_access(sid) {
+            Ok(removed) if removed => {
+                tracing::info!("已撤销该容器在 `\\Device\\Null` 上的读写 ACE")
+            }
+            Ok(_) => {}
+            Err(error) => tracing::error!(
+                %error,
+                "撤销 `\\Device\\Null` 上的容器 ACE 失败（退出时的设备 DACL 还原会兜底）"
+            ),
+        }
+    }
     match runtime.container.delete() {
         Ok(()) => tracing::info!("MCP 容器 profile 已删除"),
         Err(error) => tracing::error!(%error, "MCP 容器 profile 删除失败"),
@@ -613,6 +665,8 @@ pub struct StdioRequest<'a> {
     pub allowed_roots: &'a [AllowedRoot],
     pub allow_network: bool,
     pub env: &'a BTreeMap<String, String>,
+    /// 配置内**所有已信任** server 的 id：孤儿回收的白名单（它们的容器 profile 不算遗留物）。
+    pub trusted_server_ids: &'a [String],
 }
 
 /// 按策略准备 MCP stdio server（SH-060，X10：默认一律走沙箱）。
@@ -666,7 +720,7 @@ fn spawn_mcp_in_app_container(
     request: &StdioRequest<'_>,
     tx: mpsc::Sender<StdioEvent>,
 ) -> Result<windows_impl::RestrictedStdioChild, SandboxError> {
-    ensure_mcp_container(request.server_id)?;
+    ensure_mcp_container(request.server_id, request.trusted_server_ids)?;
 
     let data_root = crate::config::resolve_dirs_from_env().data_root;
     let server_temp = data_root
@@ -954,6 +1008,7 @@ mod tests {
                 allowed_roots: &[],
                 allow_network: false,
                 env: &BTreeMap::new(),
+                trusted_server_ids: &[],
             },
             tx,
         ) {
@@ -993,6 +1048,7 @@ mod tests {
                 allowed_roots: &[],
                 allow_network: false,
                 env: &BTreeMap::new(),
+                trusted_server_ids: &[],
             },
             tx,
         ) {
@@ -1009,7 +1065,7 @@ mod tests {
     fn mcp_container_is_per_server_and_deleted_on_release() {
         let _serial = appcontainer::PROFILE_TEST_MUTEX.blocking_lock();
         let id = format!("release-{}", std::process::id());
-        ensure_mcp_container(&id).expect("应能建立 per-server 容器");
+        ensure_mcp_container(&id, &[]).expect("应能建立 per-server 容器");
         {
             let runtimes = mcp_lock().unwrap();
             let runtime = runtimes.get(&id).expect("容器应已登记");
@@ -1029,6 +1085,64 @@ mod tests {
         );
     }
 
+    /// 硬约束：**正在运行的 server 的 profile 永不在回收范围内**——删到在跑的会直接
+    /// 打死它的进程（白删白建只是浪费）。用最坏组合钉住：配置白名单为空，
+    /// 只有「本进程正在运行」这一路能救它；若这行代码被删掉，本用例必红。
+    #[cfg(windows)]
+    #[test]
+    fn reclaim_never_deletes_a_running_profile() {
+        let _serial = appcontainer::PROFILE_TEST_MUTEX.blocking_lock();
+        let stamp = std::process::id();
+        let running = format!("keep{stamp}");
+        let orphan = format!("leak{stamp}");
+        let running_profile = appcontainer::mcp_profile_name(&running).unwrap();
+        let orphan_profile = appcontainer::mcp_profile_name(&orphan).unwrap();
+        let running_container =
+            appcontainer::AppContainer::ensure_named(&running_profile).expect("建运行中容器");
+        appcontainer::AppContainer::ensure_named(&orphan_profile).expect("建孤儿容器");
+
+        let allowlist = mcp_reclaim_allowlist("another-server", &[], [running.clone()]);
+        let deleted = appcontainer::reclaim_orphans(&allowlist);
+
+        assert!(
+            !deleted.contains(&running_profile),
+            "正在运行的 server profile 永不在回收范围内（实际删除清单：{deleted:?}）"
+        );
+        assert!(deleted.contains(&orphan_profile), "非运行、非信任的 profile 应被回收");
+        assert!(
+            appcontainer::list_mcp_profiles().contains(&running_profile),
+            "运行中的 profile 必须仍然存在"
+        );
+        let _ = running_container.delete();
+    }
+
+    /// 已信任但当前没连的 server 的 profile 不算孤儿：回收不能白删白建
+    /// （重建 profile 会丢包目录与注册记录，纯属浪费且有窗口期）。
+    #[cfg(windows)]
+    #[test]
+    fn reclaim_keeps_trusted_profiles() {
+        let _serial = appcontainer::PROFILE_TEST_MUTEX.blocking_lock();
+        let stamp = std::process::id();
+        let trusted = format!("trust{stamp}");
+        let stale = format!("stale{stamp}");
+        let trusted_profile = appcontainer::mcp_profile_name(&trusted).unwrap();
+        let stale_profile = appcontainer::mcp_profile_name(&stale).unwrap();
+        let trusted_container = appcontainer::AppContainer::ensure_named(&trusted_profile).unwrap();
+        appcontainer::AppContainer::ensure_named(&stale_profile).unwrap();
+
+        let allowlist = mcp_reclaim_allowlist(
+            "current-server",
+            std::slice::from_ref(&trusted),
+            std::iter::empty::<String>(),
+        );
+        let deleted = appcontainer::reclaim_orphans(&allowlist);
+
+        assert!(!deleted.contains(&trusted_profile), "已信任 server 的 profile 不应被回收");
+        assert!(deleted.contains(&stale_profile), "既不在配置也不在运行的 profile 才是孤儿");
+        assert!(appcontainer::list_mcp_profiles().contains(&trusted_profile));
+        let _ = trusted_container.delete();
+    }
+
     /// 每 server 的目录授权：ACE 加在该 server 自己的容器 SID 上，释放时按
     /// `(路径, SID)` 精确撤销，并且释放本身幂等。
     #[cfg(windows)]
@@ -1040,7 +1154,7 @@ mod tests {
         let target = dir.join("granted");
         std::fs::create_dir_all(&target).unwrap();
         let id = format!("acl-{}", std::process::id());
-        ensure_mcp_container(&id).expect("建立 per-server 容器");
+        ensure_mcp_container(&id, &[]).expect("建立 per-server 容器");
         let sid = {
             let runtimes = mcp_lock().unwrap();
             runtimes.get(&id).expect("容器应已登记").container.sid()
@@ -1096,6 +1210,7 @@ mod tests {
                 allowed_roots: &[],
                 allow_network: false,
                 env: &BTreeMap::new(),
+                trusted_server_ids: &[],
             },
             tx,
         )

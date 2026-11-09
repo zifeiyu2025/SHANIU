@@ -639,7 +639,10 @@ pub(crate) fn apply_grant(
 
 /// 精确撤销：只删这一条 `(路径, SID)` 的显式 ACE，其它 trustee 的 ACE 原样保留。
 /// 返回是否真的删掉了东西。
-fn revoke_ace(path: &Path, sid: PSID) -> Result<bool, String> {
+///
+/// `pub(crate)`：设备对象（`\Device\Null`，SH-064 B）也要按 SID 精确撤销，
+/// 但它没有 `exists()`、也不进目录备份台账，所以走不了 `AclManager::revoke`。
+pub(crate) fn revoke_ace(path: &Path, sid: PSID) -> Result<bool, String> {
     let name = wide(path.as_os_str());
     let before = read_dacl_snapshot(path)?;
 

@@ -116,6 +116,8 @@ pub struct SpawnSpec<'a> {
     pub workspace_root: &'a Path,
     pub approved_sha256: &'a str,
     pub approved_module_tree: Option<&'a str>,
+    /// 配置内所有已信任 server 的 id：容器孤儿回收的白名单（SH-064 C）。
+    pub trusted_server_ids: &'a [String],
 }
 
 impl McpProcess {
@@ -164,6 +166,7 @@ impl McpProcess {
         let allowed_roots = config.allowed_roots.clone();
         let workspace_access = config.workspace_access;
         let allow_network = config.allow_network;
+        let trusted_server_ids = spec.trusted_server_ids.to_vec();
 
         let mut child = tokio::task::spawn_blocking(move || {
             let arg_refs: Vec<&str> = args.iter().map(String::as_str).collect();
@@ -179,6 +182,7 @@ impl McpProcess {
                     allowed_roots: &allowed_roots,
                     allow_network,
                     env: &env,
+                    trusted_server_ids: &trusted_server_ids,
                 },
                 tx,
             )
@@ -378,6 +382,7 @@ mod tests {
             workspace_root: &std::env::temp_dir(),
             approved_sha256: "deadbeef",
             approved_module_tree: None,
+            trusted_server_ids: &[],
         })
         .await
         {
@@ -406,6 +411,7 @@ mod tests {
             workspace_root: &std::env::temp_dir(),
             approved_sha256: &sha,
             approved_module_tree: None,
+            trusted_server_ids: &[],
         })
         .await
         .expect("受限沙箱应能启动 cmd");
