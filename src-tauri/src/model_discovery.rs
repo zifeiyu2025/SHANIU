@@ -208,12 +208,15 @@ mod tests {
                     buf.extend_from_slice(&chunk[..n]);
                 }
                 let request = String::from_utf8_lossy(&buf).to_string();
-                let response = format!("{status}\r\ncontent-length: {}\r\nconnection: close\r\n\r\n{body}", body.len());
-                let _ = stream.write_all(response.as_bytes());
+                // 先登记再应答：客户端一读到响应就可能立刻断言请求头，此时桩线程
+                // 若还没写入 captured，`stub.header(..)` 就是 None。CI 上核少、桩线程
+                // 排不上，这条竞态稳定复现（本地多核则常赢）——真因在写入顺序，不是环境。
                 *sink.lock().unwrap() = request
                     .lines()
                     .filter_map(|line| line.split_once(": ").map(|(n, v)| format!("{n}: {v}")))
                     .collect();
+                let response = format!("{status}\r\ncontent-length: {}\r\nconnection: close\r\n\r\n{body}", body.len());
+                let _ = stream.write_all(response.as_bytes());
             });
             Self { url: format!("http://{addr}/v1"), captured, handle: Some(handle) }
         }
