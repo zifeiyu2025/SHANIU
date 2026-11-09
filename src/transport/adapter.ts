@@ -2019,105 +2019,118 @@ export function createAdapter(options: AdapterOptions): { remote: unknown; dispo
       traceFollow(sessionId, 'enter', { known: journals.has(sessionId) })
       // 让 WS gateway 为这个会话补订阅：页面重载后 follow 只重建档案，不补订阅的话
       // 运行中任务的后半段实时帧不会推过来（gateway 只发已订阅会话）。
-      bridge.observeEvents?.(sessionId)
-      let journal = journals.get(sessionId)
-      if (journal === undefined) {
-        // 没在当前进程里观察过：能从档案重建就重建（SH-033 的"打开旧会话"）。
-        // 宿主对"档案不存在"是**抛错**而不是空表（load_session 的诚实失败），
-        // 子代理正好走这一支——先记下错误，反查不到归属再把原始错误抛回去。
-        let replayed: Journal | undefined
-        let failure: unknown
-        try {
-          replayed = await rebuildFromArchive(sessionId)
-        } catch (error: unknown) {
-          failure = error
-        }
-        if (replayed !== undefined) {
-          yield* followReplayed(sessionId, replayed, signal)
-          return
-        }
-        // 重启后直接打开泳道（SH-056 批 2）：子代理没有自己的 rollout 档案，
-        // 它的全部事件记在父会话的事件档案里。反查归属会话 → 重建父整树 →
-        // 泳道 journal 由 `replayLanes` 经同一 `onEvent` 建出来，然后落到下面的
-        // 实时快照分支（它带 activeAttempt 基线，比档案快照更能处理"档案断在流
-        // 中途"的泳道）。
-        const ownerId = await ownerSessionOf(sessionId)
-        if (ownerId !== null && ownerId !== sessionId) {
-          // 子代理事件经父会话频道广播（gateway 按信封 `session_id` 分发）：只订阅
-          // 泳道 id 收不到任何帧，这里把父会话一并补订阅。
-          bridge.observeEvents?.(ownerId)
-          if (!journals.has(ownerId)) await rebuildFromArchive(ownerId)
-          // 父 rollout 为空也必须回放：泳道的持久事实在事件档案里，不在 rollout 里。
-          if (!journals.has(sessionId)) await replayLanes(ownerId)
-          journal = journals.get(sessionId)
-        }
-        if (journal === undefined) {
-          // 真实会话的档案读失败仍是硬错误：不静默交空态让用户以为会话没了。
-          if (failure !== undefined) throw failure
-          traceFollow(sessionId, 'end-empty')
-          yield emptySnapshot(sessionId, now())
-          return
-        }
-      }
-      // 下标在同步块里一次捕获：cursor / revision / records 必须描述同一时刻，
-      // 之后产生的帧由 tail(from) 按位置补齐，不存在"注册太晚丢帧"的窗口。
-      const from = journal.log.length
-      const baseline = {
-        cursor: journal.seq,
-        records: journal.log.eventsUpTo(from),
-        revision: journal.revision,
-      }
-      traceFollow(sessionId, 'snapshot-live', { serial: journal.serial, from, revision: baseline.revision, records: baseline.records.length })
-      yield {
-        type: 'snapshot',
-        header: { version: 0, id: sessionId, createdAt: journal.createdAt, isSeeded: false },
-        // cursor 必须等于末条 record 的 seq，否则客户端触发 page 补齐并判协议错。
-        cursor: baseline.cursor,
-        records: baseline.records,
-        hasMore: false,
-        projections: {
-          asOfSeq: 0,
-          values: {
-            modelSelection: currentModelSelection(),
-            title: titles.get(sessionId) ?? null,
-            permissions: permissionsProjection(),
-            ...(planProjectionValues()),
-            // 有排队消息才挂 inbox：QueueDock/steer 占位都按投影缺席=无队列判读。
-            ...(journal.queue.length > 0
-              ? { inbox: { 'next-turn': journal.queue.map(queueRowOf) } }
-              : {}),
-            ...todosProjectionValues(journal),
-            ...metricsProjectionsOf(journal),
-            // 泳道位：父会话挂 subagentCatalog、泳道挂 subagentTiming（缺席=无数据）。
-            ...subagentProjectionsOf(sessionId),
-            // 目标投影：每次快照都带上当前 durable 目标（没有则 null）。
-            goal: await loadGoal(sessionId),
-          },
-        },
-        // 客户端总是带 assistantStream:true 打开，缺这个基线即 gateway/internal。
-        // 流式中途打开时必须带 activeAttempt（含已吐出的紧凑前缀），否则客户端拿不到
-        // 这个尝试的身份，后续 chunk 会被当成孤儿丢掉（实时态空白，B-20 根因）。
-        assistantStream: {
-          revision: baseline.revision,
-          ...(journal.attemptOpen
-            ? {
-                activeAttempt: {
-                  attemptId: journal.attemptId,
-                  startedAfterSeq: journal.attemptStartedAfterSeq,
-                  turn: journal.attemptTurn,
-                  step: journal.attemptStep,
-                  nextIndex: journal.chunkIndex,
-                  // 快照必须是不可变值：交给客户端后再追加的 chunk 不能改到这份基线。
-                  stream: journal.attemptStream.map(item => ({ time: item.time, chunk: item.chunk })),
-                },
-              }
-            : {}),
-        },
+      // M3：本视图持有的订阅是引用计数对（observe/release）。退出有三条路径——正常
+      // return、消费方 .return() 关闭生成器、抛错——都在 finally 里释放，否则 gateway
+      // 的订阅表只增不减（页面切换后仍在为看不见的会话推帧）。
+      const held: string[] = []
+      const hold = (id: string): void => {
+        if (id === '' || held.includes(id)) return
+        held.push(id)
+        bridge.observeEvents?.(id)
       }
       try {
-        for await (const frame of journal.log.tail(from, signal)) yield frame
+        hold(sessionId)
+        let journal = journals.get(sessionId)
+        if (journal === undefined) {
+          // 没在当前进程里观察过：能从档案重建就重建（SH-033 的"打开旧会话"）。
+          // 宿主对"档案不存在"是**抛错**而不是空表（load_session 的诚实失败），
+          // 子代理正好走这一支——先记下错误，反查不到归属再把原始错误抛回去。
+          let replayed: Journal | undefined
+          let failure: unknown
+          try {
+            replayed = await rebuildFromArchive(sessionId)
+          } catch (error: unknown) {
+            failure = error
+          }
+          if (replayed !== undefined) {
+            yield* followReplayed(sessionId, replayed, signal)
+            return
+          }
+          // 重启后直接打开泳道（SH-056 批 2）：子代理没有自己的 rollout 档案，
+          // 它的全部事件记在父会话的事件档案里。反查归属会话 → 重建父整树 →
+          // 泳道 journal 由 `replayLanes` 经同一 `onEvent` 建出来，然后落到下面的
+          // 实时快照分支（它带 activeAttempt 基线，比档案快照更能处理"档案断在流
+          // 中途"的泳道）。
+          const ownerId = await ownerSessionOf(sessionId)
+          if (ownerId !== null && ownerId !== sessionId) {
+            // 子代理事件经父会话频道广播（gateway 按信封 `session_id` 分发）：只订阅
+            // 泳道 id 收不到任何帧，这里把父会话一并补订阅。
+            hold(ownerId)
+            if (!journals.has(ownerId)) await rebuildFromArchive(ownerId)
+            // 父 rollout 为空也必须回放：泳道的持久事实在事件档案里，不在 rollout 里。
+            if (!journals.has(sessionId)) await replayLanes(ownerId)
+            journal = journals.get(sessionId)
+          }
+          if (journal === undefined) {
+            // 真实会话的档案读失败仍是硬错误：不静默交空态让用户以为会话没了。
+            if (failure !== undefined) throw failure
+            traceFollow(sessionId, 'end-empty')
+            yield emptySnapshot(sessionId, now())
+            return
+          }
+        }
+        // 下标在同步块里一次捕获：cursor / revision / records 必须描述同一时刻，
+        // 之后产生的帧由 tail(from) 按位置补齐，不存在"注册太晚丢帧"的窗口。
+        const from = journal.log.length
+        const baseline = {
+          cursor: journal.seq,
+          records: journal.log.eventsUpTo(from),
+          revision: journal.revision,
+        }
+        traceFollow(sessionId, 'snapshot-live', { serial: journal.serial, from, revision: baseline.revision, records: baseline.records.length })
+        yield {
+          type: 'snapshot',
+          header: { version: 0, id: sessionId, createdAt: journal.createdAt, isSeeded: false },
+          // cursor 必须等于末条 record 的 seq，否则客户端触发 page 补齐并判协议错。
+          cursor: baseline.cursor,
+          records: baseline.records,
+          hasMore: false,
+          projections: {
+            asOfSeq: 0,
+            values: {
+              modelSelection: currentModelSelection(),
+              title: titles.get(sessionId) ?? null,
+              permissions: permissionsProjection(),
+              ...(planProjectionValues()),
+              // 有排队消息才挂 inbox：QueueDock/steer 占位都按投影缺席=无队列判读。
+              ...(journal.queue.length > 0
+                ? { inbox: { 'next-turn': journal.queue.map(queueRowOf) } }
+                : {}),
+              ...todosProjectionValues(journal),
+              ...metricsProjectionsOf(journal),
+              // 泳道位：父会话挂 subagentCatalog、泳道挂 subagentTiming（缺席=无数据）。
+              ...subagentProjectionsOf(sessionId),
+              // 目标投影：每次快照都带上当前 durable 目标（没有则 null）。
+              goal: await loadGoal(sessionId),
+            },
+          },
+          // 客户端总是带 assistantStream:true 打开，缺这个基线即 gateway/internal。
+          // 流式中途打开时必须带 activeAttempt（含已吐出的紧凑前缀），否则客户端拿不到
+          // 这个尝试的身份，后续 chunk 会被当成孤儿丢掉（实时态空白，B-20 根因）。
+          assistantStream: {
+            revision: baseline.revision,
+            ...(journal.attemptOpen
+              ? {
+                  activeAttempt: {
+                    attemptId: journal.attemptId,
+                    startedAfterSeq: journal.attemptStartedAfterSeq,
+                    turn: journal.attemptTurn,
+                    step: journal.attemptStep,
+                    nextIndex: journal.chunkIndex,
+                    // 快照必须是不可变值：交给客户端后再追加的 chunk 不能改到这份基线。
+                    stream: journal.attemptStream.map(item => ({ time: item.time, chunk: item.chunk })),
+                  },
+                }
+              : {}),
+          },
+        }
+        try {
+          for await (const frame of journal.log.tail(from, signal)) yield frame
+        } finally {
+          traceFollow(sessionId, 'end-live')
+        }
       } finally {
-        traceFollow(sessionId, 'end-live')
+        for (const id of held) bridge.releaseEvents?.(id)
       }
     },
     control: async function* (signal?: AbortSignal): AsyncGenerator<Record<string, unknown>> {

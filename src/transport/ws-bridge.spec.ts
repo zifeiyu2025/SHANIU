@@ -136,6 +136,21 @@ function sentFrames(log: string[]): Record<string, unknown>[] {
     .map(entry => JSON.parse(entry.slice('send:'.length)) as Record<string, unknown>)
 }
 
+/** 已发出的 unsubscribe 帧（按发送顺序）。 */
+function unsubscribeFrames(log: string[]): Record<string, unknown>[] {
+  return sentFrames(log).filter(frame => frame.type === 'unsubscribe')
+}
+
+interface GatewayStats {
+  subscriptions: number
+  dormant: number
+  unsubscribes: number
+}
+
+function statsOf(): GatewayStats {
+  return (globalThis as Record<string, unknown>).__SHANIU_GATEWAY_STATS__ as GatewayStats
+}
+
 describe('ws-bridge（SH-094 批 3）', () => {
   it('gateway_info → 首帧 hello → ready 后才发 subscribe，新会话带空游标 replay', async () => {
     const h = harness()
@@ -309,5 +324,121 @@ describe('ws-bridge（SH-094 批 3）', () => {
     await tick(30)
     expect(h.sockets).toHaveLength(1)
     expect(h.tauriListenerCount()).toBe(0)
+  })
+})
+
+describe('ws-bridge 订阅回收（SH-129 M3）', () => {
+  it('引用计数：多观察者共享一条订阅，最后一个退出才退订（页面切换即回落）', async () => {
+    const h = harness()
+    try {
+      await tick()
+      const ws = h.sockets[0]!
+      ws.open()
+      ws.message({ type: 'ready' })
+
+      h.bridge.observeEvents?.('s1')
+      h.bridge.observeEvents?.('s1')
+      ws.message({ type: 'event', event: event('s1', '01') })
+      expect(subscribeFrames(h.log)).toHaveLength(1)
+      expect(statsOf().subscriptions).toBe(1)
+      console.log(`[M3] 页面打开：订阅表 ${statsOf().subscriptions} 条 / 休眠 ${statsOf().dormant} 条 / 两个观察者`)
+
+      h.bridge.releaseEvents?.('s1')
+      expect(unsubscribeFrames(h.log)).toHaveLength(0)
+      expect(statsOf().subscriptions).toBe(1)
+
+      h.bridge.releaseEvents?.('s1')
+      expect(unsubscribeFrames(h.log)).toHaveLength(1)
+      expect(unsubscribeFrames(h.log)[0]).toMatchObject({ type: 'unsubscribe', session_id: 's1' })
+      expect(statsOf().subscriptions).toBe(0)
+      expect(statsOf().dormant).toBe(1)
+      console.log(
+        `[M3] 页面切走：订阅表 ${statsOf().subscriptions} 条 / 休眠 ${statsOf().dormant} 条 / unsubscribe 帧 ${unsubscribeFrames(h.log).length} 次`,
+      )
+    } finally {
+      h.dispose()
+    }
+  })
+
+  it('休眠保留游标：重新进入按 lastEventId 续播，不从头发也不丢帧', async () => {
+    const received: AgentEvent[] = []
+    const h = harness({ onEvent: ev => received.push(ev) })
+    try {
+      await tick()
+      const ws = h.sockets[0]!
+      ws.open()
+      ws.message({ type: 'ready' })
+
+      h.bridge.observeEvents?.('s1')
+      ws.message({ type: 'event', event: event('s1', '01') })
+      ws.message({ type: 'event', event: event('s1', '02') })
+      h.bridge.releaseEvents?.('s1')
+      h.bridge.observeEvents?.('s1')
+
+      const resub = subscribeFrames(h.log).at(-1)!
+      expect(resub).toMatchObject({ type: 'subscribe', session_id: 's1', after_event_id: '02' })
+      // 服务端从 02 之后补：03 到达，且不重复 01/02。
+      ws.message({ type: 'event', event: event('s1', '03') })
+      expect(received.map(ev => ev.event_id)).toEqual(['01', '02', '03'])
+      expect(statsOf().subscriptions).toBe(1)
+      expect(statsOf().dormant).toBe(0)
+    } finally {
+      h.dispose()
+    }
+  })
+
+  it('dormant 上限 32：挤掉最久未用，重新进入改走全量补播且帧数不缺', async () => {
+    const received: AgentEvent[] = []
+    const h = harness({ onEvent: ev => received.push(ev) })
+    try {
+      await tick()
+      const ws = h.sockets[0]!
+      ws.open()
+      ws.message({ type: 'ready' })
+
+      // 33 条会话依次「进入 → 收一条事件 → 退出」：第 33 次退出时挤出最久未用的 s00。
+      for (let index = 0; index < 33; index += 1) {
+        const id = `s${String(index).padStart(2, '0')}`
+        h.bridge.observeEvents?.(id)
+        ws.message({ type: 'event', event: event(id, `${String(index).padStart(2, '0')}a`) })
+        h.bridge.releaseEvents?.(id)
+      }
+      expect(statsOf().dormant).toBe(32)
+
+      const before = subscribeFrames(h.log).length
+      h.bridge.observeEvents?.('s00')
+      const resub = subscribeFrames(h.log).at(-1)!
+      expect(subscribeFrames(h.log)).toHaveLength(before + 1)
+      // 游标已被淘汰：不用老游标，走全量补播。
+      expect(resub).toMatchObject({ type: 'subscribe', session_id: 's00', after_event_id: '' })
+
+      // 全量补播：日志里的三条都要送到，一条不缺。
+      const replay = Array.from({ length: 3 }, (_, index) => event('s00', `${index + 1}0`))
+      const beforeCount = received.length
+      for (const ev of replay) ws.message({ type: 'event', event: ev })
+      expect(received.slice(beforeCount).map(ev => ev.event_id)).toEqual(['10', '20', '30'])
+      // 只挤掉一条：休眠表仍在上限内。
+      expect(statsOf().dormant).toBe(32)
+    } finally {
+      h.dispose()
+    }
+  })
+
+  it('无游标可续的 live-only 订阅不回收（否则只能全量重播或留缺口）', async () => {
+    const h = harness()
+    try {
+      await tick()
+      const ws = h.sockets[0]!
+      ws.open()
+      ws.message({ type: 'ready' })
+
+      h.bridge.observeEvents?.('old-session')
+      h.bridge.releaseEvents?.('old-session')
+      expect(unsubscribeFrames(h.log)).toHaveLength(0)
+      expect(statsOf().subscriptions).toBe(1)
+      expect(statsOf().dormant).toBe(0)
+    } finally {
+      h.dispose()
+    }
   })
 })

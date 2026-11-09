@@ -14,8 +14,11 @@ export interface HostBridge {
   /**
    * 可选：告诉事件通道"这个会话正在被观察"（适配层 follow 入口调用）。
    * WS gateway 据此补订阅；Tauri 全局广播与测试桥无需实现。
+   * 与 `releaseEvents` 是引用计数对：follow 进入 +1、退出 -1，归零才真正退订。
    */
   observeEvents?(sessionId: string): void
+  /** 可选：观察者退场（与 `observeEvents` 配对）；WS gateway 引用归零后转休眠并退订。 */
+  releaseEvents?(sessionId: string): void
 }
 
 let bridge: HostBridge | undefined

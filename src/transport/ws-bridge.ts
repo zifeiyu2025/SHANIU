@@ -21,6 +21,11 @@
  * - gateway 不可用（绑定失败/握手反复失败）时退回 Tauri 全局广播：只退一次、退后不再
  *   重连，避免两条通道同时投递造成重复；`gateway.rs` 绑定失败时 Tauri emit 仍在，
  *   所以这条兜底路径确实能收到事件。
+ * - 订阅回收（SH-129 M3）：`observeEvents`/`releaseEvents` 是引用计数对，由 follow 的
+ *   生命周期配对调用；归零后保留游标转 dormant（`DORMANT_LIMIT=32`，满了淘汰最久未用）
+ *   并给服务端发 `unsubscribe`。被淘汰的条目下次进入**不用老游标、走全量补播**——
+ *   拿一个可能错的游标去续比没有游标更糟，它会让你以为接上了，实际缺一段。
+ *   没有游标可续的订阅（live-only 且一条事件都没收到）不回收：退了只能全量重播或留缺口。
  *
  * 测试注入 `socketFactory` 脚本化 socket；桌面默认用全局 WebSocket。
  */
@@ -65,7 +70,22 @@ interface Subscription {
   initialCursor: string | null
   lastEventId: string | undefined
   credits: number
+  /** 观察者引用计数：follow 进入 +1、退出 -1；归零转 dormant 并通知服务端退订。 */
+  refs: number
 }
+
+/** 引用归零后仍保留游标的条目：下次进入用 lastEventId 续播（直接删就永久缺一段）。 */
+interface DormantEntry {
+  initialCursor: string | null
+  lastEventId: string | undefined
+  /** 进入休眠的时序号：超过上限时淘汰最久未用。 */
+  usedAt: number
+}
+
+/** dormant 上限（M3）：只进不出等于把「活跃订阅泄漏」换成「游标泄漏」。 */
+const DORMANT_LIMIT = 32
+/** 被上限挤出的会话 id 的暂存上限（一次性标记，用掉即删）。 */
+const LOST_CURSOR_LIMIT = 64
 
 const WS_OPEN = 1
 const WS_CLOSED = 3
@@ -97,7 +117,14 @@ export function createWsBridge(base: HostBridge, options: WsBridgeOptions = {}):
   let handler: ((event: AgentEvent) => void) | undefined
   /** 本次进程新建/分叉出来的会话：首个任务用全量 replay，其余会话 live-only。 */
   const freshSessions = new Set<string>()
+  /** 活跃订阅（服务端已注册，refs > 0 或命令前兜底建立）。 */
   const subscriptions = new Map<string, Subscription>()
+  /** 引用归零但保留游标的条目（服务端已退订）。 */
+  const dormant = new Map<string, DormantEntry>()
+  /** 游标已被 dormant 上限淘汰的会话：下次进入一律全量补播。 */
+  const lostCursor = new Set<string>()
+  const lostCursorOrder: string[] = []
+  let dormantTick = 0
   const readyWaiters: (() => void)[] = []
 
   /**
@@ -111,7 +138,18 @@ export function createWsBridge(base: HostBridge, options: WsBridgeOptions = {}):
     reconnects: 0,
     lastLagMs: 0,
     maxLagMs: 0,
+    /** 活跃订阅表长度（M3 验收：页面切换前后应回落）。 */
+    subscriptions: 0,
+    /** 休眠条目数（保留游标、已退订）。 */
+    dormant: 0,
+    /** 已发出的 unsubscribe 帧次数。 */
+    unsubscribes: 0,
     sessions: {} as Record<string, { cursor: string | null; last: string | undefined; events: number }>,
+  }
+  const syncDiagnostics = (): void => {
+    if (!diagnosticsOn) return
+    diagnostics.subscriptions = subscriptions.size
+    diagnostics.dormant = dormant.size
   }
   if (diagnosticsOn) {
     ;(globalThis as Record<string, unknown>).__SHANIU_GATEWAY_STATS__ = diagnostics
@@ -135,12 +173,98 @@ export function createWsBridge(base: HostBridge, options: WsBridgeOptions = {}):
     send(frame)
   }
 
-  /** 登记订阅；连接已就绪则立即发 subscribe，否则等 ready 后统一 flush。 */
+  /** 建立订阅（不计观察者引用）。cursor: ""=全量 replay；id=从该游标续播；null=live-only。 */
+  const openSubscription = (sessionId: string, cursor: string | null, refs: number): void => {
+    subscriptions.set(sessionId, { initialCursor: cursor, lastEventId: undefined, credits: initialCredit, refs })
+    if (diagnosticsOn) diagnostics.sessions[sessionId] = { cursor, last: undefined, events: 0 }
+    syncDiagnostics()
+    if (ready) subscribeFrame(sessionId, cursor)
+  }
+
+  /**
+   * 取「重新进入该会话」时的游标：休眠→保留游标续播；被上限淘汰→全量补播。
+   * 全量补播是刻意的取舍：拿一个可能过时/错的游标去续，会让人以为接上了、实际缺一段。
+   */
+  const reviveCursor = (sessionId: string): string | null => {
+    const sleeping = dormant.get(sessionId)
+    if (sleeping !== undefined) {
+      dormant.delete(sessionId)
+      syncDiagnostics()
+      return sleeping.lastEventId ?? sleeping.initialCursor
+    }
+    if (lostCursor.delete(sessionId)) {
+      const index = lostCursorOrder.indexOf(sessionId)
+      if (index >= 0) lostCursorOrder.splice(index, 1)
+      return ''
+    }
+    return freshSessions.has(sessionId) ? '' : null
+  }
+
+  /** dormant 超上限：淘汰最久未用，并记下「该会话游标已丢」。 */
+  const evictDormant = (): void => {
+    while (dormant.size > DORMANT_LIMIT) {
+      let victim: string | undefined
+      let oldest = Number.POSITIVE_INFINITY
+      for (const [id, entry] of dormant) {
+        if (entry.usedAt < oldest) {
+          oldest = entry.usedAt
+          victim = id
+        }
+      }
+      if (victim === undefined) return
+      dormant.delete(victim)
+      lostCursor.add(victim)
+      lostCursorOrder.push(victim)
+      while (lostCursorOrder.length > LOST_CURSOR_LIMIT) {
+        const gone = lostCursorOrder.shift()
+        if (gone !== undefined) lostCursor.delete(gone)
+      }
+      if (diagnosticsOn) delete diagnostics.sessions[victim]
+    }
+  }
+
+  /**
+   * 命令前兜底订阅（SH-094 批 3）：幂等、**不计观察者引用**——引用只由 follow 的
+   * observe/release 配对管理，否则命令路径会留下永远减不掉的计数。
+   */
   const ensureSubscription = (sessionId: string, initialCursor: string | null): void => {
     if (subscriptions.has(sessionId)) return
-    subscriptions.set(sessionId, { initialCursor, lastEventId: undefined, credits: initialCredit })
-    if (diagnosticsOn) diagnostics.sessions[sessionId] = { cursor: initialCursor, last: undefined, events: 0 }
-    if (ready) subscribeFrame(sessionId, initialCursor)
+    const resumable = dormant.has(sessionId) || lostCursor.has(sessionId)
+    openSubscription(sessionId, resumable ? reviveCursor(sessionId) : initialCursor, 0)
+  }
+
+  /** 观察者进场（引用 +1）：follow 入口调用；同会话多视图共享一条订阅。 */
+  const observeEvents = (sessionId: string): void => {
+    if (sessionId === '') return
+    const active = subscriptions.get(sessionId)
+    if (active !== undefined) {
+      active.refs += 1
+      return
+    }
+    openSubscription(sessionId, reviveCursor(sessionId), 1)
+  }
+
+  /**
+   * 观察者退场（引用 -1）。归零转 dormant 并让服务端退订：
+   * 只登记不回收等于把「活跃订阅泄漏」换成「游标泄漏」（M3）。
+   *
+   * 例外：live-only 且一条事件都没收到的订阅**不回收**——它没有可续的游标，
+   * 退了下次只能全量重播（会与档案重建重复）或留缺口，留着这条空订阅反而更便宜。
+   */
+  const releaseEvents = (sessionId: string): void => {
+    if (sessionId === '') return
+    const sub = subscriptions.get(sessionId)
+    if (sub === undefined) return
+    sub.refs = Math.max(0, sub.refs - 1)
+    if (sub.refs > 0) return
+    const resumeCursor = sub.lastEventId ?? sub.initialCursor
+    if (resumeCursor === null) return
+    subscriptions.delete(sessionId)
+    dormant.set(sessionId, { initialCursor: sub.initialCursor, lastEventId: sub.lastEventId, usedAt: ++dormantTick })
+    send({ type: 'unsubscribe', session_id: sessionId })
+    if (diagnosticsOn) diagnostics.unsubscribes += 1
+    evictDormant()
+    syncDiagnostics()
   }
 
   /** 等连接就绪（或退回 Tauri 兜底/超时）。首次订阅必须在命令之前完成。 */
@@ -310,16 +434,6 @@ export function createWsBridge(base: HostBridge, options: WsBridgeOptions = {}):
     return base.invoke<T>(command, args)
   }
 
-  /**
-   * 适配层打开会话视图时登记订阅（SH-094 批 3）：不调用它的话，页面重载后
-   * `follow` 只会重建档案、不会让 gateway 往这条连接推实时帧（运行中任务的后半段
-   * 要等到下次 send_task 才回来）。新会话用空游标 replay，既有会话 live-only。
-   */
-  const observeEvents = (sessionId: string): void => {
-    if (sessionId === '') return
-    ensureSubscription(sessionId, freshSessions.has(sessionId) ? '' : null)
-  }
-
   const listenEvents = (h: (event: AgentEvent) => void): (() => void) => {
     handler = h
     if (isFallback()) {
@@ -340,10 +454,14 @@ export function createWsBridge(base: HostBridge, options: WsBridgeOptions = {}):
       socket = undefined
       ready = false
       subscriptions.clear()
+      dormant.clear()
+      lostCursor.clear()
+      lostCursorOrder.length = 0
       freshSessions.clear()
+      syncDiagnostics()
       flushReadyWaiters()
     }
   }
 
-  return { invoke, listenEvents, observeEvents }
+  return { invoke, listenEvents, observeEvents, releaseEvents }
 }
