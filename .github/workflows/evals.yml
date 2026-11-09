@@ -11,11 +11,18 @@ name: Evals
 #   缺失时**判失败**而不是跳过——"今天定时跑了但没测"比"没跑"更危险，因为它会给出绿的假象。
 #   fork 场景用 repository 判断直接退出，不去碰上游密钥。
 #
-# 触发：每日 03:10 UTC（避开 Actions 整点高峰，cron 抖动小）+ 手动 workflow_dispatch。
+# 触发：手动 workflow_dispatch。
+# 定时触发已停用（2026-11-09）：GitHub 账单到顶后 schedule 每天产出 3 秒的红 run，
+# 稀释真实信号、让人开始无视红点。账单恢复后按需取消注释。
+#
+# 职责边界（2026-11-09 用户定）：
+#   - 这条 workflow 是**冒烟/回归探针**：双臂 × 1 轮 × 14 题，只拦「易题失败」；
+#   - **不做统计结论**：1 轮没有分辨力，报告头打印"非基线、不做统计结论、不用于判退化"；
+#   - 统计实验（双臂 × 5 轮）是**本地手动动作**，不是 CI 职责（docs/05 SH-073 注）。
 
 on:
-  schedule:
-    - cron: "10 3 * * *"
+  # schedule:
+  #   - cron: "10 3 * * *"   # 账单恢复后按需开启
   workflow_dispatch:
     inputs:
       model:
@@ -39,8 +46,8 @@ jobs:
       group: evals-${{ github.ref }}
       cancel-in-progress: true
     runs-on: windows-latest
-    # 8 题难样本 × 5 次 = 每臂 40 样本（两臂共 80），实测 ~55s/题，留足编译与重试余量。
-    timeout-minutes: 120
+    # 14 题 × 1 轮 × 两臂 = 28 样本，实测 ~55s/题，编译 ~5 分钟，留两倍余量。
+    timeout-minutes: 60
 
     env:
       SHANIU_TEST_PROVIDER: openai-chat
@@ -68,27 +75,28 @@ jobs:
         with:
           workspaces: src-tauri
 
-      # 分母必须是**当日对照**，不是冻结基线：端点漂移实测能把整份基线抬升 32%/轮
-      # （evals/score.mjs 文件头已写明），冻结点不是同一把尺子。所以这里跑两臂、
-      # 显式把两份报告交给 score.mjs——不再依赖永不入库的 evals/control.json。
-      # 只跑难样本子集：6 道易题长期 100%，对退化没有分辨力，白烧额度。
-      - name: 跑对照臂（关自愈）
+      # 角色分离（2026-11-09）：易题是"还能不能干活"的报警器，不是能力指标——
+      # 工具链断了、读文件坏了、审批炸了，最先红的必须是它们。所以易题**必须跑且红了要拦**，
+      # 由 SHANIU_EVAL_SMOKE=1 在运行器里断言；难题失败只记录、不拦。
+      # 两臂都跑：对照臂同时验证"关掉自愈"这条装配路径没坏。
+      # 两臂数字**不用于判退化**：1 轮没有分辨力，判退化要 5 轮（本地手动）。
+      - name: 冒烟·对照臂（关自愈）
         working-directory: src-tauri
         env:
           SHANIU_TEST_API_KEY: ${{ secrets.SHANIU_EVAL_API_KEY }}
           SHANIU_EVAL_ROLE: control
           SHANIU_EVAL_ABLATE_AR6: "1"
-          SHANIU_EVAL_HARD_ONLY: "1"
-          SHANIU_EVAL_REPEATS: "5"
+          SHANIU_EVAL_SMOKE: "1"
+          SHANIU_EVAL_REPEATS: "1"
         run: cargo test --test evals_baseline -- --ignored --nocapture
 
-      - name: 跑实验臂（开自愈）
+      - name: 冒烟·实验臂（开自愈）
         working-directory: src-tauri
         env:
           SHANIU_TEST_API_KEY: ${{ secrets.SHANIU_EVAL_API_KEY }}
           SHANIU_EVAL_ROLE: treatment
-          SHANIU_EVAL_HARD_ONLY: "1"
-          SHANIU_EVAL_REPEATS: "5"
+          SHANIU_EVAL_SMOKE: "1"
+          SHANIU_EVAL_REPEATS: "1"
         run: cargo test --test evals_baseline -- --ignored --nocapture
 
       - name: 跑 FF-5 真实端点首增量口径
@@ -105,14 +113,18 @@ jobs:
         with:
           node-version: 22
 
-      # 两臂报告按 role 后缀区分；显式传路径，避免"读最新那份"掩盖并发写错
-      - name: 对当日对照判退化（success_rate 降幅 / 轮数与 token 增幅 >10% 阻断）
+      # 只打印、不判定：1 轮没有分辨力，两臂数字不同不代表退化。
+      # 红绿由上面的冒烟步骤（易题门禁）决定；这里 continue-on-error 是为了不让
+      # "两臂数字不同"变成假红灯，同时 score.mjs 自身崩溃仍会出现在日志里。
+      - name: 打印两臂对照（探索模式，不做结论、不阻断）
+        continue-on-error: true
         shell: bash
         run: |
           treatment=$(ls -t evals/results/*-treatment.json | head -1)
           control=$(ls -t evals/results/*-control.json | head -1)
           echo "实验臂=$treatment 对照臂=$control"
-          node evals/score.mjs "$treatment" "$control"
+          echo "注意：本次为冒烟（每臂 1 轮），以下数字不用于判退化，统计结论需本地 5 轮手动实验"
+          node evals/score.mjs "$treatment" "$control" --exploratory
 
       - name: 上传本轮报告
         if: always()
