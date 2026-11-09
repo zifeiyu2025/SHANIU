@@ -1806,7 +1806,10 @@ async fn mcp_list_servers(app: tauri::AppHandle) -> Result<Vec<McpServerSummary>
                             "disabled".to_string()
                         }
                     }),
-                fingerprint: status.map(|item| item.fingerprint.clone()),
+                // blocked 但没有信任记录时没有指纹：空串对界面毫无意义，按「未知」处理。
+                fingerprint: status
+                    .map(|item| item.fingerprint.clone())
+                    .filter(|value| !value.is_empty()),
                 approved_tools: status
                     .map(|item| item.approved_tools.clone())
                     .unwrap_or_default(),

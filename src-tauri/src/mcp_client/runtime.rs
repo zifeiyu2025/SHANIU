@@ -1412,7 +1412,7 @@ impl McpRuntime {
         let blocked = self.blocked.lock().await;
         let live_reason = self.live_reason.lock().await;
         let active = self.active.lock().expect("MCP active 锁中毒");
-        trust
+        let statuses: Vec<ServerStatus> = trust
             .records()
             .into_iter()
             .map(|record| {
@@ -1451,7 +1451,8 @@ impl McpRuntime {
                     reason,
                 }
             })
-            .collect()
+            .collect();
+        merge_untrusted_blocked(statuses, &blocked)
     }
 
     /// 进程退出前关闭全部子进程。
@@ -1916,6 +1917,32 @@ fn first_line(text: &str) -> String {
     truncated
 }
 
+/// 把「没有信任记录但启动失败」的 server 并进状态表。
+///
+/// 首连就失败（例如容器给目标目录加 ACE 被拒，Windows 错误 5）的 server 从来没有
+/// 信任记录，而 [`McpRuntime::statuses`] 是按信任记录遍历的——它会被漏掉，界面只剩
+/// 「未连接」，用户看不出原因。`blocked` 是真实终态，必须出现在状态面。
+/// **只补状态展示，不改授权、启动与 fail-closed 流程。**
+fn merge_untrusted_blocked(
+    mut statuses: Vec<ServerStatus>,
+    blocked: &BTreeMap<String, String>,
+) -> Vec<ServerStatus> {
+    for (server_id, reason) in blocked {
+        if statuses.iter().any(|item| &item.server_id == server_id) {
+            continue;
+        }
+        statuses.push(ServerStatus {
+            server_id: server_id.clone(),
+            status: McpStatus::Blocked,
+            fingerprint: String::new(),
+            approved_tools: Vec::new(),
+            exemption_count: 0,
+            reason: Some(reason.clone()),
+        });
+    }
+    statuses
+}
+
 /// 服务器状态视图（`mcp_list_servers` 用）。
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct ServerStatus {
@@ -1933,6 +1960,33 @@ pub struct ServerStatus {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// 首连失败（没有信任记录）的 server 也必须在状态面出现，否则界面只剩「未连接」。
+    #[test]
+    fn blocked_without_trust_record_is_reported() {
+        let blocked = BTreeMap::from([("probe".to_string(), "错误 5".to_string())]);
+        let statuses = merge_untrusted_blocked(Vec::new(), &blocked);
+        assert_eq!(statuses.len(), 1);
+        assert_eq!(statuses[0].status, McpStatus::Blocked);
+        assert_eq!(statuses[0].reason.as_deref(), Some("错误 5"));
+    }
+
+    /// 已有信任记录的 server 不能被补成第二条（否则列表里出现重复行）。
+    #[test]
+    fn blocked_does_not_duplicate_existing_status() {
+        let blocked = BTreeMap::from([("probe".to_string(), "错误 5".to_string())]);
+        let existing = vec![ServerStatus {
+            server_id: "probe".to_string(),
+            status: McpStatus::Blocked,
+            fingerprint: "abc".to_string(),
+            approved_tools: Vec::new(),
+            exemption_count: 0,
+            reason: Some("错误 5".to_string()),
+        }];
+        let statuses = merge_untrusted_blocked(existing, &blocked);
+        assert_eq!(statuses.len(), 1);
+        assert_eq!(statuses[0].fingerprint, "abc");
+    }
 
     fn event_shape(event: &McpEvent) -> Value {
         serde_json::to_value(event).unwrap()
