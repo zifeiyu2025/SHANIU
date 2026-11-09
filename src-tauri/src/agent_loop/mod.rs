@@ -734,6 +734,22 @@ impl AgentLoop {
                 // 树级共账（SH-055）：父与全部后代记同一本账；cached 是 input 的子集，不重复计。
                 budget.record_tokens(u64::from(u.input_tokens) + u64::from(u.output_tokens));
                 observed_input_tokens = usize::try_from(u.input_tokens).unwrap_or(usize::MAX);
+                // 命中率必须落 shaniu.log（TokenUsage 事件只进前端事件流与 events.jsonl，
+                // 改提示词/压缩策略后要靠这行比对回归）。miss 由 hit+miss=input 推出：
+                // DeepSeek 的 prompt_cache_miss_tokens 与 OpenAI 的 cached_tokens 都满足该恒等式。
+                let cached = u.cached_input_tokens.unwrap_or(0);
+                tracing::info!(
+                    turn,
+                    session_id = session_id.as_deref().unwrap_or("-"),
+                    agent_id = %scope.agent_id,
+                    input_tokens = u.input_tokens,
+                    cached_input_tokens = cached,
+                    cache_miss_tokens = u.input_tokens.saturating_sub(cached),
+                    output_tokens = u.output_tokens,
+                    cache_hit_permille =
+                        if u.input_tokens == 0 { 0 } else { u64::from(cached) * 1000 / u64::from(u.input_tokens) },
+                    "token 用量"
+                );
                 emit(&sink, EventMsg::TokenUsage {
                     turn,
                     input_tokens: u.input_tokens,

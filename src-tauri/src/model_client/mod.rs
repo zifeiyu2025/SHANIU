@@ -280,6 +280,9 @@ pub fn build_chat_request(
         "model": provider.model,
         "messages": chat_messages(instructions, history),
         "stream": true,
+        // 流式默认不返回 usage（OpenAI 兼容端点一致），不加这一项 token 统计直接归零——
+        // 缓存命中率就无从观察。端点会在最后补一个 choices 为空、只带 usage 的分片。
+        "stream_options": { "include_usage": true },
         "tools": tools.iter().map(|t| serde_json::json!({
             "type": "function",
             "function": {
@@ -500,13 +503,28 @@ impl ChatStreamAccumulator {
             }
         }
         if let Some(usage) = data.get("usage").filter(|u| u.is_object()) {
+            let count = |key: &str| usage.get(key).and_then(|v| v.as_u64()).map(|v| v as u32);
+            // 缓存命中要认两套 wire（2026-11-10 命中统计补齐）：
+            // - OpenAI 系：`prompt_tokens_details.cached_tokens`（cached 是 prompt 的子集）；
+            // - DeepSeek 系：`prompt_cache_hit_tokens` / `prompt_cache_miss_tokens`
+            //   （hit + miss = prompt_tokens），且**不返回** prompt_tokens_details。
+            // 前者优先，后者兜底；两套都不在时保持 None，不猜 0。
+            let hit = usage
+                .pointer("/prompt_tokens_details/cached_tokens")
+                .and_then(|v| v.as_u64())
+                .map(|v| v as u32)
+                .or_else(|| count("prompt_cache_hit_tokens"));
+            let miss = count("prompt_cache_miss_tokens");
+            // prompt_tokens 缺失时用 hit+miss 复原（DeepSeek 两条字段合起来就是输入规模）。
+            let input_tokens = match (count("prompt_tokens"), hit.zip(miss)) {
+                (Some(input), _) => input,
+                (None, Some((h, m))) => h.saturating_add(m),
+                (None, None) => 0,
+            };
             let usage = Usage {
-                input_tokens: usage.get("prompt_tokens").and_then(|v| v.as_u64()).unwrap_or(0) as u32,
-                cached_input_tokens: usage
-                    .pointer("/prompt_tokens_details/cached_tokens")
-                    .and_then(|v| v.as_u64())
-                    .map(|v| v as u32),
-                output_tokens: usage.get("completion_tokens").and_then(|v| v.as_u64()).unwrap_or(0) as u32,
+                input_tokens,
+                cached_input_tokens: hit,
+                output_tokens: count("completion_tokens").unwrap_or(0),
             };
             events.push(ModelStreamEvent::Completed { usage });
         }
@@ -1096,6 +1114,74 @@ mod chat_tests {
             &mut acc,
         );
         assert!(matches!(evs.last(), Some(ModelStreamEvent::Completed { .. })));
+    }
+
+    #[test]
+    fn chat_request_asks_endpoint_to_include_usage_in_stream() {
+        let p = ProviderConfig {
+            provider: "openai-chat".into(),
+            base_url: "https://x/v1".into(),
+            model: "m1".into(),
+            reasoning_effort: None,
+            headers: Default::default(),
+        };
+        let body = build_chat_request(&p, &[], &[], "SYS");
+        assert_eq!(
+            body["stream_options"]["include_usage"], true,
+            "流式不请求 usage 时 token 统计与缓存命中率全部归零"
+        );
+    }
+
+    /// DeepSeek 的 usage 只有 `prompt_cache_hit/miss_tokens`，没有
+    /// `prompt_tokens_details.cached_tokens`——不认这套 wire 命中率永远是 None。
+    #[test]
+    fn chat_usage_reads_deepseek_cache_fields() {
+        let mut acc = ChatStreamAccumulator::default();
+        let evs = translate_chat_data(
+            r#"{"choices":[],"usage":{"prompt_tokens":1000,"completion_tokens":20,
+                "prompt_cache_hit_tokens":900,"prompt_cache_miss_tokens":100}}"#,
+            &mut acc,
+        );
+        assert_eq!(
+            evs,
+            vec![ModelStreamEvent::Completed {
+                usage: Usage { input_tokens: 1000, cached_input_tokens: Some(900), output_tokens: 20 }
+            }]
+        );
+    }
+
+    #[test]
+    fn chat_usage_reads_openai_cache_details_first() {
+        let mut acc = ChatStreamAccumulator::default();
+        let evs = translate_chat_data(
+            r#"{"choices":[],"usage":{"prompt_tokens":1000,"completion_tokens":20,
+                "prompt_tokens_details":{"cached_tokens":800},"prompt_cache_hit_tokens":900}}"#,
+            &mut acc,
+        );
+        assert_eq!(
+            evs,
+            vec![ModelStreamEvent::Completed {
+                usage: Usage { input_tokens: 1000, cached_input_tokens: Some(800), output_tokens: 20 }
+            }],
+            "两套字段同时出现时以 OpenAI 口径为准"
+        );
+    }
+
+    #[test]
+    fn chat_usage_restores_input_from_hit_plus_miss() {
+        let mut acc = ChatStreamAccumulator::default();
+        let evs = translate_chat_data(
+            r#"{"choices":[],"usage":{"completion_tokens":5,"prompt_cache_hit_tokens":30,
+                "prompt_cache_miss_tokens":70}}"#,
+            &mut acc,
+        );
+        assert_eq!(
+            evs,
+            vec![ModelStreamEvent::Completed {
+                usage: Usage { input_tokens: 100, cached_input_tokens: Some(30), output_tokens: 5 }
+            }],
+            "缺 prompt_tokens 时用 hit+miss 复原输入规模"
+        );
     }
 
     #[test]
