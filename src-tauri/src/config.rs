@@ -1019,8 +1019,10 @@ pub struct McpServerConfig {
     pub unsandboxed: bool,
     /// 豁免原因（记录在案，供界面与审计展示）。非空才允许 `unsandboxed = true`。
     pub unsandboxed_reason: String,
-    /// 是否允许该 server 访问网络（默认拒绝，C-R4）。v1 若底层未实现网络策略，
-    /// 该项只是声明值，残余风险按 §3.1.9 如实记录，不得声称已拦截。
+    /// 是否允许该 server 访问网络。**默认 `true`（允许）**，显式 `allow_network = false`
+    /// 才关断（容器不挂 `internetClient`）。与「网络不是策略维度」一致：命令与终端一律可出网，
+    /// MCP 不该是唯一例外；per-server 关断能力保留，但不作默认。
+    /// `sandbox.os = "logical"` 下该开关不生效，状态面按 `not_isolated` 如实显示。
     pub allow_network: bool,
     /// 目录级授权清单（Q2）：默认空 = 只能读工作区。
     /// 每一项都要经过 [`validate_allowed_root`]；拒绝名单内的路径不许写进配置。
@@ -1133,7 +1135,9 @@ impl Default for McpServerConfig {
             enabled: true,
             unsandboxed: false,
             unsandboxed_reason: String::new(),
-            allow_network: false,
+            // 方案 3（2026-11-10）：默认允许，显式 false 才关。容器级 `#[serde(default)]`
+            // 使「字段缺失」也落到这里，因此三态 = 缺失/true → 允许，false → 拒绝。
+            allow_network: true,
             allowed_roots: Vec::new(),
             workspace_access: WorkspaceAccess::Read,
         }
@@ -2686,10 +2690,50 @@ mod mcp_config_tests {
         let d = McpServerConfig::default();
         assert!(d.enabled, "写了配置即启用");
         assert!(!d.unsandboxed, "X10：默认必须走沙箱");
-        assert!(!d.allow_network, "C-R4：网络默认拒绝");
+        assert!(d.allow_network, "方案 3：网络默认允许（显式 false 才关）");
         assert!(d.unsandboxed_reason.is_empty());
         assert!(d.allowed_roots.is_empty(), "Q2：默认没有任何目录授权");
         assert_eq!(d.workspace_access, WorkspaceAccess::Read, "Q3：工作区默认只读");
+    }
+
+    /// 网络三态契约（方案 3，2026-11-10）：字段缺失 → 允许；显式 true → 允许；
+    /// 显式 false → 拒绝。前两态与第三态成对断言——反转的只是「字段缺失」的默认值，
+    /// 不许推翻用户显式写的 false。同时钉住旧配置（没有该字段）加载不改写文件字节。
+    #[test]
+    fn mcp_network_three_states_and_legacy_file_bytes_stay_untouched() {
+        let base = crate::test_support::TestTempDir::new("mcp-net-3state");
+        let path = base.join(CONFIG_FILE);
+        let legacy = "[[mcp.servers]]\nid = \"srv\"\ncommand = \"node\"\n";
+        fs::write(&path, legacy).unwrap();
+        let before = fs::read(&path).unwrap();
+
+        let loaded = AppConfig::load_or_create_diagnosed(&base);
+        assert_eq!(loaded.outcome, ConfigLoadOutcome::Clean);
+        assert_eq!(loaded.config.mcp.servers.len(), 1);
+        assert!(
+            loaded.config.mcp.servers[0].allow_network,
+            "字段缺失必须默认允许（方案 3）"
+        );
+        assert_eq!(
+            fs::read(&path).unwrap(),
+            before,
+            "加载不得把默认值写回文件（旧字段/缺字段都原样保留）"
+        );
+
+        let explicit_true: AppConfig = toml::from_str(
+            "[[mcp.servers]]\nid = \"srv\"\ncommand = \"node\"\nallow_network = true\n",
+        )
+        .unwrap();
+        assert!(explicit_true.mcp.servers[0].allow_network, "显式 true = 允许");
+
+        let explicit_false: AppConfig = toml::from_str(
+            "[[mcp.servers]]\nid = \"srv\"\ncommand = \"node\"\nallow_network = false\n",
+        )
+        .unwrap();
+        assert!(
+            !explicit_false.mcp.servers[0].allow_network,
+            "显式 false 必须仍然是关——这是「缺失 → 允许」的反向对照"
+        );
     }
 
     #[test]

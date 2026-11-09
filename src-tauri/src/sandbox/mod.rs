@@ -735,7 +735,7 @@ pub struct StdioRequest<'a> {
 ///
 /// - read-only：纯策略拒绝（只读沙箱不允许任何进程执行）；
 /// - workspace-write + `sandbox.os = "app_container"`：**逐 server 一个容器**，
-///   ACE 按 server 的 cwd/allowed_roots 逐条授权，网络默认拒绝；
+///   ACE 按 server 的 cwd/allowed_roots 逐条授权，网络默认允许（显式 `allow_network = false` 才不挂 `internetClient`）；
 /// - workspace-write + `sandbox.os = "logical"`：受限令牌 + Job（用户显式选择）；
 /// - danger-full-access：**调用方必须先确认该 server 的 `unsandboxed=true` 且原因已记录**
 ///   （逐服务器显式豁免），这里才走未沙箱启动。

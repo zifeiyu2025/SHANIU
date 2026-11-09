@@ -720,9 +720,8 @@ impl McpRuntime {
                 }
             ));
         }
-        if config.allow_network {
-            warnings.push("该 server 声明允许网络访问（v1 进程约束不保证网络隔离）".to_string());
-        }
+        // 网络自 2026-11-10 起默认允许（方案 3），不再对默认值发泛化警告；
+        // 生效值仍由 sandbox_summary.network 在审查页「网络访问」行如实显示。
 
         match existing {
             Some(record)
@@ -2071,6 +2070,12 @@ mod tests {
         assert_eq!(container.workspace, "write");
         assert_eq!(container.allowed_roots, vec!["读：D:\\data".to_string()]);
         assert_eq!(container.network, "denied");
+
+        // 反向对照：同一台 server 显式允许（现在也是默认值）时必须是 allowed，
+        // 证明「denied」不是写死的字符串。
+        let allowed =
+            sandbox_summary(&config_for_summary(false, true), crate::config::OsSandbox::AppContainer);
+        assert_eq!(allowed.network, "allowed");
 
         let logical = sandbox_summary(&config, crate::config::OsSandbox::Logical);
         assert_eq!(logical.kind, "logical");
