@@ -39,8 +39,8 @@ pub use crate::model_client::ModelStream;
 
 /// 模型后端：把 (历史, 工具声明, 系统提示) 变成模型事件流。
 ///
-/// `instructions` 每轮由 `prompt::system_instruction` 生成（docs/04 §6.1），
-/// 不写入 history，避免逐轮重复累积。
+/// `instructions` 每个任务只组装一次（`prompt::SessionPrompt`，docs/04 §6.1），
+/// 不写入 history，避免逐轮重复累积；会话内的易变量以尾部 system 消息进 history。
 #[async_trait::async_trait]
 pub trait ModelBackend: Send + Sync {
     async fn stream(
@@ -200,6 +200,19 @@ where
         *recorded += 1;
     }
     Ok(())
+}
+
+/// 把任务开始时的环境快照插到**最后一条用户消息之前**。
+///
+/// 顺序理由：快照（时间 / Git）是"交底"，读起来应该跟着任务走；直接追加到用户消息之后
+/// 会形成 `user → system` 的奇怪收尾。找不到用户消息（纯工具链历史等）时追加到末尾——
+/// 位置差一点可以接受，把快照丢掉不行。
+fn insert_prompt_note(history: &mut Vec<HistoryItem>, text: String) {
+    let at = history
+        .iter()
+        .rposition(|item| matches!(item, HistoryItem::Message { role: Role::User, .. }))
+        .unwrap_or(history.len());
+    history.insert(at, HistoryItem::Message { role: Role::System, text, reasoning: None });
 }
 
 impl AgentLoop {
@@ -499,6 +512,9 @@ impl AgentLoop {
         // 最近一次端点报回的上下文规模，作为压缩判据的观测侧（SH-032）。
         // 字节估算看不见推理 token 与工具声明开销，只有端点的 input_tokens 是真实值。
         let mut observed_input_tokens = 0usize;
+        // 任务内冻结的系统提示（DSH `systemPromptUpdate: 'in-history'`）：只组装一次，
+        // 易变量（时间 / Git / 权限档 / 计划态）走尾部 system 消息，保证前缀逐字节稳定。
+        let mut session_prompt: Option<prompt::SessionPrompt> = None;
         // 结束前否决点是否已经用过（SH-121②：每次任务最多一次）。
         let mut stop_vetoed = false;
         let emit = |sink: &Arc<dyn crate::events::EventSink>, msg: EventMsg| {
@@ -550,15 +566,35 @@ impl AgentLoop {
             }
 
             // 1) 采样（流式）：取消 → drop 流 = 断开连接
-            // 系统提示每轮重算（docs/04 §6.1 不变量③）：计划态与沙箱模式变化必须反映到模型
-            let instructions = prompt::system_instruction(&prompt::PromptContext {
+            // 系统提示**每任务只组装一次**（DSH in-history 方案）：DeepSeek 的缓存是前缀
+            // 精确匹配，每轮把「当前时间」写回 system 开头等于每分钟把几万 token 历史作废。
+            // 中途变化（权限档 / 隔离机制 / 计划态）仍必须让模型知道，改走尾部 system 消息。
+            let prompt_ctx = prompt::PromptContext {
                 workspace_root: &self.workspace_root,
                 sandbox: turn_policy.sandbox,
                 os: crate::sandbox::current_os_mode(),
                 plan_mode: self.plan_state.is_active_for(session_id.as_deref()),
                 skill_catalog: &skill_catalog,
                 env: prompt::EnvironmentFacts::detect(&self.workspace_root),
-            });
+            };
+            if session_prompt.is_none() {
+                let (assembled, note) = prompt::SessionPrompt::assemble(&prompt_ctx);
+                if let Some(note) = note {
+                    insert_prompt_note(history, note);
+                }
+                session_prompt = Some(assembled);
+            }
+            let session_prompt = session_prompt.as_mut().expect("上一行保证已组装");
+            if let Some(note) = session_prompt.refresh(&prompt_ctx) {
+                tracing::info!(
+                    turn,
+                    session_id = session_id.as_deref().unwrap_or("-"),
+                    agent_id = %scope.agent_id,
+                    "运行事实变化，已作为尾部 system 消息注入"
+                );
+                history.push(HistoryItem::Message { role: Role::System, text: note, reasoning: None });
+            }
+            let instructions = session_prompt.instructions().to_string();
             // 计划态下只向模型声明只读工具 + exit_plan_mode（ADR-003 双层防御第一层）
             let declarations = declarations_for(
                 &self.router,
@@ -2081,10 +2117,15 @@ mod tests {
 
     // ---- 系统提示下发（docs/04 §6.1）----
 
-    /// 记录 (系统提示, 历史长度) 的后端：验证每轮下发、且不写入 history。
-    type Recorded = Arc<Mutex<Vec<(String, usize)>>>;
+    /// 记录 (系统提示, 请求历史快照) 的后端：验证系统提示不写入 history、
+    /// 且历史里只多一条任务开始时的环境快照。
+    type Recorded = Arc<Mutex<Vec<(String, Vec<HistoryItem>)>>>;
 
-    struct PromptRecordingBackend(Recorded);
+    struct PromptRecordingBackend {
+        recorded: Recorded,
+        /// 每轮脚本；排空后退化为"只回文本"的收尾轮。
+        script: Mutex<std::collections::VecDeque<Vec<ModelStreamEvent>>>,
+    }
 
     #[async_trait::async_trait]
     impl ModelBackend for PromptRecordingBackend {
@@ -2094,11 +2135,12 @@ mod tests {
             _tools: &[ToolDeclaration],
             instructions: &str,
         ) -> Result<ModelStream, String> {
-            self.0.lock().unwrap().push((instructions.to_string(), history.len()));
-            // 无工具调用 → 单轮即完成
-            Ok(Box::pin(futures::stream::iter(vec![ModelStreamEvent::OutputTextDelta {
-                delta: "ok".into(),
-            }])))
+            self.recorded.lock().unwrap().push((instructions.to_string(), history.to_vec()));
+            let next = self.script.lock().unwrap().pop_front().unwrap_or_else(|| {
+                // 无工具调用 → 单轮即完成
+                vec![ModelStreamEvent::OutputTextDelta { delta: "ok".into() }]
+            });
+            Ok(Box::pin(futures::stream::iter(next)))
         }
     }
 
@@ -2106,16 +2148,29 @@ mod tests {
         workspace: PathBuf,
         plan_active: bool,
     ) -> (AgentLoop, Recorded, Arc<Mutex<Vec<EventMsg>>>) {
+        agent_with_recording_script(workspace, plan_active, Vec::new())
+    }
+
+    fn agent_with_recording_script(
+        workspace: PathBuf,
+        plan_active: bool,
+        script: Vec<Vec<ModelStreamEvent>>,
+    ) -> (AgentLoop, Recorded, Arc<Mutex<Vec<EventMsg>>>) {
         let recorded = Arc::new(Mutex::new(Vec::new()));
-        let backend = Arc::new(PromptRecordingBackend(recorded.clone()));
+        let backend = Arc::new(PromptRecordingBackend {
+            recorded: recorded.clone(),
+            script: Mutex::new(script.into()),
+        });
         let (_sink, store) = CapturingSink::new();
         let plan_state = Arc::new(PlanState::new());
         if plan_active {
             plan_state.activate();
         }
+        let mut router = ToolRouter::new();
+        router.register(Arc::new(EchoTool::default()));
         let agent = AgentLoop {
             backend,
-            router: Arc::new(ToolRouter::new()),
+            router: Arc::new(router),
             broker: Arc::new(ApprovalBroker::new()),
             plan_state,
             workspace_root: workspace,
@@ -2145,12 +2200,49 @@ mod tests {
 
         let calls = recorded.lock().unwrap();
         assert_eq!(calls.len(), 1, "单轮任务应只采样一次");
-        let (prompt, history_len) = &calls[0];
+        let (prompt, history) = &calls[0];
         assert!(prompt.contains(&ws.display().to_string()), "提示须含工作区路径");
         assert!(prompt.contains("工作区写入"), "提示须反映沙箱模式");
         assert!(!prompt.contains("当前状态：计划模式"));
-        // 提示不写入 history：历史里只有用户这一条
-        assert_eq!(*history_len, 1, "系统提示不得混入 history");
+        // 系统提示本体进 instructions，不写 history；history 只多一条环境快照（时间/Git）。
+        assert_eq!(history.len(), 2, "历史 = 环境快照 + 用户任务");
+        match &history[0] {
+            HistoryItem::Message { role: Role::System, text, .. } => {
+                assert!(text.contains("## 环境快照"), "尾部消息只允许任务开始时的环境快照：{text}");
+                assert!(!text.contains("## 沙箱边界"), "系统提示本体不得混入 history：{text}");
+            }
+            other => panic!("历史首条必须是环境快照 system 消息，实际 {other:?}"),
+        }
+        assert!(
+            matches!(&history[1], HistoryItem::Message { role: Role::User, .. }),
+            "环境快照必须插在用户任务之前"
+        );
+    }
+
+    /// 前缀稳定化的端到端断言：同一任务多轮采样，system 必须逐字节一致。
+    #[tokio::test]
+    async fn system_prompt_is_identical_across_turns() {
+        // 第一轮发起一次工具调用，逼出第二轮采样。
+        let script = vec![vec![
+            ModelStreamEvent::OutputItem(ResponseItem::FunctionCall {
+                name: "read_file".into(),
+                arguments: "{}".into(),
+                call_id: "c1".into(),
+            }),
+            usage_ev(),
+        ]];
+        let (agent, recorded, store) =
+            agent_with_recording_script(std::env::temp_dir(), false, script);
+        agent
+            .run_task("任务", Arc::new(CapturingSink(store)), CancellationToken::new())
+            .await;
+
+        let calls = recorded.lock().unwrap();
+        assert!(calls.len() >= 2, "需要多轮才能验证前缀稳定，实际 {} 轮", calls.len());
+        let first = &calls[0].0;
+        for (index, (prompt, _)) in calls.iter().enumerate() {
+            assert_eq!(prompt, first, "第 {} 轮 system 与首轮不一致，前缀缓存会全灭", index + 1);
+        }
     }
 
     #[tokio::test]

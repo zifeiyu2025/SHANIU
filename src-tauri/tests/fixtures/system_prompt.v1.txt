@@ -3,10 +3,8 @@
 ## 环境
 - 操作系统：Windows（x86_64）
 - Shell：cmd /C（不是 PowerShell；勿用 PowerShell 专有语法、cmdlet 或 $变量）
-- 当前时间：2026-11-08 20:05（UTC+08:00，China Standard Time）
 - 权限档：工作区写入（文件工具仅当前工作区内可写）
 - 隔离机制：AppContainer（OS 级；文件系统按路径授权，路径外一律拒绝）
-- Git：分支 main，0 个未提交改动
 
 ## 工作区
 当前工作区：D:/ws/demo
