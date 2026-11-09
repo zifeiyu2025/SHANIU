@@ -1,0 +1,60 @@
+/**
+ * 能力视图的数据面：只读 `get_settings`（视图字段，不属于 config.toml）。
+ *
+ * 字段名跟着宿主 serde 的 camelCase 走（与 settings-face.ts 同源），这里只挑
+ * 能力区块需要的键——不复制整份设置模型，避免上游加字段时跟着漂移。
+ */
+import { tauriBridge, type HostBridge } from '../transport/tauri'
+
+/** 一项能力的视图（`capability::model_view` 的条目形状）。 */
+export interface CapabilityViewWire {
+  /** 布尔项为 true/false，数值项为数字，档位项没有该字段。 */
+  readonly value?: boolean | number
+  /** 声明档位（档位项）。 */
+  readonly levels?: readonly string[]
+  /** 实测通过的档位（档位项）。 */
+  readonly verifiedLevels?: readonly string[]
+  /** 默认档（档位项）。 */
+  readonly default?: string
+  /** unknown / endpoint / builtin / inferred / probe / manual。 */
+  readonly source?: string
+  /** verified / mismatch / unverified。 */
+  readonly state?: string
+  /** 实测证据原文（"红图→红色"这类），悬浮可见。 */
+  readonly evidence?: string
+  /** 内置表数据日期（毫秒）；只有内置表/推测来源才带。 */
+  readonly catalogUpdatedAt?: number
+  readonly checkedAtMs?: number
+}
+
+/** 一行模型的能力视图。 */
+export interface CapabilityModelWire {
+  readonly id: string
+  readonly name?: string
+  readonly contextWindow?: number
+  readonly maxTokens?: number
+  readonly input?: readonly string[]
+  readonly capabilities?: Readonly<Record<string, CapabilityViewWire>>
+}
+
+/** 一家服务商在设置文档里的模型清单。 */
+export interface CapabilityProviderWire {
+  readonly id: string
+  readonly label?: string
+  readonly models: readonly CapabilityModelWire[]
+}
+
+/** 能力区块的数据面；测试注入脚本化实现，运行时走 `hostCapabilitiesWire()`。 */
+export interface CapabilitiesWire {
+  providers(): Promise<readonly CapabilityProviderWire[]>
+}
+
+/** 桌面运行时实现（命令名与 Rust `generate_handler!` 逐字对应）。 */
+export function hostCapabilitiesWire(bridge: HostBridge = tauriBridge()): CapabilitiesWire {
+  return {
+    providers: async () => {
+      const snapshot = await bridge.invoke<{ providers?: readonly CapabilityProviderWire[] }>('get_settings')
+      return snapshot.providers ?? []
+    },
+  }
+}

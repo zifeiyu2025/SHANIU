@@ -77,6 +77,7 @@ import { apply as brandApply, inject as brandInject } from './brand'
 import { apply as headerActionsApply, inject as headerActionsInject } from './header-actions'
 import { apply as mcpTrustApply, inject as mcpTrustInject } from './mcp-trust'
 import { apply as modelConfigApply, inject as modelConfigInject } from './model-config'
+import { apply as modelCapabilitiesApply, inject as modelCapabilitiesInject } from './model-capabilities'
 import { apply as sandboxStatusApply, inject as sandboxStatusInject } from './sandbox-status'
 import { apply as userTerminalSourceApply, inject as userTerminalSourceInject } from './terminal-source'
 import { apply as trayHintApply, inject as trayHintInject } from './tray-hint'
@@ -268,6 +269,8 @@ export async function bootShaniu(container: HTMLElement, options: BootOptions = 
     { inject: modelConfigInject, apply: modelConfigApply },
     { inject: uiSettingsGeneralInject, apply: uiSettingsGeneralApply },
     { inject: uiSettingsModelsInject, apply: uiSettingsModelsApply },
+    // 能力视图（SH-132）：走设置页服务商卡片的扩展点，不改 vendored 模型行。
+    { inject: modelCapabilitiesInject, apply: modelCapabilitiesApply },
     // MCP 信任页（SH-063）：首连指纹审查 / 逐工具风险 / 撤销信任与豁免。
     { inject: mcpTrustInject, apply: mcpTrustApply },
     // 沙箱状态条（SH-021）：常驻展示 OS/逻辑沙箱与网络授权，提供放行/撤销入口。

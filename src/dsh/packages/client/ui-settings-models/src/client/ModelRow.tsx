@@ -48,76 +48,6 @@ function rowHalf(event: DragEvent<HTMLElement>): 'before' | 'after' {
   return event.clientY < rect.top + rect.height / 2 ? 'before' : 'after'
 }
 
-/** Known capability ids and the section copy that names them; `other` entries print their id as-is. */
-const CAPABILITY_ITEMS = [
-  ['vision', 'capVision'],
-  ['context_window', 'capContextWindow'],
-  ['max_output', 'capMaxTokens'],
-  ['reasoning', 'capReasoningLevels'],
-  ['tools', 'capTools'],
-  ['builtin_web_search', 'capBuiltinWebSearch'],
-] as const satisfies readonly (readonly [string, ModelsKey])[]
-
-/** Source spellings to their badge copy; anything unrecognized reads as unknown. */
-const CAPABILITY_SOURCES: Readonly<Record<string, ModelsKey>> = {
-  manual: 'capSourceManual',
-  endpoint: 'capSourceEndpoint',
-  builtin: 'capSourceBuiltin',
-  inferred: 'capSourceInferred',
-  probe: 'capSourceProbe',
-  unknown: 'capSourceUnknown',
-}
-
-/** Verification states to their copy; a manual value is never probed, so it shows none. */
-const CAPABILITY_STATES: Readonly<Record<string, ModelsKey>> = {
-  verified: 'capStateVerified',
-  mismatch: 'capStateMismatch',
-  unverified: 'capStateUnverified',
-}
-
-/** One capability view as a record, or undefined when the value is not an object. */
-function viewOf(value: unknown): Record<string, unknown> | undefined {
-  return typeof value === 'object' && value !== null && !Array.isArray(value) ? value as Record<string, unknown> : undefined
-}
-
-/** The row's `capabilities` map when it is an object; legacy and hostless rows carry none. */
-function capabilityViews(model: DeepSeekModelDraft): Record<string, unknown> | undefined {
-  return viewOf(model['capabilities'])
-}
-
-/** Display text of a capability value; `reasoning` lists its levels instead of a scalar. */
-function capabilityValue(id: string, view: Record<string, unknown>, t: (key: ModelsKey) => string): string {
-  if (id === 'reasoning') {
-    const levels = Array.isArray(view['levels'])
-      ? view['levels'].filter((level): level is string => typeof level === 'string')
-      : []
-    return levels.length > 0 ? levels.join('/') : '—'
-  }
-  const value = view['value']
-  if (typeof value === 'boolean') return t(value ? 'capValueYes' : 'capValueNo')
-  return typeof value === 'number' ? String(value) : '—'
-}
-
-/** Who said this value, with the catalog date when the value came from a dated table. */
-function capabilitySource(view: Record<string, unknown>, t: (key: ModelsKey) => string): ReactNode {
-  const source = typeof view['source'] === 'string' ? view['source'] : 'unknown'
-  const updatedAt = typeof view['catalogUpdatedAt'] === 'string' ? view['catalogUpdatedAt'] : ''
-  return (
-    <span className={styles['capabilitySource']} data-source={source}>
-      {t(CAPABILITY_SOURCES[source] ?? 'capSourceUnknown')}
-      {updatedAt === '' ? null : ` · ${updatedAt}`}
-    </span>
-  )
-}
-
-/** Whether a probe confirmed the declaration; manual values have no probe to report. */
-function capabilityState(view: Record<string, unknown>, t: (key: ModelsKey) => string): ReactNode {
-  if (view['source'] === 'manual') return null
-  const state = typeof view['state'] === 'string' ? view['state'] : ''
-  const key = CAPABILITY_STATES[state]
-  return key === undefined ? null : <span className={styles['capabilityState']} data-state={state}>{t(key)}</span>
-}
-
 /**
  * Render model fields with the display name in the expanded area of narrow rows.
  * @param props - drafted fields and their owning editor's actions.
@@ -126,20 +56,6 @@ function capabilityState(view: Record<string, unknown>, t: (key: ModelsKey) => s
 export function ModelRow(props: ModelRowProps): ReactNode {
   const { model, position, t, disabled } = props
   const preview = useRowDragPreview(styles['modelDragPreview'] as string)
-  const capabilities = capabilityViews(model)
-  const knownCapabilities = capabilities === undefined
-    ? []
-    : CAPABILITY_ITEMS.flatMap(([id, labelKey]) => {
-      const view = viewOf(capabilities[id])
-      return view === undefined ? [] : [[id, labelKey, view] as const]
-    })
-  const otherCapabilities = capabilities === undefined
-    ? []
-    : Object.entries(viewOf(capabilities['other']) ?? {})
-      .flatMap(([id, raw]) => {
-        const view = viewOf(raw)
-        return view === undefined ? [] : [[id, view] as const]
-      })
   const modelField = (field: 'id' | 'name') => (
     <label className={`${styles['modelField']} ${field === 'name' ? styles['modelName'] : ''}`}>
       {field === 'name'
@@ -255,29 +171,6 @@ export function ModelRow(props: ModelRowProps): ReactNode {
                 model={model} field={props.inputField} position={position}
                 fallback={props.inputFallback} disabled={disabled || props.inputLoading === true} t={t} onChange={props.onChange}
               />
-              {knownCapabilities.length > 0
-                ? (
-                  <div className={styles['modelCapabilities']} role="group" aria-label={`${t('capSectionTitle')} ${String(position)}`}>
-                    <span className={styles['modelFieldLabel']}>{t('capSectionTitle')}</span>
-                    <ul className={styles['capabilityList']}>
-                      {knownCapabilities.map(([id, labelKey, view]) => (
-                        <li key={`known-${id}`} className={styles['capabilityChip']}>
-                          <span className={styles['capabilityName']}>{t(labelKey)}</span>
-                          <span className={styles['capabilityValue']}>{capabilityValue(id, view, t)}</span>
-                          {capabilitySource(view, t)}
-                          {capabilityState(view, t)}
-                        </li>
-                      ))}
-                      {otherCapabilities.map(([id, view]) => (
-                        <li key={`other-${id}`} className={styles['capabilityChip']}>
-                          <span className={styles['capabilityName']}>{id}</span>
-                          {capabilitySource(view, t)}
-                        </li>
-                      ))}
-                    </ul>
-                  </div>
-                )
-                : null}
               {props.reasoningLevels !== undefined && props.reasoningLevels.length > 0
                 ? (
                   <ModelReasoningEfforts

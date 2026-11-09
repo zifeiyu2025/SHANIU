@@ -707,66 +707,6 @@
   gap: 6px;
 }
 
-/* Capability provenance: value, who declared it, and whether a probe confirmed
-   it. Chips stay caption-sized so they annotate the row rather than compete
-   with the inputs above them. */
-.modelCapabilities {
-  grid-column: 1 / -1;
-  display: flex;
-  flex-direction: column;
-  gap: 6px;
-  min-width: 0;
-}
-
-.capabilityList {
-  display: flex;
-  flex-wrap: wrap;
-  gap: 6px;
-  margin: 0;
-  padding: 0;
-  list-style: none;
-}
-
-.capabilityChip {
-  display: inline-flex;
-  align-items: center;
-  gap: 6px;
-  padding: 2px 8px;
-  border: 0.5px solid var(--dsw-alias-border-l3);
-  border-radius: var(--dsw-radius-sm);
-  font-size: 12px;
-  line-height: 18px;
-  color: var(--dsw-alias-label-secondary);
-}
-
-.capabilityName {
-  color: var(--dsw-alias-label-tertiary);
-}
-
-.capabilityValue {
-  font-family: var(--ds-font-family-code);
-  color: var(--dsw-alias-label-primary);
-}
-
-.capabilitySource {
-  padding: 0 5px;
-  border-radius: var(--dsw-radius-xs);
-  background: var(--dsw-alias-bg-layer-1);
-  color: var(--dsw-alias-label-tertiary);
-}
-
-.capabilityState[data-state='verified'] {
-  color: var(--dsw-alias-state-success-primary);
-}
-
-.capabilityState[data-state='mismatch'] {
-  color: var(--dsw-alias-state-error-primary);
-}
-
-.capabilityState[data-state='unverified'] {
-  color: var(--dsw-alias-label-dimmed);
-}
-
 .modelReasoningHead {
   display: flex;
   align-items: center;

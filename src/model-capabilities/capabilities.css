@@ -1,0 +1,125 @@
+/*
+ * 能力区块（宿主插件样式）。
+ *
+ * 只引用真实存在的主题令牌（`src/theme-tokens.spec.ts` 机检）：
+ * 颜色一律走 `--dsw-alias-*`，且必须浅色/暗色都定义。
+ *
+ * 三态的视觉分档（AGENTS §11.3「不静默降级」的可见性要求）：
+ *  - verified：中性，靠文字区分；
+ *  - mismatch：警示底色 + 警示描边，**不能**和"未验证"长得一样；
+ *  - unverified：虚线描边（表示"还没测"，不是"测过不行"）。
+ */
+
+.shaniu-capabilities {
+  display: flex;
+  flex-direction: column;
+  gap: 6px;
+  margin: 8px 0 4px;
+  padding: 8px 10px;
+  border: 1px solid var(--dsw-alias-border-l2);
+  border-radius: 8px;
+  background: var(--dsw-alias-bg-layer-1);
+  font-size: 12px;
+  line-height: 18px;
+}
+
+.shaniu-capabilities-head {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: baseline;
+  gap: 4px 10px;
+}
+
+.shaniu-capabilities-title {
+  font-weight: 600;
+  color: var(--dsw-alias-label-primary);
+}
+
+.shaniu-capabilities-hint,
+.shaniu-capabilities-date {
+  color: var(--dsw-alias-label-secondary);
+}
+
+.shaniu-capabilities-model {
+  display: flex;
+  flex-direction: column;
+  gap: 4px;
+}
+
+.shaniu-capabilities-model-head {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: baseline;
+  gap: 8px;
+}
+
+.shaniu-capabilities-model-name {
+  font-family: ui-monospace, SFMono-Regular, Menlo, monospace;
+  color: var(--dsw-alias-label-primary);
+}
+
+.shaniu-capabilities-items {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 6px;
+}
+
+.shaniu-capabilities-chip {
+  display: inline-flex;
+  align-items: center;
+  gap: 6px;
+  padding: 1px 8px;
+  border: 1px solid var(--dsw-alias-border-l2);
+  border-radius: 999px;
+  background: var(--dsw-alias-bg-base);
+  color: var(--dsw-alias-label-secondary);
+}
+
+.shaniu-capabilities-chip[data-state='mismatch'] {
+  border-color: var(--dsw-alias-state-warn-primary);
+  background: var(--dsw-alias-state-warn-tertiary);
+  color: var(--dsw-alias-label-primary);
+}
+
+.shaniu-capabilities-chip[data-state='unverified'] {
+  border-style: dashed;
+}
+
+.shaniu-capabilities-chip[data-state='verified'] {
+  border-color: var(--dsw-alias-state-success-primary);
+}
+
+.shaniu-capabilities-label {
+  color: var(--dsw-alias-label-secondary);
+}
+
+.shaniu-capabilities-value {
+  color: var(--dsw-alias-label-primary);
+  font-variant-numeric: tabular-nums;
+}
+
+.shaniu-capabilities-source {
+  padding: 0 4px;
+  border-radius: 4px;
+  background: var(--dsw-alias-bg-layer-2);
+  font-size: 11px;
+}
+
+.shaniu-capabilities-state {
+  font-size: 11px;
+}
+
+.shaniu-capabilities-chip[data-state='mismatch'] .shaniu-capabilities-state {
+  color: var(--dsw-alias-state-warn-primary);
+  font-weight: 600;
+}
+
+.shaniu-capabilities-error {
+  margin: 8px 0 4px;
+  padding: 6px 10px;
+  border: 1px solid var(--dsw-alias-state-warn-primary);
+  border-radius: 8px;
+  background: var(--dsw-alias-state-warn-tertiary);
+  color: var(--dsw-alias-label-primary);
+  font-size: 12px;
+}
