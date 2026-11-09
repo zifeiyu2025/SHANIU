@@ -4,12 +4,13 @@
 //! 不含鉴权存储（provider.rs / config::SecretStore）、不含会话历史管理（agent_loop）。
 //! 取消语义：drop 返回的 Stream 即中断底层连接（agent_loop 的 CancellationToken 据此传播）。
 
-pub mod image_store;
 pub mod provider;
 
 use eventsource_stream::{Event, Eventsource};
 use futures::{Stream, StreamExt};
 use serde::{Deserialize, Serialize};
+
+use crate::images::{image_store, ImageRef};
 
 pub use provider::ProviderConfig;
 
@@ -70,27 +71,13 @@ pub enum HistoryItem {
     FunctionCallOutput { call_id: String, output: String },
     /// 带图片的用户消息（`view_image` 回填专用）。
     ///
-    /// 图片以 [`ImageRef`] 引用形式**持久化**，真实字节只活在
-    /// [`image_store`] 的内存缓存里——这是「base64 不进 rollout」的落点。
+    /// 图片以 [`ImageRef`](crate::images::ImageRef) 引用形式**持久化**，真实字节只活在
+    /// [`image_store`](crate::images::image_store) 的内存缓存里——这是「base64 不进 rollout」的落点。
     ImageMessage {
         role: Role,
         text: String,
         images: Vec<ImageRef>,
     },
-}
-
-/// 图片引用：rollout / 事件日志里只允许出现这份元数据，永远不含字节。
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-pub struct ImageRef {
-    /// 工作区相对路径（展示与重新读取用）。
-    pub path: String,
-    /// 内容 sha256，[`image_store`] 的键。
-    pub sha256: String,
-    pub width: u32,
-    pub height: u32,
-    /// 按分辨率估算的输入 token（不是字节数）。
-    pub tokens: u32,
-    pub mime: String,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]

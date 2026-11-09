@@ -479,8 +479,8 @@ pub fn carry_sources(previous: &[ProviderProfile], next: &mut [ProviderProfile])
 // ============================== 合并视图 ==============================
 
 /// 内置表命中：来源（内置表 / 推测）与能力字段。没有命中 = 这一层没有发言权。
-fn builtin_of(row: &ModelProfile, base_url: &str) -> Option<(CapabilitySource, crate::model_catalog::BuiltinCapabilities)> {
-    crate::model_catalog::lookup(base_url, &row.id).map(|hit| {
+fn builtin_of(row: &ModelProfile, base_url: &str) -> Option<(CapabilitySource, crate::config::model_catalog::BuiltinCapabilities)> {
+    crate::config::model_catalog::lookup(base_url, &row.id).map(|hit| {
         let source = if hit.is_inferred() {
             CapabilitySource::Inferred
         } else {
@@ -494,7 +494,7 @@ fn builtin_of(row: &ModelProfile, base_url: &str) -> Option<(CapabilitySource, c
 /// ——否则界面上会出现"来源：内置表、值：false"这种自相矛盾的组合。
 fn builtin_declares(
     item: &str,
-    builtin: Option<&crate::model_catalog::BuiltinCapabilities>,
+    builtin: Option<&crate::config::model_catalog::BuiltinCapabilities>,
 ) -> bool {
     let Some(builtin) = builtin else { return false };
     match item {
@@ -543,7 +543,7 @@ pub fn model_view(
     let builtin_source = builtin.as_ref().map(|(source, _)| *source);
     let builtin_fields = builtin.as_ref().map(|(_, fields)| fields);
     let catalog_updated_at = serde_json::Value::from(
-        crate::model_catalog::data_updated_at().unwrap_or_default(),
+        crate::config::model_catalog::data_updated_at().unwrap_or_default(),
     );
     let mut out = serde_json::Map::new();
     for item in ITEMS {
@@ -1732,7 +1732,7 @@ mod tests {
         assert_eq!(view["vision"]["source"], "builtin");
         assert_eq!(
             view["vision"]["catalogUpdatedAt"],
-            crate::model_catalog::data_updated_at().unwrap(),
+            crate::config::model_catalog::data_updated_at().unwrap(),
             "「内置表」徽标必须带数据日期"
         );
         assert_eq!(view["context_window"]["value"], 1_048_576);
@@ -1769,7 +1769,7 @@ mod tests {
         let base = "https://api.deepseek.com";
         let flash = ModelProfile { id: "deepseek-flash".into(), ..Default::default() };
         let view = model_view(&flash, base, None, false);
-        let builtin = crate::model_catalog::lookup(base, "deepseek-flash").expect("内置表命中");
+        let builtin = crate::config::model_catalog::lookup(base, "deepseek-flash").expect("内置表命中");
         assert_eq!(view["max_output"]["source"], "builtin");
         assert_eq!(
             view["max_output"]["value"].as_u64(),

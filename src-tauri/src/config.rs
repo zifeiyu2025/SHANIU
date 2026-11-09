@@ -19,6 +19,9 @@ use serde::{Deserialize, Serialize};
 use tracing_appender::non_blocking::{NonBlocking, WorkerGuard};
 use tracing_subscriber::fmt::MakeWriter;
 
+/// 内置模型能力表（SH-132）：`config` 层的默认值数据表，不是业务模块。
+pub mod model_catalog;
+
 pub const DATA_DIR_ENV: &str = "SHANIU_DATA_DIR";
 pub const PORTABLE_MARKER: &str = "portable.marker";
 pub const CONFIG_FILE: &str = "config.toml";
@@ -205,8 +208,8 @@ pub struct ModelProfile {
 impl ModelProfile {
     /// 内置表命中（精确或家族）。`base_url` 必填：同一个模型 id 在不同端点上
     /// 能力并不相同（`deepseek-flash` 在 DeepSeek 有视觉、在 Sensenova 没有）。
-    fn builtin(&self, base_url: &str) -> Option<crate::model_catalog::BuiltinCapabilities> {
-        crate::model_catalog::lookup(base_url, &self.id).map(|hit| hit.capabilities())
+    fn builtin(&self, base_url: &str) -> Option<model_catalog::BuiltinCapabilities> {
+        model_catalog::lookup(base_url, &self.id).map(|hit| hit.capabilities())
     }
 
     /// 声明的视觉能力。优先级：能力项显式值 > `input` 字段 > 内置表。

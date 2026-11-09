@@ -14,8 +14,8 @@ use std::sync::Arc;
 use futures::StreamExt;
 use shaniu_lib::config::SandboxMode;
 use shaniu_lib::model_client::{stream_model, HistoryItem, ModelStreamEvent, ProviderConfig, Role};
-use shaniu_lib::tool_router::{ToolContext, ToolExecutor};
-use shaniu_lib::tools::view_image::{attachment, ViewImage};
+use shaniu_lib::tool_router::{attachment, ToolContext, ToolExecutor};
+use shaniu_lib::tools::view_image::ViewImage;
 use tokio_util::sync::CancellationToken;
 
 struct NoopSink;

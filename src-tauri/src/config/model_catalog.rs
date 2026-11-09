@@ -1,5 +1,9 @@
 //! 内置模型能力表（SH-132 第一层，`resources/model-catalog.json`）。
 //!
+//! 归属 `config` 层而不是顶层模块：这张表只提供"用户没声明时补什么默认值"，
+//! 是被 `config` 的默认值解析直接读取的数据层（`ModelProfile::builtin`）。放在
+//! 顶层会让 `config` 反向依赖业务模块——`docs/01 §2.3.2` 明令禁止的边。
+//!
 //! 这是四层能力来源里最靠前的一层：**内置表 → 端点元数据 → 实测探针 → 手动**。
 //! 有它就不必每次从零探；探针只用于校验"这家实际表现与标称是否一致"。
 //!
@@ -25,7 +29,7 @@ use serde::Deserialize;
 
 /// 随二进制发布的内置表。`include_str!` 而不是运行时读文件：便携版/安装版都不会
 /// 因为漏拷资源目录而静默失去第一层能力来源。
-pub const CATALOG_JSON: &str = include_str!("../resources/model-catalog.json");
+pub const CATALOG_JSON: &str = include_str!("../../resources/model-catalog.json");
 
 /// 表结构版本。**加字段不升版本**（`Option` 缺省即兼容）；改变已有字段语义才升。
 /// 版本不认识时整表按不存在处理——宁可降级到探针，也不要拿错语义的旧表当真。

@@ -12,11 +12,10 @@ pub mod file_actions;
 pub mod file_references;
 pub mod gateway;
 pub mod goals;
+pub mod images;
 pub mod jobs;
 pub mod mcp_client;
 pub mod model_client;
-/// 内置模型能力表（SH-132 第一层，`resources/model-catalog.json`）。
-pub mod model_catalog;
 pub mod model_discovery;
 pub mod open_in_app;
 pub mod sandbox;

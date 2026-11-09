@@ -5,7 +5,7 @@
     依赖方向检查（FF-1，docs/01 §5 健身函数表，阈值 = 0）。
 
 .DESCRIPTION
-    白名单 fail-closed：每个模块允许依赖谁，按 docs/01 §2.3.1（E02–E20）逐条正向登记在 $allow 里。
+    白名单 fail-closed：每个模块允许依赖谁，按 docs/01 §2.3.1（E02–E59）逐条正向登记在 $allow 里。
     - 表外模块 → 违规（要求先去 §2.3.1 登记，再同步脚本），避免 rollout / compaction /
       subagent_registry / mcp_client 这类新模块一落地就天然免检；
     - 不在允许集合里的边 → 违规；
@@ -41,22 +41,23 @@ $OutputEncoding = [System.Text.UTF8Encoding]::new($false)
 # 改规则必须先改 §2.3.1，再改本节——禁止把架构规则只藏在脚本里。
 # 三类特殊角色见下方 $skipOwners / $infraModules，不参与普通分层判定。
 #
-# 注意空数组不是漏登记：permission / sandbox / model_client / events / config 的合法目标
-# 只有共享基础设施 config、events，而它们由下方 $infraModules 全局放行，故表内无需再列，
-# 顺手补进去只会造成冗余。要给这些模块新增业务依赖，必须先改 §2.3.1，再写进这里。
+# 注意空数组不是漏登记：permission / events / config / text_encoding / user_terminal /
+# test_support / images 的合法目标只有共享基础设施 config、events（由下方 $infraModules
+# 全局放行）或没有 crate 内依赖，故表内无需再列；顺手补进去只会造成冗余。
+# 要给这些模块新增业务依赖，必须先改 §2.3.1，再写进这里。
 $allow = @{
-    'agent_loop'   = @('model_client', 'tool_router', 'permission', 'rollout', 'compaction', 'session_reference', 'skills', 'jobs')  # E02–E04、E06、E23、E35、E40、E43
-    'tool_router'  = @('model_client', 'tools', 'jobs', 'permission')                          # E08、E11、E43、E46
-    'tools'        = @('tool_router', 'sandbox', 'permission', 'skills', 'jobs')  # E12–E14、E41、E43
+    'agent_loop'   = @('model_client', 'tool_router', 'permission', 'rollout', 'compaction', 'session_reference', 'skills', 'jobs', 'sandbox')  # E02–E04、E06、E23、E35、E40、E43、E48
+    'tool_router'  = @('model_client', 'tools', 'jobs', 'permission', 'images')                 # E08、E11、E43、E46、E53
+    'tools'        = @('tool_router', 'sandbox', 'permission', 'skills', 'jobs', 'text_encoding', 'images')  # E12–E14、E41、E43、E50、E54
     'permission'   = @()
-    'sandbox'      = @()
-    'model_client' = @()
+    'sandbox'      = @('text_encoding')                                           # E49（子进程输出按实际编码解码）
+    'model_client' = @('images')                                                   # E52（ImageMessage 持久化 ImageRef）
     'events'       = @()
     'config'       = @()
     'rollout'      = @('model_client')                                            # E21
     'compaction'   = @('model_client')                                             # E22
     'session_query'= @('rollout', 'model_client')                                  # E24、E25（SH-113 只读派生索引）
-    'model_discovery' = @('app_state')                                             # E26（SH-098 命令壳取 tauri::State；config 属 infra 全局放行）
+    'model_discovery' = @('app_state', 'capability')                               # E26、E51（SH-098 命令壳取 tauri::State；共用端点元数据解析）
     'session_title'   = @('model_client', 'rollout', 'app_state')                   # E27（SH-104；config 属 infra 全局放行）
     'session_export'  = @()                                                          # E28（SH-114 批 2 ZIP 编码；零业务依赖，档案读取在组合根 lib.rs）
     'session_compact' = @('compaction', 'model_client', 'rollout')                    # E29（SH-115 /compact；config 属 infra 全局放行，守卫在组合根 lib.rs）
@@ -73,6 +74,11 @@ $allow = @{
     'jobs'            = @('app_state')                                                # E43（SH-089 后台作业注册表：从装配层取注册表句柄）
     'goals'           = @('app_state')                                                # E44（SH-088 会话目标持久层：从装配层取数据根）
     'mcp_client'      = @('tool_router', 'sandbox')                                   # E47（SH-060 MCP 客户端：try_register/ToolSpec + spawn_restricted_stdio；config/events 属 infra 全局放行）
+    'capability'      = @('app_state')                                                # E55（SH-132 能力探针：命令壳经 tauri::State 取数据根与密钥；config 属 infra 全局放行）
+    'text_encoding'   = @()                                                           # E56（SH-064 编码识别：零依赖叶子，只依赖 std）
+    'user_terminal'   = @()                                                           # E57（SH-071 右侧栏独立终端：只依赖 portable_pty/windows/std，不进沙箱与模型通道）
+    'test_support'    = @()                                                           # E58（测试夹具：只依赖 std/ulid；仅测试路径可反向依赖它，见下方窄豁免）
+    'images'          = @()                                                           # E59（SH-072 图片引用与字节缓存：只依赖 serde/base64/std 的共享叶子）
 }
 # rollout 已落地（SH-030）：它只借用 model_client 的 HistoryItem 作为条目载荷，
 # 不反向依赖循环或工具层——档案是被读写的对象，不是参与者。
@@ -305,6 +311,10 @@ function Invoke-Check {
                 if ($mod -eq $owner) { continue }              # 同模块自引用不是依赖边
                 if ($infraModules -contains $mod) { continue } # config/events 任何模块都可依赖
                 if ($allowed -contains $mod) { continue }
+                # 测试专用窄豁免：**只放行 test_support 这一条**，且只认测试文件名
+                # （tests.rs / test.rs）。不做"所有 tests.rs 一律豁免"——那会让下一条
+                # 真违规顺着这个口子漏过去。目标不是 test_support 时照常判违规。
+                if ($mod -eq 'test_support' -and $parts[$parts.Count - 1] -match '^tests?\.rs$') { continue }
                 $key = "$rel|$lineNo|$mod"
                 if ($seen.ContainsKey($key)) { continue }
                 $seen[$key] = $true

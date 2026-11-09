@@ -1,7 +1,7 @@
 //! `view_image`（SH-072）：把工作区内的图片交给视觉模型看。
 //!
 //! 三个必须守住的点：
-//! 1. **字节不进会话档案**：本工具只把图片塞进 `model_client::image_store`，
+//! 1. **字节不进会话档案**：本工具只把图片塞进 `images::image_store`，
 //!    返回的 `IMAGE_REF` 行只含路径 / hash / 尺寸 / token 估算（见 `HistoryItem::ImageMessage`）。
 //! 2. **长边先缩放**：4K 截图按分辨率折算接近一万 token，一张就吃掉半条上下文。
 //! 3. **单张与会话上限**：超限明确拒绝，不偷偷截断——截断后的图模型看的是另一张图。
@@ -13,8 +13,11 @@ use async_trait::async_trait;
 use image::{DynamicImage, GenericImageView, ImageFormat, RgbImage};
 use serde_json::Value;
 
-use crate::model_client::{image_store, ImageRef};
-use crate::tool_router::{resolve_in_workspace, ToolContext, ToolError, ToolExecutor, ToolOutput, ToolSpec};
+use crate::images::{image_store, ImageRef};
+use crate::tool_router::{
+    resolve_in_workspace, ToolContext, ToolError, ToolExecutor, ToolOutput, ToolSpec,
+    ATTACHMENT_PREFIX,
+};
 
 /// 单张图片原始体积上限。
 ///
@@ -33,25 +36,6 @@ pub const MAX_SESSION_BYTES: u64 = 40 * 1024 * 1024;
 pub const MAX_LONG_SIDE: u32 = 1568;
 /// 缩放后统一转 JPEG 的质量（截图里大量纯色块，q85 基本无损且比 PNG 小一个量级）。
 const JPEG_QUALITY: u8 = 85;
-/// 模型结果里回填图片引用的机器可读行前缀（agent_loop 据此追加带图用户消息）。
-pub const ATTACHMENT_PREFIX: &str = "IMAGE_REF ";
-
-/// 会话级图片预算：每会话一份，由 agent_loop 持有并注入 [`ToolContext`]。
-#[derive(Debug, Default)]
-pub struct ImageBudget {
-    images: usize,
-    bytes: u64,
-}
-
-impl ImageBudget {
-    pub fn used_images(&self) -> usize {
-        self.images
-    }
-
-    pub fn used_bytes(&self) -> u64 {
-        self.bytes
-    }
-}
 
 pub struct ViewImage {
     spec: ToolSpec,
@@ -97,14 +81,6 @@ impl ViewImage {
 pub fn estimate_tokens(width: u32, height: u32) -> u32 {
     let blocks = |side: u32| side.div_ceil(28).max(1);
     blocks(width).saturating_mul(blocks(height))
-}
-
-/// 从工具输出里取回图片引用（agent_loop 用）。只认我们自己的 `IMAGE_REF ` 行。
-pub fn attachment(output: &str) -> Option<ImageRef> {
-    output
-        .lines()
-        .find_map(|line| line.strip_prefix(ATTACHMENT_PREFIX))
-        .and_then(|json| serde_json::from_str::<ImageRef>(json).ok())
 }
 
 fn detect_format(bytes: &[u8]) -> Option<(&'static str, ImageFormat)> {
@@ -181,19 +157,25 @@ impl ToolExecutor for ViewImage {
         }
         // 先扣预算再读盘：超限时连解码都不做。
         if let Some(budget) = &ctx.images {
-            let guard = budget.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
-            if guard.images + 1 > MAX_SESSION_IMAGES {
-                return Err(ToolError::InvalidArgs(format!(
-                    "本会话已查看 {} 张图片，达到上限 {}。请基于已有图片继续，或开新会话。",
-                    guard.images, MAX_SESSION_IMAGES
-                )));
-            }
-            if guard.bytes + metadata.len() > MAX_SESSION_BYTES {
-                return Err(ToolError::InvalidArgs(format!(
-                    "本会话已累计查看 {} MB 图片，再加载这张会超过 {} MB 上限。",
-                    guard.bytes / (1024 * 1024),
-                    MAX_SESSION_BYTES / (1024 * 1024)
-                )));
+            let guard = budget
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner());
+            match guard.exceeds(metadata.len(), MAX_SESSION_IMAGES, MAX_SESSION_BYTES) {
+                Some("images") => {
+                    return Err(ToolError::InvalidArgs(format!(
+                        "本会话已查看 {} 张图片，达到上限 {}。请基于已有图片继续，或开新会话。",
+                        guard.used_images(),
+                        MAX_SESSION_IMAGES
+                    )));
+                }
+                Some(_) => {
+                    return Err(ToolError::InvalidArgs(format!(
+                        "本会话已累计查看 {} MB 图片，再加载这张会超过 {} MB 上限。",
+                        guard.used_bytes() / (1024 * 1024),
+                        MAX_SESSION_BYTES / (1024 * 1024)
+                    )));
+                }
+                None => {}
             }
         }
         let original = std::fs::read(&full)
@@ -218,9 +200,10 @@ impl ToolExecutor for ViewImage {
         let hash = sha256_hex(&sent);
         image_store::put(&hash, mime, &sent);
         if let Some(budget) = &ctx.images {
-            let mut guard = budget.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
-            guard.images += 1;
-            guard.bytes += metadata.len();
+            let mut guard = budget
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner());
+            guard.record(metadata.len());
         }
         let reference = ImageRef {
             path: path.clone(),
@@ -253,6 +236,7 @@ mod tests {
     use super::*;
     use crate::config::SandboxMode;
     use crate::events::NullEventSink;
+    use crate::tool_router::attachment;
     use std::path::{Path, PathBuf};
     use std::sync::{Arc, Mutex};
     use tokio_util::sync::CancellationToken;
@@ -344,7 +328,7 @@ mod tests {
     async fn session_budget_rejects_after_limit() {
         let root = workspace();
         write_png(&root.join("a.png"), 16, 16);
-        let budget = Arc::new(Mutex::new(ImageBudget::default()));
+        let budget = Arc::new(Mutex::new(crate::tool_router::ImageBudget::default()));
         let ctx = context(&root).with_images(budget.clone());
         for _ in 0..MAX_SESSION_IMAGES {
             run(&ctx, "a.png").await.unwrap();

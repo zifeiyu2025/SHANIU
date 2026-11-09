@@ -388,7 +388,7 @@ pub struct ToolContext {
     /// 写日志（SH-126）：写工具登记、自愈闭环判定「是否靠改测试变绿」。
     pub writes: Option<Arc<WriteJournal>>,
     /// 会话级图片预算（SH-072）：`view_image` 的张数/字节上限。
-    pub images: Option<Arc<std::sync::Mutex<crate::tools::view_image::ImageBudget>>>,
+    pub images: Option<Arc<std::sync::Mutex<ImageBudget>>>,
 }
 
 impl ToolContext {
@@ -457,13 +457,65 @@ impl ToolContext {
     }
 
     /// 注入会话级图片预算（SH-072）：`view_image` 的张数与字节上限按会话累计。
-    pub fn with_images(
-        mut self,
-        images: Arc<std::sync::Mutex<crate::tools::view_image::ImageBudget>>,
-    ) -> Self {
+    pub fn with_images(mut self, images: Arc<std::sync::Mutex<ImageBudget>>) -> Self {
         self.images = Some(images);
         self
     }
+}
+
+/// 会话级图片预算：每会话一份，由 agent_loop 持有并注入 [`ToolContext`]。
+///
+/// 归属共享内核而不是 `view_image`：`agent_loop` 要构造它，而 `agent_loop → tools`
+/// 是越层边（`docs/01 §2.3.2`）。预算本身只是两个计数，不属于任何具体工具。
+#[derive(Debug, Default)]
+pub struct ImageBudget {
+    images: usize,
+    bytes: u64,
+}
+
+impl ImageBudget {
+    pub fn used_images(&self) -> usize {
+        self.images
+    }
+
+    pub fn used_bytes(&self) -> u64 {
+        self.bytes
+    }
+
+    /// 记一张图（原始字节数）：先由调用方查上限，再并入累计。
+    pub fn record(&mut self, bytes: u64) {
+        self.images += 1;
+        self.bytes = self.bytes.saturating_add(bytes);
+    }
+
+    /// 剩余可加载张数/字节（`None` = 未装预算，不限制）。
+    pub fn exceeds(
+        &self,
+        next_bytes: u64,
+        max_images: usize,
+        max_bytes: u64,
+    ) -> Option<&'static str> {
+        if self.images + 1 > max_images {
+            return Some("images");
+        }
+        if self.bytes.saturating_add(next_bytes) > max_bytes {
+            return Some("bytes");
+        }
+        None
+    }
+}
+
+/// 模型结果里回填图片引用的机器可读行前缀（`agent_loop` 据此追加带图用户消息）。
+///
+/// 归共享内核：写这一行的是 `view_image`，读它的是 `agent_loop`，两边不得各写一份字面量。
+pub const ATTACHMENT_PREFIX: &str = "IMAGE_REF ";
+
+/// 从工具输出里取回图片引用（`agent_loop` 用）。只认我们自己的 `IMAGE_REF ` 行。
+pub fn attachment(output: &str) -> Option<crate::images::ImageRef> {
+    output
+        .lines()
+        .find_map(|line| line.strip_prefix(ATTACHMENT_PREFIX))
+        .and_then(|json| serde_json::from_str::<crate::images::ImageRef>(json).ok())
 }
 
 /// 工具执行器：一个实现 = 一个工具。

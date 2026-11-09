@@ -444,7 +444,7 @@ impl AgentLoop {
         let write_journal = Arc::new(crate::tool_router::WriteJournal::new());
         // SH-072：本次任务共享一份图片预算——view_image 的张数/字节上限按会话累计。
         let image_budget = Arc::new(std::sync::Mutex::new(
-            crate::tools::view_image::ImageBudget::default(),
+            crate::tool_router::ImageBudget::default(),
         ));
         // 自上次失败以来发生过的写入（恢复窗口内），命令重新通过时结算。
         let mut pending_writes: Vec<crate::tool_router::FileWrite> = Vec::new();
@@ -929,7 +929,7 @@ impl AgentLoop {
                 // 历史里只有 ImageRef（rollout 因此不会变大）。
                 if let Ok(out) = &result {
                     if out.success {
-                        if let Some(image) = crate::tools::view_image::attachment(&out.output) {
+                        if let Some(image) = crate::tool_router::attachment(&out.output) {
                             history.push(HistoryItem::ImageMessage {
                                 role: crate::model_client::Role::User,
                                 text: format!("[view_image] {}", image.path),
