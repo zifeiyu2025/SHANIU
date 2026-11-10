@@ -41,6 +41,7 @@ export const zh = {
   'summary.none': '还没有配置 MCP 服务器',
   'summary.loading': '读取 MCP 状态…',
   'summary.unavailable': 'MCP 状态读取失败',
+  'summary.stale': '刷新失败（以下为上次结果） · {summary}',
   'summary.total': '{count} 台服务器',
   'summary.review': '{count} 台待审查',
   'summary.retrust': '{count} 台需要重新信任',
@@ -135,6 +136,7 @@ export const zh = {
   'confirm.cancel': '取消',
   'confirm.close': '关闭',
   'loadFailed': '读取 MCP 状态失败：{message}',
+  'stale': '以下为上次成功读取的状态，本次刷新失败：{message}。刷新成功前，这些信任状态可能已经过期。',
   'actionFailed': '操作失败：{message}',
 } as const
 
@@ -179,6 +181,7 @@ export const en: Record<McpTrustKey, string> = {
   'summary.none': 'No MCP servers configured',
   'summary.loading': 'Reading MCP status…',
   'summary.unavailable': 'MCP status unavailable',
+  'summary.stale': 'Refresh failed (previous results) · {summary}',
   'summary.total': '{count} servers',
   'summary.review': '{count} need review',
   'summary.retrust': '{count} need re-trust',
@@ -273,6 +276,7 @@ export const en: Record<McpTrustKey, string> = {
   'confirm.cancel': 'Cancel',
   'confirm.close': 'Close',
   'loadFailed': 'Failed to read MCP status: {message}',
+  'stale': 'Showing the last successful read; this refresh failed: {message}. Until a refresh succeeds, these trust states may be out of date.',
   'actionFailed': 'Action failed: {message}',
 }
 

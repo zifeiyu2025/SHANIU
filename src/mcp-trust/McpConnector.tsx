@@ -202,7 +202,9 @@ function McpConnectorSummary({ t }: { t: McpConnectorProps['t'] }): ReactNode {
   const { servers, error } = useServers(tick)
   if (error !== null && servers === null) return t('summary.unavailable')
   if (servers === null) return t('summary.loading')
-  return summarizeServers(servers, t)
+  const summary = summarizeServers(servers, t)
+  // 有旧数据但本次刷新失败：摘要必须是「刷新失败 + 上次结果」，不能和刷新成功长得一样。
+  return error === null ? summary : t('summary.stale', { summary })
 }
 
 /** 详情页主体。 */
@@ -325,6 +327,18 @@ function McpConnectorPage({ t }: { t: McpConnectorProps['t'] }): ReactNode {
         <p className="mcp-connector-alert" role="alert">
           <StateDot state="error" />
           {t('actionFailed', { message: failure })}
+          <Button size="sm" variant="outline" onClick={reload}>
+            {t('refresh')}
+          </Button>
+        </p>
+      )}
+      {servers !== null && error !== null && (
+        // 刷新失败但还留着上次的结果：清空会让人以为服务器没了，保留又会让人以为
+        // 「界面有数据 = 刷新成功」。折中：保留旧数据，但在最显眼的位置说明它是旧的，
+        // 并给一个就地重试入口（与首次失败的 loadFailed 是两套不同文案）。
+        <p className="mcp-connector-alert" role="alert">
+          <StateDot state="warning" />
+          {t('stale', { message: error })}
           <Button size="sm" variant="outline" onClick={reload}>
             {t('refresh')}
           </Button>

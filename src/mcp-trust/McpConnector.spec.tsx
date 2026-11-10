@@ -20,6 +20,9 @@ import { zh, type McpTrustKey } from './locales'
 
 const state = vi.hoisted(() => ({
   servers: [] as McpServerSummaryWire[],
+  listError: null as string | null,
+  /** 宿主 MCP 事件回调：用例用它触发一次「刷新」。 */
+  notify: null as (() => void) | null,
   settings: { configReadOnly: null as string | null },
   connect: (async () => { throw new Error('本测试不发起连接') }) as () => Promise<unknown>,
 }))
@@ -32,13 +35,21 @@ vi.mock('../transport/tauri', () => ({
 }))
 
 vi.mock('../transport/mcp-wire', () => ({
-  mcpListServers: async () => state.servers,
+  mcpListServers: async () => {
+    if (state.listError !== null) throw new Error(state.listError)
+    return state.servers
+  },
   mcpListExemptions: async () => [],
   mcpConnectAndReview: () => state.connect(),
   mcpResolveTrust: async () => { throw new Error('本测试不提交裁决') },
   mcpRevokeTrust: async () => {},
   mcpRevokeExemption: async () => {},
-  tauriMcpSource: () => ({ listen: () => () => {} }),
+  tauriMcpSource: () => ({
+    listen: (callback: () => void) => {
+      state.notify = callback
+      return () => { if (state.notify === callback) state.notify = null }
+    },
+  }),
 }))
 
 /** 词典直译（测试只关心键是否被用到，不关心八语种）。 */
@@ -75,6 +86,8 @@ function blockedServer(): McpServerSummaryWire {
 
 beforeEach(() => {
   state.servers = []
+  state.listError = null
+  state.notify = null
   state.settings = { configReadOnly: null }
   state.connect = async () => { throw new Error('本测试不发起连接') }
 })
@@ -150,6 +163,48 @@ describe('MCP 连接器：等待期间的状态说明', () => {
 
     await act(async () => { finish(new Error('测试结束')); await Promise.resolve() })
     expect(screen.queryByText(/正在准备沙箱容器并写入目录授权/)).toBeNull()
+  })
+})
+
+describe('MCP 连接器：刷新失败但仍有旧数据', () => {
+  it('保留上次结果，同时显著标出「本次刷新失败」，与首次失败是两套文案', async () => {
+    state.servers = [idleServer()]
+    render(<McpConnector t={t} />)
+    expect(await screen.findByText('bench-echo')).toBeTruthy()
+
+    // 首次读取成功后宿主命令开始失败：旧实现的界面与刷新成功完全一样。
+    state.listError = '宿主命令超时'
+    await act(async () => {
+      state.notify?.()
+      await Promise.resolve()
+      await Promise.resolve()
+    })
+
+    // 旧数据仍在（清空会让人以为服务器消失了）
+    expect(screen.getByText('bench-echo')).toBeTruthy()
+    // 但必须明说这是上次的状态：横幅、原因、过期提醒缺一不可
+    const stale = screen.getByRole('alert')
+    expect(stale.textContent).toContain('以下为上次成功读取的状态，本次刷新失败')
+    expect(stale.textContent).toContain('宿主命令超时')
+    expect(stale.textContent).toContain('这些信任状态可能已经过期')
+    // 与「首次读取就失败」的文案不同，两种状态不能长得一样
+    expect(screen.queryByText(/读取 MCP 状态失败：/)).toBeNull()
+  })
+
+  it('摘要行同样标出刷新失败，不把旧结果当成本次结果', async () => {
+    state.servers = [idleServer()]
+    render(<McpConnector t={t} view="summary" />)
+    expect(await screen.findByText('1 台服务器 · 1 台未连接')).toBeTruthy()
+
+    state.listError = '宿主命令超时'
+    await act(async () => {
+      state.notify?.()
+      await Promise.resolve()
+      await Promise.resolve()
+    })
+
+    const summary = screen.getByText(/刷新失败（以下为上次结果）/)
+    expect(summary.textContent).toContain('1 台服务器 · 1 台未连接')
   })
 })
 
