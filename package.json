@@ -11,6 +11,7 @@
     "typecheck": "tsc -b --force",
     "test": "vitest run",
     "package:portable": "powershell -NoProfile -ExecutionPolicy Bypass -File scripts/package-portable.ps1",
+    "release:portable": "pnpm tauri build && pnpm package:portable",
     "tauri": "tauri"
   },
   "dependencies": {

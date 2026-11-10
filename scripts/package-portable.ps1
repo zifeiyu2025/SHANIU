@@ -1,7 +1,8 @@
 ﻿# 便携版装配（docs/01 §9.2）：release 产物 → SHANIU-Portable 目录 + ZIP。
 #
 # 用法：
-#   pnpm tauri build --bundles msi        # 先产出 release exe（MSI 与便携版共用同一产物）
+#   pnpm tauri build                      # 产出 release exe（tauri.conf.json 里 bundle.active=false，
+#                                         #   只出可执行文件，不再打 MSI）
 #   pnpm package:portable                 # 生成 dist-portable/SHANIU-Portable 与 ZIP
 param(
   [string]$Exe = "",
@@ -13,7 +14,7 @@ if ([string]::IsNullOrWhiteSpace($Exe)) {
   $Exe = Join-Path $root "src-tauri\target\release\shaniu.exe"
 }
 if (-not (Test-Path $Exe)) {
-  throw "[package-portable] 找不到 release 产物：$Exe。先跑 pnpm tauri build --bundles msi"
+  throw "[package-portable] 找不到 release 产物：$Exe。先跑 pnpm tauri build"
 }
 
 # 产物模式校验：custom-protocol 构建会把 dist/ 整个内嵌进 exe（资源文件名作为查找键明文可见）。
