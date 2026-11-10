@@ -247,7 +247,7 @@ impl ApprovalBroker {
             .lock()
             .expect("pending 锁中毒")
             .insert(request_id.clone(), tx);
-        let _ = env.sink.emit(&EventMsg::ExecApprovalRequest {
+        if let Err(error) = env.sink.emit(&EventMsg::ExecApprovalRequest {
             request_id: request_id.clone(),
             tool: tool.to_string(),
             args: args.clone(),
@@ -258,7 +258,19 @@ impl ApprovalBroker {
             task_summary: subject.task_summary.map(str::to_string),
             // SH-118⑤：审批上下文要带风险原因，用户才知道自己在批什么。
             reason: reason.map(str::to_string),
-        });
+        }) {
+            // M2：卡片送不到 = 用户不可能看到、也就不可能批准 = 唯一安全的裁决是拒绝。
+            // 不能等：没有回执来源，下面的 `select!` 会永久挂起整个回合。
+            // 也不加超时——「用户暂时离开」是正常场景，超时默认拒绝会误伤真实用户；
+            // 要区分的是「人没在看」（等）和「卡片根本没送到」（拒），这里是后者。
+            self.pending.lock().expect("pending 锁中毒").remove(&request_id);
+            tracing::warn!(
+                "审批卡未能送达（request_id={request_id}，tool={tool}，agent={}）：{error}；\
+                 卡片送不到则用户无法批准，按 Denied 裁决，不挂起等待回执",
+                subject.agent_id
+            );
+            return GateOutcome::Denied;
+        }
         let outcome = tokio::select! {
             resp = rx => match resp {
                 // 允许一次 = 只放行这一次，**不记忆**。ADR-003 的"本会话记住"只由
@@ -382,6 +394,90 @@ mod tests {
         fn take(&self) -> Vec<EventMsg> {
             std::mem::take(&mut *self.events.lock().unwrap())
         }
+    }
+
+    /// tracing 测试用捕获器：断言「卡片没送到」这件事在日志里留了可定位的记录。
+    #[derive(Clone, Default)]
+    struct LogCapture(Arc<Mutex<Vec<u8>>>);
+
+    impl LogCapture {
+        fn text(&self) -> String {
+            String::from_utf8_lossy(&self.0.lock().unwrap()).to_string()
+        }
+    }
+
+    impl std::io::Write for LogCapture {
+        fn write(&mut self, bytes: &[u8]) -> std::io::Result<usize> {
+            self.0.lock().unwrap().extend_from_slice(bytes);
+            Ok(bytes.len())
+        }
+
+        fn flush(&mut self) -> std::io::Result<()> {
+            Ok(())
+        }
+    }
+
+    impl<'a> tracing_subscriber::fmt::MakeWriter<'a> for LogCapture {
+        type Writer = LogCapture;
+
+        fn make_writer(&'a self) -> Self::Writer {
+            self.clone()
+        }
+    }
+
+    /// M2：审批卡 emit 失败（前端窗口已销毁 / 通道断开）→ 必须立即 Denied，不能挂起。
+    ///
+    /// 反向对照：把 `request_approval` 里的 emit 失败分支去掉（回到 `let _ =`），
+    /// 本用例会卡在 2s 超时上——没有人能替一个没送到的卡片回执。
+    #[tokio::test]
+    async fn approval_request_is_denied_when_card_cannot_be_delivered() {
+        struct FailingSink;
+        impl EventSink for FailingSink {
+            fn emit(&self, _msg: &EventMsg) -> Result<(), String> {
+                Err("前端通道已断开".into())
+            }
+        }
+
+        let capture = LogCapture::default();
+        let subscriber = tracing_subscriber::fmt()
+            .with_writer(capture.clone())
+            .with_ansi(false)
+            .without_time()
+            .with_max_level(tracing::Level::WARN)
+            .finish();
+        let _guard = tracing::subscriber::set_default(subscriber);
+
+        let broker = ApprovalBroker::new();
+        let cancel = CancellationToken::new();
+        let sink: Arc<dyn EventSink> = Arc::new(FailingSink);
+        let out = tokio::time::timeout(
+            std::time::Duration::from_secs(2),
+            broker.gate(
+                "unified_exec",
+                &args(),
+                "c-fail",
+                policy::SessionPolicy {
+                    approval: ApprovalMode::OnRequest,
+                    sandbox: SandboxMode::WorkspaceWrite,
+                },
+                GateSubject::root("root"),
+                GateEnv { sink: &sink, cancel: &cancel },
+            ),
+        )
+        .await
+        .expect("卡片送不到时必须立即裁决；旧实现会挂在这里直到超时");
+        assert_eq!(out, GateOutcome::Denied, "送不到 = 用户不可能批准 = 拒绝");
+        assert!(
+            !broker.has_pending("appr-c-fail"),
+            "送不出的请求不得留在 pending 表里"
+        );
+
+        let logged = capture.text();
+        assert!(logged.contains("审批卡未能送达"), "日志缺少可定位记录: {logged}");
+        assert!(
+            logged.contains("appr-c-fail") && logged.contains("unified_exec"),
+            "日志要能定位到具体请求: {logged}"
+        );
     }
 
     /// SH-120 / ADR-007③④：命中前缀白名单 → 放行 + 审计事件（含规则 id）；
