@@ -338,6 +338,12 @@ fn program_name(token: &str) -> String {
 /// 只有含第二个分隔符（`/etc/passwd`）或除开关名外还带路径的才按越界处理。
 fn escapes_workspace(arg: &str) -> bool {
     let bytes = arg.as_bytes();
+    // `tokenize` 只在**引号外**把 `%`/`^`/`!` 当元字符（引号内原样收词），
+    // 而 cmd 在引号内照样展开 `%NAME%`。到了这里说明分词器没拦，静态无法
+    // 判定最终路径 → 一律按越界处理，落回审批（宁可多问一次，不能漏）。
+    if arg.contains(['%', '^', '!']) {
+        return true;
+    }
     if bytes.len() >= 2 && bytes[0].is_ascii_alphabetic() && bytes[1] == b':' {
         return true;
     }
@@ -712,6 +718,52 @@ mod tests {
             "git log --oneline",
         ] {
             assert!(rules.match_command(command).is_some(), "工作区内只读应命中: {command}");
+        }
+    }
+
+    /// 审计 H1：`tokenize` 只在引号外把 `%`/`^`/`!` 当元字符，引号内会原样收词，
+    /// 而 cmd 在引号内照样展开 `%NAME%`。因此 `type "%USERPROFILE%\.ssh\id_rsa"`
+    /// 这条路径必须由参数级守卫兜住，否则免审批读任意文件。
+    #[test]
+    fn readonly_guard_blocks_quoted_cmd_expansion() {
+        let (rules, rejected) =
+            PrefixAllowlist::from_config(&crate::config::default_allow_prefixes());
+        assert!(rejected.is_empty(), "{rejected:?}");
+        // 引号形态：分词器放行、只有参数级守卫能拦（撤掉判据即变红）
+        for command in [
+            r#"type "%USERPROFILE%\.ssh\id_rsa""#,
+            r#"dir "%SystemRoot%\System32\config""#,
+            r#"findstr TODO "%USERPROFILE%\.ssh\id_rsa""#,
+            r#"type "!USERPROFILE!\.ssh\id_rsa""#,
+        ] {
+            assert!(
+                rules.match_command(command).is_none(),
+                "引号内的 cmd 展开字符不得命中只读白名单: {command}"
+            );
+        }
+        // 无引号形态：分词器本来就拦下，保留为回归（防止将来放宽元字符判定）
+        for command in [
+            r"type %USERPROFILE%\.ssh\id_rsa",
+            r"dir %SystemRoot%\System32\config",
+            r"type ^C:\Users\x\.ssh\id_rsa",
+        ] {
+            assert!(
+                rules.match_command(command).is_none(),
+                "未加引号的 cmd 展开/转义字符不得命中: {command}"
+            );
+        }
+        // 反向对照：不含 %/^/! 的工作区内相对路径仍然免审批，别把正常用法打死
+        for command in [
+            "type README.md",
+            "dir src",
+            r"dir src\permission",
+            "findstr TODO src\\main.rs",
+            "git diff --stat",
+        ] {
+            assert!(
+                rules.match_command(command).is_some(),
+                "工作区内只读调用应继续命中: {command}"
+            );
         }
     }
 
