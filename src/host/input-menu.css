@@ -5,7 +5,10 @@
 .sn-input-menu {
   position: fixed;
   z-index: 10000;
-  min-width: 176px;
+  /* 与 DSH `Menu.module.css` 同规格：min 144 / 上限 360，视口装不下时收窄。 */
+  min-width: min(144px, calc(100vw - 24px));
+  max-width: min(360px, calc(100vw - 24px));
+  max-height: calc(100dvh - 24px);
   padding: 4px;
   display: flex;
   flex-direction: column;
@@ -24,13 +27,24 @@
   user-select: none;
 }
 
+/* 滚动视口：卡片表面不滚，列表在内部滚（同 `.scrollable .viewport`）。 */
+.sn-input-menu-viewport {
+  display: flex;
+  flex-direction: column;
+  flex: 1 1 auto;
+  min-height: 0;
+  overflow-y: auto;
+  overscroll-behavior: contain;
+}
+
 .sn-input-menu-item {
   display: flex;
   align-items: center;
   justify-content: space-between;
   gap: 24px;
   width: 100%;
-  padding: 6px 10px;
+  /* DSH 菜单项内距：6px 8px。 */
+  padding: 6px 8px;
   border: 0;
   border-radius: var(--dsw-radius-sm);
   background: transparent;
@@ -40,8 +54,10 @@
   cursor: default;
 }
 
-.sn-input-menu-item:hover:not(:disabled) {
+.sn-input-menu-item:hover:not(:disabled),
+.sn-input-menu-item:focus-visible {
   background: var(--dsw-alias-interactive-bg-hover);
+  outline: none;
 }
 
 .sn-input-menu-item:disabled {

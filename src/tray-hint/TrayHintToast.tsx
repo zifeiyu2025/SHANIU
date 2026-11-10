@@ -1,6 +1,8 @@
 import { useEffect, useState } from 'react'
 import { listen } from '@tauri-apps/api/event'
+import type { PropsLocale } from '@deepseek-ai/dsh-client-ui-slots'
 import { IconWarningOutlineRegular, Toast } from '@deepseek-ai/dsh-client-ui-primitives'
+import type { NS } from './locales'
 
 /** 与宿主 `user_terminal::TRAY_HINT_EVENT` 同名。 */
 export const TRAY_HINT_EVENT = 'user-terminal://tray-hint'
@@ -16,9 +18,10 @@ interface Hint {
 
 /**
  * 隐藏到托盘时的一次性提示。
+ * @param props.t - 本命名空间词典（中英两语）。
  * @returns 有提示时渲染 toast，否则不占位。
  */
-export function TrayHintToast() {
+export function TrayHintToast({ t }: PropsLocale<typeof NS>) {
   const [hint, setHint] = useState<Hint | null>(null)
 
   useEffect(() => {
@@ -43,7 +46,7 @@ export function TrayHintToast() {
   return (
     <Toast
       key={shown.seq}
-      text={`仍有 ${String(shown.count)} 个终端会话在运行，退出应用才会终止。`}
+      text={t('trayHint', { count: shown.count })}
       icon={<IconWarningOutlineRegular />}
       holdMs={HOLD_MS}
       onDone={() => {

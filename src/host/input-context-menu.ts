@@ -16,6 +16,7 @@
  *   input/textarea 走 setRangeText 兜底。
  */
 import { readClipboardText, writeClipboardText } from './clipboard'
+import { hostT, type HostTextKey } from './host-locale'
 import './input-menu.css'
 
 /** 可执行的标准编辑命令。 */
@@ -23,23 +24,23 @@ type MenuAction = 'undo' | 'redo' | 'cut' | 'copy' | 'paste' | 'selectAll'
 
 interface MenuItem {
   readonly action: MenuAction
-  readonly label: string
+  readonly label: HostTextKey
   readonly shortcut: string
 }
 
-/** 菜单分组（组间画分隔线）。 */
+/** 菜单分组（组间画分隔线）。文案在打开时按当前界面语言取（`hostT`）。 */
 const MENU_GROUPS: readonly (readonly MenuItem[])[] = [
   [
-    { action: 'undo', label: '撤销', shortcut: 'Ctrl+Z' },
-    { action: 'redo', label: '重做', shortcut: 'Ctrl+Y' },
+    { action: 'undo', label: 'contextMenu.undo', shortcut: 'Ctrl+Z' },
+    { action: 'redo', label: 'contextMenu.redo', shortcut: 'Ctrl+Y' },
   ],
   [
-    { action: 'cut', label: '剪切', shortcut: 'Ctrl+X' },
-    { action: 'copy', label: '复制', shortcut: 'Ctrl+C' },
-    { action: 'paste', label: '粘贴', shortcut: 'Ctrl+V' },
+    { action: 'cut', label: 'contextMenu.cut', shortcut: 'Ctrl+X' },
+    { action: 'copy', label: 'contextMenu.copy', shortcut: 'Ctrl+C' },
+    { action: 'paste', label: 'contextMenu.paste', shortcut: 'Ctrl+V' },
   ],
   [
-    { action: 'selectAll', label: '全选', shortcut: 'Ctrl+A' },
+    { action: 'selectAll', label: 'contextMenu.selectAll', shortcut: 'Ctrl+A' },
   ],
 ]
 
@@ -197,7 +198,10 @@ function showMenu(editable: HTMLElement, x: number, y: number): void {
   const menu = document.createElement('div')
   menu.className = 'sn-input-menu'
   menu.setAttribute('role', 'menu')
-  menu.setAttribute('aria-label', '编辑')
+  menu.setAttribute('aria-label', hostT('contextMenu.label'))
+  // 与 DSH `Menu.module.css` 同构：卡片只负责表面，滚动发生在内层 viewport。
+  const viewport = document.createElement('div')
+  viewport.className = 'sn-input-menu-viewport'
 
   const selection = hasSelection(editable)
   const enabled: Record<MenuAction, boolean> = {
@@ -214,7 +218,7 @@ function showMenu(editable: HTMLElement, x: number, y: number): void {
       const separator = document.createElement('div')
       separator.className = 'sn-input-menu-sep'
       separator.setAttribute('role', 'separator')
-      menu.append(separator)
+      viewport.append(separator)
     }
     for (const item of group) {
       const button = document.createElement('button')
@@ -223,7 +227,7 @@ function showMenu(editable: HTMLElement, x: number, y: number): void {
       button.setAttribute('role', 'menuitem')
       button.disabled = !enabled[item.action]
       const label = document.createElement('span')
-      label.textContent = item.label
+      label.textContent = hostT(item.label)
       const shortcut = document.createElement('span')
       shortcut.className = 'sn-input-menu-shortcut'
       shortcut.textContent = item.shortcut
@@ -232,9 +236,10 @@ function showMenu(editable: HTMLElement, x: number, y: number): void {
         closeInputContextMenu()
         perform(item.action, editable)
       })
-      menu.append(button)
+      viewport.append(button)
     }
   }
+  menu.append(viewport)
 
   menu.style.left = '0px'
   menu.style.top = '0px'
@@ -247,6 +252,13 @@ function showMenu(editable: HTMLElement, x: number, y: number): void {
   openMenu = menu
   openTarget = editable
 
+  /** 当前可用的菜单项（键盘导航只看可用项，跳过禁用项）。 */
+  const enabledItems = (): HTMLButtonElement[] =>
+    [...menu.querySelectorAll<HTMLButtonElement>('.sn-input-menu-item:not(:disabled)')]
+
+  // 键盘入口：打开即聚焦第一项，方向键 / Home / End 在可用项间移动。
+  enabledItems()[0]?.focus({ preventScroll: true })
+
   const onPointerDown = (event: PointerEvent): void => {
     if (event.target instanceof Node && menu.contains(event.target)) return
     closeInputContextMenu()
@@ -254,8 +266,25 @@ function showMenu(editable: HTMLElement, x: number, y: number): void {
   const onKeyDown = (event: KeyboardEvent): void => {
     if (event.key === 'Escape') {
       event.stopPropagation()
+      // 关菜单把焦点交还控件，键盘用户不用再找回来。
+      editable.focus({ preventScroll: true })
       closeInputContextMenu()
+      return
     }
+    if (event.key !== 'ArrowDown' && event.key !== 'ArrowUp'
+      && event.key !== 'Home' && event.key !== 'End') return
+    const buttons = enabledItems()
+    if (buttons.length === 0) return
+    event.preventDefault()
+    const current = buttons.indexOf(document.activeElement as HTMLButtonElement)
+    const next = event.key === 'Home'
+      ? 0
+      : event.key === 'End'
+        ? buttons.length - 1
+        : event.key === 'ArrowDown'
+          ? (current < 0 ? 0 : (current + 1) % buttons.length)
+          : (current < 0 ? buttons.length - 1 : (current - 1 + buttons.length) % buttons.length)
+    buttons[next]?.focus({ preventScroll: true })
   }
   const onClose = (): void => { closeInputContextMenu() }
   document.addEventListener('pointerdown', onPointerDown, true)

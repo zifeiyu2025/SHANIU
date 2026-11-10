@@ -99,6 +99,31 @@ describe('输入框右键菜单', () => {
     expect(menu()).toBeNull()
   })
 
+  it('键盘导航：方向键 / Home / End 在可用项间移动，Escape 交还焦点', () => {
+    const input = textInput('hello')
+    input.focus()
+    fireContextMenu(input)
+    const enabled = items().filter(button => !button.disabled)
+    expect(enabled.length).toBeGreaterThan(1)
+    expect(document.activeElement).toBe(enabled[0])
+
+    const key = (value: string): void => {
+      document.dispatchEvent(new KeyboardEvent('keydown', { key: value, bubbles: true }))
+    }
+    key('ArrowDown')
+    expect(document.activeElement).toBe(enabled[1])
+    key('End')
+    expect(document.activeElement).toBe(enabled[enabled.length - 1])
+    key('Home')
+    expect(document.activeElement).toBe(enabled[0])
+    key('ArrowUp')
+    expect(document.activeElement).toBe(enabled[enabled.length - 1])
+
+    key('Escape')
+    expect(menu()).toBeNull()
+    expect(document.activeElement).toBe(input)
+  })
+
   it('重复右键只保留一个菜单', () => {
     fireContextMenu(textInput('a'))
     fireContextMenu(textInput('b'))

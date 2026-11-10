@@ -15,6 +15,7 @@
 import { useEffect, useState, type ReactNode } from 'react'
 import type { PropsLocale, PropsRuntime } from '@deepseek-ai/dsh-client-ui-slots'
 import type {} from '@deepseek-ai/dsh-client-ui-settings-models/client'
+import { Button } from '@deepseek-ai/dsh-client-ui-primitives'
 import { NS, type CapabilitiesKey } from './locales'
 import type { CapabilitiesWire, CapabilityModelWire, CapabilityViewWire } from './wire'
 import './capabilities.css'
@@ -179,13 +180,13 @@ export function CapabilityPanel(props: Props): ReactNode {
                 : null}
               {hasUnjudgeable && wire.reprobe !== undefined
                 ? (
-                  <button
-                    type="button"
-                    className="shaniu-capabilities-retry"
+                  <Button
+                    size="sm"
+                    variant="ghost"
                     onClick={() => { void reprobe(model.id) }}
                   >
                     {t('retry')}
-                  </button>
+                  </Button>
                 )
                 : null}
             </div>

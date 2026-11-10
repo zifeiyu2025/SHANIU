@@ -8,19 +8,22 @@
  */
 import type { Context } from '@deepseek-ai/cordis'
 import type {} from '@deepseek-ai/dsh-client-ui-renderer/client'
+import { en, NS, zh } from './locales'
 import { TrayHintToast } from './TrayHintToast'
 
-/** 必需服务：UI 槽位注册表（`shell.overlay` 由 Chat 宿主声明）。 */
-export const inject = ['slots']
+/** 必需服务：UI 槽位注册表（`shell.overlay` 由 Chat 宿主声明）与词典。 */
+export const inject = ['slots', 'locale']
 
 /**
  * 把提示组件挂进 frame 级 overlay。
  * @param ctx - 客户端根上下文。
  */
 export function apply(ctx: Context): void {
+  ctx.effect(() => ctx.locale.register(NS, { zh, en }), 'shaniu-tray-hint: dictionaries')
   ctx.slots.inject('shell.overlay', () => ctx.slots.register({
     name: 'shell.overlay',
     id: 'shaniu-tray-hint',
     order: 100,
+    locale: NS,
   }, TrayHintToast))
 }

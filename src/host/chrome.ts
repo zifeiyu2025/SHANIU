@@ -15,6 +15,7 @@
  *   Windows 版式下 DSH 会把侧栏控件摆进那条带里（SidebarRoot.module.css 按
  *   --dsh-windows-titlebar-height 定位），整条压上去会吞掉它们的点击。
  */
+import { hostT } from './host-locale'
 
 /** Tauri startResizeDragging 的八个方向。 */
 export type ResizeEdge =
@@ -102,12 +103,12 @@ export function mountWindowChrome(controls: WindowControls): () => void {
   const root = document.createElement('div')
   root.className = 'sn-chrome'
 
-  const minimize = button('minimize', '最小化', icon('M3.5 8h9'))
+  const minimize = button('minimize', hostT('chrome.minimize'), icon('M3.5 8h9'))
   const restoreGlyph = document.createElement('span')
   restoreGlyph.className = 'sn-glyph-restore'
   restoreGlyph.append(icon('M5 3h8v8h-8z', 'M3 6v7h7'))
-  const maximize = button('maximize', '最大化', icon('M3.5 3.5h9v9h-9z'), restoreGlyph)
-  const close = button('close', '关闭', icon('M3.5 3.5l9 9', 'M12.5 3.5l-9 9'))
+  const maximize = button('maximize', hostT('chrome.maximize'), icon('M3.5 3.5h9v9h-9z'), restoreGlyph)
+  const close = button('close', hostT('chrome.close'), icon('M3.5 3.5l9 9', 'M12.5 3.5l-9 9'))
   close.classList.add('sn-close')
   const caption = document.createElement('div')
   caption.className = 'sn-caption'
@@ -131,9 +132,23 @@ export function mountWindowChrome(controls: WindowControls): () => void {
 
   function applyMaximized(maximized: boolean): void {
     html.toggleAttribute(MAXIMIZED_ATTR, maximized)
-    const label = maximized ? '还原' : '最大化'
+    applyMaximizeLabel(maximized)
+  }
+
+  /** 最大化/还原的文案随状态与界面语言变化；aria 与 title 必须同步。 */
+  function applyMaximizeLabel(maximized: boolean): void {
+    const label = hostT(maximized ? 'chrome.restore' : 'chrome.maximize')
     maximize.setAttribute('aria-label', label)
     maximize.title = label
+  }
+
+  /** 语言切换后重刷标题栏三处静态 aria（`<html lang>` 由 DSH locale 插件同步）。 */
+  function applyChromeLabels(): void {
+    minimize.setAttribute('aria-label', hostT('chrome.minimize'))
+    minimize.title = hostT('chrome.minimize')
+    close.setAttribute('aria-label', hostT('chrome.close'))
+    close.title = hostT('chrome.close')
+    applyMaximizeLabel(html.hasAttribute(MAXIMIZED_ATTR))
   }
 
   /**
@@ -199,8 +214,13 @@ export function mountWindowChrome(controls: WindowControls): () => void {
   window.addEventListener('resize', syncMaximized)
   syncMaximized()
 
+  // DSH locale 切换语言时同步 <html lang>；标题栏是 boot 前挂的静态 DOM，需要重刷文案。
+  const langObserver = new MutationObserver(applyChromeLabels)
+  langObserver.observe(html, { attributes: true, attributeFilter: ['lang'] })
+
   return () => {
     disposed = true
+    langObserver.disconnect()
     document.removeEventListener('mousedown', onButtonDown)
     window.removeEventListener('resize', syncMaximized)
     root.remove()

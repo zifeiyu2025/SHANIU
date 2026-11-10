@@ -13,6 +13,11 @@ vi.mock('@tauri-apps/api/event', () => ({
 }))
 
 import { TrayHintToast } from './TrayHintToast'
+import { zh, type TrayHintKey } from './locales'
+
+/** 词典桩：只验插值与渲染契约，文案本身以 `locales.ts` 为准。 */
+const t = ((key: TrayHintKey, params?: { count?: number }) =>
+  zh[key].replace('{count}', String(params?.count ?? 0))) as never
 
 /** 模拟宿主发一次提示事件。 */
 function emit(count: number): void {
@@ -30,7 +35,7 @@ describe('TrayHintToast', () => {
   })
 
   it('收到存活会话数后显示，并说明退出应用才会终止', async () => {
-    render(<TrayHintToast />)
+    render(<TrayHintToast t={t} />)
     await act(async () => {})
     expect(screen.queryByRole('alert')).toBeNull()
 
@@ -41,7 +46,7 @@ describe('TrayHintToast', () => {
   })
 
   it('淡出结束后自行卸载，不留常驻提示', async () => {
-    render(<TrayHintToast />)
+    render(<TrayHintToast t={t} />)
     await act(async () => {})
     emit(1)
     expect(screen.queryByRole('alert')).not.toBeNull()
@@ -51,7 +56,7 @@ describe('TrayHintToast', () => {
   })
 
   it('计数为 0 时不提示', async () => {
-    render(<TrayHintToast />)
+    render(<TrayHintToast t={t} />)
     await act(async () => {})
     emit(0)
     expect(screen.queryByRole('alert')).toBeNull()
