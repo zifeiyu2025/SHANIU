@@ -26,7 +26,7 @@
       }
     ],
     "security": {
-      "csp": "object-src 'none'; base-uri 'self'; frame-ancestors 'none'"
+      "csp": "default-src 'self'; object-src 'none'; base-uri 'self'; frame-ancestors 'none'; connect-src 'self' ipc: http://ipc.localhost ws://127.0.0.1:*"
     }
   },
   "bundle": {
