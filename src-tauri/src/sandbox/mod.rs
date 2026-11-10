@@ -778,6 +778,41 @@ pub fn prepare_stdio(
 }
 
 #[cfg(windows)]
+/// 收集 MCP 容器要授权的「用户指定根」：工作区根、cwd、`allowed_roots`。
+///
+/// 判定只有 `config::workspace_gate` 一份——这里不复制规则，只把「指向数据根」翻成
+/// 拒绝启动的原因。数据根里是会话档案、日志与凭据：容器一旦拿到 ACE，MCP server
+/// 就能直接读写它们。`allowed_roots` / `cwd` 都直接来自配置，换个键不该绕过工作区
+/// 那套判据（`workspace_root` 上游已过闸门，这里再判一次是兜底，不是第二份规则）。
+fn guarded_mcp_user_roots(
+    request: &StdioRequest<'_>,
+    data_root: &Path,
+    workspace_access: acl::Access,
+) -> Result<Vec<(PathBuf, acl::Access, acl::RootRole)>, SandboxError> {
+    let candidates = [
+        ("工作区根", request.workspace_root.to_path_buf(), workspace_access),
+        ("cwd", request.cwd.to_path_buf(), workspace_access),
+    ]
+    .into_iter()
+    .chain(request.allowed_roots.iter().map(|root| {
+        ("allowed_roots", PathBuf::from(root.path.trim()), acl_access(root.access))
+    }));
+    let mut roots = Vec::new();
+    for (label, path, access) in candidates {
+        let verdict = crate::config::workspace_gate::check_against(&path, data_root);
+        if let Some(rejection) = verdict.rejection() {
+            return Err(SandboxError::CreateFailed(format!(
+                "MCP server {} 的{label}目录不可用：{}",
+                request.server_id,
+                rejection.message(&path, data_root)
+            )));
+        }
+        roots.push((path, access, acl::RootRole::UserPicked));
+    }
+    Ok(roots)
+}
+
+#[cfg(windows)]
 fn spawn_mcp_in_app_container(
     request: &StdioRequest<'_>,
     tx: mpsc::Sender<StdioEvent>,
@@ -798,21 +833,9 @@ fn spawn_mcp_in_app_container(
 
     let workspace_access = acl_access(request.workspace_access);
     // 角色决定是否受过宽约束：用户指定的一律判，程序推导的（临时目录、工具链）不判。
-    let mut desired: Vec<(PathBuf, acl::Access, acl::RootRole)> = vec![
-        // 工作区按用户所选档位；cwd 单独列出（可能在工作区之外）。
-        (request.workspace_root.to_path_buf(), workspace_access, acl::RootRole::UserPicked),
-        (request.cwd.to_path_buf(), workspace_access, acl::RootRole::UserPicked),
-        // 临时目录必须可写：TEMP/TMP 会在下面改指到这里。
-        (server_temp.clone(), acl::Access::Write, acl::RootRole::Derived),
-    ];
-    for root in request.allowed_roots {
-        // `allowed_roots` 与工作区根同一套判定：换个键不该能绕过。
-        desired.push((
-            PathBuf::from(root.path.trim()),
-            acl_access(root.access),
-            acl::RootRole::UserPicked,
-        ));
-    }
+    let mut desired = guarded_mcp_user_roots(request, &data_root, workspace_access)?;
+    // 临时目录必须可写：TEMP/TMP 会在下面改指到这里。
+    desired.push((server_temp.clone(), acl::Access::Write, acl::RootRole::Derived));
     for root in toolchain_roots(request.program, request.args) {
         desired.push((root, acl::Access::Read, acl::RootRole::Derived));
     }
@@ -1329,6 +1352,67 @@ mod tests {
         grant_mcp_paths(&id, &[(sub.clone(), acl::Access::Read, acl::RootRole::UserPicked)])
             .expect("主目录的子目录不应被拦");
         release_mcp_server(&id);
+    }
+
+    /// MCP 的 `cwd` / `allowed_roots` 直接来自配置，ACL 侧必须在授权前再判一次数据根：
+    /// 容器一旦拿到 ACE，server 就能直接读写会话档案、日志与凭据。
+    /// 反向对照：去掉 `guarded_mcp_user_roots` 里的 `check_against`，下面三条拒绝会变成 Ok。
+    #[cfg(windows)]
+    #[test]
+    fn mcp_user_picked_roots_inside_data_root_are_refused() {
+        let dir = ws();
+        let data_root = dir.join("data");
+        std::fs::create_dir_all(data_root.join("secrets")).unwrap();
+        let workspace = dir.join("workspace");
+        std::fs::create_dir_all(&workspace).unwrap();
+        let env = BTreeMap::new();
+        let workspace = workspace.as_path();
+        fn make<'a>(
+            cwd: &'a Path,
+            workspace: &'a Path,
+            allowed: &'a [AllowedRoot],
+            env: &'a BTreeMap<String, String>,
+        ) -> StdioRequest<'a> {
+            StdioRequest {
+                policy: SandboxMode::WorkspaceWrite,
+                server_id: "guard-probe",
+                program: "cmd",
+                args: &[],
+                cwd,
+                workspace_root: workspace,
+                workspace_access: WorkspaceAccess::Read,
+                allowed_roots: allowed,
+                allow_network: false,
+                env,
+                trusted_server_ids: &[],
+            }
+        }
+
+        // 正常：工作区与数据根之外的目录放行。
+        let outside = dir.join("outside");
+        std::fs::create_dir_all(&outside).unwrap();
+        let allowed = [AllowedRoot { path: outside.display().to_string(), access: WorkspaceAccess::Read }];
+        let roots = guarded_mcp_user_roots(&make(&workspace, workspace, &allowed, &env), &data_root, acl::Access::Read)
+            .expect("数据根之外的用户指定根必须放行");
+        assert_eq!(roots.len(), 3, "工作区、cwd、allowed_roots 各一条");
+
+        // 拒绝：allowed_roots 指到 data\secrets。
+        let secrets = data_root.join("secrets");
+        let allowed = [AllowedRoot { path: secrets.display().to_string(), access: WorkspaceAccess::Write }];
+        let error = guarded_mcp_user_roots(&make(&workspace, workspace, &allowed, &env), &data_root, acl::Access::Read)
+            .expect_err("allowed_roots 指向数据根内部必须拒绝");
+        assert!(error.to_string().contains("allowed_roots"), "{error}");
+        assert!(error.to_string().contains("secrets"), "{error}");
+
+        // 拒绝：cwd 指向数据根本身。
+        let error = guarded_mcp_user_roots(&make(&data_root, workspace, &[], &env), &data_root, acl::Access::Read)
+            .expect_err("cwd 指向数据根必须拒绝");
+        assert!(error.to_string().contains("cwd"), "{error}");
+
+        // 拒绝：数据根的上级目录（祖先）同样拿到的是「能读档案」的授权。
+        let error = guarded_mcp_user_roots(&make(dir.path(), workspace, &[], &env), &data_root, acl::Access::Read)
+            .expect_err("数据根祖先必须拒绝");
+        assert!(error.to_string().contains("上级目录"), "{error}");
     }
 
     /// 「补 NUL ACE → 释放时撤销」整条链路（SH-064 B）。
