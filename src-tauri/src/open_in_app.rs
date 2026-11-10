@@ -5,6 +5,10 @@
 //! （上游 resolver 的 revalidate 语义）。所有路径必须绝对且存在；目录走 ShellExecute 的 open
 //! 动词（直接 spawn explorer 不保证抬升窗口），文件走默认处理器或已登记的处理器。
 //!
+//! **可执行内容一律拒绝**（审计 H2 批 3）：文件目标是 `.exe`/`.cmd`/`.lnk` 这类可执行内容时，
+//! 无论走默认处理器还是显式处理器都直接拒绝——它们的「打开」动词就是「运行」，等于绕开
+//! `exec` 工具的审批通道执行任意程序（判定与理由见 [`EXECUTABLE_EXTENSIONS`]）。
+//!
 //! **图标不做**：上游从可执行文件抽 PNG；本仓不引入图像解码，`icon` 一律 null，
 //! 客户端按自己的回退规则画原生图钉（`OpenInAppApps` 的 apps 路由仍给图标 URL，
 //! `/open-in-app/icon/*` 由前端路由垫片回 404 → vendored 组件回退）。
@@ -472,10 +476,50 @@ pub fn workspace_path_applications(path: String) -> Result<Vec<FileApplication>,
     Ok(file_applications(&target))
 }
 
+/// 可执行内容类的扩展名（审计 H2 批 3）。
+///
+/// **为什么按扩展名拒绝，而不是按处理器 id**：`.exe` 在 Windows 里的「打开」动词就是
+/// 「运行」（`HKCR\exefile\shell\open\command` = `"%1" %*`），处理器 id 本身完全合法，
+/// 按 id 判断等于永远放行。能区分「打开看看」与「执行」的只有目标自身。
+///
+/// **为什么默认打开（`application` 省略）这一支也必须拦**：实测 `file_applications`
+/// 对本机 `.exe`/`.cmd`/`.bat`/`.lnk`/`.msi`/`.vbs`/`.js` 返回**空表**（这些类型没有
+/// UserChoice / OpenWithList 登记），所以借「显式处理器」反而走不通；真正可达的路径是
+/// 省略 `application` 落进 `shell_open` → `ShellExecuteW("open")`，实测该调用会真实
+/// 启动进程（写标记文件成功），不是只弹属性页/选择程序。两支都不能漏。
+///
+/// 后四个（`jse`/`vbe`/`wsf`/`hta`）与 `js`/`vbs` 同族，同样是由脚本宿主直接执行，
+/// 留一个就是留一整条旁路。**这是黑名单，不是完备边界**——完备解是执行通道统一收口
+/// （`exec` + 审批）；本条只负责关掉「无审批的旁路」。
+const EXECUTABLE_EXTENSIONS: &[&str] = &[
+    "exe", "com", "scr", "bat", "cmd", "ps1", "lnk", "msi", "vbs", "js", "jse", "vbe", "wsf",
+    "hta",
+];
+
+/// 文件目标是可执行内容时返回其扩展名（小写），用于拒绝与留痕；否则 `None`。
+///
+/// 目录不参与判断：`explorer` 打开目录是安全的，目录名恰好叫 `x.exe` 也照常放行。
+fn denied_extension(target: &Path) -> Option<String> {
+    if target.is_dir() {
+        return None;
+    }
+    let extension = target.extension()?.to_str()?.to_ascii_lowercase();
+    if extension.is_empty() {
+        return None;
+    }
+    EXECUTABLE_EXTENSIONS
+        .contains(&extension.as_str())
+        .then_some(extension)
+}
+
 /// 打开/定位一个已校验的工作区路径：`reveal` 走资源管理器选中，否则默认应用或显式处理器。
 ///
 /// **路径范围由调用方先行限制**（审计 H2 批 2）：本函数只做动作分派，不判断目标
 /// 是否在工作区内——那一步用组合根里与沙箱同源的 `tool_router::resolve_in_workspace`。
+///
+/// **可执行内容在动作分派之前就拒**（审计 H2 批 3）：这一支改前会把 `.exe`/`.cmd`
+/// 交给系统「运行」，模型先往工作区写一个 exe 再调本命令即可无审批执行。`reveal`
+/// 不受影响——它只在资源管理器里选中，不产生执行。
 pub fn open_workspace_path_at(
     target: &Path,
     action: Option<&str>,
@@ -483,6 +527,17 @@ pub fn open_workspace_path_at(
 ) -> Result<(), String> {
     if action == Some("reveal") {
         return reveal(target);
+    }
+    if let Some(extension) = denied_extension(target) {
+        tracing::warn!(
+            target = %target.display(),
+            extension = %extension,
+            application = application.unwrap_or(""),
+            "拒绝打开可执行内容：执行必须走带审批的 exec 通道"
+        );
+        return Err(format!(
+            "拒绝用系统处理器打开可执行文件（.{extension}）：执行请走带审批的 exec 通道"
+        ));
     }
     match application.filter(|app| !app.trim().is_empty()) {
         Some(app) => {
@@ -553,5 +608,122 @@ mod tests {
     fn paths_must_be_absolute_and_exist() {
         assert!(existing_absolute("relative/path").is_err());
         assert!(existing_absolute("C:\\definitely-not-here-shaniu").is_err());
+    }
+
+    #[test]
+    fn executable_content_is_denied_by_extension() {
+        let dir = crate::test_support::TestTempDir::new("deny-ext");
+        for extension in [
+            "exe", "bat", "cmd", "ps1", "lnk", "msi", "scr", "com", "vbs", "js",
+        ] {
+            let file = dir.join(format!("payload.{extension}"));
+            std::fs::write(&file, b"x").unwrap();
+            assert_eq!(
+                denied_extension(&file).as_deref(),
+                Some(extension),
+                ".{extension} 必须被拒"
+            );
+        }
+        // Windows 的关联大小写不敏感：`.EXE` 与 `.exe` 是同一条关联，不能靠改大小写绕过。
+        let upper = dir.join("PAYLOAD.EXE");
+        std::fs::write(&upper, b"x").unwrap();
+        assert_eq!(denied_extension(&upper).as_deref(), Some("exe"));
+        // 另一半对照：普通文档不受影响，否则这条规则会把「双击打开 md」一起废掉。
+        let doc = dir.join("notes.md");
+        std::fs::write(&doc, b"# hi").unwrap();
+        assert_eq!(denied_extension(&doc), None);
+        // 无扩展名文件同样放行（系统会弹「选择程序」而不是执行）。
+        let bare = dir.join("Makefile");
+        std::fs::write(&bare, b"all:").unwrap();
+        assert_eq!(denied_extension(&bare), None);
+    }
+
+    /// 目录场景不受影响：`explorer` 打开目录仍是安全的，目录名带可执行后缀也照常。
+    #[test]
+    fn directories_are_never_denied_by_the_extension_rule() {
+        let dir = crate::test_support::TestTempDir::new("deny-dir");
+        let nested = dir.join("folder.exe");
+        std::fs::create_dir_all(&nested).unwrap();
+        assert_eq!(denied_extension(&nested), None);
+    }
+
+    /// 拒绝发生在任何启动动作之前：两条 `application` 路径都必须被拦，
+    /// 且错误信息点名扩展名（用户能看懂被拦的是哪个文件类型）。
+    #[test]
+    fn opening_an_executable_is_rejected_on_both_paths() {
+        let dir = crate::test_support::TestTempDir::new("deny-open");
+        let payload = dir.join("payload.cmd");
+        std::fs::write(&payload, b"@echo off\r\n").unwrap();
+        for application in [None, Some("C:\\Windows\\System32\\notepad.exe")] {
+            let error = open_workspace_path_at(&payload, None, application)
+                .expect_err("可执行内容必须被拒绝");
+            assert!(error.contains(".cmd"), "错误信息要点名扩展名: {error}");
+        }
+    }
+
+    /// 反向对照（AGENTS §4.2）：改前这条分支就是 `shell_open`，所以必须证明
+    /// `shell_open` 对可执行内容是真的**启动进程**——否则上面的拒绝挡的是空气。
+    #[cfg(windows)]
+    #[test]
+    fn shell_open_really_launches_executable_content() {
+        use std::time::{Duration, Instant};
+        let dir = crate::test_support::TestTempDir::new("shell-open-launch");
+        let marker = dir.join("marker.txt");
+        let script = dir.join("payload.cmd");
+        std::fs::write(
+            &script,
+            format!("@echo off\r\necho ran>\"{}\"\r\n", marker.display()),
+        )
+        .unwrap();
+        shell_open(&script).expect("ShellExecute 应接受 .cmd");
+        let deadline = Instant::now() + Duration::from_secs(10);
+        while Instant::now() < deadline {
+            if marker.is_file() {
+                return;
+            }
+            std::thread::sleep(Duration::from_millis(100));
+        }
+        panic!(
+            "ShellExecute(\"open\") 没有执行 .cmd：{} 未生成",
+            marker.display()
+        );
+    }
+
+    /// 回答「`ShellExecuteW` 拿到运行处理器后是真启动、还是只弹属性页/选择程序」：
+    /// 用 `evil.exe`（`cmd.exe` 的副本）走 open 动词 + `/c` 写标记，实测**会执行**。
+    /// 这条是 `.exe` 进入拒绝名单的直接依据，改动名单前先看它。
+    #[cfg(windows)]
+    #[test]
+    fn the_open_verb_executes_exe_targets() {
+        use std::time::{Duration, Instant};
+        let dir = crate::test_support::TestTempDir::new("open-verb-exe");
+        let marker = dir.join("marker.txt");
+        let evil = dir.join("evil.exe");
+        std::fs::copy("C:\\Windows\\System32\\cmd.exe", &evil).expect("复制 cmd.exe 作探针");
+        use windows::core::HSTRING;
+        use windows::Win32::UI::Shell::ShellExecuteW;
+        use windows::Win32::UI::WindowsAndMessaging::SW_HIDE;
+        let operation = HSTRING::from("open");
+        let target = HSTRING::from(evil.to_string_lossy().into_owned());
+        let parameters = HSTRING::from(format!("/c echo ran>\"{}\"", marker.display()));
+        let working_dir = HSTRING::from(dir.to_string_lossy().into_owned());
+        let result =
+            unsafe { ShellExecuteW(None, &operation, &target, &parameters, &working_dir, SW_HIDE) };
+        assert!(
+            result.0 as isize > 32,
+            "ShellExecute 应接受 .exe（返回 {}）",
+            result.0 as isize
+        );
+        let deadline = Instant::now() + Duration::from_secs(10);
+        while Instant::now() < deadline {
+            if marker.is_file() {
+                return;
+            }
+            std::thread::sleep(Duration::from_millis(100));
+        }
+        panic!(
+            "open 动词没有执行 .exe：{} 未生成",
+            marker.display()
+        );
     }
 }
