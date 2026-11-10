@@ -76,12 +76,30 @@ export function apply(ctx: Context): void {
   ctx.effect(() => ctx.locale.register(EXPORT_NS, { zh: exportZh, en: exportEn }), 'shaniu-header: export dictionaries')
   const t = ctx.locale.bind(NS)
 
-  // 直接打开当前会话的工作区目录；浏览器 dev 环境没有这个能力，保持静默
+  // 直接打开当前会话的工作区目录。失败一律发声：这条链曾经在"列表行没有 cwd"时
+  // 静默 return，产物回归里表现为「点按钮毫无反应、console 也没有任何输出」，
+  // 排查代价远高于一条 warn（与 cordis FAILED fiber 是同一个病）。
   const openExplorer = (sessionId: SessionId): void => {
-    const cwd = ctx.sessions.list.getSnapshot().byId[sessionId]?.cwd
-    if (cwd === undefined) return
-    void openInSystemExplorer(cwd).catch((error: unknown) => {
-      ctx.logger.warn('打开文件管理器失败: %s', error)
+    const list = ctx.sessions.list.getSnapshot()
+    const row = list.byId[sessionId]
+    const cwd = row?.cwd
+    if (cwd === undefined) {
+      ctx.logger.warn(
+        '资源管理器：会话 %s 的列表行%s（列表 phase=%s，共 %d 条），没有工作区目录可打开',
+        sessionId,
+        row === undefined ? '不存在' : '缺 cwd',
+        list.phase,
+        list.ids.length,
+      )
+      return
+    }
+    void openInSystemExplorer(cwd).then((opened) => {
+      // 浏览器 dev 直开页面没有 Tauri 内部对象：这是预期的"做不到"，但也要留痕。
+      if (!opened) {
+        ctx.logger.warn('资源管理器：当前页面不是 Tauri 宿主，%s 没有执行', cwd)
+      }
+    }).catch((error: unknown) => {
+      ctx.logger.warn('资源管理器：打开 %s 失败: %s', cwd, error)
     })
   }
 

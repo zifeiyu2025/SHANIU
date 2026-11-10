@@ -1958,6 +1958,21 @@ export function createAdapter(options: AdapterOptions): { remote: unknown; dispo
       // 的事件写进另一个对象——真机表现就是"实时态只有用户气泡，重载后档案全对"（B-20）。
       // 已有 journal 就保留（空白复用的语义就是接着这个会话继续）；只有从未观察过才新建。
       if (!journals.has(agentId)) journals.set(agentId, newJournal(now()))
+      // 补发上游的 `api-session/added`（session-controller 在会话创建时广播的那条）：
+      // 界面新建会话只传 workspaceId，`manager.create` 的占位行因此**没有 cwd**，
+      // 而资源管理器按钮与官方 `workspace.openLocal` 都以列表行的 cwd 为前置条件——
+      // 少了这条事件，新会话在本次运行内一直"点了没反应"，要重开窗口（list 刷新）才补上。
+      // 复用空白会话时 rows 里已有该行，按它的 blank / 工作区如实上报。
+      const reused = rows.find(row => row.agentId === agentId)
+      dispatch('api-session/added', {
+        agentAvailable: true,
+        sessionId: agentId,
+        cwd: reused?.workspaceRoot ?? cwd,
+        updatedAt: Date.now(),
+        running: journals.get(agentId)?.taskOpen === true,
+        blank: reused?.blank ?? true,
+        formatStatus: 'current',
+      })
       // 工作区分组按 sessionIds 显示：新会话建完就要推一帧，否则侧栏的工作区树
       // 里看不到它，要重开窗口才出现。目标工作区可能不是默认那家，按路径找视图。
       const target = registered.find(ws => ws.path === cwd) ?? registered[0]

@@ -1,9 +1,23 @@
-import { describe, expect, it, vi } from 'vitest'
+import { afterEach, describe, expect, it, vi } from 'vitest'
 
-const opened = vi.fn(async (_path: string) => true)
-vi.mock('./open-workspace', () => ({
-  openInSystemExplorer: (path: string) => opened(path),
-}))
+/**
+ * 资源管理器走**真实** `openInSystemExplorer`：它动态 import `@tauri-apps/api/core`，
+ * 后者调用 `window.__TAURI_INTERNALS__.invoke`。这里只装宿主对象、不打桩业务模块——
+ * 要证的正是"点下去真的产生了 invoke"（产物回归丢的就是这一步）。
+ *
+ * 宿主对象**按用例装**：`inTauri()` 同时决定剪贴板走宿主命令还是 navigator，
+ * 全局留着会改变导出/复制用例的路径。
+ */
+const hostInvoke = vi.hoisted(() => vi.fn(async (_cmd: string, _args?: Record<string, unknown>): Promise<unknown> => undefined))
+
+function installHost(): void {
+  Object.defineProperty(window, '__TAURI_INTERNALS__', {
+    value: { invoke: hostInvoke, transformCallback: (callback: unknown) => callback },
+    configurable: true,
+  })
+}
+
+afterEach(() => { Reflect.deleteProperty(window, '__TAURI_INTERNALS__') })
 
 /** `load_session` 的替身：Markdown 复制的唯一宿主调用。 */
 const invoke = vi.hoisted(() => vi.fn(async (): Promise<unknown> => []))
@@ -55,9 +69,10 @@ function harness(row: Record<string, unknown> | null = { id: SESSION_ID, cwd: WO
   const registrations: Registration[] = []
   const contributions: Contribution[] = []
   const commands: ShortcutCommand[] = []
+  const warnings: unknown[][] = []
   const ctx = {
     effect: (fn: () => unknown) => fn(),
-    logger: { warn: () => {} },
+    logger: { warn: (...args: unknown[]) => { warnings.push(args) } },
     locale: { register: () => () => {}, bind: () => (key: string, params?: { app?: string }) => params?.app === undefined ? key : `${key}:${params.app}` },
     slots: {
       inject: (_name: string, callback: () => () => void) => {
@@ -76,11 +91,19 @@ function harness(row: Record<string, unknown> | null = { id: SESSION_ID, cwd: WO
       },
     },
     shortcuts: { register: (command: ShortcutCommand) => { commands.push(command); return () => {} }, catalog: { getSnapshot: () => [], subscribe: () => () => {} } },
-    sessions: { list: { getSnapshot: () => ({ byId: row === null ? {} : { [SESSION_ID]: row } }) } },
+    sessions: {
+      list: {
+        getSnapshot: () => ({
+          ids: row === null ? [] : [SESSION_ID],
+          byId: row === null ? {} : { [SESSION_ID]: row },
+          phase: 'ready',
+        }),
+      },
+    },
     uiConversation: { binding: () => ({ target: () => ({ getSnapshot: () => ({ legacy: { nodes: [] } }) }) }) },
   }
   apply(ctx as never)
-  return { registrations, contributions, commands }
+  return { registrations, contributions, commands, warnings }
 }
 
 /** 取出 utilities 槽位注册项，按会话拿到它的 open 回调。 */
@@ -100,17 +123,39 @@ function sessionMenu(contributions: readonly Contribution[], sessionId = SESSION
 }
 
 describe('header actions', () => {
-  it('资源管理器按钮直接打开会话的工作区目录', async () => {
-    const { registrations } = harness()
+  it('资源管理器按钮直接打开会话的工作区目录：有会话、有 cwd 就必然产生 invoke', async () => {
+    installHost()
+    hostInvoke.mockClear()
+    const { registrations, warnings } = harness()
     explorerOpen(registrations)()
-    await vi.waitFor(() => expect(opened).toHaveBeenCalledWith(WORKSPACE))
+    await vi.waitFor(() => expect(hostInvoke).toHaveBeenCalled())
+    // 上游 invoke 会带第三个 options 形参，这里只看命令与载荷。
+    expect(hostInvoke.mock.calls[0]?.slice(0, 2)).toEqual(['open_in_explorer', { path: WORKSPACE }])
+    expect(warnings).toEqual([])
   })
 
-  it('会话没有 cwd 时不做任何事', async () => {
-    const { registrations } = harness({ id: SESSION_ID, displayTitle: '无目录', retainedBy: { mainView: 1 } })
+  it('列表行缺 cwd 时不静默：warn 点名会话与缺什么，且不发 invoke', async () => {
+    // 反向对照：修之前这里是裸 return——产物回归里表现为"点按钮毫无反应、console 也没有
+    // 任何输出"，排查时只能靠人肉反编译。现在必须留下可读的一条。
+    installHost()
+    hostInvoke.mockClear()
+    const { registrations, warnings } = harness({ id: SESSION_ID, displayTitle: '无目录', retainedBy: { mainView: 1 } })
     explorerOpen(registrations)()
     await new Promise(resolve => setTimeout(resolve, 0))
-    expect(opened).not.toHaveBeenCalled()
+    expect(hostInvoke).not.toHaveBeenCalled()
+    expect(warnings).toHaveLength(1)
+    expect(warnings[0]?.slice(1)).toEqual([SESSION_ID, '缺 cwd', 'ready', 1])
+  })
+
+  it('会话根本不在列表快照里时也要留痕（phase 与条数进日志）', async () => {
+    installHost()
+    hostInvoke.mockClear()
+    const { registrations, warnings } = harness(null)
+    explorerOpen(registrations)()
+    await new Promise(resolve => setTimeout(resolve, 0))
+    expect(hostInvoke).not.toHaveBeenCalled()
+    expect(warnings).toHaveLength(1)
+    expect(warnings[0]?.slice(1)).toEqual([SESSION_ID, '不存在', 'ready', 0])
   })
 
   it('不重复注册 workspace.openLocal：命令位归官方 ui-open-in-app', () => {

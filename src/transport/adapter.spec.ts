@@ -941,6 +941,23 @@ describe('适配层的命令面映射', () => {
     dispose()
   })
 
+  it('create 成功后补发 api-session/added：列表行要带 cwd，否则资源管理器与官方 openLocal 都缺前置条件', async () => {
+    const bridge = scriptedBridge()
+    const { remote, dispose } = createAdapter({ bridge })
+    const added: Record<string, unknown>[] = []
+    faceOf(remote).$on('api-session/added', ((summary: Record<string, unknown>) => {
+      added.push(summary)
+    }) as never)
+    // 界面新建会话只传 workspaceId（createInWorkspace 的正式载荷），不传 cwd。
+    expect(await faceOf(remote).session.create({ workspaceId: 'default-workspace' }))
+      .toEqual({ ok: true, value: { sessionId: 'agent-new' } })
+    expect(added).toHaveLength(1)
+    expect(added[0]).toMatchObject({
+      sessionId: 'agent-new', cwd: 'W', agentAvailable: true, running: false, blank: true,
+    })
+    dispose()
+  })
+
   it('cancel 只转发给宿主，不提前造终态', async () => {
     const bridge = scriptedBridge()
     const { remote, dispose } = createAdapter({ bridge })
