@@ -416,6 +416,33 @@ pub fn spawn_restricted_command(
     }
 }
 
+/// 宿主环境 + 工具链注入（MSVC：PATH/INCLUDE/LIB，见 `sandbox::msvc`）。
+///
+/// M5：不能用 `std::env::vars()`——它遇到非 Unicode 环境变量会 **panic**
+/// （Windows 环境块本身是 UTF-16，只有未配对代理项会触发）。改用 `vars_os()`。
+///
+/// 转换策略选 `to_string_lossy`，不是「跳过非 Unicode 项」：
+/// - 跳过会让这个变量**整条消失**，改变子进程「变量是否存在」的语义；环境块缺项
+///   正是 terminal 路径改白名单时踩过的「cmd 初始化失败」那类问题。
+/// - lossy 只损坏该变量的值（换成 U+FFFD），变量本身仍在；且 Windows 上唯一失败
+///   形态就是未配对代理项，本身不是合法文本，没有无损可选。
+/// - 与 MCP 路径一致：`build_environment_block` 编码时同样是 lossy，这里选 lossy
+///   不引入新的可观察差异。
+fn inherited_env(extra_env: &[(String, String)]) -> BTreeMap<String, String> {
+    let mut env_map: BTreeMap<String, String> = std::env::vars_os()
+        .map(|(key, value)| {
+            (
+                key.to_string_lossy().into_owned(),
+                value.to_string_lossy().into_owned(),
+            )
+        })
+        .collect();
+    for (key, value) in extra_env {
+        env_map.insert(key.clone(), value.clone());
+    }
+    env_map
+}
+
 /// 以「仅留 SeChangeNotifyPrivilege 的受限令牌 + JobObject + **AppContainer**」启动子进程（SH-021）。
 ///
 /// 与 `spawn_restricted_command` 的区别：
@@ -436,12 +463,8 @@ pub fn spawn_appcontainer_command(
     let command_line = shell_command_line(program, args);
     let mut cmdline_wide = wide(&command_line);
     let cwd_wide = wide(cwd.as_os_str());
-    // 宿主环境 + 工具链注入（MSVC：PATH/INCLUDE/LIB，见 sandbox::msvc）。按 Windows 惯例
-    // 键名大小写不敏感排序；CREATE_UNICODE_ENVIRONMENT 已在 flags 里。
-    let mut env_map: std::collections::BTreeMap<String, String> = std::env::vars().collect();
-    for (key, value) in extra_env {
-        env_map.insert(key.clone(), value.clone());
-    }
+    // 宿主环境 + 工具链注入（M5：见 inherited_env 的转换策略说明）。
+    let env_map = inherited_env(extra_env);
     let mut env_block = env_map
         .into_iter()
         .map(|(key, value)| format!("{key}={value}"))
@@ -1828,6 +1851,49 @@ fn spawn_restricted_stdio_with_max_line(
         },
         tx,
     )
+}
+
+#[cfg(test)]
+mod env_tests {
+    use super::*;
+    use std::os::windows::ffi::OsStringExt;
+
+    /// 测试结束一定清掉探针变量（panic 时 Drop 也会跑）。
+    struct EnvGuard(&'static str);
+
+    impl Drop for EnvGuard {
+        fn drop(&mut self) {
+            unsafe { std::env::remove_var(self.0) };
+        }
+    }
+
+    /// M5：非 Unicode 环境变量不得再让 exec 路径 panic。
+    ///
+    /// 反向对照：`std::env::vars()`（旧写法）在本用例构造的环境下会 panic——
+    /// 下面的断言先在 catch_unwind 里把它跑一遍，证明这条用例确实覆盖到了该缺陷。
+    #[test]
+    fn inherited_env_keeps_non_unicode_variable_instead_of_panicking() {
+        const PROBE: &str = "SHANIU_M5_NON_UNICODE";
+        // 0xD800 是未配对的高位代理项：合法 UTF-16 code unit，但不是合法 Unicode 标量。
+        let value = OsString::from_wide(&[0xD800, u16::from(b'A')]);
+        unsafe { std::env::set_var(PROBE, value) };
+        let _guard = EnvGuard(PROBE);
+
+        let old = std::panic::catch_unwind(|| std::env::vars().count());
+        assert!(
+            old.is_err(),
+            "基线失效：std::env::vars() 没有因非 Unicode 变量 panic，反向对照不成立"
+        );
+
+        let env = inherited_env(&[]);
+        let got = env
+            .get(PROBE)
+            .expect("lossy 转换后变量必须仍然存在（跳过式策略会让它整条消失）");
+        assert!(
+            got.contains('\u{FFFD}'),
+            "非 Unicode 代理项应替换为 U+FFFD: {got:?}"
+        );
+    }
 }
 
 #[cfg(test)]
