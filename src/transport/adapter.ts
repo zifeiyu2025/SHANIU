@@ -280,6 +280,7 @@ interface Journal {
 type SessionEntry =
   | { kind: 'message'; role: string; text: string; reasoning?: string }
   | { kind: 'tool_call'; call_id: string; tool: string; arguments: string; output?: string }
+  | { kind: 'turn_end'; turn: number; reason: string; at_ms: number; error?: TurnErrorInfo }
 
 /**
  * 会话附件在 prompt 里的落地形状（SH-116 批 1）：宿主只暂存文件字节，模型侧
@@ -483,6 +484,34 @@ function errorDetail(info: TurnErrorInfo): string {
   if (info.provider_message !== undefined) lines.push(info.provider_message)
   else if (info.message !== '') lines.push(info.message)
   return lines.join('\n')
+}
+
+/**
+ * 档案里的结局字符串 → DSH `turn/end` 的 reason 形状（A0-3）。
+ *
+ * 档案只存代码值；这里只做形状翻译，不改写结局——`failed` 绝不能被翻译成
+ * `completed` 或直接省略。
+ */
+function archiveTurnReason(reason: string, error?: TurnErrorInfo): Record<string, unknown> {
+  switch (reason) {
+    case 'completed':
+      return { kind: 'completed' }
+    case 'cancelled':
+      return { kind: 'aborted', reason: { kind: 'user' } }
+    case 'failed':
+      return {
+        kind: 'error',
+        error: {
+          code: error?.code ?? 'UNKNOWN',
+          message: error?.message ?? '回合失败',
+          ...(error === undefined ? {} : { detail: errorDetail(error) }),
+        },
+      }
+    case 'budget_exhausted':
+      return { kind: 'error', error: { code: 'BUDGET_EXHAUSTED', message: '本轮已达到轮次上限' } }
+    default:
+      return { kind: 'unknown' }
+  }
 }
 
 function newJournal(createdAt: number): Journal {
@@ -1343,10 +1372,10 @@ export function createAdapter(options: AdapterOptions): { remote: unknown; dispo
       closeStepMetrics(journal)
       stepOpen = false
     }
-    const closeTurn = (): void => {
+    const closeTurn = (reason: Record<string, unknown> = { kind: 'unknown' }): void => {
       closeStep()
       if (!journal.taskOpen) return
-      pushEvent(journal, 'turn/end', { turn: journal.turn, reason: { kind: 'completed' } })
+      pushEvent(journal, 'turn/end', { turn: journal.turn, reason })
       journal.taskOpen = false
     }
     const startTurn = (): void => {
@@ -1359,6 +1388,12 @@ export function createAdapter(options: AdapterOptions): { remote: unknown; dispo
     }
 
     entries.forEach((entry, index) => {
+      if (entry.kind === 'turn_end') {
+        // 结局行：新档案才有；旧档案走到末尾时 closeTurn() 会落 unknown。
+        if (entry.turn === journal.turn) closeTurn(archiveTurnReason(entry.reason, entry.error))
+        journal.entryToSeq[index] = journal.seq
+        return
+      }
       if (entry.kind === 'message' && entry.role === 'user') {
         startTurn()
         openStep(0)

@@ -123,12 +123,17 @@ async fn rollout_file_matches_history_after_one_task() {
     }
     assert_eq!(first["config_snapshot"]["model"], "m");
 
-    // 其余行都是 response_item，且带 type 标签
-    for line in &lines[1..] {
+    // 其余行是 response_item；最后一行必须是回合结局（A0-3），不能只有正文没有收口。
+    let (end, body) = lines[1..].split_last().expect("至少要有回合结局行");
+    for line in body {
         let v: serde_json::Value = serde_json::from_str(line).unwrap();
-        assert_eq!(v["type"], "response_item", "档案主体只能是 response_item，收到 {v}");
+        assert_eq!(v["type"], "response_item", "档案正文只能是 response_item，收到 {v}");
         assert!(v.get("item").is_some(), "response_item 必须带 item 载荷");
     }
+    let end: serde_json::Value = serde_json::from_str(end).unwrap();
+    assert_eq!(end["type"], "turn_end", "档案收口必须是 turn_end，收到 {end}");
+    assert_eq!(end["reason"], "completed");
+    assert!(end["at_ms"].as_u64().unwrap_or(0) > 0, "结局必须带事件时刻");
 
     // 读回来必须与写出去的一致：user 消息 + assistant(文本+reasoning 未回传则仅正文) + call + output
     let back = rollout::read(&path).unwrap();
@@ -137,8 +142,10 @@ async fn rollout_file_matches_history_after_one_task() {
     let items: Vec<HistoryItem> = back
         .items
         .iter()
-        .map(|i| match i {
-            RolloutItem::ResponseItem { item } => item.clone(),
+        .filter_map(|i| match i {
+            RolloutItem::ResponseItem { item } => Some(item.clone()),
+            // 结局行不进模型历史（回归时单独断言），这里只取正文。
+            RolloutItem::TurnEnd { .. } => None,
             other => panic!("本轮不该出现 {other:?}"),
         })
         .collect();

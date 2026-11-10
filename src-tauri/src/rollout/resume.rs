@@ -97,6 +97,10 @@ pub fn resume(path: &Path) -> Result<Resumed, RolloutError> {
                 // 否则“档案为什么断在这里”又变成无人能解释。
                 tracing::warn!("会话档案含强制中止记录：{reason}");
             }
+            RolloutItem::TurnEnd { reason, .. } => {
+                // 结局只服务于导出/统计/审计，不参与模型历史重建。
+                tracing::debug!("会话档案回合结局：{reason}");
+            }
             RolloutItem::SessionMeta { .. } => {
                 return Err(RolloutError::Corrupted {
                     line: 0,

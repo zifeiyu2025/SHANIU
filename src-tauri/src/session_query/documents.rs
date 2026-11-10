@@ -125,11 +125,12 @@ pub fn build_documents(items: &[RolloutItem], created_at: u64) -> Vec<SearchDoc>
                 parts.extend(paths);
                 push(join_text(&parts), role_doc_type(*role), base_seq, &mut documents);
             }
-            // 首行 meta、子代理引用、档位事件与退出留痕都不是可搜索内容。
+            // 首行 meta、子代理引用、档位事件、退出留痕与回合结局都不是可搜索内容。
             RolloutItem::SessionMeta { .. }
             | RolloutItem::SubagentRef { .. }
             | RolloutItem::SandboxMode { .. }
-            | RolloutItem::AbortNote { .. } => {}
+            | RolloutItem::AbortNote { .. }
+            | RolloutItem::TurnEnd { .. } => {}
         }
     }
     documents

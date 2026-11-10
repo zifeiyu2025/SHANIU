@@ -80,6 +80,18 @@ pub enum RolloutItem {
     /// 这一行把“为什么断”写清楚，resume 与审计才有据可查。
     /// **只在等待超时、被迫退出时写**；正常取消走 `TurnEnd`，不写这里。
     AbortNote { reason: String, at_ms: u64 },
+    /// 回合结局（A0-3）：档案必须如实记录成功/失败/取消/超时，导出与统计都靠它。
+    ///
+    /// 旧档案没有这一行——那是历史事实，读侧只能标 `unknown`，不许默认成成功。
+    TurnEnd {
+        turn: u32,
+        /// `completed` / `cancelled` / `failed` / `budget_exhausted`。
+        reason: String,
+        at_ms: u64,
+        /// 失败时的结构化原因（分类码 + 脱敏后的端点原文）。
+        #[serde(default)]
+        error: Option<crate::events::TurnErrorInfo>,
+    },
 }
 
 #[derive(Debug, thiserror::Error)]

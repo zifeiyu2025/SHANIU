@@ -82,4 +82,43 @@ describe('档案条目 → 逻辑事件', () => {
     expect(events).toHaveLength(1)
     expect((events[0] as { type: string }).type).toBe('session/title')
   })
+
+  it('档案结局行如实进 turn/end：失败不写成成功，原始错误一并带出', () => {
+    const events = sessionEntriesToEvents([
+      { kind: 'message', role: 'user', text: '问' },
+      { kind: 'message', role: 'assistant', text: '半截' },
+      {
+        kind: 'turn_end',
+        turn: 1,
+        reason: 'failed',
+        at_ms: 1_700_000_000_123,
+        error: {
+          code: 'AUTH',
+          message: '密钥无效',
+          http_status: 401,
+          provider_code: 'invalid_api_key',
+          provider_message: 'Invalid API key',
+        },
+      },
+    ], '标题')
+
+    const end = ofType(events, 'turn/end')[0] as { time: number; data: Record<string, unknown> }
+    // 反向对照：把 reason 写死成 completed（修复前的行为），这两条必红。
+    expect(end.data['reason']).toBe('failed')
+    expect(end.data['reason']).not.toBe('completed')
+    expect((end.data['error'] as { code: string }).code).toBe('AUTH')
+    // 导出时间取事件发生时刻，不是导出那一刻。
+    expect(end.time).toBe(1_700_000_000_123)
+  })
+
+  it('旧档案没有结局行 → unknown，不冒充 completed', () => {
+    const events = sessionEntriesToEvents([
+      { kind: 'message', role: 'user', text: '问' },
+      { kind: 'message', role: 'assistant', text: '答' },
+    ], '标题')
+
+    const end = ofType(events, 'turn/end')[0] as { data: Record<string, unknown> }
+    // 反向对照：缺省 completed 会把所有旧档案的失败回合洗成成功。
+    expect(end.data['reason']).toBe('unknown')
+  })
 })

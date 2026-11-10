@@ -24,6 +24,7 @@
  */
 import type { SessionEvent } from '@deepseek-ai/dsh-session/types'
 import type { SessionTitleEventData } from '@deepseek-ai/dsh-session-title/types'
+import type { TurnErrorInfo } from '../transport/types'
 
 /**
  * `session/title` 事件的类型增强。
@@ -48,6 +49,14 @@ export type SessionEntryLike =
     readonly tool: string
     readonly arguments: string
     readonly output?: string
+  }
+  | {
+    /** 回合结局（A0-3）：`completed` / `cancelled` / `failed` / `budget_exhausted`。 */
+    readonly kind: 'turn_end'
+    readonly turn: number
+    readonly reason: string
+    readonly at_ms: number
+    readonly error?: TurnErrorInfo
   }
 
 /** 合成事件的载体：`SessionEvent` 是带条件字段的判别联合，逐字段构造过不了收窄，这里统一承载。 */
@@ -78,13 +87,33 @@ export function sessionEntriesToEvents(
   // 只放一条即可；放最前面也符合"标题先于正文"的阅读顺序。
   push({ type: 'session/title', time: Date.now(), data: { title } })
 
-  const closeTurn = (): void => {
+  /**
+   * 收口当前回合。
+   *
+   * `reason` 缺省为 `unknown`：旧档案没有结局行，只能如实说"不知道"。
+   * 写成 `completed` 会让失败回合在导出里变成成功，任何基于档案的统计、
+   * 审计、评测都会被骗（A0-3）。
+   */
+  const closeTurn = (
+    reason = 'unknown',
+    atMs?: number,
+    error?: TurnErrorInfo,
+  ): void => {
     if (!open) return
-    push({ type: 'turn/end', time: Date.now(), data: { turn, reason: 'completed' } })
+    push({
+      type: 'turn/end',
+      time: atMs ?? Date.now(),
+      data: error === undefined ? { turn, reason } : { turn, reason, error },
+    })
     open = false
   }
 
   for (const entry of entries) {
+    // 结局行由宿主在回合收口时写入；它不属于新回合，只负责关闭当前回合。
+    if (entry.kind === 'turn_end') {
+      if (entry.turn === turn) closeTurn(entry.reason, entry.at_ms, entry.error)
+      continue
+    }
     if (entry.kind === 'message') {
       if (entry.role === 'user') {
         closeTurn()

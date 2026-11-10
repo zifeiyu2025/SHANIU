@@ -221,6 +221,17 @@ where
     Ok(())
 }
 
+/// 档案时间戳：事件发生时刻（Unix 毫秒）。
+///
+/// 刻意不复用序列化时刻：导出/搜索/审计都按它排序，写成"导出那一刻"会让整份
+/// 历史的时间轴塌缩成几个点（A0-4 的根因）。
+fn now_ms() -> u64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|since| since.as_millis() as u64)
+        .unwrap_or(0)
+}
+
 /// 把任务开始时的环境快照插到**最后一条用户消息之前**。
 ///
 /// 顺序理由：快照（时间 / Git）是"交底"，读起来应该跟着任务走；直接追加到用户消息之后
@@ -1185,6 +1196,30 @@ impl AgentLoop {
             reason = TurnEndReasonLocal::Failed;
         }
 
+        // A0-3：回合结局必须落档。导出/统计只认这一行；不写就等于把失败当成功。
+        // 写失败不阻断退出（档案已处于不可写状态），但必须在日志里点名——
+        // 导出侧看不到 TurnEnd 时会标 unknown，不会被当成成功。
+        if let Some(writer) = rollout {
+            let reason_code = match reason {
+                TurnEndReasonLocal::Completed => "completed",
+                TurnEndReasonLocal::Cancelled => "cancelled",
+                TurnEndReasonLocal::Failed => "failed",
+                TurnEndReasonLocal::BudgetExhausted => "budget_exhausted",
+            };
+            if let Err(error) = writer.append(&crate::rollout::RolloutItem::TurnEnd {
+                turn: last_turn,
+                reason: reason_code.to_string(),
+                at_ms: now_ms(),
+                error: turn_error.clone(),
+            }) {
+                tracing::warn!(
+                    target: "rollout",
+                    %error,
+                    "回合结局写入档案失败，导出将标记为 unknown"
+                );
+            }
+        }
+
         emit(&sink, EventMsg::TurnCompleted {
             turn: last_turn,
             reason: match reason {
@@ -1728,6 +1763,45 @@ mod tests {
         .unwrap();
         assert_eq!(recorded, 1, "重试成功后游标必须前进");
         assert_eq!(calls, 2);
+    }
+
+    /// A0-3：失败回合的档案结局必须写 `failed`，不能默认 `completed`。
+    /// 反向对照：撤掉收口处的 TurnEnd 追加，最后一行会变回 `response_item`，本用例红。
+    #[tokio::test]
+    async fn turn_end_is_recorded_with_real_reason() {
+        let dir = std::env::temp_dir().join(format!(
+            "shaniu-a0-turnend-{}",
+            std::process::id()
+        ));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let meta = crate::rollout::RolloutItem::SessionMeta {
+            session_id: "session".into(),
+            agent_id: "agent".into(),
+            parent_id: None,
+            created_at: 0,
+            config_snapshot: crate::rollout::ConfigSnapshot::default(),
+        };
+        let writer = Arc::new(crate::rollout::RolloutWriter::create(&dir, &meta).unwrap());
+        let (mut agent, store, cancel, _broker) = make_loop(vec![vec![ModelStreamEvent::Failed {
+            message: "boom".into(),
+            error: None,
+        }]]);
+        agent.rollout = Some(writer.clone());
+
+        agent.run_task("任务", Arc::new(CapturingSink(store)), cancel).await;
+
+        let text = std::fs::read_to_string(writer.path()).unwrap();
+        let last = text.lines().rev().find(|line| !line.trim().is_empty()).unwrap();
+        match serde_json::from_str::<crate::rollout::RolloutItem>(last).unwrap() {
+            crate::rollout::RolloutItem::TurnEnd { turn, reason, error, .. } => {
+                assert_eq!(turn, 1);
+                assert_eq!(reason, "failed");
+                assert_eq!(error.expect("失败结局必须带结构化原因").code, "UNKNOWN");
+            }
+            other => panic!("档案最后一行必须是回合结局，实际为 {other:?}"),
+        }
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[tokio::test]

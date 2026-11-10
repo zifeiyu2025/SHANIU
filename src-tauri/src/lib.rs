@@ -643,6 +643,14 @@ pub enum SessionEntry {
         #[serde(skip_serializing_if = "Option::is_none")]
         output: Option<String>,
     },
+    /// 回合结局（A0-3）。旧档案没有这一条，导出侧必须标 `unknown` 而不是成功。
+    TurnEnd {
+        turn: u32,
+        reason: String,
+        at_ms: u64,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        error: Option<events::TurnErrorInfo>,
+    },
 }
 
 /// 档案历史 → 展示条目。
@@ -718,6 +726,15 @@ fn project_entries(items: &[rollout::RolloutItem]) -> Vec<SessionEntry> {
                     .to_string(),
                     text: shown,
                     reasoning: None,
+                });
+            }
+            // 回合结局：如实带给导出/审计，不进对话历史。
+            rollout::RolloutItem::TurnEnd { turn, reason, at_ms, error } => {
+                out.push(SessionEntry::TurnEnd {
+                    turn: *turn,
+                    reason: reason.clone(),
+                    at_ms: *at_ms,
+                    error: error.clone(),
                 });
             }
             // 首行 meta 不是历史；子代理引用要等 SH-056 的泳道 UI 才有展示形态；

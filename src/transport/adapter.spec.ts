@@ -1418,6 +1418,57 @@ describe('适配层的命令面映射', () => {
     expect(replayTypes).toEqual(liveTypes)
   })
 
+  it('重开档案按结局行收口：失败回合不会在回放里变成 completed', async () => {
+    const archive = [
+      { kind: 'message', role: 'user', text: '问' },
+      { kind: 'message', role: 'assistant', text: '半截' },
+      {
+        kind: 'turn_end',
+        turn: 1,
+        reason: 'failed',
+        at_ms: 1_700_000_000_123,
+        error: {
+          code: 'AUTH',
+          message: '密钥无效',
+          http_status: 401,
+          provider_code: 'invalid_api_key',
+          provider_message: 'Invalid API key',
+        },
+      },
+    ]
+    const reopened = createAdapter({ bridge: scriptedBridge(undefined, archive) })
+    const iterator = faceOf(reopened.remote).session.follow({ address: { kind: 'session', sessionId: 'agent-old' } })
+    const events = eventsOf((await iterator.next()).value as Record<string, unknown>)
+    await iterator.return?.(undefined)
+    reopened.dispose()
+
+    const reason = (events.find(event => event['type'] === 'turn/end')?.['data'] as {
+      reason: { kind: string; error?: { code: string; message: string; detail?: string } }
+    }).reason
+    // 反向对照：replayArchive 里沿用 `{ kind: 'completed' }` 时这里必红。
+    expect(reason.kind).toBe('error')
+    expect(reason.error?.code).toBe('AUTH')
+    expect(reason.error?.message).toBe('密钥无效')
+    expect(reason.error?.detail).toContain('HTTP 401')
+  })
+
+  it('旧档案没有结局行 → 回放收口为 unknown，不冒充成功', async () => {
+    const archive = [
+      { kind: 'message', role: 'user', text: '问' },
+      { kind: 'message', role: 'assistant', text: '答' },
+    ]
+    const reopened = createAdapter({ bridge: scriptedBridge(undefined, archive) })
+    const iterator = faceOf(reopened.remote).session.follow({ address: { kind: 'session', sessionId: 'agent-old' } })
+    const events = eventsOf((await iterator.next()).value as Record<string, unknown>)
+    await iterator.return?.(undefined)
+    reopened.dispose()
+
+    const reason = (events.find(event => event['type'] === 'turn/end')?.['data'] as {
+      reason: { kind: string }
+    }).reason
+    expect(reason.kind).toBe('unknown')
+  })
+
   it('模型席位只反映宿主真实配置，选模写回服务商文档并推投影', async () => {
     const bridge = scriptedBridge()
     const { remote, dispose } = createAdapter({ bridge })
