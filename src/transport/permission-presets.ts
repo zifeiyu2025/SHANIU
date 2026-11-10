@@ -43,16 +43,12 @@ export const DEFAULT_PERMISSION_PRESET: string = PERMISSION_PRESETS[0] ?? 'read-
 /**
  * 挡位选项的静态目录（形状照上游 PermissionCatalog.options；name 给机器值走界面词典）。
  * 只服务于 `remote.permissionPresets` 的 catalog 应答。
+ *
+ * **不带 `description`**：说明文案是界面文案，只能来自界面词典
+ * （`ui-permission-presets` 的 `preset.*.description`）。写在这里会被 `/permission`
+ * 下拉的 detail 与芯片 tooltip 原样渲染，等于把中文硬编码进 en 界面。
  */
-export const PERMISSION_PRESET_OPTIONS = PERMISSION_PRESETS.map(value => ({
-  value,
-  name: value,
-  description: value === 'read-only'
-    ? '只读查看，不产生任何写入'
-    : value === 'workspace-write'
-      ? '仅在工作区内读写'
-      : '不受工作区边界限制',
-}))
+export const PERMISSION_PRESET_OPTIONS = PERMISSION_PRESETS.map(value => ({ value, name: value }))
 
 /**
  * 宿主沙箱档 → DSH 挡位键。读不到/认不出的档回落 {@link DEFAULT_PERMISSION_PRESET}：

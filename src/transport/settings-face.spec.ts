@@ -352,7 +352,7 @@ describe('settings 面：读视图', () => {
     expect((described['value'] as { writable: boolean }).writable).toBe(false)
     const written = await face.settings.mutate('llm-pi-ai', [{ op: 'set', path: ['providers', 'x'], value: profileValue() }])
     expect(written['ok']).toBe(false)
-    expect((written['error'] as Error).message).toContain('读不到')
+    expect((written['error'] as Error).message).toContain('provider document unavailable')
     // 拿空文档写回去就等于删光用户已有服务商，这条路必须一条命令都不发
     expect(host.calls.some(call => call.command === 'save_providers')).toBe(false)
   })
@@ -442,7 +442,7 @@ describe('settings 面：写路径', () => {
     const face = faceOf(fakeHost([LONGCAT]))
     // 自定义请求头自 SH-097 起接线，从拒绝清单移除
     const cases: [string, Record<string, unknown>, string][] = [
-      ['非 OpenAI 协议', profileValue({ api: 'anthropic-messages' }), '不支持协议'],
+      ['非 OpenAI 协议', profileValue({ api: 'anthropic-messages' }), 'does not support protocol "anthropic-messages"'],
       ['非法路由名', profileValue(), ''],
     ]
     for (const [label, value, keyword] of cases) {
@@ -453,7 +453,7 @@ describe('settings 面：写路径', () => {
     }
     const badRoute = await face.settings.mutate('llm-pi-ai', [{ op: 'set', path: ['providers', 'Bad Route'], value: profileValue() }], 0)
     expect(badRoute['ok']).toBe(false)
-    expect((badRoute['error'] as Error).message).toContain('路由名')
+    expect((badRoute['error'] as Error).message).toContain('provider route "Bad Route": invalid')
 
     // 推理档自 SH-096 起接线：拒绝断言换成校验断言（未知档位 / 非 off 缺 wire 值）
     const unknownLevel = await face.settings.mutate('llm-pi-ai', [{
@@ -462,7 +462,7 @@ describe('settings 面：写路径', () => {
       value: profileValue({ models: [{ id: 'a', reasoningEfforts: { ultra: 'ultra' } }] }),
     }], 0)
     expect(unknownLevel['ok']).toBe(false)
-    expect((unknownLevel['error'] as Error).message).toContain('未知推理档位')
+    expect((unknownLevel['error'] as Error).message).toContain('unknown reasoning level "ultra"')
 
     const blankWire = await face.settings.mutate('llm-pi-ai', [{
       op: 'set',
@@ -470,13 +470,13 @@ describe('settings 面：写路径', () => {
       value: profileValue({ models: [{ id: 'a', reasoningEfforts: { low: '' } }] }),
     }], 0)
     expect(blankWire['ok']).toBe(false)
-    expect((blankWire['error'] as Error).message).toContain('缺 wire 值')
+    expect((blankWire['error'] as Error).message).toContain('wire value is required')
 
     const badRef = await face.settings.mutate('llm-pi-ai', [{
       op: 'set', path: ['providers', 'x'], value: profileValue({ apiKeyEnv: '../evil' }),
     }], 0)
     expect(badRef['ok']).toBe(false)
-    expect((badRef['error'] as Error).message).toContain('密钥引用名')
+    expect((badRef['error'] as Error).message).toContain('secret reference "../evil": invalid')
   })
 
   it('推理档声明（SH-096）：null 翻成落盘空串、false 归一缺席，写面带校验', async () => {
@@ -572,7 +572,7 @@ describe('settings 面：写路径', () => {
     // 未声明的档位拒绝：静默收下会让运行时查不到 wire 值、跑的还是默认档
     const bogus = await face.session.selectModel({ provider: 'longcat', model: 'LongCat-2.5', reasoningEffort: 'xhigh' })
     expect(bogus['ok']).toBe(false)
-    expect((bogus['error'] as Error).message).toContain('未声明推理档位')
+    expect((bogus['error'] as Error).message).toContain('does not declare reasoning level')
 
     // 模型行点击不带 effort（上游 ModelSelect.tsx:596 的事实形状）= 保留现有档位，
     // 绝不清空——清空会让"配置选好的 high"被一次普通选模型抹掉（真机缺陷 05:08）
@@ -751,14 +751,14 @@ describe('权限挡位域（permission 命名空间，SH-105 补修）', () => {
     const host = fakeHost([LONGCAT])
     const face = faceOf(host)
     const cases: [string, Record<string, unknown>[], string][] = [
-      ['上游实验档 auto 不在目录里', [{ op: 'set', path: ['defaultPreset'], value: 'auto' }], '未知权限挡位'],
-      ['非字符串挡位', [{ op: 'set', path: ['defaultPreset'], value: 3 }], '未知权限挡位'],
+      ['上游实验档 auto 不在目录里', [{ op: 'set', path: ['defaultPreset'], value: 'auto' }], 'unknown permission preset'],
+      ['非字符串挡位', [{ op: 'set', path: ['defaultPreset'], value: 3 }], 'unknown permission preset'],
       ['未知字段', [{ op: 'set', path: ['approvalMode'], value: 'never' }], 'defaultPreset'],
-      ['删除语义', [{ op: 'unset', path: ['defaultPreset'] }], '只能把挡位设为某一档'],
+      ['删除语义', [{ op: 'unset', path: ['defaultPreset'] }], 'has no removable key'],
       ['多 op', [
         { op: 'set', path: ['defaultPreset'], value: 'read-only' },
         { op: 'set', path: ['defaultPreset'], value: 'danger-full-access' },
-      ], '一次只接受一个写入'],
+      ], 'takes exactly one write'],
     ]
     for (const [label, ops, keyword] of cases) {
       const result = await face.settings.mutate('permission', ops, 0)
@@ -877,7 +877,7 @@ describe('llm 面', () => {
     const calls = host.calls.filter(entry => entry.command === 'discover_models').length
     const blank = await face.llm.discoverModels('llm-pi-ai', {})
     expect(blank['ok']).toBe(false)
-    expect((blank['error'] as Error).message).toContain('端点地址为空')
+    expect((blank['error'] as Error).message).toContain('endpoint is empty')
     expect(host.calls.filter(entry => entry.command === 'discover_models').length).toBe(calls)
 
     // 不支持的协议：上游目录之外的 api 拒绝
@@ -885,7 +885,7 @@ describe('llm 面', () => {
       baseURL: 'https://x/v1', api: 'anthropic-messages',
     })
     expect(unsupported['ok']).toBe(false)
-    expect((unsupported['error'] as Error).message).toContain('OpenAI 兼容端点')
+    expect((unsupported['error'] as Error).message).toContain('OpenAI-compatible endpoints')
   })
 
   it('listProviders 只列真能跑的，名字取展示名并回落目录名', async () => {

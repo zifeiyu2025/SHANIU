@@ -1368,7 +1368,7 @@ describe('适配层的命令面映射', () => {
     const { remote, dispose } = createAdapter({ bridge })
     const result = await faceOf(remote).session.selectModel({ sessionId: 'a', provider: 'longcat', model: '不存在的模型' })
     expect(result['ok']).toBe(false)
-    expect((result['error'] as Error).message).toContain('模型清单里没有')
+    expect((result['error'] as Error).message).toContain('is not listed under provider')
     expect(bridge.calls.some(call => call.command === 'save_providers')).toBe(false)
     dispose()
   })
@@ -1453,6 +1453,9 @@ describe('权限挡位与底部指标的数据面', () => {
       defaultPreset: string
     }
     expect(catalog.options.map(option => option.value)).toEqual(['read-only', 'workspace-write', 'danger-full-access'])
+    // 说明行是界面文案，只能来自界面词典：宿主目录带 description 就会被下拉 detail
+    // 原样渲染成中文（en 界面串语言），所以这里锁住「不下发」。
+    expect(catalog.options.every(option => !('description' in option))).toBe(true)
     expect(catalog.defaultOptions.map(option => option.value)).toEqual(['read-only', 'workspace-write', 'danger-full-access'])
     expect(catalog.defaultPreset).toBe('workspace-write')
 

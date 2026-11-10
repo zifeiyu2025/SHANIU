@@ -18,6 +18,7 @@ import { PERMISSION_ACCESS_NS } from './locales.ts'
 import {
   AUTO_REVIEW_PRESET as AUTO_REVIEW,
   displayPermissionPreset,
+  displayPermissionPresetDescription,
   FULL_ACCESS_PRESET as FULL_ACCESS,
 } from './presentation.ts'
 import css from './PermissionSelect.module.css'
@@ -50,12 +51,13 @@ function optionBadge(value: string, t: PermissionSelectProps['t']): string | und
   return value === AUTO_REVIEW ? t('auto.badge') : undefined
 }
 
-/** Resolve locale-owned copy for the shipped Auto option; preserve host copy for other presets. */
+/** Resolve locale-owned copy for the built-in presets; preserve host copy for other presets. */
 function optionDescription(
   option: PresetOption,
   t: PermissionSelectProps['t'],
 ): string | undefined {
-  return option.value === AUTO_REVIEW ? t('auto.description') : option.description
+  if (option.value === AUTO_REVIEW) return t('auto.description')
+  return displayPermissionPresetDescription(option.value, key => t(key)) ?? option.description
 }
 
 /** Business face injected by the permission package's slot registration. */

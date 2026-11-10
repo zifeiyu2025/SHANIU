@@ -44,7 +44,7 @@ import {
   accessEn, accessJa, accessEs, accessFr, accessDe, accessRu, accessPt, accessZh, en, ja, es, fr, de, ru, pt, PERMISSION_ACCESS_NS, zh,
 } from './locales.ts'
 import {
-  AUTO_REVIEW_PRESET, displayPermissionPreset, FULL_ACCESS_PRESET,
+  AUTO_REVIEW_PRESET, displayPermissionPreset, displayPermissionPresetDescription, FULL_ACCESS_PRESET,
 } from './presentation.ts'
 import { PermissionPresetSettingsController } from './settings-store.ts'
 
@@ -74,6 +74,18 @@ function selectionOf(session: SessionFace | undefined): PermissionSelection | un
   return session?.projections.faceOf('permissions').getSnapshot() as PermissionSelection | undefined
 }
 
+/**
+ * 内置挡位的说明行：词典有就进 detail，词典没有的自定义挡位沿用宿主给的 description。
+ * detail 由弹出选择器原样渲染，宿主串只在这个兜底分支里出现。
+ */
+function presetDetail(
+  option: { value: string; description?: string },
+  t: TranslateNS<typeof PERMISSION_ACCESS_NS>,
+): { detail?: string } {
+  const detail = displayPermissionPresetDescription(option.value, t) ?? option.description
+  return detail === undefined ? {} : { detail }
+}
+
 /** Join the process catalog with one Session's current value. */
 function optionsOf(
   catalog: PermissionCatalog,
@@ -89,7 +101,7 @@ function optionsOf(
       ...(option.value === AUTO_REVIEW_PRESET ? { badge: t('auto.badge') } : {}),
       ...(option.value === AUTO_REVIEW_PRESET
         ? { detail: t('auto.description') }
-        : option.description !== undefined ? { detail: option.description } : {}),
+        : presetDetail(option, t)),
       ...(option.value === currentValue ? { active: true } : {}),
       ...(option.value === FULL_ACCESS_PRESET || option.value === AUTO_REVIEW_PRESET
         ? {

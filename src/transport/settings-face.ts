@@ -10,6 +10,11 @@
  * 分层口径照 DSH 自己：`base` 空、`user` 装全部服务商。设置页按"在 user 且不在 base
  * 才可删"判定 removable（`ui-settings-models/src/client/store.ts:255`），把服务商放
  * `base` 会让用户删不掉自己刚加的那家。
+ *
+ * **文案口径**：这一层拿不到 DSH 的 `t`（`createSettingsFace` 只有 bridge），所以
+ * 界面文案（挡位名称、说明、按钮）留在界面词典里；这里的拒绝理由与诊断是**英文**，
+ * 它们描述的是文档结构问题（字段名、协议名本来就是英文标识符），两种界面语言下
+ * 都不会冒出另一门语言的散文。
  */
 import z from '@deepseek-ai/schemastery'
 import { RemoteError } from '@deepseek-ai/dsh-typert-protocol'
@@ -482,20 +487,26 @@ export function createSettingsFace(bridge: HostBridge, options: SettingsFaceOpti
     revision: permissionRevision,
   })
 
-  /** 视图里的一行 profile → 文档行。不认识的内容一律抛 Refusal，不静默降级。 */
+  /**
+   * 视图里的一行 profile → 文档行。不认识的内容一律抛 Refusal，不静默降级。
+   *
+   * 拒绝理由用英文：它会原样显示在设置卡片的告警行，而这一层没有词典
+   * （`createSettingsFace` 只有 bridge）。界面文案进词典，文档校验诊断用英文标识符，
+   * 两种语言下都不会出现「另一门语言的散文」。
+   */
   const parseProfile = (route: string, profile: JsonValue, previous: HostProviderRow | undefined): ProviderPayload => {
-    if (!ROUTE_GRAMMAR.test(route)) throw new Refusal(`服务商路由名 ${route} 不合法（需小写字母开头，可含数字与单个连字符）`)
-    if (!isRecord(profile)) throw new Refusal(`服务商 ${route} 的配置必须是对象`)
+    if (!ROUTE_GRAMMAR.test(route)) throw new Refusal(`provider route "${route}": invalid (lowercase letter first; digits and single hyphens allowed)`)
+    if (!isRecord(profile)) throw new Refusal(`provider "${route}": config must be an object`)
     for (const key of Object.keys(profile)) {
       if (PROFILE_KEYS.has(key)) continue
-      throw new Refusal(`服务商 ${route} 含 SHANIU 不认识的配置项 ${key}`)
+      throw new Refusal(`provider "${route}": unknown setting "${key}"`)
     }
     // 自定义请求头（SH-097）：结构由 schema 保证（dict<string>），名字与值的
     // 合法性（头名 token、头注入）交给宿主 validate_providers 统一拦
     const rawHeaders = profile.headers
     let headers: Record<string, string> | undefined
     if (rawHeaders !== undefined) {
-      if (!isRecord(rawHeaders)) throw new Refusal(`服务商 ${route} 的 headers 必须是字符串到字符串的映射`)
+      if (!isRecord(rawHeaders)) throw new Refusal(`provider "${route}": headers must map string to string`)
       headers = {}
       for (const [name, value] of Object.entries(rawHeaders)) headers[name] = String(value)
     } else if (previous?.headers !== undefined && Object.keys(previous.headers).length > 0) {
@@ -505,30 +516,30 @@ export function createSettingsFace(bridge: HostBridge, options: SettingsFaceOpti
     const api = profile.api
     let provider = 'openai-chat'
     if (api !== undefined) {
-      if (typeof api !== 'string') throw new Refusal(`服务商 ${route} 的 api 必须是协议名`)
+      if (typeof api !== 'string') throw new Refusal(`provider "${route}": api must be a protocol name`)
       const mapped = HOST_OF_API[api]
       if (mapped === undefined) {
-        throw new Refusal(`SHANIU 后端不支持协议 ${api}，可用：openai-completions / openai-responses`)
+        throw new Refusal(`SHANIU backend does not support protocol "${api}"; use openai-completions / openai-responses`)
       }
       provider = mapped
     }
     const baseURL = profile.baseURL === undefined
       ? previous?.baseUrl ?? ''
-      : typeof profile.baseURL === 'string' ? profile.baseURL.trim() : (() => { throw new Refusal(`服务商 ${route} 的 baseURL 必须是字符串`) })()
+      : typeof profile.baseURL === 'string' ? profile.baseURL.trim() : (() => { throw new Refusal(`provider "${route}": baseURL must be a string`) })()
     const secretRef = profile.apiKeyEnv === undefined
       ? previous?.secretRef ?? ''
-      : typeof profile.apiKeyEnv === 'string' ? profile.apiKeyEnv.trim() : (() => { throw new Refusal(`服务商 ${route} 的 apiKeyEnv 必须是字符串`) })()
+      : typeof profile.apiKeyEnv === 'string' ? profile.apiKeyEnv.trim() : (() => { throw new Refusal(`provider "${route}": apiKeyEnv must be a string`) })()
     if (secretRef !== '' && !REF_GRAMMAR.test(secretRef)) {
-      throw new Refusal(`密钥引用名 ${secretRef} 不合法：必须是环境变量写法（字母或下划线开头，只含字母、数字、下划线）`)
+      throw new Refusal(`secret reference "${secretRef}": invalid (environment-variable form: a letter or underscore first, then letters, digits, underscores)`)
     }
     const rawModels = profile.models === undefined
       ? previous === undefined ? [] : modelRowsOf(previous)
       : profile.models
-    if (!Array.isArray(rawModels)) throw new Refusal(`服务商 ${route} 的 models 必须是数组`)
+    if (!Array.isArray(rawModels)) throw new Refusal(`provider "${route}": models must be an array`)
     const models = rawModels.map(raw => parseModelRow(route, raw))
     const label = profile.displayName === undefined
       ? previous?.label ?? PROVIDER_CATALOG[route]?.displayName ?? route
-      : typeof profile.displayName === 'string' ? profile.displayName.trim() : (() => { throw new Refusal(`服务商 ${route} 的 displayName 必须是字符串`) })()
+      : typeof profile.displayName === 'string' ? profile.displayName.trim() : (() => { throw new Refusal(`provider "${route}": displayName must be a string`) })()
     return {
       id: route,
       label,
@@ -545,47 +556,47 @@ export function createSettingsFace(bridge: HostBridge, options: SettingsFaceOpti
   }
 
   const parseModelRow = (route: string, raw: unknown): ProviderPayload['models'][number] => {
-    if (!isRecord(raw)) throw new Refusal(`服务商 ${route} 有模型行不是对象`)
+    if (!isRecord(raw)) throw new Refusal(`provider "${route}": every model row must be an object`)
     for (const key of Object.keys(raw)) {
       if (MODEL_KEYS.has(key)) continue
-      throw new Refusal(`服务商 ${route} 的模型行含 SHANIU 不认识的字段 ${key}`)
+      throw new Refusal(`provider "${route}": model row has unknown field "${key}"`)
     }
     const id = typeof raw.id === 'string' ? raw.id.trim() : ''
-    if (id === '') throw new Refusal(`服务商 ${route} 有模型行缺 id`)
+    if (id === '') throw new Refusal(`provider "${route}": model row is missing id`)
     const positive = (key: string): number => {
       const value = raw[key]
       if (value === undefined) return 0
       if (typeof value !== 'number' || !Number.isInteger(value) || value <= 0) {
-        throw new Refusal(`服务商 ${route} 的模型 ${id} 的 ${key} 必须是正整数`)
+        throw new Refusal(`provider "${route}": model "${id}": ${key} must be a positive integer`)
       }
       return value
     }
     const input = raw.input === undefined ? [] : raw.input
     if (!Array.isArray(input) || input.some(item => item !== 'text' && item !== 'image')) {
-      throw new Refusal(`服务商 ${route} 的模型 ${id} 的 input 只能是 text / image`)
+      throw new Refusal(`provider "${route}": model "${id}": input must be text / image`)
     }
     // 推理档声明（SH-096）：`false` = 显式声明非推理模型，SHANIU 没有可继承的
     // 目录，与缺席等价，归一成空 map；dict 的 null 值（off 档）落盘成空串。
     const rawEfforts = raw.reasoningEfforts
     const reasoning_efforts: Record<string, string> = {}
     if (rawEfforts !== undefined && rawEfforts !== false) {
-      if (!isRecord(rawEfforts)) throw new Refusal(`服务商 ${route} 的模型 ${id} 的 reasoningEfforts 必须是档位到 wire 值的映射`)
+      if (!isRecord(rawEfforts)) throw new Refusal(`provider "${route}": model "${id}": reasoningEfforts must map level to wire value`)
       const levels = thinkingLevels()
       for (const [level, wire] of Object.entries(rawEfforts)) {
         if (!levels.includes(level)) {
-          throw new Refusal(`服务商 ${route} 的模型 ${id} 有未知推理档位 ${level}（可用：${levels.join('/')}）`)
+          throw new Refusal(`provider "${route}": model "${id}": unknown reasoning level "${level}" (available: ${levels.join('/')})`)
         }
         const value = wire === null || wire === undefined ? '' : wire
         if (typeof value !== 'string') {
-          throw new Refusal(`服务商 ${route} 的模型 ${id} 的推理档位 ${level} 的 wire 值必须是字符串或 null`)
+          throw new Refusal(`provider "${route}": model "${id}": reasoning level "${level}": wire value must be a string or null`)
         }
         if (level !== 'off' && value.trim() === '') {
-          throw new Refusal(`服务商 ${route} 的模型 ${id} 的推理档位 ${level} 缺 wire 值（只有 off 允许为空）`)
+          throw new Refusal(`provider "${route}": model "${id}": reasoning level "${level}": wire value is required (only off may be empty)`)
         }
         reasoning_efforts[level] = value
       }
       if (Object.values(reasoning_efforts).every(v => v.trim() === '')) {
-        throw new Refusal(`服务商 ${route} 的模型 ${id} 的推理档位只声明了 off：至少给一个非 off 档 wire 值`)
+        throw new Refusal(`provider "${route}": model "${id}": reasoningEfforts declares only off; give a wire value for at least one non-off level`)
       }
     }
     return {
@@ -741,7 +752,7 @@ export function createSettingsFace(bridge: HostBridge, options: SettingsFaceOpti
 
   const applySandboxMode = async (mode: string): Promise<void> => {
     await ensure()
-    if (snapshot === undefined) throw new Error('读不到宿主设置，无法切换挡位')
+    if (snapshot === undefined) throw new Error('host settings unavailable; cannot switch sandbox preset')
     // 非法档位由宿主 save_settings 校验并报错（lib.rs 的 SANDBOX_MODE_NAMES），
     // 这里不预判一份平行清单——两处清单迟早漂移，宿主那份才是事实来源。
     //
@@ -787,29 +798,29 @@ export function createSettingsFace(bridge: HostBridge, options: SettingsFaceOpti
     const ns = 'permission'
     await ensure()
     if (snapshot === undefined) {
-      return refused(new RemoteError('settings/rejected', '读不到宿主设置，未写入权限挡位', { ns }))
+      return refused(new RemoteError('settings/rejected', 'host settings unavailable; permission preset not written', { ns }))
     }
     if (expectedRevision !== undefined && expectedRevision !== permissionRevision) {
-      return refused(new RemoteError('settings/conflict', '权限挡位已被改动，请重新读取后再写', {
+      return refused(new RemoteError('settings/conflict', 'permission preset changed; read it again before writing', {
         ns, expected: expectedRevision, actual: permissionRevision,
       }))
     }
     if (ops.length !== 1) {
-      return refused(new RemoteError('settings/rejected', `权限域一次只接受一个写入，收到 ${ops.length} 个`, { ns }))
+      return refused(new RemoteError('settings/rejected', `permission namespace takes exactly one write, got ${ops.length}`, { ns }))
     }
     const op = ops[0]!
     if (op.op !== 'set') {
-      return refused(new RemoteError('settings/rejected', '权限域没有可删除的键，只能把挡位设为某一档', { ns }))
+      return refused(new RemoteError('settings/rejected', 'permission namespace has no removable key; set the preset instead', { ns }))
     }
     if (op.path.length !== 1 || op.path[0] !== 'defaultPreset') {
-      const where = op.path.length === 0 ? '(空路径)' : op.path.join('.')
-      return refused(new RemoteError('settings/rejected', `权限域只有一个可写字段 defaultPreset，收到 ${where}`, { ns }))
+      const where = op.path.length === 0 ? '(empty path)' : op.path.join('.')
+      return refused(new RemoteError('settings/rejected', `permission namespace has a single writable field defaultPreset, got ${where}`, { ns }))
     }
     const preset = typeof op.value === 'string' ? op.value : ''
     const sandbox = PRESET_TO_SANDBOX[preset]
     if (sandbox === undefined) {
       return refused(new RemoteError('settings/rejected',
-        `未知权限挡位 ${typeof op.value === 'string' ? op.value : JSON.stringify(op.value)}（可用：${PERMISSION_PRESETS.join(' / ')}）`, { ns }))
+        `unknown permission preset ${typeof op.value === 'string' ? op.value : JSON.stringify(op.value)} (available: ${PERMISSION_PRESETS.join(' / ')})`, { ns }))
     }
     try {
       await applySandboxMode(sandbox)
@@ -849,7 +860,7 @@ export function createSettingsFace(bridge: HostBridge, options: SettingsFaceOpti
         // 这是个纯客户端显示偏好，落 localStorage；其余形状如实拒绝。
         if (ns === 'ui-settings') {
           if (expectedRevision !== undefined && expectedRevision !== developerToolsRevision) {
-            return refused(new RemoteError('settings/conflict', '显示代码工作视图已被改动，请重新读取后再写', {
+            return refused(new RemoteError('settings/conflict', 'developer tools view changed; read it again before writing', {
               ns, expected: expectedRevision, actual: developerToolsRevision,
             }))
           }
@@ -857,7 +868,7 @@ export function createSettingsFace(bridge: HostBridge, options: SettingsFaceOpti
           const enabled = isRecord(next) ? next['enabled'] : undefined
           const unknown = isRecord(next) ? Object.keys(next).filter(key => key !== 'enabled') : []
           if (typeof enabled !== 'boolean' || unknown.length > 0) {
-            return refused(new RemoteError('settings/rejected', '显示代码工作视图只接受 set enabled=<boolean>', { ns }))
+            return refused(new RemoteError('settings/rejected', 'developer tools view accepts only set enabled=<boolean>', { ns }))
           }
           developerToolsEnabled = enabled
           writeDeveloperTools(enabled)
@@ -866,18 +877,18 @@ export function createSettingsFace(bridge: HostBridge, options: SettingsFaceOpti
           return ok(viewOfUiSettings())
         }
         // 权限挡位（SH-105 补修）：DSH 的权限设置行走这条写面。缺了这条分支时旧代码
-        // 会落到下面那句 `SHANIU 没有 permission 这个配置域`——界面把这句话显示在
-        // 设置行里，用户看到的就是"切不动，还有一个看不懂的错"。
+        // 会落到下面那句 `SHANIU has no settings namespace "permission"`——界面把这句话
+        // 显示在设置行里，用户看到的就是"切不动，还有一个看不懂的错"。
         if (ns === 'permission') return mutatePermission(ops, expectedRevision)
         if (ns !== 'llm-pi-ai') {
-          return refused(new RemoteError('settings/rejected', `SHANIU 没有 ${ns} 这个配置域`, { ns }))
+          return refused(new RemoteError('settings/rejected', `SHANIU has no settings namespace "${ns}"`, { ns }))
         }
         await ensure()
         if (snapshot === undefined) {
-          return refused(new RemoteError('settings/rejected', '读不到宿主服务商文档，未写入', { ns }))
+          return refused(new RemoteError('settings/rejected', 'host provider document unavailable; nothing written', { ns }))
         }
         if (expectedRevision !== undefined && expectedRevision !== snapshot.providerRevision) {
-          return refused(new RemoteError('settings/conflict', '服务商文档已被改动，请重新读取后再写', {
+          return refused(new RemoteError('settings/conflict', 'provider document changed; read it again before writing', {
             ns, expected: expectedRevision, actual: snapshot.providerRevision,
           }))
         }
@@ -923,7 +934,7 @@ export function createSettingsFace(bridge: HostBridge, options: SettingsFaceOpti
       },
       discoverModels: async (settingsNs, request) => {
         if (settingsNs !== 'llm-pi-ai') {
-          return refused(new RemoteError('llm/model-discovery-rejected', `SHANIU 没有 ${settingsNs} 这个配置域`, { settingsNs }))
+          return refused(new RemoteError('llm/model-discovery-rejected', `SHANIU has no settings namespace "${settingsNs}"`, { settingsNs }))
         }
         const entry = request.provider === undefined ? undefined : PROVIDER_CATALOG[request.provider]
         if (entry !== undefined) {
@@ -939,12 +950,12 @@ export function createSettingsFace(bridge: HostBridge, options: SettingsFaceOpti
         // （表单里刚输入未存的）由宿主优先使用、用完即弃。
         const baseURL = (request.baseURL ?? '').trim()
         if (baseURL === '') {
-          return refused(new RemoteError('llm/model-discovery-rejected', '端点地址为空：拉取模型需要 baseURL，或手工填写模型行', { settingsNs }))
+          return refused(new RemoteError('llm/model-discovery-rejected', 'endpoint is empty: model discovery needs a baseURL, or fill model rows by hand', { settingsNs }))
         }
         const api = request.api
         if (api !== undefined && api !== 'openai-completions' && api !== 'openai-responses') {
           return refused(new RemoteError('llm/model-discovery-rejected',
-            `SHANIU 只支持 OpenAI 兼容端点的模型发现（openai-completions / openai-responses），收到 ${api}`,
+            `SHANIU only discovers models on OpenAI-compatible endpoints (openai-completions / openai-responses), got ${api}`,
             { settingsNs, baseURL }))
         }
         try {
@@ -963,7 +974,7 @@ export function createSettingsFace(bridge: HostBridge, options: SettingsFaceOpti
     credentials: {
       describe: async (refs) => {
         if (refs.length > MAX_DESCRIBE_REFS) {
-          return refused(new RemoteError('credential/rejected', `一次最多描述 ${MAX_DESCRIBE_REFS} 个引用`, { ref: refs[0] ?? '' }))
+          return refused(new RemoteError('credential/rejected', `at most ${MAX_DESCRIBE_REFS} references per call`, { ref: refs[0] ?? '' }))
         }
         await ensure()
         const info: Record<string, CredentialInfo> = {}
@@ -986,10 +997,10 @@ export function createSettingsFace(bridge: HostBridge, options: SettingsFaceOpti
       },
       set: async (ref, value) => {
         if (!REF_GRAMMAR.test(ref)) {
-          return refused(new RemoteError('credential/rejected', `密钥引用名 ${ref} 不合法：必须是环境变量写法`, { ref }))
+          return refused(new RemoteError('credential/rejected', `secret reference "${ref}": invalid (environment-variable form)`, { ref }))
         }
         if (value.length === 0) {
-          return refused(new RemoteError('credential/rejected', '密钥不能为空', { ref }))
+          return refused(new RemoteError('credential/rejected', 'API key must not be empty', { ref }))
         }
         try {
           await bridge.invoke('store_api_key', { provider: ref, key: value })
@@ -1003,7 +1014,7 @@ export function createSettingsFace(bridge: HostBridge, options: SettingsFaceOpti
       },
       unset: async (ref) => {
         if (!REF_GRAMMAR.test(ref)) {
-          return refused(new RemoteError('credential/rejected', `密钥引用名 ${ref} 不合法：必须是环境变量写法`, { ref }))
+          return refused(new RemoteError('credential/rejected', `secret reference "${ref}": invalid (environment-variable form)`, { ref }))
         }
         try {
           await bridge.invoke('delete_api_key', { provider: ref })
@@ -1021,18 +1032,18 @@ export function createSettingsFace(bridge: HostBridge, options: SettingsFaceOpti
       selectModel: async (request) => {
         await ensure()
         if (snapshot === undefined) {
-          return refused(new RemoteError('gateway/internal', '读不到宿主服务商文档，无法切换模型', {}))
+          return refused(new RemoteError('gateway/internal', 'host provider document unavailable; model not switched', {}))
         }
         const row = snapshot.providers.find(candidate => candidate.id === request.provider)
         if (row === undefined || request.model === '') {
-          return refused(new RemoteError('gateway/bad-request', `服务商 ${request.provider} 不在文档里，不能选它的模型`, {}))
+          return refused(new RemoteError('gateway/bad-request', `provider "${request.provider}" is not in the document; cannot select its models`, {}))
         }
         // 席位只能选它列得出来的行。选了清单里没有的模型必须拒绝，而不是写进去：
         // 写进去的那份文档会被 validate_providers 判成"生效模型不在清单里"，
         // 结果是整份服务商文档写不进去，用户以为切换失败是别的原因。
         const selectable = modelRowsOf(row).filter(isRecord).map(model => String(model.id ?? ''))
         if (selectable.length > 0 && !selectable.includes(request.model)) {
-          return refused(new RemoteError('gateway/bad-request', `服务商 ${row.id} 的模型清单里没有 ${request.model}`, {}))
+          return refused(new RemoteError('gateway/bad-request', `model "${request.model}" is not listed under provider "${row.id}"`, {}))
         }
         // 选中推理档位（SH-096）：请求带档位时必须是该模型声明过的档位；**缺席 =
         // 保留现有档位**。上游的模型行点击本就不带 effort（ModelSelect.tsx:596），
@@ -1044,7 +1055,7 @@ export function createSettingsFace(bridge: HostBridge, options: SettingsFaceOpti
         if (effort !== '') {
           const declared = row.models.find(candidate => candidate.id === request.model)?.reasoningEfforts
           if (declared === undefined || !(effort in declared)) {
-            return refused(new RemoteError('gateway/bad-request', `模型 ${request.model} 未声明推理档位 ${effort}`, {}))
+            return refused(new RemoteError('gateway/bad-request', `model "${request.model}" does not declare reasoning level "${effort}"`, {}))
           }
         }
         const providers = snapshot.providers.map(candidate => ({

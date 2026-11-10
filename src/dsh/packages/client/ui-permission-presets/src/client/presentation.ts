@@ -24,6 +24,24 @@ const DEFAULT_PRESET_LABELS: Record<PermissionPresetLabelKey, string> = {
   'preset.fullAccess': en['preset.fullAccess'],
 }
 
+/** Locale dictionary key for a built-in permission preset's one-line description. */
+export type PermissionPresetDescriptionKey =
+  | 'preset.readOnly.description'
+  | 'preset.workspaceWrite.description'
+  | 'preset.fullAccess.description'
+
+const PRESET_DESCRIPTION_KEYS = new Map<string, PermissionPresetDescriptionKey>([
+  ['read-only', 'preset.readOnly.description'],
+  ['workspace-write', 'preset.workspaceWrite.description'],
+  [FULL_ACCESS_PRESET, 'preset.fullAccess.description'],
+])
+
+const DEFAULT_PRESET_DESCRIPTIONS: Record<PermissionPresetDescriptionKey, string> = {
+  'preset.readOnly.description': en['preset.readOnly.description'],
+  'preset.workspaceWrite.description': en['preset.workspaceWrite.description'],
+  'preset.fullAccess.description': en['preset.fullAccess.description'],
+}
+
 /**
  * Convert conventional kebab-case preset names into user-facing title case.
  * @param name - host-supplied preset label or key.
@@ -51,4 +69,23 @@ export function displayPermissionPreset(
     return t?.(key) ?? DEFAULT_PRESET_LABELS[key]
   }
   return displayPresetName(name)
+}
+
+/**
+ * Render the one-line hint of a preset under its product copy.
+ *
+ * The hint is UI copy, so it comes from the dictionary rather than from the host
+ * catalog: a host-supplied string would show Chinese inside an English UI.
+ *
+ * @param value - preset machine value.
+ * @param t - locale dictionary lookup for built-in product copy.
+ * @returns the localized hint, or undefined for presets the dictionary does not own.
+ */
+export function displayPermissionPresetDescription(
+  value: string,
+  t?: (key: PermissionPresetDescriptionKey) => string,
+): string | undefined {
+  const key = PRESET_DESCRIPTION_KEYS.get(value)
+  if (key === undefined) return undefined
+  return t?.(key) ?? DEFAULT_PRESET_DESCRIPTIONS[key]
 }

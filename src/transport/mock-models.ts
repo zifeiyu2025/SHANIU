@@ -530,7 +530,7 @@ export function createModelsMock(options: ModelsMockOptions = { emit: () => fals
           })))
         }
         if (typeof request.baseURL !== 'string' || !/^https?:\/\//.test(request.baseURL)) {
-          return FAIL<LlmDiscoveredModel[]>('llm/model-discovery-rejected', '该路由需要一个 http(s) 端点才能列模型')
+          return FAIL<LlmDiscoveredModel[]>('llm/model-discovery-rejected', 'this route needs an http(s) endpoint to list models')
         }
         // 本地假目录：不触网，端点只用来决定命名，保证同一端点答案稳定。
         const host = new URL(request.baseURL).hostname.replace(/[^a-z0-9]+/gi, '-').toLowerCase()
@@ -543,7 +543,7 @@ export function createModelsMock(options: ModelsMockOptions = { emit: () => fals
     credentials: {
       describe: async (refs) => {
         if (refs.length > MAX_DESCRIBE_REFS) {
-          return FAIL<Record<string, CredentialInfo>>('credentials/rejected', `一次最多描述 ${MAX_DESCRIBE_REFS} 个引用`)
+          return FAIL<Record<string, CredentialInfo>>('credentials/rejected', `at most ${MAX_DESCRIBE_REFS} references per call`)
         }
         const info: Record<string, CredentialInfo> = {}
         for (const ref of refs) {
@@ -553,8 +553,8 @@ export function createModelsMock(options: ModelsMockOptions = { emit: () => fals
         return OK(info)
       },
       set: async (ref, value) => {
-        if (!CREDENTIAL_REF.test(ref)) return FAIL<void>('credentials/rejected', `非法密钥引用：${ref}`)
-        if (value.length === 0) return FAIL<void>('credentials/rejected', '密钥不能为空')
+        if (!CREDENTIAL_REF.test(ref)) return FAIL<void>('credentials/rejected', `invalid secret reference: ${ref}`)
+        if (value.length === 0) return FAIL<void>('credentials/rejected', 'API key must not be empty')
         credentials.set(ref, value)
         emit('credentials/reference-updated', ref)
         emit('llm/adapters-updated')
