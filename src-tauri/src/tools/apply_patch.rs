@@ -468,6 +468,57 @@ fn record_write(ctx: &ToolContext, full: &std::path::Path, before: Option<&str>,
     }
 }
 
+/// 回滚结果：`restored` 已改回，`failed` 未能改回（`路径: 原因`）。
+/// 路径排序，保证错误文案稳定、可断言。
+#[derive(Default)]
+struct RollbackReport {
+    restored: Vec<String>,
+    failed: Vec<String>,
+}
+
+/// 把快照里的文件写回原状（`None` = 原本不存在，回滚即删除）。
+fn rollback(snapshot: &HashMap<String, Option<Vec<u8>>>) -> RollbackReport {
+    let mut report = RollbackReport::default();
+    let mut paths: Vec<&String> = snapshot.keys().collect();
+    paths.sort();
+    for path in paths {
+        let result = match &snapshot[path] {
+            Some(bytes) => std::fs::write(path, bytes),
+            None => std::fs::remove_file(path),
+        };
+        match result {
+            Ok(()) => report.restored.push(path.clone()),
+            Err(error) => report.failed.push(format!("{path}: {error}")),
+        }
+    }
+    report
+}
+
+/// 把回滚结果附在原始错误后面。
+///
+/// 全部改回成功 → 原样返回：正常失败路径（回滚成功）的文案仍是「写入失败: x」一句话，
+/// 不拿回滚细节污染它。
+///
+/// 有文件没改回 → 单列两份清单。多文件补丁中途失败且回滚也失败时，工作区停在半修改
+/// 状态；只说「写入失败: {path}」会让模型误以为什么都没变，按错误前提继续下一步。
+fn with_rollback(error: ToolError, report: RollbackReport) -> ToolError {
+    if report.failed.is_empty() {
+        return error;
+    }
+    let restored = if report.restored.is_empty() {
+        String::new()
+    } else {
+        format!("（{}）", report.restored.join("、"))
+    };
+    ToolError::Execution(format!(
+        "{error}；回滚未完成：已改回 {} 个文件{restored}，未能改回 {} 个文件 [{}]。\
+         工作区停在半修改状态——请先检查这些文件，不要按「什么都没变」继续",
+        report.restored.len(),
+        report.failed.len(),
+        report.failed.join("；"),
+    ))
+}
+
 // ============================== 执行 ==============================
 
 #[async_trait]
@@ -499,28 +550,16 @@ impl ToolExecutor for ApplyPatch {
         // 应用 + 回滚快照：path → 原（None=原不存在，回滚=删除）
         let mut snapshot: HashMap<String, Option<Vec<u8>>> = HashMap::new();
         let mut summary: Vec<String> = Vec::new();
-        let rollback = |snapshot: &HashMap<String, Option<Vec<u8>>>| {
-            for (path, old) in snapshot {
-                match old {
-                    Some(bytes) => {
-                        let _ = std::fs::write(path, bytes);
-                    }
-                    None => {
-                        let _ = std::fs::remove_file(path);
-                    }
-                }
-            }
-        };
 
         for op in &ops {
             match op {
                 PatchOp::Add { path, lines } => {
                     let full = resolve_for_write(&ctx.workspace_root, path)?;
                     if full.exists() {
-                        rollback(&snapshot);
-                        return Err(ToolError::Execution(format!(
-                            "Add File 目标已存在: {path}"
-                        )));
+                        return Err(with_rollback(
+                            ToolError::Execution(format!("Add File 目标已存在: {path}")),
+                            rollback(&snapshot),
+                        ));
                     }
                     if let Some(parent) = full.parent() {
                         let _ = std::fs::create_dir_all(parent);
@@ -530,8 +569,10 @@ impl ToolExecutor for ApplyPatch {
                         content.push('\n');
                     }
                     if std::fs::write(&full, &content).is_err() {
-                        rollback(&snapshot);
-                        return Err(ToolError::Execution(format!("写入失败: {path}")));
+                        return Err(with_rollback(
+                            ToolError::Execution(format!("写入失败: {path}")),
+                            rollback(&snapshot),
+                        ));
                     }
                     snapshot.insert(full.to_string_lossy().to_string(), None);
                     record_write(ctx, &full, None, Some(&content));
@@ -547,9 +588,10 @@ impl ToolExecutor for ApplyPatch {
                     let original =
                         std::fs::read(&full).map_err(|e| ToolError::Execution(format!("读取失败: {e}")))?;
                     // SH-124：先读过、且内容未被外部改动，才允许修改
-                    let read_key = verify_read_state(ctx, path, &full, &original).inspect_err(|_| {
-                        rollback(&snapshot);
-                    })?;
+                    let read_key = match verify_read_state(ctx, path, &full, &original) {
+                        Ok(key) => key,
+                        Err(error) => return Err(with_rollback(error, rollback(&snapshot))),
+                    };
                     let text = String::from_utf8(original.clone())
                         .map_err(|_| ToolError::Execution(format!("非 UTF-8 文本文件: {path}")))?;
                     let had_trailing_newline = text.ends_with('\n');
@@ -558,16 +600,20 @@ impl ToolExecutor for ApplyPatch {
                         seq,
                     )
                     .map_err(|e| {
-                        rollback(&snapshot);
-                        ToolError::Execution(format!("{path}: {e}"))
+                        with_rollback(
+                            ToolError::Execution(format!("{path}: {e}")),
+                            rollback(&snapshot),
+                        )
                     })?;
                     let mut new_text = new_lines.join("\n");
                     if had_trailing_newline && !new_text.is_empty() {
                         new_text.push('\n');
                     }
                     if std::fs::write(&full, &new_text).is_err() {
-                        rollback(&snapshot);
-                        return Err(ToolError::Execution(format!("写入失败: {path}")));
+                        return Err(with_rollback(
+                            ToolError::Execution(format!("写入失败: {path}")),
+                            rollback(&snapshot),
+                        ));
                     }
                     snapshot.entry(full.to_string_lossy().to_string()).or_insert(Some(original));
                     record_write(ctx, &full, Some(&text), Some(&new_text));
@@ -583,19 +629,22 @@ impl ToolExecutor for ApplyPatch {
                     let original = match std::fs::read(&full) {
                         Ok(bytes) => bytes,
                         Err(_) => {
-                            rollback(&snapshot);
-                            return Err(ToolError::Execution(format!(
-                                "Delete File 目标不存在: {path}"
-                            )));
+                            return Err(with_rollback(
+                                ToolError::Execution(format!("Delete File 目标不存在: {path}")),
+                                rollback(&snapshot),
+                            ));
                         }
                     };
-                    let read_key = verify_read_state(ctx, path, &full, &original).inspect_err(|_| {
-                        rollback(&snapshot);
-                    })?;
+                    let read_key = match verify_read_state(ctx, path, &full, &original) {
+                        Ok(key) => key,
+                        Err(error) => return Err(with_rollback(error, rollback(&snapshot))),
+                    };
                     record_write(ctx, &full, Some(&String::from_utf8_lossy(&original)), None);
                     if std::fs::remove_file(&full).is_err() {
-                        rollback(&snapshot);
-                        return Err(ToolError::Execution(format!("删除失败: {path}")));
+                        return Err(with_rollback(
+                            ToolError::Execution(format!("删除失败: {path}")),
+                            rollback(&snapshot),
+                        ));
                     }
                     snapshot.insert(full.to_string_lossy().to_string(), Some(original));
                     if let (Some(reads), Some(key)) = (&ctx.reads, read_key) {
@@ -668,8 +717,68 @@ mod tests {
         let patch = "*** Begin Patch\n*** Add File: temp.txt\n+x\n*** Update File: a.txt\n 不存在的上下文\n-y\n*** End Patch";
         let err = ApplyPatch::new().execute(serde_json::json!({"patch": patch}), &ctx(&ws)).await.unwrap_err();
         assert!(matches!(err, ToolError::Execution(_)));
+        let ToolError::Execution(text) = &err else { unreachable!() };
+        assert!(
+            !text.contains("回滚"),
+            "回滚成功时错误文案必须保持一句话，不许混入回滚噪音: {text}"
+        );
         assert!(!ws.join("temp.txt").exists(), "回滚必须删除本轮新增的文件");
         assert_eq!(std::fs::read_to_string(ws.join("a.txt")).unwrap(), "line1\nline2\nline3\n");
+    }
+
+    /// M4：回滚本身失败时，错误文案必须单列「已改回」与「未能改回」两份清单。
+    ///
+    /// 构造方式：把一个**目录**放进快照当文件写回（`fs::write` 必然失败），
+    /// 同时放一个正常文件验证成功清单。反向对照：旧实现用 `let _ = fs::write`，
+    /// 这个用例的断言全部落空——文案只有原始的「写入失败: …」一句。
+    #[test]
+    fn rollback_reports_files_it_could_not_restore() {
+        let ws = workspace();
+        std::fs::write(ws.join("a.txt"), "被改坏\n").unwrap();
+        std::fs::create_dir(ws.join("not-a-file")).unwrap();
+        let mut snapshot = HashMap::new();
+        snapshot.insert(
+            ws.join("a.txt").to_string_lossy().to_string(),
+            Some(b"line1\nline2\nline3\n".to_vec()),
+        );
+        snapshot.insert(
+            ws.join("not-a-file").to_string_lossy().to_string(),
+            Some("写不进去".as_bytes().to_vec()),
+        );
+
+        let report = rollback(&snapshot);
+        assert_eq!(report.restored.len(), 1, "可写文件应改回: {:?}", report.restored);
+        assert_eq!(report.failed.len(), 1, "目录不能当文件写回: {:?}", report.failed);
+        assert_eq!(
+            std::fs::read_to_string(ws.join("a.txt")).unwrap(),
+            "line1\nline2\nline3\n"
+        );
+
+        let text = with_rollback(
+            ToolError::Execution("写入失败: later.txt".into()),
+            report,
+        )
+        .to_string();
+        // 原始错误保留：模型仍要知道「本来哪一步失败」
+        assert!(text.starts_with("写入失败: later.txt"), "{text}");
+        // 两份清单都在：哪些改回来了、哪些没有
+        assert!(text.contains("已改回 1 个文件") && text.contains("a.txt"), "{text}");
+        assert!(
+            text.contains("未能改回 1 个文件") && text.contains("not-a-file"),
+            "{text}"
+        );
+        assert!(text.contains("半修改状态"), "{text}");
+    }
+
+    /// 反向对照的另一半：回滚全部成功时不得给文案加料。
+    #[test]
+    fn clean_rollback_keeps_failure_message_concise() {
+        let report = RollbackReport {
+            restored: vec!["a.txt".into()],
+            failed: Vec::new(),
+        };
+        let error = with_rollback(ToolError::Execution("写入失败: b.txt".into()), report);
+        assert_eq!(error.to_string(), "写入失败: b.txt");
     }
 
     #[tokio::test]
