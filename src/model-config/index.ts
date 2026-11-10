@@ -7,10 +7,12 @@
  * 以 priority -1 影子上游注册（框架规定同槽「低优先级渲染」），配置好提供商后再撤回，
  * 席位自动交还上游的模型选择器。
  *
- * 三个阶段：
+ * 四个阶段：
  *  - `loading`：首帧先接管。上游在这段时间显示「正在加载模型…」，我们同文案同几何，
  *    用户不会看到席位闪断；点开会直接进设置，无副作用。
  *  - `empty`：确认零提供商，文案「请选择模型」。
+ *  - `error`：读取提供商目录**失败**（宿主命令 reject）。必须与加载态区分：停在 loading
+ *    会让人一直等一个永远不会到的结果；失败态至少说明「读不出来」，点击仍进设置。
  *  - `none`：有提供商或远端面不可用，撤回影子，交还上游。
  */
 import type { Context } from '@deepseek-ai/cordis'
@@ -33,8 +35,8 @@ declare module '@deepseek-ai/cordis' {
 /** 设置里模型分段注册的 id（ui-settings-models 的 `settings.section`）。 */
 const MODELS_SECTION = 'models'
 
-/** 席位的三种形态。 */
-type SeatPhase = 'none' | 'loading' | 'empty'
+/** 席位的四种形态。 */
+type SeatPhase = 'none' | 'loading' | 'empty' | 'error'
 
 /**
  * 注册席位影子：未配置时接管，配置好后撤回。
@@ -58,18 +60,32 @@ export function apply(ctx: Context): void {
         name: 'conversation.input.model',
         priority: -1,
         locale: NS,
-        inject: () => ({ open, loading: next === 'loading' }),
+        inject: () => ({
+          open,
+          loading: next === 'loading',
+          failed: next === 'error',
+        }),
       }, ModelConfigSeat)
     }
 
     const sync = async (): Promise<void> => {
-      const providers = await ctx.remote.llm?.listProviders()
-      // 远端面缺失或查询失败时交还上游席位，避免把正常席位顶掉
-      if (providers === undefined || !providers.ok) {
-        show('none')
-        return
+      try {
+        const providers = await ctx.remote.llm?.listProviders()
+        // 远端面缺失或查询失败时交还上游席位，避免把正常席位顶掉
+        if (providers === undefined || !providers.ok) {
+          show('none')
+          return
+        }
+        show(providers.value.length === 0 ? 'empty' : 'none')
+      } catch (reason) {
+        // 宿主命令 reject 以前完全没人接：席位永远停在 loading，同时留下一个未处理拒绝。
+        // 这里落到失败态并留一条可定位的日志，别让「读不出来」伪装成「还在加载」。
+        ctx.logger.warn(
+          '[SHANIU] 模型席位读取提供商目录失败（listProviders reject）：%s；席位转为失败态，点击仍可打开设置-模型页',
+          reason instanceof Error ? reason.message : String(reason),
+        )
+        show('error')
       }
-      show(providers.value.length === 0 ? 'empty' : 'none')
     }
 
     // 首帧先接管：与上游同文案的加载态，避免席位闪断。

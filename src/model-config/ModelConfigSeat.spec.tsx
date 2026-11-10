@@ -41,9 +41,9 @@ function declarations(raw: string, selector: string): Map<string, string> {
   return map
 }
 
-function seatElement(inject: { open: () => void, loading: boolean }): ReactNode {
+function seatElement(inject: { open: () => void, loading: boolean, failed?: boolean }): ReactNode {
   const Seat = ModelConfigSeat as unknown as (props: Record<string, unknown>) => ReactNode
-  return <Seat t={translate} open={inject.open} loading={inject.loading} />
+  return <Seat t={translate} open={inject.open} loading={inject.loading} failed={inject.failed ?? false} />
 }
 
 describe('src/model-config：席位形态', () => {
@@ -68,6 +68,21 @@ describe('src/model-config：席位形态', () => {
     expect(seat.textContent).toContain('正在加载模型…')
     expect(seat.getAttribute('aria-busy')).toBe('true')
     expect(seat.querySelector('svg[data-icon*="chevron-down"]')).toBeNull()
+  })
+
+  it('失败态：文案与圆点都和加载态不同（读取失败不能被画成「还在加载」）', () => {
+    render(seatElement({ open: () => {}, loading: false, failed: true }))
+
+    const seat = screen.getByRole('button', { name: zh['seat.aria'] })
+    expect(seat.textContent).toContain('读取模型配置失败')
+    expect(seat.textContent).not.toContain('正在加载模型…')
+    // 不再是「忙碌」：读屏也不该报 busy。
+    expect(seat.getAttribute('aria-busy')).toBeNull()
+    expect(seat.getAttribute('data-loading')).toBeNull()
+    expect(seat.getAttribute('data-failed')).toBe('')
+    expect(seat.querySelector('svg[data-icon*="chevron-down"]')).toBeNull()
+    expect(seat.querySelector('[data-state="error"]')).toBeTruthy()
+    expect(seat.querySelector('[data-state="ongoing"]')).toBeNull()
   })
 
   it('几何与同槽位 DSH 原件、同排访问模式 chip 逐项一致', () => {

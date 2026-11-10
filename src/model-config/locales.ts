@@ -7,6 +7,7 @@ export const NS = 'shaniuModelConfig'
 export const zh = {
   'seat.empty': '请选择模型',
   'seat.loading': '正在加载模型…',
+  'seat.failed': '读取模型配置失败',
   'seat.aria': '打开设置中的模型页以配置模型',
 } as const
 
@@ -17,6 +18,7 @@ export type ModelConfigKey = keyof typeof zh
 export const en: Record<ModelConfigKey, string> = {
   'seat.empty': 'Select a model',
   'seat.loading': 'Loading models…',
+  'seat.failed': 'Failed to load model settings',
   'seat.aria': 'Open Models settings to configure a model',
 }
 
