@@ -386,7 +386,8 @@ fn is_git_output_arg(arg: &str) -> bool {
 ///
 /// 未加引号的 shell 元字符不再一律拒绝，而是先整词收集、收词后判定：
 /// 整词恰好是安全重定向（`2>&1`、`>NUL`）就丢弃该词，其余含元字符的词一律返回 `None`。
-/// 引号内的元字符仍是普通字符（cmd 不会解释它们），保持原语义。
+/// 引号内的元字符按普通字符收词——**但 `%NAME%` 例外：cmd 在双引号内照样展开**，
+/// 所以引号内的 `%`/`^`/`!` 收词后仍要由 `escapes_workspace` 兜住（审计 H1）。
 fn tokenize(command: &str) -> Option<Vec<String>> {
     let mut raw: Vec<(String, bool)> = Vec::new();
     let mut current = String::new();
