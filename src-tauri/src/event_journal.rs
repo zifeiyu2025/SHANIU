@@ -3,7 +3,12 @@
 //! 广播出口的 `AgentEvent` 逐条追加到 `<data_root>/sessions/<session_id>.events.jsonl`，
 //! 供 gateway 以 `after_event_id` 续播。**只追加、不改写**：事件信封一旦编号就不可变；
 //! 读取按 event_id 单调序（ULID 同宽字典序），容忍崩溃留下的半截尾行（与 rollout 同口径），
-//! 中途坏行跳过——续播是尽力而为的恢复面，不替协议层掩盖事件缺失。
+//! 中途坏行（解析失败）跳过——续播是尽力而为的恢复面，不替协议层掩盖事件缺失。
+//! 但 **I/O 读失败不算坏行**：`latest_event_id` 直接上抛（M7），把读错误当 EOF 只会
+//! 让调用方拿着旧游标静默重复/漏播。
+//!
+//! 落盘前统一过 `config::redact`（M6）：信封里带 `ToolCallOutputDelta` 的命令原始输出，
+//! 且本文件是导出 ZIP 的数据源，口径与 `rollout` 一致。
 //!
 //! 已知限制（批 1 明示）：没有落盘保留策略/压缩，长会话会持续增长（批 2 的 gateway
 //! 需要时再加轮转）；本模块不负责广播传输，只负责持久化与读取。
@@ -46,8 +51,17 @@ fn log_path(dir: &Path, session_id: &str) -> Result<PathBuf, String> {
 }
 
 /// 信封序列化成一行 NDJSON（含行尾换行）。
+///
+/// 落盘前统一过脱敏过滤器（M6，与 `rollout/mod.rs::append` 同口径，docs/01 §438）：
+/// - 本文件里有 `ToolCallOutputDelta`（`channel` + `delta` = 命令的**原始输出**），
+///   模型跑一次 `type .env`、`echo %API_KEY%` 就能把密钥明文写进
+///   `sessions/<session>.events.jsonl`；
+/// - 这份日志正是导出 ZIP 的数据源，明文一旦落盘就会被打包带出工作区；
+/// - `append` 与 `FileEventJournal::append` 都经过本函数，改这一处覆盖两条写路径，
+///   不存在"某条写路径忘了脱敏"的缝隙。
 fn encode(event: &AgentEvent) -> Result<String, String> {
-    let mut line = serde_json::to_string(event).map_err(|e| format!("事件信封序列化失败: {e}"))?;
+    let json = serde_json::to_string(event).map_err(|e| format!("事件信封序列化失败: {e}"))?;
+    let mut line = crate::config::redact(&json);
     line.push('\n');
     Ok(line)
 }
@@ -73,7 +87,13 @@ pub fn append(dir: &Path, event: &AgentEvent) -> Result<(), String> {
 }
 
 /// 读取日志最后一条合法事件 id（只用于 live-only 订阅的游标种子，不重放大历史）。
-/// 不存在的日志 = 没有历史；坏行/torn 尾行跳过，与 `read_after` 同口径。
+/// 不存在的日志 = 没有历史；**坏行**（JSON 解析失败）/torn 尾行跳过，与 `read_after` 同口径。
+///
+/// 但 **I/O 读失败不是坏行**（M7）：`lines()` 的 `Err` 一律上抛。先前把读错误当 EOF
+/// `break`，调用方会拿到一个旧的游标且毫不知情——live-only 订阅随后会把已看过的那段
+/// 历史再送一遍（或漏掉尾部事件），而日志里没有任何异常痕迹。这与 rollout 把
+/// 中间行读错误转 `RolloutError::Io` 是同一类问题，本模块错误类型是 `String`，故用
+/// 带路径的 `String` 错误。
 pub fn latest_event_id(dir: &Path, session_id: &str) -> Result<Option<String>, String> {
     let path = log_path(dir, session_id)?;
     if !path.exists() {
@@ -83,7 +103,8 @@ pub fn latest_event_id(dir: &Path, session_id: &str) -> Result<Option<String>, S
         .map_err(|e| format!("事件日志打开失败（{}）: {e}", path.display()))?;
     let mut last = None;
     for line in BufReader::new(file).lines() {
-        let Ok(line) = line else { break };
+        // M7：读错误不得当 EOF（见函数注释）。
+        let line = line.map_err(|e| format!("事件日志读取失败（{}）: {e}", path.display()))?;
         let line = line.trim();
         if line.is_empty() {
             continue;
@@ -292,7 +313,7 @@ impl crate::events::EventJournal for FileEventJournal {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::events::{EventJournal, EventMsg};
+    use crate::events::{EventJournal, EventMsg, IoChannel};
 
     fn event(session: &str, id: &str, turn: u32) -> AgentEvent {
         AgentEvent {
@@ -352,6 +373,56 @@ mod tests {
         file.write_all(b"\n").unwrap();
         assert_eq!(latest_event_id(&dir, "s1").unwrap().as_deref(), Some("02"));
         assert!(latest_event_id(&dir, "../escape").is_err());
+    }
+
+    /// M7 反向对照：非法 UTF-8 会让 `lines()` 返回 `Err`（InvalidData）——这是**读失败**，
+    /// 不是坏行。改前 `let Ok(line) = line else { break }` 把它当 EOF，返回
+    /// `Ok(Some("01"))`（旧游标）且调用方毫不知情；改后必须上抛。
+    #[test]
+    fn latest_event_id_fails_loudly_on_read_error() {
+        let dir = temp_dir();
+        append(&dir, &event("s1", "01", 1)).unwrap();
+        let path = dir.join("s1.events.jsonl");
+        let mut file = OpenOptions::new().append(true).open(&path).unwrap();
+        file.write_all(b"\xff\xfe\n").unwrap();
+        file.flush().unwrap();
+
+        let err = latest_event_id(&dir, "s1").expect_err("读错误必须上抛，不能当 EOF 返回旧游标");
+        assert!(err.contains("读取失败"), "错误文案要点名读取失败：{err}");
+        assert!(err.contains("s1.events.jsonl"), "错误要带路径便于定位：{err}");
+    }
+
+    /// M6：落盘前必须过 `config::redact`。模拟 `type .env` 的原始输出落进
+    /// `ToolCallOutputDelta`——改前这条明文会原样进 `sessions/*.events.jsonl`，
+    /// 而该文件正是导出 ZIP 的数据源。
+    #[test]
+    fn append_redacts_secrets_before_persisting() {
+        let dir = temp_dir();
+        let secret = "sk-audit0123456789abcdef";
+        let delta_event = |id: &str| AgentEvent {
+            event_id: id.into(),
+            session_id: "s1".into(),
+            agent_id: "root".into(),
+            parent_id: None,
+            ts_ms: 1,
+            msg: EventMsg::ToolCallOutputDelta {
+                call_id: "call-1".into(),
+                channel: IoChannel::Stdout,
+                delta: format!("API_KEY={secret} 普通输出一行"),
+            },
+        };
+        // 两条写路径都覆盖：一次性 append 与复用句柄的 FileEventJournal::append。
+        append(&dir, &delta_event("01")).unwrap();
+        FileEventJournal::new(dir.path().to_path_buf()).append(&delta_event("02")).unwrap();
+
+        let raw = std::fs::read_to_string(dir.join("s1.events.jsonl")).unwrap();
+        assert!(!raw.contains(secret), "明文密钥不得落盘：{raw}");
+        assert!(raw.contains(crate::config::REDACTED), "应留下脱敏标记：{raw}");
+        // 反向对照的另一半：正常字段不能被一起抹掉，否则整个 journal 变成一堆 [REDACTED]。
+        assert!(raw.contains("\"event_id\":\"01\""), "正常字段被误伤：{raw}");
+        assert!(raw.contains("\"event_id\":\"02\""), "正常字段被误伤：{raw}");
+        assert!(raw.contains("\"call_id\":\"call-1\""), "正常字段被误伤：{raw}");
+        assert!(raw.contains("普通输出一行"), "正常输出被误伤：{raw}");
     }
 
     #[test]
