@@ -113,23 +113,11 @@ describe('header actions', () => {
     expect(opened).not.toHaveBeenCalled()
   })
 
-  it('注册 workspace.openLocal：桌面 Ctrl+Alt+O，作用在当前主视图会话上', async () => {
-    const { commands, registrations } = harness()
-    void registrations
-    const command = commands.find(item => item.id === 'workspace.openLocal')
-    expect(command?.defaults['desktop:windows']).toEqual({ code: 'KeyO', modifiers: ['primary', 'alt'] })
-    expect(command?.defaults['web:windows']).toEqual({ code: 'KeyO', modifiers: ['primary', 'shift'] })
-    const resolution = command?.resolve()
-    expect(resolution?.status).toBe('handled')
-    resolution?.run?.()
-    await vi.waitFor(() => expect(opened).toHaveBeenCalledWith(WORKSPACE))
-  })
-
-  it('没有主视图会话时快捷键给出阻塞原因', () => {
-    const { commands } = harness(null)
-    const resolution = commands.find(item => item.id === 'workspace.openLocal')?.resolve()
-    expect(resolution?.status).toBe('blocked')
-    expect(resolution?.reason).toBe('explorer.noSession')
+  it('不重复注册 workspace.openLocal：命令位归官方 ui-open-in-app', () => {
+    // 同 id 二次注册会让 ShortcutsRegistry 抛错并回滚整颗 fiber——曾经因此让
+    // 资源管理器按钮与「更多操作」三项一起消失（见 boot 级装载健康测试）。
+    const { commands } = harness()
+    expect(commands.some(item => item.id === 'workspace.openLocal')).toBe(false)
   })
 
   it('复制 Markdown 走宿主全量档案，而不是界面已加载的节点', async () => {

@@ -44,7 +44,7 @@ import {
 import { tauriBridge } from '../transport/tauri'
 import { registerExportTrigger } from '../transport/command-triggers'
 import { writeClipboardText } from '../host/clipboard'
-import { ExplorerButton, OPEN_LOCAL_COMMAND } from './ExplorerButton'
+import { ExplorerButton } from './ExplorerButton'
 import { openInSystemExplorer } from './open-workspace'
 import { exportMarkdownFetcher } from './export-markdown'
 import { exportZipFetcher, exportZipSaver } from './export-zip'
@@ -85,27 +85,9 @@ export function apply(ctx: Context): void {
     })
   }
 
-  // 与官方一致的绑定：桌面 Ctrl+Alt+O，Web 让位给 workspace.add 改用 Ctrl+Shift+O
-  ctx.effect(() => ctx.shortcuts.register({
-    id: OPEN_LOCAL_COMMAND,
-    label: () => t('explorer.tooltip', { app: t('explorer.app') }),
-    aliases: ['open workspace locally', 'open in app'],
-    defaults: {
-      'desktop:macos': { code: 'KeyO', modifiers: ['primary', 'alt'] },
-      'desktop:windows': { code: 'KeyO', modifiers: ['primary', 'alt'] },
-      'desktop:linux': { code: 'KeyO', modifiers: ['primary', 'alt'] },
-      'web:macos': { code: 'KeyO', modifiers: ['primary', 'shift'] },
-      'web:windows': { code: 'KeyO', modifiers: ['primary', 'shift'] },
-    },
-    regions: ['page', 'editable'],
-    modals: [],
-    resolve: () => {
-      // 快捷键没有按钮携带的会话，取当前挂在主视图上的那一条（与官方同一判据）
-      const row = Object.values(ctx.sessions.list.getSnapshot().byId).find(entry => (entry.retainedBy.mainView ?? 0) > 0)
-      if (row === undefined) return { status: 'blocked', reason: t('explorer.noSession') }
-      return { status: 'handled', run: () => { openExplorer(row.id) } }
-    },
-  }), 'shaniu-header: open explorer shortcut')
+  // 快捷键复用 vendored `ui-open-in-app` 的 `workspace.openLocal`（桌面 Ctrl+Alt+O）：
+  // 同 id 二次注册会被 ShortcutsRegistry 判为重复并抛出，整颗插件 fiber 因此回滚
+  // （见 dsh-boot 的装载失败扫描）。按钮只读 catalog 里的那一行拿键位提示。
 
   ctx.slots.inject('conversation.session.header.utilities', () => ctx.slots.register({
     name: 'conversation.session.header.utilities',

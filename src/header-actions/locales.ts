@@ -7,7 +7,6 @@ export const NS = 'shaniuHeader'
 export const zh = {
   'explorer.app': '文件资源管理器',
   'explorer.tooltip': '用 {app} 打开',
-  'explorer.noSession': '当前没有打开的会话',
   'menu.copyMarkdown': '复制会话为 Markdown',
   'menu.copyId': '复制会话 ID',
   'menu.copyFailed': '复制失败，请重试',
@@ -20,7 +19,6 @@ export type HeaderKey = keyof typeof zh
 export const en: Record<HeaderKey, string> = {
   'explorer.app': 'File Explorer',
   'explorer.tooltip': 'Open with {app}',
-  'explorer.noSession': 'No session is open',
   'menu.copyMarkdown': 'Copy session as Markdown',
   'menu.copyId': 'Copy session ID',
   'menu.copyFailed': 'Could not copy. Try again.',

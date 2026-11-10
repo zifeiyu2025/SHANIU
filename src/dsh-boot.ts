@@ -5,7 +5,8 @@
  * 宿主侧服务（sessions/remote/configForms/remoteAccess）由 src/transport/ 适配层提供；
  * 尚未接线的能力一律经 stubs.ts 显式 stub，不做隐式降级。
  */
-import { Context } from '@deepseek-ai/cordis'
+import { Context, Logger } from '@deepseek-ai/cordis'
+import type { Exporter, FiberState } from '@deepseek-ai/cordis'
 import { apply as rendererApply } from '@deepseek-ai/dsh-client-ui-renderer/client'
 import { apply as themeApply, inject as themeInject } from '@deepseek-ai/dsh-client-ui-theme/client'
 import { apply as layoutApply, inject as layoutInject } from '@deepseek-ai/dsh-client-ui-layout/client'
@@ -126,14 +127,50 @@ async function applyProductWorkspacePath(): Promise<{ homeDir: string }> {
  */
 const MOCK_IN_DESKTOP = false
 
+/** cordis `FiberState.FAILED`：const enum 在 isolatedModules 下不能按值导入，故取序号并锁定类型。 */
+const FIBER_STATE_FAILED: FiberState = 3
+
+/**
+ * 装载失败上报：cordis 对 `apply` 抛异常只把 fiber 标 FAILED 并卸载，不向用户报错，
+ * 结果是一整块功能静默消失（2026-11-10：重复快捷键让会话头按钮与三项菜单全没了，
+ * 打包产物与 0.2.0 都复现，却没有任何日志线索）。boot 收尾统一扫 registry，
+ * 把失败项与原因写进宿主日志。
+ * @param ctx - 客户端根上下文。
+ * @param labels - boot 装载时记下的 feature 标签（cordis 会把名为 `apply` 的回调名丢掉，只剩 root）。
+ */
+function reportFailedPlugins(ctx: Context, labels: ReadonlyMap<number, string>): void {
+  for (const runtime of ctx.registry.values()) {
+    for (const fiber of runtime.fibers) {
+      if (fiber.state !== FIBER_STATE_FAILED) continue
+      // cordis 没有公开的 error getter；FAILED fiber 的原因只存在私有字段里（fiber.ts:208）。
+      const error = (fiber as unknown as { _error?: unknown })._error
+      const label = (fiber.uid === null ? undefined : labels.get(fiber.uid)) ?? `${fiber.name}#${String(fiber.uid)}`
+      ctx.logger.error('[SHANIU] 插件装载失败 · %s：%s', label,
+        error instanceof Error ? error.message : String(error))
+    }
+  }
+}
+
 /** 启动阶段回调：只上报真实存在的阶段（启动页据此显示，见 src/host/boot-progress.ts）。 */
 export interface BootOptions {
   onStage?: (label: string) => void
+  /**
+   * 是否挂载 UI（默认 true）。置 false 只装配服务与槽位、不渲染，
+   * 供 boot 级装载健康测试使用：jsdom 没有真实布局，挂载会在测量代码里崩。
+   */
+  mount?: boolean
 }
 
 /** 组装并挂载完整 UI；失败时把原因抛给调用方（入口页自绘错误）。 */
 export async function bootShaniu(container: HTMLElement, options: BootOptions = {}): Promise<BootHandle> {
   const root = new Context()
+  // cordis 默认 exporter 只把日志写进环形缓冲（logger.ts:213），宿主不接 console 出口时
+  // 连 error 都没有声音——插件装载失败因此完全不可见。这里只放行 error（level 0）。
+  const consoleExporter: Exporter = {
+    levels: { default: 0 },
+    export: (message) => { console.error(Logger.format(consoleExporter, message)) },
+  }
+  root.logger.exporter(consoleExporter)
   const mockData = !usingTauriBackend() || MOCK_IN_DESKTOP
   const realData = usingTauriBackend() && !MOCK_IN_DESKTOP
   /** 桌面适配层：卸载会话时要一起拆掉事件订阅。 */
@@ -306,10 +343,16 @@ export async function bootShaniu(container: HTMLElement, options: BootOptions = 
     { inject: uiPluginManagerInject, apply: uiPluginManagerApply },
     { inject: uiScheduleInject, apply: uiScheduleApply },
   ]
+  /** 装载失败项：cordis 只把 fiber 标 FAILED 并卸载，不向用户报错（见 reportFailedPlugins）。 */
+  const bootLabels = new Map<number, string>()
   for (const [index, feature] of features.entries()) {
     // 真实进度：已装载数量 / 总数（不编造比例，见 boot-progress.ts 的约束）
     options.onStage?.(`装载界面插件 ${index + 1}/${features.length}`)
-    await root.plugin({ inject: [...feature.inject], apply: feature.apply }).await()
+    const fiber = root.plugin({ inject: [...feature.inject], apply: feature.apply })
+    if (fiber.uid !== null) {
+      bootLabels.set(fiber.uid, `features[${index + 1}] inject=[${feature.inject.join(', ')}]`)
+    }
+    await fiber.await()
   }
 
   // 布局壳：占据 root slot（sidebar/main/rightbar/shell.*）
@@ -323,10 +366,12 @@ export async function bootShaniu(container: HTMLElement, options: BootOptions = 
   await new Promise<void>(resolve => setTimeout(resolve, 0))
   await Promise.resolve()
 
+  reportFailedPlugins(root, bootLabels)
+
   const uiRenderer = root.get('uiRenderer')
   if (uiRenderer === undefined) throw new Error('dsh-boot: uiRenderer 服务未就位')
   options.onStage?.('渲染界面')
-  const unmount = uiRenderer.mount(container)
+  const unmount = options.mount === false ? () => {} : uiRenderer.mount(container)
   // 开发期诊断：真机排查槽位/视图注册（例如"会话头 More 不出现"）时读根 Context。
   if (import.meta.env.DEV) {
     ;(globalThis as Record<string, unknown>).__SHANIU_BOOT_CTX__ = root
