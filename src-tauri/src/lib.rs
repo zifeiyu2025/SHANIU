@@ -2134,6 +2134,11 @@ fn show_main_window(app: &tauri::AppHandle) {
         let _ = window.unminimize();
         let _ = window.show();
         let _ = window.set_focus();
+        // 二次启动唤回：窗口可能被隐藏（托盘态）或压在别的窗口后面，补一次原生
+        // 恢复 + 置前，保证"再启动一次 = 看到同一个窗口"。
+        if let Ok(hwnd) = window.hwnd() {
+            config::single_instance::restore_window(hwnd.0 as *mut _);
+        }
     }
 }
 
@@ -2203,6 +2208,28 @@ pub fn run() {
         std::process::exit(2);
     }
     let dirs = root.dirs.clone();
+    // 第一层：全局（本登录会话）唯一 UI 实例。第二次启动不是"程序已在运行"然后什么
+    // 都不发生——而是把已运行的窗口叫到前台；若两份指向不同数据目录，明确说明当前
+    // 运行的是哪个并给出退出的指引，绝不让两个实例各自写自己的历史。
+    let _global_lock = match config::single_instance::acquire_global() {
+        Ok(config::single_instance::GlobalAcquire::Acquired(lock)) => lock,
+        Ok(config::single_instance::GlobalAcquire::AlreadyRunning) => {
+            let outcome = config::single_instance::handle_second_launch(
+                &dirs.data_root,
+                &config::single_instance::running_info_path(),
+                config::single_instance::ACTIVATE_EVENT_NAME,
+                show_native_message,
+            );
+            // 二次启动进程干净退出（0）：它不是错误，只是把用户送回已在运行的那个窗口。
+            eprintln!("[SHANIU] 已有实例在运行（{outcome:?}），本次启动不再继续");
+            std::process::exit(0);
+        }
+        Err(message) => {
+            eprintln!("[SHANIU] {message}");
+            show_native_message(&format!("无法启动：{message}"));
+            std::process::exit(2);
+        }
+    };
     // 同一 data_root 只允许一个写者：rollout 是逐行 append 的真源，两个进程同写会把
     // 两条历史交错进同一档案。互斥体名由规范化路径 hash 派生，所以不同 `data\` 的
     // 两个副本仍能同时跑（那是合法用法，拦下来是错的）。
@@ -2216,6 +2243,15 @@ pub fn run() {
             std::process::exit(2);
         }
     };
+    // 告诉下一次启动"我用的是哪个数据目录"；写不下去不拦启动（最多让二次启动退化成
+    // 通用提示），但必须留痕。两把锁都拿到之后才写，避免第二实例覆盖首实例的信息。
+    let running_info = config::single_instance::RunningInstance::new(&dirs.data_root);
+    if let Err(message) = config::single_instance::write_running_info(
+        &config::single_instance::running_info_path(),
+        &running_info,
+    ) {
+        eprintln!("[SHANIU] {message}");
+    }
     // 产品目录结构提前建好（幂等）：secrets/settings-backup、sessions/rollouts/logs/cache/crash
     // 与默认工作区 Workspace。失败不拦启动——各写路径自己 fail-closed，这里只如实报告。
     if let Err(e) = config::ensure_product_dirs(&dirs) {
@@ -2445,6 +2481,16 @@ pub fn run() {
                 ));
             }
             builder.build()?;
+            // 二次启动唤回：首实例在后台等命名事件，第二实例 SetEvent 后把窗口拉回前台。
+            // 监听必须早于用户可能发起的第二次启动，所以紧跟窗口创建注册。
+            let activate_handle = app.handle().clone();
+            if let Err(error) = config::single_instance::spawn_activation_listener(
+                config::single_instance::ACTIVATE_EVENT_NAME,
+                move || show_main_window(&activate_handle),
+            ) {
+                // 监听起不来不拦启动：二次启动会退化成"无法唤出窗口"的明确提示。
+                tracing::warn!("{error}");
+            }
             // MCP 应用级事件通道（SH-063）：运行时在 setup 前已随 AppState 构造，
             // 这里补上真正的发送端。
             {
