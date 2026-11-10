@@ -87,3 +87,60 @@ jobs:
       # 指向 dist：构建链断裂不该等到打包阶段才暴露
       - name: 前端构建
         run: pnpm build
+
+  # 产物级冒烟：必须跑在 release 主程序上。dev server 不经过 Tauri 资源协议、CSP 头与
+  # /api/file 媒体路由，unit/vitest 也覆盖不到，所以这一层单独一个 job。
+  #
+  # 与 gate 并行（不写 needs）：墙钟 ≈ max(gate 约 11 分钟, 本 job 约 13 分钟)，
+  # 串行会直接叠加到 25 分钟以上。runner 分钟数增加约一倍，换取"每次推送都验证安装形态"。
+  product-smoke:
+    runs-on: windows-latest
+    timeout-minutes: 40
+
+    steps:
+      - uses: actions/checkout@v7
+
+      - uses: actions/setup-node@v7
+        with:
+          node-version: '22'
+
+      - uses: pnpm/action-setup@v6
+
+      - uses: dtolnay/rust-toolchain@1.99.1
+
+      # 主程序编译是这条流水线的大头；缓存后同一 Cargo.lock 的二次运行约 4~6 分钟。
+      # 依赖或代码一变 key 就变，宁可重编也不跑旧产物。
+      - name: 缓存 cargo 构建产物
+        uses: actions/cache@v4
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+            src-tauri/target
+          key: ${{ runner.os }}-cargo-release-${{ hashFiles('src-tauri/Cargo.lock') }}
+          restore-keys: |
+            ${{ runner.os }}-cargo-release-
+
+      - name: 安装前端依赖
+        run: pnpm install --frozen-lockfile
+
+      # 只要主程序，不产安装器：冒烟验证的是资源协议/CSP/媒体路由，与 MSI 无关，
+      # 省掉 WiX 打包时间
+      - name: 构建 release 主程序（不打包安装器）
+        run: pnpm tauri build --no-bundle
+
+      # 四项只留最贵的：首屏、消息收发（本地 stub，不烧真 key）、/api/file 出图、PDF 出页
+      - name: 产物级冒烟（CDP 驱动 release 主程序）
+        shell: pwsh
+        run: |
+          $exe = 'src-tauri/target/release/shaniu.exe'
+          if (-not (Test-Path $exe)) { throw "release 主程序不存在：$exe" }
+          node scripts/smoke/run-smoke.mjs --exe $exe --out smoke-out
+
+      - name: 失败时留证据
+        if: failure()
+        uses: actions/upload-artifact@v4
+        with:
+          name: product-smoke-evidence
+          path: smoke-out
+          if-no-files-found: ignore
