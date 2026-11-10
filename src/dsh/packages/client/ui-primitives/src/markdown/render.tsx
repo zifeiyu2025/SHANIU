@@ -701,7 +701,27 @@ function LoadedMarkdownImage({ src, alt, destination, preview }: {
   const [failed, setFailed] = useState(false)
   const [open, setOpen] = useState(false)
   const close = useCallback(() => { setOpen(false) }, [])
-  if (failed) return <span className={css.imageAlt}>{preview === undefined ? '' : `${preview.labels.failed} · `}{alt || destination}</span>
+  if (failed) {
+    const label = <>{preview === undefined ? '' : `${preview.labels.failed} · `}{alt || destination}</>
+    // SH-137：失败态只有在目标是绝对 http(s) 时才可点。**不渲染 `<a href>`**——WebView
+    // 里点击裸锚点会把整个应用导航到外网；相对路径与 `file:` / `data:` 保持纯文本
+    // （`inlineCodeHttpUrl` 对它们返回 undefined）。
+    // 点击直接走全局 `window.open`：桌面装配期已把它换成宿主垫片
+    // （`src/external-link/route.ts` → `open_external_url`）。**不经**会话的
+    // `openExternalLink` 委托——那个委托会受「链接在侧栏打开」偏好影响，落到被 CSP
+    // `frame-src` 拦掉的内嵌浏览器页签，等于点了没反应。
+    const external = inlineCodeHttpUrl(destination)
+    const hint = preview?.labels.openExternal ?? preview?.labels.open
+    // 图片在链接内部（`preview === undefined`）时不放按钮：交互元素不能嵌在 `<a>` 里。
+    if (external === undefined || hint === undefined || preview === undefined) {
+      return <span className={css.imageAlt}>{label}</span>
+    }
+    return <button type="button" className={css.imageAltAction} title={external}
+      onClick={(event) => {
+        if (event.button !== 0) return
+        window.open(external, '_blank', 'noopener,noreferrer')
+      }}>{label}（{hint}）</button>
+  }
   const file = parseFileLink(destination)
   const contextMenuProps = getTriggerProps?.({ kind: 'image', url: src, ...(file === undefined ? {} : { path: file.path }) })
   const imageProps = { className: css.image, src, alt, onError: () => { setFailed(true) },

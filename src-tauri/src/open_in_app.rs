@@ -280,17 +280,30 @@ fn launch_args(id: &str, path: &Path) -> Vec<String> {
 }
 
 #[cfg(windows)]
-fn shell_open(path: &Path) -> Result<(), String> {
+fn shell_execute(target: &str) -> Result<(), String> {
     use windows::core::HSTRING;
     use windows::Win32::UI::Shell::ShellExecuteW;
     use windows::Win32::UI::WindowsAndMessaging::SW_SHOWNORMAL;
     let operation = HSTRING::from("open");
-    let target = HSTRING::from(path.to_string_lossy().into_owned());
+    let target = HSTRING::from(target);
     let result = unsafe { ShellExecuteW(None, &operation, &target, None, None, SW_SHOWNORMAL) };
     if result.0 as isize <= 32 {
-        return Err(format!("系统拒绝打开该路径（ShellExecute 返回 {}）", result.0 as isize));
+        return Err(format!(
+            "系统拒绝打开该目标（ShellExecute 返回 {}）",
+            result.0 as isize
+        ));
     }
     Ok(())
+}
+
+#[cfg(not(windows))]
+fn shell_execute(_target: &str) -> Result<(), String> {
+    Err("仅支持 Windows 桌面".to_string())
+}
+
+#[cfg(windows)]
+fn shell_open(path: &Path) -> Result<(), String> {
+    shell_execute(&path.to_string_lossy())
 }
 
 #[cfg(not(windows))]
@@ -476,6 +489,38 @@ pub fn workspace_path_applications(path: String) -> Result<Vec<FileApplication>,
     Ok(file_applications(&target))
 }
 
+/// 外部链接长度上限（字节），与媒体路由的 `path` 上限同量级。
+const MAX_EXTERNAL_URL_BYTES: usize = 8_192;
+
+/// SH-137：把 Markdown 里的 http(s) 链接交给系统默认浏览器。
+///
+/// 唯一调用方是装配期的 `window.open` 宿主垫片（`src/external-link/route.ts`）。
+/// **只认 http/https**：`javascript:` / `data:` 在 WebView 里等于给页面拿执行能力，
+/// `file:` 越出工作区边界，`mailto:` 等则把任意协议塞给 `ShellExecuteW`——一律拒绝。
+pub fn open_external_url(raw: &str) -> Result<(), String> {
+    let url = external_http_url(raw)?;
+    shell_execute(&url)
+}
+
+/// 外链白名单校验：纯函数，便于在不启动浏览器的前提下验证拒绝面。
+fn external_http_url(raw: &str) -> Result<String, String> {
+    if raw.is_empty() {
+        return Err("链接为空".to_string());
+    }
+    if raw.len() > MAX_EXTERNAL_URL_BYTES {
+        return Err(format!("链接超过 {MAX_EXTERNAL_URL_BYTES} 字节上限"));
+    }
+    // 空白/控制字符会让协议处理器产生歧义（换行甚至能截断参数）。
+    if raw.chars().any(|ch| ch.is_control() || ch.is_whitespace()) {
+        return Err("链接含空白或控制字符".to_string());
+    }
+    let lower = raw.to_ascii_lowercase();
+    if !(lower.starts_with("http://") || lower.starts_with("https://")) {
+        return Err("只允许 http/https 链接".to_string());
+    }
+    Ok(raw.to_string())
+}
+
 /// 可执行内容类的扩展名（审计 H2 批 3）。
 ///
 /// **为什么按扩展名拒绝，而不是按处理器 id**：`.exe` 在 Windows 里的「打开」动词就是
@@ -608,6 +653,42 @@ mod tests {
     fn paths_must_be_absolute_and_exist() {
         assert!(existing_absolute("relative/path").is_err());
         assert!(existing_absolute("C:\\definitely-not-here-shaniu").is_err());
+    }
+
+    /// SH-137：外链出口只放行 http/https；其余协议一律在参数校验处拒绝，
+    /// 不留给 `ShellExecuteW` 去「试试看」。
+    #[test]
+    fn external_urls_accept_only_http_schemes() {
+        assert!(external_http_url("https://example.com/a?b=1").is_ok());
+        assert!(external_http_url("http://example.com").is_ok());
+        // 协议大小写不敏感（`HTTPS:` 与 `https:` 等价）。
+        assert!(external_http_url("HTTPS://EXAMPLE.COM/a").is_ok());
+        for denied in [
+            "javascript:alert(1)",
+            "data:text/html,<script>alert(1)</script>",
+            "file:///C:/Windows/System32/calc.exe",
+            "mailto:someone@example.com",
+            "//example.com/a",
+            "/relative/path",
+            "example.com",
+            "",
+        ] {
+            assert!(external_http_url(denied).is_err(), "{denied} 必须被拒");
+        }
+    }
+
+    #[test]
+    fn external_urls_reject_whitespace_control_and_oversize() {
+        assert!(external_http_url("https://example.com/a b").is_err());
+        assert!(external_http_url("https://example.com/\r\nHost:evil").is_err());
+        assert!(external_http_url("https://example.com/\u{7f}").is_err());
+        let overlong = format!("https://example.com/{}", "a".repeat(MAX_EXTERNAL_URL_BYTES));
+        assert!(external_http_url(&overlong).is_err());
+        assert!(external_http_url(&format!(
+            "https://example.com/{}",
+            "a".repeat(MAX_EXTERNAL_URL_BYTES - "https://example.com/".len())
+        ))
+        .is_ok());
     }
 
     #[test]

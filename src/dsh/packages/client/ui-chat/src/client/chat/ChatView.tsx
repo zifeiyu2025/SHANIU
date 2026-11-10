@@ -103,6 +103,7 @@ export function ChatView({
     resourceAddress: (path: string) => sessionFileAddress(sessionId, resolveWorkspacePath(cwd, path)),
     labels: {
       open: t('image.open'), loading: t('image.loading'), failed: t('image.failed'),
+      openExternal: t('image.openExternal'),
       dialog: t('image.dialog'), close: t('image.close'),
     },
   }), [cwd, t, fileDrag, sessionId])

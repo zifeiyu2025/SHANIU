@@ -1817,6 +1817,15 @@ fn open_in_app_launch(
     open_in_app::open_in_app_launch_at(&app, &target)
 }
 
+/// SH-137：`window.open` 的宿主出口——只放行 http(s)，交给系统默认浏览器。
+///
+/// 前端在装配期把 `window.open` 换成宿主垫片（`src/external-link/route.ts`），
+/// 避免 Tauri 把整个应用导航到外网；协议白名单在 Rust 侧再判一次。
+#[tauri::command]
+fn open_external_url(url: String) -> Result<(), String> {
+    open_in_app::open_external_url(&url)
+}
+
 /// SH-115：`/plan` 命令的宿主面——直接置位/清位**该会话**的 PlanState。
 ///
 /// 上游 `/plan` 注册在 host 插件（`plan-mode/src/index.ts`，inject `['commands']`），
@@ -2244,6 +2253,7 @@ pub fn run() {
             open_in_app::open_in_app_catalog,
             open_in_app_launch,
             open_in_app::workspace_path_applications,
+            open_external_url,
             open_workspace_path,
             file_references::list_file_references,
             session_reference::list_session_references,

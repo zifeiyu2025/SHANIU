@@ -302,6 +302,23 @@
   font-style: italic;
 }
 
+/* SH-137：加载失败但目标是绝对 http(s) 时，占位文案本身是宿主外链按钮。 */
+.imageAltAction {
+  padding: 0;
+  border: 0;
+  background: none;
+  font: inherit;
+  font-style: italic;
+  color: var(--dsw-alias-label-tertiary);
+  text-decoration: underline;
+  text-underline-offset: 2px;
+  cursor: pointer;
+}
+
+.imageAltAction:hover {
+  color: var(--dsw-alias-label-secondary);
+}
+
 .image {
   display: block;
   width: auto;

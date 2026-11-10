@@ -28,7 +28,7 @@ export interface MarkdownDelegate {
     fileDrag: FileDragActions
     resolve: (path: string) => string | undefined
     resourceAddress?: ((path: string) => string) | undefined
-    labels: ImageLightboxLabels & { open: string; loading: string; failed: string }
+    labels: ImageLightboxLabels & { open: string; loading: string; failed: string; openExternal?: string }
   } | undefined
   /** Ordinary HTTP(S) activation; absent handlers retain native anchor behavior. */
   readonly openExternalLink?: MarkdownExternalLinkHandler | undefined

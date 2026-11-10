@@ -48,6 +48,7 @@ import { apply as uiSkillApply, inject as uiSkillInject } from '@deepseek-ai/dsh
 import { installDesktopFileActions } from './file-actions/desktop-bridge'
 import { installAttachmentUploadFetch } from './transport/attachment-upload'
 import { installOpenInAppRoutes } from './open-in-app/route-fetch'
+import { installExternalLinkOpener } from './external-link/route'
 import { apply as uiInputTriggerApply, inject as uiInputTriggerInject } from '@deepseek-ai/dsh-client-ui-input-trigger/client'
 import { apply as uiCommandsApply, inject as uiCommandsInject } from '@deepseek-ai/dsh-client-ui-commands/client'
 import { apply as uiEntryCustomizationApply, inject as uiEntryCustomizationInject } from '@deepseek-ai/dsh-client-ui-entry-customization/client'
@@ -248,6 +249,9 @@ export async function bootShaniu(container: HTMLElement, options: BootOptions = 
       // open-in-app 的三条 Host HTTP 路由（SH-092 批 3）接到 Tauri 命令；vendored
       // ui-open-in-app 只经全局 fetch 访问相对路径，源码无需改动。
       installOpenInAppRoutes(tauriBridge()),
+      // 外链（SH-137）：上游三处 `window.open` 入口只认全局函数，这里换成
+      // `open_external_url`——WebView 里原生 open 会把整个应用导航到外网。
+      installExternalLinkOpener(tauriBridge()),
       // 附件上传（SH-116 批 1）：file-upload 的 fetch 钩子接到 `upload_attachment`。
       // 必须在 fileUpload 插件构造前注入（本分支早于 features 挂载）。
       installAttachmentUploadFetch(),
