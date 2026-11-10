@@ -6,6 +6,7 @@
  */
 import { describe, expect, it, vi } from 'vitest'
 import { assertSessionWireEvent } from '../dsh/packages/api/session-controller/src/client/session-wire-event.ts'
+import { ClientSessions } from '../dsh/packages/api/session-controller/src/client/sessions/service.ts'
 import { ClientWorkspaceModel } from '../dsh/packages/api/workspace-controller/src/client/model.ts'
 import { createAdapter } from './adapter'
 import { registerExportTrigger } from './command-triggers'
@@ -397,6 +398,9 @@ function scriptedBridge(
 function eventsOf(snapshot: Record<string, unknown>): Record<string, unknown>[] {
   return (snapshot['records'] as { event: Record<string, unknown> }[]).map(record => record.event)
 }
+
+/** 让 manager 的微任务通知落地：`sessions.list` 的订阅回填要等一拍才可见。 */
+const flush = (): Promise<void> => new Promise(resolve => { setTimeout(resolve, 0) })
 
 /** 会话面在测试里的窄形状：只声明被测方法，避免每处都写类型断言。 */
 interface SessionFace {
@@ -955,6 +959,36 @@ describe('适配层的命令面映射', () => {
     expect(added[0]).toMatchObject({
       sessionId: 'agent-new', cwd: 'W', agentAvailable: true, running: false, blank: true,
     })
+    dispose()
+  })
+
+  it('补发事件只补齐 cwd、不新增行：已有占位行时列表条数不变', async () => {
+    const bridge = scriptedBridge()
+    const { remote, dispose } = createAdapter({ bridge })
+    // 与 dsh 的 client/index.ts:116 同一行接线：事件 → handleSessionAdded。
+    // 按钮读的就是 sessions.list，所以这里断言到 list，而不是只断言事件载荷。
+    const sessions = new ClientSessions(
+      // cordis 的 effect 登记的是**销毁回调**，返回句柄；这里不能执行它，否则创建完就 disposed。
+      { effect: () => () => {}, reflect: { provide: () => {} } } as never,
+      faceOf(remote) as never,
+    )
+    faceOf(remote).$on('api-session/added', ((summary: never) => {
+      sessions.handleSessionAdded(summary)
+    }) as never)
+    // 修前 create 落地的就是这种行：有身份、没有 cwd（upsert 分支只在缺 cwd 时补）。
+    sessions.handleSessionAdded({
+      agentAvailable: true, sessionId: 'agent-new' as never, updatedAt: 1, running: false, blank: true,
+    } as never)
+    await flush()
+    expect(sessions.list.getSnapshot().ids).toHaveLength(1)
+
+    await sessions.create({ workspaceId: 'default-workspace' as never })
+    await flush()
+    const list = sessions.list.getSnapshot()
+    // 条数不变（applyMutation 的 upsert 分支先按 sessionId 找 existing，L808-L809；
+    // cwd 只在 existing 缺、事件带时才补，L820；随后原位替换，L831），目标行 cwd 被填上。
+    expect(list.ids).toEqual(['agent-new'])
+    expect(list.byId['agent-new' as never]?.cwd).toBe('W')
     dispose()
   })
 
