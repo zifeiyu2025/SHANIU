@@ -1400,6 +1400,10 @@ fn get_settings(app: tauri::AppHandle) -> Result<serde_json::Value, String> {
                     // 推理档声明（SH-096）：档位 → wire 值；空串 = off 档（不发字段）。
                     // 前端视图把它翻成 null，写回时再归一成空串。
                     "reasoningEfforts": m.reasoning_efforts,
+                    // 生效档位（视图专用，不落盘）：与请求侧同一个判据
+                    // `declared_reasoning_levels`，本行没声明时由内置表/端点补出
+                    // 实际会接受的档位。设置页只读它补显示，写面逐字段挑时丢弃。
+                    "effectiveReasoningLevels": m.declared_reasoning_levels(&p.base_url),
                     // 能力视图（SH-132）：值 + 来源 + 实测四态（已验证/不符/检测中/未验证）。
                     // 实测结论按 (端点, 协议, 模型, 密钥指纹) 取缓存，换任一项自然失效。
                     "capabilities": capability::model_view(m, &p.base_url, probed, probing),

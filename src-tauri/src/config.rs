@@ -2616,6 +2616,44 @@ network = \"restricted\"\n";
         assert_eq!(cfg.effective_model().reasoning_effort, None);
     }
 
+    /// 设置页的「生效档位」与请求侧必须是同一个判据：本行没声明时由内置表补出
+    /// 实际会被 `reasoning_wire` 接受的档；内置表也没有就不给，不猜。
+    #[test]
+    fn declared_levels_fall_back_to_builtin_and_stay_empty_when_unknown() {
+        let base = "https://api.deepseek.com";
+        let flash = row("deepseek-flash");
+        assert_eq!(
+            flash.declared_reasoning_levels(base),
+            ["low", "high", "max"],
+            "内置表声明了 low/high/max，设置页必须与请求侧看到同一组档"
+        );
+        // 两侧同源：界面列出的每一档，请求侧都必须查得到 wire 值
+        for level in flash.declared_reasoning_levels(base) {
+            assert!(
+                flash.reasoning_wire(base, &level).is_some(),
+                "界面给出的档 {level} 在请求侧没有 wire 值 = 两侧漂移"
+            );
+        }
+        assert_eq!(flash.reasoning_wire(base, "high").as_deref(), Some("high"));
+        // LongCat 端点实测静默忽略 reasoning_effort（thinking 才是真开关），
+        // 内置表不声明档位 → 空清单，设置页就不给档位选择。
+        let longcat_base = "https://api.longcat.chat/openai/v1";
+        assert!(
+            row("LongCat-2.5").declared_reasoning_levels(longcat_base).is_empty(),
+            "内置表没声明的模型不得凭空出档位"
+        );
+        // 本行声明优先于内置表（同 id 换端点能力可能不同）
+        let declared = effort_row("deepseek-flash");
+        assert_eq!(declared.declared_reasoning_levels(base), ["low", "high"]);
+        // 端点明说没这档 → 从清单里剔掉（selected 与 wire 不能错位）
+        let mut constrained = row("deepseek-flash");
+        constrained.capabilities.insert(
+            "reasoning".into(),
+            CapabilityRecord { endpoint_levels: vec!["low".into()], ..Default::default() },
+        );
+        assert_eq!(constrained.declared_reasoning_levels(base), ["low"]);
+    }
+
     #[test]
     fn validate_providers_rejects_bad_reasoning_declarations() {
         // 未知档位名：席位会列出后端查不到 wire 值的档

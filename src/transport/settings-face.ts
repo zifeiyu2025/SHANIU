@@ -43,6 +43,12 @@ interface HostModelRow {
    */
   readonly reasoningEfforts?: Readonly<Record<string, string>>
   /**
+   * 生效推理档（视图专用，不属于 config.toml）：宿主按请求侧同一判据
+   * （本行声明 → 内置表 → 端点声明）算好。本行没声明时席位据此补出档位，
+   * 前端不自己维护一份内置表——两份清单迟早对不上。写面逐字段挑时丢弃。
+   */
+  readonly effectiveReasoningLevels?: readonly string[]
+  /**
    * 能力来源视图（视图专用，不属于 config.toml）：宿主按「值 + 来源 + 三态」
    * 给出每个能力项谁说的、测过没有，这里原样透传，写面逐字段挑时丢弃。
    */
@@ -674,11 +680,13 @@ export function createSettingsFace(bridge: HostBridge, options: SettingsFaceOpti
       .map(model => {
         const out: Record<string, unknown> = { id: String(model.id ?? ''), name: String(model.name ?? model.id ?? '') }
         // 声明了推理档位的模型把可选档带给席位（SH-096）：下拉按 efforts 列档、
-        // 按 defaultEffort 预选；未声明的模型不出档位（席位的既有判据）。
+        // 按 defaultEffort 预选；本行没声明时用宿主算出的生效档（见下），
+        // 宿主连内置表都没命中才不出档位。
         // 初始默认（用户拍板，2026-11-07）：没选择过档位时预选声明的 high——
         // 与后端 effective_model 的请求侧回落同一规则（config.rs），两侧不漂移；
         // 模型没声明 high（或其 wire 值为空）就不给 defaultEffort，不发明档位。
         const declared = row.models.find(candidate => candidate.id === out.id)?.reasoningEfforts
+        const effective = row.models.find(candidate => candidate.id === out.id)?.effectiveReasoningLevels ?? []
         if (declared !== undefined && Object.keys(declared).length > 0) {
           const efforts = thinkingLevels().filter(level => level in declared)
             .map(level => ({ id: level, name: level }))
@@ -690,6 +698,22 @@ export function createSettingsFace(bridge: HostBridge, options: SettingsFaceOpti
           out.reasoning = {
             efforts,
             ...(defaultEffort !== undefined ? { defaultEffort } : {}),
+          }
+        } else if (effective.length > 0) {
+          // 本行没声明（老配置/内置默认行）：宿主给出的生效档就是请求侧真正会接受
+          // 的那组档，界面照它列，不再"后端发 high、界面没有档位"。
+          const efforts = thinkingLevels().filter(level => effective.includes(level))
+            .map(level => ({ id: level, name: level }))
+          const selected = row.reasoningEffort ?? ''
+          const preferred = snapshot?.defaultReasoningLevel
+          const defaultEffort = selected !== '' && effective.includes(selected)
+            ? selected
+            : preferred !== undefined && effective.includes(preferred) ? preferred : undefined
+          if (efforts.length > 0) {
+            out.reasoning = {
+              efforts,
+              ...(defaultEffort !== undefined ? { defaultEffort } : {}),
+            }
           }
         }
         return out
@@ -1053,8 +1077,13 @@ export function createSettingsFace(bridge: HostBridge, options: SettingsFaceOpti
         const effort = (request.reasoningEffort ?? '').trim()
         const effectiveEffort = effort !== '' ? effort : row.reasoningEffort ?? ''
         if (effort !== '') {
-          const declared = row.models.find(candidate => candidate.id === request.model)?.reasoningEfforts
-          if (declared === undefined || !(effort in declared)) {
+          const model = row.models.find(candidate => candidate.id === request.model)
+          const declared = model?.reasoningEfforts ?? {}
+          const effective = model?.effectiveReasoningLevels ?? []
+          // 可选档 = 本行声明 ∪ 宿主算出的生效档（后者在本行没声明时来自内置表/
+          // 端点声明，后端 reasoning_wire 同样认这组档）。两者都不含就拒单：
+          // 写进去的档后端查不到 wire 值，席位会显示"选了但请求里没有"。
+          if (!(effort in declared) && !effective.includes(effort)) {
             return refused(new RemoteError('gateway/bad-request', `model "${request.model}" does not declare reasoning level "${effort}"`, {}))
           }
         }

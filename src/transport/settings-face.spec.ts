@@ -37,7 +37,16 @@ interface Row {
   /** 自定义请求头（SH-097）。 */
   headers?: Record<string, string>
   secret_ref: string
-  models: { id: string; name: string; context_window: number; max_tokens: number; input: string[]; reasoning_efforts?: Record<string, string> }[]
+  models: {
+    id: string
+    name: string
+    context_window: number
+    max_tokens: number
+    input: string[]
+    reasoning_efforts?: Record<string, string>
+    /** 宿主算出的生效档（视图专用）：本行没声明时由内置表/端点声明补齐。 */
+    effective_reasoning_levels?: string[]
+  }[]
 }
 
 /**
@@ -118,6 +127,8 @@ function fakeHost(rows: Row[] = []): FakeHost {
             approvalMode: 'ask',
             activeProvider: state.active,
             providerRevision: state.revision,
+            // 与真实 `get_settings` 同形：默认档由宿主给出（config.rs 的唯一真源）
+            defaultReasoningLevel: 'high',
             providers: state.rows.map(row => ({
               id: row.id,
               label: row.label,
@@ -140,6 +151,10 @@ function fakeHost(rows: Row[] = []): FakeHost {
                 input: model.input,
                 // 空串 = off 档的落盘形态（TOML 无 null），与真实宿主同形
                 ...(model.reasoning_efforts === undefined ? {} : { reasoningEfforts: model.reasoning_efforts }),
+                // 视图专用字段：真实宿主每条模型行都给（可能是空数组），这里同形回显
+                ...(model.effective_reasoning_levels === undefined
+                  ? {}
+                  : { effectiveReasoningLevels: model.effective_reasoning_levels }),
               })),
               reasoningEffort: row.reasoning_effort ?? '',
             })),
@@ -250,6 +265,31 @@ const LONGCAT_EFFORTS_NO_HIGH: Row = {
     id: 'LongCat-2.5', name: 'LongCat 2.5', context_window: 128_000, max_tokens: 8_192, input: ['text'],
     reasoning_efforts: { off: '', low: 'low' },
   }],
+}
+
+/**
+ * 本行**没声明**档位、内置表声明了的组合（老配置/未回写的 DeepSeek 行）：
+ * 宿主按请求侧同一判据回显生效档，席位据此补显示。
+ */
+const DEEPSEEK_UNDECLARED: Row = {
+  ...{
+    id: 'deepseek',
+    label: 'DeepSeek',
+    provider: 'openai-chat',
+    base_url: 'https://api.deepseek.com',
+    model: 'deepseek-flash',
+    secret_ref: 'DEEPSEEK_API_KEY',
+  },
+  models: [{
+    id: 'deepseek-flash', name: 'DeepSeek-V4.1-Flash', context_window: 1_048_576, max_tokens: 393_216,
+    input: ['text', 'image'], effective_reasoning_levels: ['low', 'high', 'max'],
+  }],
+}
+
+/** 同样未声明，但宿主算出的生效档为空（内置表与端点都没声明）：不许凭空出档位。 */
+const LONGCAT_NO_LEVELS: Row = {
+  ...LONGCAT,
+  models: [{ ...LONGCAT.models[0]!, effective_reasoning_levels: [] }],
 }
 
 /** 出厂内置的 DeepSeek（与 Rust `builtin_providers`、`model-catalog.json` 同数值）。 */
@@ -602,6 +642,56 @@ describe('settings 面：写路径', () => {
     const catalog2 = (await face2.session.modelCatalog())['value'] as {
       groups: { models: { reasoning?: { defaultEffort?: string } }[] }[] }
     expect(catalog2.groups[0]!.models[0]!.reasoning?.defaultEffort).toBeUndefined()
+  })
+
+  it('本行未声明档位时用宿主生效档补显示，且视图字段不落盘', async () => {
+    // 症状：后端按内置表发 reasoning_effort=high，界面因为只读原始声明而一个档都没有。
+    const host = fakeHost([DEEPSEEK_UNDECLARED])
+    host.active = 'deepseek'
+    const face = faceOf(host)
+    await face.credentials.set('DEEPSEEK_API_KEY', 'k')
+    const catalog = (await face.session.modelCatalog())['value'] as {
+      groups: { models: { id: string; reasoning?: { efforts: { id: string }[]; defaultEffort?: string } }[] }[]
+    }
+    const model = catalog.groups[0]!.models[0]!
+    expect(model.reasoning?.efforts.map(effort => effort.id)).toEqual(['low', 'high', 'max'])
+    // 默认档来自宿主下发的 defaultReasoningLevel（与请求侧同一真源），不在清单内就不给
+    expect(model.reasoning?.defaultEffort).toBe('high')
+
+    // 选档：写进 reasoning_effort，模型行不许夹带视图字段（否则会落进 config.toml）
+    const picked = await face.session.selectModel({ provider: 'deepseek', model: 'deepseek-flash', reasoningEffort: 'max' })
+    expect(picked['ok']).toBe(true)
+    expect(face.activeSelection()).toMatchObject({ reasoningEffort: 'max' })
+    const saved = host.calls.filter(call => call.command === 'save_providers').at(-1)?.args as {
+      providers: { reasoning_effort: string; models: Record<string, unknown>[] }[]
+    }
+    expect(saved.providers[0]!.reasoning_effort).toBe('max')
+    expect(saved.providers[0]!.models[0]).not.toHaveProperty('effectiveReasoningLevels')
+    expect(saved.providers[0]!.models[0]).not.toHaveProperty('reasoning_efforts')
+
+    // 设置页写面（describe 的 value）同样不含视图字段：保存时整份回写也不会带上
+    const described = (await face.settings.describe())['value'] as {
+      namespaces: { ns: string; value: { providers: Record<string, { models: Record<string, unknown>[] }> } }[]
+    }
+    const piAi = described.namespaces.find(ns => ns['ns'] === 'llm-pi-ai')!
+    expect(piAi.value.providers['deepseek']!.models[0]).not.toHaveProperty('effectiveReasoningLevels')
+
+    // 生效档之外的档位仍然拒单（与既有语义一致，没有因为放宽而放行任意档）
+    const bogus = await face.session.selectModel({ provider: 'deepseek', model: 'deepseek-flash', reasoningEffort: 'xhigh' })
+    expect(bogus['ok']).toBe(false)
+    expect((bogus['error'] as Error).message).toContain('does not declare reasoning level')
+  })
+
+  it('宿主生效档为空时席位不出 reasoning：没有证据就不给档位', async () => {
+    const host = fakeHost([LONGCAT_NO_LEVELS])
+    host.active = 'longcat'
+    const face = faceOf(host)
+    await face.credentials.set('LONGCAT_API_KEY', 'k')
+    const catalog = (await face.session.modelCatalog())['value'] as {
+      groups: { models: { reasoning?: unknown }[] }[]
+    }
+    // LongCat 端点实测静默忽略 reasoning_effort（thinking 才是真开关）→ 必须保持无档位
+    expect(catalog.groups[0]!.models[0]!.reasoning).toBeUndefined()
   })
 
   it('developer tools 域（ui-settings）：默认开启、可切换、跨实例回读，未知形状拒绝', async () => {

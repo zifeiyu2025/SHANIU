@@ -275,7 +275,6 @@ mod tests {
         ("https://api.longcat.chat/openai/v1", "LongCat-2.7", "longcat-2x"),
         ("https://token.sensenova.cn/v1", "sensenova-6.8-flash-preview", "sensenova-68-flash"),
         ("https://token.sensenova.cn/v1", "glm-5.7", "sensenova-glm-5"),
-        ("https://api.deepseek.com", "deepseek-v4-preview", "deepseek-v4"),
     ];
 
     #[test]

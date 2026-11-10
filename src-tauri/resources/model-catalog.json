@@ -1,7 +1,7 @@
 {
   "schema_version": 1,
-  "data_updated_at": "2026-11-09",
-  "note": "来源：各端点 GET /models（及 /models/{id}）实测取回，2026-11-09。只收实测过的模型条目，不抄不确定的数字；端点没给的字段留空，交给探针与用户手填。SiliconFlow 端点返回 401，未取得任何数据，因此不收录。tools 只记端点明确声明的（DeepSeek 端点未声明，留空由探针补）。",
+  "data_updated_at": "2026-11-10",
+  "note": "来源：各端点 GET /models（及 /models/{id}）实测取回。只收实测过的模型条目，不抄不确定的数字；端点没给的字段留空，交给探针与用户手填。SiliconFlow 端点返回 401，未取得任何数据，因此不收录。tools 只记端点明确声明的（DeepSeek 端点未声明，留空由探针补）。2026-11-10 复核 DeepSeek 端点 /v1/models 只有 deepseek-flash 与 deepseek-v4-pro，原「deepseek-v4 家族」规则匹配的是不存在的 id 且会把 low/high/max 静默安到任意未来的 deepseek-v4-xxx 上，已删除；未知 id 交给端点元数据、探针与用户手填，不猜。",
   "models": [
     {
       "host": "api.deepseek.com",
@@ -151,17 +151,6 @@
       "input": ["text"],
       "tools": true,
       "note": "glm-5.2/5.3 实测同值"
-    },
-    {
-      "id": "deepseek-v4",
-      "host": "api.deepseek.com",
-      "pattern": "^deepseek-v4(-[a-z0-9.]+)?$",
-      "context_window": 1048576,
-      "max_output": 393216,
-      "input": ["text"],
-      "reasoning_levels": ["low", "high", "max"],
-      "default_reasoning_level": "high",
-      "note": "v4 家族共用端点 effort 声明；vision 不继承（v4-pro 实测仅 text）"
     }
   ]
 }
