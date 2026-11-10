@@ -1,6 +1,6 @@
 [package]
 name = "shaniu"
-version = "0.2.1"
+version = "0.2.2"
 description = "SHANIU - Windows 桌面 Agent Harness 客户端"
 edition = "2021"
 
