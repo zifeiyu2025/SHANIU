@@ -2137,9 +2137,53 @@ fn show_main_window(app: &tauri::AppHandle) {
     }
 }
 
+/// 原生消息框：启动早期窗口还没创建，只能走 Win32。
+fn show_native_message(text: &str) {
+    use windows::core::HSTRING;
+    use windows::Win32::UI::WindowsAndMessaging::{
+        MessageBoxW, MB_ICONERROR, MB_OK, MB_SETFOREGROUND, MB_TOPMOST,
+    };
+    let text = HSTRING::from(text);
+    let caption = HSTRING::from("SHANIU");
+    unsafe {
+        MessageBoxW(
+            None,
+            &text,
+            &caption,
+            MB_OK | MB_ICONERROR | MB_SETFOREGROUND | MB_TOPMOST,
+        );
+    }
+}
+
+/// 第二个实例的告知：主窗口此时还没创建（tauri.conf.json 里 `create: false`，
+/// 要等 setup 才建），所以只能用原生消息框。静默退出或"只读凑合启动"都不行——
+/// 前者让用户以为程序没起来，后者会让用户以为历史还在、实际写不进去。
+fn report_data_root_in_use(data_root: &Path) {
+    show_native_message(&format!(
+        "这个数据目录已被另一个 SHANIU 实例占用：\n{}\n\n\
+         同一数据目录不能同时打开两份，否则会话历史可能被写坏。\n\
+         请先退出另一个实例；或为这份副本指定独立的数据目录（便携模式：\
+         把 exe 单独放进一个空文件夹，首次启动会在它旁边建 data\\）。",
+        data_root.display()
+    ));
+}
+
 pub fn run() {
     // 数据目录解析结果写入日志第一行（docs §9.3 的「解析结果写入日志第一行」即指此条）
     let dirs = config::resolve_dirs_from_env();
+    // 同一 data_root 只允许一个写者：rollout 是逐行 append 的真源，两个进程同写会把
+    // 两条历史交错进同一档案。互斥体名由规范化路径 hash 派生，所以不同 `data\` 的
+    // 两个副本仍能同时跑（那是合法用法，拦下来是错的）。
+    // 必须早于日志初始化与任何文件写入：第二个实例不该往同一 logs\ 里再写一份。
+    // 锁存活到 run() 返回 = 进程结束；异常退出时由 OS 关闭句柄自动释放。
+    let _instance_lock = match config::single_instance::acquire(&dirs.data_root) {
+        Ok(lock) => lock,
+        Err(message) => {
+            eprintln!("[SHANIU] {message}");
+            report_data_root_in_use(&dirs.data_root);
+            std::process::exit(2);
+        }
+    };
     // 产品目录结构提前建好（幂等）：secrets/settings-backup、sessions/rollouts/logs/cache/crash
     // 与默认工作区 Workspace。失败不拦启动——各写路径自己 fail-closed，这里只如实报告。
     if let Err(e) = config::ensure_product_dirs(&dirs) {

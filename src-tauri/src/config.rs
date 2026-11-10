@@ -23,6 +23,8 @@ use tracing_subscriber::fmt::MakeWriter;
 pub mod model_catalog;
 /// 内置服务商表：出厂默认服务商与展示次序的数据层来源。
 pub mod builtin_providers;
+/// 同 `<data_root>` 单实例保护：命名互斥体按数据目录 hash 区分（2026-11-11）。
+pub mod single_instance;
 
 pub const DATA_DIR_ENV: &str = "SHANIU_DATA_DIR";
 pub const PORTABLE_MARKER: &str = "portable.marker";
