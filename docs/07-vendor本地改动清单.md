@@ -21,12 +21,13 @@
 | 1 | `aliases.ts`（**本地新增，非上游文件**） | 维护 `@deepseek-ai/dsh-*` → 实际路径的别名表；多笔提交持续追加 | 只 vendor 了用到的包，入口需要显式映射；上游没有等价物 | SH-071/088/089/090/091/092/093/109、0238af4 |
 | 2 | `tsconfig.base.json` | 别名映射剪到真实存在的条目 | 映射到不存在的包会让 `tsc -b` 报错，且掩盖真实缺包 | 466192d、1f5d13f |
 | 3 | `packages/client/ui-sidebar-terminal/src/client/{face.ts,index.ts,terminal.tsx,TerminalCleanup.tsx,TerminalGuide.tsx}` | 把上游对 `@deepseek-ai/dsh-api-terminal-controller/{client,types}` 的导入改为本地 `./model.ts`；`index.ts` 的 `target()` 只接受终端形状参数 | 控制器包未 vendor（依赖宿主 PTY/终端服务），本地 `model.ts`（新增，约 146 行）实现同一契约；窄化参数避免把任意导航参数当终端请求 | SH-071（0dc03f0） |
-| 4 | `packages/client/ui-sidebar-terminal/src/client/{terminal.module.css,TerminalCleanup.module.css,TerminalTitle.module.css}` | `--dsw-alias-bg-l1/-2` → `--dsw-alias-bg-layer-1/-2` | 上游 CSS 引用的令牌在真实主题里不存在，面板背景透明；由 `src/theme-tokens.spec.ts` 机检兜底 | SH-071 纠错、fcc0ad4621 |
-| 5 | `packages/client/ui-primitives/src/AnimatedRows.tsx`、`packages/client/ui-workspace/src/client/rows/WorkspaceBrowser.tsx` | 修复 UIA Expand 导致的渲染进程卡死；补 ARIA 树键盘模型 | Windows 辅助功能树展开会触发上游动画路径的重入；键盘可访问性缺失 | SH-101（ff384d9） |
+| 4 | `packages/client/ui-sidebar-terminal/src/client/{terminal.module.css,TerminalCleanup.module.css,TerminalTitle.module.css,TerminalGuide.module.css}` | `--dsw-alias-bg-l1/-2` → `--dsw-alias-bg-layer-1/-2`（共 5 处） | 上游包间漂移：`fcc0ad4621` 的 `ui-theme` 已改名 `bg-layer-*`，而同一基线的 `ui-sidebar-terminal` 仍在引用 `bg-l1/-2`，面板背景透明。**下次同步**：先看上游 terminal 是否已改用 `bg-layer-*`——已改就删本地补丁；同步 theme 时反向核对，别把令牌名改回 `bg-l*`。由 `src/theme-tokens.spec.ts` 机检兜底 | SH-071 纠错、fcc0ad4621 |
+| 5 | `packages/client/ui-primitives/src/AnimatedRows.tsx`、`packages/client/ui-workspace/src/client/rows/{WorkspaceBrowser.tsx,treeKeyboard.ts}`（`treeKeyboard.ts` 为本地新增） | 修复 UIA Expand 导致的渲染进程卡死；补 ARIA 树键盘模型（方向键/Home/End 在树内移动焦点，**比上游多**，见下方同步说明第 4 条） | Windows 辅助功能树展开会触发上游动画路径的重入；键盘可访问性缺失 | SH-101（ff384d9） |
 | 6 | `packages/client/ui-approval/src/client/ApprovalCard.tsx` | 默认焦点落在「拒绝」；修复 `allow-once` 被记忆为永久放行 | 审批默认必须是安全侧；一次性放行不得降级成 `allow_always` | SH-025（5d5342a） |
 | 7 | `packages/client/ui-settings-general/src/client/{SettingsRoot.module.css,chrome.module.css}` | 设置按钮紧凑化并右对齐 | 用户明确要求；纯样式 | a10cd6c |
 | 8 | `packages/client/ui-settings-models/src/client/ModelsSection.tsx` | 恢复上游的 `intro` 段落（2 处，空态与主态各一）；文案走词典 `intro`（`zh` / `en`），不写在 JSX 里 | 此前 vendor 导入时被移除，导致模型设置页从 `h2` 直接跳到卡片、缺一句页面说明；恢复的是上游原节点，不是新增 | 2026-11-10（v0.2.1 视觉对齐批，04） |
 | 9 | React 19 / 严格类型门禁批次（28 个文件，见下） | 类型级修复：显式返回类型、`useRef` 初值、可选属性收窄、`readonly` 对齐；不改运行行为 | `tsc -b` 恢复零错（原 246 错）；React 19 类型定义更严 | 97b5250 |
+| 10 | `packages/client/ui-layout/src/client/AppFrame.tsx` | `inert: 条件 ? '' : undefined` → `inert: 条件`（5 处） | React 19 已按布尔处理 `inert`；空串写法在新类型定义下不合法，语义等价，属 React 19 兼容修复 | 2026-11-10（0.2.2 类型门禁） |
 
 第 9 行的文件（全部只做类型修复）：
 
@@ -68,6 +69,9 @@ git log --diff-filter=M --name-only -- src/dsh
 git diff --no-index "D:\AI\deepseek-harness\packages\<pkg>" "src\dsh\packages\<pkg>"
 
 # 3) 上游已修的项：删本表行 + 移除本地补丁；上游新增的扩展点：优先改走扩展点
+# 4) WorkspaceBrowser 的树形键盘导航是本地增补：上游只有鼠标展开/收起。方向与
+#    「对齐 DSH」相反，但只增不减、不影响上游行为，同步时保留；若上游后来自己
+#    加了键盘模型，删本地 treeKeyboard.ts 并改用上游实现。
 ```
 
 新增/调整本表时，同一提交内更新，不要事后补记——事后补记等于没记。
