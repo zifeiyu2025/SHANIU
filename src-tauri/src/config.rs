@@ -1294,6 +1294,9 @@ fn create_subdir(root: &Path, name: &str) -> Result<(), String> {
 }
 
 /// 纯函数解析（输入显式注入，可单测各优先级分支）。
+///
+/// **不做首次判定**：没有 `portable.marker` 时直接回落安装版，不探测可写性、不写记录。
+/// 真实启动走 [`init_root_resolution`]——它先读记录、再在确实没有记录时判定一次。
 pub fn resolve_dirs(
     env_data_dir: Option<&str>,
     exe_dir: Option<&Path>,
@@ -1314,15 +1317,371 @@ pub fn resolve_dirs(
             return DataDirs { config_root: root.clone(), data_root: root };
         }
     }
-    // 优先级 3：安装模式默认
+    installed_dirs(appdata, localdata)
+}
+
+/// 安装模式默认根：配置侧 `%APPDATA%\SHANIU`，数据侧 `%LOCALAPPDATA%\SHANIU`。
+fn installed_dirs(appdata: Option<&Path>, localdata: Option<&Path>) -> DataDirs {
     let fallback = std::env::temp_dir().join(APP_DIR_NAME);
     let config_root = appdata.map(|p| p.join(APP_DIR_NAME)).unwrap_or_else(|| fallback.clone());
     let data_root = localdata.map(|p| p.join(APP_DIR_NAME)).unwrap_or(config_root.clone());
     DataDirs { config_root, data_root }
 }
 
+// ==================== 数据根首次判定（2026-11-11） ====================
+//
+// 问题：便携与否原来只看 `portable.marker`。用户把单文件 exe 单独取出（无 marker）
+// 启动时，数据落进 `%LOCALAPPDATA%\SHANIU`、exe 旁边不生成 `data\`——"单文件 exe
+// 发群、数据在 exe 同目录"的发放形态因此不成立。
+//
+// 现在的规则：**首次启动判定一次，之后一律按记录走，绝不每次重新探测**。
+// 为什么不能每次探测：U 盘只读开关、目录权限变化、杀软临时拦截都会让两次启动落到
+// 不同位置；数据根一旦漂移，用户看到的是"历史没了"——那比"路径不理想"严重一个量级。
+// 路径不理想最多是用户手动搬一次目录；数据分裂是两份历史、无法自动合并。
+
+/// 数据根来源。
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum DataRootKind {
+    /// 数据在程序旁边（`<exe 目录>\data`）。
+    Portable,
+    /// 数据在用户目录（`%APPDATA%\SHANIU` / `%LOCALAPPDATA%\SHANIU`）。
+    Installed,
+}
+
+impl DataRootKind {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Portable => "portable",
+            Self::Installed => "installed",
+        }
+    }
+}
+
+/// 数据根记录：`<用户目录>\SHANIU\data-root\<exe 目录 hash>.json`。
+///
+/// **按 exe 目录分文件，不是全机一份**：同一台机器可以有两份便携副本，各自 `data\`
+/// 互不相干、也允许同时运行。全机一份记录会把它们强行指向同一个根——第二份要么被
+/// 单实例锁拦下，要么更糟：两份历史混进同一个目录。
+pub const DATA_ROOT_RECORD_VERSION: u32 = 1;
+pub const DATA_ROOT_RECORD_DIR: &str = "data-root";
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct DataRootRecord {
+    pub version: u32,
+    pub kind: DataRootKind,
+    /// 判定当时的数据根绝对路径。
+    pub path: String,
+    /// 判定当时的 exe 目录（排障用，不参与判定；exe 移动后靠它一眼看出记录是旧的）。
+    pub exe_dir: String,
+}
+
+/// 一次数据根解析的完整结果。
+#[derive(Debug, Clone)]
+pub struct RootResolution {
+    pub dirs: DataDirs,
+    /// `None` = `SHANIU_DATA_DIR` 显式覆盖（不落记录，也不算"首次判定"）。
+    pub kind: Option<DataRootKind>,
+    /// true = 本次做了首次判定，需要把记录落盘。
+    pub decided_now: bool,
+    pub record_path: PathBuf,
+    /// 必须明确告诉用户的问题（记录与实际不符、记录写不下）；`None` = 一致。
+    pub warning: Option<String>,
+}
+
+/// 记录文件路径：按 exe 目录 hash 分文件，放在用户目录（而不是 exe 旁边）——
+/// exe 旁边恰恰可能是只读的，记录写不下去就退化成"每次重新判定"，正是要防的。
+pub fn data_root_record_path(
+    exe_dir: Option<&Path>,
+    appdata: Option<&Path>,
+    localdata: Option<&Path>,
+) -> PathBuf {
+    let base = localdata
+        .or(appdata)
+        .map(|root| root.join(APP_DIR_NAME))
+        .unwrap_or_else(|| std::env::temp_dir().join(APP_DIR_NAME));
+    let key = exe_dir.map(path_hash).unwrap_or(0);
+    base.join(DATA_ROOT_RECORD_DIR).join(format!("{key:016x}.json"))
+}
+
+/// 路径的稳定 hash：canonicalize 小写后按 UTF-16 取字节。
+/// `DefaultHasher` 不保证跨 Rust 版本稳定——升级工具链后记录文件名会变，
+/// 等于把"之后固定"作废。
+pub(crate) fn path_hash(path: &Path) -> u64 {
+    let full = fs::canonicalize(path)
+        .or_else(|_| std::path::absolute(path))
+        .unwrap_or_else(|_| path.to_path_buf());
+    let lowered = full.to_string_lossy().to_lowercase();
+    let mut bytes = Vec::with_capacity(lowered.len() * 2);
+    for unit in lowered.encode_utf16() {
+        bytes.extend_from_slice(&unit.to_le_bytes());
+    }
+    single_instance::fnv1a_64(&bytes)
+}
+
+/// 真实探测"能建目录**并且**能写文件"。
+///
+/// 只判 `create_dir_all` 不够：目录可能早就存在（只读介质、权限被收回），mkdir 成功
+/// 但一写就失败——那正是数据分裂最典型的触发条件。
+fn probe_data_dir_writable(dir: &Path) -> bool {
+    if fs::create_dir_all(dir).is_err() {
+        return false;
+    }
+    let probe = dir.join(format!(".shaniu-write-probe-{}", std::process::id()));
+    let ok = fs::write(&probe, b"ok").is_ok();
+    let _ = fs::remove_file(&probe);
+    ok
+}
+
+fn same_path(left: &Path, right: &Path) -> bool {
+    let norm = |path: &Path| {
+        path.to_string_lossy()
+            .trim_end_matches(['\\', '/'])
+            .to_lowercase()
+    };
+    norm(left) == norm(right)
+}
+
+fn unwritable_warning(dirs: &DataDirs, record_path: &Path) -> String {
+    format!(
+        "数据目录现在写不进去：{}\n\n\
+         程序不会自动换到别的位置（换了会把已有历史分成两处，看起来就像全丢了），\
+         因此仍按原位置启动，但这次可能存不下新内容。\n\n\
+         请恢复该目录的写权限。要重新选择位置，删除记录文件后重启：\n{}",
+        dirs.data_root.display(),
+        record_path.display()
+    )
+}
+
+/// 纯判定：输入显式注入（含"可写探测"这个可替换的副作用点），可单测每一条分支。
+///
+/// 优先级：`SHANIU_DATA_DIR` > 已有记录（**不再探测**）> 旧 `portable.marker` /
+/// 已存在的 `<exe>\data` > 可写性探测 > 安装版默认。
+pub fn decide_root(
+    env_data_dir: Option<&str>,
+    exe_dir: Option<&Path>,
+    appdata: Option<&Path>,
+    localdata: Option<&Path>,
+    record: Option<&DataRootRecord>,
+    writable: impl Fn(&Path) -> bool,
+) -> RootResolution {
+    let record_path = data_root_record_path(exe_dir, appdata, localdata);
+
+    // 0）显式覆盖：测试/CI/多实例隔离用，不读不写记录。
+    if let Some(dir) = env_data_dir.map(str::trim).filter(|dir| !dir.is_empty()) {
+        let root = PathBuf::from(dir);
+        return RootResolution {
+            dirs: DataDirs { config_root: root.clone(), data_root: root },
+            kind: None,
+            decided_now: false,
+            record_path,
+            warning: None,
+        };
+    }
+
+    // 1）有记录：一律按记录。探测只用于**发现不一致并告知**，绝不用于换位置。
+    if let Some(record) = record {
+        let root = PathBuf::from(&record.path);
+        let dirs = DataDirs { config_root: root.clone(), data_root: root.clone() };
+        let expected = match record.kind {
+            DataRootKind::Portable => exe_dir.map(|dir| dir.join("data")),
+            DataRootKind::Installed => Some(installed_dirs(appdata, localdata).data_root),
+        };
+        // exe 被挪走 / 系统用户目录变了：记录仍有效，但它已经和"当前该在的位置"不同了。
+        let moved = expected
+            .as_deref()
+            .map(|expected| !same_path(expected, &root))
+            .unwrap_or(false);
+        let warning = if moved {
+            Some(format!(
+                "数据位置记录显示数据在：{}\n\
+                 但当前程序/系统默认位置指向：{}\n\n\
+                 程序按记录继续使用原数据位置（不会自动切换，否则历史会分成两处）。\n\
+                 要改用当前位置：把原数据目录整体移到新位置后，删除记录文件再重启：\n{}",
+                root.display(),
+                expected.as_deref().map(|p| p.display().to_string()).unwrap_or_else(|| "（未知）".into()),
+                record_path.display()
+            ))
+        } else if !writable(&root) {
+            Some(unwritable_warning(&dirs, &record_path))
+        } else {
+            None
+        };
+        return RootResolution {
+            dirs,
+            kind: Some(record.kind),
+            decided_now: false,
+            record_path,
+            warning,
+        };
+    }
+
+    // 2）首次判定。旧 marker 与"已经存在的 data 目录"优先于可写性探测：
+    //    已存在的数据即便当前不可写也不能丢下——那等于让用户"历史没了"。
+    if let Some(exe) = exe_dir {
+        let portable_root = exe.join("data");
+        if exe.join(PORTABLE_MARKER).exists() || portable_root.is_dir() {
+            let dirs = DataDirs { config_root: portable_root.clone(), data_root: portable_root.clone() };
+            let warning = if writable(&portable_root) {
+                None
+            } else {
+                Some(unwritable_warning(&dirs, &record_path))
+            };
+            return RootResolution {
+                dirs,
+                kind: Some(DataRootKind::Portable),
+                decided_now: true,
+                record_path,
+                warning,
+            };
+        }
+        if writable(&portable_root) {
+            let dirs = DataDirs { config_root: portable_root.clone(), data_root: portable_root };
+            return RootResolution {
+                dirs,
+                kind: Some(DataRootKind::Portable),
+                decided_now: true,
+                record_path,
+                warning: None,
+            };
+        }
+    }
+
+    // 3）程序旁边写不进去（Program Files、只读介质）→ 安装版默认。
+    let dirs = installed_dirs(appdata, localdata);
+    let warning = if writable(&dirs.data_root) {
+        None
+    } else {
+        Some(unwritable_warning(&dirs, &record_path))
+    };
+    RootResolution {
+        dirs,
+        kind: Some(DataRootKind::Installed),
+        decided_now: true,
+        record_path,
+        warning,
+    }
+}
+
+enum RecordRead {
+    Missing,
+    Valid(DataRootRecord),
+    Corrupt(String),
+}
+
+fn read_record(path: &Path) -> RecordRead {
+    let raw = match fs::read_to_string(path) {
+        Ok(raw) => raw,
+        Err(e) if e.kind() == io::ErrorKind::NotFound => return RecordRead::Missing,
+        Err(e) => return RecordRead::Corrupt(format!("读不到: {e}")),
+    };
+    match serde_json::from_str::<DataRootRecord>(&raw) {
+        Ok(record) if record.version == DATA_ROOT_RECORD_VERSION => RecordRead::Valid(record),
+        Ok(record) => RecordRead::Corrupt(format!(
+            "版本 {} 不认识（期望 {}）",
+            record.version, DATA_ROOT_RECORD_VERSION
+        )),
+        Err(e) => RecordRead::Corrupt(format!("内容不是有效的 JSON: {e}")),
+    }
+}
+
+fn write_record(path: &Path, record: &DataRootRecord) -> Result<(), String> {
+    if let Some(parent) = path.parent() {
+        fs::create_dir_all(parent)
+            .map_err(|e| format!("创建记录目录失败 {}: {e}", parent.display()))?;
+    }
+    let body = serde_json::to_string_pretty(record).map_err(|e| format!("序列化记录失败: {e}"))?;
+    let tmp = temp_sibling(path);
+    if let Err(e) = fs::write(&tmp, body).and_then(|()| fs::rename(&tmp, path)) {
+        let _ = fs::remove_file(&tmp);
+        return Err(format!("写数据位置记录失败 {}: {e}", path.display()));
+    }
+    Ok(())
+}
+
+/// 进程内唯一的数据根解析结果（`run()` 第一步初始化；之后的调用都读这一份）。
+static ROOT_RESOLUTION: OnceLock<RootResolution> = OnceLock::new();
+
+/// 真实启动入口：读记录 → 只在没有记录时判定一次 → 需要时落记录。
+pub fn init_root_resolution() -> &'static RootResolution {
+    ROOT_RESOLUTION.get_or_init(compute_root_resolution)
+}
+
+fn compute_root_resolution() -> RootResolution {
+    let exe_dir = std::env::current_exe()
+        .ok()
+        .and_then(|path| path.parent().map(Path::to_path_buf));
+    let appdata = std::env::var_os("APPDATA").map(PathBuf::from);
+    let localdata = std::env::var_os("LOCALAPPDATA").map(PathBuf::from);
+    let env_data_dir = std::env::var(DATA_DIR_ENV).ok();
+
+    let record_path = data_root_record_path(
+        exe_dir.as_deref(),
+        appdata.as_deref(),
+        localdata.as_deref(),
+    );
+    let (record, mut warning) = match read_record(&record_path) {
+        RecordRead::Missing => (None, None),
+        RecordRead::Valid(record) => (Some(record), None),
+        // 记录坏了也不能静默重新判定（那可能把历史分到第二处）。这里按现有目录判定，
+        // 但必须把"记录坏了、怎么修"说清楚。
+        RecordRead::Corrupt(reason) => (
+            None,
+            Some(format!(
+                "数据位置记录损坏（{}）：{reason}\n\n\
+                 本次按现有目录重新判定。如果之前的数据在别处，请先用 SHANIU_DATA_DIR \
+                 指过去再启动，或修复/删除这个记录文件后重启。",
+                record_path.display()
+            )),
+        ),
+    };
+
+    let mut resolution = decide_root(
+        env_data_dir.as_deref(),
+        exe_dir.as_deref(),
+        appdata.as_deref(),
+        localdata.as_deref(),
+        record.as_ref(),
+        probe_data_dir_writable,
+    );
+
+    if resolution.decided_now {
+        let record = DataRootRecord {
+            version: DATA_ROOT_RECORD_VERSION,
+            kind: resolution.kind.unwrap_or(DataRootKind::Installed),
+            path: resolution.dirs.data_root.display().to_string(),
+            exe_dir: exe_dir
+                .as_deref()
+                .map(|dir| dir.display().to_string())
+                .unwrap_or_default(),
+        };
+        if let Err(error) = write_record(&resolution.record_path, &record) {
+            // 记录落不下 = 下次启动会重新判定 = 可能数据分裂，必须让用户知道。
+            warning = Some(match warning {
+                Some(prev) => format!("{prev}\n\n{error}"),
+                None => error,
+            });
+        }
+    }
+
+    if let Some(extra) = resolution.warning.take() {
+        warning = Some(match warning {
+            Some(prev) => format!("{prev}\n\n{extra}"),
+            None => extra,
+        });
+    }
+    resolution.warning = warning;
+    resolution
+}
+
 /// 读取真实环境后的解析入口。
+///
+/// 生产启动第一步就是 [`init_root_resolution`]，所以这里直接返回那一份结果；只有
+/// 测试/工具在启动前直接调用时才走不探测、不落盘的旧口径。
 pub fn resolve_dirs_from_env() -> DataDirs {
+    if let Some(resolution) = ROOT_RESOLUTION.get() {
+        return resolution.dirs.clone();
+    }
     let exe_dir = std::env::current_exe().ok().and_then(|p| p.parent().map(Path::to_path_buf));
     resolve_dirs(
         std::env::var(DATA_DIR_ENV).ok().as_deref(),
@@ -2063,6 +2422,172 @@ mod tests {
         let expected = exe.join("data");
         assert_eq!(dirs.config_root, expected);
         assert_eq!(dirs.data_root, expected);
+    }
+
+    /// 首次判定：exe 旁边能建能写 → 用 `<exe>\data` 并落记录；写不进去 → 安装版默认。
+    #[test]
+    fn first_launch_prefers_writable_data_next_to_exe() {
+        let base = crate::test_support::TestTempDir::new("root-decide-portable");
+        let exe = base.join("app");
+        fs::create_dir_all(&exe).unwrap();
+        let portable_root = exe.join("data");
+
+        let resolution = decide_root(
+            None,
+            Some(exe.as_path()),
+            Some(base.join("appdata").as_path()),
+            Some(base.join("localdata").as_path()),
+            None,
+            |_| true,
+        );
+        assert_eq!(resolution.kind, Some(DataRootKind::Portable));
+        assert_eq!(resolution.dirs.data_root, portable_root);
+        assert!(resolution.decided_now, "首次判定必须落记录，否则下次又得探测");
+        assert!(resolution.warning.is_none());
+
+        let installed = decide_root(
+            None,
+            Some(exe.as_path()),
+            Some(base.join("appdata").as_path()),
+            Some(base.join("localdata").as_path()),
+            None,
+            |dir| dir != portable_root.as_path(),
+        );
+        assert_eq!(installed.kind, Some(DataRootKind::Installed));
+        assert_eq!(installed.dirs.data_root, base.join("localdata").join(APP_DIR_NAME));
+        assert!(installed.decided_now);
+    }
+
+    /// "首次判定之后固定"的核心：记录存在时，**即使这次探测说不可写也不许换位置**。
+    /// 反向对照：改成每次探测判定 → 这里会得到安装版路径 → 断言红。
+    #[test]
+    fn recorded_root_wins_even_when_probe_now_fails() {
+        let base = crate::test_support::TestTempDir::new("root-decide-fixed");
+        let exe = base.join("app");
+        fs::create_dir_all(&exe).unwrap();
+        let portable_root = exe.join("data");
+        let record = DataRootRecord {
+            version: DATA_ROOT_RECORD_VERSION,
+            kind: DataRootKind::Portable,
+            path: portable_root.display().to_string(),
+            exe_dir: exe.display().to_string(),
+        };
+
+        let resolution = decide_root(
+            None,
+            Some(exe.as_path()),
+            Some(base.join("appdata").as_path()),
+            Some(base.join("localdata").as_path()),
+            Some(&record),
+            |_| false,
+        );
+        assert_eq!(
+            resolution.dirs.data_root, portable_root,
+            "数据根不许因为一次探测失败就漂移（那就是数据分裂）"
+        );
+        assert!(!resolution.decided_now, "已有记录时不该再判定/写记录");
+        let warning = resolution.warning.expect("记录与实际不符必须明确提示");
+        assert!(warning.contains("写不进去"), "提示要说清原因：{warning}");
+        assert!(warning.contains("删除记录文件"), "提示要说清怎么改回去：{warning}");
+    }
+
+    /// 旧便携目录兼容：`portable.marker` 必须继续被识别，哪怕目录这次不可写。
+    /// 这里刻意**只放 marker、不预建 `data\`**：两种信号同时存在时无法证明 marker
+    /// 真的被读到（老目录通常两者都有，但那样用例就没有分辨力）。
+    /// 反向对照：去掉 marker 兼容 → 会回落安装版 → 断言红。
+    #[test]
+    fn legacy_portable_marker_still_wins_over_writability_probe() {
+        let base = crate::test_support::TestTempDir::new("root-decide-marker");
+        let exe = base.join("app");
+        fs::create_dir_all(&exe).unwrap();
+        fs::write(exe.join(PORTABLE_MARKER), b"").unwrap();
+
+        let resolution = decide_root(
+            None,
+            Some(exe.as_path()),
+            Some(base.join("appdata").as_path()),
+            Some(base.join("localdata").as_path()),
+            None,
+            |_| false,
+        );
+        assert_eq!(resolution.kind, Some(DataRootKind::Portable));
+        assert_eq!(resolution.dirs.data_root, exe.join("data"));
+        assert!(resolution.warning.is_some(), "不可写要提示，但不能换位置");
+    }
+
+    /// 没有 marker 但 `<exe>\data` 已经在（老版本 / 手工放的数据）：同样按便携。
+    #[test]
+    fn existing_data_dir_next_to_exe_is_kept() {
+        let base = crate::test_support::TestTempDir::new("root-decide-existing");
+        let exe = base.join("app");
+        fs::create_dir_all(exe.join("data").join(ROLLOUTS_DIR)).unwrap();
+
+        let resolution = decide_root(
+            None,
+            Some(exe.as_path()),
+            Some(base.join("appdata").as_path()),
+            Some(base.join("localdata").as_path()),
+            None,
+            |_| false,
+        );
+        assert_eq!(resolution.dirs.data_root, exe.join("data"));
+        assert_eq!(resolution.kind, Some(DataRootKind::Portable));
+    }
+
+    /// 记录往返 + 损坏识别：坏记录必须能被识别出来（走"提示后重新判定"，
+    /// 而不是当成"没有记录"悄悄判定）。
+    #[test]
+    fn record_round_trips_and_corruption_is_detected() {
+        let base = crate::test_support::TestTempDir::new("root-record");
+        let path = base.join(DATA_ROOT_RECORD_DIR).join("k.json");
+        let record = DataRootRecord {
+            version: DATA_ROOT_RECORD_VERSION,
+            kind: DataRootKind::Installed,
+            path: base.join("localdata").display().to_string(),
+            exe_dir: base.join("app").display().to_string(),
+        };
+        write_record(&path, &record).unwrap();
+        match read_record(&path) {
+            RecordRead::Valid(back) => assert_eq!(back, record),
+            _ => panic!("记录必须能读回"),
+        }
+
+        fs::write(&path, b"not-json").unwrap();
+        assert!(matches!(read_record(&path), RecordRead::Corrupt(_)));
+        assert!(matches!(
+            read_record(&base.join("missing.json")),
+            RecordRead::Missing
+        ));
+    }
+
+    /// 环境变量覆盖：不判定、不落记录（测试/CI/多实例隔离都靠它）。
+    #[test]
+    fn env_override_skips_decision() {
+        let base = crate::test_support::TestTempDir::new("root-decide-env");
+        let resolution = decide_root(
+            Some("D:/tmp/shaniu-env"),
+            Some(base.join("app").as_path()),
+            Some(base.join("appdata").as_path()),
+            Some(base.join("localdata").as_path()),
+            None,
+            |_| true,
+        );
+        assert_eq!(resolution.kind, None);
+        assert!(!resolution.decided_now, "环境变量覆盖不该写记录");
+        assert_eq!(resolution.dirs.data_root, PathBuf::from("D:/tmp/shaniu-env"));
+    }
+
+    /// 记录按 exe 目录分文件：两份便携副本各自判定，互不覆盖。
+    #[test]
+    fn record_path_is_per_exe_directory() {
+        let base = crate::test_support::TestTempDir::new("root-record-path");
+        let first = base.join("copy-a");
+        let second = base.join("copy-b");
+        fs::create_dir_all(&first).unwrap();
+        fs::create_dir_all(&second).unwrap();
+        let a = data_root_record_path(Some(first.as_path()), None, Some(base.path()));
+        let b = data_root_record_path(Some(second.as_path()), None, Some(base.path()));
+        assert_ne!(a, b, "两份副本不能共用一份记录，否则会被指向同一个数据根");
     }
 
     #[test]

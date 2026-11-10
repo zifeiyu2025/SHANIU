@@ -120,7 +120,11 @@ impl AppState {
     ///
     /// 为什么不回落到用户主目录：工作区根会被授给沙箱容器，主目录下是凭据、
     /// 浏览器数据与整份用户资料——范围远超工具需要（B 轮 105 秒只是它的症状）。
-    /// 口径与 `get_product_dirs` 回给界面的 `workspaceRoot` 一致，两处不分叉。
+    ///
+    /// **与 `get_product_dirs` 的 `workspaceRoot` 不是同一个值**：那个恒为
+    /// `<data_root>\Workspace`（`DataDirs::workspace_root`，只作界面展示与"默认值"），
+    /// 而这里配置优先。两者只在用户显式设置了 `[workspace].root` 时才有差异；
+    /// 未设置时恰好相同，但不要据此把两处判据合并——合并后配置一非空就分叉。
     pub fn workspace_root(&self) -> PathBuf {
         workspace_root_of(&self.config(), &self.data_root)
     }

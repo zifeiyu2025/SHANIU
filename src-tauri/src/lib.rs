@@ -2169,8 +2169,10 @@ fn report_data_root_in_use(data_root: &Path) {
 }
 
 pub fn run() {
-    // 数据目录解析结果写入日志第一行（docs §9.3 的「解析结果写入日志第一行」即指此条）
-    let dirs = config::resolve_dirs_from_env();
+    // 数据根：**首次启动判定一次，之后按记录固定**（2026-11-11）。判定结果写入日志
+    // 第一行（docs §9.3），并作为本进程内所有路径解析的唯一依据。
+    let root = config::init_root_resolution();
+    let dirs = root.dirs.clone();
     // 同一 data_root 只允许一个写者：rollout 是逐行 append 的真源，两个进程同写会把
     // 两条历史交错进同一档案。互斥体名由规范化路径 hash 派生，所以不同 `data\` 的
     // 两个副本仍能同时跑（那是合法用法，拦下来是错的）。
@@ -2204,6 +2206,18 @@ pub fn run() {
     tracing::info!("config_root: {}", dirs.config_root.display());
     tracing::info!("data_root:   {}", dirs.data_root.display());
     tracing::info!("workspace:   {}", dirs.workspace_root().display());
+    tracing::info!(
+        data_root_kind = root.kind.map(config::DataRootKind::as_str).unwrap_or("env"),
+        record = %root.record_path.display(),
+        decided_now = root.decided_now,
+        "数据根判定"
+    );
+    // 记录与实际不符（目录不可写 / 位置被改）必须明确告诉用户，不许静默按新位置跑。
+    // 此刻窗口尚未创建，只能用原生消息框；日志同时留一条，便于事后对账。
+    if let Some(warning) = &root.warning {
+        tracing::warn!(%warning, "数据位置需要用户注意");
+        show_native_message(&format!("数据位置需要注意\n\n{warning}"));
+    }
 
     // 启动加载 + 一次性修复：盘上可能留着「写串段」的旧配置（`reasoning_efforts`
     // 里混进 path/title）。修复只做备份→剔除→写回；修不了就进只读、绝不覆盖。
