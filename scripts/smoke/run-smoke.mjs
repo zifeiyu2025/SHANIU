@@ -6,7 +6,7 @@
 //        [--port 9333] [--stub-port 18180] [--timeout 480]
 // 退出码：0 = 四项全过；1 = 有项失败；2 = 环境起不来（不是产品问题，但同样判红）。
 import { spawn } from 'node:child_process'
-import { existsSync, mkdirSync, writeFileSync } from 'node:fs'
+import { appendFileSync, existsSync, mkdirSync, writeFileSync } from 'node:fs'
 import path from 'node:path'
 import WS from 'ws'
 import { FIXTURE_PDF, FIXTURE_PNG, writeFixtures } from './make-fixtures.mjs'
@@ -57,13 +57,19 @@ writeFileSync(
 const child = spawn(exe, [], {
   env: {
     ...process.env,
-    // WebView2 远程调试只能经这个环境变量开；探针与本脚本共用同一通道
-    WEBVIEW2_ADDITIONAL_BROWSER_ARGUMENTS: `--remote-debugging-port=${cdpPort}`,
+    // 调试端口由宿主在窗口构建时挂上（只认这个环境变量）。
+    // 不用 WEBVIEW2_ADDITIONAL_BROWSER_ARGUMENTS：CI runner 上实测会被丢掉。
+    SHANIU_CDP_PORT: String(cdpPort),
     SHANIU_DATA_DIR: dataDir,
   },
-  stdio: 'ignore',
+  stdio: ['ignore', 'pipe', 'pipe'],
   windowsHide: true,
 })
+
+// 主程序 stderr 落证据目录：CI 上「端口没开」这类失败，答案通常就在里面
+for (const stream of [child.stdout, child.stderr]) {
+  stream?.on('data', (chunk) => appendFileSync(path.join(outDir, 'app.log'), chunk))
+}
 
 const sleep = (ms) => new Promise((resolve) => setTimeout(resolve, ms))
 

@@ -54,6 +54,14 @@ use agent_loop::ModelBackend;
 use app_state::AppState;
 use config::AppConfig;
 
+/// 冒烟探针用的远程调试端口：只认显式环境变量，非法值直接忽略。
+/// 仅在窗口构建路径使用，不参与任何业务逻辑。
+fn cdp_debug_port() -> Option<u16> {
+    std::env::var("SHANIU_CDP_PORT")
+        .ok()
+        .and_then(|raw| raw.trim().parse::<u16>().ok())
+}
+
 /// IPC 握手（M0 验收）：前端 invoke 携带 nonce，后端经事件通道原样回显。
 #[tauri::command]
 fn dev_ping(app: tauri::AppHandle, nonce: String) -> Result<(), String> {
@@ -2322,11 +2330,20 @@ pub fn run() {
                 .cloned()
                 .ok_or("tauri.conf.json 缺少 label=main 的窗口配置")?;
             let resource_app = app.handle().clone();
-            tauri::WebviewWindowBuilder::from_config(app.handle(), &window_config)?
+            let mut builder = tauri::WebviewWindowBuilder::from_config(app.handle(), &window_config)?
                 .on_web_resource_request(move |request, response| {
                     crate::media_route::handle_request(&resource_app, &request, response);
-                })
-                .build()?;
+                });
+            // 冒烟探针专用：显式给了 SHANIU_CDP_PORT 才开远程调试端口。
+            // 不能只依赖 WEBVIEW2_ADDITIONAL_BROWSER_ARGUMENTS——CI runner 上实测该环境变量
+            // 会被丢掉（窗口起来了、端口没开），走 builder 参数才是确定路径。
+            // 与 WebView2 自带的调试参数同权限模型：能改环境变量的人本来就能开这个口子。
+            if let Some(port) = cdp_debug_port() {
+                builder = builder.additional_browser_args(&format!(
+                    "--disable-features=msWebOOUI,msPdfOOUI,msSmartScreenProtection --remote-debugging-port={port}"
+                ));
+            }
+            builder.build()?;
             // MCP 应用级事件通道（SH-063）：运行时在 setup 前已随 AppState 构造，
             // 这里补上真正的发送端。
             {
