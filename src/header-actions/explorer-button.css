@@ -1,49 +1,30 @@
 /*
  * 标题行资源管理器按钮（`ExplorerButton.tsx`）。
  *
- * 视觉与 DSH `ui-open-in-app/OpenTargetButton.module.css` 的紧凑分裂按钮同规格：
- * 24px 高、0.5px `border-l4` 外描边、11px/16px 文字、chevron 半区以 0.5px 竖线分隔、
- * `radius-sm` 圆角、hover 走 `interactive-bg-hover`。
+ * 保留 DSH `ui-open-in-app/OpenTargetButton.module.css` 紧凑态的尺寸与描边：
+ * 24px 高、11px/16px、0.5px `border-l4`、`radius-sm`、hover 走 `interactive-bg-hover`。
  *
- * 有意不补二级菜单：我们只有一个打开目标（系统文件管理器），菜单里只放一项就是假交互。
- * chevron 因此纯装饰（`aria-hidden`），点击整颗按钮都执行同一个打开动作。
+ * 有意偏离：不画 chevron 半区与其分隔线。上游那半个是真实下拉入口，本项目只有一个
+ * 打开目标；画一个点不开的 chevron 会诱导无效点击。登记见 `docs/07`。
  */
 
 .explorer-button {
   display: inline-flex;
-  align-items: stretch;
+  align-items: center;
+  justify-content: center;
   align-self: center;
   flex: none;
   box-sizing: border-box;
   height: 24px;
-  overflow: hidden;
-  padding: 0;
+  padding: 0 5px;
   border: 0.5px solid var(--dsw-alias-border-l4);
   border-radius: var(--dsw-radius-sm);
   background: none;
   color: var(--dsw-alias-label-primary);
   font-family: var(--dsw-font-family);
-  cursor: pointer;
-}
-
-.explorer-button-main,
-.explorer-button-chevron {
-  display: inline-flex;
-  align-items: center;
-  justify-content: center;
   font-size: 11px;
   line-height: 16px;
-}
-
-.explorer-button-main {
-  gap: 4px;
-  padding: 3px 5px;
-}
-
-.explorer-button-chevron {
-  padding: 3px 4px 3px 3px;
-  border-left: 0.5px solid var(--dsw-alias-border-l4);
-  color: var(--dsw-alias-label-secondary);
+  cursor: pointer;
 }
 
 .explorer-button:focus-visible {

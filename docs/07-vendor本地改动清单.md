@@ -50,6 +50,14 @@ packages/client/ui-workflow-run/src/client/WorkflowRunPanel.tsx
 packages/core/session/src/request-header.ts
 ```
 
+## 有意偏离（非 `src/dsh/` 文件）
+
+这些文件不在 `src/dsh/` 下，不算 vendor 改动；但对齐上游时故意少做了一部分，同步/对照 UI 时不要按「缺了就补」处理。
+
+| 文件 | 偏离 | 理由 | 时间 |
+| --- | --- | --- | --- |
+| `src/header-actions/ExplorerButton.tsx`、`src/header-actions/explorer-button.css` | 保留 DSH `ui-open-in-app/OpenTargetButton.module.css` 紧凑态的 24px 高 / 11px / 0.5px `border-l4` 描边，但**去掉 chevron 半区与其分隔线**，整颗按钮一个点击区 | 上游那半个 chevron 是真实的下拉入口；本项目只有一个打开目标（系统文件管理器），画出来却不能展开属于无效交互诱导，比没有更糟 | 2026-11-10（v0.2.1，08 修） |
+
 ## 同步上游时怎么用
 
 ```powershell
