@@ -642,9 +642,10 @@ pub async fn stream_body(
     if !response.status().is_success() {
         let status = response.status();
         let body_text = response.text().await.unwrap_or_default();
-        // 错误响应体可能含敏感信息，仅保留状态码与截断正文
-        let snippet: String = body_text.chars().take(200).collect();
-        return Err(format!("模型端点返回 {status}: {snippet}"));
+        // 端点错误体常回显 request（含 Authorization）或自定义请求头。这里必须**先
+        // 脱敏再截断**：先截断会让跨 200 字符边界的密钥只漏出半截，整串匹配不到，
+        // 而这段文字会进错误串 → 模型上下文（审计 M9；journal 侧 M6 已堵）。
+        return Err(format!("模型端点返回 {status}: {}", error_snippet(&body_text)));
     }
     if provider.is_responses() {
         Ok(Box::pin(response
@@ -668,9 +669,39 @@ pub async fn stream_body(
     }
 }
 
+/// 端点错误体 → 错误串片段：先脱敏，再截到 200 字符。
+///
+/// 顺序不可交换：`redact` 靠登记表整串替换，若先截断，一段跨边界的密钥会以半截
+/// 形式留在错误串里，既匹配不到登记原文，也照样把凭据漏进模型上下文。
+fn error_snippet(body: &str) -> String {
+    crate::config::redact(body).chars().take(200).collect()
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// 审计 M9：端点错误体回显凭据时，进错误串之前必须已经替换掉。
+    #[test]
+    fn endpoint_error_body_is_redacted_before_the_model_sees_it() {
+        // 用不像任何内建正则的形态，确保断言走的是 SECRET_REGISTRY 而不是模式匹配
+        let secret = "opaque-endpoint-echo-m9-0123";
+        crate::config::register_secret(secret);
+        let body = format!(r#"{{"error":{{"message":"invalid header: {secret}"}}}}"#);
+        let snippet = error_snippet(&body);
+        assert!(!snippet.contains(secret), "错误串仍在回显凭据: {snippet}");
+        assert!(snippet.contains(crate::config::REDACTED));
+
+        // 截断仍然生效（先脱敏再截断，不是先截断）
+        let long = "字".repeat(500);
+        assert_eq!(error_snippet(&long).chars().count(), 200);
+
+        // 跨边界的密钥：先截断会漏出半截，先脱敏则整串消失
+        let padded = format!("{}{secret}", "a".repeat(190));
+        let snippet = error_snippet(&padded);
+        assert!(!snippet.contains(secret));
+        assert!(!snippet.contains(&secret[..10]), "不得漏出半截凭据: {snippet}");
+    }
 
     fn provider(protocol: &str) -> ProviderConfig {
         ProviderConfig {
