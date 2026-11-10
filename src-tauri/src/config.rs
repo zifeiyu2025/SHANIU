@@ -1387,6 +1387,13 @@ pub struct RootResolution {
     pub record_path: PathBuf,
     /// 必须明确告诉用户的问题（记录与实际不符、记录写不下）；`None` = 一致。
     pub warning: Option<String>,
+    /// 记录/旧目录说便携、但当前不可写：给用户一条明确出口（改用安装模式）。
+    /// `Some` 时由启动层询问用户；**未确认不得自动切换**（数据分裂）。
+    pub fallback_to_installed: Option<DataDirs>,
+    /// 用户在出口选择"退出"：启动层据此中止，不许继续用不可写目录。
+    pub aborted: bool,
+    /// 走出口切换到安装模式时原来的数据位置（只为日志/提示，不参与判定）。
+    pub switched_from: Option<PathBuf>,
 }
 
 /// 记录文件路径：按 exe 目录 hash 分文件，放在用户目录（而不是 exe 旁边）——
@@ -1453,6 +1460,23 @@ fn unwritable_warning(dirs: &DataDirs, record_path: &Path) -> String {
     )
 }
 
+/// 便携目录不可写时的出口提示：用户点「是」才切到安装模式，原目录原样保留。
+/// 没有这条出口，只读介质/权限变化会把用户卡在"只能退出"的状态。
+fn portable_unwritable_prompt(dirs: &DataDirs, installed: &DataDirs, record_path: &Path) -> String {
+    format!(
+        "你的数据本来在：\n{}\n\n\
+         这个目录现在写不进去（可能是 U 盘只读、权限变化或安全软件拦截）。\n\n\
+         选择「是」：改用安装模式，数据放到\n{}\n\
+         你现有的数据仍在 {}，**不会被删除或移动**。\n\n\
+         选择「否」：退出，什么都不改。\n\n\
+         记录文件：{}（要改回便携，删除它后重启）",
+        dirs.data_root.display(),
+        installed.data_root.display(),
+        dirs.data_root.display(),
+        record_path.display()
+    )
+}
+
 /// 纯判定：输入显式注入（含"可写探测"这个可替换的副作用点），可单测每一条分支。
 ///
 /// 优先级：`SHANIU_DATA_DIR` > 已有记录（**不再探测**）> 旧 `portable.marker` /
@@ -1476,6 +1500,9 @@ pub fn decide_root(
             decided_now: false,
             record_path,
             warning: None,
+            fallback_to_installed: None,
+            aborted: false,
+            switched_from: None,
         };
     }
 
@@ -1492,6 +1519,14 @@ pub fn decide_root(
             .as_deref()
             .map(|expected| !same_path(expected, &root))
             .unwrap_or(false);
+        let is_writable = writable(&root);
+        // 只有"位置没变、只是这次写不进去"才给安装模式出口；位置已经变了（moved）
+        // 说明用户挪过 exe，切换会把两处历史分开，不能拿这个当出口。
+        let fallback = if !moved && !is_writable && record.kind == DataRootKind::Portable {
+            Some(installed_dirs(appdata, localdata))
+        } else {
+            None
+        };
         let warning = if moved {
             Some(format!(
                 "数据位置记录显示数据在：{}\n\
@@ -1502,7 +1537,9 @@ pub fn decide_root(
                 expected.as_deref().map(|p| p.display().to_string()).unwrap_or_else(|| "（未知）".into()),
                 record_path.display()
             ))
-        } else if !writable(&root) {
+        } else if let Some(installed) = &fallback {
+            Some(portable_unwritable_prompt(&dirs, installed, &record_path))
+        } else if !is_writable {
             Some(unwritable_warning(&dirs, &record_path))
         } else {
             None
@@ -1513,6 +1550,9 @@ pub fn decide_root(
             decided_now: false,
             record_path,
             warning,
+            fallback_to_installed: fallback,
+            aborted: false,
+            switched_from: None,
         };
     }
 
@@ -1522,17 +1562,24 @@ pub fn decide_root(
         let portable_root = exe.join("data");
         if exe.join(PORTABLE_MARKER).exists() || portable_root.is_dir() {
             let dirs = DataDirs { config_root: portable_root.clone(), data_root: portable_root.clone() };
-            let warning = if writable(&portable_root) {
+            let is_writable = writable(&portable_root);
+            let fallback = if is_writable {
                 None
             } else {
-                Some(unwritable_warning(&dirs, &record_path))
+                Some(installed_dirs(appdata, localdata))
             };
+            let warning = fallback
+                .as_ref()
+                .map(|installed| portable_unwritable_prompt(&dirs, installed, &record_path));
             return RootResolution {
                 dirs,
                 kind: Some(DataRootKind::Portable),
                 decided_now: true,
                 record_path,
                 warning,
+                fallback_to_installed: fallback,
+                aborted: false,
+                switched_from: None,
             };
         }
         if writable(&portable_root) {
@@ -1543,6 +1590,9 @@ pub fn decide_root(
                 decided_now: true,
                 record_path,
                 warning: None,
+                fallback_to_installed: None,
+                aborted: false,
+                switched_from: None,
             };
         }
     }
@@ -1560,6 +1610,9 @@ pub fn decide_root(
         decided_now: true,
         record_path,
         warning,
+        fallback_to_installed: None,
+        aborted: false,
+        switched_from: None,
     }
 }
 
@@ -1602,12 +1655,61 @@ fn write_record(path: &Path, record: &DataRootRecord) -> Result<(), String> {
 /// 进程内唯一的数据根解析结果（`run()` 第一步初始化；之后的调用都读这一份）。
 static ROOT_RESOLUTION: OnceLock<RootResolution> = OnceLock::new();
 
-/// 真实启动入口：读记录 → 只在没有记录时判定一次 → 需要时落记录。
+/// 真实启动入口（不带交互）：读记录 → 只在没有记录时判定一次 → 需要时落记录。
+/// 便携目录不可写时只返回提示（`fallback_to_installed`），由调用方决定是否询问用户。
 pub fn init_root_resolution() -> &'static RootResolution {
-    ROOT_RESOLUTION.get_or_init(compute_root_resolution)
+    ROOT_RESOLUTION.get_or_init(build_root_resolution)
 }
 
-fn compute_root_resolution() -> RootResolution {
+/// 带用户确认的启动入口：便携目录不可写时询问一次。用户同意 → 落"安装模式"记录并
+/// 改用 `%LOCALAPPDATA%`（原 `data\` 原样保留）；不同意 → `aborted = true`，启动层退出。
+/// 判定只发生一次，之后不受影响。
+pub fn init_root_resolution_with(
+    confirm: impl Fn(&RootResolution) -> bool + 'static,
+) -> &'static RootResolution {
+    ROOT_RESOLUTION.get_or_init(|| {
+        let mut resolution = build_root_resolution();
+        switch_to_installed_if_confirmed(&mut resolution, &confirm);
+        resolution
+    })
+}
+
+fn switch_to_installed_if_confirmed(
+    resolution: &mut RootResolution,
+    confirm: &dyn Fn(&RootResolution) -> bool,
+) {
+    let Some(installed) = resolution.fallback_to_installed.clone() else {
+        return;
+    };
+    if !confirm(resolution) {
+        // 没有确认就不切换，也不许继续用不可写目录：交给启动层退出。
+        resolution.aborted = true;
+        return;
+    }
+    let from = resolution.dirs.data_root.clone();
+    let record = DataRootRecord {
+        version: DATA_ROOT_RECORD_VERSION,
+        kind: DataRootKind::Installed,
+        path: installed.data_root.display().to_string(),
+        exe_dir: std::env::current_exe()
+            .ok()
+            .and_then(|path| path.parent().map(|dir| dir.display().to_string()))
+            .unwrap_or_default(),
+    };
+    let mut warning = None;
+    if let Err(error) = write_record(&resolution.record_path, &record) {
+        // 记录写不下 = 下次启动还会再问一遍；不拦启动，但必须留痕。
+        warning = Some(error);
+    }
+    resolution.dirs = installed;
+    resolution.kind = Some(DataRootKind::Installed);
+    resolution.decided_now = false;
+    resolution.fallback_to_installed = None;
+    resolution.switched_from = Some(from);
+    resolution.warning = warning;
+}
+
+fn build_root_resolution() -> RootResolution {
     let exe_dir = std::env::current_exe()
         .ok()
         .and_then(|path| path.parent().map(Path::to_path_buf));
@@ -2488,7 +2590,10 @@ mod tests {
         assert!(!resolution.decided_now, "已有记录时不该再判定/写记录");
         let warning = resolution.warning.expect("记录与实际不符必须明确提示");
         assert!(warning.contains("写不进去"), "提示要说清原因：{warning}");
-        assert!(warning.contains("删除记录文件"), "提示要说清怎么改回去：{warning}");
+        assert!(
+            warning.contains("要改回便携") && warning.contains("删除它后重启"),
+            "提示要说清怎么改回去：{warning}"
+        );
     }
 
     /// 旧便携目录兼容：`portable.marker` 必须继续被识别，哪怕目录这次不可写。
@@ -2532,6 +2637,116 @@ mod tests {
         );
         assert_eq!(resolution.dirs.data_root, exe.join("data"));
         assert_eq!(resolution.kind, Some(DataRootKind::Portable));
+    }
+
+    /// ACL 禁写不能只报错：必须给一条用户可以走的路（改用安装模式），
+    /// 否则只读介质/权限变化就把用户卡在"只能退出"。
+    #[test]
+    fn unwritable_portable_offers_installed_exit() {
+        let base = crate::test_support::TestTempDir::new("root-exit-offer");
+        let exe = base.join("app");
+        fs::create_dir_all(&exe).unwrap();
+        let portable_root = exe.join("data");
+        fs::create_dir_all(&portable_root).unwrap();
+        fs::write(portable_root.join("keep.txt"), b"old").unwrap();
+        let record = DataRootRecord {
+            version: DATA_ROOT_RECORD_VERSION,
+            kind: DataRootKind::Portable,
+            path: portable_root.display().to_string(),
+            exe_dir: exe.display().to_string(),
+        };
+
+        let resolution = decide_root(
+            None,
+            Some(exe.as_path()),
+            Some(base.join("appdata").as_path()),
+            Some(base.join("localdata").as_path()),
+            Some(&record),
+            |_| false,
+        );
+        let installed = resolution
+            .fallback_to_installed
+            .as_ref()
+            .expect("不可写必须给出口，不能只有一句报错");
+        assert_eq!(
+            installed.data_root,
+            base.join("localdata").join(APP_DIR_NAME),
+            "出口就是安装模式的数据根"
+        );
+        let warning = resolution.warning.expect("出口提示必须存在");
+        for needle in [
+            "改用安装模式",
+            "不会被删除或移动",
+            "选择「否」：退出",
+            &portable_root.display().to_string(),
+        ] {
+            assert!(warning.contains(needle), "出口提示缺少「{needle}」：{warning}");
+        }
+        // 只是"给出出口"：未经确认，数据根与记录都不许动。
+        assert_eq!(resolution.dirs.data_root, portable_root);
+        assert!(resolution.switched_from.is_none());
+        assert!(!resolution.decided_now);
+    }
+
+    /// 出口必须由用户点确认才生效；未确认时既不切换也不落记录。
+    /// 反向对照：把 `switch_to_installed_if_confirmed` 改成"直接切换"，
+    /// 「否」那一段的 `aborted` / 数据根 / 记录文件三条断言会同时变红。
+    #[test]
+    fn installed_switch_needs_explicit_confirmation() {
+        let base = crate::test_support::TestTempDir::new("root-exit-confirm");
+        let exe = base.join("app");
+        fs::create_dir_all(&exe).unwrap();
+        let portable_root = exe.join("data");
+        fs::create_dir_all(&portable_root).unwrap();
+        fs::write(portable_root.join("keep.txt"), b"old").unwrap();
+        let record = DataRootRecord {
+            version: DATA_ROOT_RECORD_VERSION,
+            kind: DataRootKind::Portable,
+            path: portable_root.display().to_string(),
+            exe_dir: exe.display().to_string(),
+        };
+        let make = || {
+            decide_root(
+                None,
+                Some(exe.as_path()),
+                Some(base.join("appdata").as_path()),
+                Some(base.join("localdata").as_path()),
+                Some(&record),
+                |_| false,
+            )
+        };
+
+        // ① 用户选「否」（含直接关窗）：不切换、不落记录，交给启动层退出。
+        let mut declined = make();
+        switch_to_installed_if_confirmed(&mut declined, &|_| false);
+        assert!(declined.aborted, "用户拒绝后必须中止，不许继续用不可写目录");
+        assert_eq!(declined.dirs.data_root, portable_root, "未确认就不许换位置");
+        assert!(declined.switched_from.is_none());
+        assert!(
+            !declined.record_path.exists(),
+            "未确认不许写「已改用安装模式」记录，否则下次启动再也不会问"
+        );
+
+        // ② 用户选「是」：切到安装模式，原目录原样保留（不删、不搬）。
+        let mut accepted = make();
+        switch_to_installed_if_confirmed(&mut accepted, &|_| true);
+        assert!(!accepted.aborted);
+        assert_eq!(
+            accepted.dirs.data_root,
+            base.join("localdata").join(APP_DIR_NAME)
+        );
+        assert_eq!(accepted.kind, Some(DataRootKind::Installed));
+        assert_eq!(
+            accepted.switched_from.as_deref(),
+            Some(portable_root.as_path()),
+            "切换后要留下「从哪来」的痕迹供日志与提示"
+        );
+        let written = fs::read_to_string(&accepted.record_path).expect("切换后必须落记录");
+        assert!(written.contains("\"installed\""), "记录要写明新形态：{written}");
+        assert!(
+            portable_root.join("keep.txt").is_file(),
+            "原数据必须原样保留，不许删除或移动"
+        );
     }
 
     /// 记录往返 + 损坏识别：坏记录必须能被识别出来（走"提示后重新判定"，

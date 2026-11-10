@@ -2155,6 +2155,25 @@ fn show_native_message(text: &str) {
     }
 }
 
+/// 原生二选一：返回 true = 用户点了「是」。
+fn show_native_confirm(text: &str) -> bool {
+    use windows::core::HSTRING;
+    use windows::Win32::UI::WindowsAndMessaging::{
+        MessageBoxW, IDYES, MB_ICONWARNING, MB_SETFOREGROUND, MB_TOPMOST, MB_YESNO,
+    };
+    let text = HSTRING::from(text);
+    let caption = HSTRING::from("SHANIU");
+    let result = unsafe {
+        MessageBoxW(
+            None,
+            &text,
+            &caption,
+            MB_YESNO | MB_ICONWARNING | MB_SETFOREGROUND | MB_TOPMOST,
+        )
+    };
+    result == IDYES
+}
+
 /// 第二个实例的告知：主窗口此时还没创建（tauri.conf.json 里 `create: false`，
 /// 要等 setup 才建），所以只能用原生消息框。静默退出或"只读凑合启动"都不行——
 /// 前者让用户以为程序没起来，后者会让用户以为历史还在、实际写不进去。
@@ -2171,7 +2190,18 @@ fn report_data_root_in_use(data_root: &Path) {
 pub fn run() {
     // 数据根：**首次启动判定一次，之后按记录固定**（2026-11-11）。判定结果写入日志
     // 第一行（docs §9.3），并作为本进程内所有路径解析的唯一依据。
-    let root = config::init_root_resolution();
+    // 记录/旧目录说便携但当前不可写时，给用户一次明确出口（改用安装模式，原目录保留），
+    // 不自动切换；用户选择退出则中止，不拿不可写目录凑合启动。
+    let root = config::init_root_resolution_with(|resolution| {
+        show_native_confirm(&format!(
+            "数据目录不可用\n\n{}",
+            resolution.warning.as_deref().unwrap_or_default()
+        ))
+    });
+    if root.aborted {
+        eprintln!("[SHANIU] 数据目录不可写，且用户未选择改用安装模式，已退出");
+        std::process::exit(2);
+    }
     let dirs = root.dirs.clone();
     // 同一 data_root 只允许一个写者：rollout 是逐行 append 的真源，两个进程同写会把
     // 两条历史交错进同一档案。互斥体名由规范化路径 hash 派生，所以不同 `data\` 的
@@ -2212,6 +2242,13 @@ pub fn run() {
         decided_now = root.decided_now,
         "数据根判定"
     );
+    if let Some(from) = &root.switched_from {
+        tracing::warn!(
+            from = %from.display(),
+            to = %dirs.data_root.display(),
+            "经用户确认改用安装模式；原数据保留在原处，未删除、未移动"
+        );
+    }
     // 记录与实际不符（目录不可写 / 位置被改）必须明确告诉用户，不许静默按新位置跑。
     // 此刻窗口尚未创建，只能用原生消息框；日志同时留一条，便于事后对账。
     if let Some(warning) = &root.warning {
