@@ -2,10 +2,19 @@
 /** Dynamic ui-theme entry owns the global styles in dependency order. */
 import { Context } from '@deepseek-ai/cordis'
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest'
-import { installThemeStyles } from '../src/client/styles.ts'
+import { installThemeStyles, themeStyleSheets } from '../src/client/styles.ts'
 
-const PLUGIN_ID = '@deepseek-ai/dsh-client-ui-theme'
 const HAIRLINE_WIDTH = '--dsh-hairline-width'
+const SHEET_NAMES = [
+  'base.css',
+  'corner-shape.css',
+  'design-platform.css',
+  'focus.css',
+  'onboarding.css',
+  'scrollbar.css',
+  'gradient-shadow-text.css',
+  'shiki.css',
+]
 const contexts = new Set<Context>()
 let previousWidth: string
 let previousPriority: string
@@ -18,7 +27,7 @@ beforeEach(() => {
 afterEach(async () => {
   for (const ctx of contexts) await ctx.fiber.dispose()
   contexts.clear()
-  document.head.querySelectorAll(`style[data-plugin="${PLUGIN_ID}"]`).forEach((node) => { node.remove() })
+  document.adoptedStyleSheets = []
   if (previousWidth === '') document.documentElement.style.removeProperty(HAIRLINE_WIDTH)
   else document.documentElement.style.setProperty(HAIRLINE_WIDTH, previousWidth, previousPriority)
   vi.restoreAllMocks()
@@ -37,19 +46,14 @@ describe('ui-theme client styles', () => {
   it('mounts every global sheet in dependency order and removes them on dispose', async () => {
     const fiber = await mountStyles()
 
-    const styles = [...document.head.querySelectorAll<HTMLStyleElement>(`style[data-plugin="${PLUGIN_ID}"]`)]
-    expect(styles.map(style => style.dataset.pluginCss)).toEqual([
-      `${PLUGIN_ID}/base.css`,
-      `${PLUGIN_ID}/corner-shape.css`,
-      `${PLUGIN_ID}/design-platform.css`,
-      `${PLUGIN_ID}/focus.css`,
-      `${PLUGIN_ID}/onboarding.css`,
-      `${PLUGIN_ID}/scrollbar.css`,
-      `${PLUGIN_ID}/gradient-shadow-text.css`,
-      `${PLUGIN_ID}/shiki.css`,
-    ])
+    // 构造式样式表不进 DOM：断言对象是 adoptedStyleSheets 里的引用与顺序，不是节点。
+    const expected = themeStyleSheets()
+    expect(expected.map(entry => entry.name)).toEqual(SHEET_NAMES)
+    expect(document.adoptedStyleSheets).toEqual(expected.map(entry => entry.sheet))
+    expect(new Set(document.adoptedStyleSheets).size).toBe(SHEET_NAMES.length)
+
     await fiber.dispose()
-    expect(document.head.querySelectorAll(`style[data-plugin="${PLUGIN_ID}"]`)).toHaveLength(0)
+    expect(document.adoptedStyleSheets).toHaveLength(0)
     expect(document.documentElement.style.getPropertyValue(HAIRLINE_WIDTH)).toBe(previousWidth)
   })
 
@@ -66,10 +70,10 @@ describe('ui-theme client styles', () => {
     try {
       const fiber = await mountStyles()
       expect(detached.defaultView).toBeNull()
-      expect(detached.head.querySelectorAll(`style[data-plugin="${PLUGIN_ID}"]`)).toHaveLength(8)
+      expect(detached.adoptedStyleSheets).toHaveLength(SHEET_NAMES.length)
       expect(detached.documentElement.style.getPropertyValue(HAIRLINE_WIDTH)).toBe('')
       await fiber.dispose()
-      expect(detached.head.querySelectorAll(`style[data-plugin="${PLUGIN_ID}"]`)).toHaveLength(0)
+      expect(detached.adoptedStyleSheets).toHaveLength(0)
     } finally {
       vi.unstubAllGlobals()
     }
@@ -84,7 +88,7 @@ describe('ui-theme client styles', () => {
     } finally {
       vi.unstubAllGlobals()
     }
-    expect(document.head.querySelectorAll(`style[data-plugin="${PLUGIN_ID}"]`)).toHaveLength(0)
+    expect(document.adoptedStyleSheets).toHaveLength(0)
     expect(document.documentElement.style.getPropertyValue(HAIRLINE_WIDTH)).toBe(previousWidth)
   })
 

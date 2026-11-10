@@ -28,7 +28,15 @@ export default defineConfig({
   // Tauri 约定：不清屏、固定端口，便于 cargo tauri dev 挂接
   clearScreen: false,
   server: { port: 5173, strictPort: true },
-  build: { target: 'es2022', outDir: 'dist' },
+  build: {
+    target: 'es2022',
+    outDir: 'dist',
+    // 字体一律产出文件，不内联成 data: URI：KaTeX 的 woff2 里有小于默认阈值（4KB）的
+    // （Size3），内联后打包产物需要 font-src 放行 data: 才显示公式。H2 收紧 CSP 时
+    // 用这条换掉一处放宽，代价是多几个几十 KB 的静态文件。
+    assetsInlineLimit: (filePath: string) =>
+      /\.(?:woff2?|ttf|otf|eot)$/i.test(filePath) ? false : undefined,
+  },
   test: {
     environment: 'jsdom',
     setupFiles: ['./src/test-setup.ts'],

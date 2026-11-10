@@ -37,6 +37,7 @@
 | 17 | `packages/web/web/src/types.ts` | `@deepseek-ai/dsh-llm` → `@deepseek-ai/dsh-llm/error` | 同上：只取 `HarnessError`，不拖入根入口的 Node 侧导出 | 97b5250。同上 |
 | 18 | `packages/util/time/src/rrule.ts` | `import rrulePackage from 'rrule'` + 解构 → `import { Weekday, rrulestr } from 'rrule'`（含注释说明） | 上游依赖自家打包器做 CJS 互操作；SHANIU 的 Vite/rolldown 解析到 rrule 的 ESM 构建（只有命名导出），默认导入拿到 `undefined`，构建期即红 | a6da7e0。**同步上游时**：上游若改成命名导入，删本地改动；若上游仍用默认导入，保留（否则构建失败） |
 | 19 | `packages/util/official-bundles/src/plugin-manager.ts` | `PROTECTED_PLUGINS` 去掉 `@deepseek-ai/dsh-client-ui-settings-plugin-inventory` | 该包已按「设置只留通用 + 模型」删除；保护清单留着不存在的名字，会让「受保护插件」判断指向空气 | b1f9fa7。**同步上游时**：上游若也删了该包，两边一致、无需保留；若上游重新引入，先确认是否要恢复名单 |
+| 20 | `packages/client/ui-theme/src/client/styles.ts`（及 `tests/client-styles.client.spec.ts`） | 8 张主题样式表从 `document.createElement('style')` 改为构造式样式表（`new CSSStyleSheet()` + `document.adoptedStyleSheets`），新增 `themeStyleSheets()` 供用例按引用断言顺序/归属；用例断言对象由 `style[data-plugin]` 节点改为 `adoptedStyleSheets` | 打包构建下宿主 CSP 的 `style-src` 只放行静态资源内带 nonce 的标签，运行时新建的 `<style>` 被整表拦截（H2 实测 8 张全灭、界面近乎全黑）。构造式样式表不经 HTML/CSS 解析器，不受 `style-src` 约束，且无需放宽 `'unsafe-inline'` | 2026-11-10（H2 CSP 第二步）。**同步上游时**：上游若已改用构造式样式表或给 `<style>` 打 nonce，删本地实现改跟上游；同步时不要退回 `<style>` 注入，否则打包界面直接失效 |
 
 第 9 行的文件（全部只做类型修复）：
 
