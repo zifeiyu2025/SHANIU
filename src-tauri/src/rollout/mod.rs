@@ -4,8 +4,10 @@
 //!
 //! 1. **逐行 flush**：进程被杀/断电时，已写行必须可读。攒批写快，但崩溃点之后的历史全丢，
 //!    resume 就会拿到一段"看起来完整、实际缺尾"的历史——比没存档更糟。
-//! 2. **只容忍最后一行撕裂**：读的时候，最后一行如果不是完整 JSON 就当半截写丢弃；
-//!    **中间**任何一行解析失败一律报错。跳过坏行等于悄悄篡改历史，那是最难查的一类 bug。
+//! 2. **容忍中间坏行，但必须看得见**：跳过无法解析的行继续读，坏行行号随
+//!    [`Rollout::damaged_lines`] 返回，并在 `read` 内打一条 warn。**不允许静默跳过**——
+//!    跳过且不告诉任何人，等于把"可恢复的损坏"变成"悄悄丢历史"。首行坏仍报错
+//!    （没有 meta 就没有会话，跳过它等于编造一份无头档案）；末行撕裂照旧丢弃并计数。
 //! 3. **载荷直接复用 `model_client::HistoryItem`**：04 §3.1 的 `ResponseItem` 就是
 //!    "模型请求/响应/工具调用的完整记录"，而 HistoryItem 正是循环里那份记录。再造一个
 //!    同构类型 = 两份真相，resume 时必然与运行时历史漂移。
@@ -82,7 +84,9 @@ pub enum RolloutError {
     AlreadyExists(String),
     #[error("首行不是 session_meta: {0}")]
     NoSessionMeta(String),
-    #[error("rollout 第 {line} 行解析失败（中间行不容忍）: {message}")]
+    /// 档案不可用：首行不是/读不出 `session_meta`，或重放期发现结构性矛盾（如压缩锚点越界）。
+    /// 中间坏行不再走这个变体——它们被跳过并记入 [`Rollout::damaged_lines`]。
+    #[error("rollout 第 {line} 行不可用: {message}")]
     Corrupted { line: usize, message: String },
 }
 
@@ -187,30 +191,39 @@ pub struct Rollout {
     pub items: Vec<RolloutItem>,
     /// 末行不完整（崩溃时正在写）时被丢弃的行数。正常应为 0 或 1。
     pub torn_tail_lines: usize,
+    /// 中间坏行（JSON 解析失败或单行非法 UTF-8）的 1-based 行号；空 = 档案完好。
+    /// 条数就是 `len()`——调用方据此在界面/日志说明"这份历史不完整"。
+    pub damaged_lines: Vec<usize>,
 }
 
-/// 读取档案。规则见文件头设计选择 2：只容忍最后一行撕裂，中间坏行直接报错。
+/// 读取档案。规则见文件头设计选择 2：中间坏行跳过但**记录并告警**，首行坏与末行撕裂
+/// 分别按"没有 meta"与"半截写"处理。
 pub fn read(path: &Path) -> Result<Rollout, RolloutError> {
     let file = File::open(path).map_err(|e| RolloutError::Io(format!("{path:?}: {e}")))?;
     let reader = BufReader::new(file);
-    // 读错误必须原样上报（审计 M6）：`unwrap_or_default()` 会把中段的 IO/编码错误
-    // 变成空行再被静默跳过，于是"档案损坏"被伪装成"这一行本来就没有"——
-    // 与文件头"中间坏行直接报错"的契约正好相反。
-    let mut raw_lines: Vec<String> = Vec::new();
+    // 单行编码损坏（InvalidData）与"这一行 JSON 写坏了"同属可跳过的数据损坏，记为
+    // 损坏行；其余 IO 错误是磁盘/句柄故障，跳过它会把后续行一起读歪，必须整份上报。
+    // （审计 M6 防的是 `unwrap_or_default()` 把读错误变成空行再**悄悄**略过；这里的
+    // 跳过是带行号计数的显式损坏，不是静默。）
+    let mut raw_lines: Vec<Option<String>> = Vec::new();
     for line in reader.lines() {
-        raw_lines.push(line.map_err(|e| RolloutError::Io(format!("{path:?}: {e}")))?);
+        match line {
+            Ok(text) => raw_lines.push(Some(text)),
+            Err(e) if e.kind() == std::io::ErrorKind::InvalidData => raw_lines.push(None),
+            Err(e) => return Err(RolloutError::Io(format!("{path:?}: {e}"))),
+        }
     }
 
     // 半截写判定看**文件末尾有没有换行**，而不是看 JSON 能不能解析：
     // 崩溃时最后一段可能恰好是合法 JSON 的前缀，也可能碰巧完整——只有换行位置是可靠信号。
     let mut torn = 0usize;
     if !ends_newline(path) {
-        match raw_lines.last().map(|l| l.trim().is_empty()) {
-            Some(false) => {
-                torn = 1;
+        match raw_lines.last() {
+            Some(Some(text)) if text.trim().is_empty() => {
                 raw_lines.pop();
             }
-            Some(true) => {
+            Some(_) => {
+                torn = 1;
                 raw_lines.pop();
             }
             None => {}
@@ -218,13 +231,27 @@ pub fn read(path: &Path) -> Result<Rollout, RolloutError> {
     }
 
     let mut parsed: Vec<(usize, RolloutItem)> = Vec::new();
+    let mut damaged: Vec<usize> = Vec::new();
     for (idx, line) in raw_lines.iter().enumerate() {
-        if line.trim().is_empty() {
+        let number = idx + 1;
+        let Some(text) = line else {
+            damaged.push(number);
+            continue;
+        };
+        if text.trim().is_empty() {
             continue;
         }
-        let item: RolloutItem = serde_json::from_str(line)
-            .map_err(|e| RolloutError::Corrupted { line: idx + 1, message: e.to_string() })?;
-        parsed.push((idx + 1, item));
+        match serde_json::from_str::<RolloutItem>(text) {
+            Ok(item) => parsed.push((number, item)),
+            Err(e) => {
+                // 首行坏 = 没有 meta。跳过它只会把后面条目伪装成"一份没有开头的档案"，
+                // 读出来仍然不能用，所以这里保持硬失败。
+                if parsed.is_empty() {
+                    return Err(RolloutError::Corrupted { line: number, message: e.to_string() });
+                }
+                damaged.push(number);
+            }
+        }
     }
 
     let (first_line, meta) = parsed
@@ -235,7 +262,17 @@ pub fn read(path: &Path) -> Result<Rollout, RolloutError> {
         return Err(RolloutError::NoSessionMeta(format!("第 {} 行", first_line)));
     }
     let items = parsed.into_iter().skip(1).map(|(_, item)| item).collect();
-    Ok(Rollout { meta, items, torn_tail_lines: torn })
+    if !damaged.is_empty() {
+        // 唯一收口：所有调用方（打开会话、搜索对账、resume、fork）都经这里，
+        // 不会出现"某个入口悄悄少了几条历史却没人知道"。
+        tracing::warn!(
+            path = %path.display(),
+            count = damaged.len(),
+            lines = %damaged.iter().map(usize::to_string).collect::<Vec<_>>().join(","),
+            "rollout 含无法解析的行：已跳过并保留其余条目，这份历史可能不完整"
+        );
+    }
+    Ok(Rollout { meta, items, torn_tail_lines: torn, damaged_lines: damaged })
 }
 
 /// 会话列表的一行摘要（SH-033）。字段用 camelCase 出到前端，与 `get_settings` 同一风格。
@@ -350,11 +387,18 @@ pub fn read_session_order(dir: &Path) -> SessionOrderState {
 
 /// 原子替换侧车（半截文件会被当成空表，用户的归档/置顶一起丢——同 titles）。
 pub fn write_session_order(dir: &Path, state: &SessionOrderState) -> Result<(), String> {
-    let tmp = dir.join(format!("{SESSION_ORDER_FILE}.tmp"));
+    // 唯一临时名：固定的 `.tmp` 会让两个写者踩同一个文件（rename 失败 / last-write-wins）。
+    let tmp = crate::config::temp_sibling(&dir.join(SESSION_ORDER_FILE));
     let body = serde_json::to_string_pretty(state).map_err(|e| format!("序列化失败: {e}"))?;
-    std::fs::write(&tmp, body).map_err(|e| format!("写临时文件失败: {e}"))?;
-    std::fs::rename(&tmp, dir.join(SESSION_ORDER_FILE))
-        .map_err(|e| format!("替换文件失败: {e}"))
+    std::fs::write(&tmp, body).map_err(|e| {
+        let _ = std::fs::remove_file(&tmp);
+        format!("写临时文件失败: {e}")
+    })?;
+    if let Err(e) = std::fs::rename(&tmp, dir.join(SESSION_ORDER_FILE)) {
+        let _ = std::fs::remove_file(&tmp);
+        return Err(format!("替换文件失败: {e}"));
+    }
+    Ok(())
 }
 
 /// `set_title` 的失败类型：`code` 给前端按类分派（`title-invalid` → DSH wire 的
@@ -400,13 +444,19 @@ pub fn set_title(dir: &Path, agent_id: &str, title: &str) -> Result<Option<Strin
         titles.insert(id.to_string(), trimmed.to_string());
         Some(trimmed.to_string())
     };
-    // 原子替换：半截的 titles.json 会被当成空表，用户改过的所有标题一起丢
-    let tmp = dir.join(format!("{TITLES_FILE}.tmp"));
+    // 原子替换：半截的 titles.json 会被当成空表，用户改过的所有标题一起丢。
+    // 临时名唯一（pid + 序号）：固定的 `.tmp` 会让同刻的两次改名互相踩。
+    let tmp = crate::config::temp_sibling(&dir.join(TITLES_FILE));
     let body = serde_json::to_string_pretty(&titles)
         .map_err(|e| RenameError::Rejected(format!("序列化标题失败: {e}")))?;
-    std::fs::write(&tmp, body).map_err(|e| RenameError::Rejected(format!("写标题临时文件失败: {e}")))?;
-    std::fs::rename(&tmp, dir.join(TITLES_FILE))
-        .map_err(|e| RenameError::Rejected(format!("替换标题文件失败: {e}")))?;
+    std::fs::write(&tmp, body).map_err(|e| {
+        let _ = std::fs::remove_file(&tmp);
+        RenameError::Rejected(format!("写标题临时文件失败: {e}"))
+    })?;
+    if let Err(e) = std::fs::rename(&tmp, dir.join(TITLES_FILE)) {
+        let _ = std::fs::remove_file(&tmp);
+        return Err(RenameError::Rejected(format!("替换标题文件失败: {e}")));
+    }
     Ok(accepted)
 }
 
@@ -580,7 +630,7 @@ mod tests {
     }
 
     #[test]
-    fn tolerates_torn_last_line_but_rejects_middle_corruption() {
+    fn tolerates_torn_last_line_and_reports_middle_corruption() {
         let dir = temp_dir();
         let path = dir.join("agent-torn.jsonl");
         // 崩溃在写第三行的中途：末行没有换行且不是合法 JSON
@@ -598,8 +648,10 @@ mod tests {
         let back = read(&path).unwrap();
         assert_eq!(back.items.len(), 1, "半截写的那行应被丢弃");
         assert_eq!(back.torn_tail_lines, 1);
+        assert!(back.damaged_lines.is_empty(), "末行撕裂不是中间坏行");
 
-        // 同样的坏内容出现在中间（后面还有完整行）→ 必须报错，不能悄悄跳过
+        // 同样的坏内容出现在中间（后面还有完整行）→ 跳过、其余读回、坏行行号必须可见。
+        // 反向对照：修复前这里返回 Err，断言立刻红。
         std::fs::write(
             &path,
             format!("{}\n{{\"type\":\"bogus\"\n{}\n",
@@ -611,15 +663,59 @@ mod tests {
             ),
         )
         .unwrap();
-        let err = read(&path).unwrap_err();
-        assert!(matches!(err, RolloutError::Corrupted { .. }), "中间坏行必须报错：{err}");
+        let back = read(&path).unwrap();
+        assert_eq!(back.items.len(), 1, "坏行之后的有效条目必须照常读回");
+        assert_eq!(back.damaged_lines, vec![2], "坏行行号（1-based）必须报出来");
+        assert_eq!(back.torn_tail_lines, 0);
     }
 
-    /// 审计 M6：读取层面的 IO/编码错误必须转成 `RolloutError::Io`。
-    /// 修复前 `unwrap_or_default()` 把它变成空行再被静默跳过——档案损坏被伪装成
-    /// "这一行本来就没有"，与"中间坏行直接报错"的契约相反。
+    /// 中间坏行不能变成"悄悄丢历史"：条数与行号都要能从返回值看到。
     #[test]
-    fn read_io_error_in_the_middle_is_reported_not_swallowed() {
+    fn multiple_damaged_lines_are_counted_and_located() {
+        let dir = temp_dir();
+        let path = dir.join("agent-damaged.jsonl");
+        let good = serde_json::to_string(&RolloutItem::ResponseItem {
+            item: HistoryItem::Message { role: Role::User, text: "有效".into(), reasoning: None },
+        })
+        .unwrap();
+        std::fs::write(
+            &path,
+            format!(
+                "{}\nnot-json\n{}\n{{\"type\":\"response_item\"}}\n{}\n",
+                serde_json::to_string(&meta("d")).unwrap(),
+                good,
+                good,
+            ),
+        )
+        .unwrap();
+        let back = read(&path).unwrap();
+        assert_eq!(back.items.len(), 2, "两条有效条目都要读回");
+        assert_eq!(back.damaged_lines, vec![2, 4], "两处坏行的行号都要报");
+    }
+
+    /// 首行坏 = 没有 meta：跳过它只会产出一份无头档案，仍然不可用，必须硬失败。
+    #[test]
+    fn damaged_first_line_is_still_rejected() {
+        let dir = temp_dir();
+        let path = dir.join("agent-badhead.jsonl");
+        std::fs::write(
+            &path,
+            format!(
+                "not-json\n{}\n",
+                serde_json::to_string(&RolloutItem::ResponseItem {
+                    item: HistoryItem::Message { role: Role::User, text: "x".into(), reasoning: None },
+                })
+                .unwrap()
+            ),
+        )
+        .unwrap();
+        assert!(matches!(read(&path).unwrap_err(), RolloutError::Corrupted { line: 1, .. }));
+    }
+
+    /// 单行非法 UTF-8 与"这一行 JSON 写坏"同类：跳过并计入损坏行，而不是把整份档案判死。
+    /// 反向对照：修复前这里返回 `Io`，断言红。
+    #[test]
+    fn undecodable_line_is_reported_as_damage_not_swallowed() {
         let dir = temp_dir();
         let path = dir.join("agent-io-error.jsonl");
         let mut bytes = Vec::new();
@@ -642,8 +738,9 @@ mod tests {
         bytes.push(b'\n');
         std::fs::write(&path, bytes).unwrap();
 
-        let err = read(&path).unwrap_err();
-        assert!(matches!(err, RolloutError::Io(_)), "中段读错误必须报 Io，不能吞成空行：{err}");
+        let back = read(&path).unwrap();
+        assert_eq!(back.items.len(), 1, "解码失败行之后的有效条目必须读回");
+        assert_eq!(back.damaged_lines, vec![2], "解码失败行必须显式报出来");
     }
 
     #[test]
@@ -750,9 +847,10 @@ mod tests {
         std::fs::write(&path, raw).unwrap();
         let one = &list(&dir)[0];
         assert_eq!(one.title, "第一条任务", "坏行不该影响已经取到的标题");
-        assert_eq!(one.item_count, 3, "行数按物理行计，坏行留给 read() 去报错");
-        assert!(matches!(read(&path).unwrap_err(), RolloutError::Corrupted { .. }),
-            "同一份档案走 read() 必须仍然报错——两种容错口径不能混用");
+        assert_eq!(one.item_count, 3, "行数按物理行计，坏行留给 read() 去报");
+        let archive = read(&path).expect("中间坏行不再判死整份档案");
+        assert_eq!(archive.items.len(), 2, "两条有效条目照常读回");
+        assert_eq!(archive.damaged_lines, vec![4], "坏行必须可见，不能悄悄丢");
     }
 
     #[test]
@@ -870,5 +968,28 @@ mod tests {
         let final_state = read_session_order(&dir);
         assert_eq!(final_state.archived_session_ids, vec!["x".to_string()]);
         assert_eq!(final_state.pinned_session_ids, vec!["y".to_string()]);
+    }
+
+    /// 固定临时名会被另一个写者占住：把旧代码用的 `titles.json.tmp` /
+    /// `session-order.json.tmp` 占成**目录**（模拟"另一个写者正持有这个临时名"），
+    /// 写侧车仍必须成功。旧代码写固定临时文件会失败 → 本用例红。
+    #[test]
+    fn sidecar_writes_use_unique_temps_and_survive_occupied_legacy_names() {
+        let dir = temp_dir();
+        write_session(&dir, "a", "任务");
+        std::fs::create_dir(dir.join(format!("{TITLES_FILE}.tmp"))).unwrap();
+        std::fs::create_dir(dir.join(format!("{SESSION_ORDER_FILE}.tmp"))).unwrap();
+
+        let accepted = set_title(&dir, "a", "新标题").expect("唯一临时名不该被固定名占用影响");
+        assert_eq!(accepted.as_deref(), Some("新标题"));
+        assert_eq!(read_titles(&dir).get("a").map(String::as_str), Some("新标题"));
+
+        let state = SessionOrderState {
+            archived_session_ids: vec!["a".into()],
+            pinned_session_ids: vec![],
+            session_order: vec!["a".into()],
+        };
+        write_session_order(&dir, &state).expect("唯一临时名不该被固定名占用影响");
+        assert_eq!(read_session_order(&dir), state);
     }
 }

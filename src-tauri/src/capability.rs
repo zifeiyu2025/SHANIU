@@ -193,7 +193,9 @@ impl ProbeCache {
                 return;
             }
         };
-        let tmp = path.with_extension("json.tmp");
+        // 临时名唯一（pid + 序号）：多个探针同刻写回时，固定的 `.json.tmp`
+        // 会被两个写者踩同一个文件（rename 失败或 last-write-wins）。
+        let tmp = crate::config::temp_sibling(&path);
         if let Err(error) = std::fs::write(&tmp, body).and_then(|()| std::fs::rename(&tmp, &path)) {
             let _ = std::fs::remove_file(&tmp);
             tracing::warn!(path = %path.display(), %error, "写入能力缓存失败");
@@ -2137,5 +2139,28 @@ mod tests {
         assert_eq!(back.providers[0].models[0].capabilities["tools"].source, CapabilitySource::Endpoint);
         assert!(back.providers[0].models[0].vision_effective(&cfg.providers[0].base_url));
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// 固定的 `capabilities.json.tmp` 被另一个写者占住时，写回仍要成功：
+    /// 旧代码写固定临时名会失败（这里占成目录必然失败）→ 缓存文件不存在 → 本用例红。
+    #[test]
+    fn save_uses_unique_temp_and_survives_occupied_legacy_name() {
+        let dir = crate::test_support::TestTempDir::new("capability-tmp");
+        let cache_dir = dir.join(crate::config::CACHE_DIR);
+        std::fs::create_dir_all(cache_dir.join(format!("{CACHE_FILE}.tmp"))).unwrap();
+
+        let mut cache = ProbeCache::default();
+        cache.entries.insert(
+            "https://example.test/v1|m".into(),
+            BTreeMap::from([(
+                "tools".to_string(),
+                ProbeOutcome { verified: Some(true), ..Default::default() },
+            )]),
+        );
+        cache.save(&dir);
+
+        let body = std::fs::read_to_string(cache_dir.join(CACHE_FILE))
+            .expect("唯一临时名下写回不该被固定名占用影响");
+        assert!(body.contains("\"tools\""), "落盘内容必须完整：{body}");
     }
 }

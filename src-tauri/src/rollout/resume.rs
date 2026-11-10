@@ -28,6 +28,8 @@ pub struct Resumed {
     pub sandbox_mode: Option<String>,
     /// 末行半截写被丢弃的行数。
     pub torn_tail_lines: usize,
+    /// 中间坏行（已跳过）的 1-based 行号；空 = 档案完好。重放出来的历史因此可能缺条目。
+    pub damaged_lines: Vec<usize>,
 }
 
 /// 重放档案 → 历史。
@@ -109,6 +111,7 @@ pub fn resume(path: &Path) -> Result<Resumed, RolloutError> {
         applied_compactions: applied,
         sandbox_mode,
         torn_tail_lines: archive.torn_tail_lines,
+        damaged_lines: archive.damaged_lines,
     })
 }
 

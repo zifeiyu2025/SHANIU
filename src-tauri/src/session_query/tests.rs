@@ -499,3 +499,53 @@ fn schema_ownership_is_conservative_and_supports_in_place_version_reset() {
     assert_eq!(page.items.len(), 1, "认识的不兼容派生 schema 必须能原地重置并重建索引");
     assert_eq!(schema::SCHEMA_VERSION, 1);
 }
+
+/// 连接参数（2026-11-11）：WAL + 5 秒忙等待。旧代码只有 application_id，
+/// 这两条断言都会红。
+#[test]
+fn index_connection_uses_wal_and_five_second_busy_timeout() {
+    let fx = Fixture::new("pragmas");
+    let conn = schema::open_index(&fx.index_path()).unwrap();
+    let mode: String = conn
+        .query_row("PRAGMA journal_mode", [], |row| row.get(0))
+        .unwrap();
+    assert_eq!(mode.to_ascii_lowercase(), "wal", "派生索引必须跑在 WAL 下");
+    let timeout: i64 = conn
+        .query_row("PRAGMA busy_timeout", [], |row| row.get(0))
+        .unwrap();
+    assert_eq!(timeout, 5_000, "忙等待必须是 5 秒量级，不能是默认 0");
+}
+
+/// 双开搜索：另一个连接持写锁时，第二次搜索应**等待后成功**，而不是立刻
+/// `IndexFailed`（旧代码 `busy_timeout=0` 会立即失败 → 本用例红）。
+#[test]
+fn search_waits_for_a_concurrent_writer_instead_of_failing() {
+    use std::time::{Duration, Instant};
+
+    let fx = Fixture::new("busy");
+    write_archive(&fx, "a", &[message(Role::User, "并发写等待")]);
+    // 先建好索引（这张连接即"另一个实例"），再用 BEGIN IMMEDIATE 占住写锁。
+    let holder = schema::open_index(&fx.index_path()).unwrap();
+    holder.execute_batch("BEGIN IMMEDIATE").unwrap();
+
+    let root = fx.root.clone();
+    let searcher = std::thread::spawn(move || {
+        let start = Instant::now();
+        let result = search(&root, "并发写等待");
+        (result, start.elapsed())
+    });
+    // 让搜索线程真的撞上写锁再放行。
+    std::thread::sleep(Duration::from_millis(300));
+    holder.execute_batch("COMMIT").unwrap();
+
+    let (result, elapsed) = searcher.join().unwrap();
+    assert!(
+        result.is_ok(),
+        "争用应等待后成功，而不是立刻 IndexFailed：{:?}",
+        result.err()
+    );
+    assert!(
+        elapsed >= Duration::from_millis(250),
+        "第二个连接必须真的等待过写锁，实际 {elapsed:?}"
+    );
+}

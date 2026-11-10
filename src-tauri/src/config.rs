@@ -1491,14 +1491,8 @@ impl AppConfig {
 
         // 原子替换：先写同目录临时文件再 rename。直接 fs::write 中途崩溃会留下
         // 半截 config.toml——下次启动读不回来，用户看到的就是"配置全没了"。
-        // 临时名跟着目标文件名走，不固定成 config.toml：并发写不同目标（测试里
-        // 每个用例一份）时固定名会互相抢同一个临时文件。
-        let base = path
-            .file_name()
-            .and_then(|name| name.to_str())
-            .unwrap_or(CONFIG_FILE);
-        let seq = TMP_SEQ.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-        let tmp = path.with_file_name(format!("{base}.tmp-{}-{seq}", std::process::id()));
+        // 临时名唯一（pid + 序号）：并发写不同目标时固定名会互相抢同一个临时文件。
+        let tmp = temp_sibling(path);
         fs::write(&tmp, &body).map_err(|e| {
             let _ = fs::remove_file(&tmp);
             format!("写入配置失败: {e}")
@@ -1558,6 +1552,20 @@ impl AppConfig {
 
 /// 配置原子写的临时文件序号：同一毫秒内并发 save 也不互相抢同一个临时文件。
 static TMP_SEQ: AtomicU64 = AtomicU64::new(0);
+
+/// 同目录唯一临时文件名：`<目标名>.tmp-<pid>-<序号>`。
+///
+/// 原子替换（写临时文件 → rename）必须用唯一名：固定成 `xxx.json.tmp` 时，两个写者
+/// 会踩同一个临时文件——rename 目标被占用直接失败，或者后写者把前写者的内容覆盖成
+/// last-write-wins。pid 区分进程、序号区分同进程内的并发写（2026-11-11）。
+pub(crate) fn temp_sibling(target: &Path) -> PathBuf {
+    let base = target
+        .file_name()
+        .and_then(|name| name.to_str())
+        .unwrap_or("shaniu");
+    let seq = TMP_SEQ.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    target.with_file_name(format!("{base}.tmp-{}-{seq}", std::process::id()))
+}
 
 /// 拒绝落盘前把磁盘上的原文件复制一份（`config.toml.bak-<毫秒>`，重名则加序号）。
 /// 备份只为取证：原文件本身不会被改写。

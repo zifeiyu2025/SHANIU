@@ -8,11 +8,17 @@
 
 use std::fs;
 use std::path::{Path, PathBuf};
-use std::time::{SystemTime, UNIX_EPOCH};
+use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use rusqlite::{Connection, Transaction};
 
 use crate::session_query::SearchError;
+
+/// 索引连接的忙等待上限（2026-11-11）。派生索引会被第二个实例并发访问。
+/// rusqlite 0.37 的 `Connection::open` 默认已设 5000ms；这里显式写出来不是"从 0 改成 5 秒"，
+/// 而是不依赖依赖库默认值（升级后可能漂移）。5 秒覆盖一次对账事务的正常时长，
+/// 超过 5 秒说明另一方卡死，报错比无限等更好。
+const BUSY_TIMEOUT: Duration = Duration::from_secs(5);
 
 /// SHANIU 派生索引的 application id（"SHNQ"）。
 /// 刻意**不共用**上游 DSH 的 `0x44534851`：两侧 schema 不同，共用会让上游库
@@ -68,14 +74,48 @@ pub fn open_index(path: &Path) -> Result<Connection, SearchError> {
             let conn = Connection::open(path).map_err(|e| {
                 SearchError::IndexFailed(format!("新建派生索引失败 {}: {e}", path.display()))
             })?;
+            conn.busy_timeout(BUSY_TIMEOUT).map_err(|e| {
+                SearchError::IndexFailed(format!("设置新建索引忙等待失败 {}: {e}", path.display()))
+            })?;
             conn.execute_batch(&format!("PRAGMA application_id = {APPLICATION_ID};"))
                 .map_err(|e| SearchError::IndexFailed(format!("写入 application id 失败: {e}")))?;
             conn
         }
     };
+    // 先配连接参数再碰 schema：下面的 DDL 与对账都要经过写锁，忙等待必须在它们之前生效。
+    configure_connection(&conn, path)?;
     ensure_persistent_schema(&mut conn)?;
     ensure_temp_schema(&conn)?;
     Ok(conn)
+}
+
+/// 连接参数：忙等待 + WAL（2026-11-11）。
+///
+/// `busy_timeout` 必须每条连接都设（SQLite 是 per-connection 语义），包括
+/// `classify_existing` 里那条——否则双开时归属校验会在争用下被判成 "Corrupt"，
+/// 进而尝试 quarantine 一个其实健康的库。
+///
+/// WAL 让读不阻塞写、写不阻塞读，正是双开搜索的场景。设不上（网络盘等不支持 WAL 的
+/// 文件系统）只记 warn 继续用当前模式：派生索引可用性优先于模式偏好，不为一个
+/// 模式选择让搜索整体不可用。WAL 的 `-wal/-shm` 残留由 `quarantine` 一并改名带走。
+fn configure_connection(conn: &Connection, path: &Path) -> Result<(), SearchError> {
+    conn.busy_timeout(BUSY_TIMEOUT).map_err(|e| {
+        SearchError::IndexFailed(format!("设置索引忙等待失败 {}: {e}", path.display()))
+    })?;
+    match conn.query_row("PRAGMA journal_mode = WAL", [], |row| row.get::<_, String>(0)) {
+        Ok(mode) if mode.eq_ignore_ascii_case("wal") => {}
+        Ok(mode) => tracing::warn!(
+            path = %path.display(),
+            mode = %mode,
+            "派生索引未进入 WAL 模式，继续使用当前模式"
+        ),
+        Err(error) => tracing::warn!(
+            path = %path.display(),
+            %error,
+            "派生索引切换 WAL 失败，继续使用当前模式"
+        ),
+    }
+    Ok(())
 }
 
 /// 校验既有文件归属。只读 PRAGMA 与 sqlite_master；除"认识的版本不匹配原地重置"外不写。
@@ -84,6 +124,11 @@ fn classify_existing(path: &Path) -> Existing {
         Ok(conn) => conn,
         Err(e) => return Existing::Corrupt(format!("打不开: {e}")),
     };
+    // 与 open_index 同一条忙等待口径：这里的读不该被另一个实例的写瞬间打回 BUSY，
+    // 否则"争用"会被误判成"文件损坏"并触发 quarantine。
+    if let Err(e) = conn.busy_timeout(BUSY_TIMEOUT) {
+        return Existing::Corrupt(format!("设置忙等待失败: {e}"));
+    }
     let application_id = match pragma_i64(&conn, "PRAGMA application_id") {
         Ok(value) => value,
         Err(e) => return Existing::Corrupt(format!("读 application_id 失败: {e}")),
