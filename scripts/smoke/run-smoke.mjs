@@ -243,24 +243,87 @@ try {
     el.focus()
     return el.tagName
   })()`
-  let editor = await evalJs(findEditor)
+  const waitEditor = async (timeoutMs) => {
+    const deadline = Date.now() + timeoutMs
+    while (Date.now() < deadline) {
+      const tag = await evalJs(findEditor).catch(() => null)
+      if (tag) return tag
+      await sleep(500)
+    }
+    return null
+  }
+  const pressCtrl = async (key, code) => {
+    const base = {
+      key,
+      code,
+      windowsVirtualKeyCode: key.toUpperCase().charCodeAt(0),
+      nativeVirtualKeyCode: key.toUpperCase().charCodeAt(0),
+      modifiers: 2,
+    }
+    await send('Input.dispatchKeyEvent', { type: 'rawKeyDown', ...base })
+    await send('Input.dispatchKeyEvent', { type: 'keyUp', ...base })
+  }
+
+  let editor = await waitEditor(8_000)
+  if (!editor) {
+    // 空数据根在非中文环境会停在「Choose a workspace to start」：先选默认工作区，
+    // 再退回 Ctrl+N 建会话，最后退回点「New Session / 新建会话」按钮
+    await evalJs(`(() => {
+      const names = ['Default workspace', '默认工作区']
+      const hit = [...document.querySelectorAll('button,[role="button"],[role="treeitem"],a,li,div')]
+        .find((n) => names.some((x) => (n.innerText || '').trim() === x))
+      if (hit) hit.click()
+      return !!hit
+    })()`)
+    editor = await waitEditor(20_000)
+  }
+  if (!editor) {
+    // 兜底：点输入框上方的「Choose workspace / 选择工作区」，再点菜单里的默认工作区
+    await evalJs(`(() => {
+      const words = ['Choose workspace', '选择工作区']
+      const trigger = [...document.querySelectorAll('button,[role="button"]')]
+        .find((n) => words.some((x) => (n.innerText || '').includes(x)))
+      if (trigger) trigger.click()
+      return !!trigger
+    })()`)
+    await sleep(800)
+    await evalJs(`(() => {
+      const names = ['Default workspace', '默认工作区']
+      const item = [...document.querySelectorAll('[role="menuitem"],[role="option"],button,li')]
+        .find((n) => names.some((x) => (n.innerText || '').trim().includes(x)))
+      if (item) item.click()
+      return !!item
+    })()`)
+    editor = await waitEditor(15_000)
+  }
+  if (!editor) {
+    await pressCtrl('n', 'KeyN')
+    editor = await waitEditor(15_000)
+  }
   if (!editor) {
     await evalJs(`(() => {
-      const want = ['新建会话', '新会话', '开始新会话', 'New session', '开始']
+      const want = ['New Session', '新建会话', '新会话', '开始新会话', '开始']
       const btn = [...document.querySelectorAll('button,[role="button"]')]
         .find((b) => want.some((w) => (b.innerText || '').includes(w)))
       if (btn) btn.click()
       return !!btn
     })()`)
-    await sleep(1500)
-    editor = await evalJs(findEditor)
+    editor = await waitEditor(15_000)
   }
-  if (!editor) throw new Error('找不到输入框，无法发消息')
+  if (!editor) {
+    const text = await evalJs(`(document.body.innerText || '').replace(/\\s+/g, ' ').slice(0, 400)`)
+    throw new Error(`找不到输入框，无法发消息（页面文本：${text}）`)
+  }
 
   const typeAndSend = async (text) => {
     await evalJs(findEditor)
     await send('Input.insertText', { text })
     await sleep(400)
+    const typed = await evalJs(`(() => {
+      const el = document.querySelector('[contenteditable="true"]') || document.querySelector('textarea')
+      return el ? ((el.value ?? el.innerText) || '').length : -1
+    })()`)
+    if (typed <= 0) throw new Error('输入框没收到文本（可能仍被工作区未选中挡住）')
     const base = { key: 'Enter', code: 'Enter', windowsVirtualKeyCode: 13, nativeVirtualKeyCode: 13 }
     await send('Input.dispatchKeyEvent', { type: 'rawKeyDown', ...base })
     await send('Input.dispatchKeyEvent', { type: 'char', text: '\r', key: 'Enter' })
