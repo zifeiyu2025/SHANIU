@@ -1,0 +1,20 @@
+/*
+ * 侧栏品牌名（`BrandName.tsx`）。
+ *
+ * 上游 `ui-brand-official` 的 wordmark 是 DeepSeek 的品牌字形（SVG 路径），不能复制。
+ * 这里用**同规格的排版**排出 SHANIU：与 `SidebarRoot.module.css` 的 `.brandName`
+ * 一致 —— 24px 行高/盒高、18px 字号、600 字重、0.04em 字距。
+ */
+
+.shaniu-brand-name {
+  display: inline-flex;
+  align-items: center;
+  height: 24px;
+  font-family: var(--dsw-font-family);
+  font-size: 18px;
+  font-weight: 600;
+  line-height: 24px;
+  letter-spacing: 0.04em;
+  color: inherit;
+  white-space: nowrap;
+}

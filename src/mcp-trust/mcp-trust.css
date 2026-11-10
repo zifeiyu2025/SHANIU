@@ -158,11 +158,39 @@
   gap: 8px;
 }
 
-.mcp-connector-tool-head select {
+/* 风险档位选择器：与 DSH `PermissionRow.module.css` 的 `.selector` 同规格
+   （36px 高、14px/22px、左右 14px 内距、radius-md、模块底色、chevron）。 */
+.mcp-connector-risk {
   flex: none;
   margin-left: auto;
-  font-size: 12px;
-  padding: 2px 6px;
+  display: inline-flex;
+  align-items: center;
+  gap: 12px;
+  height: 36px;
+  padding: 0 14px;
+  border: none;
+  border-radius: var(--dsw-radius-md, 8px);
+  background: var(--dsw-alias-bg-module-platform, transparent);
+  font: inherit;
+  font-size: 14px;
+  line-height: 22px;
+  color: var(--dsw-alias-label-primary, inherit);
+  cursor: pointer;
+}
+
+@media (hover: hover) {
+  .mcp-connector-risk:hover:not(:disabled) {
+    background: var(--dsw-alias-interactive-bg-hover, rgba(0, 0, 0, 0.04));
+  }
+}
+
+.mcp-connector-risk:disabled {
+  cursor: default;
+  opacity: 0.5;
+}
+
+.mcp-connector-risk-chevron {
+  flex: none;
 }
 
 .mcp-connector-tool-desc,

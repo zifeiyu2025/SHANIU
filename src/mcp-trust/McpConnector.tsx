@@ -15,7 +15,9 @@ import {
   Button,
   Checkbox,
   DisclosureRow,
+  IconChevronDownOutlineRegular,
   IconLinkOutlineRegular,
+  Menu,
   PathLabel,
   RiskConfirmation,
   SegmentedTabs,
@@ -55,10 +57,9 @@ import {
 import './mcp-trust.css'
 
 /**
- * 本条目从槽位拿到的 props：`view` 契约（`plugins.item` 才有）+ 本命名空间词典。
+ * 本条目从槽位拿到的 props：`view` 契约（`plugins.item`）+ 本命名空间词典。
  *
- * `settings.section` 的临时挂载点不传 `view`（只给 `close`），所以这里放开为
- * 可选：两个挂载点共用**同一个组件定义、同一份数据源与状态**，不是两份 UI。
+ * `view` 保持可选：直接渲染（与既有测试）不传，视为详情页主体 `page`。
  */
 type McpConnectorProps = Partial<PluginConfigViewProps> & PropsLocale<typeof NS>
 
@@ -757,6 +758,7 @@ function ToolRow({
   selection: ToolSelection
   onChange: (next: ToolSelection) => void
 }): ReactNode {
+  const [riskOpen, setRiskOpen] = useState(false)
   return (
     <li className="mcp-connector-tool">
       <div className="mcp-connector-tool-head">
@@ -767,19 +769,34 @@ function ToolRow({
             ? tool.dispatch_name
             : `${tool.dispatch_name} (${tool.raw_name})`}
         />
-        <select
-          className="mcp-connector-risk"
-          aria-label={`${t('toolRisk')}: ${tool.dispatch_name}`}
-          value={selection.risk}
-          disabled={!selection.approved}
-          onChange={(event) => {
-            onChange({ ...selection, risk: event.target.value as ToolSelection['risk'] })
+        {/* 与 DSH `PermissionRow` 的 `.selector` 同规格（36px / 14px / chevron）。 */}
+        <Menu
+          open={riskOpen}
+          onClose={() => { setRiskOpen(false) }}
+          items={SELECTABLE_RISKS.map(risk => ({ id: risk, label: t(riskKey(risk)) }))}
+          selectedId={selection.risk}
+          onSelect={(id) => {
+            setRiskOpen(false)
+            if (id === selection.risk) return
+            onChange({ ...selection, risk: id as ToolSelection['risk'] })
           }}
-        >
-          {SELECTABLE_RISKS.map(risk => (
-            <option key={risk} value={risk}>{t(riskKey(risk))}</option>
-          ))}
-        </select>
+          align="end"
+          portal
+          anchor={(
+            <button
+              type="button"
+              className="mcp-connector-risk"
+              aria-label={`${t('toolRisk')}: ${tool.dispatch_name}`}
+              aria-haspopup="menu"
+              aria-expanded={riskOpen}
+              disabled={!selection.approved}
+              onClick={() => { setRiskOpen(value => !value) }}
+            >
+              {t(riskKey(selection.risk))}
+              <IconChevronDownOutlineRegular className="mcp-connector-risk-chevron" />
+            </button>
+          )}
+        />
       </div>
       {tool.description !== '' && <p className="mcp-connector-tool-desc">{tool.description}</p>}
       {tool.server_read_only_hint && <p className="mcp-connector-note">{t('serverHint')}</p>}

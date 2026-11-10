@@ -7,12 +7,29 @@
  * 它等的是 `sidebar.brand.name` 这个键，以及槽位就位时填进去的组件就是 ShaniuBrandName。
  * 端到端是否真的换掉 "DSH 本地构建"，由桌面窗口截图验收（见交付说明）。
  */
+import { readFileSync } from 'node:fs'
+import { join } from 'node:path'
 import { beforeEach, describe, expect, it } from 'vitest'
 import { render, screen } from '@testing-library/react'
 import { Context } from '@deepseek-ai/cordis'
 import { apply as brandApply, inject as brandInject } from './index'
 import { ShaniuBrandName } from './BrandName'
 import { SHANIU_BRAND_NAME } from './brand-name'
+
+/** 取出某个选择器的声明块（先剥注释，避免注释里的冒号污染键名）。 */
+function declarations(raw: string, selector: string): Map<string, string> {
+  const css = raw.replace(/\/\*[\s\S]*?\*\//g, '')
+  const escaped = selector.replace(/[.*+?^${}()|[\]\\]/g, '\\$&')
+  const match = css.match(new RegExp(`(?:^|\\n)\\s*${escaped}\\s*\\{([^}]*)\\}`))
+  if (match === null) throw new Error(`selector not found: ${selector}`)
+  const map = new Map<string, string>()
+  for (const chunk of (match[1] ?? '').split(';')) {
+    const at = chunk.indexOf(':')
+    if (at < 0) continue
+    map.set(chunk.slice(0, at).trim(), chunk.slice(at + 1).trim())
+  }
+  return map
+}
 
 /** 记录插件对槽位注册表做了什么。 */
 interface SlotsProbe {
@@ -86,5 +103,25 @@ describe('src/brand：侧栏品牌名占用者', () => {
 
   it('品牌名常量与构建期标题同源', () => {
     expect(SHANIU_BRAND_NAME).toBe('SHANIU')
+  })
+
+  it('排版规格与上游 `.brandName` 逐项一致（不复制上游 SVG，只对齐字重/字号/字距/尺寸）', () => {
+    const own = declarations(
+      readFileSync(join(import.meta.dirname, 'brand-name.css'), 'utf8'),
+      '.shaniu-brand-name',
+    )
+    const upstream = declarations(
+      readFileSync(
+        join(
+          import.meta.dirname, '..', 'dsh', 'packages', 'client', 'ui-sidebar',
+          'src', 'client', 'SidebarRoot.module.css',
+        ),
+        'utf8',
+      ),
+      '.brandName',
+    )
+    for (const key of ['height', 'font-size', 'font-weight', 'line-height', 'letter-spacing']) {
+      expect(own.get(key), `declaration ${key}`).toBe(upstream.get(key))
+    }
   })
 })
