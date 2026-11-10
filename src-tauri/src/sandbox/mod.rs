@@ -1470,4 +1470,25 @@ mod tests {
         }
         assert!(found, "沙箱化子进程 stdout 应含输出");
     }
+
+    /// H3：`wait()` 的退出码必须**缓存**——`unified_exec` 的 `select!` 每收一行都会重建
+    /// `waiter.status()` future，旧实现每次调用都新起一个 `spawn_blocking(INFINITE)`，
+    /// 阻塞池（512）会被输出行数填满。这里验证重复调用返回同一结果，且已完成的 oneshot
+    /// 不会被二次轮询（第二次调用命中 `exit_result` 缓存，不再触碰阻塞池）。
+    #[cfg(windows)]
+    #[tokio::test]
+    async fn restricted_wait_caches_exit_code_across_calls() {
+        let _serial = appcontainer::PROFILE_TEST_MUTEX.lock().await;
+        let dir = ws();
+        let (tx, _rx) = mpsc::channel(64);
+        let mut child =
+            match prepare_spawn(SandboxMode::WorkspaceWrite, "cmd", &["/C", "exit 7"], &dir, tx) {
+                Ok(PreparedSpawn::Restricted(child)) => child,
+                _ => panic!("workspace-write 应为 Restricted"),
+            };
+        let first = child.wait().await.expect("首次等待应拿到退出码");
+        let second = child.wait().await.expect("重复等待必须复用缓存结果");
+        let third = child.wait().await.expect("第三次等待同样走缓存");
+        assert_eq!((first, second, third), (7, 7, 7));
+    }
 }

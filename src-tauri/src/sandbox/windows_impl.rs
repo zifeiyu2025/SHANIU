@@ -24,7 +24,8 @@ use std::sync::{Arc, Mutex};
 use tokio::sync::mpsc;
 use windows::core::{PCWSTR, PWSTR};
 use windows::Win32::Foundation::{
-    CloseHandle, HANDLE, HANDLE_FLAGS, HANDLE_FLAG_INHERIT, SetHandleInformation,
+    CloseHandle, HANDLE, HANDLE_FLAGS, HANDLE_FLAG_INHERIT, SetHandleInformation, WAIT_FAILED,
+    WAIT_OBJECT_0,
 };
 use windows::Win32::Security::{
     CreateRestrictedToken, GetTokenInformation, LookupPrivilegeValueW, LUID_AND_ATTRIBUTES,
@@ -216,6 +217,15 @@ pub struct RestrictedChild {
     /// 两条输出流各自的编码判定结果（读线程回写）。中文 Windows 上 cmd 内建命令
     /// 按 OEM 代码页（936）写管道，外部程序多用 UTF-8——统一在这里判定一次。
     encodings: crate::text_encoding::EncodingLedger,
+    /// **唯一一次**退出等待（H3）。首次 `wait()` 才提交 `spawn_blocking`，之后复用同一个
+    /// 接收端：`unified_exec` 的 `select!` 每收一行就重建一次 `waiter.status()`，旧实现
+    /// 每次都新起一个 `WaitForSingleObject(INFINITE)`，线程在子进程退出前不返回，
+    /// 阻塞池（上限 512）会被输出行数填满——实测 2000 行时 `tokio::fs` 往返从 256µs
+    /// 变成 5s 超时。缓存后每个子进程恒为 1 条阻塞线程。
+    exit_rx: Option<tokio::sync::oneshot::Receiver<io::Result<i32>>>,
+    /// 等待结果缓存（成功 = 退出码，失败 = 同一条错误文本）：多次 `wait()` 返回同一结果，
+    /// 已完成的 oneshot 不会被二次轮询。
+    exit_result: Option<Result<i32, String>>,
 }
 
 unsafe impl Send for RestrictedChild {}
@@ -229,24 +239,44 @@ impl RestrictedChild {
         self.encodings.note()
     }
 
-    /// 阻塞等待退出（经 spawn_blocking 在阻塞线程池运行），返回退出码。
+    /// 等待子进程退出，返回退出码。
+    ///
+    /// H3：整个生命周期只提交**一次**阻塞等待任务（见 `exit_rx`），后续调用直接等同一个
+    /// 结果，不再碰阻塞线程池。
+    ///
+    /// `exit_rx` 用 `poll_fn` **原地轮询**而不是 `.await` 消费它：外层 future 被 `select!`
+    /// 丢弃时接收端必须留在 `self` 里，否则下次 `wait()` 会永远等不到（接收端被消费掉）。
     pub async fn wait(&mut self) -> io::Result<i32> {
-        let process = self
-            .process
-            .try_clone()
-            .map_err(|e| io::Error::other(format!("复制进程句柄失败: {e}")))?;
-        use std::os::windows::io::AsRawHandle as _;
-        tokio::task::spawn_blocking(move || unsafe {
-            WaitForSingleObject(HANDLE(process.as_raw_handle()), INFINITE);
-            let mut code: u32 = 0;
-            let _ = GetExitCodeProcess(HANDLE(process.as_raw_handle()), &mut code);
-            Ok(code as i32)
-        })
-        .await
-        .map_err(|e| io::Error::other(e.to_string()))?
+        if let Some(result) = &self.exit_result {
+            return result.clone().map_err(io::Error::other);
+        }
+        if self.exit_rx.is_none() {
+            let process = self
+                .process
+                .try_clone()
+                .map_err(|e| io::Error::other(format!("复制进程句柄失败: {e}")))?;
+            let (tx, rx) = tokio::sync::oneshot::channel();
+            tokio::task::spawn_blocking(move || {
+                // 发送端唯一可能失败的路径是接收端已随 child drop；那说明调用方已经不再
+                // 关心退出码，没有需要上报的地方。
+                let _ = tx.send(wait_for_exit_code(&process));
+            });
+            self.exit_rx = Some(rx);
+        }
+        let rx = self.exit_rx.as_mut().expect("上一段刚插入接收端");
+        use std::future::Future as _;
+        let result = std::future::poll_fn(|cx| std::pin::Pin::new(&mut *rx).poll(cx))
+            .await
+            // 发送端在阻塞任务里；只有运行时关停丢弃该任务才会走到这里。
+            // 不能把它当成退出码 0——那会把「没等到」报成「成功退出」。
+            .unwrap_or_else(|e| Err(io::Error::other(format!("退出等待任务失联: {e}"))));
+        // 已完成的 oneshot 不能再轮询：取走接收端，之后只读缓存。
+        self.exit_rx = None;
+        self.exit_result = Some(result.as_ref().map(|code| *code).map_err(|e| e.to_string()));
+        result
     }
 
-    /// 终止子进程（超时/取消时调用）。
+    /// 终止子进程（超时/取消时调用）。语义不变：可重复调用，不依赖 `wait()` 的状态。
     pub fn kill(&self) {
         unsafe {
             let _ = windows::Win32::System::Threading::TerminateProcess(
@@ -254,6 +284,32 @@ impl RestrictedChild {
                 1,
             );
         }
+    }
+}
+
+/// 同步等待进程退出并取退出码（只在 `spawn_blocking` 里执行一次）。
+///
+/// `WAIT_FAILED` 与 `GetExitCodeProcess` 失败都必须报错：旧实现两者都静默忽略，
+/// 失败会以「退出码 0」的形式回报给工具，模型看到的是「命令成功」。
+fn wait_for_exit_code(process: &OwnedHandle) -> io::Result<i32> {
+    use std::os::windows::io::AsRawHandle as _;
+    let handle = HANDLE(process.as_raw_handle());
+    let waited = unsafe { WaitForSingleObject(handle, INFINITE) };
+    if waited == WAIT_OBJECT_0 {
+        let mut code: u32 = 0;
+        unsafe { GetExitCodeProcess(handle, &mut code) }
+            .map_err(|e| io::Error::other(format!("读取退出码失败: {e}")))?;
+        Ok(code as i32)
+    } else if waited == WAIT_FAILED {
+        Err(io::Error::other(format!(
+            "等待进程退出失败（WAIT_FAILED）: {}",
+            io::Error::last_os_error()
+        )))
+    } else {
+        Err(io::Error::other(format!(
+            "等待进程退出返回意外状态: {}",
+            waited.0
+        )))
     }
 }
 
@@ -335,7 +391,13 @@ pub fn spawn_restricted_command(
         let process = OwnedHandle::from_raw_handle(raw);
         // 线程主句柄立即关闭（线程已 Resume；si 为 Copy 无需 drop）
         let _ = CloseHandle(pi.hThread);
-        Ok(RestrictedChild { process, _job: job_guard, encodings })
+        Ok(RestrictedChild {
+            process,
+            _job: job_guard,
+            encodings,
+            exit_rx: None,
+            exit_result: None,
+        })
     }
 }
 
@@ -450,7 +512,13 @@ pub fn spawn_appcontainer_command(
         let raw: RawHandle = pi.hProcess.0.cast();
         let process = OwnedHandle::from_raw_handle(raw);
         let _ = CloseHandle(pi.hThread);
-        Ok(RestrictedChild { process, _job: job_guard, encodings })
+        Ok(RestrictedChild {
+            process,
+            _job: job_guard,
+            encodings,
+            exit_rx: None,
+            exit_result: None,
+        })
     }
 }
 
