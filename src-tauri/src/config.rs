@@ -368,8 +368,12 @@ pub struct ProviderProfile {
     pub reasoning_effort: String,
     /// 自定义请求头（SH-097，additive）：发往该服务商端点的附加头。上游同字段
     /// 位于服务商 profile（llm-pi-ai config.ts），语义一致：部署头先放，认证头
-    /// 与保留名后到者胜。不标 secret——代理网关签名这类值本来就要在设置页明文
-    /// 可见，与上游的"headers 非 credential 角色"同口径。
+    /// 与保留名后到者胜。
+    ///
+    /// **值是凭据，一律按 secret 处理（审计 M8）**：这个字段的语义就是"发给模型端点
+    /// 的凭据类头"，用户不会拿它填普通元数据；只按头名（`X-Api-Key` / `Authorization`
+    /// …）做匹配是启发式，厂商自定义命名漏一个就等于没做。因此全部值都进
+    /// `SECRET_REGISTRY`，走与 API Key 同一条落盘/日志脱敏路径，设置页不回显。
     #[serde(alias = "headers")]
     pub headers: std::collections::BTreeMap<String, String>,
     /// 密钥存放名（DPAPI 文件名 / 设置页 ref）。空 = 按 id 派生。
@@ -569,6 +573,8 @@ impl AppConfig {
 
     /// 启动配置的完整性校验（解析成功后立即调用）。
     fn validate_loaded(&self) -> Result<(), String> {
+        // 头值也是凭据：装载即登记，任何一次日志都晚于这次调用（审计 M8）
+        register_header_secrets(&self.providers);
         Self::validate_mcp(&self.mcp)
     }
 
@@ -640,6 +646,9 @@ impl AppConfig {
     /// 校验服务商文档：id 非空且唯一、active 要么空要么命中。
     /// 报错而不是静默修——静默丢掉一个 id 会让用户以为已经配好，实际那家根本不存在。
     pub fn validate_providers(providers: &[ProviderProfile], active: &str) -> Result<(), String> {
+        // 校验通过与否都要先登记：写入后紧接着就可能打日志（保存失败的报错里
+        // 常带原文），晚一步登记就漏一步（审计 M8）
+        register_header_secrets(providers);
         let mut seen: Vec<&str> = Vec::with_capacity(providers.len());
         for p in providers {
             if p.id.trim().is_empty() {
@@ -1719,6 +1728,29 @@ pub fn register_secret(secret: &str) {
     }
 }
 
+/// 自定义请求头值能被整串替换的最短长度。
+///
+/// 低于这个长度的值不做原文登记：`redact` 是**逐字面量替换**，把 `X-Debug: 1` 的 `1`
+/// 登记进去，日志与 events.jsonl 里每个 `1` 都会变成 `[REDACTED]`——那会毁掉会话
+/// 回放（模型看到的正文被抹穿），比漏脱敏一个短值更糟。8 字符与上面 "Bearer ≥8"
+/// 的既有阈值同口径：低于它的串不可能是任何真实签名/令牌。
+const HEADER_SECRET_MIN_CHARS: usize = 8;
+
+/// 把服务商自定义请求头的**全部值**登记为密钥（审计 M8）。
+///
+/// 不做头名匹配：`X-Api-Key` / `X-Auth-Token` / 厂商自造名都可能漏，漏一个等于没做。
+/// 只在配置装载与写入两个入口调用，保证任何一次日志/事件落盘之前登记表已经就绪。
+pub fn register_header_secrets(providers: &[ProviderProfile]) {
+    for p in providers {
+        for value in p.headers.values() {
+            let v = value.trim();
+            if v.chars().count() >= HEADER_SECRET_MIN_CHARS {
+                register_secret(v);
+            }
+        }
+    }
+}
+
 struct Pattern {
     re: Regex,
     /// 替换模板：无捕获组用全匹配替换；有捕获组保留键名/方案名只抹值。
@@ -2657,6 +2689,57 @@ network = \"restricted\"\n";
         let mut ok = profile("longcat", "b", "m1");
         ok.headers = [("X-Gateway-Sign".to_string(), String::new())].into_iter().collect();
         assert!(AppConfig::validate_providers(&[ok], "").is_ok());
+    }
+
+    #[test]
+    fn custom_header_values_are_registered_as_secrets() {
+        // 审计 M8：头名不可预测（X-Gateway-Sign 这类），只按名字匹配必然漏，
+        // 所以全部值都进登记表，走与 API Key 同一条 redact 路径。
+        let value = "opaque-gateway-signature-m8";
+        let mut p = profile("longcat", "b", "m1");
+        p.headers = [("X-Gateway-Sign".to_string(), value.to_string())].into_iter().collect();
+        assert!(redact(value) == value, "构造前提：登记前这串不是已知密钥");
+
+        // 保存/装载入口都会登记（反向对照：把 validate_providers 里的
+        // register_header_secrets 调用去掉，本断言立刻红）
+        AppConfig::validate_providers(std::slice::from_ref(&p), "longcat").unwrap();
+        assert_eq!(redact(&format!("hdr={value}")), "hdr=[REDACTED]");
+
+        // 短值不登记：把 `X-Debug: 1` 的 "1" 登记进去会把日志里每个 1 都抹掉
+        let mut short = profile("longcat", "b", "m1");
+        short.headers = [("X-Debug".to_string(), "1".to_string())].into_iter().collect();
+        register_header_secrets(&[short]);
+        assert_eq!(redact("turn=1 ok"), "turn=1 ok", "短值不得进入整串替换");
+
+        // 装载路径：config.toml 读进内存时同样先登记，早于任何一次日志
+        let from_disk = "opaque-from-disk-m8-xyz";
+        let mut loaded = profile("longcat", "b", "m1");
+        loaded.headers =
+            [("X-From-Disk".to_string(), from_disk.to_string())].into_iter().collect();
+        let cfg = AppConfig { providers: vec![loaded], ..AppConfig::default() };
+        cfg.validate_loaded().expect("装载校验");
+        assert_eq!(redact(from_disk), REDACTED);
+    }
+
+    #[test]
+    fn custom_header_still_reaches_the_request() {
+        // 别把功能改哑了：脱敏只影响落盘/日志，不影响实际发出去的请求头
+        let mut p = profile("longcat", "b", "m1");
+        p.headers = [("X-Gateway-Sign".to_string(), "sig-0123456789".to_string())]
+            .into_iter()
+            .collect();
+        let cfg = AppConfig {
+            providers: vec![p],
+            active_provider: "longcat".into(),
+            ..AppConfig::default()
+        };
+        AppConfig::validate_providers(&cfg.providers, "longcat").unwrap();
+        let resolved = cfg.effective_model();
+        assert_eq!(
+            resolved.headers.get("X-Gateway-Sign").map(String::as_str),
+            Some("sig-0123456789"),
+            "登记为 secret 不能把头发送值改掉"
+        );
     }
 
     #[test]
