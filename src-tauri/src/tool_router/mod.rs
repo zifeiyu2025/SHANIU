@@ -740,9 +740,38 @@ pub fn resolve_in_workspace(workspace_root: &Path, path: &str) -> Result<PathBuf
     Ok(shell_usable(&canonical))
 }
 
+/// 判断路径**自身**是否为重解析点（符号链接 / junction / mount point），不跟随。
+/// 用 `symlink_metadata`：`metadata` 会跟随链接，悬空链接上直接报"不存在"，
+/// 那正是审计 M3 的穿孔条件。
+fn is_reparse_point(path: &Path) -> bool {
+    match std::fs::symlink_metadata(path) {
+        Ok(meta) => {
+            if meta.file_type().is_symlink() {
+                return true;
+            }
+            #[cfg(windows)]
+            {
+                use std::os::windows::fs::MetadataExt;
+                // FILE_ATTRIBUTE_REPARSE_POINT：junction / mount point 的
+                // `is_symlink()` 返回 false（它们不是 symlink 标签），只有属性位能认出来
+                const FILE_ATTRIBUTE_REPARSE_POINT: u32 = 0x400;
+                meta.file_attributes() & FILE_ATTRIBUTE_REPARSE_POINT != 0
+            }
+            #[cfg(not(windows))]
+            {
+                false
+            }
+        }
+        Err(_) => false,
+    }
+}
+
 /// 写类操作的工作区路径校验：允许目标**尚不存在**（如 Add File）。
 /// 规则：拒绝包含 `..` 组件；对最深存在的祖先做 canonicalize 并校验不越界，
 /// 尾部组件原样拼接（不存在 `..` 故不可能向上逃逸）。
+/// 悬空重解析点单独拦：`exists()` 跟随链接、目标不存在时返回 false，会被误判成
+/// "待创建的新路径"，而 `fs::write` 会沿链接在工作区外建出目标文件（审计 M3，
+/// 本机已实测复现）。
 pub fn resolve_for_write(workspace_root: &Path, path: &str) -> Result<PathBuf, ToolError> {
     if path.trim().is_empty() {
         return Err(ToolError::InvalidArgs("路径为空".into()));
@@ -761,6 +790,12 @@ pub fn resolve_for_write(workspace_root: &Path, path: &str) -> Result<PathBuf, T
     let mut tail: Vec<std::ffi::OsString> = Vec::new();
     let mut probe = joined.clone();
     while !probe.exists() {
+        // 链接本身存在、目标不存在 → 这里必须拒绝，不能当"待创建路径"放过去
+        if is_reparse_point(&probe) {
+            return Err(ToolError::Execution(format!(
+                "路径含悬空符号链接（重解析点），拒绝写入以防越界: {path}"
+            )));
+        }
         match probe.parent() {
             Some(parent) if parent != probe => {
                 tail.push(probe.file_name().map(|n| n.to_os_string()).unwrap_or_default());
@@ -835,6 +870,42 @@ mod tests {
             spec: ToolSpec::new("noop", "no-op", serde_json::json!({"type":"object"})),
         }));
         router
+    }
+
+    /// 审计 M3：悬空文件符号链接不得把写入带到工作区外。
+    ///
+    /// 真机构造（本机已复现修前穿透）：工作区内 `link.txt` 是指向工作区外**不存在**
+    /// 路径的符号链接。`exists()` 跟随链接回 false，旧实现把它当"待创建路径"放行，
+    /// `fs::write` 于是沿链接在工作区外建出了文件。
+    /// 反向对照：修前本用例在 `assert!(resolved.is_err())` 处红（resolve 回了
+    /// `ws\link.txt` 且目标文件被建出）；修后绿。
+    #[cfg(windows)]
+    #[test]
+    fn dangling_symlink_cannot_pierce_workspace_write() {
+        let base = std::env::temp_dir().join(format!("shaniu-m3-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&base);
+        let ws = base.join("ws");
+        std::fs::create_dir_all(&ws).unwrap();
+        let target = base.join("outside.txt");
+        let link = ws.join("link.txt");
+        if let Err(e) = std::os::windows::fs::symlink_file(&target, &link) {
+            // 没有开发者模式/管理员时构造函数本身不可用：如实跳过，不改成"看起来通过"
+            eprintln!("SKIP：本机无法创建文件符号链接（需开发者模式/管理员）: {e}");
+            let _ = std::fs::remove_dir_all(&base);
+            return;
+        }
+        let resolved = resolve_for_write(&ws, "link.txt");
+        assert!(
+            resolved.is_err(),
+            "悬空符号链接必须被拒绝，否则 fs::write 会在工作区外建出 {}",
+            target.display()
+        );
+        assert!(!target.exists(), "拒绝之后不得留下工作区外的目标文件");
+        // 正常路径不受影响：同目录下的新建文件仍然可解析、可写
+        let plain = resolve_for_write(&ws, "fresh.txt").expect("普通新文件仍应放行");
+        std::fs::write(&plain, "ok").unwrap();
+        assert!(ws.join("fresh.txt").exists());
+        let _ = std::fs::remove_dir_all(&base);
     }
 
     #[tokio::test]
