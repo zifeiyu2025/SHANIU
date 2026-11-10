@@ -1275,13 +1275,14 @@ describe('适配层的命令面映射', () => {
     dispose()
   })
 
-  it('未接线的命名空间显式抛错并指向核销清单', async () => {
+  it('未接线的命名空间显式抛错，文案可读且不带内部编号', async () => {
     const bridge = scriptedBridge()
     const { remote, dispose } = createAdapter({ bridge })
     // SH-092 之后 workspaceFiles 已接真，未接线样本改取 terminal（宿主没有终端面）。
     const terminal = (faceOf(remote) as unknown as Record<string, Record<string, (() => Promise<unknown>) | undefined>>).terminal
-    await expect(terminal['run']!()).rejects.toThrow(/未接线/)
-    await expect(terminal['run']!()).rejects.toThrow(/SH-040/)
+    await expect(terminal['run']!()).rejects.toThrow(/不支持这个操作/)
+    // 卡号（docs/05 SH-040）只留在代码里：这条消息会原样显示给使用者
+    await expect(terminal['run']!()).rejects.not.toThrow(/SH-\d+/)
     dispose()
   })
 
@@ -1854,9 +1855,10 @@ describe('Plan 芯片与客户端排队', () => {
     expect(bridge.calls.some(call => call.command === 'send_task' && call.args?.['task'] === '先调研再动手')).toBe(true)
     expect(await projectionValuesOf(session, 'agent-new')).toMatchObject({ plan: { active: true } })
 
-    // 运行中：没有注入面（SH-053），报错让草稿留在输入框，不伪造受理
+    // 运行中：没有注入面（SH-053），报错让草稿留在输入框，不伪造受理；
+    // 文案要能直接读（不带卡号），见下方「用户可见错误文案」用例。
     const busy = await face.commands.execute('agent-new', '/plan 再补一条')
-    expect(busy).toMatchObject({ ok: true, value: { result: { kind: 'error', text: expect.stringContaining('SH-053') } } })
+    expect(busy).toMatchObject({ ok: true, value: { result: { kind: 'error', text: expect.stringContaining('暂不能接收这条消息') } } })
     dispose()
   })
 
@@ -3366,7 +3368,7 @@ describe('session.search 接宿主 FTS5 派生索引（SH-113，wire query-only�
     const bridge = scriptedBridge()
     const { remote, dispose } = createAdapter({ bridge })
     const stream = (faceOf(remote).workspaceFiles as unknown as Record<string, (...a: unknown[]) => AsyncGenerator<unknown>>)['changes']!('sess-1', 'a.txt')
-    await expect(stream.next()).rejects.toThrow(/宿主没有文件监视面/)
+    await expect(stream.next()).rejects.toThrow(/当前版本不监视文件变更/)
     dispose()
   })
 })
@@ -3390,6 +3392,46 @@ describe('SH-040 只读空态命名空间（插件 / 自动化任务）', () => 
     const created = await face.schedule!['create']!({})
     expect(created['ok']).toBe(false)
     expect((created['error'] as { code: string }).code).toBe('schedule/unavailable')
+    dispose()
+  })
+})
+
+describe('用户可见错误文案不带内部编号', () => {
+  // 错误消息会被原样渲染到界面（消息卡 / 提示条），SH-0xx 对使用者是看不懂的暗号：
+  // 既没说明发生了什么，也没告诉他能做什么。卡号只允许留在注释与提交信息里。
+  const NO_CARD = /SH-\d+/
+
+  it('未接线的命名空间与成员：文案可读、不含卡号', async () => {
+    const bridge = scriptedBridge()
+    const { remote, dispose } = createAdapter({ bridge })
+    const face = faceOf(remote) as unknown as Record<string, Record<string, (...args: unknown[]) => Promise<never>>>
+
+    const unwired = await face.notWiredYet!.someMethod!().catch((error: Error) => error)
+    expect(unwired).toBeInstanceOf(Error)
+    const unwiredMessage = (unwired as Error).message
+    expect(unwiredMessage).not.toMatch(NO_CARD)
+    // 至少要说清"这个操作现在做不到"，而不是把内部命名空间当成全部信息
+    expect(unwiredMessage).toContain('不支持')
+    expect(unwiredMessage).toContain('notWiredYet.someMethod')
+
+    const state = await face.session!.state!().catch((error: Error) => error)
+    expect((state as Error).message).not.toMatch(NO_CARD)
+    dispose()
+  })
+
+  it('文件变更流不支持时：拒绝文案不含卡号', async () => {
+    const bridge = scriptedBridge()
+    const { remote, dispose } = createAdapter({ bridge })
+    const files = (faceOf(remote) as unknown as Record<string, unknown>)['workspaceFiles'] as Record<
+      string,
+      (...args: unknown[]) => AsyncGenerator<unknown>
+    >
+    const error: Error | null = await files['changes']!('sess-1', 'a.txt')
+      .next()
+      .then(() => null, (reason: Error) => reason)
+    expect(error).toBeInstanceOf(Error)
+    expect((error as Error).message).toBe('当前版本不监视文件变更')
+    expect((error as Error).message).not.toMatch(NO_CARD)
     dispose()
   })
 })

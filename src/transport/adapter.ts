@@ -490,8 +490,15 @@ function newJournal(createdAt: number): Journal {
   }
 }
 
-function unimplemented(name: string, milestone: string): Promise<never> {
-  return Promise.reject(new RemoteError('gateway/internal', `适配层未接线：remote.${name}（见 docs/05 ${milestone}）`, {}))
+/**
+ * 未接线能力的统一拒绝。
+ *
+ * 消息会原样出现在界面上，所以只写用户能读懂的话；卡号（docs/05 SH-033/SH-040…）
+ * 留在调用点注释与提交信息里。带编号的用户文案会被使用者当成"产品里的神秘代码"，
+ * 既不解释发生了什么，也不告诉他能做什么。
+ */
+function unimplemented(name: string): Promise<never> {
+  return Promise.reject(new RemoteError('gateway/internal', `当前版本还不支持这个操作（${name}）`, {}))
 }
 
 export function createAdapter(options: AdapterOptions): { remote: unknown; dispose(): void } {
@@ -2426,12 +2433,13 @@ export function createAdapter(options: AdapterOptions): { remote: unknown; dispo
           }
       }
     },
-    state: () => unimplemented('session.state', 'SH-033'),
-    wait: () => unimplemented('session.wait', 'SH-033'),
-    events: () => unimplemented('session.events', 'SH-033'),
-    observeEvent: () => unimplemented('session.observeEvent', 'SH-094'),
-    observeProjections: () => unimplemented('session.observeProjections', 'SH-094'),
-    observeState: () => unimplemented('session.observeState', 'SH-094'),
+    // 未接线成员（docs/05）：状态/等待/事件 = SH-033，观察面 = SH-094。
+    state: () => unimplemented('session.state'),
+    wait: () => unimplemented('session.wait'),
+    events: () => unimplemented('session.events'),
+    observeEvent: () => unimplemented('session.observeEvent'),
+    observeProjections: () => unimplemented('session.observeProjections'),
+    observeState: () => unimplemented('session.observeState'),
   }
 
   /**
@@ -2908,7 +2916,7 @@ export function createAdapter(options: AdapterOptions): { remote: unknown; dispo
             // 如实报错让草稿留在输入框，用户可以停下任务后重发。
             const result = {
               kind: 'error' as const,
-              text: '已进入计划态，但运行中的会话暂不能接收这条消息（steering 待 SH-053）；停止任务后可直接发送。',
+              text: '已进入计划态，但运行中的会话暂不能接收这条消息；停止任务后可直接发送。',
             }
             pushCommandDone(sessionId, run.commandId, result)
             return OK({ result })
@@ -3302,7 +3310,8 @@ export function createAdapter(options: AdapterOptions): { remote: unknown; dispo
     },
     changes: async function* (_sessionId: string, path: string, _signal?: AbortSignal): AsyncGenerator<never> {
       // 契约要求首帧是 ready；这里没有可声明的监视器，如实带码中断而不是挂一条空流。
-      throw new RemoteError('workspace-file/watch-unsupported' as never, '宿主没有文件监视面（SH-092 未含 watcher）', { path } as never)
+      // 宿主未提供 watcher（docs/05 SH-092 未含），消息不带卡号——它会显示给使用者。
+      throw new RemoteError('workspace-file/watch-unsupported' as never, '当前版本不监视文件变更', { path } as never)
     },
   }
 
@@ -3610,9 +3619,9 @@ export function createAdapter(options: AdapterOptions): { remote: unknown; dispo
       if (typeof prop === 'symbol') return undefined
       const known = namespaces.get(prop)
       if (known !== undefined) return known
-      // 未接线的命名空间显式抛错并指回核销清单，不返回假数据让界面看起来正常。
+      // 未接线的命名空间显式抛错（核销清单见 docs/05 SH-040），不返回假数据让界面看起来正常。
       return new Proxy({}, {
-        get: (_t, method) => () => unimplemented(`${String(prop)}.${String(method)}`, 'SH-040'),
+        get: (_t, method) => () => unimplemented(`${String(prop)}.${String(method)}`),
       })
     },
   })

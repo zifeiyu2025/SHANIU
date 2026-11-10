@@ -1,3 +1,9 @@
+// SHANIU 是 Windows 专属产品：沙箱（受限令牌 / Job Object / deny-ACE）、ConPTY 终端与
+// WebView2 通路都只在这条平台栈上有实现。跨平台分支保留（删掉要逐 diff 摸 sandbox/ 的
+// fail-closed 桩，收益不值），但编译期锁死：在别的平台上"编过去了却跑不对"比直接失败更坏。
+#[cfg(not(windows))]
+compile_error!("SHANIU 只支持 Windows");
+
 // pub 供集成测试（src-tauri/tests/）作为契约面使用
 pub mod agent_loop;
 pub mod app_state;
