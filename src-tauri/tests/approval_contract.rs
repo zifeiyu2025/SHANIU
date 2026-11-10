@@ -62,7 +62,7 @@ impl ModelBackend for ScriptedBackend {
         history: &[HistoryItem],
         _tools: &[ToolDeclaration],
         _instructions: &str,
-    ) -> Result<ModelStream, String> {
+    ) -> Result<ModelStream, shaniu_lib::model_client::ModelError> {
         // 已有工具回填 → 视为完成（避免无限循环）
         let tool_already_ran = history
             .iter()
@@ -93,7 +93,7 @@ impl ModelBackend for MultiCallBackend {
         history: &[HistoryItem],
         _tools: &[ToolDeclaration],
         _instructions: &str,
-    ) -> Result<ModelStream, String> {
+    ) -> Result<ModelStream, shaniu_lib::model_client::ModelError> {
         let tool_already_ran = history
             .iter()
             .any(|h| matches!(h, HistoryItem::FunctionCallOutput { .. }));
@@ -128,7 +128,7 @@ impl ModelBackend for SequentialBackend {
         history: &[HistoryItem],
         _tools: &[ToolDeclaration],
         _instructions: &str,
-    ) -> Result<ModelStream, String> {
+    ) -> Result<ModelStream, shaniu_lib::model_client::ModelError> {
         let outputs = history
             .iter()
             .filter(|h| matches!(h, HistoryItem::FunctionCallOutput { .. }))

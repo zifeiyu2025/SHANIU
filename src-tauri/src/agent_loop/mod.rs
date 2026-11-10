@@ -48,7 +48,7 @@ pub trait ModelBackend: Send + Sync {
         history: &[HistoryItem],
         tools: &[ToolDeclarationShim],
         instructions: &str,
-    ) -> Result<ModelStream, String>;
+    ) -> Result<ModelStream, crate::model_client::ModelError>;
 }
 
 /// 避免 agent_loop 直接耦合 model_client 的声明类型（转发即可，无重复定义）。
@@ -67,7 +67,7 @@ impl ModelBackend for ResponsesBackend {
         history: &[HistoryItem],
         tools: &[ToolDeclarationShim],
         instructions: &str,
-    ) -> Result<ModelStream, String> {
+    ) -> Result<ModelStream, crate::model_client::ModelError> {
         let stream =
             model_client::stream_model(&self.provider, &self.api_key, history, tools, instructions)
                 .await?;
@@ -529,6 +529,9 @@ impl AgentLoop {
         // SH-122：空转检测（连续相同工具 + 相同参数），跨 turn 累计连续计数。
         let mut anomaly = anomaly::AnomalyGuard::new();
         let mut reason = TurnEndReasonLocal::Completed;
+        // 审计 A0：失败结局的结构化原因，随 `TurnCompleted` 一起收口。
+        // 只有模型请求失败才填；落盘/压缩失败仍以 `Error` 事件说明。
+        let mut turn_error: Option<crate::events::TurnErrorInfo> = None;
         let mut last_turn = 0u32;
         // 最近一次端点报回的上下文规模，作为压缩判据的观测侧（SH-032）。
         // 字节估算看不见推理 token 与工具声明开销，只有端点的 input_tokens 是真实值。
@@ -550,6 +553,7 @@ impl AgentLoop {
 
         'outer: for turn in 1..=self.max_turns {
             last_turn = turn;
+            turn_error = None;
             // SH-120：策略快照按 turn 取。运行中切换审批档只影响后续 turn，
             // 不回改正在执行的这一轮——一轮之内裁决依据必须自洽。
             let turn_policy = self.policy.snapshot();
@@ -691,7 +695,8 @@ impl AgentLoop {
                     match opened {
                         Ok(s) => s,
                         Err(e) => {
-                            emit(&sink, EventMsg::Error { message: e });
+                            emit(&sink, EventMsg::Error { message: e.human.clone() });
+                            turn_error = Some((&e).into());
                             reason = TurnEndReasonLocal::Failed;
                             break 'outer;
                         }
@@ -717,11 +722,17 @@ impl AgentLoop {
                         break 'outer;
                     }
                     _ = &mut idle => {
-                        emit(&sink, EventMsg::Error {
-                            message: format!(
-                                "模型流空闲超过 {}s 未收到数据，已中断",
-                                crate::model_client::STREAM_IDLE_TIMEOUT.as_secs()
-                            ),
+                        let message = format!(
+                            "模型流空闲超过 {}s 未收到数据，已中断",
+                            crate::model_client::STREAM_IDLE_TIMEOUT.as_secs()
+                        );
+                        emit(&sink, EventMsg::Error { message: message.clone() });
+                        turn_error = Some(crate::events::TurnErrorInfo {
+                            code: "TIMEOUT".into(),
+                            message: "网络超时".into(),
+                            http_status: None,
+                            provider_code: None,
+                            provider_message: Some(message),
                         });
                         reason = TurnEndReasonLocal::Failed;
                         break 'outer;
@@ -747,8 +758,18 @@ impl AgentLoop {
                         Some(ModelStreamEvent::Completed { usage: u }) => {
                             usage = Some(u);
                         }
-                        Some(ModelStreamEvent::Failed { message }) => {
+                        Some(ModelStreamEvent::Failed { message, error }) => {
                             emit(&sink, EventMsg::Error { message });
+                            turn_error = Some(match error {
+                                Some(error) => (&error).into(),
+                                // 流内失败没有结构化信息时也要留下痕迹：
+                                // 结局不得被前端当成"正常结束"。
+                                None => crate::events::TurnErrorInfo {
+                                    code: "UNKNOWN".into(),
+                                    message: "模型请求失败".into(),
+                                    ..Default::default()
+                                },
+                            });
                             reason = TurnEndReasonLocal::Failed;
                             break 'outer;
                         }
@@ -1172,6 +1193,7 @@ impl AgentLoop {
                 TurnEndReasonLocal::Failed => crate::events::TurnEndReason::Failed,
                 TurnEndReasonLocal::BudgetExhausted => crate::events::TurnEndReason::BudgetExhausted,
             },
+            error: turn_error,
         });
         TurnSummary { turns: last_turn, reason: reason.into() }
     }
@@ -1281,7 +1303,7 @@ mod tests {
             _history: &[HistoryItem],
             _tools: &[ToolDeclaration],
             _instructions: &str,
-        ) -> Result<ModelStream, String> {
+        ) -> Result<ModelStream, crate::model_client::ModelError> {
             let mut q = self.0.lock().unwrap();
             match q.pop_front() {
                 Some(script) if !script.is_empty() => Ok(Box::pin(futures::stream::iter(script))),
@@ -1302,7 +1324,7 @@ mod tests {
             _history: &[HistoryItem],
             _tools: &[ToolDeclaration],
             _instructions: &str,
-        ) -> Result<ModelStream, String> {
+        ) -> Result<ModelStream, crate::model_client::ModelError> {
             futures::future::pending().await
         }
     }
@@ -1710,13 +1732,50 @@ mod tests {
 
     #[tokio::test]
     async fn model_failure_maps_to_failed() {
-        let (agent, store, cancel, _broker) = make_loop(vec![vec![ModelStreamEvent::Failed { message: "boom".into() }]]);
+        let (agent, store, cancel, _broker) = make_loop(vec![vec![ModelStreamEvent::Failed {
+            message: "boom".into(),
+            error: None,
+        }]]);
         let summary = agent.run_task("任务", Arc::new(CapturingSink(store.clone())), cancel).await;
         assert_eq!(summary.reason, TurnEndReason::Failed);
         assert!(store.lock().unwrap().iter().any(|e| matches!(
             e,
             EventMsg::Error { message } if message == "boom"
         )));
+        // 反向对照：撤掉 `turn_error` 的赋值，这条必红——失败回合不得"无原因"。
+        assert!(store.lock().unwrap().iter().any(|e| matches!(
+            e,
+            EventMsg::TurnCompleted { reason: TurnEndReason::Failed, error: Some(info), .. }
+                if info.code == "UNKNOWN"
+        )));
+    }
+
+    /// 审计 A0：401 必须带着分类码与原始 code/message 进入 `TurnCompleted`，
+    /// 否则 UI 只能显示"回合以 failed 结束"、导出也无法对账。
+    #[tokio::test]
+    async fn auth_failure_carries_structured_error() {
+        let (agent, store, cancel, _broker) = make_loop(vec![vec![ModelStreamEvent::Failed {
+            message: "Invalid API key".into(),
+            error: Some(crate::model_client::ModelError::from_status(
+                401,
+                r#"{"error":{"code":"invalid_api_key","message":"Invalid API key"}}"#,
+            )),
+        }]]);
+        let summary = agent.run_task("任务", Arc::new(CapturingSink(store.clone())), cancel).await;
+        assert_eq!(summary.reason, TurnEndReason::Failed);
+        let events = store.lock().unwrap();
+        let info = events
+            .iter()
+            .find_map(|event| match event {
+                EventMsg::TurnCompleted { error: Some(info), .. } => Some(info),
+                _ => None,
+            })
+            .expect("失败回合必须带结构化错误");
+        assert_eq!(info.code, "AUTH");
+        assert_eq!(info.message, "密钥无效");
+        assert_eq!(info.http_status, Some(401));
+        assert_eq!(info.provider_code.as_deref(), Some("invalid_api_key"));
+        assert_eq!(info.provider_message.as_deref(), Some("Invalid API key"));
     }
 
     #[tokio::test]
@@ -1814,7 +1873,7 @@ mod tests {
                 history: &[HistoryItem],
                 _tools: &[ToolDeclaration],
                 _instructions: &str,
-            ) -> Result<ModelStream, String> {
+            ) -> Result<ModelStream, crate::model_client::ModelError> {
                 self.seen.lock().unwrap().push(history.to_vec());
                 let mut queue = self.script.lock().unwrap();
                 match queue.pop_front() {
@@ -2050,7 +2109,7 @@ mod tests {
                 history: &[HistoryItem],
                 _tools: &[ToolDeclaration],
                 _instructions: &str,
-            ) -> Result<ModelStream, String> {
+            ) -> Result<ModelStream, crate::model_client::ModelError> {
                 self.seen.lock().unwrap().push(history.to_vec());
                 let mut queue = self.script.lock().unwrap();
                 match queue.pop_front() {
@@ -2197,7 +2256,7 @@ mod tests {
             history: &[HistoryItem],
             _tools: &[ToolDeclaration],
             instructions: &str,
-        ) -> Result<ModelStream, String> {
+        ) -> Result<ModelStream, crate::model_client::ModelError> {
             self.recorded.lock().unwrap().push((instructions.to_string(), history.to_vec()));
             let next = self.script.lock().unwrap().pop_front().unwrap_or_else(|| {
                 // 无工具调用 → 单轮即完成
@@ -2415,7 +2474,7 @@ mod tests {
                 history: &[HistoryItem],
                 _tools: &[ToolDeclaration],
                 _instructions: &str,
-            ) -> Result<ModelStream, String> {
+            ) -> Result<ModelStream, crate::model_client::ModelError> {
                 self.seen.lock().unwrap().push(history.to_vec());
                 let mut queue = self.script.lock().unwrap();
                 match queue.pop_front() {

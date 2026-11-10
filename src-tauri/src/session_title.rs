@@ -171,7 +171,9 @@ async fn generate_title(
     } else {
         body["max_tokens"] = serde_json::json!(config.max_output_tokens);
     }
-    let mut stream = model_client::stream_body(provider, api_key, body).await?;
+    let mut stream = model_client::stream_body(provider, api_key, body)
+        .await
+        .map_err(|error| error.human)?;
     let mut text = String::new();
     let consumed = tokio::time::timeout(
         std::time::Duration::from_millis(config.timeout_ms),
@@ -179,7 +181,7 @@ async fn generate_title(
             while let Some(event) = stream.next().await {
                 match event {
                     ModelStreamEvent::OutputTextDelta { delta } => text.push_str(&delta),
-                    ModelStreamEvent::Failed { message } => {
+                    ModelStreamEvent::Failed { message, .. } => {
                         return Err(format!("标题流失败: {message}"))
                     }
                     ModelStreamEvent::Completed { .. } => break,

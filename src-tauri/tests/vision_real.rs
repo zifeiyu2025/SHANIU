@@ -99,7 +99,7 @@ async fn view_image_reaches_the_model() {
                     used.output_tokens
                 );
             }
-            ModelStreamEvent::Failed { message } => panic!("端点报错: {message}"),
+            ModelStreamEvent::Failed { message, .. } => panic!("端点报错: {message}"),
             _ => {}
         }
     }

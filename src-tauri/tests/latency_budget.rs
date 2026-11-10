@@ -77,7 +77,7 @@ impl ModelBackend for StubBackend {
         _history: &[HistoryItem],
         _tools: &[ToolDeclarationShim],
         _instructions: &str,
-    ) -> Result<ModelStream, String> {
+    ) -> Result<ModelStream, shaniu_lib::model_client::ModelError> {
         tokio::time::sleep(self.first_byte).await;
         Ok(Box::pin(futures::stream::iter(self.script.clone())))
     }
@@ -301,7 +301,7 @@ async fn cancellation_stops_within_half_second() {
             _history: &[HistoryItem],
             _tools: &[ToolDeclarationShim],
             _instructions: &str,
-        ) -> Result<ModelStream, String> {
+        ) -> Result<ModelStream, shaniu_lib::model_client::ModelError> {
             let items = futures::stream::unfold(0u32, |n| async move {
                 tokio::time::sleep(Duration::from_millis(900)).await;
                 Some((

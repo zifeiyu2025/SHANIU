@@ -20,6 +20,7 @@ interface TurnErrorState {
     readonly time: number
     readonly message: string
     readonly code?: string
+    readonly detail?: string
   }
 }
 
@@ -33,7 +34,7 @@ function lastStep(context: ConversationNodeContext<TurnErrorState>): number {
  * Failure shown for a turn ending: a recorded error, a sign-out cancellation,
  * or a turn that restart recovery closed because the DSH process exited mid-turn.
  */
-function endFailure(reason: TurnEndReason): { readonly message: string; readonly code?: string } | undefined {
+function endFailure(reason: TurnEndReason): { readonly message: string; readonly code?: string; readonly detail?: string } | undefined {
   switch (reason.kind) {
     case 'error':
       return reason.error
@@ -60,6 +61,7 @@ function failureFrom(match: ConversationMatch): TurnErrorState['failure'] | unde
     time: match.event.time,
     message: display.message,
     ...(display.code === undefined ? {} : { code: display.code }),
+    ...(display.detail === undefined ? {} : { detail: display.detail }),
   }
 }
 
@@ -106,6 +108,7 @@ export const turnErrorDefinition: ConversationNodeDefinition<TurnErrorState> = {
       step: lastStep(context),
       message: failure.message,
       ...failure.code === undefined ? {} : { code: failure.code },
+      ...failure.detail === undefined ? {} : { detail: failure.detail },
     }
     return chatNode(context, 'turn-error', node.seq, node, { groupTree: 'turn' })
   },

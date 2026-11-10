@@ -61,7 +61,7 @@ impl ModelBackend for HangingBackend {
         _history: &[HistoryItem],
         _tools: &[ToolDeclarationShim],
         _instructions: &str,
-    ) -> Result<ModelStream, String> {
+    ) -> Result<ModelStream, shaniu_lib::model_client::ModelError> {
         self.live.fetch_add(1, Ordering::SeqCst);
         Ok(Box::pin(HangingStream { _guard: StreamGuard(self.live.clone()) }))
     }

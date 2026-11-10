@@ -592,6 +592,49 @@ describe('适配层把 EventMsg 流映射成 DSH 会话 journal', () => {
     dispose()
   })
 
+  it('失败回合把结构化错误写进 turn/end（401 → AUTH，原始诊断可展开）', async () => {
+    const bridge = scriptedBridge()
+    const { remote, dispose } = createAdapter({ bridge })
+    const session = faceOf(remote).session
+
+    await session.prompt({ sessionId: 'agent-auth', requestId: 'rpc-auth', content: [{ type: 'text', text: '你好' }] })
+    bridge.emit('agent-auth', { type: 'agent_message_delta', delta: '半截' })
+    bridge.emit('agent-auth', {
+      type: 'turn_completed',
+      turn: 1,
+      reason: 'failed',
+      error: {
+        code: 'AUTH',
+        message: '密钥无效',
+        http_status: 401,
+        provider_code: 'invalid_api_key',
+        provider_message: 'Incorrect API key provided',
+      },
+    })
+
+    const iterator = session.follow({ address: { kind: 'session', sessionId: 'agent-auth' } })
+    const snapshot = (await iterator.next()).value as Record<string, unknown>
+    const end = eventsOf(snapshot).find(event => event['type'] === 'turn/end')
+    const reason = (end?.['data'] as {
+      reason: {
+        kind: string
+        error?: { message: string; code: string; detail?: string }
+      }
+    } | undefined)?.reason
+
+    // 反向对照：撤掉 adapter 里的 error 透传，这里会退回 `回合以 failed 结束`（code=failed）而变红。
+    expect(reason?.kind).toBe('error')
+    expect(reason?.error?.code).toBe('AUTH')
+    expect(reason?.error?.message).toBe('密钥无效')
+    // 原始响应对账：UI 的一句话之外，展开区必须能给出 HTTP 状态与端点 code/message。
+    expect(reason?.error?.detail).toContain('HTTP 401')
+    expect(reason?.error?.detail).toContain('code: invalid_api_key')
+    expect(reason?.error?.detail).toContain('Incorrect API key provided')
+
+    await iterator.return?.(undefined)
+    dispose()
+  })
+
   it('助手流帧：revision 从快照基线起逐帧 +1，end 引用真实事件 seq', async () => {
     const bridge = scriptedBridge()
     const { remote, dispose } = createAdapter({ bridge })

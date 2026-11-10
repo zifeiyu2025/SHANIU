@@ -139,6 +139,8 @@ export function emptyAssistantBlock(blockType: string): AssistantBlock {
 export interface DisplayFailure {
   readonly code?: string
   readonly message: string
+  /** Raw sanitized provider diagnostics for the expandable detail block. */
+  readonly detail?: string
 }
 
 /**
@@ -148,14 +150,16 @@ export interface DisplayFailure {
  */
 export function displayFailure(failure: unknown): DisplayFailure {
   if (failure === null || typeof failure !== 'object') return { message: String(failure) }
-  const record = failure as { code?: unknown; message?: unknown }
+  const record = failure as { code?: unknown; message?: unknown; detail?: unknown }
   const code = typeof record.code === 'string' ? record.code : undefined
+  const detail = typeof record.detail === 'string' ? record.detail : undefined
   // Provider AUTH messages may echo a masked or partially preserved credential.
   // Keep the raw diagnostic in the Session log, but never retain it in UI state.
-  if (code === 'AUTH') return { code, message: '' }
+  if (code === 'AUTH') return { code, message: '', ...(detail === undefined ? {} : { detail }) }
   return {
     ...(code === undefined ? {} : { code }),
     message: typeof record.message === 'string' ? record.message : JSON.stringify(failure),
+    ...(detail === undefined ? {} : { detail }),
   }
 }
 

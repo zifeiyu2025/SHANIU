@@ -76,7 +76,7 @@ impl ModelBackend for ScriptedBackend {
         _history: &[HistoryItem],
         _tools: &[ToolDeclarationShim],
         _instructions: &str,
-    ) -> Result<ModelStream, String> {
+    ) -> Result<ModelStream, shaniu_lib::model_client::ModelError> {
         let script = self.0.lock().unwrap().pop_front();
         match script {
             Some(events) if !events.is_empty() => Ok(Box::pin(futures::stream::iter(events))),

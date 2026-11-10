@@ -4,7 +4,10 @@
 //! 不含鉴权存储（provider.rs / config::SecretStore）、不含会话历史管理（agent_loop）。
 //! 取消语义：drop 返回的 Stream 即中断底层连接（agent_loop 的 CancellationToken 据此传播）。
 
+mod error;
 pub mod provider;
+
+pub use error::{ModelError, ModelErrorKind};
 
 use eventsource_stream::{Event, Eventsource};
 use futures::{Stream, StreamExt};
@@ -57,7 +60,12 @@ pub enum ModelStreamEvent {
     ReasoningDelta { delta: String },
     OutputItem(ResponseItem),
     Completed { usage: Usage },
-    Failed { message: String },
+    /// 流内失败。`message` 保留原文（旧消费端/日志），`error` 是分类后的结构化描述，
+    /// 供 UI 展开与导出对账；流内错误拿不到 HTTP 状态，故 `error` 可能缺状态码。
+    Failed {
+        message: String,
+        error: Option<ModelError>,
+    },
 }
 
 /// 会话历史项（agent_loop 持有并回填；只描述模型需要看见的内容）。
@@ -142,6 +150,7 @@ pub fn translate_sse_event(event: &Event) -> Option<ModelStreamEvent> {
                 .and_then(|v| v.as_str())
                 .unwrap_or("response.failed")
                 .to_string(),
+            error: Some(ModelError::from_body(data.pointer("/response/error"))),
         }),
         "error" => Some(ModelStreamEvent::Failed {
             message: data
@@ -149,6 +158,7 @@ pub fn translate_sse_event(event: &Event) -> Option<ModelStreamEvent> {
                 .and_then(|v| v.as_str())
                 .unwrap_or("stream error")
                 .to_string(),
+            error: Some(ModelError::from_body(Some(&data))),
         }),
         _ => None,
     }
@@ -549,6 +559,7 @@ pub fn translate_chat_data(data: &str, acc: &mut ChatStreamAccumulator) -> Vec<M
                 .and_then(|v| v.as_str())
                 .unwrap_or("chat error")
                 .to_string(),
+            error: Some(ModelError::from_body(Some(err))),
         });
     }
     events
@@ -566,7 +577,7 @@ pub async fn stream_model(
     history: &[HistoryItem],
     tools: &[ToolDeclaration],
     instructions: &str,
-) -> Result<ModelStream, String> {
+) -> Result<ModelStream, ModelError> {
     if provider.is_responses() {
         Ok(Box::pin(stream_responses(provider, api_key, history, tools, instructions).await?))
     } else {
@@ -590,7 +601,7 @@ pub async fn stream_chat(
     history: &[HistoryItem],
     tools: &[ToolDeclaration],
     instructions: &str,
-) -> Result<impl Stream<Item = ModelStreamEvent>, String> {
+) -> Result<impl Stream<Item = ModelStreamEvent>, ModelError> {
     stream_body(provider, api_key, build_chat_request(provider, history, tools, instructions)).await
 }
 
@@ -601,7 +612,7 @@ pub async fn stream_responses(
     history: &[HistoryItem],
     tools: &[ToolDeclaration],
     instructions: &str,
-) -> Result<impl Stream<Item = ModelStreamEvent>, String> {
+) -> Result<impl Stream<Item = ModelStreamEvent>, ModelError> {
     stream_body(provider, api_key, build_responses_request(provider, history, tools, instructions)).await
 }
 
@@ -614,7 +625,7 @@ pub async fn stream_body(
     provider: &ProviderConfig,
     api_key: &str,
     body: serde_json::Value,
-) -> Result<ModelStream, String> {
+) -> Result<ModelStream, ModelError> {
     // 审计 H1：`Client::new()` 没有任何时限——端点不响应时请求会永久挂起，
     // 连取消都进不去。三个时限各管一段：建连、每次读取、整请求。
     let client = reqwest::Client::builder()
@@ -622,7 +633,7 @@ pub async fn stream_body(
         .read_timeout(STREAM_IDLE_TIMEOUT)
         .timeout(REQUEST_TIMEOUT)
         .build()
-        .map_err(|e| format!("构造模型 HTTP 客户端失败: {e}"))?;
+        .map_err(|e| ModelError::client_build(format!("构造模型 HTTP 客户端失败: {e}")))?;
     let url = if provider.is_responses() { provider.responses_url() } else { chat_url(provider) };
     // 自定义请求头（SH-097）先放：bearer_auth 后到，authorization 冲突时认证头获胜
     let mut request = client.post(url);
@@ -636,16 +647,31 @@ pub async fn stream_body(
     )
     .await
     .map_err(|_| {
-        format!("模型请求首包超时（{}s 内未收到响应头）", FIRST_BYTE_TIMEOUT.as_secs())
+        ModelError::timeout(format!(
+            "模型请求首包超时（{}s 内未收到响应头）",
+            FIRST_BYTE_TIMEOUT.as_secs()
+        ))
     })?
-    .map_err(|e| format!("模型请求失败: {e}"))?;
+    .map_err(|e| ModelError::from_reqwest(&e))?;
     if !response.status().is_success() {
         let status = response.status();
         let body_text = response.text().await.unwrap_or_default();
         // 端点错误体常回显 request（含 Authorization）或自定义请求头。这里必须**先
         // 脱敏再截断**：先截断会让跨 200 字符边界的密钥只漏出半截，整串匹配不到，
         // 而这段文字会进错误串 → 模型上下文（审计 M9；journal 侧 M6 已堵）。
-        return Err(format!("模型端点返回 {status}: {}", error_snippet(&body_text)));
+        let error = ModelError::from_status(status.as_u16(), &body_text);
+        // 审计 A0：UI / 日志 / 导出三处都要能对上原始响应。这里落一行脱敏后的 warn，
+        // 就是"日志里能查到这个 401"的落点；只输出字段名与脱敏值，不回显密钥。
+        tracing::warn!(
+            target: "model_client",
+            status = status.as_u16(),
+            error_code = error.code(),
+            provider_code = error.provider_code.as_deref().unwrap_or("-"),
+            provider_message = error.provider_message.as_deref().unwrap_or("-"),
+            body = %error_snippet(&body_text),
+            "模型端点返回错误"
+        );
+        return Err(error);
     }
     if provider.is_responses() {
         Ok(Box::pin(response
@@ -653,7 +679,10 @@ pub async fn stream_body(
             .eventsource()
             .map(|res| match res {
                 Ok(event) => translate_sse_event(&event),
-                Err(e) => Some(ModelStreamEvent::Failed { message: format!("SSE 流错误: {e}") }),
+                Err(e) => Some(ModelStreamEvent::Failed {
+                    message: format!("SSE 流错误: {e}"),
+                    error: Some(ModelError::stream_broken(format!("SSE 流错误: {e}"))),
+                }),
             })
             .filter_map(|ev| async move { ev }))) // None = 无法翻译的事件，忽略
     } else {
@@ -663,7 +692,10 @@ pub async fn stream_body(
             .eventsource()
             .map(move |res| match res {
                 Ok(event) => translate_chat_data(&event.data, &mut acc.borrow_mut()),
-                Err(e) => vec![ModelStreamEvent::Failed { message: format!("SSE 流错误: {e}") }],
+                Err(e) => vec![ModelStreamEvent::Failed {
+                    message: format!("SSE 流错误: {e}"),
+                    error: Some(ModelError::stream_broken(format!("SSE 流错误: {e}"))),
+                }],
             })
             .flat_map(futures::stream::iter)))
     }
@@ -1220,6 +1252,6 @@ mod chat_tests {
         let mut acc = ChatStreamAccumulator::default();
         assert!(translate_chat_data("[DONE]", &mut acc).is_empty());
         let evs = translate_chat_data(r#"{"error":{"message":"quota"}}"#, &mut acc);
-        assert!(matches!(evs.last(), Some(ModelStreamEvent::Failed { message }) if message == "quota"));
+        assert!(matches!(evs.last(), Some(ModelStreamEvent::Failed { message, .. }) if message == "quota"));
     }
 }

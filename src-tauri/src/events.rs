@@ -37,6 +37,23 @@ impl TurnEndReason {
     }
 }
 
+/// 回合失败的结构化描述（审计 A0，additive）。
+///
+/// `code` 是稳定分类码（`AUTH` / `QUOTA` / `RATE_LIMIT` / `TIMEOUT` / `NETWORK` /
+/// `SERVER` / `ENDPOINT_UNSUPPORTED` / `BAD_REQUEST` / `UNKNOWN`），前端按它本地化；
+/// `provider_code` / `provider_message` 是端点原始值（已脱敏），用于展开与对账。
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, Default)]
+pub struct TurnErrorInfo {
+    pub code: String,
+    pub message: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub http_status: Option<u16>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub provider_code: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub provider_message: Option<String>,
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum IoChannel {
@@ -150,7 +167,14 @@ impl SubagentExitStatus {
 #[serde(tag = "type", rename_all = "snake_case")]
 pub enum EventMsg {
     TurnStarted { turn: u32 },
-    TurnCompleted { turn: u32, reason: TurnEndReason },
+    TurnCompleted {
+        turn: u32,
+        reason: TurnEndReason,
+        /// 审计 A0：失败回合的结构化错误。additive + optional，旧消费端无感知。
+        /// 有它，UI 才能说"密钥无效"而不是"回合以 failed 结束"，导出才能对账 401。
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        error: Option<TurnErrorInfo>,
+    },
     AgentMessageDelta { delta: String },
     /// additive（FF-2，docs/04 §1.2）：思考模型的推理增量。刻意**不复用**正文 delta——
     /// 混进正文会把"想的过程"当成"答的内容"，前端也无法折叠；业界（codex

@@ -12,6 +12,7 @@
 use serde::Serialize;
 use shaniu_lib::events::{
     AgentEvent, ApprovalDecision, EventMsg, IoChannel, RiskLevel, SubagentExitStatus, ToolCallResult, TurnEndReason,
+    TurnErrorInfo,
 };
 
 /// 与 src/transport/types.ts 的 type 判别值逐一对应。
@@ -38,7 +39,19 @@ const EXPECTED_TAGS: [&str; 17] = [
 fn all_variants() -> Vec<EventMsg> {
     let variants = vec![
         EventMsg::TurnStarted { turn: 1 },
-        EventMsg::TurnCompleted { turn: 1, reason: TurnEndReason::Cancelled },
+        EventMsg::TurnCompleted { turn: 1, reason: TurnEndReason::Cancelled, error: None },
+        // 审计 A0：失败回合的结构化错误（additive）也要进 round-trip 与序列化覆盖
+        EventMsg::TurnCompleted {
+            turn: 2,
+            reason: TurnEndReason::Failed,
+            error: Some(TurnErrorInfo {
+                code: "AUTH".into(),
+                message: "密钥无效".into(),
+                http_status: Some(401),
+                provider_code: Some("invalid_api_key".into()),
+                provider_message: Some("Invalid API key".into()),
+            }),
+        },
         EventMsg::AgentMessageDelta { delta: "你好".into() },
         EventMsg::ReasoningDelta { delta: "先想想".into() },
         EventMsg::ToolCallBegin { call_id: "c1".into(), tool: "unified_exec".into(), args: serde_json::json!({"cmd": "ls"}) },

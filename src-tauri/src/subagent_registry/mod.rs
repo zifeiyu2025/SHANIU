@@ -782,7 +782,7 @@ mod tests {
             _history: &[HistoryItem],
             _tools: &[crate::model_client::ToolDeclaration],
             _instructions: &str,
-        ) -> Result<ModelStream, String> {
+        ) -> Result<ModelStream, crate::model_client::ModelError> {
             let mut queue = self.0.lock().unwrap();
             match queue.pop_front() {
                 Some(script) if !script.is_empty() => Ok(Box::pin(futures::stream::iter(script))),
@@ -1025,7 +1025,7 @@ mod tests {
                 history: &[HistoryItem],
                 tools: &[crate::model_client::ToolDeclaration],
                 instructions: &str,
-            ) -> Result<ModelStream, String> {
+            ) -> Result<ModelStream, crate::model_client::ModelError> {
                 if !self.gated.swap(true, std::sync::atomic::Ordering::SeqCst) {
                     self.started.notify_one();
                     self.gate.notified().await;

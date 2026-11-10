@@ -36,7 +36,7 @@ impl ModelBackend for CountingBackend {
         _history: &[HistoryItem],
         _tools: &[ToolDeclarationShim],
         _instructions: &str,
-    ) -> Result<ModelStream, String> {
+    ) -> Result<ModelStream, shaniu_lib::model_client::ModelError> {
         let call = self.requests.fetch_add(1, Ordering::SeqCst) + 1;
         let events = vec![
             ModelStreamEvent::OutputItem(ResponseItem::FunctionCall {

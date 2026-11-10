@@ -34,7 +34,7 @@ impl ModelBackend for ScriptedBackend {
         _history: &[HistoryItem],
         _tools: &[ToolDeclarationShim],
         _instructions: &str,
-    ) -> Result<ModelStream, String> {
+    ) -> Result<ModelStream, shaniu_lib::model_client::ModelError> {
         let script = self.0.lock().unwrap().pop_front().unwrap_or_default();
         Ok(Box::pin(futures::stream::iter(script)))
     }

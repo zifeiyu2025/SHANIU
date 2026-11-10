@@ -56,7 +56,7 @@ impl ModelBackend for ScriptedBackend {
         history: &[HistoryItem],
         tools: &[ToolDeclarationShim],
         _instructions: &str,
-    ) -> Result<ModelStream, String> {
+    ) -> Result<ModelStream, shaniu_lib::model_client::ModelError> {
         self.seen
             .lock()
             .unwrap()

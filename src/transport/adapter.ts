@@ -36,7 +36,7 @@ import {
   relaySourceOf, settledNoticeOf, timingProjectionOf,
   type SubagentCatalogEntry, type SubagentCatalogEventData, type SubagentTimingState,
 } from './subagent-wire'
-import type { AgentEvent, EventMsg } from './types'
+import type { AgentEvent, EventMsg, TurnErrorInfo } from './types'
 import type { HostBridge } from './tauri'
 
 const OK = <T>(value: T) => ({ ok: true as const, value })
@@ -471,6 +471,19 @@ export interface AdapterOptions {
 }
 
 let journalSerial = 0
+
+/**
+ * 失败回合的原始诊断（供 UI 展开与复制，审计 A0）。
+ * 文案只在展开区出现，不参与"一句人话"的展示；后端已做过脱敏。
+ */
+function errorDetail(info: TurnErrorInfo): string {
+  const lines: string[] = []
+  if (info.http_status !== undefined) lines.push(`HTTP ${info.http_status}`)
+  if (info.provider_code !== undefined) lines.push(`code: ${info.provider_code}`)
+  if (info.provider_message !== undefined) lines.push(info.provider_message)
+  else if (info.message !== '') lines.push(info.message)
+  return lines.join('\n')
+}
 
 function newJournal(createdAt: number): Journal {
   journalSerial += 1
@@ -1656,14 +1669,25 @@ export function createAdapter(options: AdapterOptions): { remote: unknown; dispo
         if (toolName === 'exit_plan_mode' && !failed) setPlanActive(false)
         return
       }
-      case 'turn_completed':
+      case 'turn_completed': {
+        // 审计 A0：失败回合必须带上结构化原因（如 401 → AUTH）。导出的档案里
+        // 由此能看出"为什么失败"；只有后端没给结构时，才退回最后兜底文案。
+        const failure = msg.reason === 'completed'
+          ? undefined
+          : msg.error === undefined
+            ? { message: `回合以 ${msg.reason} 结束`, code: msg.reason }
+            : {
+                message: msg.error.message,
+                code: msg.error.code,
+                detail: errorDetail(msg.error),
+              }
         // cancelled 的半截正文是真实发生过的输出：落进档案，但打 interrupted，
         // 不能当成正常答完。
         closeTask(sessionId, journal, msg.reason === 'completed'
           ? { kind: 'completed' }
           : msg.reason === 'cancelled'
             ? { kind: 'aborted', reason: { kind: 'user' } }
-            : { kind: 'error', error: { message: `回合以 ${msg.reason} 结束`, code: msg.reason } },
+            : { kind: 'error', error: failure },
         msg.reason === 'cancelled')
         if (laneId !== undefined) foldLaneTiming(laneId, 'turn/end', msg.reason)
         // 运行态必须收回：输入卡的 Stop 按钮由 `api-session/status` 决定（`running`
@@ -1672,6 +1696,7 @@ export function createAdapter(options: AdapterOptions): { remote: unknown; dispo
         // 闸随任务协程收口释放（晚于本事件）：排队消息在这里按序补发，对短时拒绝重试。
         void drainQueues()
         return
+      }
       case 'subagent_exited': {
         // 结算通知落**父** journal（上游 createSettlementMessage 的位置）：用户在父会话里
         // 看到"哪个子代理、怎么结束、收尾说了什么"，泳道自身由 turn_completed 收口。

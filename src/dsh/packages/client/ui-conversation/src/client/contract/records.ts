@@ -146,6 +146,11 @@ export interface TurnErrorNode {
    * turn closed after DSH stopped.
    */
   code?: string
+  /**
+   * Raw sanitized provider diagnostics (HTTP status, provider code/message),
+   * shown only in an expandable block. Never used for the one-line summary.
+   */
+  detail?: string
 }
 
 /** Durable notice for a turn ended by the per-request output-token cap. */

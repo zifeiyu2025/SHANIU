@@ -35,7 +35,7 @@ impl ModelBackend for Scripted {
         _history: &[HistoryItem],
         _tools: &[ToolDeclarationShim],
         _instructions: &str,
-    ) -> Result<ModelStream, String> {
+    ) -> Result<ModelStream, shaniu_lib::model_client::ModelError> {
         let mut queue = self.0.lock().unwrap();
         // 脚本用尽后只出文本：保证任何续跑都必然收口，不会把测试挂在无限循环上
         let script = if queue.is_empty() {

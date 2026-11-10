@@ -133,12 +133,31 @@ function TurnErrorItem({ node, t }: {
   node: TurnErrorNode
   t: ChatViewSlotProps['t']
 }) {
+  const [copied, setCopied] = useState(false)
+  const detail = node.detail
   return (
     <div className={css.turnErrorRow} role="status">
       <StateDot state="error" className={css.turnErrorDot} />
       <div className={css.turnErrorCopy}>
         <span className={css.turnErrorTitle}>{node.code === 'ACCOUNT_SIGNED_OUT' || node.code === 'INTERRUPTED' ? t('message.taskStopped') : t('message.turnError')}</span>
         <span className={css.turnErrorMessage}>{failureMessage(node.message, node.code, t)}</span>
+        {detail !== undefined && detail !== '' && (
+          <details className={css.turnErrorDetail}>
+            <summary className={css.turnErrorDetailSummary}>{t('message.turnError.detail')}</summary>
+            <div className={css.turnErrorDetailBody}>
+              <pre className={css.turnErrorDetailText}>{detail}</pre>
+              <button
+                type="button"
+                className={css.turnErrorCopyButton}
+                onClick={() => {
+                  void navigator.clipboard.writeText(detail).then(() => setCopied(true))
+                }}
+              >
+                {copied ? t('message.turnError.copied') : t('message.turnError.copy')}
+              </button>
+            </div>
+          </details>
+        )}
       </div>
       {node.code !== undefined && node.code !== 'INTERRUPTED' && <code className={css.turnErrorCode}>{node.code}</code>}
     </div>

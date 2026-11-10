@@ -7,9 +7,21 @@ export type SubagentExitStatus = 'done' | 'failed' | 'cancelled';
 
 export type JsonValue = null | boolean | number | string | JsonValue[] | { [key: string]: JsonValue };
 
+/**
+ * 回合失败的结构化原因（与 Rust `TurnErrorInfo` 同形，审计 A0）。
+ * `code` 是稳定分类码，`provider_code`/`provider_message` 是端点原始值（已脱敏）。
+ */
+export interface TurnErrorInfo {
+  code: string
+  message: string
+  http_status?: number
+  provider_code?: string
+  provider_message?: string
+}
+
 export type EventMsg =
   | { type: 'turn_started'; turn: number }
-  | { type: 'turn_completed'; turn: number; reason: TurnEndReason }
+  | { type: 'turn_completed'; turn: number; reason: TurnEndReason; error?: TurnErrorInfo }
   | { type: 'agent_message_delta'; delta: string }
   | { type: 'reasoning_delta'; delta: string }
   | { type: 'tool_call_begin'; call_id: string; tool: string; args: JsonValue }
