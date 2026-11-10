@@ -45,6 +45,9 @@ pub struct AppState {
     /// 会话尚未建档时先切的档位（草稿）：贴到 id 上，等首条任务落盘时写进档案。
     /// 进程内、不落盘——这份选择本来就没被持久化过，重启丢掉是诚实的。
     draft_sandbox: Mutex<std::collections::HashMap<String, crate::config::SandboxMode>>,
+    /// 「另存为」票据（审计 H2 批 1）：`export_session_log` 的 `dest` 不再收路径，
+    /// 只收这里签发的随机票据，确保只能写用户本人在原生对话框里选过的位置。
+    pub save_tickets: crate::session_export::SaveTicketStore,
 }
 
 impl AppState {
@@ -75,6 +78,7 @@ impl AppState {
             mcp: Arc::new(crate::mcp_client::runtime::McpRuntime::new(&config_root)),
             probing: Arc::new(crate::capability::Inflight::default()),
             draft_sandbox: Mutex::new(std::collections::HashMap::new()),
+            save_tickets: crate::session_export::SaveTicketStore::new(),
         };
         state.refresh_derived_policy(None);
         state

@@ -1668,29 +1668,84 @@ fn export_probe(
 ///
 /// 与 `pick_folder` 同款：阻塞式选择器只在异步命令里用，主线程保持可渲染。
 /// 用户取消返回 None。
+///
+/// **返回的是票据而不是路径**（审计 H2 批 1）：调用方拿不到也不需要目标路径，
+/// `export_session_log` 只接受这里签发的凭据，因此无法凭任意字符串把文件写到别处。
+/// 取消时一并撤销上一张票据——「上次确认、这次取消」不能落回旧目标。
 #[tauri::command]
 async fn pick_save_file(app: tauri::AppHandle, default_name: String) -> Option<String> {
     use tauri_plugin_dialog::DialogExt;
-    app.dialog()
+    let picked = app
+        .dialog()
         .file()
         .set_title("保存会话日志")
         .set_file_name(&default_name)
         .add_filter("ZIP 压缩包", &["zip"])
         .blocking_save_file()
-        .and_then(|path| path.into_path().ok())
-        .map(|path| path.to_string_lossy().into_owned())
+        .and_then(|path| path.into_path().ok());
+    let state = app.state::<AppState>();
+    match picked {
+        Some(path) => Some(state.save_tickets.issue(path)),
+        None => {
+            state.save_tickets.revoke();
+            None
+        }
+    }
+}
+
+/// 导出条目的附件来源必须落在附件目录内（审计 H2 批 1）。
+///
+/// 复用 `tool_router::resolve_in_workspace` 的同一套比较口径（canonicalize +
+/// `starts_with`），不另写路径判定；越界或不存在都拒绝，由调用方记日志。
+fn validate_export_sources(
+    entries: &[session_export::ExportEntry],
+    attachments_root: &std::path::Path,
+) -> Result<(), String> {
+    for entry in entries {
+        let Some(source) = entry.source_path.as_deref() else {
+            continue;
+        };
+        if let Err(reason) = crate::tool_router::resolve_in_workspace(attachments_root, source) {
+            return Err(format!(
+                "附件路径越界（附件目录之外）: {source}；条目 {}；{reason}",
+                entry.path
+            ));
+        }
+    }
+    Ok(())
 }
 
 /// SH-114 批 2：把条目写成 ZIP。
 ///
 /// 条目内容是"canonical 逻辑会话日志"（上游 `archive.ts` 的原文定义），由前端
 /// `session-events.ts` 那套唯一的事件翻译产出；宿主只负责压缩与路径安全。
+///
+/// **`dest` 是 `pick_save_file` 的返回值（一次性票据），不是路径**（审计 H2 批 1）：
+/// 票据无效/已使用/用户取消后调用，一律拒绝并留日志——没有用户手势就没有写盘目标。
 #[tauri::command]
 fn export_session_log(
+    app: tauri::AppHandle,
     dest: String,
     entries: Vec<session_export::ExportEntry>,
 ) -> Result<session_export::ExportReport, String> {
-    session_export::write_zip(std::path::Path::new(&dest), &entries)
+    let state = app.state::<AppState>();
+    let Some(target) = state.save_tickets.take(&dest) else {
+        tracing::warn!(
+            target: "shaniu::export",
+            "导出目标票据无效或已被使用，拒绝写入"
+        );
+        return Err("保存目标无效或已失效：请重新选择保存位置".to_string());
+    };
+    let attachments_root = state.data_root().join("attachments");
+    if let Err(reason) = validate_export_sources(&entries, &attachments_root) {
+        tracing::warn!(
+            target: "shaniu::export",
+            %reason,
+            "导出被拒绝：附件来源不在附件目录内"
+        );
+        return Err(reason);
+    }
+    session_export::write_zip(&target, &entries)
 }
 
 /// SH-115：`/plan` 命令的宿主面——直接置位/清位**该会话**的 PlanState。
@@ -2562,5 +2617,65 @@ mod session_projection_tests {
             serde_json::Value::String("full_access".into())
         )
         .is_err());
+    }
+}
+
+/// 导出路径收紧的用例（审计 H2 批 1）。
+#[cfg(test)]
+mod export_scope_tests {
+    use super::validate_export_sources;
+    use crate::session_export::{write_zip, ExportEntry};
+
+    fn source_entry(source: &std::path::Path, logical: &str) -> ExportEntry {
+        ExportEntry {
+            path: logical.to_string(),
+            content: None,
+            source_path: Some(source.to_string_lossy().into_owned()),
+        }
+    }
+
+    #[test]
+    fn attachment_sources_must_stay_inside_the_attachments_root() {
+        let dir = crate::test_support::TestTempDir::new("export-scope");
+        let attachments = dir.join("attachments");
+        std::fs::create_dir_all(attachments.join("sess-1")).unwrap();
+        let inside = attachments.join("sess-1").join("a.bin");
+        std::fs::write(&inside, b"payload").unwrap();
+        assert!(
+            validate_export_sources(&[source_entry(&inside, "media/a.bin")], &attachments).is_ok(),
+            "附件目录内的来源应放行"
+        );
+
+        // 目录外：文件存在，但不在附件根之下。
+        let outside = dir.join("outside.bin");
+        std::fs::write(&outside, b"payload").unwrap();
+        let err = validate_export_sources(&[source_entry(&outside, "media/outside.bin")], &attachments)
+            .unwrap_err();
+        assert!(err.contains("附件路径越界"), "错误须点名越界: {err}");
+
+        // 反向对照：拒绝来自本函数而非底层 I/O——改前命令直接调 write_zip，
+        // 同一个工作区外目标会被真的写出去（这里证明底层不设位置限制）。
+        let dest = dir.join("outside.zip");
+        let report = write_zip(
+            &dest,
+            &[ExportEntry {
+                path: "session.v4.jsonl".into(),
+                content: Some("x".into()),
+                source_path: None,
+            }],
+        )
+        .expect("底层写盘本身不做位置校验");
+        assert!(std::path::Path::new(&report.path).is_file());
+    }
+
+    #[test]
+    fn missing_attachment_source_is_rejected() {
+        let dir = crate::test_support::TestTempDir::new("export-missing");
+        let attachments = dir.join("attachments");
+        std::fs::create_dir_all(&attachments).unwrap();
+        let missing = dir.join("nope.bin");
+        let err = validate_export_sources(&[source_entry(&missing, "media/x.bin")], &attachments)
+            .unwrap_err();
+        assert!(err.contains("附件路径越界"), "不存在的来源同样拒绝: {err}");
     }
 }

@@ -15,8 +15,54 @@ use serde::{Deserialize, Serialize};
 use std::fs::{self, File};
 use std::io::{BufWriter, Write};
 use std::path::{Path, PathBuf};
+use std::sync::Mutex;
 use zip::write::SimpleFileOptions;
 use zip::{CompressionMethod, ZipWriter};
+
+/// 一次「另存为」的凭据（审计 H2 批 1）。
+///
+/// **为什么 `dest` 不再是路径**：IPC 参数里的任何字符串都能由调用方随手拼出来，
+/// 把目标换成宿主进程内存里的随机票据后，`export_session_log` 只能写「用户本人
+/// 在原生对话框里选过、且尚未被消费」的那一个位置。票据不可由路径反推——它只
+/// 活在宿主内存，不落盘、不回显，伪造要猜中 ULID 的随机位。
+///
+/// **取消即撤销**：用户点取消时清空待用票据，避免「上次确认过、这次取消」却仍
+/// 写进上一次的目标。
+///
+/// **一次性**：`take` 取出即清空，同一张票据重复调用必然失败；重新导出必须重新
+/// 弹框（即重新获得一次用户手势）。
+#[derive(Default)]
+pub struct SaveTicketStore {
+    pending: Mutex<Option<(String, PathBuf)>>,
+}
+
+impl SaveTicketStore {
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    /// 签发一张新票据并替换旧票据（同一时刻只有一个待用目标）。
+    pub fn issue(&self, dest: PathBuf) -> String {
+        let token = format!("save-{}", ulid::Ulid::generate());
+        *self.pending.lock().unwrap_or_else(|e| e.into_inner()) = Some((token.clone(), dest));
+        token
+    }
+
+    /// 用户取消选择：撤销待用票据。
+    pub fn revoke(&self) {
+        *self.pending.lock().unwrap_or_else(|e| e.into_inner()) = None;
+    }
+
+    /// 消费票据：命中即取出并清空；伪造或重复使用一律返回 None。
+    pub fn take(&self, token: &str) -> Option<PathBuf> {
+        let mut guard = self.pending.lock().unwrap_or_else(|e| e.into_inner());
+        let hit = guard.as_ref().is_some_and(|(known, _)| known == token);
+        if !hit {
+            return None;
+        }
+        guard.take().map(|(_, dest)| dest)
+    }
+}
 
 /// 上游 `archive.ts` 的 `DEFAULT_SESSION_LOG_COMPRESSION_LEVEL`。
 pub const COMPRESSION_LEVEL: i64 = 6;

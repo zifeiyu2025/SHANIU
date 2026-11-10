@@ -165,3 +165,36 @@ fn destination_failure_does_not_leave_partial_file() {
     assert!(err.contains("临时文件"), "错误应指出来源: {err}");
     assert!(!dir.join("missing-subdir").exists());
 }
+
+#[test]
+fn save_ticket_is_single_use_and_cannot_be_forged() {
+    let store = SaveTicketStore::new();
+    let dir = temp_dir("ticket");
+    let dest = dir.join("session.v4.zip");
+    let token = store.issue(dest.clone());
+    assert!(token.starts_with("save-"), "票据应带可识别前缀: {token}");
+    assert_eq!(store.take(&token), Some(dest.clone()), "首次消费命中目标");
+    assert_eq!(store.take(&token), None, "同一张票据不能消费两次");
+    // 反向对照：路径字符串本身不是票据——改前 `dest` 就是任意路径。
+    assert_eq!(store.take(&dest.to_string_lossy()), None);
+    assert_eq!(store.take("save-00000000000000000000000000"), None, "伪造/过期票据一律不命中");
+}
+
+#[test]
+fn cancelling_the_picker_revokes_the_previous_ticket() {
+    let store = SaveTicketStore::new();
+    let dir = temp_dir("cancel");
+    let old = store.issue(dir.join("old.zip"));
+    store.revoke();
+    assert_eq!(store.take(&old), None, "取消选择后旧票据必须立即失效");
+}
+
+#[test]
+fn a_new_pick_invalidates_the_previous_ticket() {
+    let store = SaveTicketStore::new();
+    let dir = temp_dir("repick");
+    let old = store.issue(dir.join("old.zip"));
+    let new = store.issue(dir.join("new.zip"));
+    assert_eq!(store.take(&old), None, "重新选择后旧票据失效");
+    assert!(store.take(&new).is_some(), "最新票据仍可消费");
+}
