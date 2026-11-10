@@ -175,6 +175,11 @@ export async function bootShaniu(container: HTMLElement, options: BootOptions = 
   const realData = usingTauriBackend() && !MOCK_IN_DESKTOP
   /** 桌面适配层：卸载会话时要一起拆掉事件订阅。 */
   let adapter: { remote: unknown; dispose(): void } | undefined
+  /**
+   * 全局补丁的还原器（仅桌面态）。这些 install* 直接改 `globalThis`，
+   * 不属于 cordis 上下文，`fiber.dispose()` 不会碰它们——必须由 dispose 显式逆序撤回。
+   */
+  const restoreGlobals: (() => void)[] = []
 
   // 模型设置页的公开引导开关：SHANIU 没有 DeepSeek 云端账号，
   // 关掉自动弹出的官方登录引导（该 payload 就是上游为此留的接入口）。
@@ -189,13 +194,16 @@ export async function bootShaniu(container: HTMLElement, options: BootOptions = 
   if (realData) {
     // 原始文件动作的桌面适配面（SH-092 批 2）：上游 ui-file-actions 从这里取
     // `dshDesktop.fileActions`；保存目标只由命令内部的原生对话框产生。
-    installDesktopFileActions(tauriBridge())
-    // open-in-app 的三条 Host HTTP 路由（SH-092 批 3）接到 Tauri 命令；vendored
-    // ui-open-in-app 只经全局 fetch 访问相对路径，源码无需改动。
-    installOpenInAppRoutes(tauriBridge())
-    // 附件上传（SH-116 批 1）：file-upload 的 fetch 钩子接到 `upload_attachment`。
-    // 必须在 fileUpload 插件构造前注入（本分支早于 features 挂载）。
-    installAttachmentUploadFetch()
+    // 三个 install* 都改 globalThis，返回值是还原器——全部收好，dispose 逆序撤回。
+    restoreGlobals.push(
+      installDesktopFileActions(tauriBridge()),
+      // open-in-app 的三条 Host HTTP 路由（SH-092 批 3）接到 Tauri 命令；vendored
+      // ui-open-in-app 只经全局 fetch 访问相对路径，源码无需改动。
+      installOpenInAppRoutes(tauriBridge()),
+      // 附件上传（SH-116 批 1）：file-upload 的 fetch 钩子接到 `upload_attachment`。
+      // 必须在 fileUpload 插件构造前注入（本分支早于 features 挂载）。
+      installAttachmentUploadFetch(),
+    )
     // 默认工作区基线必须在挂载前写入；家目录给 connection 基线缩写路径用
     options.onStage?.('准备工作区')
     const { homeDir } = await applyProductWorkspacePath()
@@ -382,6 +390,11 @@ export async function bootShaniu(container: HTMLElement, options: BootOptions = 
     async dispose() {
       unmount()
       adapter?.dispose()
+      // 逆序还原全局补丁：后装的先撤，与安装顺序严格对称。不还原的代价：
+      // `globalThis.fetch` 被永久包裹，同一进程里重复 boot 会层层套娃，
+      // dispose 之后再 boot 的路径全部穿过上一次的闭包。
+      // splice(0) 同时清空，重复 dispose 不会二次调用还原器。
+      for (const restore of restoreGlobals.splice(0).reverse()) restore()
       await root.fiber.dispose()
     },
   }

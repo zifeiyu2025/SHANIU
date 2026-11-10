@@ -135,13 +135,22 @@ export async function handleAttachmentUpload(
   }
 }
 
-/** 在 file-upload 插件构造前注入 fetch 钩子（桌面真实数据源路径调用）。 */
-export function installAttachmentUploadFetch(): void {
+/**
+ * 在 file-upload 插件构造前注入 fetch 钩子（桌面真实数据源路径调用）。
+ * @returns 还原器：撤回钩子并恢复安装前的全局值（boot 的 dispose 必须调用它）。
+ */
+export function installAttachmentUploadFetch(): () => void {
   const invoke: Invoke = async (command, args) => {
     const { invoke: tauriInvoke } = await import('@tauri-apps/api/core')
     return await tauriInvoke(command, args)
   }
-  ;(globalThis as Record<string, unknown>).__DSH_FILE_UPLOAD__ = {
+  const host = globalThis as { __DSH_FILE_UPLOAD__?: unknown }
+  const previous = host.__DSH_FILE_UPLOAD__
+  host.__DSH_FILE_UPLOAD__ = {
     fetch: (input: string | URL, init: RequestInit) => handleAttachmentUpload(invoke, input, init),
+  }
+  return () => {
+    if (previous === undefined) delete host.__DSH_FILE_UPLOAD__
+    else host.__DSH_FILE_UPLOAD__ = previous
   }
 }
