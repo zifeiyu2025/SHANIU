@@ -6,7 +6,7 @@
  * 尚未接线的能力一律经 stubs.ts 显式 stub，不做隐式降级。
  */
 import { Context, Logger } from '@deepseek-ai/cordis'
-import type { Exporter, FiberState } from '@deepseek-ai/cordis'
+import type { Exporter, Fiber, FiberState } from '@deepseek-ai/cordis'
 import { apply as rendererApply } from '@deepseek-ai/dsh-client-ui-renderer/client'
 import { apply as themeApply, inject as themeInject } from '@deepseek-ai/dsh-client-ui-theme/client'
 import { apply as layoutApply, inject as layoutInject } from '@deepseek-ai/dsh-client-ui-layout/client'
@@ -127,28 +127,70 @@ async function applyProductWorkspacePath(): Promise<{ homeDir: string }> {
  */
 const MOCK_IN_DESKTOP = false
 
-/** cordis `FiberState.FAILED`：const enum 在 isolatedModules 下不能按值导入，故取序号并锁定类型。 */
+/** cordis `FiberState` 序号：const enum 在 isolatedModules 下不能按值导入，故取序号并锁定类型。 */
+const FIBER_STATE_ACTIVE: FiberState = 2
 const FIBER_STATE_FAILED: FiberState = 3
+const FIBER_STATE_DISPOSED: FiberState = 4
+
+/** fiber → 可读标签（cordis 会把 `apply` 回调名丢掉，只剩 root，所以用 boot 记下的标签）。 */
+function fiberLabel(labels: ReadonlyMap<number, string>, fiber: Fiber): string {
+  return (fiber.uid === null ? undefined : labels.get(fiber.uid)) ?? `${fiber.name}#${String(fiber.uid)}`
+}
+
+/** FAILED fiber 的失败原因：cordis 没有公开 getter，只存在私有字段里（fiber.ts:208）。 */
+function fiberError(fiber: Fiber): string {
+  const error = (fiber as unknown as { _error?: unknown })._error
+  return error instanceof Error ? error.message : String(error)
+}
 
 /**
- * 装载失败上报：cordis 对 `apply` 抛异常只把 fiber 标 FAILED 并卸载，不向用户报错，
- * 结果是一整块功能静默消失（2026-11-10：重复快捷键让会话头按钮与三项菜单全没了，
- * 打包产物与 0.2.0 都复现，却没有任何日志线索）。boot 收尾统一扫 registry，
- * 把失败项与原因写进宿主日志。
- * @param ctx - 客户端根上下文。
- * @param labels - boot 装载时记下的 feature 标签（cordis 会把名为 `apply` 的回调名丢掉，只剩 root）。
+ * 插件装载失败上报：订阅 `internal/status` 事件，不再用 boot 收尾快照。
+ *
+ * 为什么不是快照：`apply` 里 `await` 之后才抛的异常，落成 FAILED 的时机晚于任何
+ * 「等两个宏任务再扫一遍」；boot 之后才失败的也永远扫不到。cordis 每次状态变更都会
+ * `emit('internal/status')`（fiber.ts:592），而 `_reload` 的 catch 先写 `_error` 再更新状态
+ * （fiber.ts:693-708），所以订阅事件能拿到全部失败，且不需要猜等待时长。
+ *
+ * @param isDisposing - 拆卸窗口抑制。vendored cordis 的 `_unload` 自己 catch 了 disposer 抛错，
+ *   只写日志、不置 FAILED（fiber.ts:720-730）；但拆卸期间仍在跑的 reload 若 apply 抛错则会置
+ *   FAILED——那不是装载失败。把退出期的这类失败报成「插件装载失败」会训练人忽略这条线，
+ *   假红比没红更坏（AGENTS §4.2）。
  */
-function reportFailedPlugins(ctx: Context, labels: ReadonlyMap<number, string>): void {
+export function watchPluginFailures(
+  ctx: Context,
+  labels: ReadonlyMap<number, string>,
+  isDisposing: () => boolean,
+): void {
+  ctx.on('internal/status', (fiber) => {
+    if (fiber.state !== FIBER_STATE_FAILED) return
+    if (isDisposing()) return
+    ctx.logger.error('[SHANIU] 插件装载失败 · %s：%s', fiberLabel(labels, fiber), fiberError(fiber))
+  })
+}
+
+/**
+ * 开发态排查辅助：打印一次 boot 完成时仍未 ACTIVE 的插件，附上缺的 inject 服务名。
+ *
+ * 这不是错误上报——PENDING 是合法的等待态（插件在等依赖）。这里只给排查的人一张
+ * 清单，措辞不叫失败；生产分支不调用（调用点由 `import.meta.env.DEV` 静态裁剪）。
+ */
+export function dumpPendingPlugins(ctx: Context, labels: ReadonlyMap<number, string>): void {
+  const rows: string[] = []
   for (const runtime of ctx.registry.values()) {
     for (const fiber of runtime.fibers) {
-      if (fiber.state !== FIBER_STATE_FAILED) continue
-      // cordis 没有公开的 error getter；FAILED fiber 的原因只存在私有字段里（fiber.ts:208）。
-      const error = (fiber as unknown as { _error?: unknown })._error
-      const label = (fiber.uid === null ? undefined : labels.get(fiber.uid)) ?? `${fiber.name}#${String(fiber.uid)}`
-      ctx.logger.error('[SHANIU] 插件装载失败 · %s：%s', label,
-        error instanceof Error ? error.message : String(error))
+      if (fiber.state === FIBER_STATE_ACTIVE || fiber.state === FIBER_STATE_DISPOSED) continue
+      // 只比「声明要注入的名字」与「此刻注册表里真有的服务」；optional 注入不参与，
+      // 它们不阻塞 ACTIVE，不会有对应 fiber。
+      const missing = Object.keys(fiber.inject ?? {})
+        .filter(name => ctx.reflect.get(name, false) === undefined)
+      rows.push(
+        `${fiberLabel(labels, fiber)} state=${fiber.state}` +
+        (missing.length === 0 ? '' : ` 缺注入=[${missing.join(', ')}]`),
+      )
     }
   }
+  if (rows.length === 0) return
+  console.info('[SHANIU][dev] boot 完成时仍未 ACTIVE 的插件（排查用，不代表失败）:\n%s', rows.join('\n'))
 }
 
 /** 启动阶段回调：只上报真实存在的阶段（启动页据此显示，见 src/host/boot-progress.ts）。 */
@@ -180,6 +222,12 @@ export async function bootShaniu(container: HTMLElement, options: BootOptions = 
    * 不属于 cordis 上下文，`fiber.dispose()` 不会碰它们——必须由 dispose 显式逆序撤回。
    */
   const restoreGlobals: (() => void)[] = []
+  /** 装载失败上报用的标签表：feature 装载时按 uid 登记（cordis 不保留 apply 名）。 */
+  const bootLabels = new Map<number, string>()
+  /** 拆卸窗口标志：抑制「退出期仍在跑的 reload 失败」被记成插件装载失败（见 watchPluginFailures）。 */
+  let disposing = false
+  // 必须在装载任何插件之前订阅：晚于第一个 fiber 就会漏掉它的装载期失败。
+  watchPluginFailures(root, bootLabels, () => disposing)
 
   // 模型设置页的公开引导开关：SHANIU 没有 DeepSeek 云端账号，
   // 关掉自动弹出的官方登录引导（该 payload 就是上游为此留的接入口）。
@@ -351,8 +399,7 @@ export async function bootShaniu(container: HTMLElement, options: BootOptions = 
     { inject: uiPluginManagerInject, apply: uiPluginManagerApply },
     { inject: uiScheduleInject, apply: uiScheduleApply },
   ]
-  /** 装载失败项：cordis 只把 fiber 标 FAILED 并卸载，不向用户报错（见 reportFailedPlugins）。 */
-  const bootLabels = new Map<number, string>()
+  /** 装载失败项按 fiber uid 关联到这里；上报本身由 boot 早期订阅的事件完成。 */
   for (const [index, feature] of features.entries()) {
     // 真实进度：已装载数量 / 总数（不编造比例，见 boot-progress.ts 的约束）
     options.onStage?.(`装载界面插件 ${index + 1}/${features.length}`)
@@ -369,25 +416,32 @@ export async function bootShaniu(container: HTMLElement, options: BootOptions = 
 
   // 挂载：等价 DSH mountClient —— 等 uiRenderer 就位后 mount
 
-  // 先冲刷微任务：部分 Service 经 ctx.plugin(Class, config) 异步实例化（fiber 微任务），
+  // 首帧后再跑一轮微任务：部分 Service 经 ctx.plugin(Class, config) 异步实例化（fiber 微任务），
   // 同步挂载会在首次渲染时读到未就位的服务（conversation 等）并让槽位边界卡死。
+  // 注意这里不再扫描装载失败——失败由 watchPluginFailures 在发生的那一刻上报，
+  // 快照只能看到此刻已经 FAILED 的，await 之后才抛的会漏。
   await new Promise<void>(resolve => setTimeout(resolve, 0))
   await Promise.resolve()
-
-  reportFailedPlugins(root, bootLabels)
 
   const uiRenderer = root.get('uiRenderer')
   if (uiRenderer === undefined) throw new Error('dsh-boot: uiRenderer 服务未就位')
   options.onStage?.('渲染界面')
   const unmount = options.mount === false ? () => {} : uiRenderer.mount(container)
   // 开发期诊断：真机排查槽位/视图注册（例如"会话头 More 不出现"）时读根 Context。
+  let devDumpTimer: ReturnType<typeof setTimeout> | undefined
   if (import.meta.env.DEV) {
     ;(globalThis as Record<string, unknown>).__SHANIU_BOOT_CTX__ = root
+    // 固定时刻再列一次仍未 ACTIVE 的插件：此刻还没就位的多是在等依赖或装载较慢，
+    // 清单只做排查参考，不判定失败。生产分支不执行（上面的 DEV 静态裁剪）。
+    devDumpTimer = setTimeout(() => { dumpPendingPlugins(root, bootLabels) }, 3000)
   }
 
   return {
     ctx: root,
     async dispose() {
+      // 先立标志再拆：disposer 抛错会被 cordis 记成 FAILED，那不是装载失败。
+      disposing = true
+      if (devDumpTimer !== undefined) clearTimeout(devDumpTimer)
       unmount()
       adapter?.dispose()
       // 逆序还原全局补丁：后装的先撤，与安装顺序严格对称。不还原的代价：
