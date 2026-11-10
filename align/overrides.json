@@ -1,0 +1,365 @@
+{
+  "$comment": [
+    "人工记录表：`scripts/align-report.mjs` 只读这里，绝不自己编 reason/guard。",
+    "键 = packages/client 下的相对路径；以 / 结尾表示目录前缀（对整棵子树生效）。",
+    "status 可选，用于把机械判定改成有意的分类（例：整包未 vendor 的 missing 应记为 not-applicable）。",
+    "没有条目的不一致文件，账本会打 review=needs-review 待办标记。",
+    "路径必须用 POSIX 分隔符。"
+  ],
+  "entries": {
+    "AGENTS.md": {
+      "status": "not-applicable",
+      "reason": "上游 packages/client 顶层文档，不随 vendor 引入",
+      "guard": "无需同步"
+    },
+    "README.md": {
+      "status": "not-applicable",
+      "reason": "上游 packages/client 顶层文档，不随 vendor 引入",
+      "guard": "无需同步"
+    },
+    "README.zh.md": {
+      "status": "not-applicable",
+      "reason": "上游 packages/client 顶层文档，不随 vendor 引入",
+      "guard": "无需同步"
+    },
+    "README.i18n.yaml": {
+      "status": "not-applicable",
+      "reason": "上游 packages/client 顶层文档，不随 vendor 引入",
+      "guard": "无需同步"
+    },
+    "tsdown.client.ts": {
+      "status": "not-applicable",
+      "reason": "上游 client 包群构建入口；本项目走 Vite 自有构建链",
+      "guard": "无需同步"
+    },
+    "hmr/": {
+      "status": "not-applicable",
+      "reason": "整包未 vendor（本项目未接线该能力）",
+      "guard": "接入该能力时整包 vendor，并按 docs/07 登记改动"
+    },
+    "ui-agent-preset/": {
+      "status": "not-applicable",
+      "reason": "整包未 vendor（本项目未接线该能力）",
+      "guard": "接入该能力时整包 vendor，并按 docs/07 登记改动"
+    },
+    "ui-agent-team/": {
+      "status": "not-applicable",
+      "reason": "整包未 vendor（本项目未接线该能力）",
+      "guard": "接入该能力时整包 vendor，并按 docs/07 登记改动"
+    },
+    "ui-brand-official/": {
+      "status": "not-applicable",
+      "reason": "整包未 vendor（本项目未接线该能力）",
+      "guard": "接入该能力时整包 vendor，并按 docs/07 登记改动"
+    },
+    "ui-message-feedback/": {
+      "status": "not-applicable",
+      "reason": "整包未 vendor（本项目未接线该能力）",
+      "guard": "接入该能力时整包 vendor，并按 docs/07 登记改动"
+    },
+    "ui-plugin-market/": {
+      "status": "not-applicable",
+      "reason": "整包未 vendor（本项目未接线该能力）",
+      "guard": "接入该能力时整包 vendor，并按 docs/07 登记改动"
+    },
+    "ui-settings-account/": {
+      "status": "not-applicable",
+      "reason": "整包未 vendor（设置只留通用 + 模型，见 docs/07 #19）",
+      "guard": "接入该能力时整包 vendor，并按 docs/07 登记改动"
+    },
+    "ui-settings-agent-loop/": {
+      "status": "not-applicable",
+      "reason": "整包未 vendor（设置只留通用 + 模型，见 docs/07 #19）",
+      "guard": "接入该能力时整包 vendor，并按 docs/07 登记改动"
+    },
+    "ui-settings-plugin-inventory/": {
+      "status": "not-applicable",
+      "reason": "整包未 vendor（设置只留通用 + 模型，见 docs/07 #19）",
+      "guard": "接入该能力时整包 vendor，并按 docs/07 登记改动"
+    },
+    "ui-settings-plugins/": {
+      "status": "not-applicable",
+      "reason": "整包未 vendor（设置只留通用 + 模型，见 docs/07 #19）",
+      "guard": "接入该能力时整包 vendor，并按 docs/07 登记改动"
+    },
+    "ui-settings-session-log/": {
+      "status": "not-applicable",
+      "reason": "整包未 vendor（设置只留通用 + 模型，见 docs/07 #19）",
+      "guard": "接入该能力时整包 vendor，并按 docs/07 登记改动"
+    },
+    "ui-settings-shell/": {
+      "status": "not-applicable",
+      "reason": "整包未 vendor（设置只留通用 + 模型，见 docs/07 #19）",
+      "guard": "接入该能力时整包 vendor，并按 docs/07 登记改动"
+    },
+    "ui-settings-subagent/": {
+      "status": "not-applicable",
+      "reason": "整包未 vendor（设置只留通用 + 模型，见 docs/07 #19）",
+      "guard": "接入该能力时整包 vendor，并按 docs/07 登记改动"
+    },
+    "ui-settings-web-search/": {
+      "status": "not-applicable",
+      "reason": "整包未 vendor（设置只留通用 + 模型，见 docs/07 #19）",
+      "guard": "接入该能力时整包 vendor，并按 docs/07 登记改动"
+    },
+    "ui-shortcuts/": {
+      "status": "not-applicable",
+      "reason": "整包未 vendor（本项目未接线该能力）",
+      "guard": "接入该能力时整包 vendor，并按 docs/07 登记改动"
+    },
+    "ui-entry-customization/tests/": {
+      "status": "not-applicable",
+      "reason": "上游测试不随包 vendor；本项目用例另写",
+      "guard": "同步上游时对照上游用例核对行为差异，必要时补本地用例"
+    },
+    "ui-permission-presets/tests/": {
+      "status": "not-applicable",
+      "reason": "上游测试不随包 vendor；本项目用例另写",
+      "guard": "同步上游时对照上游用例核对行为差异，必要时补本地用例"
+    },
+    "ui-sidebar-terminal/tests/": {
+      "status": "not-applicable",
+      "reason": "上游测试不随包 vendor；本项目用例另写",
+      "guard": "同步上游时对照上游用例核对行为差异，必要时补本地用例"
+    },
+    "ui-sidebar-terminal/tsdown.config.ts": {
+      "status": "not-applicable",
+      "reason": "包构建入口不进本项目构建链",
+      "guard": "无需同步"
+    },
+    "ui-sidebar-terminal/src/client/model.ts": {
+      "status": "not-applicable",
+      "reason": "本地新增（约 146 行）：控制器包依赖宿主 PTY 未 vendor，自实现同一契约",
+      "guard": "上游若提供 browser-safe 控制器包，删本地实现改导入上游"
+    },
+    "ui-workspace/src/client/rows/treeKeyboard.ts": {
+      "status": "not-applicable",
+      "reason": "本地新增：ARIA 树键盘模型（上游只有鼠标展开/收起，见 docs/07 #5）",
+      "guard": "上游若自带键盘模型，删本地实现改跟上游"
+    },
+    "ui-sidebar-terminal/src/client/face.ts": {
+      "reason": "上游依赖未 vendor 的 dsh-api-terminal-controller，导入改指向本地 ./model.ts（docs/07 #3）",
+      "guard": "上游若提供 browser-safe 控制器契约，改回上游导入并删 model.ts"
+    },
+    "ui-sidebar-terminal/src/client/index.ts": {
+      "reason": "同 face.ts 改本地导入；target() 收窄为只接受终端形状参数（docs/07 #3）",
+      "guard": "同上；上游若已把参数收窄，删本地改动"
+    },
+    "ui-sidebar-terminal/src/client/terminal.tsx": {
+      "reason": "终端会话实现改走本地 ./model.ts 契约（docs/07 #3）",
+      "guard": "同 face.ts"
+    },
+    "ui-sidebar-terminal/src/client/TerminalCleanup.tsx": {
+      "reason": "终端清理面板改走本地 ./model.ts 契约（docs/07 #3）",
+      "guard": "同 face.ts"
+    },
+    "ui-sidebar-terminal/src/client/TerminalGuide.tsx": {
+      "reason": "终端引导面板改走本地 ./model.ts 契约（docs/07 #3）",
+      "guard": "同 face.ts"
+    },
+    "ui-sidebar-terminal/src/client/terminal.module.css": {
+      "reason": "上游包间令牌漂移：ui-theme 已改 bg-layer-*，本包仍引用 bg-l1/-2 导致面板透明（docs/07 #4）",
+      "guard": "同步上游时先看 terminal 是否已改用 bg-layer-*，已改则删本地补丁；src/theme-tokens.spec.ts 机检兜底"
+    },
+    "ui-sidebar-terminal/src/client/TerminalCleanup.module.css": {
+      "reason": "同上，bg-l2 → bg-layer-2（docs/07 #4）",
+      "guard": "同上"
+    },
+    "ui-sidebar-terminal/src/client/TerminalTitle.module.css": {
+      "reason": "同上，bg-l1 → bg-layer-1（docs/07 #4）",
+      "guard": "同上"
+    },
+    "ui-primitives/src/AnimatedRows.tsx": {
+      "reason": "修复 Windows UIA Expand 触发的渲染进程卡死（docs/07 #5）",
+      "guard": "上游若修复动画路径重入，删本地补丁"
+    },
+    "ui-workspace/src/client/rows/WorkspaceBrowser.tsx": {
+      "reason": "同 AnimatedRows：修 UIA Expand 卡死并接入本地键盘模型（docs/07 #5）",
+      "guard": "上游若修复重入且自带键盘模型，删本地改动"
+    },
+    "ui-approval/src/client/ApprovalCard.tsx": {
+      "reason": "默认焦点落「拒绝」；修 allow-once 被记忆为永久放行（docs/07 #6）",
+      "guard": "同步时确认上游未把一次性放行降级为 allow_always（§11.3 退化红线）"
+    },
+    "ui-settings-general/src/client/SettingsRoot.module.css": {
+      "reason": "设置按钮紧凑化并右对齐，纯样式（docs/07 #7）",
+      "guard": "上游若已调整为同等形态，删本地补丁"
+    },
+    "ui-settings-general/src/client/chrome.module.css": {
+      "reason": "设置按钮紧凑化并右对齐，纯样式（docs/07 #7）",
+      "guard": "上游若已调整为同等形态，删本地补丁"
+    },
+    "ui-settings-general/src/client/index.ts": {
+      "reason": "新增 settingsShell 服务（openSection），供宿主模型配置座位直达设置分段；拆卸链已接 disposeShell（docs/07 #15）",
+      "guard": "上游若提供等价入口，删本地服务改调用方；保留时必须确认拆卸链仍调用 disposeShell"
+    },
+    "ui-layout/src/client/AppFrame.tsx": {
+      "reason": "React 19 已按布尔处理 inert，'' 空串写法在新类型下不合法（docs/07 #10）",
+      "guard": "同第 9 行类型批；语义等价，上游升级类型后可删"
+    },
+    "ui-permission-presets/src/client/locales.ts": {
+      "reason": "8 套词典各加三档说明键（共 24 条），此前宿主下发只有中文（docs/07 #11）",
+      "guard": "上游若已把三句收进自身词典，删本地 24 条改指上游键"
+    },
+    "ui-permission-presets/src/client/presentation.ts": {
+      "reason": "新增挡位→词典键映射与回落，集中在一处（docs/07 #12）",
+      "guard": "上游若自带等价映射，删本地实现；预设机器值变化需同步 PRESET_DESCRIPTION_KEYS"
+    },
+    "ui-permission-presets/src/client/index.ts": {
+      "reason": "新增 presetDetail()：下拉 detail 走词典，自定义挡位才回落宿主描述（docs/07 #13）",
+      "guard": "上游若已统一取文案，删本地函数改调上游"
+    },
+    "ui-permission-presets/src/client/PermissionSelect.tsx": {
+      "reason": "芯片 tooltip 与下拉取文案规则统一（docs/07 #14）",
+      "guard": "上游若已统一取文案，删本地函数改调上游"
+    },
+    "ui-primitives/src/markdown/render.tsx": {
+      "reason": "失败图片改可点按钮（经宿主 openExternal），避免裸 <a> 把 Tauri 导航到外网（docs/07 #21）",
+      "guard": "上游若已做可点失败图片，删本地实现；同步后必须确认仍是按钮/宿主 IPC"
+    },
+    "ui-primitives/src/markdown/MarkdownDelegate.tsx": {
+      "reason": "同 render.tsx：fileImages.labels 增加可选 openExternal（docs/07 #21）",
+      "guard": "同上"
+    },
+    "ui-primitives/src/markdown/MarkdownText.module.css": {
+      "reason": "新增 .imageAltAction 样式（docs/07 #21）",
+      "guard": "同上"
+    },
+    "ui-chat/src/client/locale.ts": {
+      "reason": "8 套词典各加 image.openExternal（共 8 条）（docs/07 #22）",
+      "guard": "上游若已加等价键，删本地 8 条改指上游键"
+    },
+    "ui-chat/src/client/chat/ChatView.tsx": {
+      "reason": "类型级修复（第 9 行批次）+ fileImages.labels 传 image.openExternal（第 22 行）",
+      "guard": "两项分别按对应行规则同步：上游统一文案则删本地传参，类型批随 React 19 升级重跑 tsc -b"
+    },
+    "ui-theme/src/client/styles.ts": {
+      "reason": "8 张主题样式表改构造式样式表，绕过打包后 CSP style-src 拦截（docs/07 #20）",
+      "guard": "上游若改构造式样式表或给 <style> 打 nonce，删本地实现；不要退回 <style> 注入"
+    },
+    "ui-theme/tests/client-styles.client.spec.ts": {
+      "reason": "用例断言对象改为 adoptedStyleSheets，配合上面的实现改动（docs/07 #20）",
+      "guard": "实现回退时用例一并回退"
+    },
+    "file-upload/src/client/runtime.ts": {
+      "reason": "React 19 / 严格类型门禁：类型级修复，不改运行行为（docs/07 #9）",
+      "guard": "上游升级 React 19 类型后重跑 tsc -b；上游已修则删本地改动"
+    },
+    "ui-chat/src/client/chat/flow-motion.ts": {
+      "reason": "类型级修复（docs/07 #9）",
+      "guard": "同第 9 行类型批"
+    },
+    "ui-chat/src/client/chat/searchable-hidden.ts": {
+      "reason": "类型级修复（docs/07 #9）",
+      "guard": "同第 9 行类型批"
+    },
+    "ui-chat/src/client/chat/text-interaction.ts": {
+      "reason": "类型级修复（docs/07 #9）",
+      "guard": "同第 9 行类型批"
+    },
+    "ui-chat/src/client/chat/use-chat-scroll.ts": {
+      "reason": "类型级修复（docs/07 #9）",
+      "guard": "同第 9 行类型批"
+    },
+    "ui-chat/src/client/chat/use-chat-viewport.ts": {
+      "reason": "类型级修复（docs/07 #9）",
+      "guard": "同第 9 行类型批"
+    },
+    "ui-chat/src/client/chat/use-process-scroll.ts": {
+      "reason": "类型级修复（docs/07 #9）",
+      "guard": "同第 9 行类型批"
+    },
+    "ui-chat/src/client/contract/slots.ts": {
+      "reason": "类型级修复（docs/07 #9）",
+      "guard": "同第 9 行类型批"
+    },
+    "ui-conversation/src/client/contract/slots.ts": {
+      "reason": "类型级修复（docs/07 #9）",
+      "guard": "同第 9 行类型批"
+    },
+    "ui-conversation/src/client/input/editor/DraftEditor.tsx": {
+      "reason": "类型级修复（docs/07 #9）",
+      "guard": "同第 9 行类型批"
+    },
+    "ui-conversation/src/client/input/editor/view-binding.ts": {
+      "reason": "类型级修复（docs/07 #9）",
+      "guard": "同第 9 行类型批"
+    },
+    "ui-conversation/src/client/skeleton/EmptyHero.tsx": {
+      "reason": "类型级修复（docs/07 #9）",
+      "guard": "同第 9 行类型批"
+    },
+    "ui-primitives/src/markdown/useViewportHighlighting.ts": {
+      "reason": "类型级修复（docs/07 #9）",
+      "guard": "同第 9 行类型批"
+    },
+    "ui-primitives/src/useAnchoredMaxHeight.ts": {
+      "reason": "类型级修复（docs/07 #9）",
+      "guard": "同第 9 行类型批"
+    },
+    "ui-primitives/src/useMenuSubmenu.ts": {
+      "reason": "类型级修复（docs/07 #9）",
+      "guard": "同第 9 行类型批"
+    },
+    "ui-session/src/client/index.ts": {
+      "reason": "类型级修复（docs/07 #9）",
+      "guard": "同第 9 行类型批"
+    },
+    "ui-sidebar-browser/src/client/view/BrowserBody.tsx": {
+      "reason": "类型级修复（docs/07 #9）",
+      "guard": "同第 9 行类型批"
+    },
+    "ui-sidebar-documentpreview/src/client/image/ImageBody.tsx": {
+      "reason": "类型级修复（docs/07 #9）",
+      "guard": "同第 9 行类型批"
+    },
+    "ui-sidebar-documentpreview/src/client/pdf/pdf.tsx": {
+      "reason": "类型级修复（docs/07 #9）",
+      "guard": "同第 9 行类型批"
+    },
+    "ui-sidebar-documentpreview/src/client/zoom/ZoomViewport.tsx": {
+      "reason": "类型级修复（docs/07 #9）",
+      "guard": "同第 9 行类型批"
+    },
+    "ui-sidebar-right/src/client/shell/SidebarRight.tsx": {
+      "reason": "类型级修复（docs/07 #9）",
+      "guard": "同第 9 行类型批"
+    },
+    "ui-sidebar-right/src/client/tab-domain.ts": {
+      "reason": "类型级修复（docs/07 #9）",
+      "guard": "同第 9 行类型批"
+    },
+    "ui-workflow-run/src/client/WorkflowRunPanel.tsx": {
+      "reason": "类型级修复（docs/07 #9）",
+      "guard": "同第 9 行类型批"
+    },
+    "ui-dockkit/src/components/TabLayout.tsx": {
+      "reason": "React 19 / 严格类型门禁：类型级修复（useRef 显式初值），不改运行行为（docs/07 #9，2026-11-11 由账本核对补登）",
+      "guard": "同第 9 行类型批：上游升级 React 19 类型后重跑 tsc -b；上游已修则删本地改动"
+    },
+    "ui-primitives/src/HoverCard.tsx": {
+      "reason": "React 19 / 严格类型门禁：类型级修复（`!== false` → 真值判断）（docs/07 #9，2026-11-11 由账本核对补登）",
+      "guard": "同第 9 行类型批"
+    },
+    "ui-primitives/src/JsonTree.tsx": {
+      "reason": "React 19 / 严格类型门禁：类型级修复（useRef 显式初值）（docs/07 #9，2026-11-11 由账本核对补登）",
+      "guard": "同第 9 行类型批"
+    },
+    "ui-primitives/src/Menu.tsx": {
+      "reason": "React 19 / 严格类型门禁：类型级修复（`list !== false` → 真值判断）（docs/07 #9，2026-11-11 由账本核对补登）",
+      "guard": "同第 9 行类型批"
+    },
+    "ui-primitives/src/TextShimmer.tsx": {
+      "reason": "React 19 / 严格类型门禁：`inert: ''` → `inert: true`（React 19 已按布尔转发）（docs/07 #9，2026-11-11 由账本核对补登）",
+      "guard": "同第 9 行类型批"
+    },
+    "ui-primitives/src/Tooltip.tsx": {
+      "reason": "React 19 / 严格类型门禁：类型级修复（`content !== false` → 真值判断）（docs/07 #9，2026-11-11 由账本核对补登）",
+      "guard": "同第 9 行类型批"
+    },
+    "ui-primitives/src/image-drag.ts": {
+      "reason": "React 19 / 严格类型门禁：类型级修复（useRef 显式初值）（docs/07 #9，2026-11-11 由账本核对补登）",
+      "guard": "同第 9 行类型批"
+    }
+  }
+}

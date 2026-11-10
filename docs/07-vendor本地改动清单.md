@@ -2,6 +2,7 @@
 
 > 状态：活文档｜上游基线：`D:\AI\deepseek-harness` @ `fcc0ad4621`（2026-11-04）
 > 作用：跟上游同步前，先看这份清单。**凡是改动 `src/dsh/` 下上游文件的提交，必须在同一笔里追加一行**；只读、未改的上游文件不登记。
+> 修订：2026-11-11，依据 `docs/09` 首轮账本核对（上游 `fcc0ad4621`，逐文件 sha256 比对）——#9 补登 7 个漏登文件；#8 `ModelsSection.tsx` 标注退役（已与上游一致）；#4 移除从未改动的 `TerminalGuide.module.css` 并把计数更正为 3 个文件 5 处。这份清单此前有漏登与多列，不是天生准确。
 
 ## 为什么需要这份清单
 
@@ -21,12 +22,12 @@
 | 1 | `aliases.ts`（**本地新增，非上游文件**） | 维护 `@deepseek-ai/dsh-*` → 实际路径的别名表；多笔提交持续追加 | 只 vendor 了用到的包，入口需要显式映射；上游没有等价物 | SH-071/088/089/090/091/092/093/109、0238af4 |
 | 2 | `tsconfig.base.json` | 别名映射剪到真实存在的条目 | 映射到不存在的包会让 `tsc -b` 报错，且掩盖真实缺包 | 466192d、1f5d13f |
 | 3 | `packages/client/ui-sidebar-terminal/src/client/{face.ts,index.ts,terminal.tsx,TerminalCleanup.tsx,TerminalGuide.tsx}` | 把上游对 `@deepseek-ai/dsh-api-terminal-controller/{client,types}` 的导入改为本地 `./model.ts`；`index.ts` 的 `target()` 只接受终端形状参数 | 控制器包未 vendor（依赖宿主 PTY/终端服务），本地 `model.ts`（新增，约 146 行）实现同一契约；窄化参数避免把任意导航参数当终端请求 | SH-071（0dc03f0） |
-| 4 | `packages/client/ui-sidebar-terminal/src/client/{terminal.module.css,TerminalCleanup.module.css,TerminalTitle.module.css,TerminalGuide.module.css}` | `--dsw-alias-bg-l1/-2` → `--dsw-alias-bg-layer-1/-2`（共 5 处） | 上游包间漂移：`fcc0ad4621` 的 `ui-theme` 已改名 `bg-layer-*`，而同一基线的 `ui-sidebar-terminal` 仍在引用 `bg-l1/-2`，面板背景透明。**下次同步**：先看上游 terminal 是否已改用 `bg-layer-*`——已改就删本地补丁；同步 theme 时反向核对，别把令牌名改回 `bg-l*`。由 `src/theme-tokens.spec.ts` 机检兜底 | SH-071 纠错、fcc0ad4621 |
+| 4 | `packages/client/ui-sidebar-terminal/src/client/{terminal.module.css,TerminalCleanup.module.css,TerminalTitle.module.css}` | `--dsw-alias-bg-l1/-2` → `--dsw-alias-bg-layer-1/-2`（3 个文件 5 处） | 上游包间漂移：`fcc0ad4621` 的 `ui-theme` 已改名 `bg-layer-*`，而同一基线的 `ui-sidebar-terminal` 仍在引用 `bg-l1/-2`，面板背景透明。**下次同步**：先看上游 terminal 是否已改用 `bg-layer-*`——已改就删本地补丁；同步 theme 时反向核对，别把令牌名改回 `bg-l*`。由 `src/theme-tokens.spec.ts` 机检兜底 | SH-071 纠错、fcc0ad4621 |
 | 5 | `packages/client/ui-primitives/src/AnimatedRows.tsx`、`packages/client/ui-workspace/src/client/rows/{WorkspaceBrowser.tsx,treeKeyboard.ts}`（`treeKeyboard.ts` 为本地新增） | 修复 UIA Expand 导致的渲染进程卡死；补 ARIA 树键盘模型（方向键/Home/End 在树内移动焦点，**比上游多**，见下方同步说明第 4 条） | Windows 辅助功能树展开会触发上游动画路径的重入；键盘可访问性缺失 | SH-101（ff384d9） |
 | 6 | `packages/client/ui-approval/src/client/ApprovalCard.tsx` | 默认焦点落在「拒绝」；修复 `allow-once` 被记忆为永久放行 | 审批默认必须是安全侧；一次性放行不得降级成 `allow_always` | SH-025（5d5342a） |
 | 7 | `packages/client/ui-settings-general/src/client/{SettingsRoot.module.css,chrome.module.css}` | 设置按钮紧凑化并右对齐 | 用户明确要求；纯样式 | a10cd6c |
-| 8 | `packages/client/ui-settings-models/src/client/ModelsSection.tsx` | 恢复上游的 `intro` 段落（2 处，空态与主态各一）；文案走词典 `intro`（`zh` / `en`），不写在 JSX 里 | 此前 vendor 导入时被移除，导致模型设置页从 `h2` 直接跳到卡片、缺一句页面说明；恢复的是上游原节点，不是新增 | 2026-11-10（v0.2.1 视觉对齐批，04） |
-| 9 | React 19 / 严格类型门禁批次（28 个文件，见下） | 类型级修复：显式返回类型、`useRef` 初值、可选属性收窄、`readonly` 对齐；不改运行行为 | `tsc -b` 恢复零错（原 246 错）；React 19 类型定义更严 | 97b5250 |
+| 8 | `packages/client/ui-settings-models/src/client/ModelsSection.tsx`（**已退役 2026-11-11**） | ~~恢复上游的 `intro` 段落（2 处，空态与主态各一）；文案走词典 `intro`（`zh` / `en`），不写在 JSX 里~~ | 退役理由：`docs/09` 核对实测该文件与上游 `fcc0ad4621` 逐字节一致，本地回填已与上游同形，不再构成 vendor 改动；同步上游时无需再逐行对照本行 | 2026-11-10（v0.2.1 视觉对齐批，04）；2026-11-11 退役 |
+| 9 | React 19 / 严格类型门禁批次（35 个文件，见下；其中 7 个于 2026-11-11 补登） | 类型级修复：显式返回类型、`useRef` 初值、可选属性收窄、`readonly` 对齐；不改运行行为 | `tsc -b` 恢复零错（原 246 错）；React 19 类型定义更严 | 97b5250 |
 | 10 | `packages/client/ui-layout/src/client/AppFrame.tsx` | `inert: 条件 ? '' : undefined` → `inert: 条件`（5 处） | React 19 已按布尔处理 `inert`；空串写法在新类型定义下不合法，语义等价，属 React 19 兼容修复 | 2026-11-10（0.2.2 类型门禁） |
 | 11 | `packages/client/ui-permission-presets/src/client/locales.ts` | 在 8 套语言词典里各加 `preset.readOnly/workspaceWrite/fullAccess.description` 三键（共 24 条） | 三档的说明行是 UI 文案；此前由宿主目录下发（只有中文），en/ja/… 界面会串中文 | e9166a9（P3-16）。**同步上游时**：上游若已把这三句收进自身词典，删本地 24 条改指上游键；若上游改了预设机器值（`read-only` / `workspace-write`），`PRESET_DESCRIPTION_KEYS` 的映射必须同步 |
 | 12 | `packages/client/ui-permission-presets/src/client/presentation.ts` | 新增 `PermissionPresetDescriptionKey`、`PRESET_DESCRIPTION_KEYS`、`DEFAULT_PRESET_DESCRIPTIONS`、`displayPermissionPresetDescription()`（词典缺失时回落 en 原文） | 把「挡位机器值 → 词典键」的映射与回落收在一处，UI 不必各自判断内置/自定义 | 同上。**同步上游时**：上游若自带等价映射函数，删本地实现改调上游；保留则只跟随键名变化 |
@@ -61,6 +62,18 @@ packages/client/ui-sidebar-documentpreview/src/client/{image/ImageBody.tsx,pdf/p
 packages/client/ui-sidebar-right/src/client/{shell/SidebarRight.tsx,tab-domain.ts}
 packages/client/ui-workflow-run/src/client/WorkflowRunPanel.tsx
 packages/core/session/src/request-header.ts
+```
+
+第 9 行补登（2026-11-11，`docs/09` 首轮账本核对发现漏登；改动性质与上面同批，全部是 React 19 类型兼容）：
+
+```
+packages/client/ui-dockkit/src/components/TabLayout.tsx
+packages/client/ui-primitives/src/HoverCard.tsx
+packages/client/ui-primitives/src/JsonTree.tsx
+packages/client/ui-primitives/src/Menu.tsx
+packages/client/ui-primitives/src/TextShimmer.tsx
+packages/client/ui-primitives/src/Tooltip.tsx
+packages/client/ui-primitives/src/image-drag.ts
 ```
 
 ## 有意偏离（非 `src/dsh/` 文件）
