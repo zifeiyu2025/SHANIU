@@ -435,22 +435,26 @@ pub fn open_in_app_catalog() -> Vec<String> {
     catalog().into_iter().map(|entry| entry.id.to_string()).collect()
 }
 
-/// 用一个目录应用打开工作区目录。
-#[tauri::command]
-pub fn open_in_app_launch(app: String, path: String) -> Result<(), String> {
-    let target = existing_absolute(&path)?;
+/// 用一个目录应用打开已校验的目录（审计 H2 批 2：路径判定上移到组合根）。
+///
+/// `app` 只认 [`catalog`] 里的 id；本函数不做路径范围校验——调用方必须先把
+/// 目标限制在已注册工作区内（E32：本模块零业务依赖，拿不到 AppState）。
+pub fn open_in_app_launch_at(app: &str, target: &Path) -> Result<(), String> {
     if !target.is_dir() {
         return Err("目录应用只能打开目录".to_string());
     }
     let entry = catalog()
         .into_iter()
         .find(|entry| entry.id == app)
-        .ok_or_else(|| format!("应用未安装或不在目录中: {app}"))?;
+        .ok_or_else(|| {
+            tracing::warn!(application = app, "拒绝：应用不在目录中");
+            format!("应用未安装或不在目录中: {app}")
+        })?;
     match entry.launch {
-        Launch::ShellOpen => shell_open(&target),
+        Launch::ShellOpen => shell_open(target),
         Launch::Exe { exe } => {
             std::process::Command::new(&exe)
-                .args(launch_args(&app, &target))
+                .args(launch_args(app, target))
                 .spawn()
                 .map(|_| ())
                 .map_err(|e| format!("启动 {} 失败: {e}", exe.display()))
@@ -468,36 +472,47 @@ pub fn workspace_path_applications(path: String) -> Result<Vec<FileApplication>,
     Ok(file_applications(&target))
 }
 
-/// 打开/定位一个工作区路径：`reveal` 走资源管理器选中，否则默认应用或显式处理器。
-#[tauri::command]
-pub fn open_workspace_path(
-    path: String,
-    action: Option<String>,
-    application: Option<String>,
+/// 打开/定位一个已校验的工作区路径：`reveal` 走资源管理器选中，否则默认应用或显式处理器。
+///
+/// **路径范围由调用方先行限制**（审计 H2 批 2）：本函数只做动作分派，不判断目标
+/// 是否在工作区内——那一步用组合根里与沙箱同源的 `tool_router::resolve_in_workspace`。
+pub fn open_workspace_path_at(
+    target: &Path,
+    action: Option<&str>,
+    application: Option<&str>,
 ) -> Result<(), String> {
-    let target = existing_absolute(&path)?;
-    if action.as_deref() == Some("reveal") {
-        return reveal(&target);
+    if action == Some("reveal") {
+        return reveal(target);
     }
     match application.filter(|app| !app.trim().is_empty()) {
         Some(app) => {
-            let exe = PathBuf::from(&app);
-            if !exe.is_file() {
-                return Err(format!("应用不可用: {app}"));
+            if target.is_dir() {
+                // 目录：只认 catalog id。改前这里把 `application` 当 exe 路径直接
+                // spawn，等于「任意 exe + 任意目录」——注入可直接执行指定程序。
+                open_in_app_launch_at(app, target)
+            } else {
+                // 文件：只认「该文件当前注册处理器」这个封闭集合。条目 id 本身就是
+                // 宿主从注册表读出的 exe 路径，调用方自带的任意路径一律拒绝。
+                let known = file_applications(target);
+                let hit = known
+                    .iter()
+                    .find(|known| known.id.eq_ignore_ascii_case(app))
+                    .ok_or_else(|| {
+                        tracing::warn!(
+                            application = app,
+                            target = %target.display(),
+                            "拒绝：应用不是该文件的注册处理器"
+                        );
+                        "应用不再是该文件的处理程序".to_string()
+                    })?;
+                std::process::Command::new(&hit.id)
+                    .arg(target)
+                    .spawn()
+                    .map(|_| ())
+                    .map_err(|e| format!("启动 {} 失败: {e}", hit.id))
             }
-            // 上游 revalidate：文件必须仍在该扩展名的处理器列表里；目录没有关联面。
-            if target.is_file()
-                && !file_applications(&target).iter().any(|known| known.id.eq_ignore_ascii_case(&app))
-            {
-                return Err("应用不再是该文件的处理程序".to_string());
-            }
-            std::process::Command::new(&exe)
-                .arg(&target)
-                .spawn()
-                .map(|_| ())
-                .map_err(|e| format!("启动 {app} 失败: {e}"))
         }
-        None => shell_open(&target),
+        None => shell_open(target),
     }
 }
 

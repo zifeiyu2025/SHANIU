@@ -1748,6 +1748,73 @@ fn export_session_log(
     session_export::write_zip(&target, &entries)
 }
 
+/// 已注册的工作区根：默认工作区 + 配置里的额外工作区（审计 H2 批 2）。
+fn registered_workspace_roots(state: &AppState) -> Vec<std::path::PathBuf> {
+    let mut roots = vec![state.workspace_root()];
+    roots.extend(
+        state
+            .config()
+            .workspaces
+            .iter()
+            .map(|workspace| workspace.path.trim().to_string())
+            .filter(|path| !path.is_empty())
+            .map(std::path::PathBuf::from),
+    );
+    roots
+}
+
+/// 目标必须落在某个已注册工作区内，返回 canonical 路径。
+///
+/// 比较口径直接复用 `tool_router::resolve_in_workspace`（canonicalize +
+/// `starts_with`），与沙箱/工作区文件面同一套判定，不另写路径比较（审计 H2 批 2）。
+fn resolve_in_registered_workspace(
+    state: &AppState,
+    path: &str,
+) -> Result<std::path::PathBuf, String> {
+    if !std::path::Path::new(path).is_absolute() {
+        return Err(format!("路径必须是绝对路径: {path}"));
+    }
+    let mut last_err = String::new();
+    for root in registered_workspace_roots(state) {
+        match crate::tool_router::resolve_in_workspace(&root, path) {
+            Ok(resolved) => return Ok(resolved),
+            Err(reason) => last_err = reason.to_string(),
+        }
+    }
+    tracing::warn!(
+        target: "shaniu::open_in_app",
+        path,
+        "拒绝打开工作区之外的路径"
+    );
+    Err(format!("路径不在任何已注册工作区内: {path}（{last_err}）"))
+}
+
+/// 打开/定位工作区路径（审计 H2 批 2 的收紧入口）。
+///
+/// 改前：路径随便给，`application` 在目录场景直接当 exe 执行。改后：目标必须落在
+/// 已注册工作区内；目录只认 catalog id、文件只认该文件当前注册处理器。
+#[tauri::command]
+fn open_workspace_path(
+    state: tauri::State<'_, AppState>,
+    path: String,
+    action: Option<String>,
+    application: Option<String>,
+) -> Result<(), String> {
+    let target = resolve_in_registered_workspace(&state, &path)?;
+    open_in_app::open_workspace_path_at(&target, action.as_deref(), application.as_deref())
+}
+
+/// 用一个目录应用打开工作区内的目录（审计 H2 批 2 的收紧入口）。
+#[tauri::command]
+fn open_in_app_launch(
+    state: tauri::State<'_, AppState>,
+    app: String,
+    path: String,
+) -> Result<(), String> {
+    let target = resolve_in_registered_workspace(&state, &path)?;
+    open_in_app::open_in_app_launch_at(&app, &target)
+}
+
 /// SH-115：`/plan` 命令的宿主面——直接置位/清位**该会话**的 PlanState。
 ///
 /// 上游 `/plan` 注册在 host 插件（`plan-mode/src/index.ts`，inject `['commands']`），
@@ -2173,9 +2240,9 @@ pub fn run() {
             workspace_files::workspace_file_list,
             file_actions::save_file_bytes,
             open_in_app::open_in_app_catalog,
-            open_in_app::open_in_app_launch,
+            open_in_app_launch,
             open_in_app::workspace_path_applications,
-            open_in_app::open_workspace_path,
+            open_workspace_path,
             file_references::list_file_references,
             session_reference::list_session_references,
             skills::list_skills,
@@ -2677,5 +2744,83 @@ mod export_scope_tests {
         let err = validate_export_sources(&[source_entry(&missing, "media/x.bin")], &attachments)
             .unwrap_err();
         assert!(err.contains("附件路径越界"), "不存在的来源同样拒绝: {err}");
+    }
+}
+
+/// 「打开方式」路径范围收紧的用例（审计 H2 批 2）。
+#[cfg(test)]
+mod workspace_scope_tests {
+    use super::resolve_in_registered_workspace;
+    use crate::app_state::AppState;
+    use crate::config::{AppConfig, WorkspaceProfile};
+
+    fn state_with(
+        dir: &crate::test_support::TestTempDir,
+        default_root: &std::path::Path,
+        extra: &[&std::path::Path],
+    ) -> AppState {
+        let mut config = AppConfig::default();
+        config.workspace.root = default_root.to_string_lossy().into_owned();
+        config.workspaces = extra
+            .iter()
+            .enumerate()
+            .map(|(index, path)| WorkspaceProfile {
+                id: format!("w-extra-{index}"),
+                path: path.to_string_lossy().into_owned(),
+                title: String::new(),
+            })
+            .collect();
+        AppState::new(config, dir.join("config.toml"), dir.join("data"))
+    }
+
+    #[test]
+    fn targets_outside_registered_workspaces_are_rejected() {
+        let dir = crate::test_support::TestTempDir::new("ws-scope");
+        let ws = dir.join("ws");
+        std::fs::create_dir_all(ws.join("sub")).unwrap();
+        let outside = dir.join("outside");
+        std::fs::create_dir_all(&outside).unwrap();
+        let state = state_with(&dir, &ws, &[]);
+
+        // 工作区内：根与子目录都放行。
+        assert!(resolve_in_registered_workspace(&state, &ws.to_string_lossy()).is_ok());
+        assert!(resolve_in_registered_workspace(&state, &ws.join("sub").to_string_lossy()).is_ok());
+
+        // 反向对照：改前这里直接 existing_absolute + spawn，工作区外照样打开。
+        let err = resolve_in_registered_workspace(&state, &outside.to_string_lossy()).unwrap_err();
+        assert!(err.contains("不在任何已注册工作区内"), "{err}");
+
+        // 相对路径仍按旧契约拒绝，不放宽成「相对工作区根解析」。
+        let err = resolve_in_registered_workspace(&state, "sub").unwrap_err();
+        assert!(err.contains("绝对路径"), "{err}");
+    }
+
+    #[test]
+    fn extra_workspaces_are_allowed_too() {
+        let dir = crate::test_support::TestTempDir::new("ws-extra");
+        let ws = dir.join("ws");
+        let extra = dir.join("extra");
+        std::fs::create_dir_all(&ws).unwrap();
+        std::fs::create_dir_all(&extra).unwrap();
+        let state = state_with(&dir, &ws, &[extra.as_path()]);
+        assert!(
+            resolve_in_registered_workspace(&state, &extra.to_string_lossy()).is_ok(),
+            "多工作区场景不能因为只认默认根而失效"
+        );
+    }
+
+    #[test]
+    fn directory_application_must_be_a_catalog_id() {
+        let dir = crate::test_support::TestTempDir::new("ws-app");
+        let target = dir.join("some-dir");
+        std::fs::create_dir_all(&target).unwrap();
+        // 改前：目录场景把 application 当 exe 路径直接 spawn（任意程序 + 任意目录）。
+        let err = crate::open_in_app::open_workspace_path_at(
+            &target,
+            None,
+            Some("C:\\Windows\\System32\\calc.exe"),
+        )
+        .unwrap_err();
+        assert!(err.contains("不在目录中"), "任意 exe 路径必须被拒: {err}");
     }
 }
