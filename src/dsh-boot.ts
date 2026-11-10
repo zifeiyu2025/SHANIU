@@ -83,6 +83,7 @@ import { apply as modelCapabilitiesApply, inject as modelCapabilitiesInject } fr
 import { apply as sandboxStatusApply, inject as sandboxStatusInject } from './sandbox-status'
 import { apply as userTerminalSourceApply, inject as userTerminalSourceInject } from './terminal-source'
 import { apply as trayHintApply, inject as trayHintInject } from './tray-hint'
+import { apply as quitGuardApply, inject as quitGuardInject } from './quit-guard'
 
 export interface BootHandle {
   readonly ctx: Context
@@ -356,7 +357,9 @@ export async function bootShaniu(container: HTMLElement, options: BootOptions = 
     ...(realData
       ? [{ inject: userTerminalSourceInject, apply: userTerminalSourceApply } as FeaturePlugin,
         { inject: uiSidebarTerminalInject, apply: uiSidebarTerminalApply } as FeaturePlugin,
-        { inject: trayHintInject, apply: trayHintApply } as FeaturePlugin]
+        { inject: trayHintInject, apply: trayHintApply } as FeaturePlugin,
+        // 真退出前先盘点在跑的任务：没有就直接退，有就给三个选项。
+        { inject: quitGuardInject, apply: quitGuardApply } as FeaturePlugin]
       : []),
     { inject: uiSidebarFilesInject, apply: uiSidebarFilesApply },
     { inject: uiSidebarBrowserInject, apply: uiSidebarBrowserApply },

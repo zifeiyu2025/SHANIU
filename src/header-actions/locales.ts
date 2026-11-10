@@ -10,6 +10,7 @@ export const zh = {
   'menu.copyMarkdown': '复制会话为 Markdown',
   'menu.copyId': '复制会话 ID',
   'menu.copyFailed': '复制失败，请重试',
+  'menu.quit': '退出 SHANIU',
 } as const
 
 /** 词典键联合。 */
@@ -22,6 +23,7 @@ export const en: Record<HeaderKey, string> = {
   'menu.copyMarkdown': 'Copy session as Markdown',
   'menu.copyId': 'Copy session ID',
   'menu.copyFailed': 'Could not copy. Try again.',
+  'menu.quit': 'Quit SHANIU',
 }
 
 declare module '@deepseek-ai/dsh-client-ui-slots' {

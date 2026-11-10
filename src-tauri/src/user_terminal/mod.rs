@@ -31,10 +31,13 @@ pub const FRAME_EVENT: &str = "user-terminal://frame";
 /// 关窗口（隐藏到托盘）时的一次性提示通道；只在仍有终端存活时发一次。
 pub const TRAY_HINT_EVENT: &str = "user-terminal://tray-hint";
 
-/// 托盘提示载荷。`count` 是当前存活的终端会话数。
+/// 托盘提示载荷。`count` 是当前存活的终端会话数；`first` 表示这是本进程内第一次
+/// 点关闭，前端据此补一句“图标在托盘区哪里”。
 #[derive(Debug, Clone, Serialize)]
 pub struct TrayHint {
     pub count: usize,
+    #[serde(default)]
+    pub first: bool,
 }
 
 /// 单次写入上限：防止前端一次塞进巨量数据占住 IPC。

@@ -77,6 +77,10 @@ fn dev_ping(app: tauri::AppHandle, nonce: String) -> Result<(), String> {
 /// 主窗口是否已收到前端的就绪信号（首帧启动页已可显示）。
 static FRONTEND_READY: AtomicBool = AtomicBool::new(false);
 
+/// 本进程内是否已经提示过“图标在托盘区”。只影响第一次点关闭时多出的那一句，
+/// 避免每次关闭都重复同一段位置说明。
+static TRAY_HINT_SHOWN: AtomicBool = AtomicBool::new(false);
+
 /// 首帧就绪信号：窗口以 `visible: false` 创建（tauri.conf.json），前端把启动页
 /// 画出来后调用这里再显示，避免用户先看到未绘制窗口。重复调用无副作用；
 /// 前端若始终不发信号（脚本崩溃、页面加载失败），setup 里的 3 秒兜底会强制显示。
@@ -91,6 +95,233 @@ fn frontend_ready(app: tauri::AppHandle) {
         tracing::info!("前端就绪信号到达，显示主窗口");
     }
     show_main_window(&app);
+}
+
+/// 真正退出进程（一步可达）。
+///
+/// 关闭窗口只隐藏到托盘，退出必须显式触发：托盘菜单「退出」走同一套清理，
+/// 会话头「更多操作 → 退出 SHANIU」调这里。桌面壳里托盘图标可能被折叠，
+/// 不能让它成为唯一出口。
+#[tauri::command]
+fn quit_app(app: tauri::AppHandle) {
+    tracing::info!("收到退出请求，开始清理并退出进程");
+    // SH-021：退出前先还原 DACL 并删除容器 profile，避免残留 ACE/悬空 profile。
+    sandbox::shutdown();
+    app.exit(0);
+}
+
+/// 托盘/菜单发起的“退出请求”事件：有任务时不直接退，先让前端给出三个选项。
+pub const QUIT_REQUEST_EVENT: &str = "app://quit-requested";
+
+/// 退出前盘点“还在跑的事”。`busy=false` 时调用方应直接退出，不多问。
+#[derive(Debug, Clone, serde::Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct QuitSurvey {
+    /// 正在跑的会话（agent_id）；单任务闸下最多一个。
+    pub active_session: Option<String>,
+    pub running_jobs: Vec<QuitJob>,
+    pub running_terminals: usize,
+    pub pending_approvals: usize,
+    pub busy: bool,
+}
+
+#[derive(Debug, Clone, serde::Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct QuitJob {
+    pub id: String,
+    /// 所属会话 id；无主作业为 None。
+    pub session_id: Option<String>,
+    pub label: String,
+    pub status: String,
+}
+
+/// 盘点结果装配：`busy` 的判定只在这里，避免托盘与命令各写一套“算不算在跑”。
+fn assemble_quit_survey(
+    active_session: Option<String>,
+    running_jobs: Vec<QuitJob>,
+    running_terminals: usize,
+    pending_approvals: usize,
+) -> QuitSurvey {
+    let busy = active_session.is_some()
+        || !running_jobs.is_empty()
+        || running_terminals > 0
+        || pending_approvals > 0;
+    QuitSurvey {
+        active_session,
+        running_jobs,
+        running_terminals,
+        pending_approvals,
+        busy,
+    }
+}
+
+/// 盘点当前在跑的任务/作业/终端/待审批。
+fn quit_survey_of(app: &tauri::AppHandle) -> QuitSurvey {
+    let state = app.state::<AppState>();
+    let running_jobs: Vec<QuitJob> = state
+        .jobs
+        .list_running()
+        .into_iter()
+        .map(|job| QuitJob {
+            id: job.id,
+            session_id: job.owner,
+            label: job.label,
+            status: job.status,
+        })
+        .collect();
+    let running_terminals = app
+        .try_state::<user_terminal::UserTerminalManager>()
+        .map(|manager| manager.active_count())
+        .unwrap_or(0);
+    let pending_approvals = state.broker.pending_count();
+    assemble_quit_survey(
+        state.active_agent(),
+        running_jobs,
+        running_terminals,
+        pending_approvals,
+    )
+}
+
+/// 强制中止要写进哪些会话的档案：活动会话 + 仍在跑的作业所属会话，去重保序。
+fn forced_abort_targets(active_session: Option<&str>, job_sessions: &[Option<String>]) -> Vec<String> {
+    let mut targets: Vec<String> = Vec::new();
+    if let Some(session_id) = active_session {
+        targets.push(session_id.to_string());
+    }
+    for owner in job_sessions.iter().flatten() {
+        if !targets.contains(owner) {
+            targets.push(owner.clone());
+        }
+    }
+    targets
+}
+
+/// 限时等待“任务全部收口”。返回 `(是否超时, 实际等待毫秒)`。
+///
+/// 抽成纯等待是为了能测：撤掉等待（直接返回超时/不超时）或去掉轮询，
+/// 反向对照必须红。
+async fn wait_until_idle<F>(mut idle: F, limit: std::time::Duration) -> (bool, u64)
+where
+    F: FnMut() -> bool,
+{
+    let started = std::time::Instant::now();
+    while started.elapsed() < limit {
+        if idle() {
+            return (false, started.elapsed().as_millis() as u64);
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+    }
+    (!idle(), started.elapsed().as_millis() as u64)
+}
+
+#[tauri::command]
+fn quit_survey(app: tauri::AppHandle) -> QuitSurvey {
+    quit_survey_of(&app)
+}
+
+/// 隐藏主窗口（退出对话框的“收回托盘”）。
+#[tauri::command]
+fn hide_main_window(app: tauri::AppHandle) {
+    if let Some(window) = app.get_webview_window("main") {
+        let _ = window.hide();
+    }
+}
+
+/// 把“因退出而强制中止”写进该会话档案。
+///
+/// 失败只记日志、不拦退出：这时进程已经在收尾，档案写不进去也不能把用户卡住。
+fn record_forced_abort_at(data_root: &std::path::Path, session_id: &str, reason: &str) {
+    let path = data_root
+        .join(rollout::ROLLOUT_DIR)
+        .join(format!("{session_id}.jsonl"));
+    match rollout::RolloutWriter::open_existing(&path) {
+        Ok(writer) => {
+            if let Err(error) = writer.append(&rollout::RolloutItem::AbortNote {
+                reason: reason.to_string(),
+                at_ms: now_ms(),
+            }) {
+                tracing::error!(
+                    session_id,
+                    "强制中止留痕写入档案失败（不拦退出），路径 {}: {error}",
+                    path.display()
+                );
+            }
+        }
+        Err(error) => {
+            tracing::error!(
+                session_id,
+                "强制中止留痕打开档案失败（不拦退出），路径 {}: {error}",
+                path.display()
+            );
+        }
+    }
+}
+
+/// 取消任务并退出：先走正常取消路径，限时等待；超时才强制退出并留痕。
+///
+/// 为什么不能直接 `app.exit(0)`：那样在跑的回合会以“非取消形态”断在半路，
+/// 档案里出现一条没人能解释的中断。先发取消信号，让回合走到自己的取消分支。
+#[tauri::command]
+async fn quit_after_cancel(app: tauri::AppHandle) -> Result<(), String> {
+    let state = app.state::<AppState>();
+    let survey = quit_survey_of(&app);
+    let cancelled_approvals = state.broker.cancel_all();
+    let cancelled_task = state.cancel_active();
+    let job_ids: Vec<String> = state
+        .jobs
+        .list_running()
+        .into_iter()
+        .map(|job| job.id)
+        .collect();
+    for job_id in &job_ids {
+        state.jobs.kill_unscoped(job_id);
+    }
+    tracing::info!(
+        active_session = ?survey.active_session,
+        cancelled_task,
+        cancelled_approvals,
+        jobs = ?job_ids,
+        terminals = survey.running_terminals,
+        "退出前已发出取消信号，等待任务收口（上限 3 秒）"
+    );
+
+    let started = std::time::Instant::now();
+    let limit = std::time::Duration::from_millis(3000);
+    let (timed_out, _waited_ms) = wait_until_idle(
+        || !state.has_active_task() && state.jobs.list_running().is_empty(),
+        limit,
+    )
+    .await;
+
+    let still_running_jobs = state.jobs.list_running();
+    if timed_out {
+        let waited = started.elapsed().as_millis() as u64;
+        tracing::warn!(
+            waited_ms = waited,
+            active_session = ?state.active_agent(),
+            jobs = ?still_running_jobs.iter().map(|job| job.id.as_str()).collect::<Vec<_>>(),
+            "退出时等待任务取消超时，强制中止（已写入强制中止记录）"
+        );
+        let reason = format!("因退出而强制中止：取消等待超时（等待 {waited} ms，上限 3000 ms）");
+        let data_root = state.data_root();
+        let job_sessions: Vec<Option<String>> = still_running_jobs
+            .iter()
+            .map(|job| job.owner.clone())
+            .collect();
+        for session_id in forced_abort_targets(state.active_agent().as_deref(), &job_sessions) {
+            record_forced_abort_at(&data_root, &session_id, &reason);
+        }
+    } else {
+        tracing::info!(
+            waited_ms = started.elapsed().as_millis() as u64,
+            "任务已在等待窗口内收口，正常退出"
+        );
+    }
+
+    // SH-021：退出前先还原 DACL 并删除容器 profile，避免残留 ACE/悬空 profile。
+    sandbox::shutdown();
+    app.exit(0);
+    Ok(())
 }
 
 /// 提交任务，并返回**本次使用的 agent_id**。
@@ -490,10 +721,11 @@ fn project_entries(items: &[rollout::RolloutItem]) -> Vec<SessionEntry> {
                 });
             }
             // 首行 meta 不是历史；子代理引用要等 SH-056 的泳道 UI 才有展示形态；
-            // 档位事件是控制面记录，不进对话历史。
+            // 档位事件是控制面记录，退出留痕是审计记录——都不进对话历史。
             rollout::RolloutItem::SessionMeta { .. }
             | rollout::RolloutItem::SubagentRef { .. }
-            | rollout::RolloutItem::SandboxMode { .. } => {}
+            | rollout::RolloutItem::SandboxMode { .. }
+            | rollout::RolloutItem::AbortNote { .. } => {}
         }
     }
     out
@@ -2180,6 +2412,10 @@ fn show_main_window(app: &tauri::AppHandle) {
         let _ = window.unminimize();
         let _ = window.show();
         let _ = window.set_focus();
+        // 窗口回到前台后，托盘 tooltip 里的“仍在后台运行”就不再成立。
+        if let Some(tray) = app.tray_by_id("main") {
+            let _ = tray.set_tooltip(Some("SHANIU"));
+        }
         // 二次启动唤回：窗口可能被隐藏（托盘态）或压在别的窗口后面，补一次原生
         // 恢复 + 置前，保证"再启动一次 = 看到同一个窗口"。
         if let Ok(hwnd) = window.hwnd() {
@@ -2407,6 +2643,10 @@ pub fn run() {
         .invoke_handler(tauri::generate_handler![
             dev_ping,
             frontend_ready,
+            quit_app,
+            quit_survey,
+            quit_after_cancel,
+            hide_main_window,
             send_task,
             create_session,
             resume_session,
@@ -2496,22 +2736,33 @@ pub fn run() {
             user_terminal::user_terminal_active_count,
         ])
         .on_window_event(|window, event| {
-            // 关闭 = 隐藏到系统托盘（不退出）；真正退出只走托盘菜单「退出」
+            // 关闭 = 隐藏到系统托盘（不退出）；真正退出走托盘菜单「退出」
+            // 或会话头「更多操作 → 退出 SHANIU」（`quit_app`）。
+            //
+            // 为什么每次关闭都发提示：只隐藏、无提示会让用户以为已经退出；单实例锁
+            // 落地后再双击会得到“已被占用”，体感就是“再也打不开”。提示必须说明
+            // “程序还在、怎么真正退出”，有终端在跑时再带上数量。
             if let tauri::WindowEvent::CloseRequested { api, .. } = event {
                 if window.label() == "main" {
                     api.prevent_close();
-                    // 隐藏 ≠ 退出：仍有终端在跑时提示一次，避免「关了窗口就没事」的误判。
-                    // 只在隐藏这一刻发一次，不重复轰炸；没有存活终端则不发。
                     let count = window
                         .app_handle()
                         .try_state::<user_terminal::UserTerminalManager>()
                         .map(|state| state.active_count())
                         .unwrap_or(0);
-                    if count > 0 {
-                        let _ = window.emit(
-                            user_terminal::TRAY_HINT_EVENT,
-                            user_terminal::TrayHint { count },
-                        );
+                    let first = !TRAY_HINT_SHOWN.swap(true, Ordering::SeqCst);
+                    let _ = window.emit(
+                        user_terminal::TRAY_HINT_EVENT,
+                        user_terminal::TrayHint { count, first },
+                    );
+                    // 提示 toast 可能被错过；托盘 tooltip 让“还在后台”持续可见。
+                    if let Some(tray) = window.app_handle().tray_by_id("main") {
+                        let tooltip = if count > 0 {
+                            format!("SHANIU 仍在后台运行（{count} 个终端）· 右键退出")
+                        } else {
+                            "SHANIU 仍在后台运行 · 右键退出".to_string()
+                        };
+                        let _ = tray.set_tooltip(Some(tooltip.as_str()));
                     }
                     let _ = window.hide();
                 }
@@ -2606,9 +2857,18 @@ pub fn run() {
                 .on_menu_event(|app, event| match event.id().as_ref() {
                     "show" => show_main_window(app),
                     "quit" => {
-                        // SH-021：退出前先还原 DACL 并删除容器 profile，避免残留 ACE/悬空 profile。
-                        sandbox::shutdown();
-                        app.exit(0);
+                        // 真退前先查有没有在跑的事：有就让前端给三个选项，
+                        // 没有就直接退出（别让无任务的用户也点两次）。
+                        let survey = quit_survey_of(app);
+                        if survey.busy {
+                            show_main_window(app);
+                            let _ = app.emit(QUIT_REQUEST_EVENT, survey);
+                        } else {
+                            tracing::info!("托盘退出：没有在跑的任务，直接退出");
+                            // SH-021：退出前先还原 DACL 并删除容器 profile，避免残留 ACE/悬空 profile。
+                            sandbox::shutdown();
+                            app.exit(0);
+                        }
                     }
                     _ => {}
                 })
@@ -2627,6 +2887,108 @@ pub fn run() {
         })
         .run(tauri::generate_context!())
         .expect("SHANIU 启动失败");
+}
+
+#[cfg(test)]
+mod quit_flow_tests {
+    use super::{
+        assemble_quit_survey, forced_abort_targets, record_forced_abort_at, wait_until_idle,
+        QuitJob,
+    };
+    use crate::rollout::{ConfigSnapshot, RolloutItem};
+    use std::time::Duration;
+
+    fn job(id: &str, session: Option<&str>) -> QuitJob {
+        QuitJob {
+            id: id.to_string(),
+            session_id: session.map(str::to_string),
+            label: format!("job-{id}"),
+            status: String::from("running"),
+        }
+    }
+
+    /// 反向对照：删掉任意一类“在跑的事”，`busy` 就会漏报，这条必须红。
+    #[test]
+    fn busy_covers_task_jobs_terminals_and_approvals() {
+        assert!(!assemble_quit_survey(None, Vec::new(), 0, 0).busy);
+        assert!(assemble_quit_survey(Some(String::from("sess-1")), Vec::new(), 0, 0).busy);
+        assert!(assemble_quit_survey(None, vec![job("j1", None)], 0, 0).busy);
+        assert!(assemble_quit_survey(None, Vec::new(), 1, 0).busy);
+        assert!(assemble_quit_survey(None, Vec::new(), 0, 1).busy);
+    }
+
+    #[test]
+    fn forced_abort_targets_dedupes_active_session_and_jobs() {
+        let targets = forced_abort_targets(
+            Some("sess-1"),
+            &[
+                Some(String::from("sess-1")),
+                Some(String::from("sess-2")),
+                None,
+            ],
+        );
+        assert_eq!(targets, vec![String::from("sess-1"), String::from("sess-2")]);
+    }
+
+    /// 撤掉轮询/等待 → 第二条“永不收口必须超时”会红。
+    #[tokio::test]
+    async fn wait_until_idle_returns_early_when_task_finishes() {
+        let mut polls = 0;
+        let (timed_out, waited) = wait_until_idle(|| {
+            polls += 1;
+            polls >= 3
+        }, Duration::from_millis(300))
+            .await;
+        assert!(!timed_out, "第三次轮询已收口，不该判超时");
+        assert!(waited < 300, "应早于上限返回，实际 {waited} ms");
+    }
+
+    #[tokio::test]
+    async fn wait_until_idle_times_out_when_task_never_finishes() {
+        let (timed_out, waited) = wait_until_idle(|| false, Duration::from_millis(250)).await;
+        assert!(timed_out, "一直不收口必须判超时");
+        assert!(waited >= 250, "必须熬到上限，实际 {waited} ms");
+    }
+
+    /// 撤掉留痕 → 档案里读不到 `abort_note`，这条红。
+    #[test]
+    fn forced_abort_is_written_into_archive() {
+        let root = std::env::temp_dir().join(format!(
+            "shaniu-quit-abort-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .expect("时钟早于 Unix 纪元")
+                .as_nanos()
+        ));
+        let dir = root.join(crate::rollout::ROLLOUT_DIR);
+        std::fs::create_dir_all(&dir).expect("建临时 rollout 目录");
+        let path = dir.join("sess-1.jsonl");
+        let meta = RolloutItem::SessionMeta {
+            session_id: String::from("sess-1"),
+            agent_id: String::from("sess-1"),
+            parent_id: None,
+            created_at: 1,
+            config_snapshot: ConfigSnapshot::default(),
+        };
+        std::fs::write(&path, format!("{}\n", serde_json::to_string(&meta).expect("序列化 meta")))
+            .expect("写 meta");
+
+        record_forced_abort_at(&root, "sess-1", "因退出而强制中止：取消等待超时（测试）");
+
+        let text = std::fs::read_to_string(&path).expect("读档案");
+        let last = text.lines().last().expect("至少两行");
+        let item: RolloutItem = serde_json::from_str(last).expect("最后一行可解析");
+        match item {
+            RolloutItem::AbortNote { reason, at_ms } => {
+                assert!(reason.contains("因退出而强制中止"));
+                assert!(reason.contains("取消等待超时"));
+                assert!(at_ms > 0);
+            }
+            other => panic!("期望 abort_note，实际 {other:?}"),
+        }
+        let _ = std::fs::remove_dir_all(&root);
+    }
 }
 
 #[cfg(test)]

@@ -1392,14 +1392,14 @@ mod tests {
         let outside = dir.join("outside");
         std::fs::create_dir_all(&outside).unwrap();
         let allowed = [AllowedRoot { path: outside.display().to_string(), access: WorkspaceAccess::Read }];
-        let roots = guarded_mcp_user_roots(&make(&workspace, workspace, &allowed, &env), &data_root, acl::Access::Read)
+        let roots = guarded_mcp_user_roots(&make(workspace, workspace, &allowed, &env), &data_root, acl::Access::Read)
             .expect("数据根之外的用户指定根必须放行");
         assert_eq!(roots.len(), 3, "工作区、cwd、allowed_roots 各一条");
 
         // 拒绝：allowed_roots 指到 data\secrets。
         let secrets = data_root.join("secrets");
         let allowed = [AllowedRoot { path: secrets.display().to_string(), access: WorkspaceAccess::Write }];
-        let error = guarded_mcp_user_roots(&make(&workspace, workspace, &allowed, &env), &data_root, acl::Access::Read)
+        let error = guarded_mcp_user_roots(&make(workspace, workspace, &allowed, &env), &data_root, acl::Access::Read)
             .expect_err("allowed_roots 指向数据根内部必须拒绝");
         assert!(error.to_string().contains("allowed_roots"), "{error}");
         assert!(error.to_string().contains("secrets"), "{error}");

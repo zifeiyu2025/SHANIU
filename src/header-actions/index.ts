@@ -48,6 +48,7 @@ import { ExplorerButton } from './ExplorerButton'
 import { openInSystemExplorer } from './open-workspace'
 import { exportMarkdownFetcher } from './export-markdown'
 import { exportZipFetcher, exportZipSaver } from './export-zip'
+import { requestQuit } from '../quit-guard/quit'
 import { en, NS, zh } from './locales'
 
 /** 必需服务：槽位、词典、菜单、快捷键、会话与对话视图。 */
@@ -224,6 +225,14 @@ export function apply(ctx: Context): void {
         separatorBefore: true,
         failureLabel: t('menu.copyFailed'),
         run: async () => { await writeClipboardText(sessionId) },
+      },
+      {
+        id: 'quit-app',
+        // 托盘图标可能被折叠；这里是“怎么真正退出”的一步可达入口。
+        // 有任务时会弹三个选项（取消并退出 / 继续跑 / 收回托盘）。
+        label: t('menu.quit'),
+        separatorBefore: true,
+        run: () => requestQuit(),
       },
     ],
   }), 'shaniu-header: more menu')

@@ -92,6 +92,11 @@ pub fn resume(path: &Path) -> Result<Resumed, RolloutError> {
             RolloutItem::SubagentRef { .. } => {
                 // 子代理引用不进父会话历史；整树 replay 是 SH-056 的范围
             }
+            RolloutItem::AbortNote { reason, .. } => {
+                // 退出等待超时的强制中止留痕：不进模型历史，但必须在日志里看得见，
+                // 否则“档案为什么断在这里”又变成无人能解释。
+                tracing::warn!("会话档案含强制中止记录：{reason}");
+            }
             RolloutItem::SessionMeta { .. } => {
                 return Err(RolloutError::Corrupted {
                     line: 0,

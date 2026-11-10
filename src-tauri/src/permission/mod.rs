@@ -340,6 +340,22 @@ impl ApprovalBroker {
     pub fn has_pending(&self, request_id: &str) -> bool {
         self.pending.lock().expect("pending 锁中毒").contains_key(request_id)
     }
+
+    /// 当前待审批请求数（退出前“还有几件事”用）。
+    pub fn pending_count(&self) -> usize {
+        self.pending.lock().expect("pending 锁中毒").len()
+    }
+
+    /// 撤掉所有待审批请求（退出路径）。
+    ///
+    /// 直接 drop 发送端：等待方 `rx` 收到 `Err`，按 `GateOutcome::Cancelled` 处理——
+    /// 这与“用户取消任务”是同一条路径，不是“审批被拒绝”。返回值仅用于日志。
+    pub fn cancel_all(&self) -> usize {
+        let mut guard = self.pending.lock().expect("pending 锁中毒");
+        let count = guard.len();
+        guard.clear();
+        count
+    }
 }
 
 impl From<ApprovalDecision> for GateOutcome {

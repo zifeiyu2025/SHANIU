@@ -290,6 +290,35 @@ impl JobRegistry {
         jobs
     }
 
+    /// 全部未终态作业（退出前检查用；跨会话）。按开始时间升序。
+    pub fn list_running(&self) -> Vec<JobView> {
+        let guard = self.lock();
+        let mut jobs: Vec<JobView> = guard
+            .jobs
+            .values()
+            .filter(|entry| !is_terminal(entry.status))
+            .map(JobEntry::view)
+            .collect();
+        jobs.sort_by_key(|job| job.started_at);
+        jobs
+    }
+
+    /// 退出路径专用：不按会话校验归属，直接请求终止。
+    /// 返回是否真的发出了停止信号（已终态返回 false）。
+    pub fn kill_unscoped(&self, id: &str) -> bool {
+        let mut guard = self.lock();
+        match guard.jobs.get_mut(id) {
+            Some(entry) if !is_terminal(entry.status) => {
+                entry.status = "stopping";
+                if let Some(signal) = entry.kill.take() {
+                    let _ = signal.send(());
+                }
+                true
+            }
+            _ => false,
+        }
+    }
+
     /// 非消费读取：返回从 `from` 起仍保留的字节；`from` 缺省取 `earliest`。
     pub fn read(&self, id: &str, session_id: &str, from: Option<u64>) -> Result<JobRead, JobOpError> {
         let guard = self.lock();
@@ -328,6 +357,11 @@ fn not_found(session_id: &str, job_id: &str) -> JobOpError {
         "job/not-found",
         format!("会话 {session_id} 的作业列表中没有 {job_id}"),
     )
+}
+
+/// 终态判定：只有这三个值不再算“在跑的事”。
+fn is_terminal(status: &str) -> bool {
+    matches!(status, "completed" | "killed" | "failed")
 }
 
 fn now_ms() -> u64 {

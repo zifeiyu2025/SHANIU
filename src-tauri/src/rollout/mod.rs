@@ -74,6 +74,12 @@ pub enum RolloutItem {
     /// 事件回放当前档位（进程在不在都不影响）。部署默认仍由设置页写 config。
     /// 最后一条生效——切多次就是多条事件，不做原地改写（档案 append-only）。
     SandboxMode { mode: String, at_ms: u64 },
+    /// 退出流程里的“强制中止”留痕：取消信号已发，但等待超时后进程仍要退出。
+    ///
+    /// 为什么必须有这一条：直接 kill 会在档案里留下一条没人能解释的中断；
+    /// 这一行把“为什么断”写清楚，resume 与审计才有据可查。
+    /// **只在等待超时、被迫退出时写**；正常取消走 `TurnEnd`，不写这里。
+    AbortNote { reason: String, at_ms: u64 },
 }
 
 #[derive(Debug, thiserror::Error)]

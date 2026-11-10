@@ -200,11 +200,12 @@ describe('header actions', () => {
     expect(invoke).not.toHaveBeenCalled()
   })
 
-  it('更多操作三项入口（复制 Markdown / 下载日志 / 复制 ID），不出现双份「复制 Markdown」', () => {
+  it('更多操作入口：复制 Markdown / 下载日志 / 复制 ID / 退出 SHANIU，不出现双份「复制 Markdown」', () => {
     const { contributions } = harness()
     // 顺序即渲染顺序：上游是 copy → download，本地补充项排在最后。
+    // 托盘图标可能被折叠，「退出 SHANIU」保证真正退出始终一步可达。
     expect(sessionMenu(contributions).map(action => action.id))
-      .toEqual(['copy-markdown', 'download', 'copy-id'])
+      .toEqual(['copy-markdown', 'download', 'copy-id', 'quit-app'])
   })
 })
 
