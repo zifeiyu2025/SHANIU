@@ -417,3 +417,69 @@ async fn sandbox_streams_every_output_line() {
     }
     std::fs::remove_dir_all(&ws).ok();
 }
+
+/// 句柄白名单回归锁（M1）：并发 exec 不得互相继承对方的管道写端。
+///
+/// 机制：`bInheritHandles=TRUE` 的全量继承是「哪个句柄可继承」就放行，不是「这次
+/// spawn 的」——没有 `PROC_THREAD_ATTRIBUTE_HANDLE_LIST` 时，后创建的长命令会把
+/// 并发的短命令管道**写端**一起继承走。短命令退出后写端仍在长命令进程里，短命令的
+/// 读线程永远等不到 EOF：表现为「命令明明跑完了却迟迟不返回」，句柄与线程一起漏。
+///
+/// 反向对照（2026-11-10 旧实现实测 8/8 复现）：去掉 `spawn_restricted_command` 里的
+/// `set_handle_list` 一行，本轮 3 轮都会挂到 3s 超时；带上白名单后每轮 5-6ms 收尾。
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn concurrent_execs_do_not_inherit_each_others_pipes() {
+    let ws = unique_dir("handles");
+    let mut hung_rounds = 0;
+    for round in 0..3 {
+        // 两条命令必须「同时」创建才能撞出继承窗口：用 Barrier 对齐后各走一个线程。
+        let barrier = Arc::new(std::sync::Barrier::new(2));
+        let (short_tx, mut short_rx) = mpsc::channel::<shaniu_lib::sandbox::ExecLine>(64);
+        let (long_tx, _long_rx) = mpsc::channel::<shaniu_lib::sandbox::ExecLine>(64);
+
+        let (b, dir) = (barrier.clone(), ws.clone());
+        let short_thread = std::thread::spawn(move || {
+            b.wait();
+            shaniu_lib::sandbox::windows_impl::spawn_restricted_command(
+                "cmd",
+                &["/C", "echo short-done"],
+                &dir,
+                short_tx,
+            )
+        });
+        let (b, dir) = (barrier.clone(), ws.clone());
+        let long_thread = std::thread::spawn(move || {
+            b.wait();
+            shaniu_lib::sandbox::windows_impl::spawn_restricted_command(
+                "cmd",
+                &["/C", "ping -n 11 127.0.0.1"],
+                &dir,
+                long_tx,
+            )
+        });
+        let _short = short_thread.join().unwrap().expect("短命令应能启动");
+        let mut long = long_thread.join().unwrap().expect("长命令应能启动");
+
+        let mut text = String::new();
+        let eof = loop {
+            match tokio::time::timeout(Duration::from_secs(3), short_rx.recv()).await {
+                Ok(Some((_, line))) => text.push_str(&line),
+                Ok(None) => break true,
+                Err(_) => break false,
+            }
+        };
+        if !eof {
+            hung_rounds += 1;
+            println!("[m1] 第 {round} 轮挂住：短命令输出流 3s 内未 EOF（内容={text:?}）");
+        }
+
+        // 收尾：杀掉长命令，顺带让本轮被挂住的流得到 EOF，避免拖累下一轮。
+        long.kill();
+        let _ = long.wait().await;
+    }
+    std::fs::remove_dir_all(&ws).ok();
+    assert_eq!(
+        hung_rounds, 0,
+        "短命令的输出流被长命令进程继承的写端挂住了（HANDLE_LIST 白名单失效）"
+    );
+}

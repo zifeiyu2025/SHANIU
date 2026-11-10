@@ -6,7 +6,8 @@
 //! 3. CreateRestrictedToken 以 SE_PRIVILEGE_REMOVED **删除除 SeChangeNotifyPrivilege 外的全部特权**
 //!    （删除而非禁用：子进程拿不到 SeDebug/SeBackup 等任何提权能力）；
 //! 4. CreateJobObject + KILL_ON_JOB_CLOSE（应用崩溃/退出兜底回收子进程树）；
-//! 5. 手工匿名管道（写端可继承）+ STARTF_USESTDHANDLES 接管子进程 stdio；
+//! 5. 手工匿名管道（写端可继承）+ `PROC_THREAD_ATTRIBUTE_HANDLE_LIST` 句柄白名单
+//!    + STARTF_USESTDHANDLES 接管子进程 stdio（白名单外的可继承句柄不进入子进程）；
 //! 6. CreateProcessAsUserW 以 CREATE_SUSPENDED 挂起启动 → AssignProcessToJobObject
 //!    → ResumeThread（子进程任何代码执行前已入 Job）；
 //! 7. std::thread 读线程 + blocking_send 桥接 tokio 通道；句柄 RAII（CloseHandle）。
@@ -50,7 +51,7 @@ use windows::Win32::System::Threading::{
     PROC_THREAD_ATTRIBUTE_JOB_LIST, PROC_THREAD_ATTRIBUTE_PSEUDOCONSOLE,
     PROC_THREAD_ATTRIBUTE_SECURITY_CAPABILITIES,
     PROCESS_INFORMATION, ResumeThread, STARTF_USESTDHANDLES,
-    STARTUPINFOEXW, STARTUPINFOW, WaitForSingleObject, CREATE_NO_WINDOW, CREATE_SUSPENDED,
+    STARTUPINFOEXW, WaitForSingleObject, CREATE_NO_WINDOW, CREATE_SUSPENDED,
     CREATE_UNICODE_ENVIRONMENT,
 };
 
@@ -315,6 +316,9 @@ fn wait_for_exit_code(process: &OwnedHandle) -> io::Result<i32> {
 
 /// 以「仅留 SeChangeNotifyPrivilege 的受限令牌 + JobObject」启动子进程。
 /// stdout/stderr 由 std::thread 读线程逐行送入 tx（blocking_send 桥接 tokio）。
+///
+/// 句柄继承走 `PROC_THREAD_ATTRIBUTE_HANDLE_LIST` 白名单（见第 5.1 步注释），
+/// 这是 `spawn_appcontainer_command` 之外的独立调用点，两处都必须带这一层。
 pub fn spawn_restricted_command(
     program: &str,
     args: &[&str],
@@ -349,15 +353,26 @@ pub fn spawn_restricted_command(
         let (out_read, out_write) = create_inheritable_pipe()?;
         let (err_read, err_write) = create_inheritable_pipe()?;
 
-        // 6) CREATE_SUSPENDED 启动
-        let si = STARTUPINFOW {
-            cb: std::mem::size_of::<STARTUPINFOW>() as u32,
-            dwFlags: STARTF_USESTDHANDLES,
-            hStdInput: HANDLE::default(),
-            hStdOutput: out_write.handle(),
-            hStdError: err_write.handle(),
-            ..Default::default()
-        };
+        // 5.1) 句柄白名单（M1）：只有列表内的两根写端能进子进程。
+        //
+        // 为什么不能只把读端设成不可继承：`bInheritHandles=true` 的全量继承是按
+        // 「哪个句柄可继承」放的，不是按「这次 spawn 的」放的——同进程里并发的命令 B
+        // 会把命令 A 的管道写端一起继承走。A 退出后 B 还持着 A 的写端，A 的读线程
+        // 永远等不到 EOF，句柄与读线程一起漏（实测 8/8 复现，短命令的输出流挂到超时）。
+        // HANDLE_LIST 是白名单：未列出的可继承句柄一律不进入子进程。
+        // 注意：HANDLE_LIST 要求 bInheritHandles 仍为 TRUE 且列表内句柄本身可继承。
+        let mut attributes = AttrList::new(1)?;
+        attributes.set_handle_list(vec![out_write.handle(), err_write.handle()])?;
+
+        // 6) CREATE_SUSPENDED 启动（EXTENDED_STARTUPINFO_PRESENT 是带属性表的前提）
+        let mut startup = STARTUPINFOEXW::default();
+        startup.StartupInfo.cb = std::mem::size_of::<STARTUPINFOEXW>() as u32;
+        startup.StartupInfo.dwFlags = STARTF_USESTDHANDLES;
+        startup.StartupInfo.hStdInput = HANDLE::default();
+        startup.StartupInfo.hStdOutput = out_write.handle();
+        startup.StartupInfo.hStdError = err_write.handle();
+        startup.lpAttributeList = attributes.as_mut_ptr();
+
         let mut pi = PROCESS_INFORMATION::default();
         CreateProcessAsUserW(
             Some(token_guard.handle()),
@@ -366,10 +381,10 @@ pub fn spawn_restricted_command(
             None,
             None,
             true,
-            PROCESS_CREATION_FLAGS(CREATE_SUSPENDED.0),
+            PROCESS_CREATION_FLAGS(CREATE_SUSPENDED.0 | EXTENDED_STARTUPINFO_PRESENT.0),
             None,
             PCWSTR::from_raw(cwd_wide.as_ptr()),
-            &si,
+            &startup.StartupInfo,
             &mut pi,
         )
         .map_err(|e| format!("CreateProcessAsUserW 失败: {e}"))?;
