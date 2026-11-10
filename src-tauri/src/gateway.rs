@@ -388,9 +388,24 @@ async fn handle_frame(
                 // 省略游标 = 只接 live（docs/04 §1.4）：用日志尾作为去重基线，绝不重放历史。
                 // 不种这个游标的话，`last_id = None` 会让 lag 路径/后续续播把整段历史再送一遍，
                 // 客户端看到的是重复内容与错乱的助手流 revision（真机 B-20 复发的直接原因）。
+                //
+                // 读不出游标时**不得**降级成「从头开始」（事件日志 M7 之后只有真 I/O 故障
+                // 才会 Err：文件不存在走 `Ok(None)`）。那会把已知历史重放一遍，用户看到的是
+                // 莫名重复，而不是一个能归因的错误。这里回错误帧并**不建立订阅**：本次
+                // `subscribe` 失败，连接与其它会话的订阅不受影响。
                 match event_journal::latest_event_id(&hub.journal_dir, &session_id) {
                     Ok(last) => state.last_id = last,
-                    Err(e) => tracing::warn!("gateway 读取日志尾失败（{session_id}）: {e}"),
+                    Err(e) => {
+                        send_frame(
+                            sink,
+                            &ServerFrame::error(
+                                "journal",
+                                format!("读取会话事件日志失败（{session_id}）: {e}"),
+                            ),
+                        )
+                        .await?;
+                        return Ok(());
+                    }
                 }
             }
             sessions.insert(session_id, state);
@@ -560,6 +575,52 @@ mod tests {
         ws.send(Message::text(r#"{"type":"credit","session_id":"s1","credits":1}"#)).await.unwrap();
         let second = next_event(&mut ws).await;
         assert_eq!(second.event_id, "03");
+    }
+
+    /// 省略游标的订阅在读不出日志尾时**必须报错**，不能把 `last_id` 置空继续订阅：
+    /// 那会让客户端把已有历史当新事件重放一遍。此用例构造一条非法 UTF-8 的日志
+    /// （`lines()` 返回读错误 → `latest_event_id` 上抛）作为唯一的失败入口。
+    #[tokio::test]
+    async fn subscribe_without_cursor_reports_error_when_journal_unreadable() {
+        let (hub, url, dir) = spawn_server().await;
+        std::fs::write(dir.join("s1.events.jsonl"), b"\xff\xfe\n").unwrap();
+        let mut ws = hello_ok(&url, &hub).await;
+        ws.send(Message::text(r#"{"type":"subscribe","session_id":"s1","credits":1}"#))
+            .await
+            .unwrap();
+
+        let msg = ws.next().await.unwrap().unwrap();
+        let Message::Text(text) = msg else {
+            panic!("期望 error 帧，实得 {msg:?}")
+        };
+        let frame: serde_json::Value = serde_json::from_str(text.as_str()).unwrap();
+        assert_eq!(frame["type"], "error", "读不出游标必须回错误帧：{frame}");
+        assert_eq!(frame["code"], "journal");
+        assert!(
+            frame["message"].as_str().unwrap().contains("读取"),
+            "错误文案要能归因：{frame}"
+        );
+
+        // 订阅未建立：之后该会话的 live 事件不得投递（不是“降级但还在听”）。
+        hub.publish(&event("s1", "09"));
+        assert!(
+            timeout(Duration::from_millis(150), ws.next()).await.is_err(),
+            "订阅失败后不得再投递该会话事件"
+        );
+    }
+
+    /// 同一入口的反向对照：日志文件不存在 = 没有历史（`Ok(None)`），是**正常路径**，
+    /// 必须照常建立 live-only 订阅（不能因为上面的报错分支把全新会话也拒了）。
+    #[tokio::test]
+    async fn subscribe_without_cursor_accepted_when_journal_absent() {
+        let (hub, url, _dir) = spawn_server().await;
+        let mut ws = hello_ok(&url, &hub).await;
+        ws.send(Message::text(r#"{"type":"subscribe","session_id":"fresh","credits":1}"#))
+            .await
+            .unwrap();
+        tokio::time::sleep(Duration::from_millis(100)).await;
+        hub.publish(&event("fresh", "01"));
+        assert_eq!(next_event(&mut ws).await.event_id, "01");
     }
 
     /// 用自定义 hub 起服务（心跳时限被缩短的用例需要它）；临时目录由调用方持有。
