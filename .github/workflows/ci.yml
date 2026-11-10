@@ -83,6 +83,31 @@ jobs:
       - name: 前端测试
         run: pnpm test
 
+      # ── 上游对齐账本（docs/09）──────────────────────────────────────────
+      # 只跑有意义的检查：按冻结基线重新生成 ledger.md，与入库版本比对，不一致即失败。
+      # 没有这一步，入库的账本三个月后就是一张过期的漂亮表格——它会继续显示"全绿"，
+      # 而真实漂移早已发生。上游必须整棵检出：脚本要统计 packages/ 其它分组的规模，
+      # 不能 sparse，所以用 cache 兜住重复成本，key 跟着冻结 commit 走。
+      - name: 缓存上游 DSH 检出
+        uses: actions/cache@v4
+        with:
+          path: ${{ runner.temp }}/dsh-upstream
+          key: ${{ runner.os }}-dsh-upstream-fcc0ad4621
+
+      - name: 上游对齐账本（ledger.md 过期即失败）
+        shell: pwsh
+        run: |
+          $up = Join-Path $env:RUNNER_TEMP 'dsh-upstream'
+          if (-not (Test-Path (Join-Path $up '.git'))) {
+            # cache 未命中：全量克隆
+            git clone --quiet https://github.com/deepseek-ai/deepseek-harness $up
+          }
+          # 冻结 commit 见 docs/09 §0；上游前进时先改那里，再改这里的两个字面量
+          git -C $up fetch --quiet --depth 1 origin fcc0ad462172522aaf5c93a7b2e01f6b9f0b0159
+          git -C $up -c advice.detachedHead=false checkout --quiet --force FETCH_HEAD
+          $env:DSH_UPSTREAM = $up
+          pnpm align:report --check
+
       # typecheck/test 抓不到 Tailwind/vite 构建期问题，而 tauri.conf.json 的 frontendDist
       # 指向 dist：构建链断裂不该等到打包阶段才暴露
       - name: 前端构建

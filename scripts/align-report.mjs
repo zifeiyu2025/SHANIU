@@ -18,6 +18,11 @@
  *
  * 输出必须可静态重跑：条目按路径排序、JSON 无时间戳、无绝对路径，
  * 同一份上游 + 同一份本地代码两次运行应逐字节相同。
+ *
+ * `--check` 模式：只重新生成并与已入库的 `align/ledger.md` 比对，**不写盘**；
+ * 不一致即非零退出。存在的理由是让入库的 md 不能变成过期的假象——没有这道
+ * 检查，三个月后账本仍是一张排版漂亮的谎话。`align/ledger.json` 是本地/CI
+ * 产物，不入库（见 .gitignore 与 docs/09 §1），所以也不参与比对。
  */
 import { createHash } from 'node:crypto'
 import { mkdir, readdir, readFile, writeFile } from 'node:fs/promises'
@@ -32,6 +37,15 @@ const upstreamBase = path.join(upstreamRoot, SCOPE)
 const ourBase = path.join(repoRoot, 'src', 'dsh', SCOPE)
 const alignDir = path.join(repoRoot, 'align')
 const overridesPath = path.join(alignDir, 'overrides.json')
+
+/** `--check`：只校验已入库的 ledger.md 是否与重新生成的结果一致，不写盘（CI 用）。 */
+const CHECK = process.argv.includes('--check')
+
+if (CHECK && !existsSync(upstreamBase)) {
+  console.error(`[align] --check 需要上游源码，但 ${upstreamBase} 不存在。`)
+  console.error('  把 DSH_UPSTREAM 指到 deepseek-harness 的检出（commit 见 docs/09 §0）。')
+  process.exit(2)
+}
 
 /** 目录级忽略：构建产物与依赖不进账本。 */
 const IGNORE_DIRS = new Set(['node_modules', '.git', 'dist', 'build', 'coverage', '.turbo', '.vite', '.cache'])
@@ -174,14 +188,6 @@ async function main() {
     if (entry.review === 'needs-review') stats['needs-review'] += 1
   }
 
-  await mkdir(alignDir, { recursive: true })
-  await writeFile(path.join(alignDir, 'ledger.json'), `${JSON.stringify({
-    version: 1,
-    scope: { upstream: SCOPE, ours: `src/dsh/${SCOPE}` },
-    stats,
-    entries,
-  }, null, 2)}\n`, 'utf8')
-
   const line = (entry) =>
     `| \`${entry.upstreamPath ?? entry.ourPath}\` | ${entry.status} | ${entry.review === 'needs-review' ? '**needs-review**' : '已登记'} | ${entry.reason ?? '—'} | ${entry.guard ?? '—'} |`
   const md = [
@@ -213,12 +219,40 @@ async function main() {
     ...(await countOtherPackages()).map(row => `| ${row.group} | ${row.files} |`),
     '',
   ].join('\n')
-  await writeFile(path.join(alignDir, 'ledger.md'), md, 'utf8')
 
   console.log(`[align] total=${stats.total} same=${stats.same} drift=${stats.drift} missing=${stats.missing} n/a=${stats['not-applicable']} needs-review=${stats['needs-review']}`)
   for (const entry of entries.filter(item => item.status === 'drift' || item.status === 'missing')) {
     console.log(`  ${entry.status.padEnd(8)} ${entry.upstreamPath ?? entry.ourPath}`)
   }
+
+  if (CHECK) {
+    const target = path.join(alignDir, 'ledger.md')
+    // 行尾归一后比对：autocrlf 下新检出是 CRLF，生成器写的是 LF；直接比字节
+    // 会让每次 CI 都假红，和账本本身的判定口径（CRLF→LF）保持一致。
+    const normalize = (text) => text.replaceAll('\r\n', '\n')
+    if (!existsSync(target)) {
+      console.error('[align] --check 失败：align/ledger.md 不存在（账本未入库？）')
+      process.exitCode = 1
+      return
+    }
+    if (normalize(await readFile(target, 'utf8')) !== normalize(md)) {
+      console.error('[align] --check 失败：align/ledger.md 与重新生成的结果不一致。')
+      console.error('  跑一遍 `pnpm align:report` 再提交——入库的是生成物，过期即假象。')
+      process.exitCode = 1
+      return
+    }
+    console.log('[align] --check 通过：align/ledger.md 与当前上游基线一致')
+    return
+  }
+
+  await mkdir(alignDir, { recursive: true })
+  await writeFile(path.join(alignDir, 'ledger.json'), `${JSON.stringify({
+    version: 1,
+    scope: { upstream: SCOPE, ours: `src/dsh/${SCOPE}` },
+    stats,
+    entries,
+  }, null, 2)}\n`, 'utf8')
+  await writeFile(path.join(alignDir, 'ledger.md'), md, 'utf8')
 }
 
 await main()

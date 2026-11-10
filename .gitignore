@@ -61,3 +61,9 @@ evals/control.json
 evals/results/
 evals/.eval.lock
 evals/*.log
+
+# 上游对齐账本的 JSON 产物：本地/CI 读，不入库。理由有两条——
+# ① 三万行生成物入库后，真实漂移的 diff 会被机器重排淹没；
+# ② 它会变成与 overrides.json 并列的"第二个真源"，出现改 ledger 不改 overrides。
+# 人读的 align/ledger.md 仍入库，过期由 `pnpm align:report --check` 在 CI 拦住。
+align/ledger.json
