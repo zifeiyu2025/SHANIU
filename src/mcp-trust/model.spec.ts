@@ -171,7 +171,7 @@ describe('卡片摘要', () => {
 })
 
 describe('条目注册', () => {
-  it('一份 UI 两个挂载点：plugins.item + 临时 settings.section，挂同一组件', () => {
+  it('只在 plugins.item 挂一次；临时 settings.section 挂载点已删除', () => {
     const registered: { options: Record<string, unknown>; component: unknown }[] = []
     const ctx = {
       effect: (fn: () => void) => { fn() },
@@ -185,9 +185,9 @@ describe('条目注册', () => {
       },
     }
     apply(ctx as never)
-    // 两个挂载点挂同一组件定义 = 同一份数据源与状态，不是复制一份列表 UI。
+    // 插件页详情自带标题层级；settings.section 那条会渲染成没有 h2 的裸页，已删除。
     const connector = registered.filter((entry) => entry.component === McpConnector)
-    expect(connector.map((entry) => entry.options.name)).toEqual(['plugins.item', 'settings.section'])
+    expect(connector.map((entry) => entry.options.name)).toEqual(['plugins.item'])
     for (const entry of connector) {
       expect(entry.options).toMatchObject({ id: 'mcp', locale: 'shaniuMcp' })
       expect((entry.options.label as () => string)()).toBe('label')

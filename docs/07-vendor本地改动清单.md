@@ -25,7 +25,7 @@
 | 5 | `packages/client/ui-primitives/src/AnimatedRows.tsx`、`packages/client/ui-workspace/src/client/rows/WorkspaceBrowser.tsx` | 修复 UIA Expand 导致的渲染进程卡死；补 ARIA 树键盘模型 | Windows 辅助功能树展开会触发上游动画路径的重入；键盘可访问性缺失 | SH-101（ff384d9） |
 | 6 | `packages/client/ui-approval/src/client/ApprovalCard.tsx` | 默认焦点落在「拒绝」；修复 `allow-once` 被记忆为永久放行 | 审批默认必须是安全侧；一次性放行不得降级成 `allow_always` | SH-025（5d5342a） |
 | 7 | `packages/client/ui-settings-general/src/client/{SettingsRoot.module.css,chrome.module.css}` | 设置按钮紧凑化并右对齐 | 用户明确要求；纯样式 | a10cd6c |
-| 8 | `packages/client/ui-settings-models/src/client/ModelsSection.tsx` | 移除模型设置页的 `intro` 段落（2 处） | vendor 导入时即缺失，仓库内无单独提交、原因未记录；同步时按"上游有、我们无"核对，别误当成上游回归 | vendor 导入时、无独立提交 |
+| 8 | `packages/client/ui-settings-models/src/client/ModelsSection.tsx` | 恢复上游的 `intro` 段落（2 处，空态与主态各一）；文案走词典 `intro`（`zh` / `en`），不写在 JSX 里 | 此前 vendor 导入时被移除，导致模型设置页从 `h2` 直接跳到卡片、缺一句页面说明；恢复的是上游原节点，不是新增 | 2026-11-10（v0.2.1 视觉对齐批，04） |
 | 9 | React 19 / 严格类型门禁批次（28 个文件，见下） | 类型级修复：显式返回类型、`useRef` 初值、可选属性收窄、`readonly` 对齐；不改运行行为 | `tsc -b` 恢复零错（原 246 错）；React 19 类型定义更严 | 97b5250 |
 
 第 9 行的文件（全部只做类型修复）：

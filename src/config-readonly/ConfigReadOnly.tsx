@@ -6,7 +6,6 @@
  * 组件、同一条词典键 `configReadOnly`，两处不会出现两套措辞。
  */
 import { useEffect, useState, type ReactNode } from 'react'
-import { StateDot } from '@deepseek-ai/dsh-client-ui-primitives'
 import { tauriBridge } from '../transport/tauri'
 import './config-readonly.css'
 
@@ -33,16 +32,14 @@ export function useConfigReadOnly(): string | null {
 
 /**
  * 只读横幅本体。
+ *
+ * 刻意**不用** `role="alert"`：配置只读是启动时确定的静态状态，每次进设置页都被
+ * 读屏打断是副作用；用普通段落 + 12px 警示色，进入页面即可读到，不抢焦点。
  * @param props.message - 已按词典键 `configReadOnly` 生成的整句（文案只有一份）。
  * @returns 横幅元素。
  */
 export function ConfigReadOnlyNotice({ message }: { readonly message: string }): ReactNode {
-  return (
-    <p className="config-readonly-notice" role="alert">
-      <StateDot state="error" />
-      {message}
-    </p>
-  )
+  return <p className="config-readonly-notice">{message}</p>
 }
 
 /** 通用设置页里的一行：有只读原因才出现，整行就是横幅。 */

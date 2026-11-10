@@ -115,11 +115,13 @@ describe('MCP 连接器：配置只读', () => {
     }
     render(<McpConnector t={t} />)
 
-    const banner = await screen.findByRole('alert')
+    const banner = await screen.findByText(/配置读取失败，已按只读运行/)
     expect(banner.textContent).toContain('配置读取失败，已按只读运行')
     expect(banner.textContent).toContain('不会写回 config.toml')
     // 指向具体行，用户才改得动。
     expect(banner.textContent).toContain('line 12')
+    // 静态状态不用 role="alert"：每次进设置页都打断读屏是副作用。
+    expect(screen.queryByRole('alert')).toBeNull()
   })
 
   it('配置可写时不出现只读横幅', async () => {
@@ -159,9 +161,10 @@ describe('通用设置页：配置只读横幅', () => {
     state.settings = { configReadOnly: '解析配置失败: TOML parse error at line 3, column 1' }
     render(<GeneralConfigReadOnlyRow t={rowT} />)
 
-    const banner = await screen.findByRole('alert')
+    const banner = await screen.findByText(/配置读取失败，已按只读运行/)
     expect(banner.textContent).toContain('配置读取失败，已按只读运行')
     expect(banner.textContent).toContain('line 3')
+    expect(screen.queryByRole('alert')).toBeNull()
   })
 
   it('配置可写时这一行不渲染', async () => {
