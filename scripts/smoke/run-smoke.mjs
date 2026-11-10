@@ -122,11 +122,17 @@ const waitFor = async (expression, timeoutMs, label) => {
   throw new Error(`等待超时 ${timeoutMs}ms：${label}`)
 }
 
-/** 打开工作区文件页：优先点右栏的「文件」标签，退回 Ctrl+P 快捷键 */
+/**
+ * 打开工作区文件页：优先点右栏的文件标签，退回 Ctrl+P 快捷键。
+ * 标签文案随界面语言变（中文「文件」/ 英文「Files」）——CI runner 是英文界面，
+ * 只按中文匹配会让第 4 项永远打不开文件页。
+ */
 const openFilesPage = async () => {
   if (await evalJs(`!!document.querySelector('[data-files-page]')`)) return
   const byTab = await evalJs(`(() => {
-    const tab = [...document.querySelectorAll('[role="tab"]')].find((n) => (n.innerText || '').trim() === '文件')
+    const want = ['文件', 'Files']
+    const tab = [...document.querySelectorAll('[role="tab"]')]
+      .find((n) => want.includes((n.innerText || '').trim()))
     if (!tab) return false
     tab.click()
     return true
@@ -372,7 +378,8 @@ try {
     'PDF 出页',
   )
   await shot('04-pdf')
-  const pdfBroken = /无法显示|无法打开|加载失败|不能预览/.test(pdfState.text)
+  // 界面语言随 runner（中文 / 英文），两种文案都要算"预览失败"
+  const pdfBroken = /无法显示|无法打开|加载失败|不能预览|Failed to load|Cannot display|Unable to (open|load|display)/.test(pdfState.text)
   record('PDF 出页', pdfState.w > 0 && pdfState.h > 0 && !pdfBroken, `w=${pdfState.w} h=${pdfState.h} broken=${pdfBroken} opened=${openedPdf}`)
 
   exitCode = checks.every((c) => c.ok) ? 0 : 1
