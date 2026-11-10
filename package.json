@@ -6,7 +6,7 @@
   "packageManager": "pnpm@12.16.1",
   "scripts": {
     "dev": "vite",
-    "build": "pnpm typecheck && vite build",
+    "build": "pnpm typecheck && vite build && node scripts/check-dist-assets.mjs",
     "typecheck": "tsc -b --force",
     "test": "vitest run",
     "package:portable": "powershell -NoProfile -ExecutionPolicy Bypass -File scripts/package-portable.ps1",

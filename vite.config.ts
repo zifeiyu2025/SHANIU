@@ -1,9 +1,37 @@
 /// <reference types="vitest/config" />
+import { readFileSync, readdirSync } from 'node:fs';
+import { createRequire } from 'node:module';
+import { dirname, join } from 'node:path';
 import { defineConfig } from 'vite';
 import react from '@vitejs/plugin-react';
 import tailwindcss from '@tailwindcss/vite';
 import { dshAliases } from './src/dsh/aliases.ts';
 import { SHANIU_BRAND_NAME } from './src/brand/brand-name.ts';
+
+/**
+ * PDF.js 的 cMap / 标准字体 / wasm 按上游做法全量内联（SH-136）。
+ *
+ * 上游由 tsdown 插件注入 `__DSH_PDFJS_ASSETS__`（`ui-sidebar-documentpreview/tsdown.config.ts`），
+ * 我们的前端走 Vite，没有这个注入点，运行时便抛 `__DSH_PDFJS_ASSETS__ is not defined`。
+ * 这里用同一份目录约定读成 `{kind: {文件名: base64}}`：不在运行时发网络请求，也不引入
+ * 额外静态目录（打包后 `dist` 之外没有可服务路径）。
+ */
+function pdfjsAssets(): string {
+  const root = dirname(createRequire(import.meta.url).resolve('pdfjs-dist/package.json'));
+  const kinds: ReadonlyArray<readonly [string, string]> = [
+    ['cMapUrl', 'cmaps'],
+    ['standardFontDataUrl', 'standard_fonts'],
+    ['wasmUrl', 'wasm'],
+  ];
+  return JSON.stringify(Object.fromEntries(kinds.map(([kind, directory]) => [
+    kind,
+    Object.fromEntries(readdirSync(join(root, directory))
+      .filter((name) => !name.startsWith('LICENSE'))
+      .sort()
+      .map((name) => [name, readFileSync(join(root, directory, name)).toString('base64')])),
+  ])));
+}
+
 
 export default defineConfig({
   plugins: [react(), tailwindcss()],
@@ -15,6 +43,8 @@ export default defineConfig({
       DSH_CLIENT_TITLE: SHANIU_BRAND_NAME,
       DSH_CLIENT_COMMIT_HASH: '',
     }),
+    // SH-136：PDF 预览依赖的构建期资产表，见 `pdfjsAssets()` 注释。
+    __DSH_PDFJS_ASSETS__: pdfjsAssets(),
   },
   resolve: {
     alias: [
