@@ -67,6 +67,9 @@ fn media_type(path: &str) -> Option<&'static str> {
 }
 
 /// 媒体路由可读的根集合（默认工作区 + 额外工作区），顺序稳定、去重、跳过空项。
+///
+/// 每个根都过工作区唯一判据：额外工作区若指到 `data\secrets` 这类位置，媒体路由
+/// 不能成为它的读取通道（即使配置里已经存在这一项）。
 pub fn media_roots_of(config: &AppConfig, data_root: &Path) -> Vec<PathBuf> {
     let mut roots = vec![crate::app_state::workspace_root_of(config, data_root)];
     for profile in &config.workspaces {
@@ -75,6 +78,9 @@ pub fn media_roots_of(config: &AppConfig, data_root: &Path) -> Vec<PathBuf> {
             continue;
         }
         let candidate = PathBuf::from(path);
+        if !crate::config::workspace_gate::check_against(&candidate, data_root).is_allow() {
+            continue;
+        }
         if !roots.contains(&candidate) {
             roots.push(candidate);
         }
@@ -402,5 +408,30 @@ mod tests {
         ];
         let roots = media_roots_of(&config, Path::new("C:\\data"));
         assert_eq!(roots, vec![PathBuf::from("D:\\ws\\default"), PathBuf::from("D:\\ws\\one")]);
+    }
+
+    /// 额外工作区指到数据根/`data\secrets` 时不能成为媒体读取通道。
+    /// 反向对照：去掉判据后 `data\secrets` 会出现在根集合里（该断言必须红）。
+    #[test]
+    fn roots_skip_workspaces_inside_the_data_root() {
+        let base = crate::test_support::TestTempDir::new("media-roots-gate");
+        let data_root = base.join("data");
+        let secrets = data_root.join("secrets");
+        let outside = base.join("outside");
+        let profile = |path: &std::path::Path| crate::config::WorkspaceProfile {
+            id: String::from("w"),
+            path: path.display().to_string(),
+            title: String::new(),
+        };
+        let mut config = AppConfig::default();
+        config.workspace.root = secrets.display().to_string();
+        config.workspaces = vec![profile(&secrets), profile(&data_root), profile(&outside)];
+
+        let roots = media_roots_of(&config, &data_root);
+        assert_eq!(
+            roots,
+            vec![data_root.join(crate::config::WORKSPACE_DIR), outside],
+            "被拒的根既不能当默认，也不能作为额外工作区进入媒体面"
+        );
     }
 }

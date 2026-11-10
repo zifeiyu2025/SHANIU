@@ -160,7 +160,14 @@ pub(crate) fn session_root(state: &AppState, session_id: &str) -> PathBuf {
         .ok()
         .and_then(|v| v.get("config_snapshot")?.get("workspace_root")?.as_str().map(str::to_string))
         .unwrap_or_default();
-    if root.trim().is_empty() { state.workspace_root() } else { PathBuf::from(root) }
+    let root = if root.trim().is_empty() { state.workspace_root() } else { PathBuf::from(root) };
+    // 与 create_session / resume 同一份判据：旧档案里固化的根可能指向旧数据根的祖先
+    // 或 `data\secrets`，读通道不能替它开路。被拒时回落默认根（fail-closed）并留日志。
+    if let Err(reason) = state.check_workspace_root(&root) {
+        tracing::warn!("会话 {session_id} 固化的工作区被拒绝，读通道回落默认根：{reason}");
+        return state.workspace_root();
+    }
+    root
 }
 
 /// 把请求路径归一到根内并确认存在（文件读类）。
@@ -624,6 +631,42 @@ mod tests {
         let nested_absolute = list_dir(&temp.root, temp.root.join("子目录").to_str().unwrap()).expect("绝对子路径可列");
         assert_eq!(nested_absolute.path, "子目录");
         assert!(nested_absolute.entries.is_empty());
+    }
+
+    /// 档案里固化的根指向数据根内部（`data\secrets`）时必须回落默认根：
+    /// 读通道与 `create_session` / resume 共用同一份判据，旧档案不能替越界路径开路。
+    /// 反向对照：去掉 `session_root` 里的 `check_workspace_root` 后本用例会返回
+    /// `<data>\secrets` 而不是默认工作区，断言失败。
+    #[test]
+    fn archived_workspace_into_data_root_falls_back_to_default_root() {
+        let dir = crate::test_support::TestTempDir::new("wsf-archive");
+        let data_root = dir.join("data");
+        let state = AppState::new(
+            crate::config::AppConfig::default(),
+            dir.join("config.toml"),
+            data_root.clone(),
+        );
+        let rollouts = data_root.join(crate::rollout::ROLLOUT_DIR);
+        std::fs::create_dir_all(&rollouts).expect("rollout 目录可建");
+        let write_meta = |id: &str, root: &Path| {
+            let meta = serde_json::json!({
+                "config_snapshot": { "workspace_root": root.display().to_string() },
+            });
+            std::fs::write(rollouts.join(format!("{id}.jsonl")), format!("{meta}\n"))
+                .expect("档案可写");
+        };
+        write_meta("bad", &data_root.join(crate::config::SECRETS_DIR));
+        write_meta("good", &dir.join("elsewhere"));
+        assert_eq!(
+            session_root(&state, "bad"),
+            state.workspace_root(),
+            "指向数据根内部的档案根必须回落默认工作区"
+        );
+        assert_eq!(
+            session_root(&state, "good"),
+            dir.join("elsewhere"),
+            "数据根之外的合法档案根仍按档案返回，不能一律回落"
+        );
     }
 
     #[test]

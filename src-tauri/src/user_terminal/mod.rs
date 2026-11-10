@@ -137,7 +137,16 @@ pub struct UserTerminalManager {
 
 impl UserTerminalManager {
     /// 启动一个终端；`sink` 接收输出与退出事件。
-    fn open(&self, request: OpenRequest, sink: Arc<dyn FrameSink>) -> Result<TerminalInfo, String> {
+    ///
+    /// `cwd` 由调用方（组合根的命令壳）解析好再传进来：起始目录要过工作区唯一判据，
+    /// 而判据住在 `config`/`app_state` 层——本模块按 E57 保持零 crate 内依赖
+    /// （与 `session_export` 同处理：越界判定放在组合根，模块只做终端本身）。
+    fn open(
+        &self,
+        request: OpenRequest,
+        sink: Arc<dyn FrameSink>,
+        cwd: PathBuf,
+    ) -> Result<TerminalInfo, String> {
         validate_id(&request.id)?;
         let shells = shells();
         let shell = request
@@ -145,7 +154,6 @@ impl UserTerminalManager {
             .as_deref()
             .and_then(|path| shells.iter().find(|option| option.path.eq_ignore_ascii_case(path)))
             .unwrap_or_else(|| &shells[0]);
-        let cwd = resolve_cwd(request.cwd.as_deref());
         let cols = request.cols.unwrap_or(80).clamp(20, 500);
         let rows = request.rows.unwrap_or(24).clamp(5, 500);
         let title = request
@@ -367,15 +375,33 @@ fn validate_id(id: &str) -> Result<(), String> {
     Ok(())
 }
 
-/// 起始目录：请求里的目录存在就用它，否则退回宿主当前目录（不阻断启动）。
-fn resolve_cwd(requested: Option<&str>) -> PathBuf {
+/// 起始目录：请求里的目录存在且**过工作区唯一判据**就用它，否则退回默认工作区。
+///
+/// 终端本身是"给人用"的裸进程（能自己 cd 到任何地方），但**起始目录**不能是数据根
+/// 或它的祖先/兄弟目录——否则右键打开终端时默认 cwd 恰好是档案与凭据所在处。
+/// 判据由组合根注入（`is_allowed`），本模块不引用 `config`/`app_state`。
+pub fn resolve_cwd(
+    requested: Option<&str>,
+    default_root: &Path,
+    is_allowed: impl Fn(&Path) -> Result<(), String>,
+) -> PathBuf {
     if let Some(value) = requested {
         let path = Path::new(value);
-        if path.is_dir() {
+        if path.is_dir() && is_allowed(path).is_ok() {
             return path.to_path_buf();
         }
     }
-    std::env::current_dir().unwrap_or_else(|_| PathBuf::from("."))
+    default_root.to_path_buf()
+}
+
+/// 组合根的命令壳入口：解析会话工作区（默认工作区）并绑上 Tauri 事件 sink。
+pub fn open_with_cwd(
+    app: &AppHandle,
+    manager: &UserTerminalManager,
+    request: OpenRequest,
+    cwd: PathBuf,
+) -> Result<TerminalInfo, String> {
+    manager.open(request, Arc::new(TauriFrameSink(app.clone())), cwd)
 }
 
 /// 探测可用 shell：cmd 恒有；`pwsh.exe` 找不到就不提供（不假装支持）。
@@ -473,15 +499,6 @@ pub fn user_terminal_shells() -> Vec<ShellOption> {
 }
 
 #[tauri::command]
-pub fn user_terminal_open(
-    app: AppHandle,
-    state: State<'_, UserTerminalManager>,
-    request: OpenRequest,
-) -> Result<TerminalInfo, String> {
-    state.open(request, Arc::new(TauriFrameSink(app)))
-}
-
-#[tauri::command]
 pub fn user_terminal_write(
     state: State<'_, UserTerminalManager>,
     id: String,
@@ -544,6 +561,35 @@ mod tests {
         }
     }
 
+    /// 测试的起始目录：当前目录真实存在即可；起始目录判据另有专门用例。
+    fn test_cwd() -> PathBuf {
+        std::env::current_dir().expect("当前目录可读")
+    }
+
+    /// 起始目录的唯一判据由调用方注入：被拒时退回默认根，不阻断终端启动。
+    /// 反向对照：去掉 `is_allowed` 后"存在但被拒"那条会返回请求目录，用例红。
+    #[test]
+    fn resolve_cwd_falls_back_when_the_candidate_is_rejected() {
+        let existing = std::env::temp_dir();
+        let here = existing.to_str().expect("临时目录可转字符串");
+        let fallback = Path::new("C:\\fallback");
+        assert_eq!(
+            resolve_cwd(Some(here), fallback, |_: &Path| Ok(())),
+            existing,
+            "存在且放行的目录直接用作起始目录"
+        );
+        assert_eq!(
+            resolve_cwd(Some(here), fallback, |_: &Path| Err(String::from("数据根内部"))),
+            fallback.to_path_buf(),
+            "存在但被拒的目录必须回落，不能把数据根内部当起始目录"
+        );
+        assert_eq!(
+            resolve_cwd(Some(r"C:\definitely-missing-cwd"), fallback, |_: &Path| Ok(())),
+            fallback.to_path_buf(),
+            "不存在的目录不能被当成起始目录"
+        );
+    }
+
     /// 用户终端唯一的出口是本模块的 `FrameEvent`：输出/退出都只能是这两种形态。
     #[test]
     fn terminal_output_only_leaves_through_user_terminal_frames() {
@@ -561,6 +607,7 @@ mod tests {
                     title: None,
                 },
                 sink.clone(),
+                test_cwd(),
             )
             .expect("启动用户终端");
         manager
@@ -654,6 +701,7 @@ mod tests {
                     title: None,
                 },
                 sink,
+                test_cwd(),
             )
             .expect("启动用户终端");
         assert_eq!(manager.active_count(), 1, "开一个终端后应为 1");
@@ -680,6 +728,7 @@ mod tests {
                         title: None,
                     },
                     sink.clone(),
+                    test_cwd(),
                 )
                 .expect("启动用户终端");
         }
@@ -711,6 +760,7 @@ mod tests {
                     title: None,
                 },
                 sink.clone(),
+                test_cwd(),
             )
             .expect("启动用户终端");
         assert_eq!(manager.active_count(), 1);

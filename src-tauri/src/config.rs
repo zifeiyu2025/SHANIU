@@ -25,6 +25,8 @@ pub mod model_catalog;
 pub mod builtin_providers;
 /// 同 `<data_root>` 单实例保护：命名互斥体按数据目录 hash 区分（2026-11-11）。
 pub mod single_instance;
+/// 工作区根唯一判据：等于/祖先/数据根内兄弟目录一律拒绝（任务 7，2026-11-11）。
+pub mod workspace_gate;
 
 pub const DATA_DIR_ENV: &str = "SHANIU_DATA_DIR";
 pub const PORTABLE_MARKER: &str = "portable.marker";
@@ -1276,13 +1278,18 @@ pub struct ProductDirsView {
 /// 启动时提前创建产品目录结构（幂等，docs §9.1/§9.2）。
 ///
 /// 配置侧：`secrets\` / `settings-backup\`；数据侧：`sessions\` / `rollouts\` /
-/// `logs\` / `cache\` / `crash\` 与默认工作区 `Workspace\`。便携模式下两侧根相同，
-/// 逐名创建互不影响。失败即报错：后续写路径不该带着一个建不出来的根继续跑。
+/// `logs\` / `cache\` / `crash\`。便携模式下两侧根相同，逐名创建互不影响。
+/// 失败即报错：后续写路径不该带着一个建不出来的根继续跑。
+///
+/// **默认工作区 `Workspace\` 不在这里建**：用户配置了别的根时它根本不会被使用，
+/// 无条件创建会在数据根里留一个空目录（还容易被误认成"正在用的工作区"）。
+/// 由启动层在"确实以默认根工作"时创建（`run()` 里按 `AppState::workspace_root`
+/// 判定），失败同样报错。
 pub fn ensure_product_dirs(dirs: &DataDirs) -> Result<(), String> {
     for name in [SECRETS_DIR, SETTINGS_BACKUP_DIR] {
         create_subdir(&dirs.config_root, name)?;
     }
-    for name in [SESSIONS_DIR, ROLLOUTS_DIR, LOGS_DIR, CACHE_DIR, CRASH_DIR, WORKSPACE_DIR] {
+    for name in [SESSIONS_DIR, ROLLOUTS_DIR, LOGS_DIR, CACHE_DIR, CRASH_DIR] {
         create_subdir(&dirs.data_root, name)?;
     }
     Ok(())
@@ -1654,6 +1661,15 @@ fn write_record(path: &Path, record: &DataRootRecord) -> Result<(), String> {
 
 /// 进程内唯一的数据根解析结果（`run()` 第一步初始化；之后的调用都读这一份）。
 static ROOT_RESOLUTION: OnceLock<RootResolution> = OnceLock::new();
+
+/// 当前进程的数据根（未初始化时 `None`）。
+///
+/// 给"不持有 `AppState`、又必须判断路径是否落在数据根内"的地方用（工作区判据、
+/// 沙箱 ACL 兜底）。生产启动路径一定先调用 `init_root_resolution*`，所以拿到的
+/// 就是本次实际使用的目录；单元测试直接调判据时走显式传参的 `check_against`。
+pub fn current_data_root() -> Option<&'static Path> {
+    ROOT_RESOLUTION.get().map(|resolution| resolution.dirs.data_root.as_path())
+}
 
 /// 真实启动入口（不带交互）：读记录 → 只在没有记录时判定一次 → 需要时落记录。
 /// 便携目录不可写时只返回提示（`fallback_to_installed`），由调用方决定是否询问用户。
@@ -2829,9 +2845,15 @@ mod tests {
         for name in [SECRETS_DIR, SETTINGS_BACKUP_DIR] {
             assert!(installed.config_root.join(name).is_dir(), "缺少配置侧目录 {name}");
         }
-        for name in [SESSIONS_DIR, ROLLOUTS_DIR, LOGS_DIR, CACHE_DIR, CRASH_DIR, WORKSPACE_DIR] {
+        for name in [SESSIONS_DIR, ROLLOUTS_DIR, LOGS_DIR, CACHE_DIR, CRASH_DIR] {
             assert!(installed.data_root.join(name).is_dir(), "缺少数据侧目录 {name}");
         }
+        // 默认工作区**不再**随目录结构无条件创建：配置了别的根时它不会被使用，
+        // 留着空目录只会被误认成"正在用的工作区"。由启动层在确实以默认根工作时创建。
+        assert!(
+            !installed.data_root.join(WORKSPACE_DIR).exists(),
+            "ensure_product_dirs 不该创建默认工作区"
+        );
         // 默认工作区落在数据根下的 Workspace
         assert_eq!(installed.workspace_root(), installed.data_root.join(WORKSPACE_DIR));
 
@@ -2842,7 +2864,7 @@ mod tests {
         };
         ensure_product_dirs(&portable).unwrap();
         ensure_product_dirs(&portable).unwrap();
-        assert!(portable.workspace_root().is_dir());
+        assert!(!portable.workspace_root().exists(), "默认工作区同样不在这一步创建");
         assert!(portable.config_root.join(SECRETS_DIR).is_dir());
     }
 

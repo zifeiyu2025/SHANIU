@@ -178,9 +178,15 @@ fn continue_session(
         reasoning: None,
     });
 
-    // 会话绑定的工作区在建档时固化（SH-099）：resume 时从档案 meta 带出来，
-    // 工具沙箱与文件工具的作用域跟随原目录而不是全局默认根。
-    let session_workspace = PathBuf::from(&resumed.workspace_root);
+    // resume 复检：档案里的旧根可能指向旧版数据根/它的祖先，按**当前**数据根重判。
+    // 命中即 fail-closed（`resume_workspace`），不拿它跑任务，也不静默改成默认根
+    // ——那会让用户以为还在原目录。
+    let archived_workspace = PathBuf::from(&resumed.workspace_root);
+    let session_workspace = if archived_workspace.as_os_str().is_empty() {
+        archived_workspace
+    } else {
+        state.resume_workspace(&archived_workspace)?
+    };
     // 会话档位：档案里的最后一条事件优先；草稿态（还没建档时先切了档）次之；
     // 都没有就跟随部署默认。
     // 取走草稿（无论是否采用都清掉，避免陈旧选择贴到以后的同名任务上）。
@@ -914,6 +920,11 @@ fn create_workspace(
             "工作区路径 {raw} 不是目录"
         )));
     }
+    // 与默认工作区、新建会话走同一份判据：注册表里不许出现指向数据根/`data\secrets`
+    // 的条目，否则侧栏添加一次就把整条读取通道打开了。
+    state
+        .check_workspace_root(&canonical)
+        .map_err(WorkspaceOpError::InvalidPath)?;
     let canonical_str = tool_router::shell_usable(&canonical).to_string_lossy().to_string();
     let cfg = state.config();
     if !cfg.workspace.hidden
@@ -1066,6 +1077,9 @@ fn create_session(
             if !root.is_dir() {
                 return Err(format!("工作区路径不存在或不是目录: {path}"));
             }
+            // 唯一判据：数据根本身/祖先/`data\secrets` 这类兄弟目录一律拒绝——
+            // 会话工作区一旦指过去，模型就能顺着文件工具读到档案与凭据。
+            state.check_workspace_root(&root)?;
             root.canonicalize().map(|p| tool_router::shell_usable(&p)).unwrap_or(root)
         }
         None => state.workspace_root(),
@@ -1575,7 +1589,17 @@ fn save_settings(
             return Err(format!("active_provider 指不到任何服务商：{target}"));
         }
     }
-    cfg.workspace.root = workspace_root;
+    // 工作区根先过唯一判据再落盘：保存成功即代表"下次启动会用它跑任务"，所以这里
+    // 必须在写入前拒绝，而不是等启动时再悄悄回落。空串 = 使用默认目录。
+    let trimmed_root = workspace_root.trim().to_string();
+    if !trimmed_root.is_empty() {
+        let candidate = std::path::PathBuf::from(&trimmed_root);
+        if !candidate.is_absolute() {
+            return Err(format!("工作区路径必须是绝对路径: {trimmed_root}"));
+        }
+        state.check_workspace_root(&candidate)?;
+    }
+    cfg.workspace.root = trimmed_root;
     // 安全面两档：None = 不改，所以旧调用形态（不传这两个键）行为完全不变。
     // 非法值必须报错而不是静默保留旧值——"点了保存却没生效、界面还显示旧档位"是安全
     // 设置里最坏的一类失败：用户会以为自己已经收紧（或放宽）了，实际什么都没变。
@@ -1600,6 +1624,24 @@ fn save_settings(
         }
     }
     Ok(())
+}
+
+/// 右侧栏终端的启动入口（组合根命令壳）。
+///
+/// 起始目录在这里解析：优先用请求给的目录，但它必须真实存在**且过工作区唯一判据**；
+/// 否则回落当前会话的默认工作区。判定不复制——只调 `AppState::check_workspace_root`。
+/// 终端模块本身按 E57 保持零 crate 内依赖（同 `session_export` 的处理方式）。
+#[tauri::command]
+fn user_terminal_open(
+    app: tauri::AppHandle,
+    state: tauri::State<'_, user_terminal::UserTerminalManager>,
+    host: tauri::State<'_, AppState>,
+    request: user_terminal::OpenRequest,
+) -> Result<user_terminal::TerminalInfo, String> {
+    let cwd = user_terminal::resolve_cwd(request.cwd.as_deref(), &host.workspace_root(), |path| {
+        host.check_workspace_root(path)
+    });
+    user_terminal::open_with_cwd(&app, &state, request, cwd)
 }
 
 /// 在系统文件管理器里打开一个目录（会话头部「资源管理器」按钮的后端）。
@@ -1769,6 +1811,9 @@ fn export_session_log(
 }
 
 /// 已注册的工作区根：默认工作区 + 配置里的额外工作区（审计 H2 批 2）。
+///
+/// 额外工作区过唯一判据：被拒的项不进入可写边界（否则审计面的"仅已注册"会被
+/// 一条指向 `data\secrets` 的配置绕过）。
 fn registered_workspace_roots(state: &AppState) -> Vec<std::path::PathBuf> {
     let mut roots = vec![state.workspace_root()];
     roots.extend(
@@ -1778,7 +1823,8 @@ fn registered_workspace_roots(state: &AppState) -> Vec<std::path::PathBuf> {
             .iter()
             .map(|workspace| workspace.path.trim().to_string())
             .filter(|path| !path.is_empty())
-            .map(std::path::PathBuf::from),
+            .map(std::path::PathBuf::from)
+            .filter(|candidate| state.check_workspace_root(candidate).is_ok()),
     );
     roots
 }
@@ -2333,6 +2379,25 @@ pub fn run() {
     if let config::ConfigLoadOutcome::ReadOnly { reason } = &loaded.outcome {
         app_state.mark_config_read_only(reason.clone());
     }
+    // 默认工作区只在"这次真的以默认根工作"时创建：配置了合法自定义根时不再在数据根里
+    // 留一个永远不会被使用的空 `Workspace\`（那还会被误认成正在用的目录）。
+    if app_state.workspace_root() == dirs.workspace_root() {
+        if let Err(error) = std::fs::create_dir_all(dirs.workspace_root()) {
+            let message = format!(
+                "创建默认工作区失败 {}: {error}",
+                dirs.workspace_root().display()
+            );
+            eprintln!("[SHANIU] {message}");
+            show_native_message(&message);
+            std::process::exit(2);
+        }
+    }
+    // 配置里的工作区根被唯一判据拒绝：本次已回落默认根，但必须明确告诉用户
+    // （不静默改配置、不静默换成默认值——用户会以为任务跑在原目录）。
+    if let Some(message) = app_state.workspace_rejection() {
+        tracing::warn!("工作区设置不可用，本次已回落默认工作区：{message}");
+        show_native_message(&format!("工作区设置不可用\n\n{message}"));
+    }
 
     tauri::Builder::default()
         .plugin(tauri_plugin_dialog::init())
@@ -2423,7 +2488,7 @@ pub fn run() {
             mcp_revoke_trust,
             mcp_revoke_exemption,
             user_terminal::user_terminal_shells,
-            user_terminal::user_terminal_open,
+            user_terminal_open,
             user_terminal::user_terminal_write,
             user_terminal::user_terminal_resize,
             user_terminal::user_terminal_close,

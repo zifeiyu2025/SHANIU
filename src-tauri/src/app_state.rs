@@ -54,6 +54,9 @@ pub struct AppState {
     /// 上面那把锁不可用时的回落根（不可变，永远可读）：宁可只放行默认工作区，
     /// 也不在请求线程上退回 `config()` 的读锁。
     fallback_root: PathBuf,
+    /// 配置里的工作区根被唯一判据拒绝时的说明（配置变更时刷新）。
+    /// Some = 本次回落到默认根，UI 必须显式提示；**不写回配置文件**，等用户重选。
+    workspace_rejection: RwLock<Option<String>>,
 }
 
 impl AppState {
@@ -71,6 +74,7 @@ impl AppState {
         let broker = Arc::new(ApprovalBroker::new());
         // 回落根在构造时就算好并保持不可变：请求线程不碰配置锁（SH-135 D17）。
         let fallback_root = workspace_root_of(&config, &data_root);
+        let workspace_rejection = workspace_rejection_of(&config, &data_root);
         let state = Self {
             config: RwLock::new(config),
             config_path: RwLock::new(config_path),
@@ -89,6 +93,7 @@ impl AppState {
             save_tickets: crate::session_export::SaveTicketStore::new(),
             media_roots: RwLock::new(Vec::new()),
             fallback_root,
+            workspace_rejection: RwLock::new(workspace_rejection),
         };
         state.refresh_derived_policy(None);
         state.refresh_media_roots();
@@ -127,6 +132,43 @@ impl AppState {
     /// 未设置时恰好相同，但不要据此把两处判据合并——合并后配置一非空就分叉。
     pub fn workspace_root(&self) -> PathBuf {
         workspace_root_of(&self.config(), &self.data_root)
+    }
+
+    /// 工作区根的唯一写入口校验：所有把外部路径变成"工作区根"的命令都必须先过这里
+    /// （设置保存、新建会话、resume 复检、额外工作区注册）。判定只有
+    /// `config::workspace_gate::check_against` 一份，本方法不复制规则，只补错误文案。
+    pub fn check_workspace_root(&self, candidate: &std::path::Path) -> Result<(), String> {
+        crate::config::workspace_gate::check_against(candidate, &self.data_root)
+            .rejection()
+            .map(|reason| reason.message(candidate, &self.data_root))
+            .map_or(Ok(()), Err)
+    }
+
+    /// 启动/配置变更时被拒绝的工作区根说明（None = 配置合法或未配置）。
+    pub fn workspace_rejection(&self) -> Option<String> {
+        self.workspace_rejection
+            .read()
+            .expect("workspace_rejection 锁中毒")
+            .clone()
+    }
+
+    /// 配置换了就重算一次拒绝说明：外部改 config.toml 后热重载也要给出同样的提示，
+    /// 不能只在首次构造时算一遍（那会让"改了配置却没提示"重新出现）。
+    fn refresh_workspace_rejection(&self) {
+        let next = workspace_rejection_of(&self.config(), &self.data_root);
+        *self
+            .workspace_rejection
+            .write()
+            .expect("workspace_rejection 锁中毒") = next;
+    }
+
+    /// resume 复检：档案里固化的工作区根按**当前**数据根重判，命中即 fail-closed。
+    /// 返回错误而不是悄悄换成默认根——换成默认根会让用户以为任务还在原目录跑。
+    pub fn resume_workspace(&self, archived: &Path) -> Result<PathBuf, String> {
+        self.check_workspace_root(archived).map_err(|reason| {
+            format!("会话固定的工作区不可用：{reason}\n请从工作区列表重新选择后再继续该会话。")
+        })?;
+        Ok(archived.to_path_buf())
     }
 
     /// `/api/file` 可读根集合的快照（SH-135）。
@@ -180,6 +222,7 @@ impl AppState {
         }
         self.refresh_derived_policy(None);
         self.refresh_media_roots();
+        self.refresh_workspace_rejection();
         Ok(())
     }
 
@@ -307,12 +350,37 @@ impl<F: FnOnce()> Drop for TaskSlotGuard<F> {
 ///
 /// 抽出来是因为媒体路由的根集合要在构造时（还没有 `&self`）算一次回落值，
 /// 两处必须同一个判据，否则"配置空"时默认根会分叉。
+///
+/// **配置值必须过唯一判据**（`config::workspace_gate`）：`[workspace].root` 指到数据根
+/// 本身/祖先/`data\secrets` 这类位置时不能拿它跑任务，否则模型能顺着工作区读到会话
+/// 档案与凭据。被拒时这里回落到真正的默认根；拒绝原因由 `AppState::workspace_rejection`
+/// 显式告诉用户（不静默吞掉）。
 pub(crate) fn workspace_root_of(config: &AppConfig, data_root: &Path) -> PathBuf {
     let configured = config.workspace.root.trim();
     if !configured.is_empty() {
-        return PathBuf::from(configured);
+        let candidate = PathBuf::from(configured);
+        if crate::config::workspace_gate::check_against(&candidate, data_root).is_allow() {
+            return candidate;
+        }
     }
     data_root.join(crate::config::WORKSPACE_DIR)
+}
+
+/// 配置里的工作区根被唯一判据拒绝时的**可展示说明**；没配置或合法则为 `None`。
+fn workspace_rejection_of(config: &AppConfig, data_root: &Path) -> Option<String> {
+    let configured = config.workspace.root.trim();
+    if configured.is_empty() {
+        return None;
+    }
+    let candidate = PathBuf::from(configured);
+    let rejection = crate::config::workspace_gate::check_against(&candidate, data_root)
+        .rejection()
+        .copied()?;
+    Some(format!(
+        "{}\n\n本次已改用默认工作区：{}。请到设置里重新选择工作区。",
+        rejection.message(&candidate, data_root),
+        data_root.join(crate::config::WORKSPACE_DIR).display()
+    ))
 }
 
 #[cfg(test)]
@@ -482,5 +550,49 @@ mod tests {
         cfg.workspace.root = "D:/tmp/ws".into();
         s.update_config(cfg).unwrap();
         assert_eq!(s.workspace_root(), PathBuf::from("D:/tmp/ws"));
+    }
+
+    /// 唯一判据的入口面：数据根/祖先/`data\secrets` 一律拒绝，默认工作区放行。
+    /// 反向对照：不接判据时 `data\secrets` 会被当成合法工作区（该断言必须红）。
+    #[test]
+    fn workspace_root_rejects_data_root_ancestor_and_secrets() {
+        let (_dir, s) = state();
+        let data_root = s.data_root();
+        let ancestor = data_root.parent().unwrap().to_path_buf();
+        let secrets = data_root.join(crate::config::SECRETS_DIR);
+        for candidate in [data_root.clone(), ancestor, secrets.clone()] {
+            assert!(
+                s.check_workspace_root(&candidate).is_err(),
+                "{} 必须被拒",
+                candidate.display()
+            );
+        }
+        assert!(
+            s.check_workspace_root(&data_root.join(crate::config::WORKSPACE_DIR).join("proj")).is_ok(),
+            "默认工作区的子目录必须放行"
+        );
+
+        // 配置里指向 data\secrets：运行时回落默认根，并留下可展示说明（不静默）。
+        let mut cfg = s.config();
+        cfg.workspace.root = secrets.display().to_string();
+        s.update_config(cfg).unwrap();
+        assert_eq!(
+            s.workspace_root(),
+            data_root.join(crate::config::WORKSPACE_DIR),
+            "被拒的根不能拿来跑任务"
+        );
+        let message = s.workspace_rejection().expect("必须留下说明");
+        assert!(message.contains("重新选择工作区"), "{message}");
+    }
+
+    /// resume 复检：旧档案命中祖先/兄弟目录必须 fail-closed，合法根原样返回。
+    #[test]
+    fn resume_workspace_fails_closed_for_archived_roots() {
+        let (_dir, s) = state();
+        let bad = s.data_root().join("secrets");
+        let error = s.resume_workspace(&bad).expect_err("resume 必须拒绝");
+        assert!(error.contains("请从工作区列表重新选择"), "{error}");
+        let good = s.data_root().join(crate::config::WORKSPACE_DIR).join("proj");
+        assert_eq!(s.resume_workspace(&good).unwrap(), good);
     }
 }
