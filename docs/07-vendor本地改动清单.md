@@ -28,6 +28,15 @@
 | 8 | `packages/client/ui-settings-models/src/client/ModelsSection.tsx` | 恢复上游的 `intro` 段落（2 处，空态与主态各一）；文案走词典 `intro`（`zh` / `en`），不写在 JSX 里 | 此前 vendor 导入时被移除，导致模型设置页从 `h2` 直接跳到卡片、缺一句页面说明；恢复的是上游原节点，不是新增 | 2026-11-10（v0.2.1 视觉对齐批，04） |
 | 9 | React 19 / 严格类型门禁批次（28 个文件，见下） | 类型级修复：显式返回类型、`useRef` 初值、可选属性收窄、`readonly` 对齐；不改运行行为 | `tsc -b` 恢复零错（原 246 错）；React 19 类型定义更严 | 97b5250 |
 | 10 | `packages/client/ui-layout/src/client/AppFrame.tsx` | `inert: 条件 ? '' : undefined` → `inert: 条件`（5 处） | React 19 已按布尔处理 `inert`；空串写法在新类型定义下不合法，语义等价，属 React 19 兼容修复 | 2026-11-10（0.2.2 类型门禁） |
+| 11 | `packages/client/ui-permission-presets/src/client/locales.ts` | 在 8 套语言词典里各加 `preset.readOnly/workspaceWrite/fullAccess.description` 三键（共 24 条） | 三档的说明行是 UI 文案；此前由宿主目录下发（只有中文），en/ja/… 界面会串中文 | e9166a9（P3-16）。**同步上游时**：上游若已把这三句收进自身词典，删本地 24 条改指上游键；若上游改了预设机器值（`read-only` / `workspace-write`），`PRESET_DESCRIPTION_KEYS` 的映射必须同步 |
+| 12 | `packages/client/ui-permission-presets/src/client/presentation.ts` | 新增 `PermissionPresetDescriptionKey`、`PRESET_DESCRIPTION_KEYS`、`DEFAULT_PRESET_DESCRIPTIONS`、`displayPermissionPresetDescription()`（词典缺失时回落 en 原文） | 把「挡位机器值 → 词典键」的映射与回落收在一处，UI 不必各自判断内置/自定义 | 同上。**同步上游时**：上游若自带等价映射函数，删本地实现改调上游；保留则只跟随键名变化 |
+| 13 | `packages/client/ui-permission-presets/src/client/index.ts` | 新增 `presetDetail()`：下拉 `detail` 走词典，只有词典不认得的自定义挡位才回落宿主 `description` | 让宿主串只出现在兜底分支；否则删掉 `description` 后自定义挡位的说明会被一起吞掉 | 同上 |
+| 14 | `packages/client/ui-permission-presets/src/client/PermissionSelect.tsx` | `optionDescription()` 从「只有 Auto 走词典」改为「Auto 走 `auto.description`，其余内置挡位走 `displayPermissionPresetDescription()`，自定义挡位回落宿主描述」 | 芯片 tooltip 与下拉必须同一取文案规则，否则同一挡位在两处说法不同（一处中文一处英文） | 同上。**同步上游时**：上游若已统一取文案，删本地函数改调上游 |
+| 15 | `packages/client/ui-settings-general/src/client/index.ts` | 新增 `ctx.provide('settingsShell', { openSection })`，并把返回的 `disposeShell()` 加进拆卸函数 | 宿主「模型配置」座位（`src/model-config/`）要能直达设置-模型分段；上游只有 `settings.open` 快捷键，没有「打开到某分段」的入口 | b61d5e0。**同步上游时**：上游若提供等价入口，删本地服务并改调用方；保留时必须确认拆卸链仍调用 `disposeShell`（漏了会跨会话泄漏服务句柄） |
+| 16 | `packages/spill/spill/src/types.ts` | `@deepseek-ai/dsh-session` → `@deepseek-ai/dsh-session/types` | 宿主域/浏览器域拆分后，包根入口把 Node 侧类型带进 client 编译域，`tsc -b` 报错 | 97b5250（类型门禁）。**同步上游时**：上游若已提供 browser-safe 子路径，按其路径改；否则保留 |
+| 17 | `packages/web/web/src/types.ts` | `@deepseek-ai/dsh-llm` → `@deepseek-ai/dsh-llm/error` | 同上：只取 `HarnessError`，不拖入根入口的 Node 侧导出 | 97b5250。同上 |
+| 18 | `packages/util/time/src/rrule.ts` | `import rrulePackage from 'rrule'` + 解构 → `import { Weekday, rrulestr } from 'rrule'`（含注释说明） | 上游依赖自家打包器做 CJS 互操作；SHANIU 的 Vite/rolldown 解析到 rrule 的 ESM 构建（只有命名导出），默认导入拿到 `undefined`，构建期即红 | a6da7e0。**同步上游时**：上游若改成命名导入，删本地改动；若上游仍用默认导入，保留（否则构建失败） |
+| 19 | `packages/util/official-bundles/src/plugin-manager.ts` | `PROTECTED_PLUGINS` 去掉 `@deepseek-ai/dsh-client-ui-settings-plugin-inventory` | 该包已按「设置只留通用 + 模型」删除；保护清单留着不存在的名字，会让「受保护插件」判断指向空气 | b1f9fa7。**同步上游时**：上游若也删了该包，两边一致、无需保留；若上游重新引入，先确认是否要恢复名单 |
 
 第 9 行的文件（全部只做类型修复）：
 
