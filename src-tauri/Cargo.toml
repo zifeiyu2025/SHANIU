@@ -112,6 +112,9 @@ unicode-normalization = "0.1"
 # SH-060 输出包裹 nonce：server 不可预测的 128 位随机数，必须取 OS 熵。
 # MIT/Apache-2.0；lock 里已有同名 crate（0.3.4），这里提升为直接依赖。
 getrandom = "0.3"
+# SH-135 `/api/file` 媒体路由：查询串里 `path` 参数只解码一次（前端已 encodeURIComponent）。
+# MIT/Apache-2.0；tauri 的传递依赖里已有 2.x，这里提升为直接依赖。
+percent-encoding = "2"
 
 [dev-dependencies]
 # 取消类用例的时序断言改走虚拟时钟（`#[tokio::test(start_paused = true)]`，SH-134 的

@@ -79,6 +79,7 @@ $allow = @{
     'user_terminal'   = @()                                                           # E57（SH-071 右侧栏独立终端：只依赖 portable_pty/windows/std，不进沙箱与模型通道）
     'test_support'    = @()                                                           # E58（测试夹具：只依赖 std/ulid；仅测试路径可反向依赖它，见下方窄豁免）
     'images'          = @()                                                           # E59（SH-072 图片引用与字节缓存：只依赖 serde/base64/std 的共享叶子）
+    'media_route'     = @('tool_router', 'workspace_files', 'app_state')              # E60（SH-135 /api/file 媒体路由：越界判定复用 resolve_in_workspace、上限复用 MAX_FILE_BYTES、命令壳经 tauri::State 取装配状态；config 属 infra 全局放行）
 }
 # rollout 已落地（SH-030）：它只借用 model_client 的 HistoryItem 作为条目载荷，
 # 不反向依赖循环或工具层——档案是被读写的对象，不是参与者。

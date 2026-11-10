@@ -1,6 +1,6 @@
 //! 全局状态（tauri::State 管理）：配置 + 会话运行时（活动任务取消令牌）。
 
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU32, Ordering};
 use std::sync::{Arc, Mutex, RwLock};
 
@@ -48,6 +48,12 @@ pub struct AppState {
     /// 「另存为」票据（审计 H2 批 1）：`export_session_log` 的 `dest` 不再收路径，
     /// 只收这里签发的随机票据，确保只能写用户本人在原生对话框里选过的位置。
     pub save_tickets: crate::session_export::SaveTicketStore,
+    /// `/api/file` 媒体路由可读的根集合快照（SH-135）：启动时算一次，配置写成功后刷新。
+    /// 请求线程只 `try_read` 这份缓存，**不等**配置锁——否则图片请求会和设置页保存互锁。
+    media_roots: RwLock<Vec<PathBuf>>,
+    /// 上面那把锁不可用时的回落根（不可变，永远可读）：宁可只放行默认工作区，
+    /// 也不在请求线程上退回 `config()` 的读锁。
+    fallback_root: PathBuf,
 }
 
 impl AppState {
@@ -63,6 +69,8 @@ impl AppState {
             },
         ));
         let broker = Arc::new(ApprovalBroker::new());
+        // 回落根在构造时就算好并保持不可变：请求线程不碰配置锁（SH-135 D17）。
+        let fallback_root = workspace_root_of(&config, &data_root);
         let state = Self {
             config: RwLock::new(config),
             config_path: RwLock::new(config_path),
@@ -79,8 +87,11 @@ impl AppState {
             probing: Arc::new(crate::capability::Inflight::default()),
             draft_sandbox: Mutex::new(std::collections::HashMap::new()),
             save_tickets: crate::session_export::SaveTicketStore::new(),
+            media_roots: RwLock::new(Vec::new()),
+            fallback_root,
         };
         state.refresh_derived_policy(None);
+        state.refresh_media_roots();
         state
     }
 
@@ -111,11 +122,28 @@ impl AppState {
     /// 浏览器数据与整份用户资料——范围远超工具需要（B 轮 105 秒只是它的症状）。
     /// 口径与 `get_product_dirs` 回给界面的 `workspaceRoot` 一致，两处不分叉。
     pub fn workspace_root(&self) -> PathBuf {
-        let configured = self.config().workspace.root.trim().to_string();
-        if !configured.is_empty() {
-            return PathBuf::from(configured);
+        workspace_root_of(&self.config(), &self.data_root)
+    }
+
+    /// `/api/file` 可读根集合的快照（SH-135）。
+    ///
+    /// 跑在 WebView2 的请求线程上，所以**只 `try_read`**：拿不到就用构造时算好的默认根，
+    /// 绝不在请求线程上等配置写锁（设置页保存时正持着它）。
+    pub fn media_roots(&self) -> Vec<PathBuf> {
+        match self.media_roots.try_read() {
+            Ok(guard) => guard.clone(),
+            Err(_) => {
+                tracing::debug!("媒体根集合暂不可读（锁被占用），本次回落默认工作区根");
+                vec![self.fallback_root.clone()]
+            }
         }
-        self.data_root().join(crate::config::WORKSPACE_DIR)
+    }
+
+    /// 配置写成功后刷新媒体根集合（唯一刷新点：`update_config` 与构造）。
+    fn refresh_media_roots(&self) {
+        let roots = crate::media_route::media_roots_of(&self.config(), &self.data_root);
+        let mut guard = self.media_roots.write().unwrap_or_else(|e| e.into_inner());
+        *guard = roots;
     }
 
     /// 标记配置只读（启动时坏配置无法安全修复）。之后所有写回都被拒绝，
@@ -147,6 +175,7 @@ impl AppState {
             *guard = next;
         }
         self.refresh_derived_policy(None);
+        self.refresh_media_roots();
         Ok(())
     }
 
@@ -268,6 +297,18 @@ impl<F: FnOnce()> Drop for TaskSlotGuard<F> {
             on_drop();
         }
     }
+}
+
+/// 工作区根的**纯函数**口径：配置优先，空则回落应用自有目录（`<data_root>\Workspace`）。
+///
+/// 抽出来是因为媒体路由的根集合要在构造时（还没有 `&self`）算一次回落值，
+/// 两处必须同一个判据，否则"配置空"时默认根会分叉。
+pub(crate) fn workspace_root_of(config: &AppConfig, data_root: &Path) -> PathBuf {
+    let configured = config.workspace.root.trim();
+    if !configured.is_empty() {
+        return PathBuf::from(configured);
+    }
+    data_root.join(crate::config::WORKSPACE_DIR)
 }
 
 #[cfg(test)]

@@ -22,7 +22,8 @@
         "decorations": false,
         "resizable": true,
         "visible": false,
-        "backgroundColor": "#151517"
+        "backgroundColor": "#151517",
+        "create": false
       }
     ],
     "security": {

@@ -15,6 +15,8 @@ pub mod goals;
 pub mod images;
 pub mod jobs;
 pub mod mcp_client;
+/// SH-135：`/api/file` 媒体路由（工作区图片 / PDF 预览的取字节通道）。
+pub mod media_route;
 pub mod model_client;
 pub mod model_discovery;
 pub mod open_in_app;
@@ -2292,6 +2294,25 @@ pub fn run() {
             }
         })
         .setup(|app| {
+            // SH-135：主窗口改为**手动创建**。`on_web_resource_request`（媒体路由唯一挂点）
+            // 只存在于 builder 上，而 tauri.conf.json 里的窗口由框架在 setup 之前自动建好，
+            // 所以配置里标了 `create: false`，这里用同一份窗口配置重建并挂上钩子——尺寸、
+            // 无边框、`visible: false`、`backgroundColor` 全部由 `from_config` 原样继承，
+            // 因此"先隐藏、前端就绪后再显示"的时序不变。
+            let window_config = app
+                .config()
+                .app
+                .windows
+                .iter()
+                .find(|window| window.label == "main")
+                .cloned()
+                .ok_or("tauri.conf.json 缺少 label=main 的窗口配置")?;
+            let resource_app = app.handle().clone();
+            tauri::WebviewWindowBuilder::from_config(app.handle(), &window_config)?
+                .on_web_resource_request(move |request, response| {
+                    crate::media_route::handle_request(&resource_app, &request, response);
+                })
+                .build()?;
             // MCP 应用级事件通道（SH-063）：运行时在 setup 前已随 AppState 构造，
             // 这里补上真正的发送端。
             {
