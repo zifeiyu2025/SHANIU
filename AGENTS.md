@@ -65,9 +65,11 @@
 | 变更类型 | 必跑检查 | 汇报内容 | 未运行时的声明 |
 | --- | --- | --- | --- |
 | Rust 代码 | `cargo clippy -- -D warnings`、`cargo test` | 通过输出摘要 | "未运行，原因：___，风险：___" |
-| 前端代码 | `pnpm typecheck`、`pnpm test`、受影响组件的渲染验证 | 通过输出摘要 | 同上 |
+| 前端代码 | `pnpm typecheck`、`pnpm test`、`pnpm build`、受影响组件的渲染验证 | 通过输出摘要 | 同上 |
 | 协议/事件变更 | schema 快照测试 | 兼容性说明（additive?） | 禁止跳过 |
 | 沙箱/权限变更 | 全部健身函数测试（文档 §5） | 探针结果 | 禁止跳过 |
+
+**`pnpm build` 是前端必跑项，不是可选项**：CSS 注释语法（如注释里出现 `**/` 提前闭合）与 EOL 这类问题只有 lightningcss/Vite 构建链会暴露，`vitest` 不经过它们。`typecheck` + `test` 全绿**不代表能构建**——0.2.1 之前的 `model-seat.css` 就是这样在本地全绿、构建时红的。未运行时按上表声明原因与风险。
 
 ### 4.1 测试密钥（唯一约定）
 
