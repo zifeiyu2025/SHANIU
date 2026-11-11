@@ -167,25 +167,6 @@ pub struct AgentLoop {
 /// 磁盘满/权限错这类持续性故障会在第一次 flush 就触顶。
 const MAX_ROLLOUT_WRITE_ATTEMPTS: u32 = 3;
 
-/// 模型行未声明 `context_window` 时用于推导压缩阈值的保守窗口。
-///
-/// 取 128K 而不是乐观值：窗口未知时宁可早压（多花一次摘要），也不能沿用 50 万预算——
-/// 那等于永不压缩，128K 模型跑到一半直接 400，代价比多压几次大得多。
-const FALLBACK_CONTEXT_WINDOW: usize = 128_000;
-
-/// 压缩触发阈值：`min(配置预算, 窗口 × 80%)`。
-///
-/// - `configured == 0`：显式关闭压缩，保持 0（不替用户改主意）；
-/// - `window == 0`（模型未声明）：按 [`FALLBACK_CONTEXT_WINDOW`] 推导，调用方负责告警；
-/// - 其余：留 20% 给下一轮回复与工具结果。
-fn compact_token_budget(configured: usize, window: usize) -> usize {
-    if configured == 0 {
-        return 0;
-    }
-    let window = if window == 0 { FALLBACK_CONTEXT_WINDOW } else { window };
-    configured.min(window.saturating_mul(4) / 5)
-}
-
 /// 把 `history[*recorded..]` 逐条追加进档案，成功一条推进一格。
 ///
 /// **失败时游标停在失败条目前**（审计 H3）：已成功写入的前缀不回退，失败条目与它之后
@@ -226,6 +207,43 @@ where
         *recorded += 1;
     }
     Ok(())
+}
+
+/// 写一条压缩锚点；连续失败即返回 `Err`，由调用方**放弃本次压缩**（不改内存历史）。
+///
+/// 抽成接收闭包的形式是为了让失败路径可测：`RolloutWriter` 持有已打开的文件句柄，
+/// 单测里没法靠改文件权限让 `append` 失败（打开着的句柄不受只读属性影响）。
+///
+/// 重试口径与 [`append_pending`] 一致：只滤瞬时占用，连续失败视为档案不可写。
+fn append_anchor<F>(
+    target: crate::compaction::Target,
+    summary: &str,
+    mut append: F,
+) -> Result<(), String>
+where
+    F: FnMut(&crate::rollout::RolloutItem) -> Result<(), crate::rollout::RolloutError>,
+{
+    let anchor = crate::rollout::RolloutItem::Compacted {
+        range_start: target.range_start,
+        range_end: target.range_end,
+        summary: summary.to_string(),
+    };
+    let mut last_error = None;
+    for _ in 0..MAX_ROLLOUT_WRITE_ATTEMPTS {
+        match append(&anchor) {
+            Ok(()) => {
+                last_error = None;
+                break;
+            }
+            Err(error) => last_error = Some(error),
+        }
+    }
+    match last_error {
+        None => Ok(()),
+        Some(error) => Err(format!(
+            "会话档案写入失败（连续 {MAX_ROLLOUT_WRITE_ATTEMPTS} 次），本次压缩未生效：{error}"
+        )),
+    }
 }
 
 /// 档案时间戳：事件发生时刻（Unix 毫秒）。
@@ -295,9 +313,12 @@ impl AgentLoop {
     ///    summary 取代」，所以它必须写在那段条目**之后**——`recorded >= target.range_end`
     ///    由「每轮末尾都 flush」保证，锚点紧随其后，回放时正好接在那些条目之后生效。
     ///    顺序反了就会出现锚点指向尚未写入的条目，resume 直接报区间越界。
-    /// 2. **锚点写失败不阻断内存压缩**。丢一次存档可以补，预算超限继续原样发请求
-    ///    就是等着上下文溢出、整轮失败——后者严重得多。落盘失败本身已由
-    ///    `flush_history` 负责播报，这里不再重复刷一条。
+    /// 2. **锚点写失败 = 本次压缩不发生**。历史与游标都保持原样，返回
+    ///    `ArchiveUnavailable`：调用方只让本轮不再重试，不把整个回合判失败。
+    ///    反过来「内存压了、档案没压」会让重启后的历史与用户看到的结果对不上，
+    ///    而档案与运行态分叉正是必须避免的那一类问题。
+    ///    （旧实现把这次 append 的失败静默吞掉，注释还声称「已由 `flush_history` 播报」；
+    ///    这条 append 根本不经过 `flush_history`，那句话是错的。）
     /// 3. **压缩完必须把落盘游标收到新历史末尾**。`flush_history` 按
     ///    `history[*recorded..]` 切片，而压缩让 history 变短了：不收游标就是 start > len
     ///    直接 panic，而且是只在长会话跑到第 N 轮才炸的那种 panic。
@@ -343,12 +364,10 @@ impl AgentLoop {
             crate::compaction::history_tokens(&history[target.range_start..target.range_end]);
 
         if let Some(writer) = rollout {
-            // 写失败在这里静默是刻意的：见上面第 2 点。
-            let _ = writer.append(&crate::rollout::RolloutItem::Compacted {
-                range_start: target.range_start,
-                range_end: target.range_end,
-                summary: summary.clone(),
-            });
+            // 先落锚点、再改内存（顺序见上面第 1 点）。写不进去就**不提交**：
+            // 此刻 history 与 recorded 都还没动，回放与运行态继续一致。
+            append_anchor(target, &summary, |item| writer.append(item))
+                .map_err(CompactAbort::ArchiveUnavailable)?;
         }
 
         history.splice(
@@ -386,20 +405,25 @@ struct CompactionStats {
     history_tokens_after: u32,
 }
 
-/// 压缩中止的两种性质。
+/// 压缩中止的三种性质。
 ///
 /// 取消不能当失败：用户主动停止被记成「本轮失败」，就会被错误统计、错误提示，
 /// 也和后端其它取消路径（`TurnEndReasonLocal::Cancelled`）不一致。
+///
+/// 档案不可写也不能当失败（`Failed` 会中止整个回合）：其余落盘失败走的是降级
+/// （`flush_history` → `degrade_rollout`），压缩这一条若把回合判死，同一类故障
+/// 在两条路径上就有了相反的后果。
 enum CompactAbort {
     Cancelled,
     Failed(String),
+    ArchiveUnavailable(String),
 }
 
 impl CompactAbort {
     fn message(&self) -> String {
         match self {
             Self::Cancelled => "压缩被用户取消".to_string(),
-            Self::Failed(text) => text.clone(),
+            Self::Failed(text) | Self::ArchiveUnavailable(text) => text.clone(),
         }
     }
 }
@@ -430,11 +454,11 @@ impl AgentLoop {
                 if window == 0 && cfg.agent.token_budget != 0 {
                     tracing::warn!(
                         configured = cfg.agent.token_budget,
-                        fallback_window = FALLBACK_CONTEXT_WINDOW,
+                        fallback_window = crate::compaction::FALLBACK_CONTEXT_WINDOW,
                         "模型未声明 context_window：压缩阈值按保守窗口推导，请在模型行补全该字段"
                     );
                 }
-                compact_token_budget(cfg.agent.token_budget, window)
+                crate::compaction::compact_token_budget(cfg.agent.token_budget, window)
             },
             tree_budget: TreeBudget::unlimited(),
             policy: Arc::new(policy::SessionPolicyHandle::new(policy::SessionPolicy {
@@ -864,13 +888,23 @@ impl AgentLoop {
                         );
                         match abort {
                             // 取消按取消收口：不记 Error，也不算失败轮。
-                            CompactAbort::Cancelled => reason = TurnEndReasonLocal::Cancelled,
+                            CompactAbort::Cancelled => {
+                                reason = TurnEndReasonLocal::Cancelled;
+                                break 'outer;
+                            }
                             CompactAbort::Failed(_) => {
                                 emit(&sink, EventMsg::Error { message });
                                 reason = TurnEndReasonLocal::Failed;
+                                break 'outer;
+                            }
+                            // 档案不可写：本次压缩没有发生（历史与游标未动），
+                            // 与其余落盘失败同口径走降级——本轮继续，不判失败。
+                            // 压缩检查每轮只做一次（turn 体内无内层循环），所以
+                            // 这里不需要额外的「本轮不再重试」标记。
+                            CompactAbort::ArchiveUnavailable(_) => {
+                                degrade_rollout(&sink, message);
                             }
                         }
-                        break 'outer;
                     }
                 }
             }
@@ -1977,21 +2011,6 @@ mod tests {
         )));
     }
 
-    /// 压缩阈值必须跟着窗口走：`context_window = 0` 曾被短路成"照用 50 万预算"，
-    /// 128K 模型跑满也不会压缩，等端点 400 才暴露（2026-11-10 修复）。
-    #[test]
-    fn compact_budget_follows_window_and_never_uses_configured_limit_blindly() {
-        // 已知窗口：80% 封顶，配置更小时以配置为准
-        assert_eq!(compact_token_budget(500_000, 128_000), 102_400);
-        assert_eq!(compact_token_budget(50_000, 128_000), 50_000);
-        // 未知窗口：按保守窗口推导，而不是退回到 50 万
-        assert_eq!(compact_token_budget(500_000, 0), 102_400);
-        assert!(compact_token_budget(500_000, 0) < 500_000);
-        // 显式关闭压缩仍然是关闭
-        assert_eq!(compact_token_budget(0, 128_000), 0);
-        assert_eq!(compact_token_budget(0, 0), 0);
-    }
-
     /// 压缩可见性：自动压缩必须留下 `started → summarized → ended` 三条事件。
     /// 只打日志的实现下，用户唯一能观察到的是"上下文忽然变短"——说不出为什么、
     /// 丢了哪些、丢了多少。
@@ -2281,6 +2300,29 @@ mod tests {
         .unwrap();
         assert_eq!(recorded, 1, "重试成功后游标必须前进");
         assert_eq!(calls, 2);
+    }
+
+    /// D3 反向对照：压缩锚点连续写失败必须变成 `Err`，让调用方放弃本次压缩。
+    /// 改回旧写法（`let _ = writer.append(...)`）时这个返回值不存在，本用例无可断言
+    /// ——「历史与游标保持原样」由调用顺序保证：`append_anchor` 在 `history.splice` 之前，
+    /// 提前 return 时两者都还没动。
+    #[test]
+    fn anchor_write_failure_is_reported_after_retries() {
+        let mut calls = 0u32;
+        let error = append_anchor(
+            crate::compaction::Target { range_start: 0, range_end: 2 },
+            "摘要",
+            |_| {
+                calls += 1;
+                Err(crate::rollout::RolloutError::Io("磁盘满".into()))
+            },
+        )
+        .expect_err("连续写失败必须上抛，不能当成功");
+        assert_eq!(
+            calls, MAX_ROLLOUT_WRITE_ATTEMPTS,
+            "必须重试满次数再放弃，避免一次瞬时占用就把压缩作废"
+        );
+        assert!(error.contains("本次压缩未生效"), "文案要说明压缩没有发生：{error}");
     }
 
     /// A0-3：失败回合的档案结局必须写 `failed`，不能默认 `completed`。
