@@ -253,7 +253,11 @@ impl SearchProvider for Bing {
             .fetch(url.as_str(), cancel)
             .await
             .map_err(map_web_error)?;
-        match finish(&response, |body| parse_bing(body, BING, limit)) {
+        match finish(
+            &response,
+            |body| parse_bing(body, BING, limit),
+            bing_confirms_no_results,
+        ) {
             Ok(hits) => {
                 self.record_success();
                 Ok(hits)
@@ -338,9 +342,14 @@ fn map_web_error(error: WebError) -> SearchError {
 
 /// 共享分类：状态码与拦截标记先判，然后交给具体解析器；解析不出再区分
 /// 「确实没有结果」与「结构变了」。
+///
+/// **无结果只认结构**（`confirms_no_results`）：不再扫正文关键词。拦截页/错误页
+/// 里出现 "no results" 并不证明搜索成功，按关键词判会把失败谎报成「确实没找到」——
+/// 用户以为这件事不存在，实际是我们自己搜失败了。
 fn finish(
     response: &WebResponse,
     parse: impl FnOnce(&str) -> Vec<SearchHit>,
+    confirms_no_results: impl FnOnce(&str) -> bool,
 ) -> Result<Vec<SearchHit>, SearchError> {
     let body = precheck(response)?;
     let mut hits = parse(&body);
@@ -348,8 +357,7 @@ fn finish(
     if !hits.is_empty() {
         return Ok(hits);
     }
-    let lower = body.to_ascii_lowercase();
-    if NO_RESULT_MARKERS.iter().any(|marker| lower.contains(marker)) {
+    if confirms_no_results(&body) {
         return Ok(Vec::new());
     }
     if body.len() < MIN_BODY_BYTES {
@@ -407,14 +415,18 @@ const BLOCK_MARKERS: &[&str] = &[
     "access denied",
 ];
 
-const NO_RESULT_MARKERS: &[&str] = &[
-    "no results",
-    "no results found",
-    "class=\"no-results\"",
-    "没有找到",
-];
-
 // ============================== 解析 ==============================
+
+/// 结构化的「无结果」确认：结果区存在，且 Bing 明确给出无结果元素 `li.b_no`。
+///
+/// 只认结构、不认正文关键词——否则含 "no results" 字样的拦截页/错误页会被当成
+/// 「确实没有匹配项」，正是最坏的失败形态。
+fn bing_confirms_no_results(html: &str) -> bool {
+    let lower = html.to_ascii_lowercase();
+    let has_results_region =
+        lower.contains("id=\"b_results\"") || lower.contains("id='b_results'");
+    has_results_region && !elements_by_class(html, "li", "b_no").is_empty()
+}
 
 /// Bing 的容器式解析：先找 `li.b_algo`，再在容器内找标题链接与摘要。
 fn parse_bing(html: &str, spec: BingSpec, limit: usize) -> Vec<SearchHit> {
@@ -792,7 +804,7 @@ mod tests {
     const BING_FIXTURE: &str = include_str!("../../../tests/fixtures/bing_results.html");
 
     fn classify_bing(response: &WebResponse) -> Result<Vec<SearchHit>, SearchError> {
-        finish(response, |body| parse_bing(body, BING, 5))
+        finish(response, |body| parse_bing(body, BING, 5), bing_confirms_no_results)
     }
 
     #[test]
@@ -860,6 +872,23 @@ mod tests {
             "x".repeat(600)
         );
         assert_eq!(classify_bing(&response(200, &body)).unwrap(), Vec::new());
+    }
+
+    #[test]
+    fn blocked_page_with_no_results_phrase_is_parse_failure_not_empty() {
+        // 回归（判据级）：拦截页/错误页正文里出现 "no results" 时，旧实现会返回空列表，
+        // 也就是把「我们搜失败了」谎报成「确实没找到」。无结果只能由结构确认——
+        // 没有 b_results 结果区、没有 b_no 元素，就必须报 Parse。
+        let body = format!(
+            "<html><body><div class=\"oops\">Sorry, no results could be shown. Please try again.</div>{}</body></html>",
+            "x".repeat(600)
+        );
+        let error = classify_bing(&response(200, &body)).unwrap_err();
+        assert_eq!(
+            error.kind,
+            SearchFailure::Parse,
+            "含 no results 字样的非结果页不得被当成空结果：{error:?}"
+        );
     }
 
     #[test]
