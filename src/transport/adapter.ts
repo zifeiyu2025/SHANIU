@@ -1666,6 +1666,36 @@ export function createAdapter(options: AdapterOptions): { remote: unknown; dispo
       .catch((reason: unknown) => { console.error('[SHANIU] 审批回执送不出', reason) })
   }
 
+  /**
+   * 允许列表连续放行的合并计数（`allowlist_hit`）。
+   *
+   * 为什么合并：长任务里同一条前缀规则可能连续命中几十次，每次插一条通知会把
+   * 时间线刷满，用户最后会把这类提示当噪音关掉。合并口径是「同一回合 + 同一工具」：
+   * 工具变化时先结算上一条，回合收口时结算最后一条；跨回合不合并（文案说的是
+   * 「本轮」，跨回合合并会让用户以为本回合也放行了）。
+   */
+  const allowlistPending = new Map<string, { tool: string; count: number }>()
+
+  /** 结算并落一条通知；没有待结算项时是空操作。 */
+  const flushAllowlist = (sessionId: string, journal: Journal): void => {
+    const pending = allowlistPending.get(sessionId)
+    if (pending === undefined) return
+    allowlistPending.delete(sessionId)
+    const text = pending.count === 1
+      ? `系统已自动放行 ${pending.tool}：命中本次会话的允许列表，未弹审批。`
+      : `本轮 ${pending.count} 次 ${pending.tool} 已自动放行：命中本次会话的允许列表，未弹审批。`
+    pushEvent(journal, 'developer/message', {
+      turn: journal.turn,
+      step: journal.step,
+      message: {
+        id: `shaniu-allowlist-${journal.seq + 1}`,
+        role: 'developer',
+        source: { kind: 'allowlist-notice' as const, form: 'notice' as const, summary: text },
+        content: [{ type: 'text', text }],
+      },
+    }, { surfaceOp: 'append' })
+  }
+
   const onEvent = (event: AgentEvent): void => {
     const msg = event.msg
     // 子代理事件（agent_id ≠ 'root'）路由进该 agent 的泳道 journal（懒建，SH-109）；
@@ -1826,7 +1856,22 @@ export function createAdapter(options: AdapterOptions): { remote: unknown; dispo
         if (toolName === 'exit_plan_mode' && !failed) setPlanActive(false)
         return
       }
+      case 'allowlist_hit': {
+        // 放行依据必须可追溯：不弹窗不等于不留痕。这里只累积计数（见 allowlistPending），
+        // 结算成一条通知——逐条落会把长任务的时间线刷满，用户最终会把提示关掉。
+        const pending = allowlistPending.get(sessionId)
+        if (pending !== undefined && pending.tool === msg.tool) {
+          pending.count += 1
+          return
+        }
+        flushAllowlist(sessionId, journal)
+        allowlistPending.set(sessionId, { tool: msg.tool, count: 1 })
+        return
+      }
       case 'turn_completed': {
+        // 跨事件不结算（同一工具的执行结果夹在两次放行之间），只在本回合收口时
+        // 把最后一条累积落下来。
+        flushAllowlist(sessionId, journal)
         // 审计 A0：失败回合必须带上结构化原因（如 401 → AUTH）。导出的档案里
         // 由此能看出"为什么失败"；只有后端没给结构时，才退回最后兜底文案。
         const failure = msg.reason === 'completed'

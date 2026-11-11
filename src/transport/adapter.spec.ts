@@ -1132,6 +1132,52 @@ describe('适配层把 EventMsg 流映射成 DSH 会话 journal', () => {
     expect((await iterator.next()).done).toBe(true)
     dispose()
   })
+
+  it('允许列表连续放行按「同回合 + 同工具」合并成一条通知', async () => {
+    // 后端每次命中白名单都发 allowlist_hit；逐条落通知会把长任务时间线刷满。
+    const bridge = scriptedBridge()
+    const { remote, dispose } = createAdapter({ bridge })
+    const session = faceOf(remote).session
+    await session.prompt({ sessionId: 'agent-allow', requestId: 'rpc-a1', content: [{ type: 'text', text: '长任务' }] })
+    bridge.emit('agent-allow', { type: 'allowlist_hit', tool: 'shell', command: 'git status', rule_id: 'git' })
+    bridge.emit('agent-allow', { type: 'allowlist_hit', tool: 'shell', command: 'git diff', rule_id: 'git' })
+    bridge.emit('agent-allow', { type: 'allowlist_hit', tool: 'shell', command: 'git log', rule_id: 'git' })
+    bridge.emit('agent-allow', { type: 'turn_completed', reason: 'completed', turn: 1 })
+
+    const iterator = session.follow({ address: { kind: 'session', sessionId: 'agent-allow' } })
+    const journal = eventsOf((await iterator.next()).value as Record<string, unknown>)
+    const notices = journal.filter(event => event['type'] === 'developer/message')
+    expect(notices).toHaveLength(1)
+    const text = (notices[0]?.['data'] as { message: { content: { text: string }[] } }).message.content[0]?.text
+    expect(text).toBe('本轮 3 次 shell 已自动放行：命中本次会话的允许列表，未弹审批。')
+
+    await iterator.return?.(undefined)
+    dispose()
+  })
+
+  it('允许列表换工具时先结算上一个，不跨工具合并', async () => {
+    const bridge = scriptedBridge()
+    const { remote, dispose } = createAdapter({ bridge })
+    const session = faceOf(remote).session
+    await session.prompt({ sessionId: 'agent-switch', requestId: 'rpc-a2', content: [{ type: 'text', text: '长任务' }] })
+    bridge.emit('agent-switch', { type: 'allowlist_hit', tool: 'shell', command: 'git status', rule_id: 'git' })
+    bridge.emit('agent-switch', { type: 'allowlist_hit', tool: 'shell', command: 'git diff', rule_id: 'git' })
+    bridge.emit('agent-switch', { type: 'allowlist_hit', tool: 'unified_exec', command: 'ls', rule_id: 'ls' })
+    bridge.emit('agent-switch', { type: 'turn_completed', reason: 'completed', turn: 1 })
+
+    const iterator = session.follow({ address: { kind: 'session', sessionId: 'agent-switch' } })
+    const journal = eventsOf((await iterator.next()).value as Record<string, unknown>)
+    const texts = journal
+      .filter(event => event['type'] === 'developer/message')
+      .map(event => ((event['data'] as { message: { content: { text: string }[] } }).message.content[0]?.text ?? ''))
+    expect(texts).toEqual([
+      '本轮 2 次 shell 已自动放行：命中本次会话的允许列表，未弹审批。',
+      '系统已自动放行 unified_exec：命中本次会话的允许列表，未弹审批。',
+    ])
+
+    await iterator.return?.(undefined)
+    dispose()
+  })
 })
 
 describe('适配层的命令面映射', () => {
