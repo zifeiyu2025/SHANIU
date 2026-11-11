@@ -172,7 +172,7 @@ DSH 把权限拆成两个独立旋钮，预设只是两个旋钮的一个**捆�
 | `unavailable`（我们已有的前端状态） | 没有 | 已有扩展，`docs/07` 已登记 |
 | `enter_plan_mode` / `exit_plan_mode`（PlanReview） | DSH 的计划模式不走审批策略 | 本仓扩展；按上轮批准：预授权档（`never`/`on_failure`/`full_access`）放行并在时间线留痕，`on_request` 仍询问 |
 
-## 7. 对齐后建议的档位表（待批准）
+## 7. 对齐后的档位表（已批准并落地）
 
 | 顺序 | id | 捆绑 | 文案来源 | 性质 |
 | --- | --- | --- | --- | --- |
@@ -187,7 +187,7 @@ DSH 把权限拆成两个独立旋钮，预设只是两个旋钮的一个**捆�
 - 中文名：**工作区内自动**；英文名：**Workspace Write (auto)**
 - 中文说明：**在工作区内读写与执行，不再逐次确认**（破坏性操作仍由 `decide` 拒绝，见 §3 的 `danger-full-access` 行同一套 fail-closed）
 - 英文说明：**Read, write and run inside the workspace without per-action confirmation**
-- 语言覆盖：非中文的 6 套语言里 **`ja` 已译**；**`es` / `fr` / `de` / `ru` / `pt` 五套走英文原文回落**（与上游 `auto.*` 只译 `ja` 的做法一致）。
+- 语言覆盖：除 `zh` / `en` 之外的 6 套语言里 **`ja` 已译**；**`es` / `fr` / `de` / `ru` / `pt` 五套走英文原文回落**（与上游 `auto.*` 只译 `ja` 的做法一致）。
   这是**刻意安排，不是漏翻**——看到半套翻译不要去补；要补就先把 `auto.*` 一起补齐，
   并同步改 `docs/07` 第 30 行（那里是给同步上游的人看的同一句话）。
 
