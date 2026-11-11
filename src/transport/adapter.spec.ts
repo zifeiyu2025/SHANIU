@@ -1149,7 +1149,7 @@ describe('适配层把 EventMsg 流映射成 DSH 会话 journal', () => {
     const notices = journal.filter(event => event['type'] === 'developer/message')
     expect(notices).toHaveLength(1)
     const text = (notices[0]?.['data'] as { message: { content: { text: string }[] } }).message.content[0]?.text
-    expect(text).toBe('本轮 3 次 shell 已自动放行：命中本次会话的允许列表，未弹审批。')
+    expect(text).toBe('本轮 3 次 shell 已自动放行：命中本次会话的允许列表（规则 git），未弹审批。')
 
     await iterator.return?.(undefined)
     dispose()
@@ -1171,9 +1171,64 @@ describe('适配层把 EventMsg 流映射成 DSH 会话 journal', () => {
       .filter(event => event['type'] === 'developer/message')
       .map(event => ((event['data'] as { message: { content: { text: string }[] } }).message.content[0]?.text ?? ''))
     expect(texts).toEqual([
-      '本轮 2 次 shell 已自动放行：命中本次会话的允许列表，未弹审批。',
-      '系统已自动放行 unified_exec：命中本次会话的允许列表，未弹审批。',
+      '本轮 2 次 shell 已自动放行：命中本次会话的允许列表（规则 git），未弹审批。',
+      '系统已自动放行 unified_exec：命中本次会话的允许列表（规则 ls），未弹审批。',
     ])
+
+    await iterator.return?.(undefined)
+    dispose()
+  })
+
+  it('允许列表同工具但规则不同不合并：放行依据不能说错', async () => {
+    const bridge = scriptedBridge()
+    const { remote, dispose } = createAdapter({ bridge })
+    const session = faceOf(remote).session
+    await session.prompt({ sessionId: 'agent-rule', requestId: 'rpc-a3', content: [{ type: 'text', text: '长任务' }] })
+    bridge.emit('agent-rule', { type: 'allowlist_hit', tool: 'shell', command: 'git status', rule_id: 'git' })
+    bridge.emit('agent-rule', { type: 'allowlist_hit', tool: 'shell', command: 'npm test', rule_id: 'npm' })
+    bridge.emit('agent-rule', { type: 'turn_completed', reason: 'completed', turn: 1 })
+
+    const iterator = session.follow({ address: { kind: 'session', sessionId: 'agent-rule' } })
+    const journal = eventsOf((await iterator.next()).value as Record<string, unknown>)
+    const texts = journal
+      .filter(event => event['type'] === 'developer/message')
+      .map(event => ((event['data'] as { message: { content: { text: string }[] } }).message.content[0]?.text ?? ''))
+    // 合并后只报一条规则的话，「npm test 被哪条规则放行」就永远查不到了。
+    expect(texts).toEqual([
+      '系统已自动放行 shell：命中本次会话的允许列表（规则 git），未弹审批。',
+      '系统已自动放行 shell：命中本次会话的允许列表（规则 npm），未弹审批。',
+    ])
+
+    await iterator.return?.(undefined)
+    dispose()
+  })
+
+  it('压缩成功：一条通知回答区间、条数、压力与压缩后规模', async () => {
+    const bridge = scriptedBridge()
+    const { remote, dispose } = createAdapter({ bridge })
+    const session = faceOf(remote).session
+    await session.prompt({ sessionId: 'agent-ok', requestId: 'rpc-c2', content: [{ type: 'text', text: '长任务' }] })
+    bridge.emit('agent-ok', {
+      type: 'compaction_started', compaction_id: 'c2', trigger: 'pressure',
+      range_start: 0, range_end: 3, estimated_tokens: 900, budget_tokens: 800, turn: 1,
+    })
+    bridge.emit('agent-ok', {
+      type: 'compaction_summarized', compaction_id: 'c2', trigger: 'pressure',
+      range_start: 0, range_end: 3, shadowed_items: 3, shadowed_tokens: 640, summary: '摘要',
+    })
+    bridge.emit('agent-ok', {
+      type: 'compaction_ended', compaction_id: 'c2', ok: true, history_tokens_after: 120,
+    })
+
+    const iterator = session.follow({ address: { kind: 'session', sessionId: 'agent-ok' } })
+    const journal = eventsOf((await iterator.next()).value as Record<string, unknown>)
+    const notices = journal.filter(event => event['type'] === 'developer/message')
+    // 一次压缩只该有一条通知：summarized 时不发，ended 时说全（那时才知道剩余规模）。
+    expect(notices).toHaveLength(1)
+    expect(((notices[0]?.['data'] as { message: { content: { text: string }[] } }).message.content[0]?.text))
+      .toBe('上下文已压缩：历史第 1–3 条（共 3 条，约 640 token）被一条摘要取代；'
+        + '压缩后历史约 120 token；触发时上下文约 900 token（预算 800 token）。'
+        + '原文仍保留在会话档案里。')
 
     await iterator.return?.(undefined)
     dispose()

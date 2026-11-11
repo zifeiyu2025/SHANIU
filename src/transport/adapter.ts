@@ -91,6 +91,34 @@ function approvalSubject(msg: Extract<EventMsg, { type: 'exec_approval_request' 
 }
 
 /**
+ * 压缩成功的通知文案。
+ *
+ * 一条通知要回答四个问题，且每个数都来自后端字段本身：
+ * - 压的是哪一段：`range_start`/`range_end`（`[start, end)` 的历史下标，界面按 1 起数）；
+ * - 压了多少：`shadowed_items` 条、约 `shadowed_tokens` token；
+ * - 为什么现在压：`estimated_tokens` 与 `budget_tokens`（触发时的上下文规模 vs 预算）；
+ * - 压完还剩多少：`history_tokens_after`（只有 `compaction_ended` 带，缺省时不编）。
+ */
+function compactedNotice(
+  trace: {
+    estimatedTokens: number
+    budgetTokens: number
+    rangeStart: number
+    rangeEnd: number
+    shadowed: { items: number; tokens: number }
+  },
+  historyTokensAfter: number | null | undefined,
+): string {
+  const head = `上下文已压缩：历史第 ${trace.rangeStart + 1}–${trace.rangeEnd} 条`
+    + `（共 ${trace.shadowed.items} 条，约 ${trace.shadowed.tokens} token）被一条摘要取代；`
+  const pressure = `触发时上下文约 ${trace.estimatedTokens} token（预算 ${trace.budgetTokens} token）`
+  const tail = typeof historyTokensAfter === 'number'
+    ? `压缩后历史约 ${historyTokensAfter} token；${pressure}。`
+    : `${pressure}。`
+  return `${head}${tail}原文仍保留在会话档案里。`
+}
+
+/**
  * `batch_scope` 是范围标识，不是文案：协议里不写中文，措辞在这里映射。
  * 未识别的标识必须显式暴露——静默当成「不批量」会让卡片少说一句它本应说的事。
  */
@@ -611,12 +639,26 @@ export function createAdapter(options: AdapterOptions): { remote: unknown; dispo
   const journals = new Map<string, Journal>()
   const titles = new Map<string, string>()
   /**
-   * compactionId → 触发原因。`CompactionEnded` 不带 trigger（只有 started/summarized 带），
-   * 而失败通知要不要插取决于手动还是自动：手动 `/compact` 的结局由命令卡片自己展示，
-   * 再插一条就是重复。契约上每次压缩都必然有成对的 started/ended（失败/取消也发 ended），
-   * 所以这里不会无界增长。
+   * compactionId → 本次压缩的取证（触发原因 + 规模 + 实际被替换的区间）。
+   *
+   * `CompactionEnded` 不带 trigger / 区间 / 条数（只有 started、summarized 带），
+   * 而「压缩了多少、压的是哪一段、为什么现在压、压完还剩多少」必须汇成**一条**
+   * 通知——所以在 started 建档、summarized 补实测值、ended 时一次落盘。
+   * 失败通知要不要插取决于手动还是自动：手动 `/compact` 的结局由命令卡片自己展示。
+   * 契约上每次压缩都必然成对发 started/ended（失败/取消也发 ended），这里不会无界增长。
    */
-  const compactionTriggers = new Map<string, CompactionTrigger>()
+  interface CompactionTrace {
+    trigger: CompactionTrigger
+    /** 触发时的上下文规模与预算（只有 `compaction_started` 带这两个数）。 */
+    estimatedTokens: number
+    budgetTokens: number
+    /** 计划区间（started）；summarized 到达后用**实际**被替换的区间覆盖。 */
+    rangeStart: number
+    rangeEnd: number
+    /** summarized 到达才有；没有它就不发「已压缩」通知——说不出压了什么。 */
+    shadowed?: { items: number; tokens: number }
+  }
+  const compactionTraces = new Map<string, CompactionTrace>()
   /**
    * 审批监听器（DSH 的 ui-approval 在装配时注册）。`this` 由 typert 派发时绑定，
    * 所以这里保留函数本体、由调用点用 `.call(scope, …)` 触发。
@@ -1673,20 +1715,25 @@ export function createAdapter(options: AdapterOptions): { remote: unknown; dispo
    * 允许列表连续放行的合并计数（`allowlist_hit`）。
    *
    * 为什么合并：长任务里同一条前缀规则可能连续命中几十次，每次插一条通知会把
-   * 时间线刷满，用户最后会把这类提示当噪音关掉。合并口径是「同一回合 + 同一工具」：
-   * 工具变化时先结算上一条，回合收口时结算最后一条；跨回合不合并（文案说的是
+   * 时间线刷满，用户最后会把这类提示当噪音关掉。合并口径是「同一回合 + 同一工具 +
+   * 同一规则」：规则不同说明放行的依据不同，合并后只说其中一条规则会误导；
+   * 工具或规则变化时先结算上一条，回合收口时结算最后一条；跨回合不合并（文案说的是
    * 「本轮」，跨回合合并会让用户以为本回合也放行了）。
+   *
+   * `rule_id` 是规则原文，必须出现在文案里——放行依据得可事后追溯；`command`
+   * 刻意不回显：长命令会把通知刷爆。
    */
-  const allowlistPending = new Map<string, { tool: string; count: number }>()
+  const allowlistPending = new Map<string, { tool: string; ruleId: string; count: number }>()
 
   /** 结算并落一条通知；没有待结算项时是空操作。 */
   const flushAllowlist = (sessionId: string, journal: Journal): void => {
     const pending = allowlistPending.get(sessionId)
     if (pending === undefined) return
     allowlistPending.delete(sessionId)
-    const text = pending.count === 1
-      ? `系统已自动放行 ${pending.tool}：命中本次会话的允许列表，未弹审批。`
-      : `本轮 ${pending.count} 次 ${pending.tool} 已自动放行：命中本次会话的允许列表，未弹审批。`
+    const text = (pending.count === 1
+      ? `系统已自动放行 ${pending.tool}`
+      : `本轮 ${pending.count} 次 ${pending.tool} 已自动放行`)
+      + `：命中本次会话的允许列表（规则 ${pending.ruleId}），未弹审批。`
     pushEvent(journal, 'developer/message', {
       turn: journal.turn,
       step: journal.step,
@@ -1862,13 +1909,14 @@ export function createAdapter(options: AdapterOptions): { remote: unknown; dispo
       case 'allowlist_hit': {
         // 放行依据必须可追溯：不弹窗不等于不留痕。这里只累积计数（见 allowlistPending），
         // 结算成一条通知——逐条落会把长任务的时间线刷满，用户最终会把提示关掉。
+        // 规则变了就另起一条：同一条通知里报另一条规则等于把依据说错。
         const pending = allowlistPending.get(sessionId)
-        if (pending !== undefined && pending.tool === msg.tool) {
+        if (pending !== undefined && pending.tool === msg.tool && pending.ruleId === msg.rule_id) {
           pending.count += 1
           return
         }
         flushAllowlist(sessionId, journal)
-        allowlistPending.set(sessionId, { tool: msg.tool, count: 1 })
+        allowlistPending.set(sessionId, { tool: msg.tool, ruleId: msg.rule_id, count: 1 })
         return
       }
       case 'turn_completed': {
@@ -1952,7 +2000,13 @@ export function createAdapter(options: AdapterOptions): { remote: unknown; dispo
       case 'compaction_started':
         // 有损操作必须出声（对齐上游 `compaction/start`）：起点先落 journal，之后
         // 无论成功、失败还是取消，时间线上都能回答「这次上下文为什么变短」。
-        compactionTriggers.set(msg.compaction_id, msg.trigger)
+        compactionTraces.set(msg.compaction_id, {
+          trigger: msg.trigger,
+          estimatedTokens: msg.estimated_tokens,
+          budgetTokens: msg.budget_tokens,
+          rangeStart: msg.range_start,
+          rangeEnd: msg.range_end,
+        })
         pushEvent(journal, 'compaction/start', {
           turn: journal.turn,
           compactionId: msg.compaction_id,
@@ -1961,28 +2015,25 @@ export function createAdapter(options: AdapterOptions): { remote: unknown; dispo
       case 'compaction_summarized': {
         // 摘要与「丢了什么」同一条（对齐上游 `compaction/summary`）。上游的
         // `shadowedSeqs` 是会话 seq 集合，我们没有等价物——不编造，只给真实的
-        // token 数与摘要；条数由下面的通知说清楚。
+        // token 数与摘要；条数由 ended 的通知说清楚。
         pushEvent(journal, 'compaction/summary', {
           turn: journal.turn,
           compactionId: msg.compaction_id,
           summary: [{ type: 'text', text: msg.summary }],
           shadowedTokenCount: msg.shadowed_tokens,
         })
-        // 手动 `/compact` 由命令卡片自己展示结果，不重复插通知；自动压缩在聊天里
-        // 没有别的痕迹，不补这一行用户只会发现「上下文忽然变短」。
-        if (msg.trigger === 'pressure') {
-          const text = `上下文已压缩：${msg.shadowed_items} 条历史（约 ${msg.shadowed_tokens} token）`
-            + '被一条摘要取代，原文仍保留在会话档案里。'
-          pushEvent(journal, 'developer/message', {
-            turn: journal.turn,
-            step: journal.step,
-            message: {
-              id: `shaniu-compacted-${msg.compaction_id}`,
-              role: 'developer',
-              source: { kind: 'compaction-notice' as const, form: 'notice' as const, summary: text },
-              content: [{ type: 'text', text }],
-            },
-          }, { surfaceOp: 'append' })
+        // 通知**不在这里发**：`history_tokens_after`（压缩后历史规模）只有 ended 带，
+        // 而用户最关心的正是「压完还剩多少」。在这里发就得在 ended 再补一条，
+        // 两条相邻通知说同一件事；改成 ended 一次说全（区间/条数/压力/剩余）。
+        {
+          const trace = compactionTraces.get(msg.compaction_id)
+          if (trace !== undefined) {
+            // 以**实际**被替换的区间为准：started 的区间是计划值，两者不一致时
+            // 用户该看到的是真正发生的那个。
+            trace.rangeStart = msg.range_start
+            trace.rangeEnd = msg.range_end
+            trace.shadowed = { items: msg.shadowed_items, tokens: msg.shadowed_tokens }
+          }
         }
         return
       }
@@ -1991,8 +2042,9 @@ export function createAdapter(options: AdapterOptions): { remote: unknown; dispo
         // 会发 `ok:false` 且不带 `error`，而 UI 只认 `error` 判成败
         // （trajectory-compaction-definition.ts：status = error === undefined ? 'complete' : 'error'）。
         // 只透传 `error` 的话，刚被显式化的失败会在前端被抹平成正常结束。
-        const trigger = compactionTriggers.get(msg.compaction_id)
-        compactionTriggers.delete(msg.compaction_id)
+        const trace = compactionTraces.get(msg.compaction_id)
+        compactionTraces.delete(msg.compaction_id)
+        const trigger = trace?.trigger
         const reason = typeof msg.error === 'string' && msg.error.trim() !== '' ? msg.error : undefined
         const failure = msg.ok ? undefined : (reason ?? '宿主未给出原因')
         pushEvent(journal, 'compaction/end', {
@@ -2003,17 +2055,24 @@ export function createAdapter(options: AdapterOptions): { remote: unknown; dispo
           ...(failure === undefined ? {} : { error: reason ?? `压缩未生效（${failure}）` }),
         })
         // 手动 `/compact` 的结局由命令卡片（`command/done`）自己展示，不再重复；
-        // 自动压缩没有别的痕迹，失败时不补这一行，用户只会发现「上下文没变短」。
-        if (failure !== undefined && trigger !== 'manual') {
-          const text = `上下文压缩未生效：${failure}。历史保持原样，可以继续对话。`
+        // 自动压缩没有别的痕迹，不补这一行，用户只会发现「上下文没变短」。
+        const shadowed = trace?.shadowed
+        const notice = failure !== undefined
+          ? (trigger === 'manual'
+              ? undefined
+              : `上下文压缩未生效：${failure}。历史保持原样，可以继续对话。`)
+          : (trigger === 'manual' || trace === undefined || shadowed === undefined
+              ? undefined
+              : compactedNotice({ ...trace, shadowed }, msg.history_tokens_after))
+        if (notice !== undefined) {
           pushEvent(journal, 'developer/message', {
             turn: journal.turn,
             step: journal.step,
             message: {
-              id: `shaniu-compact-failed-${msg.compaction_id}`,
+              id: `shaniu-compact-${failure === undefined ? 'done' : 'failed'}-${msg.compaction_id}`,
               role: 'developer',
-              source: { kind: 'compaction-notice' as const, form: 'notice' as const, summary: text },
-              content: [{ type: 'text', text }],
+              source: { kind: 'compaction-notice' as const, form: 'notice' as const, summary: notice },
+              content: [{ type: 'text', text: notice }],
             },
           }, { surfaceOp: 'append' })
         }
