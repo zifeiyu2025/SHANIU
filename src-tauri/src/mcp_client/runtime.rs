@@ -1994,6 +1994,33 @@ mod tests {
         assert_eq!(statuses[0].fingerprint, "abc");
     }
 
+    /// 撤销信任必须**先判定再动副作用**：没有信任记录（多为拼错 id，也可能是记录丢了
+    /// 而豁免还在）时返回 Err，且该 server 的豁免一条都不能被清掉——否则一次拼错就
+    /// 静默删了用户的显式启用记录。
+    #[tokio::test]
+    async fn revoke_trust_without_record_keeps_exemptions() {
+        let root = crate::test_support::TestTempDir::new("mcp-revoke-trust");
+        let runtime = McpRuntime::new(&root);
+        // 同一个 server：没有信任记录，但有残留豁免。
+        runtime.exemptions.lock().await.grant(
+            "srv-orphan",
+            "fp-1",
+            "mcp__srv__write",
+            RuleId::InstructionOverride,
+            "ignore previous instructions",
+        );
+
+        let error = runtime
+            .revoke_trust("srv-orphan")
+            .await
+            .expect_err("没有信任记录时必须报错，不能把拼错 id 伪装成撤销成功");
+        assert!(error.contains("没有可撤销的信任记录"), "{error}");
+
+        let entries = runtime.exemptions.lock().await.list();
+        assert_eq!(entries.len(), 1, "失败的撤销不能清掉豁免：{entries:?}");
+        assert_eq!(entries[0].server_id, "srv-orphan");
+    }
+
     fn event_shape(event: &McpEvent) -> Value {
         serde_json::to_value(event).unwrap()
     }
