@@ -41,9 +41,8 @@ $OutputEncoding = [System.Text.UTF8Encoding]::new($false)
 # 改规则必须先改 §2.3.1，再改本节——禁止把架构规则只藏在脚本里。
 # 三类特殊角色见下方 $skipOwners / $infraModules，不参与普通分层判定。
 #
-# 注意空数组不是漏登记：permission / events / config / text_encoding / user_terminal /
-# test_support / images 的合法目标只有共享基础设施 config、events（由下方 $infraModules
-# 全局放行）或没有 crate 内依赖，故表内无需再列；顺手补进去只会造成冗余。
+# 注意空数组不是漏登记：permission / events / config / clock / text_encoding / user_terminal /
+# test_support / images 的合法目标只有共享基础设施 config、events、clock（由下方 $infraModules 全局放行）或没有 crate 内依赖，故表内无需再列；顺手补进去只会造成冗余。
 # 要给这些模块新增业务依赖，必须先改 §2.3.1，再写进这里。
 $allow = @{
     'agent_loop'   = @('model_client', 'tool_router', 'permission', 'rollout', 'compaction', 'session_reference', 'skills', 'jobs', 'sandbox')  # E02–E04、E06、E23、E35、E40、E43、E48
@@ -54,6 +53,7 @@ $allow = @{
     'model_client' = @('images')                                                   # E52（ImageMessage 持久化 ImageRef）
     'events'       = @()
     'config'       = @()
+    'clock'        = @()                                                           # E63（R3 收敛：全仓唯一的 now_ms 出口，纯叶子只依赖 std）
     'rollout'      = @('model_client')                                            # E21
     'compaction'   = @('model_client')                                             # E22
     'session_query'= @('rollout', 'model_client')                                  # E24、E25（SH-113 只读派生索引）
@@ -94,7 +94,7 @@ $allow = @{
 $skipFiles = @('lib.rs', 'main.rs')
 $skipOwners = @('app_state')
 # 共享基础设施：任何模块都可依赖它们，不必逐条登记；它们自身只能依赖彼此（§2.3.3）
-$infraModules = @('config', 'events')
+$infraModules = @('config', 'events', 'clock')
 
 $repoRoot = Split-Path -Parent $PSScriptRoot
 
