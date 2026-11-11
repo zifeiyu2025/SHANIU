@@ -925,8 +925,6 @@ export function createAdapter(options: AdapterOptions): { remote: unknown; dispo
    * 否则「读不到」会被渲染成「只读」，用户按错误前提去点确认。
    */
   const sessionPresetUnreadable = new Set<string>()
-  /** 还没建档的会话里选的档：首条任务提交时带给宿主，让它写进新档案。 */
-  let pendingNewSessionSandbox: string | undefined
 
   /** 读宿主 durable 的本会话档位并写入缓存；读失败只记 unknown，不伪造一个档。 */
   const loadSessionPermission = async (sessionId: string): Promise<void> => {
@@ -2240,13 +2238,13 @@ export function createAdapter(options: AdapterOptions): { remote: unknown; dispo
    * 注入面（SH-053），空闲态下等价动作就是走这条与用户输入完全相同的提交链。
    */
   const submitPromptNow = async (sessionId: string | undefined, text: string, rpcId?: string, displayText?: string, images: readonly PromptImageRef[] = []): Promise<void> => {
-    // 新会话（还没有 id）在输入框里先切了档：把这个档带进建档，宿主写进新档案。
-    const draftSandbox = sessionId === undefined ? pendingNewSessionSandbox : undefined
-    pendingNewSessionSandbox = undefined
+    // 新会话不继承任何会话的档位：不带 `sandboxMode`，由宿主按部署默认建档
+    // （`send_task(sandbox_mode: None)` → config 的 `[sandbox] mode`）。
+    // 用户要给新会话提权，得在新会话里自己设一次——这是有意的摩擦，
+    // 跨会话传档等于把「这一次提权」变成永久提权（授权作用域越界）。
     const agentId = await bridge.invoke<string>('send_task', {
       task: text,
       agentId: sessionId,
-      ...(draftSandbox === undefined ? {} : { sandboxMode: draftSandbox }),
       // 图片引用走结构化参数（对齐 DSH 的 admission：UI 只交引用，宿主读字节并校验）；
       // 无图时不发这个键，`{ task, agentId }` 的既有形状不变。
       ...(images.length === 0 ? {} : { images: toSendTaskImages(images) }),
@@ -3531,7 +3529,6 @@ export function createAdapter(options: AdapterOptions): { remote: unknown; dispo
               })
               sessionPresetCache.set(sessionId, presetOfSandbox(applied))
               sessionPresetLoaded.add(sessionId)
-              pendingNewSessionSandbox = sandbox
               result = { kind: 'success', text: `preset ${requested}` }
             } catch (reason) {
               // wire 契约：失败以 result.error 回给客户端，不是 rejection——UI 的错误

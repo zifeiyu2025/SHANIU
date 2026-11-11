@@ -446,6 +446,34 @@ mod tests {
         assert_ne!(a, b);
     }
 
+    /// 新会话不带 `sandboxMode` 时走**部署默认档**，不沿用上一任务切过的高档。
+    ///
+    /// 前端 a1 修复的后端对侧：`send_task(sandbox_mode: None)` → `reset_policy(None)`。
+    /// 反向对照：把 `unwrap_or(cfg.sandbox.mode)` 改成「有上次快照就沿用」，本用例变红。
+    #[test]
+    fn reset_policy_none_falls_back_to_config_default() {
+        let (_dir, s) = state();
+        let default_mode = s.config().sandbox.mode;
+        assert_eq!(
+            default_mode,
+            crate::config::SandboxMode::ReadOnly,
+            "部署默认必须是只读，否则「不带档位」本身就是一次隐式提权"
+        );
+
+        s.reset_policy(Some(crate::config::SandboxMode::DangerFullAccess));
+        assert_eq!(
+            s.policy.snapshot().sandbox,
+            crate::config::SandboxMode::DangerFullAccess
+        );
+
+        s.reset_policy(None);
+        assert_eq!(
+            s.policy.snapshot().sandbox,
+            default_mode,
+            "没有会话档位时必须回部署默认，不许沿用上一任务的高档"
+        );
+    }
+
     #[test]
     fn config_update_is_visible_and_persisted() {
         let (_dir, s) = state();

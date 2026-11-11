@@ -2153,6 +2153,26 @@ describe('权限挡位与底部指标的数据面', () => {
     dispose()
   })
 
+  it('§4.2 反向对照：A 会话切高档不许带进之后新建的会话（授权作用域）', async () => {
+    const bridge = scriptedBridge()
+    const { remote, dispose } = createAdapter({ bridge })
+    const face = faceOf2(remote)
+
+    // A 会话把权限提到最高档：只写 A 自己的档案。
+    const switched = await face.commands.execute('agent-a', '/permission danger-full-access')
+    expect(switched).toMatchObject({ ok: true, value: { result: { kind: 'success' } } })
+
+    // 新建会话的第一条任务：客户端没有 sessionId（正是旧实现把 A 的档位带过去的那条分支）。
+    await face.session.prompt({ content: [{ type: 'text', text: '新会话' }] })
+
+    const sent = bridge.calls.filter(call => call.command === 'send_task').at(-1)?.args
+    // `toEqual` 会忽略值为 undefined 的键，所以这里必须断言**键不存在**：
+    // 只要 `sandboxMode` 还在请求里，就等于 A 的最高档被新会话继承。
+    expect(Object.keys(sent ?? {})).toEqual(['task', 'agentId'])
+    expect(sent?.['sandboxMode']).toBeUndefined()
+    dispose()
+  })
+
   it('commands.execute：真正未命中的行回 undefined；/permission 的 bare 与未知挡位按上游语义回 CommandResult', async () => {
     const bridge = scriptedBridge()
     const { remote, dispose } = createAdapter({ bridge })
