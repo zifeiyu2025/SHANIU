@@ -505,7 +505,6 @@ fn builtin_declares(
     match item {
         "vision" => builtin.input.as_ref().is_some_and(|input| !input.is_empty()),
         "tools" => builtin.tools.is_some(),
-        "builtin_web_search" => builtin.builtin_web_search.is_some(),
         "context_window" => builtin.context_window.is_some(),
         "max_output" => builtin.max_output.is_some(),
         "reasoning" => builtin.reasoning_levels.as_ref().is_some_and(|l| !l.is_empty()),
@@ -569,9 +568,6 @@ pub fn model_view(
                         let value = from_field
                             .or_else(|| match item.id {
                                 "tools" => builtin_fields.and_then(|b| b.tools),
-                                "builtin_web_search" => {
-                                    builtin_fields.and_then(|b| b.builtin_web_search)
-                                }
                                 _ => None,
                             })
                             .unwrap_or(false);
