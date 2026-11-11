@@ -53,12 +53,13 @@ scratch/
 # 真机验收截图/取证产物（体积大、可复现，状态记在 docs/05）
 artifacts/
 
-# 评估运行产物（一进程一份，入库会churn）
-evals/latest.json
-# 已无消费方：workflow 改为跑当日两臂并显式传路径（分母必须是同日对照，
-# 冻结基线会因端点漂移失真）。仅作历史保留，删不删都不影响任何门禁。
-evals/control.json
+# 评估运行产物：唯一形态是 `evals/results/<epoch>-<pid>-<role>.json`（一进程一份，
+# 入库会 churn）。门禁 `evals/score.mjs` 只接受显式传入的两份 results 文件。
 evals/results/
+# 旧单文件产物（2026-11-09 之前）：已无消费方，score.mjs 不再兜底读取——它读到的
+# 会是别的进程留下的数字。留在磁盘上仅供历史对照，删不删都不影响任何门禁。
+evals/latest.json
+evals/control.json
 evals/.eval.lock
 evals/*.log
 

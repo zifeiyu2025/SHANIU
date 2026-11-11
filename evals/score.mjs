@@ -14,7 +14,11 @@
 // 用法：
 //   node evals/score.mjs <实验.json> <对照.json>   # 显式传两份（推荐；跑完会打印本次路径）
 //   node evals/score.mjs <实验.json> --promote    # 写成该模型的历史参考点（仅参考，不参与判定）
-//   node evals/score.mjs                          # 兜底：读 evals/latest.json 与 evals/control.json（旧产物）
+//   node evals/score.mjs                          # 拒绝：必须显式传两份报告（见下）
+//
+// **没有兜底路径**：runner 只写 evals/results/<epoch>-<pid>-<role>.json，从不写
+// latest.json；旧单文件正是 2026-11-09 并发事故的成因（磁盘文件与报告自报的不是
+// 同一组数字）。不带参数时直接拒绝并打印取路径的命令，好过默默读一份旧产物。
 //
 // 拒绝下结论的硬条件（除下面三条判据外）：报告 valid=false、样本数与实际档案数不符、
 // 两臂 pid 相同（同一个进程只可能是一种 arm）。
@@ -60,7 +64,13 @@ function load(name, { required = true } = {}) {
   }
 }
 
-const latest = positional[0] ? loadPath(positional[0]) : load('latest.json');
+const PICK_HINT =
+  '两份报告各取一份 evals/results/<epoch>-<pid>-<role>.json（跑完会打印本次路径）：\n' +
+  '  ls -t evals/results/*-treatment.json | head -1\n' +
+  '  ls -t evals/results/*-control.json   | head -1';
+
+if (!positional[0]) refuse(`未传实验报告路径，也不能默认读旧单文件。\n${PICK_HINT}`);
+const latest = loadPath(positional[0]);
 if (promote) {
   const name = `baseline.${latest.model}.json`;
   writeFileSync(join(HERE, name), `${JSON.stringify(latest, null, 2)}\n`);
@@ -68,7 +78,8 @@ if (promote) {
   process.exit(0);
 }
 
-const control = positional[1] ? loadPath(positional[1]) : load('control.json');
+if (!positional[1]) refuse(`未传对照报告路径。\n${PICK_HINT}`);
+const control = loadPath(positional[1]);
 const fmt = (v) => (typeof v === 'number' ? (Number.isInteger(v) ? `${v}` : v.toFixed(3)) : `${v}`);
 const pct = (d) => `${d >= 0 ? '+' : ''}${(d * 100).toFixed(1)}%`;
 const dateOf = (ms) => new Date(ms).toLocaleDateString('sv-SE');
