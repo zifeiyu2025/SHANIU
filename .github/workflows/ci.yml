@@ -2,7 +2,7 @@ name: CI
 
 # 已知 FF 缺口（勿把"CI 全绿"读成 docs/01 §5 七条不变量全部成立）：
 #   FF-3 沙箱越界写入探针 src-tauri/tests/sandbox_probe.rs::sandbox_denies_write_outside_workspace
-#        仍为 #[ignore]（技术不可达，待 SH-022）——本流水线不验证它；
+#        已不在 #[ignore] 之列（SH-022 于 2026-11-08 收口），由 cargo test 收集并在本流水线执行；
 #   FF-4 sandbox_failclosed.rs、FF-5 latency_budget.rs 已存在并由 cargo test 收集（SH-075）；
 #        FF-5 的**真实端点**口径不在本流水线（需密钥与外网），归 .github/workflows/evals.yml；
 #   FF-6 审批不可绕过、FF-2 事件 schema 快照、FF-7 前端块冻结由 cargo test / vitest 覆盖。
