@@ -26,7 +26,7 @@ import type { WorkspaceId } from '@deepseek-ai/dsh-workspace/types'
 import type { MessageId } from '@deepseek-ai/dsh-llm'
 import { createSettingsFace } from './settings-face'
 import {
-  PERMISSION_PRESETS, PERMISSION_PRESET_OPTIONS, presetOfSandbox, sandboxOfPreset,
+  PERMISSION_PRESETS, PERMISSION_PRESET_OPTIONS, PERMISSION_UNAVAILABLE, presetOfSandbox, sandboxOfPreset,
 } from './permission-presets'
 import { CommandDefinitionId } from '@deepseek-ai/dsh-commands/brand'
 import type { CommandDescriptor } from '@deepseek-ai/dsh-commands/types'
@@ -953,27 +953,35 @@ export function createAdapter(options: AdapterOptions): { remote: unknown; dispo
    */
   const sessionPresetLoaded = new Set<string>()
   const sessionPresetCache = new Map<string, string>()
+  /**
+   * 读宿主档案失败的会话。与「档案没记录档位」（`session_sandbox_mode` 回 null，
+   * 此时跟随部署默认是对的）不是一回事：读失败时不能回落到任何具体档，
+   * 否则「读不到」会被渲染成「只读」，用户按错误前提去点确认。
+   */
+  const sessionPresetUnreadable = new Set<string>()
   /** 还没建档的会话里选的档：首条任务提交时带给宿主，让它写进新档案。 */
   let pendingNewSessionSandbox: string | undefined
 
-  /** 读宿主 durable 的本会话档位；读失败回落部署默认（不伪造一个档）。 */
-  const loadSessionPermission = async (sessionId: string): Promise<string> => {
-    if (sessionPresetLoaded.has(sessionId)) {
-      return sessionPresetCache.get(sessionId) ?? presetOfSandbox(face.sandboxMode())
-    }
+  /** 读宿主 durable 的本会话档位并写入缓存；读失败只记 unknown，不伪造一个档。 */
+  const loadSessionPermission = async (sessionId: string): Promise<void> => {
+    if (sessionPresetLoaded.has(sessionId)) return
     try {
       const mode = await bridge.invoke<string | null>('session_sandbox_mode', { sessionId })
-      const preset = presetOfSandbox(mode ?? face.sandboxMode())
-      sessionPresetCache.set(sessionId, preset)
+      sessionPresetCache.set(sessionId, presetOfSandbox(mode ?? face.sandboxMode()))
       sessionPresetLoaded.add(sessionId)
-      return preset
+      sessionPresetUnreadable.delete(sessionId)
     } catch {
-      return presetOfSandbox(face.sandboxMode())
+      sessionPresetUnreadable.add(sessionId)
     }
   }
 
-  const currentPermission = (sessionId: string): string =>
-    sessionPresetCache.get(sessionId) ?? presetOfSandbox(face.sandboxMode())
+  const currentPermission = (sessionId: string): string => {
+    const known = sessionPresetCache.get(sessionId)
+    if (known !== undefined) return known
+    return sessionPresetUnreadable.has(sessionId)
+      ? PERMISSION_UNAVAILABLE
+      : presetOfSandbox(face.sandboxMode())
+  }
   const permissionsProjection = (sessionId: string): Record<string, unknown> => ({
     currentValue: currentPermission(sessionId),
   })
@@ -2141,6 +2149,9 @@ export function createAdapter(options: AdapterOptions): { remote: unknown; dispo
   ): AsyncGenerator<Record<string, unknown>> {
     const from = replayed.log.length
     traceFollow(sessionId, 'snapshot-replayed', { from, revision: replayed.revision, records: replayed.log.eventsUpTo(from).length })
+    // 档位先读进缓存再产快照：读值只有一个来源（`currentPermission`），
+    // 失败时它就是 unknown 哨兵，不会在这里另算一份。
+    await loadSessionPermission(sessionId)
     yield {
       type: 'snapshot',
       header: { version: 0, id: sessionId, createdAt: replayed.createdAt, isSeeded: false },
@@ -2152,7 +2163,7 @@ export function createAdapter(options: AdapterOptions): { remote: unknown; dispo
         values: {
           modelSelection: currentModelSelection(),
           title: titles.get(sessionId) ?? null,
-          permissions: { currentValue: await loadSessionPermission(sessionId) },
+          permissions: permissionsProjection(sessionId),
           ...(planProjectionValues()),
           // 档案重建出的任务清单（todo/write 推导）随快照带出：重开旧会话
           // TodoDock 直接回到最后一份清单（上游回放语义）。
@@ -2459,6 +2470,7 @@ export function createAdapter(options: AdapterOptions): { remote: unknown; dispo
           revision: journal.revision,
         }
         traceFollow(sessionId, 'snapshot-live', { serial: journal.serial, from, revision: baseline.revision, records: baseline.records.length })
+        await loadSessionPermission(sessionId)
         yield {
           type: 'snapshot',
           header: { version: 0, id: sessionId, createdAt: journal.createdAt, isSeeded: false },
@@ -2471,7 +2483,7 @@ export function createAdapter(options: AdapterOptions): { remote: unknown; dispo
             values: {
               modelSelection: currentModelSelection(),
               title: titles.get(sessionId) ?? null,
-              permissions: { currentValue: await loadSessionPermission(sessionId) },
+              permissions: permissionsProjection(sessionId),
               ...(planProjectionValues()),
               // 有排队消息才挂 inbox：QueueDock/steer 占位都按投影缺席=无队列判读。
               ...(journal.queue.length > 0
@@ -3418,9 +3430,13 @@ export function createAdapter(options: AdapterOptions): { remote: unknown; dispo
         let result: { kind: 'success' | 'error'; text: string }
         const requested = permissionMatch[1]
         if (requested === undefined) {
+          await loadSessionPermission(sessionId)
+          const current = currentPermission(sessionId)
           result = {
             kind: 'success',
-            text: `current preset ${await loadSessionPermission(sessionId)} (available: ${PERMISSION_PRESETS.join(', ')})`,
+            text: current === PERMISSION_UNAVAILABLE
+              ? `current preset unknown（会话档案读取失败）(available: ${PERMISSION_PRESETS.join(', ')})`
+              : `current preset ${current} (available: ${PERMISSION_PRESETS.join(', ')})`,
           }
         } else {
           const sandbox = sandboxOfPreset(requested)

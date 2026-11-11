@@ -14,6 +14,16 @@
  * 所以全部从这里派生（`presetOfSandbox` / `sandboxOfPreset` 是唯一的双向翻译）。
  */
 
+/**
+ * 「本会话的档位读取失败」的机器值。它不是挡位：`presetOfSandbox` 永远不会产出它，
+ * 目录里也没有这一项。存在的唯一理由是让投影如实表达 unknown，而不是回落成某个
+ * 具体档——回落会让「读不到」看起来像「只读」，用户按错误的前提点确认。
+ *
+ * 展示层（`ui-permission-presets` 的 `displayPermissionPreset`）负责把它翻成文案；
+ * 那里有同名常量，值必须一致（`src/transport/permission-presets.spec.ts` 锁住）。
+ */
+export const PERMISSION_UNAVAILABLE = 'unavailable'
+
 /** DSH 挡位键 → 宿主 `[sandbox] mode` 落盘值（04 §4）。 */
 export const PRESET_TO_SANDBOX: Record<string, string> = {
   'read-only': 'read_only',

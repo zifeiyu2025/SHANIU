@@ -2017,6 +2017,36 @@ describe('权限挡位与底部指标的数据面', () => {
     dispose()
   })
 
+  it('会话档位读取失败时投影为 unknown，不回落到任何具体档', async () => {
+    // 反面对照：改回「回落部署默认」后，这里会读到 workspace-write——用户会以为
+    // 自己处在「工作区写入」档，实际宿主按真实策略拦截，点确认时才撞墙。
+    const base = scriptedBridge()
+    const bridge: ReturnType<typeof scriptedBridge> = {
+      ...base,
+      invoke: async <T,>(command: string, args?: Record<string, unknown>): Promise<T> => {
+        if (command === 'session_sandbox_mode') throw new Error('durable 记录不可读')
+        return base.invoke<T>(command, args)
+      },
+    }
+    const { remote, dispose } = createAdapter({ bridge })
+    const face = faceOf2(remote)
+    await face.session.create({})
+    const control = face.session.control()
+    const baseline = (await control.next()).value as {
+      value: { projections: Record<string, { values: Record<string, unknown> }> }
+    }
+    expect(baseline.value.projections['agent-new']?.values['permissions'])
+      .toEqual({ currentValue: 'unavailable' })
+    await control.return?.(undefined)
+
+    // 会话快照走的是同一条读值链；两条路径必须给出同一个答案
+    const iterator = face.session.follow({ address: { kind: 'session', sessionId: 'agent-new' } })
+    const snapshot = (await iterator.next()).value as { projections: { values: Record<string, unknown> } }
+    expect(snapshot.projections.values['permissions']).toEqual({ currentValue: 'unavailable' })
+    await iterator.return?.(undefined)
+    dispose()
+  })
+
   it('设置页写 defaultPreset（settings 面的 permission 域）同样推 permissions 投影', async () => {
     const bridge = scriptedBridge()
     const { remote, dispose } = createAdapter({ bridge })
