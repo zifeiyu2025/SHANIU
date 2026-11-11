@@ -2213,10 +2213,30 @@ pub fn register_secret(secret: &str) {
     if s.is_empty() {
         return;
     }
+    // 测试下所有写入方共用一把锁（见 `secret_registry_test_lock`）。
+    // 锁在这里，而不是让每个用例各自加：`register_header_secrets` 这类间接写入
+    // 散落在别的用例里，逐个补是补不完的——漏一个就还是那条偶发红。
+    #[cfg(test)]
+    let _serialize = secret_registry_test_lock();
     let mut reg = SECRET_REGISTRY.write().unwrap_or_else(|e| e.into_inner());
     if !reg.iter().any(|x| x == s) {
         reg.push(s.to_string());
     }
+}
+
+/// 测试专用：**所有**登记密钥的用例共用这一把锁。
+///
+/// 崩溃路径用 `try_read` 是**产品行为，不是测试缺陷**——panic hook 里再阻塞会把
+/// "崩溃退出"变成"卡死"，这条不能为了让用例变绿而改成 `read`。代价是并行跑时，
+/// 只要别的用例正持写锁，`write_crash_report` 就退化成纯模式脱敏，断言"登记密钥
+/// 必须整串替换"偶发失败。因此写入方（[`register_secret`] 内部）一律先过这把锁；
+/// 崩溃用例则先登记、再持锁跑完整条写报告流程，保证那段时间没有新写入。
+///
+/// **持锁期间不得再调 `register_secret`**（`std::sync::Mutex` 不可重入，会自锁）。
+#[cfg(test)]
+pub(crate) fn secret_registry_test_lock() -> std::sync::MutexGuard<'static, ()> {
+    static LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+    LOCK.lock().unwrap_or_else(|e| e.into_inner())
 }
 
 /// 自定义请求头值能被整串替换的最短长度。
@@ -3558,8 +3578,11 @@ network = \"restricted\"\n";
 
     #[test]
     fn crash_report_is_redacted_and_unique() {
-        let dir = crate::test_support::TestTempDir::new("crash");
+        // 先登记（内部已过测试锁），再持锁跑完整条写报告流程：崩溃路径 `try_read`
+        // 撞上写锁会退化成纯模式脱敏（产品行为），不把这段时间隔出来就会偶发红。
         register_secret("opaque-crash-secret-abc");
+        let _secret_lock = secret_registry_test_lock();
+        let dir = crate::test_support::TestTempDir::new("crash");
         let first = write_crash_report(
             &dir,
             "boom sk-abcdefgh12345678 opaque-crash-secret-abc",
