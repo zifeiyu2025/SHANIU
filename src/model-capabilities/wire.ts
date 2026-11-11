@@ -44,6 +44,20 @@ export interface CapabilityProviderWire {
   readonly models: readonly CapabilityModelWire[]
 }
 
+/** 一次密钥校验的结果（`check_api_key` 的 wire 形状，A0-1）。 */
+export interface KeyCheckWire {
+  /** valid / invalid / unknown（unknown = 判断不了，不等于无效）。 */
+  readonly state: 'valid' | 'invalid' | 'unknown'
+  /** ok / key_invalid / missing / network / timeout / endpoint_unsupported / rate_limited / server / quota / bad_request / storage / no_endpoint / unknown */
+  readonly reason: string
+  /** 一句人话。 */
+  readonly message: string
+  readonly httpStatus?: number
+  readonly providerCode?: string
+  readonly providerMessage?: string
+  readonly latencyMs?: number
+}
+
 /** 能力区块的数据面；测试注入脚本化实现，运行时走 `hostCapabilitiesWire()`。 */
 export interface CapabilitiesWire {
   providers(): Promise<readonly CapabilityProviderWire[]>
@@ -52,6 +66,11 @@ export interface CapabilitiesWire {
    * 这是它唯一的出口；可选是为了让只读场景（测试夹具）不必实现它。
    */
   reprobe?(provider: string, model: string): Promise<void>
+  /**
+   * 密钥三态校验（`check_api_key`，打 `GET /models`，不产生推理费用）。
+   * 不做缓存：保存/更换密钥后必须重新问端点，吃旧结论会把配错显示成配好。
+   */
+  checkKey?(provider: string): Promise<KeyCheckWire>
 }
 
 /** 桌面运行时实现（命令名与 Rust `generate_handler!` 逐字对应）。 */
@@ -65,5 +84,6 @@ export function hostCapabilitiesWire(bridge: HostBridge = tauriBridge()): Capabi
       // 先作废这一条缓存再重探；后台任务不等结果，轮询自然会把「检测中」翻过去。
       await bridge.invoke('probe_capabilities', { provider, model, force: true })
     },
+    checkKey: async (provider) => bridge.invoke<KeyCheckWire>('check_api_key', { provider }),
   }
 }

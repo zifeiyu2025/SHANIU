@@ -36,9 +36,19 @@ export function apply(ctx: Context): void {
     locale: NS,
     inject: () => ({
       wire,
-      // 设置页保存后宿主广播 settings/document-updated：能力来源（手动/内置表）会变，
-      // 不重读就会停在保存前的旧徽标上。
-      subscribe: (handler: () => void) => ctx.remote.$on('settings/document-updated', handler),
+      // 设置保存后宿主会广播两类事件，含义不同，不能只订阅一类：
+      //  - `settings/document-updated`：能力来源（手动/内置表）与端点地址会变，要重读；
+      //  - `credentials/reference-updated`：密钥刚被保存/更换（`settings-face.ts` 的
+      //    `credentials.set` 成功后发出），**不会**同时发文档事件，只重读文档会让
+      //    三态停在保存前的旧结论上。
+      subscribe: (handler: (event?: string) => void) => {
+        const offDocument = ctx.remote.$on('settings/document-updated', () => handler('settings/document-updated'))
+        const offCredential = ctx.remote.$on('credentials/reference-updated', () => handler('credentials/reference-updated'))
+        return () => {
+          offDocument()
+          offCredential()
+        }
+      },
     }),
   }, CapabilityPanel))
 }

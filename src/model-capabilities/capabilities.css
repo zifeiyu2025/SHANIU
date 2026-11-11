@@ -177,3 +177,108 @@
   color: var(--dsw-alias-label-primary);
   font-size: 12px;
 }
+
+/*
+ * ── 密钥三态（A0-1） ────────────────────────────────────────────────
+ * 视觉分档刻意不对齐「成功 / 失败」二分：
+ *  - valid：成功色描边，端点接受了密钥；
+ *  - invalid：失败色描边（端点明确拒绝，这确实是失败）；
+ *  - unknown：中性虚线 + 次要色。「无法确认」不是失败——网络不通被画成失败色，
+ *    用户会去换一把本来正确的 Key，这就是三态存在的理由；
+ *  - unverified：中性虚线，还没结论；
+ *  - checking：呼吸描边，正在问端点。
+ */
+.shaniu-key {
+  display: flex;
+  flex-direction: column;
+  gap: 4px;
+  margin-bottom: 8px;
+  padding-bottom: 8px;
+  border-bottom: 0.5px solid var(--dsw-alias-border-l2);
+}
+
+.shaniu-key-head {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  gap: 4px 10px;
+}
+
+.shaniu-key-title {
+  font-weight: 600;
+  color: var(--dsw-alias-label-primary);
+}
+
+.shaniu-key-state {
+  padding: 0 6px;
+  border: 0.5px solid var(--dsw-alias-border-l2);
+  border-radius: var(--dsw-radius-xs);
+  color: var(--dsw-alias-label-secondary);
+  font-size: 11px;
+  line-height: 18px;
+}
+
+.shaniu-key[data-state='valid'] .shaniu-key-state {
+  border-color: var(--dsw-alias-state-success-primary);
+  color: var(--dsw-alias-state-success-primary);
+}
+
+.shaniu-key[data-state='invalid'] .shaniu-key-state {
+  border-color: var(--dsw-alias-state-error-primary);
+  color: var(--dsw-alias-state-error-primary);
+}
+
+.shaniu-key[data-state='unknown'] .shaniu-key-state,
+.shaniu-key[data-state='unverified'] .shaniu-key-state {
+  border-style: dashed;
+}
+
+.shaniu-key[data-state='checking'] .shaniu-key-state {
+  border-style: dotted;
+  animation: shaniu-capabilities-pulse 1.6s ease-in-out infinite;
+}
+
+@media (prefers-reduced-motion: reduce) {
+  .shaniu-key[data-state='checking'] .shaniu-key-state {
+    animation: none;
+  }
+}
+
+.shaniu-key-meta {
+  color: var(--dsw-alias-label-secondary);
+  font-size: 11px;
+  font-variant-numeric: tabular-nums;
+}
+
+.shaniu-key-note {
+  margin: 0;
+  color: var(--dsw-alias-label-primary);
+  font-size: 11px;
+  overflow-wrap: anywhere;
+}
+
+.shaniu-key-raw {
+  margin-top: 2px;
+  color: var(--dsw-alias-label-secondary);
+  font-size: 11px;
+}
+
+.shaniu-key-raw > summary {
+  cursor: pointer;
+  user-select: none;
+}
+
+.shaniu-key-raw pre {
+  margin: 4px 0 6px;
+  padding: 6px 8px;
+  max-height: 160px;
+  overflow: auto;
+  border: 0.5px solid var(--dsw-alias-border-l2);
+  border-radius: var(--dsw-radius-xs);
+  color: var(--dsw-alias-label-secondary);
+  font-family: ui-monospace, SFMono-Regular, Menlo, monospace;
+  font-size: 11px;
+  line-height: 16px;
+  white-space: pre-wrap;
+  overflow-wrap: anywhere;
+}
