@@ -696,6 +696,39 @@ describe('适配层把 EventMsg 流映射成 DSH 会话 journal', () => {
     dispose()
   })
 
+  it('失败回合的重试次数只从 TurnErrorInfo.attempts 读（实时事件可读，0 次不冒充重试过）', async () => {
+    const bridge = scriptedBridge()
+    const { remote, dispose } = createAdapter({ bridge })
+    const session = faceOf(remote).session
+
+    await session.prompt({ sessionId: 'agent-retry', requestId: 'rpc-retry', content: [{ type: 'text', text: '你好' }] })
+    bridge.emit('agent-retry', {
+      type: 'turn_completed',
+      turn: 1,
+      reason: 'failed',
+      error: {
+        code: 'SERVER',
+        message: '上游爆炸',
+        http_status: 500,
+        attempts: 5,
+        retry_after_secs: 120,
+      },
+    })
+
+    const iterator = session.follow({ address: { kind: 'session', sessionId: 'agent-retry' } })
+    const snapshot = (await iterator.next()).value as Record<string, unknown>
+    const detail = (eventsOf(snapshot).find(event => event['type'] === 'turn/end')?.['data'] as {
+      reason: { error?: { detail?: string } }
+    }).reason.error?.detail
+
+    // 反向对照：撤掉 errorDetail 里的 attempts / retry_after_secs 两行，这两条断言必红。
+    expect(detail).toContain('重试 5 次后仍失败')
+    expect(detail).toContain('服务端要求等待 120 秒')
+
+    await iterator.return?.(undefined)
+    dispose()
+  })
+
   it('助手流帧：revision 从快照基线起逐帧 +1，end 引用真实事件 seq', async () => {
     const bridge = scriptedBridge()
     const { remote, dispose } = createAdapter({ bridge })
@@ -1572,6 +1605,52 @@ describe('适配层的命令面映射', () => {
     expect(reason.error?.code).toBe('AUTH')
     expect(reason.error?.message).toBe('密钥无效')
     expect(reason.error?.detail).toContain('HTTP 401')
+  })
+
+  it('重开含失败重试记录的会话：次数从档案 TurnErrorInfo.attempts 还原（0 次不冒充重试过）', async () => {
+    const archiveWithRetries = [
+      { kind: 'message', role: 'user', text: '问' },
+      { kind: 'message', role: 'assistant', text: '半截' },
+      {
+        kind: 'turn_end',
+        turn: 1,
+        reason: 'failed',
+        at_ms: 1_700_000_000_123,
+        error: { code: 'SERVER', message: '上游爆炸', http_status: 500, attempts: 5 },
+      },
+    ]
+    const reopened = createAdapter({ bridge: scriptedBridge(undefined, archiveWithRetries) })
+    const iterator = faceOf(reopened.remote).session.follow({ address: { kind: 'session', sessionId: 'agent-old' } })
+    const events = eventsOf((await iterator.next()).value as Record<string, unknown>)
+    await iterator.return?.(undefined)
+    reopened.dispose()
+
+    const detailOf = (socket: Record<string, unknown>[]): string | undefined =>
+      (socket.find(event => event['type'] === 'turn/end')?.['data'] as {
+        reason: { error?: { detail?: string } }
+      }).reason.error?.detail
+
+    // 反向对照：把 errorDetail 里的 attempts 那行删掉，这条必红——重开后就只剩「一次失败」。
+    expect(detailOf(events)).toContain('重试 5 次后仍失败')
+
+    // 0 次是「首试就失败」，不能写成「重试 0 次后仍失败」——那会让档案看起来像重试过。
+    const archiveFirstTry = [
+      { kind: 'message', role: 'user', text: '问' },
+      {
+        kind: 'turn_end',
+        turn: 1,
+        reason: 'failed',
+        at_ms: 1_700_000_000_123,
+        error: { code: 'AUTH', message: '密钥无效', attempts: 0 },
+      },
+    ]
+    const reopenedZero = createAdapter({ bridge: scriptedBridge(undefined, archiveFirstTry) })
+    const zeroIterator = faceOf(reopenedZero.remote).session.follow({ address: { kind: 'session', sessionId: 'agent-zero' } })
+    const zeroEvents = eventsOf((await zeroIterator.next()).value as Record<string, unknown>)
+    await zeroIterator.return?.(undefined)
+    reopenedZero.dispose()
+
+    expect(detailOf(zeroEvents)).not.toContain('重试')
   })
 
   it('旧档案没有结局行 → 回放收口为 unknown，不冒充成功', async () => {

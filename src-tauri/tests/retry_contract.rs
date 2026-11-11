@@ -108,6 +108,15 @@ struct Harness {
 }
 
 fn harness(steps: Vec<Step>, retry: RetryPolicy) -> Harness {
+    harness_with_rollout(steps, retry, None)
+}
+
+/// C13 用：带真实 `RolloutWriter` 的装配，让断言能落在**落盘文件**而不是内存事件。
+fn harness_with_rollout(
+    steps: Vec<Step>,
+    retry: RetryPolicy,
+    rollout: Option<Arc<shaniu_lib::rollout::RolloutWriter>>,
+) -> Harness {
     let backend = Scripted::new(steps);
     let sink = Arc::new(Recorder::default());
     let budget = shaniu_lib::agent_loop::TreeBudget::unlimited();
@@ -124,7 +133,7 @@ fn harness(steps: Vec<Step>, retry: RetryPolicy) -> Harness {
             approval: ApprovalMode::OnRequest,
             sandbox: SandboxMode::WorkspaceWrite,
         })),
-        rollout: None,
+        rollout,
         rollout_broke: std::sync::atomic::AtomicBool::new(false),
         session_id: None,
         jobs: None,
@@ -454,4 +463,51 @@ async fn disabled_policy_keeps_legacy_single_attempt() {
     assert_eq!(turn_error(&events).attempts, Some(0));
     // 顺带确认错误分类没被重试逻辑改掉。
     assert_eq!(turn_error(&events).code, "SERVER");
+}
+
+/// C13：重试耗尽必须落进档案——重开应用后仍能从 `turn_end` 读出「重试过 5 次」。
+///
+/// 用户报「发消息要等半天才失败」时，界面上只有一次失败；若次数只活在内存事件里，
+/// 翻档案就只能看到一次请求失败，前面几十秒的等待没有解释。断言只读落盘文件。
+#[tokio::test]
+async fn c13_exhausted_attempts_are_persisted_in_rollout() {
+    use shaniu_lib::rollout::{self, ConfigSnapshot, RolloutItem, ROLLOUT_DIR};
+
+    let data_root = shaniu_lib::test_support::TestTempDir::new("retry-rollout");
+    let meta = RolloutItem::SessionMeta {
+        session_id: "sess-retry".into(),
+        agent_id: "agent-retry".into(),
+        parent_id: None,
+        created_at: 1_700_000_000_000,
+        config_snapshot: ConfigSnapshot {
+            provider: "openai-chat".into(),
+            base_url: "https://x/v1".into(),
+            model: "m".into(),
+            sandbox: "WorkspaceWrite".into(),
+            approval: "Ask".into(),
+            workspace_root: data_root.display().to_string(),
+        },
+    };
+    let writer = Arc::new(rollout::RolloutWriter::create(&data_root.join(ROLLOUT_DIR), &meta).unwrap());
+    let path = writer.path().to_path_buf();
+
+    let steps = (0..6).map(|_| Step::Fail(server_error())).collect();
+    let (reason, _, calls) = harness_with_rollout(steps, fast_policy(), Some(writer)).run().await;
+    assert_eq!(reason, TurnEndReason::Failed);
+    assert_eq!(calls, 6, "首试 + 5 次重试");
+
+    let archive = rollout::read(&path).unwrap();
+    let (end_reason, end_error) = archive
+        .items
+        .iter()
+        .find_map(|item| match item {
+            RolloutItem::TurnEnd { reason, error, .. } => Some((reason.clone(), error.clone())),
+            _ => None,
+        })
+        .expect("重试耗尽后档案必须有 turn_end");
+    assert_eq!(end_reason, "failed");
+    let info = end_error.expect("失败回合必须带结构化原因");
+    // 反向对照：删掉 GiveUp 分支的 `info.attempts = Some(retries)`，这里变 None 即红。
+    assert_eq!(info.attempts, Some(5), "重开应用后必须能从档案看出这轮重试过 5 次");
+    assert_eq!(info.code, "SERVER");
 }

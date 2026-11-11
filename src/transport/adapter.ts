@@ -519,6 +519,11 @@ function errorDetail(info: TurnErrorInfo): string {
   if (info.provider_code !== undefined) lines.push(`code: ${info.provider_code}`)
   if (info.provider_message !== undefined) lines.push(info.provider_message)
   else if (info.message !== '') lines.push(info.message)
+  // 重试次数只读档案里的 `TurnErrorInfo.attempts`——前端不另存计数器。两份数据
+  // 迟早对不上；重开应用后能看到的次数必须与档案落档的是同一个值。
+  // 0 = 首次请求就失败，不是「重试过」，不写这一行。
+  if (info.attempts !== undefined && info.attempts > 0) lines.push(`重试 ${info.attempts} 次后仍失败`)
+  if (info.retry_after_secs !== undefined) lines.push(`服务端要求等待 ${info.retry_after_secs} 秒`)
   return lines.join('\n')
 }
 
