@@ -649,7 +649,11 @@ struct Outcome {
     detail: String,
     trace: Vec<String>,
     prompts: Vec<String>,
-    turns: u32,
+    /// 实际用时；超时样本的轮数**未知**——`None` 就是"不知道"。
+    /// 曾写成 `Err(_) => max_turns_per_task()`，把"不知道"变成一个具体假数字：
+    /// 那个值会进平均值、会被拿去做 A/B 轮次差，然后得出错结论。缺数据说不知道，
+    /// 假数据会骗人，所以这里必须是 `Option<u32>`，聚合时排除而不是填 0 或填上限。
+    turns: Option<u32>,
     input_tokens: u64,
     output_tokens: u64,
     tool_calls: u32,
@@ -863,8 +867,9 @@ async fn run_one(
     let ms = started.elapsed().as_millis();
 
     let (turns, reason) = match &summary {
-        Ok(s) => (s.turns, format!("{:?}", s.reason)),
-        Err(_) => (max_turns_per_task(), "超时被丢弃（>180s）".to_string()),
+        Ok(s) => (Some(s.turns), format!("{:?}", s.reason)),
+        // 超时被丢在 180s：真实跑了多少轮**不知道**（回合没返回），记 None。
+        Err(_) => (None, "超时被丢弃（>180s）".to_string()),
     };
     // 超时单列：它是"没跑完"，不是"答错"。两个数都要报（含/不含超时），
     // 但**不许**把它从分母里悄悄删掉——改分母必须写出来。
@@ -1039,7 +1044,7 @@ async fn evals_baseline_v0() {
                 "[evals] run {run}/{repeats} {:<20} {} turns={} calls={} tok={}/{} appr={} 读规则={} 规则tokens={} 耗时={}ms {}",
                 task.id,
                 if out.success { "PASS" } else { "FAIL" },
-                out.turns,
+                out.turns.map_or_else(|| "unknown".to_string(), |t| t.to_string()),
                 out.tool_calls,
                 out.input_tokens,
                 out.output_tokens,
@@ -1085,7 +1090,17 @@ async fn evals_baseline_v0() {
         }
 
         let n = count as f64;
-        let sum_turns: u32 = rows.iter().filter_map(|r| r["turns"].as_u64()).map(|t| t as u32).sum();
+        // 轮数只在**已知**的样本上平均，未知（超时）样本既不填 0 也不填上限——
+        // 那两种填法都会让平均值看起来像个测量值。未知条数单列进报告。
+        let turns_known: Vec<u32> =
+            rows.iter().filter_map(|r| r["turns"].as_u64()).map(|t| t as u32).collect();
+        let turns_unknown = rows.len() - turns_known.len();
+        let sum_turns: u32 = turns_known.iter().sum();
+        let avg_turns = if turns_known.is_empty() {
+            None
+        } else {
+            Some(sum_turns as f64 / turns_known.len() as f64)
+        };
         let sum_tokens: u64 = rows
             .iter()
             .map(|r| r["input_tokens"].as_u64().unwrap_or(0) + r["output_tokens"].as_u64().unwrap_or(0))
@@ -1096,8 +1111,14 @@ async fn evals_baseline_v0() {
             rows.iter().filter(|r| r["hard"].as_bool().unwrap_or(false)).collect();
         let hard_n = hard_rows.len();
         let hard_passed = hard_rows.iter().filter(|r| r["success"].as_bool().unwrap_or(false)).count();
-        let hard_turns: u32 =
-            hard_rows.iter().filter_map(|r| r["turns"].as_u64()).map(|t| t as u32).sum();
+        let hard_turns_known: Vec<u32> =
+            hard_rows.iter().filter_map(|r| r["turns"].as_u64()).map(|t| t as u32).collect();
+        let hard_turns: u32 = hard_turns_known.iter().sum();
+        let hard_avg_turns = if hard_turns_known.is_empty() {
+            None
+        } else {
+            Some(f64::from(hard_turns) / hard_turns_known.len() as f64)
+        };
         let hard_tokens: u64 = hard_rows
             .iter()
             .map(|r| r["input_tokens"].as_u64().unwrap_or(0) + r["output_tokens"].as_u64().unwrap_or(0))
@@ -1129,8 +1150,8 @@ async fn evals_baseline_v0() {
             .filter(|r| r["infra"].as_bool().unwrap_or(false))
             .count();
         println!(
-            "[evals] run {run}/{repeats} 小计 成功率={passed}/{count}，平均轮数={:.2}，平均 token={:.0}，平均打断={:.2}{}",
-            f64::from(sum_turns) / n,
+            "[evals] run {run}/{repeats} 小计 成功率={passed}/{count}，平均轮数={}（未知 {turns_unknown} 条不计入），平均 token={:.0}，平均打断={:.2}{}",
+            avg_turns.map_or_else(|| "unknown".to_string(), |v| format!("{v:.2}")),
             sum_tokens as f64 / n,
             if count == 0 {
                 0.0
@@ -1144,8 +1165,8 @@ async fn evals_baseline_v0() {
             },
         );
         println!(
-            "[evals] run {run}/{repeats} 难样本 成功率={hard_passed}/{hard_n}，平均轮数={:.2}，平均 token={:.0}，自愈触发={hard_hit}",
-            if hard_n == 0 { 0.0 } else { f64::from(hard_turns) / hard_n as f64 },
+            "[evals] run {run}/{repeats} 难样本 成功率={hard_passed}/{hard_n}，平均轮数={}，平均 token={:.0}，自愈触发={hard_hit}",
+            hard_avg_turns.map_or_else(|| "unknown".to_string(), |v| format!("{v:.2}")),
             if hard_n == 0 { 0.0 } else { hard_tokens as f64 / hard_n as f64 },
         );
         println!(
@@ -1173,7 +1194,9 @@ async fn evals_baseline_v0() {
                 "n": count,
                 "passed": passed,
                 "success_rate": passed as f64 / n,
-                "avg_turns": f64::from(sum_turns) / n,
+                // `null` = 本轮没有任何一个样本报告了轮数（全超时）。不填 0，也不填上限。
+                "avg_turns": avg_turns,
+                "turns_unknown": turns_unknown,
                 "avg_total_tokens": sum_tokens as f64 / n,
                 // SH-119：每任务打断次数（审批卡数），中位数口径由 score.mjs/人工比对
                 "avg_approvals": if count == 0 {
@@ -1187,7 +1210,8 @@ async fn evals_baseline_v0() {
                     "n": hard_n,
                     "passed": hard_passed,
                     "success_rate": if hard_n == 0 { 0.0 } else { hard_passed as f64 / hard_n as f64 },
-                    "avg_turns": if hard_n == 0 { 0.0 } else { f64::from(hard_turns) / hard_n as f64 },
+                    "avg_turns": hard_avg_turns,
+                    "turns_unknown": hard_rows.len() - hard_turns_known.len(),
                     "avg_total_tokens": if hard_n == 0 { 0.0 } else { hard_tokens as f64 / hard_n as f64 },
                     "repair_triggered": hard_hit,
                     "infra": infra_count,
@@ -1223,15 +1247,34 @@ async fn evals_baseline_v0() {
             .collect()
     };
     let success_rates = metric("success_rate");
-    let turns = metric("avg_turns");
+    // 轮数单独走：`metric` 的 `unwrap_or(0.0)` 会把 `null`（全超时）填成 0，
+    // 那正好是我们刚拆掉的那种假数字。这里只收有值的那几次，未知次数单列。
+    let turns: Vec<f64> =
+        runs.iter().filter_map(|run| run["summary"]["avg_turns"].as_f64()).collect();
+    let turns_unknown_runs = runs.len() - turns.len();
     let tokens = metric("avg_total_tokens");
     // 难样本子集的中位数与区间（SH-073）：判断"自愈值不值"的唯一口径。
     let hard_metric = |key: &str| -> Vec<f64> {
         runs.iter().map(|run| run["summary"]["hard"][key].as_f64().unwrap_or(0.0)).collect()
     };
     let hard_success = hard_metric("success_rate");
-    let hard_turns = hard_metric("avg_turns");
+    // 同 `turns`：unknown 不填 0。
+    let hard_turns: Vec<f64> = runs
+        .iter()
+        .filter_map(|run| run["summary"]["hard"]["avg_turns"].as_f64())
+        .collect();
     let hard_tokens = hard_metric("avg_total_tokens");
+    // 空集时 `median` 会越界、`min/max` 会变成 ±∞——两者都是"看起来有值"的假数字。
+    let (turns_median, turns_range) = if turns.is_empty() {
+        (None, [None, None])
+    } else {
+        (Some(median(&turns)), [Some(min(&turns)), Some(max(&turns))])
+    };
+    let (hard_turns_median, hard_turns_range) = if hard_turns.is_empty() {
+        (None, [None, None])
+    } else {
+        (Some(median(&hard_turns)), [Some(min(&hard_turns)), Some(max(&hard_turns))])
+    };
     let hard_passed_values: Vec<f64> = runs
         .iter()
         .map(|run| run["summary"]["hard"]["passed"].as_f64().unwrap_or(0.0))
@@ -1370,6 +1413,10 @@ async fn evals_baseline_v0() {
         "base_url": provider.base_url,
         "model": provider.model,
         "max_turns_per_task": max_turns_per_task(),
+        // 两个旋钮都是**评测脚本**拍的，不是产品限制：产品侧只有 `model.max_turns`
+        // （默认 32，config.rs），没有"单任务 180 秒"这种墙钟上限。把值写进报告，
+        // 免得下一次又把脚本护栏读成产品能力。
+        "task_timeout_secs": PER_TASK_TIMEOUT.as_secs(),
         "repeats": repeats,
         "aggregate": "median-of-runs",
         // 来源自证：谁跑的、什么时候、哪份提交、写到了哪个文件。
@@ -1396,21 +1443,23 @@ async fn evals_baseline_v0() {
             "n": selected.len(),
             "passed": median(&passed_values) as u32,
             "success_rate": median_success,
-            "avg_turns": median(&turns),
+            // null = 没有任何一轮报出轮数。填 0 会被当成"零轮跑完"，比缺数据更糟。
+            "avg_turns": turns_median,
+            "avg_turns_unknown_runs": turns_unknown_runs,
             "avg_total_tokens": median(&tokens),
             // 区间一并留档：中位数相同但离散度暴涨，同样是退化信号。
             "success_rate_range": [min(&success_rates), max(&success_rates)],
-            "avg_turns_range": [min(&turns), max(&turns)],
+            "avg_turns_range": turns_range,
             "avg_total_tokens_range": [min(&tokens), max(&tokens)],
             // 难样本子集（SH-073）：与全量并列，单独看这一行才知道自愈有没有用。
             "hard": {
                 "n": hard_total,
                 "passed": median(&hard_passed_values) as u32,
                 "success_rate": median(&hard_success),
-                "avg_turns": median(&hard_turns),
+                "avg_turns": hard_turns_median,
                 "avg_total_tokens": median(&hard_tokens),
                 "success_rate_range": [min(&hard_success), max(&hard_success)],
-                "avg_turns_range": [min(&hard_turns), max(&hard_turns)],
+                "avg_turns_range": hard_turns_range,
             },
             // 事件级（SH-073）：回答"失败之后机制有没有工作"，不是"任务交付有没有变好"。
             "events": {
@@ -1426,25 +1475,27 @@ async fn evals_baseline_v0() {
         "tasks": first_rows.unwrap_or_default(),
     });
     println!(
-        "[evals] 汇总（{repeats} 次中位数）成功率={:.0}%（区间 {:.0}%–{:.0}%），平均轮数={:.2}（{:.2}–{:.2}），平均 token={:.0}（{:.0}–{:.0}）",
+        "[evals] 汇总（{repeats} 次中位数）成功率={:.0}%（区间 {:.0}%–{:.0}%），平均轮数={}，平均 token={:.0}（{:.0}–{:.0}）",
         median_success * 100.0,
         min(&success_rates) * 100.0,
         max(&success_rates) * 100.0,
-        median(&turns),
-        min(&turns),
-        max(&turns),
+        turns_median.map_or_else(
+            || format!("unknown（{turns_unknown_runs}/{repeats} 轮全超时）"),
+            |v| format!("{v:.2}（{}–{}）", turns_range[0].unwrap_or(v), turns_range[1].unwrap_or(v))
+        ),
         median(&tokens),
         min(&tokens),
         max(&tokens),
     );
     println!(
-        "[evals] 难样本汇总（{repeats} 次中位数，n={hard_total}）成功率={:.0}%（区间 {:.0}%–{:.0}%），平均轮数={:.2}（{:.2}–{:.2}），平均 token={:.0}",
+        "[evals] 难样本汇总（{repeats} 次中位数，n={hard_total}）成功率={:.0}%（区间 {:.0}%–{:.0}%），平均轮数={}，平均 token={:.0}",
         median(&hard_success) * 100.0,
         min(&hard_success) * 100.0,
         max(&hard_success) * 100.0,
-        median(&hard_turns),
-        min(&hard_turns),
-        max(&hard_turns),
+        hard_turns_median.map_or_else(
+            || "unknown".to_string(),
+            |v| format!("{v:.2}（{}–{}）", hard_turns_range[0].unwrap_or(v), hard_turns_range[1].unwrap_or(v))
+        ),
         median(&hard_tokens),
     );
     println!(
@@ -1658,15 +1709,18 @@ async fn repair_loop_fixes_broken_rust_project_until_cargo_test_green() {
     .await;
     let ms = started.elapsed().as_millis();
     let (turns, reason) = match &summary {
-        Ok(s) => (s.turns, format!("{:?}", s.reason)),
-        Err(_) => (8, "超时（>300s）".to_string()),
+        Ok(s) => (Some(s.turns), format!("{:?}", s.reason)),
+        // 同 `run_one`：超时回合没返回，轮数未知。这条用例的断言不看轮数，
+        // 但打印里也不许出现"8"这种看起来像实测的占位值。
+        Err(_) => (None, "超时（>300s）".to_string()),
     };
 
     let (green_after, after_text) = run_cargo_test(&ws);
     let source = std::fs::read_to_string(ws.join("src/lib.rs")).unwrap_or_default();
     let agg = sink.agg.lock().unwrap();
     println!(
-        "[repair] turns={turns} calls={} 审批={} 耗时={ms}ms 收口={reason}",
+        "[repair] turns={} calls={} 审批={} 耗时={ms}ms 收口={reason}",
+        turns.map_or_else(|| "unknown".to_string(), |t| t.to_string()),
         agg.tool_calls, agg.approvals
     );
     for line in &agg.trace {
@@ -1675,7 +1729,8 @@ async fn repair_loop_fixes_broken_rust_project_until_cargo_test_green() {
     println!("[repair] 修复后 cargo test:\n{after_text}");
     assert!(
         green_after,
-        "自愈闭环没有修到 cargo test 绿（turns={turns} 收口={reason}）"
+        "自愈闭环没有修到 cargo test 绿（turns={} 收口={reason}）",
+        turns.map_or_else(|| "unknown".to_string(), |t| t.to_string())
     );
     assert!(
         source.contains("assert_eq!(add(2, 3), 5)"),
