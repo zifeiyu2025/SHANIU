@@ -1277,16 +1277,26 @@ impl McpRuntime {
         Ok(payload)
     }
 
-    /// 撤销整个服务器的信任：先让在途执行器失效，再删记录与豁免。
+    /// 撤销整个服务器的信任：先判定能不能撤，再落记录、清豁免，最后让执行器失效。
+    ///
+    /// 顺序理由（审计 I3）：撤销失败或无事可做时**不能有副作用**。原实现先
+    /// `stop_server` + 清降级，再 `trust.revoke`，最后才判 `removed.is_none()`——
+    /// 于是「报错」的那次调用其实已经停了进程、清空了豁免，状态与提示相反。
     pub async fn revoke_trust(&self, server_id: &str) -> Result<(), String> {
-        self.stop_server(server_id).await;
-        self.clear_degraded(server_id).await;
         let removed = self
             .trust
             .lock()
             .await
             .revoke(server_id)
             .map_err(|error| error.to_string())?;
+        // 没有记录时直接返回，不动进程/降级/豁免：这类调用多数是 server_id 拼错，
+        // 改成幂等成功会把「拼错 id」伪装成「撤销成功」。
+        // 记录既然已经删掉，后续派发按 fail-closed 走，停机晚一步不会放行任何调用。
+        if removed.is_none() {
+            return Err(format!("服务器 {server_id} 没有可撤销的信任记录"));
+        }
+        self.stop_server(server_id).await;
+        self.clear_degraded(server_id).await;
         {
             let mut exemptions = self.exemptions.lock().await;
             let keys: Vec<ExemptionKey> = exemptions
@@ -1300,9 +1310,6 @@ impl McpRuntime {
             for key in keys {
                 exemptions.revoke(&key);
             }
-        }
-        if removed.is_none() {
-            return Err(format!("服务器 {server_id} 没有可撤销的信任记录"));
         }
         self.emit(McpEvent::ServerStatusChanged {
             server_id: server_id.to_string(),
