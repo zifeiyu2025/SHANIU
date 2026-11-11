@@ -2274,21 +2274,30 @@ fn patterns() -> &'static [Pattern] {
 /// 崩溃报告序号：同一毫秒内两次 panic 也不互相覆盖。
 static CRASH_SEQ: AtomicU64 = AtomicU64::new(0);
 
-/// 崩溃路径专用的 best-effort 脱敏：注册表锁被 panic 持有时退化为纯模式脱敏，
-/// 绝不在 panic hook 里再次阻塞（那会把"崩溃退出"变成"卡死"）。
-fn redact_for_crash(text: &str) -> String {
+/// 脱敏正文：先整串替换已登记密钥，再按模式擦掉形似密钥的串。
+///
+/// 两条调用路径**只差取锁方式**（崩溃路径不能阻塞），正文必须共用这一份——
+/// 复制粘贴出来的「几乎一样」终会漂移，而这里是密钥落盘前的最后一道闸。
+fn scrub<'a>(text: &str, secrets: impl IntoIterator<Item = &'a str>) -> String {
     let mut out = text.to_string();
-    if let Ok(reg) = SECRET_REGISTRY.try_read() {
-        for secret in reg.iter() {
-            if out.contains(secret.as_str()) {
-                out = out.replace(secret.as_str(), REDACTED);
-            }
+    for secret in secrets {
+        if out.contains(secret) {
+            out = out.replace(secret, REDACTED);
         }
     }
     for p in patterns() {
         out = p.re.replace_all(&out, p.template).into_owned();
     }
     out
+}
+
+/// 崩溃路径专用的 best-effort 脱敏：注册表锁被 panic 持有时退化为纯模式脱敏，
+/// 绝不在 panic hook 里再次阻塞（那会把"崩溃退出"变成"卡死"）。
+fn redact_for_crash(text: &str) -> String {
+    match SECRET_REGISTRY.try_read() {
+        Ok(reg) => scrub(text, reg.iter().map(String::as_str)),
+        Err(_) => scrub(text, std::iter::empty()),
+    }
 }
 
 /// 写一份本地崩溃报告到 `<data_root>\crash\panic-<ts>-<pid>-<seq>.log`。
@@ -2342,20 +2351,9 @@ pub fn install_crash_hook(crash_dir: PathBuf) {
 /// 对任意将要落盘的文本做统一脱敏：先整串替换已登记密钥，再按模式擦掉形似密钥的串。
 /// logs 与 rollouts 的所有写入都必须经过这里（docs/01 §438「落盘前统一过脱敏过滤器」）。
 pub fn redact(text: &str) -> String {
-    let mut out = text.to_string();
-    {
-        // 中毒后照常读：锁里是要保密的清单，panic 掉整个进程比少脱敏一次更糟
-        let reg = SECRET_REGISTRY.read().unwrap_or_else(|e| e.into_inner());
-        for secret in reg.iter() {
-            if out.contains(secret.as_str()) {
-                out = out.replace(secret.as_str(), REDACTED);
-            }
-        }
-    }
-    for p in patterns() {
-        out = p.re.replace_all(&out, p.template).into_owned();
-    }
-    out
+    // 中毒后照常读：锁里是要保密的清单，panic 掉整个进程比少脱敏一次更糟
+    let reg = SECRET_REGISTRY.read().unwrap_or_else(|e| e.into_inner());
+    scrub(text, reg.iter().map(String::as_str))
 }
 
 /// 按行缓冲并脱敏的 writer：tracing 的一条事件分多次 write 到达（时间戳/级别/正文
