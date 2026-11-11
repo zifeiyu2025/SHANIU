@@ -1058,6 +1058,39 @@ mod tests {
     }
 
     #[test]
+    fn preamble_holds_no_rules() {
+        // 导语不进注入（`split_sections` 只产出带标题的节），所以它只能放给**改这份文件的人**
+        // 看的东西：声明行与 HTML 注释。谁把规则停在导语里，构建先坏，而不是模型静默看不到。
+        // 剥离注释后仍有正文 → 那段正文既不会进 `text`，也不会出现在 `dropped` 里。
+        let file = std::fs::read_to_string(repo_root().join(RULE_FILE_NAME)).expect("读仓库 AGENTS.md");
+        let preamble = file
+            .lines()
+            .take_while(|line| !line.starts_with("## ") && !line.starts_with("### "))
+            .collect::<Vec<_>>()
+            .join("\n");
+        let mut leftover = String::new();
+        let mut rest = preamble.as_str();
+        while let Some(start) = rest.find("<!--") {
+            leftover.push_str(&rest[..start]);
+            let after = &rest[start + 4..];
+            let Some(end) = after.find("-->") else {
+                panic!("导语里有没闭合的 HTML 注释，它后面的内容会被整段吞掉：\n{preamble}");
+            };
+            rest = &after[end + 3..];
+        }
+        leftover.push_str(rest);
+        // 一级标题是文档名，不是规则，也从来没进过注入；只允许它一行。
+        let body = leftover.trim();
+        let body = body.strip_prefix("# ").map_or(body, |rest| {
+            rest.split_once('\n').map_or("", |(_, tail)| tail.trim())
+        });
+        assert!(
+            body.is_empty(),
+            "导语不进注入，规则停在这里等于没有规则——挪进带标题的小节并登记常驻声明：\n{body}"
+        );
+    }
+
+    #[test]
     fn token_estimate_counts_cjk_as_one() {
         assert_eq!(estimate_tokens("abcd"), 1);
         assert_eq!(estimate_tokens("中文四字"), 4);
