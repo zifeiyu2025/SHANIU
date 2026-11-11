@@ -44,6 +44,14 @@
   它不替代 `cargo test`——查的是「docs 的符号级承诺还在不在」，查不了「实现是否正确」，
   也查不了测试有没有分辨力（见清单的 B 类）。
 
+  运行时必须是 **PowerShell 7+（`pwsh`）**，不能用 Windows PowerShell 5.1：
+  本文件是 UTF-8 **无 BOM**，5.1 会按当前 ANSI 代码页读入，中文注释与中文字符串被拆成乱码，
+  脚本连解析都过不去（典型报错：`Missing closing '}' in statement block`、
+  `You must provide a value expression following the '-and' operator`、
+  `Missing type name after '['`、`Unexpected token`，且报错行附近的中文显示为乱码）。
+  CI 跑的是 `pwsh`，所以这个问题只会在本地 Windows 上暴露——见到上述报错先换 `pwsh`，
+  别去改脚本语法。
+
 .PARAMETER Claims
   断言清单。默认 `align/doc-claims.md`。
 
