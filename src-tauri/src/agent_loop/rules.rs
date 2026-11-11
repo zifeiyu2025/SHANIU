@@ -271,65 +271,77 @@ pub fn discover(workspace_root: &Path) -> ProjectRules {
         ordered.extend(merged.iter().filter(|section| section.tier() == tier));
     }
 
-    // (层级, 标题, 渲染正文)：标题留着，是为了尾部留痕时能列出"哪些没进去"
-    let mut kept: Vec<(Tier, String, String)> = Vec::new();
-    let mut used = 0usize;
-    let mut dropped: Vec<String> = Vec::new();
-    let mut clipped: Vec<String> = Vec::new();
-
-    for section in ordered {
-        let rendered = section.render();
-        let tier = section.tier();
-        let cost = estimate_tokens(&rendered) + 1;
-        if used + cost <= RULE_TOKEN_BUDGET {
-            used += cost;
-            kept.push((tier, section.title(), rendered));
-            continue;
-        }
-        if tier == Tier::Must {
-            // Must 小节宁可截断也不整节消失：模型看到半条规则，也好过看不到。
-            if let Some(partial) = clip_lines(&rendered, RULE_TOKEN_BUDGET - used) {
-                used += estimate_tokens(&partial.text) + 1;
-                clipped.push(format!(
-                    "{}：保留 {}/{} 行，未注入起于「{}」",
-                    section.title(),
-                    partial.kept_lines,
-                    partial.total_lines,
-                    partial.first_omitted.as_deref().unwrap_or("-")
-                ));
-                kept.push((tier, section.title(), partial.text));
-                continue;
-            }
-        }
-        dropped.push(section.title());
+    struct Packed {
+        kept: Vec<(Tier, String, String)>,
+        dropped: Vec<String>,
+        clipped: Vec<String>,
+        used: usize,
     }
 
-    // 未注入的小节必须在正文里留痕：只写日志的话，模型仍然不知道"还有规则没给到"。
-    // 留痕本身也占预算，装不下就从尾部剔除**非 Must** 小节（Must 一律不动）。
+    /// 按给定预算装一遍：Must 装不下就按行截断，其它装不下整节记进 `dropped`。
+    fn pack(ordered: &[&Section], budget: usize) -> Packed {
+        let mut kept: Vec<(Tier, String, String)> = Vec::new();
+        let mut dropped: Vec<String> = Vec::new();
+        let mut clipped: Vec<String> = Vec::new();
+        let mut used = 0usize;
+        for section in ordered {
+            let rendered = section.render();
+            let tier = section.tier();
+            let cost = estimate_tokens(&rendered) + 1;
+            if used + cost <= budget {
+                used += cost;
+                kept.push((tier, section.title(), rendered));
+                continue;
+            }
+            if tier == Tier::Must {
+                // Must 小节宁可截断也不整节消失：模型看到半条规则，也好过看不到。
+                if let Some(partial) = clip_lines(&rendered, budget.saturating_sub(used)) {
+                    used += estimate_tokens(&partial.text) + 1;
+                    clipped.push(format!(
+                        "{}：保留 {}/{} 行，未注入起于「{}」",
+                        section.title(),
+                        partial.kept_lines,
+                        partial.total_lines,
+                        partial.first_omitted.as_deref().unwrap_or("-")
+                    ));
+                    kept.push((tier, section.title(), partial.text));
+                    continue;
+                }
+            }
+            dropped.push(section.title());
+        }
+        Packed { kept, dropped, clipped, used }
+    }
+
+    // 留痕本身占预算，所以必须在装节**之前**预留：先装完再试着塞，塞不进就只剩
+    // "只报数量"这一档——模型看到"可能不全"，却不知道少了哪几条，而这正是要治的病。
+    // 丢的节越多留痕越长，越该在前面让位，而不是把留痕自己挤掉。
+    // 重算到稳定（丢的节只会随预算缩小而变多，两三轮即收敛）。
+    let mut packed = pack(&ordered, RULE_TOKEN_BUDGET);
+    let mut reserve = 0usize;
+    for _ in 0..8 {
+        if packed.dropped.is_empty() {
+            break;
+        }
+        let need = estimate_tokens(&dropped_note(&packed.dropped)) + 1;
+        if need <= reserve {
+            break;
+        }
+        reserve = need.min(NOTE_TOKEN_CAP + 1);
+        packed = pack(&ordered, RULE_TOKEN_BUDGET - reserve);
+    }
+    let mut kept = packed.kept;
+    let dropped = packed.dropped;
+    let clipped = packed.clipped;
+    let used = packed.used;
+
     let mut note_inlined = false;
     if !dropped.is_empty() {
-        let where_to_read = sources
-            .iter()
-            .map(|path| path.display().to_string())
-            .collect::<Vec<_>>()
-            .join("、");
-        loop {
-            let note = dropped_note(&where_to_read, &dropped);
-            let cost = estimate_tokens(&note) + 1;
-            if used + cost <= RULE_TOKEN_BUDGET {
-                kept.push((Tier::Other, String::new(), note));
-                note_inlined = true;
-                break;
-            }
-            match kept.iter().rposition(|(tier, _, _)| *tier != Tier::Must) {
-                Some(index) => {
-                    let (_, title, rendered) = kept.remove(index);
-                    used = used.saturating_sub(estimate_tokens(&rendered) + 1);
-                    dropped.push(title);
-                }
-                // 只剩 Must 小节：留痕写不进去，标题交给 `dropped` 进日志/调用方
-                None => break,
-            }
+        let note = dropped_note(&dropped);
+        let cost = estimate_tokens(&note) + 1;
+        if used + cost <= RULE_TOKEN_BUDGET {
+            kept.push((Tier::Other, String::new(), note));
+            note_inlined = true;
         }
     }
 
@@ -350,12 +362,39 @@ pub fn discover(workspace_root: &Path) -> ProjectRules {
     }
 }
 
-/// 尾部留痕：告诉模型还有哪些小节因预算没进来、去哪里读。
-fn dropped_note(where_to_read: &str, dropped: &[String]) -> String {
-    format!(
-        "（以下小节因预算未注入，需要时读取 {where_to_read}：{}）",
-        dropped.join("、")
-    )
+/// 尾部留痕的 token 上限。
+///
+/// 留痕是"说明规则不全"，不是"复述目录"——它不能比被说明的规则本身更贵，否则会
+/// 反过来把 `Must` 小节挤出预算（§11.3 退化红线就是这样在 2026-11-11 被挤掉的）。
+/// 因此标题只列前几条，其余压成总数。
+const NOTE_TOKEN_CAP: usize = 60;
+
+/// 尾部留痕：告诉模型还有几条规则没进来。
+///
+/// 不写"去读 <路径>"：提示词开头已经声明过「来源：…」，再说一遍只是重复；
+/// 更重要的是模型必须知道**自己看到的不完整**，而不是"去哪找一个它够不到的地方"。
+fn dropped_note(dropped: &[String]) -> String {
+    let mut listed: Vec<&str> = Vec::new();
+    for title in dropped {
+        listed.push(title);
+        if listed.len() > 1 && estimate_tokens(&render_note(dropped.len(), &listed)) > NOTE_TOKEN_CAP
+        {
+            listed.pop();
+            break;
+        }
+    }
+    render_note(dropped.len(), &listed)
+}
+
+fn render_note(total: usize, listed: &[&str]) -> String {
+    if listed.len() >= total {
+        format!("（另有 {total} 节规则因预算未注入，你看到的规则不完整：{}）", listed.join("、"))
+    } else {
+        format!(
+            "（另有 {total} 节规则因预算未注入，你看到的规则不完整，例如：{}）",
+            listed.join("、")
+        )
+    }
 }
 
 #[cfg(test)]
@@ -543,6 +582,14 @@ mod tests {
                 rules.dropped
             );
         }
+        // 有节被省略时，正文必须自己说"不完整"：静默截断会让模型把残缺当完整。
+        if !rules.dropped.is_empty() {
+            assert!(
+                rules.text.contains("规则不完整"),
+                "被省略的节必须在正文里留痕（当前注入：\n{}）",
+                rules.text
+            );
+        }
         assert!(
             estimate_tokens(&rules.text) <= RULE_TOKEN_BUDGET,
             "注入正文不得超过预算：{} > {RULE_TOKEN_BUDGET}",
@@ -590,6 +637,42 @@ mod tests {
                 rules.text
             );
         }
+    }
+
+    #[test]
+    fn omission_note_survives_a_fully_spent_budget() {
+        // 留痕必须在"预算已经被 Must 吃满"时仍然进正文。旧实现是装完再试着塞，
+        // 塞不进又没有一个非 Must 小节可以让位，于是退化成"只报数量"——模型看到
+        // 的是一句"可能不全"，却不知道少了哪几条。
+        // 断言落在**注入正文的内容**上，不是 `note_inlined` 这个内部状态。
+        let dir = temp_dir("note-reserve");
+        let long: String = (0..12).map(|i| format!("第{i}行：{}\n", "甲".repeat(80))).collect();
+        let mut doc = format!("## 0. 铁律\n必须遵守\n\n## 1. 安全边界\n{long}\n");
+        // 附录的正文与标题都够长：留痕会被 NOTE_TOKEN_CAP 截到上限，
+        // 于是"装完再塞"必然失败（残余空间装不下 60 tokens 的留痕）。
+        for i in 0..6 {
+            doc.push_str(&format!("## 附录章节{i}号\n{}\n\n", "乙".repeat(200)));
+        }
+        write(&dir.join(RULE_FILE_NAME), &doc);
+
+        let rules = discover(&dir);
+        assert!(!rules.clipped.is_empty(), "构造的场景必须让 Must 小节被按行截断");
+        assert_eq!(rules.dropped.len(), 6, "六个附录必须整节丢弃：{:?}", rules.dropped);
+        assert!(
+            rules.text.contains("规则不完整"),
+            "预算吃满时留痕仍必须进正文：{}",
+            rules.text
+        );
+        assert!(
+            rules.text.contains(&rules.dropped[0]),
+            "被省略的标题必须在正文里读得到：{}",
+            rules.text
+        );
+        assert!(
+            estimate_tokens(&rules.text) <= RULE_TOKEN_BUDGET,
+            "留痕不能把总量顶破预算：{}",
+            estimate_tokens(&rules.text)
+        );
     }
 
     #[test]

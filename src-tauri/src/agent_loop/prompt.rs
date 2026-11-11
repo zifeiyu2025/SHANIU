@@ -242,11 +242,12 @@ fn project_rules_block(rules: &ProjectRules) -> String {
             rules.clipped.join("、")
         ));
     }
-    // 未注入的小节：正文留痕放得下时已在 `rules.text` 里列全标题；放不下只报数量，
-    // **完整标题进日志**（`rules_dropped`）——把十几个标题塞进提示词会顶破全文预算。
+    // 未注入的小节：正文留痕通常已列在 `rules.text` 尾部；万一连留痕都放不下，
+    // 这里也必须告诉模型"你看的不完整"——**不能写"标题见日志"**：模型读不到日志，
+    // 等于给了一句它用不上的话（完整标题仍进日志 `rules_dropped`，那是给人看的）。
     if !rules.dropped.is_empty() && !rules.note_inlined {
         text.push_str(&format!(
-            "\n（另有 {} 节未注入，标题见日志。）",
+            "\n（另有 {} 节未注入，你当前看到的规则不完整。）",
             rules.dropped.len()
         ));
     }
