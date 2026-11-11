@@ -75,6 +75,7 @@ $allow = @{
     'goals'           = @('app_state')                                                # E44（SH-088 会话目标持久层：从装配层取数据根）
     'mcp_client'      = @('tool_router', 'sandbox')                                   # E47（SH-060 MCP 客户端：try_register/ToolSpec + spawn_restricted_stdio；config/events 属 infra 全局放行）
     'capability'      = @('app_state')                                                # E55（SH-132 能力探针：命令壳经 tauri::State 取数据根与密钥；config 属 infra 全局放行）
+    'key_check'       = @('model_client', 'app_state')                                # E61（A0-1 密钥三态校验：复用 ModelError 分类；命令壳经 tauri::State 取装配状态；reqwest 是外部 crate，不登记 crate 内边）
     'text_encoding'   = @()                                                           # E56（SH-064 编码识别：零依赖叶子，只依赖 std）
     'user_terminal'   = @()                                                           # E57（SH-071 右侧栏独立终端：只依赖 portable_pty/windows/std，不进沙箱与模型通道）
     'test_support'    = @()                                                           # E58（测试夹具：只依赖 std/ulid；仅测试路径可反向依赖它，见下方窄豁免）

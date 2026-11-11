@@ -20,6 +20,8 @@ pub mod gateway;
 pub mod goals;
 pub mod images;
 pub mod jobs;
+/// A0-1：密钥三态校验（保存后用免费用端点确认 Key 是否被接受）。
+pub mod key_check;
 pub mod mcp_client;
 /// SH-135：`/api/file` 媒体路由（工作区图片 / PDF 预览的取字节通道）。
 pub mod media_route;
@@ -2712,6 +2714,7 @@ pub fn run() {
             save_providers,
             sandbox_status,
             model_discovery::discover_models,
+            key_check::check_api_key,
             capability::probe_capabilities,
             capability::fetch_model_metadata,
             delete_api_key,
