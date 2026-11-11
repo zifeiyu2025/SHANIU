@@ -176,6 +176,22 @@ impl ProjectRules {
     pub fn is_empty(&self) -> bool {
         self.text.trim().is_empty()
     }
+
+    /// 一句话说明这批规则是按什么选出来的（进"内容锁"日志）。
+    ///
+    /// 出问题时第一句要能回答"为什么这几节在、那几节不在"；只记 `dropped` 清单
+    /// 回答不了这个——清单说的是结果，不是依据。
+    pub fn selection(&self) -> String {
+        match &self.declaration {
+            Declaration::Resident { anchors, line } => {
+                format!("声明选节：第 {line} 行，{} 个锚点", anchors.len())
+            }
+            Declaration::Invalid { kind, line } => {
+                format!("声明无效（第 {line} 行：{kind}），已回退旧分层")
+            }
+            Declaration::Absent => "无声明，按标题语义分层".to_string(),
+        }
+    }
 }
 
 /// 粗粒度 token 估算：CJK 字符按 1 token，ASCII 按 4 字节 1 token。

@@ -383,6 +383,7 @@ todo_write 只用于计划获批后的实施跟踪；规划阶段的计划本体
         prompt_chars = text.chars().count(),
         rules_fingerprint = %rules.fingerprint,
         rules_sources = rules.sources.len(),
+        rules_selection = %rules.selection(),
         // 记**标题列表**而不是数量：计数看不出来"被静默裁掉的是铁律还是附录"。
         rules_dropped = %rules.dropped.join("、"),
         rules_clipped = %rules.clipped.join("、"),
