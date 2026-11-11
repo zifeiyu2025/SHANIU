@@ -7,6 +7,74 @@
     "路径必须用 POSIX 分隔符。"
   ],
   "entries": {
+    "ui-approval/src/client/ApprovalPanel.tsx": {
+      "reason": "A0-T7 审批详情结构化：description 可选透传（docs/07 #25）",
+      "guard": "上游若把审批详情做成结构化组件，删本地实现改跟上游；必须确认 description 仍是 optional"
+    },
+    "ui-approval/src/client/contract/slots.ts": {
+      "reason": "A0-T7：审批详情槽所在契约，description 可选（docs/07 #25）",
+      "guard": "同步上游后确认详情槽仍是单定义、字段仍可选"
+    },
+    "ui-approval/src/client/index.ts": {
+      "reason": "A0-T7：面板导出与槽接线（docs/07 #25）",
+      "guard": "上游若提供等价入口则改调上游"
+    },
+    "ui-chat/src/client/chat/ApprovalCommand.module.css": {
+      "reason": "A0-T7 本地新增样式（上游无此文件，docs/07 #25）",
+      "guard": "上游若自带详情样式，删本地文件"
+    },
+    "ui-chat/src/client/chat/ApprovalCommand.tsx": {
+      "reason": "A0-T7 审批详情按工具结构化展示（重写，docs/07 #25）",
+      "guard": "上游若结构化渲染，删本地重写；否则保留并确认未截断原文"
+    },
+    "ui-chat/src/client/chat/MessageItem.module.css": {
+      "reason": "A0-2 失败行可展开/复制所需的样式（docs/07 #23）",
+      "guard": "上游若提供等价诊断 UI，删本地改动"
+    },
+    "ui-chat/src/client/chat/MessageItem.tsx": {
+      "reason": "A0-2 TurnErrorItem 增加可展开的原始诊断与复制（docs/07 #23）",
+      "guard": "上游若已提供等价原始诊断，删本地改动改跟上游"
+    },
+    "ui-chat/src/client/chat/TurnTriggerNodeView.tsx": {
+      "reason": "A0-4 未知时刻改用 span、不挂 dateTime（docs/07 #24）",
+      "guard": "同步后确认 time=0 不再渲染成 1970"
+    },
+    "ui-chat/src/client/chat/message-chrome.ts": {
+      "reason": "A0-4 time<=0 返回「记录时刻不可用」（docs/07 #24）",
+      "guard": "同步后确认旧档案不再显示假时钟"
+    },
+    "ui-chat/src/client/conversation-nodes/event-projection.ts": {
+      "reason": "A0-2 失败节点 detail 透传（docs/07 #23）",
+      "guard": "上游若自带 detail，删本地透传"
+    },
+    "ui-chat/src/client/conversation-nodes/turn-error.ts": {
+      "reason": "A0-2 TurnErrorNode 增加可选 detail（docs/07 #23）",
+      "guard": "上游若等价则删本地字段；字段必须保持可选"
+    },
+    "ui-chat/tests/approval-command.client.spec.tsx": {
+      "reason": "A0-T7 详情槽用例（docs/07 #25）",
+      "guard": "同步上游后用例随实现一起调整，不要单独删"
+    },
+    "ui-conversation/src/client/contract/records.ts": {
+      "reason": "A0-2 记录里的失败节点增加可选 detail（docs/07 #23）",
+      "guard": "上游若自带 detail，删本地字段"
+    },
+    "ui-workspace/src/client/contract/slots.ts": {
+      "reason": "SH-113 搜索失败/残缺与重试注入（docs/07 #26）",
+      "guard": "上游若自己区分搜索失败与残缺，删本地字段"
+    },
+    "ui-workspace/src/client/index.ts": {
+      "reason": "SH-113 注入 retrySearchIndex（docs/07 #26）",
+      "guard": "同步后确认注入仍是可选"
+    },
+    "ui-workspace/src/client/locales.ts": {
+      "reason": "SH-113 search.failed/.skipped/.retry 词典键（docs/07 #26）",
+      "guard": "上游若自带等价键，删本地键改指上游"
+    },
+    "ui-workspace/src/client/rows/WorkspaceBrowser.module.css": {
+      "reason": "SH-113 失败/残缺两行样式（docs/07 #26）",
+      "guard": "上游若自带，删本地样式"
+    },
     "AGENTS.md": {
       "status": "not-applicable",
       "reason": "上游 packages/client 顶层文档，不随 vendor 引入",

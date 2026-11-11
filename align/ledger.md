@@ -11,7 +11,7 @@
 - drift：75
 - missing：0
 - not-applicable：559
-- 待复核（needs-review）：20
+- 待复核（needs-review）：3
 
 ## 不一致条目
 
@@ -118,9 +118,9 @@
 | `packages/client/ui-agent-team/tsconfig.json` | not-applicable | 已登记 | 整包未 vendor（本项目未接线该能力） | 接入该能力时整包 vendor，并按 docs/07 登记改动 |
 | `packages/client/ui-agent-team/tsdown.config.ts` | not-applicable | 已登记 | 整包未 vendor（本项目未接线该能力） | 接入该能力时整包 vendor，并按 docs/07 登记改动 |
 | `packages/client/ui-approval/src/client/ApprovalCard.tsx` | drift | 已登记 | 默认焦点落「拒绝」；修 allow-once 被记忆为永久放行（docs/07 #6） | 同步时确认上游未把一次性放行降级为 allow_always（§11.3 退化红线） |
-| `packages/client/ui-approval/src/client/ApprovalPanel.tsx` | drift | **needs-review** | — | — |
-| `packages/client/ui-approval/src/client/contract/slots.ts` | drift | **needs-review** | — | — |
-| `packages/client/ui-approval/src/client/index.ts` | drift | **needs-review** | — | — |
+| `packages/client/ui-approval/src/client/ApprovalPanel.tsx` | drift | 已登记 | A0-T7 审批详情结构化：description 可选透传（docs/07 #25） | 上游若把审批详情做成结构化组件，删本地实现改跟上游；必须确认 description 仍是 optional |
+| `packages/client/ui-approval/src/client/contract/slots.ts` | drift | 已登记 | A0-T7：审批详情槽所在契约，description 可选（docs/07 #25） | 同步上游后确认详情槽仍是单定义、字段仍可选 |
+| `packages/client/ui-approval/src/client/index.ts` | drift | 已登记 | A0-T7：面板导出与槽接线（docs/07 #25） | 上游若提供等价入口则改调上游 |
 | `packages/client/ui-brand-official/README.i18n.yaml` | not-applicable | 已登记 | 整包未 vendor（本项目未接线该能力） | 接入该能力时整包 vendor，并按 docs/07 登记改动 |
 | `packages/client/ui-brand-official/README.md` | not-applicable | 已登记 | 整包未 vendor（本项目未接线该能力） | 接入该能力时整包 vendor，并按 docs/07 登记改动 |
 | `packages/client/ui-brand-official/README.zh.md` | not-applicable | 已登记 | 整包未 vendor（本项目未接线该能力） | 接入该能力时整包 vendor，并按 docs/07 登记改动 |
@@ -148,25 +148,25 @@
 | `packages/client/ui-brand-official/tests/pixel-whale.client.spec.tsx` | not-applicable | 已登记 | 整包未 vendor（本项目未接线该能力） | 接入该能力时整包 vendor，并按 docs/07 登记改动 |
 | `packages/client/ui-brand-official/tsconfig.json` | not-applicable | 已登记 | 整包未 vendor（本项目未接线该能力） | 接入该能力时整包 vendor，并按 docs/07 登记改动 |
 | `packages/client/ui-brand-official/tsdown.config.ts` | not-applicable | 已登记 | 整包未 vendor（本项目未接线该能力） | 接入该能力时整包 vendor，并按 docs/07 登记改动 |
-| `src/dsh/packages/client/ui-chat/src/client/chat/ApprovalCommand.module.css` | not-applicable | **needs-review** | — | — |
-| `packages/client/ui-chat/src/client/chat/ApprovalCommand.tsx` | drift | **needs-review** | — | — |
+| `src/dsh/packages/client/ui-chat/src/client/chat/ApprovalCommand.module.css` | not-applicable | 已登记 | A0-T7 本地新增样式（上游无此文件，docs/07 #25） | 上游若自带详情样式，删本地文件 |
+| `packages/client/ui-chat/src/client/chat/ApprovalCommand.tsx` | drift | 已登记 | A0-T7 审批详情按工具结构化展示（重写，docs/07 #25） | 上游若结构化渲染，删本地重写；否则保留并确认未截断原文 |
 | `packages/client/ui-chat/src/client/chat/ChatView.tsx` | drift | 已登记 | 类型级修复（第 9 行批次）+ fileImages.labels 传 image.openExternal（第 22 行） | 两项分别按对应行规则同步：上游统一文案则删本地传参，类型批随 React 19 升级重跑 tsc -b |
-| `packages/client/ui-chat/src/client/chat/MessageItem.module.css` | drift | **needs-review** | — | — |
-| `packages/client/ui-chat/src/client/chat/MessageItem.tsx` | drift | **needs-review** | — | — |
-| `packages/client/ui-chat/src/client/chat/TurnTriggerNodeView.tsx` | drift | **needs-review** | — | — |
+| `packages/client/ui-chat/src/client/chat/MessageItem.module.css` | drift | 已登记 | A0-2 失败行可展开/复制所需的样式（docs/07 #23） | 上游若提供等价诊断 UI，删本地改动 |
+| `packages/client/ui-chat/src/client/chat/MessageItem.tsx` | drift | 已登记 | A0-2 TurnErrorItem 增加可展开的原始诊断与复制（docs/07 #23） | 上游若已提供等价原始诊断，删本地改动改跟上游 |
+| `packages/client/ui-chat/src/client/chat/TurnTriggerNodeView.tsx` | drift | 已登记 | A0-4 未知时刻改用 span、不挂 dateTime（docs/07 #24） | 同步后确认 time=0 不再渲染成 1970 |
 | `packages/client/ui-chat/src/client/chat/flow-motion.ts` | drift | 已登记 | 类型级修复（docs/07 #9） | 同第 9 行类型批 |
-| `packages/client/ui-chat/src/client/chat/message-chrome.ts` | drift | **needs-review** | — | — |
+| `packages/client/ui-chat/src/client/chat/message-chrome.ts` | drift | 已登记 | A0-4 time<=0 返回「记录时刻不可用」（docs/07 #24） | 同步后确认旧档案不再显示假时钟 |
 | `packages/client/ui-chat/src/client/chat/searchable-hidden.ts` | drift | 已登记 | 类型级修复（docs/07 #9） | 同第 9 行类型批 |
 | `packages/client/ui-chat/src/client/chat/text-interaction.ts` | drift | 已登记 | 类型级修复（docs/07 #9） | 同第 9 行类型批 |
 | `packages/client/ui-chat/src/client/chat/use-chat-scroll.ts` | drift | 已登记 | 类型级修复（docs/07 #9） | 同第 9 行类型批 |
 | `packages/client/ui-chat/src/client/chat/use-chat-viewport.ts` | drift | 已登记 | 类型级修复（docs/07 #9） | 同第 9 行类型批 |
 | `packages/client/ui-chat/src/client/chat/use-process-scroll.ts` | drift | 已登记 | 类型级修复（docs/07 #9） | 同第 9 行类型批 |
 | `packages/client/ui-chat/src/client/contract/slots.ts` | drift | 已登记 | 类型级修复（docs/07 #9） | 同第 9 行类型批 |
-| `packages/client/ui-chat/src/client/conversation-nodes/event-projection.ts` | drift | **needs-review** | — | — |
-| `packages/client/ui-chat/src/client/conversation-nodes/turn-error.ts` | drift | **needs-review** | — | — |
+| `packages/client/ui-chat/src/client/conversation-nodes/event-projection.ts` | drift | 已登记 | A0-2 失败节点 detail 透传（docs/07 #23） | 上游若自带 detail，删本地透传 |
+| `packages/client/ui-chat/src/client/conversation-nodes/turn-error.ts` | drift | 已登记 | A0-2 TurnErrorNode 增加可选 detail（docs/07 #23） | 上游若等价则删本地字段；字段必须保持可选 |
 | `packages/client/ui-chat/src/client/locale.ts` | drift | 已登记 | 8 套词典各加 image.openExternal（共 8 条）（docs/07 #22） | 上游若已加等价键，删本地 8 条改指上游键 |
-| `packages/client/ui-chat/tests/approval-command.client.spec.tsx` | drift | **needs-review** | — | — |
-| `packages/client/ui-conversation/src/client/contract/records.ts` | drift | **needs-review** | — | — |
+| `packages/client/ui-chat/tests/approval-command.client.spec.tsx` | drift | 已登记 | A0-T7 详情槽用例（docs/07 #25） | 同步上游后用例随实现一起调整，不要单独删 |
+| `packages/client/ui-conversation/src/client/contract/records.ts` | drift | 已登记 | A0-2 记录里的失败节点增加可选 detail（docs/07 #23） | 上游若自带 detail，删本地字段 |
 | `packages/client/ui-conversation/src/client/contract/slots.ts` | drift | 已登记 | 类型级修复（docs/07 #9） | 同第 9 行类型批 |
 | `packages/client/ui-conversation/src/client/input/editor/DraftEditor.tsx` | drift | 已登记 | 类型级修复（docs/07 #9） | 同第 9 行类型批 |
 | `packages/client/ui-conversation/src/client/input/editor/view-binding.ts` | drift | 已登记 | 类型级修复（docs/07 #9） | 同第 9 行类型批 |
@@ -645,10 +645,10 @@
 | `packages/client/ui-theme/src/client/styles.ts` | drift | 已登记 | 8 张主题样式表改构造式样式表，绕过打包后 CSP style-src 拦截（docs/07 #20） | 上游若改构造式样式表或给 <style> 打 nonce，删本地实现；不要退回 <style> 注入 |
 | `packages/client/ui-theme/tests/client-styles.client.spec.ts` | drift | 已登记 | 用例断言对象改为 adoptedStyleSheets，配合上面的实现改动（docs/07 #20） | 实现回退时用例一并回退 |
 | `packages/client/ui-workflow-run/src/client/WorkflowRunPanel.tsx` | drift | 已登记 | 类型级修复（docs/07 #9） | 同第 9 行类型批 |
-| `packages/client/ui-workspace/src/client/contract/slots.ts` | drift | **needs-review** | — | — |
-| `packages/client/ui-workspace/src/client/index.ts` | drift | **needs-review** | — | — |
-| `packages/client/ui-workspace/src/client/locales.ts` | drift | **needs-review** | — | — |
-| `packages/client/ui-workspace/src/client/rows/WorkspaceBrowser.module.css` | drift | **needs-review** | — | — |
+| `packages/client/ui-workspace/src/client/contract/slots.ts` | drift | 已登记 | SH-113 搜索失败/残缺与重试注入（docs/07 #26） | 上游若自己区分搜索失败与残缺，删本地字段 |
+| `packages/client/ui-workspace/src/client/index.ts` | drift | 已登记 | SH-113 注入 retrySearchIndex（docs/07 #26） | 同步后确认注入仍是可选 |
+| `packages/client/ui-workspace/src/client/locales.ts` | drift | 已登记 | SH-113 search.failed/.skipped/.retry 词典键（docs/07 #26） | 上游若自带等价键，删本地键改指上游 |
+| `packages/client/ui-workspace/src/client/rows/WorkspaceBrowser.module.css` | drift | 已登记 | SH-113 失败/残缺两行样式（docs/07 #26） | 上游若自带，删本地样式 |
 | `packages/client/ui-workspace/src/client/rows/WorkspaceBrowser.tsx` | drift | 已登记 | 同 AnimatedRows：修 UIA Expand 卡死并接入本地键盘模型（docs/07 #5） | 上游若修复重入且自带键盘模型，删本地改动 |
 | `src/dsh/packages/client/ui-workspace/src/client/rows/treeKeyboard.ts` | not-applicable | 已登记 | 本地新增：ARIA 树键盘模型（上游只有鼠标展开/收起，见 docs/07 #5） | 上游若自带键盘模型，删本地实现改跟上游 |
 
