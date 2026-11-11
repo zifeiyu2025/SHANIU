@@ -9,6 +9,7 @@
  */
 import { describe, expect, it } from 'vitest'
 import { createSettingsFace } from './settings-face'
+import { PRESET_BUNDLES, presetOfBundle } from './permission-presets'
 import type { HostBridge } from './tauri'
 
 /** 一个能真的改状态、真的按修订号拒写的宿主替身。 */
@@ -21,6 +22,8 @@ interface FakeHost {
   failRead: boolean
   /** 宿主 `[sandbox] mode` 的替身状态：`save_settings` 会改它，`get_settings` 按它回显。 */
   sandboxMode: string
+  /** 宿主 `[approval] mode` 的替身状态：与沙箱档成对写，预设反查要两维。 */
+  approvalMode: string
   /** discover_models 桩：设了错误就抛，否则回固定清单。 */
   discoverError: string | undefined
   rows(): Row[]
@@ -92,6 +95,7 @@ function fakeHost(rows: Row[] = []): FakeHost {
     active: '',
     failRead: false,
     sandboxMode: 'workspace_write',
+    approvalMode: 'on_request',
     rows,
     discoverError: undefined as string | undefined,
   }
@@ -106,6 +110,8 @@ function fakeHost(rows: Row[] = []): FakeHost {
     set failRead(value) { state.failRead = value },
     get sandboxMode() { return state.sandboxMode },
     set sandboxMode(value) { state.sandboxMode = value },
+    get approvalMode() { return state.approvalMode },
+    set approvalMode(value) { state.approvalMode = value },
     get discoverError() { return state.discoverError },
     set discoverError(value) { state.discoverError = value },
     rows: () => state.rows,
@@ -124,7 +130,8 @@ function fakeHost(rows: Row[] = []): FakeHost {
             workspaceRoot: 'W',
             hasApiKey: active !== undefined && keys.has(active.secret_ref),
             sandboxMode: state.sandboxMode,
-            approvalMode: 'ask',
+            approvalMode: state.approvalMode,
+            permissionPreset: presetOfBundle(state.sandboxMode, state.approvalMode),
             activeProvider: state.active,
             providerRevision: state.revision,
             // 与真实 `get_settings` 同形：默认档由宿主给出（config.rs 的唯一真源）
@@ -171,8 +178,14 @@ function fakeHost(rows: Row[] = []): FakeHost {
           return state.revision as T
         }
         if (command === 'save_settings') {
-          // 宿主 `save_settings` 的替身：只改沙箱档（其余必填参数由 face 从快照原样写回）
-          state.sandboxMode = String(args?.sandboxMode ?? state.sandboxMode)
+          // 宿主 `save_settings` 的替身：预设把两维一起写（其余必填参数由 face 从快照写回）
+          const preset = args?.permissionPreset
+          if (preset !== undefined) {
+            const bundle = PRESET_BUNDLES[String(preset)]
+            if (bundle === undefined) throw new Error(`未知权限预设: ${String(preset)}`)
+            state.sandboxMode = bundle.sandbox
+            state.approvalMode = bundle.approval
+          }
           return undefined as T
         }
         if (command === 'has_api_key') return keys.has(args?.provider as string) as T
@@ -749,9 +762,10 @@ describe('权限挡位域（permission 命名空间，SH-105 补修）', () => {
     return described.namespaces.find(ns => ns['ns'] === 'permission')!
   }
 
-  it('describe 暴露 permission 命名空间：defaultPreset 反推自宿主沙箱档，schema 声明三档', async () => {
+  it('describe 暴露 permission 命名空间：defaultPreset 取宿主预设表结果，schema 声明四档', async () => {
     const host = fakeHost([LONGCAT])
     host.sandboxMode = 'danger_full_access'
+    host.approvalMode = 'never'
     const view = await permissionOf(faceOf(host))
     // 缺这个命名空间时 DSH 的挡位行会静默不写（settings-store.ts:109-116），
     // 连一句错误都显示不出来——这正是"点芯片没反应"的根因之一。
@@ -762,19 +776,21 @@ describe('权限挡位域（permission 命名空间，SH-105 补修）', () => {
     expect(view['revision']).toBe(0)
     // schema 的枚举必须覆盖全集：界面按它渲染下拉，缺一档就少一个可选项
     const schema = JSON.stringify(view['schema'])
-    for (const preset of ['read-only', 'workspace-write', 'danger-full-access']) {
+    for (const preset of ['read-only', 'workspace-write', 'danger-full-access', 'workspace-write-auto']) {
       expect(schema, preset).toContain(preset)
     }
+    // 派生值不进可选目录：它不是"选择"，是"组合不在表里"的观察结果
+    expect(schema).not.toContain('custom')
   })
 
-  it('认不出的沙箱档回落最小档，不猜一个更宽松的档位', async () => {
+  it('两维不在预设表里时如实给 custom，不猜一个更宽松的档位', async () => {
     const host = fakeHost([LONGCAT])
     host.sandboxMode = 'some-future-mode'
     const view = await permissionOf(faceOf(host))
-    expect(view['value']).toEqual({ defaultPreset: 'read-only' })
+    expect(view['value']).toEqual({ defaultPreset: 'custom' })
   })
 
-  it('写 defaultPreset：落宿主 [sandbox] mode、刷新快照、修订号 +1 并广播', async () => {
+  it('写 defaultPreset：落宿主 permission_preset（两维一起写）、刷新快照、修订号 +1 并广播', async () => {
     const host = fakeHost([LONGCAT])
     host.sandboxMode = 'read_only'
     const face = faceOf(host)
@@ -782,8 +798,9 @@ describe('权限挡位域（permission 命名空间，SH-105 补修）', () => {
       { op: 'set', path: ['defaultPreset'], value: 'workspace-write' },
     ], 0)
     expect(result['ok']).toBe(true)
-    // 唯一的落点是宿主的 [sandbox] mode（save_settings），不是前端自己记一份。
-    // 键名必须是 camelCase（Tauri 形参映射）：写 `base_url`/`workspace_root`/`sandbox_mode`
+    // 唯一的落点是宿主的 permission_preset（save_settings），不是前端自己记一份，
+    // 也不是只改沙箱那一维——两维由宿主预设表一起装载。
+    // 键名必须是 camelCase（Tauri 形参映射）：写 `base_url`/`workspace_root`/`permission_preset`
     // 会得到 `missing required key baseUrl`，宿主一次都不会落盘（D-08 的真机错误）。
     const write = host.calls.find(call => call.command === 'save_settings')
     expect(Object.keys(write?.args ?? {}).filter(key => key.includes('_'))).toEqual([])
@@ -791,7 +808,7 @@ describe('权限挡位域（permission 命名空间，SH-105 补修）', () => {
       baseUrl: 'https://api.longcat.chat/openai/v1',
       model: 'LongCat-2.5',
       workspaceRoot: 'W',
-      sandboxMode: 'workspace_write',
+      permissionPreset: 'workspace-write',
     })
     // 应答里的值来自写后重读的宿主快照（回弹给界面的是真实生效档）
     expect((result['value'] as { value: { defaultPreset: string } }).value.defaultPreset).toBe('workspace-write')
@@ -842,6 +859,7 @@ describe('权限挡位域（permission 命名空间，SH-105 补修）', () => {
     const face = faceOf(host)
     const cases: [string, Record<string, unknown>[], string][] = [
       ['上游实验档 auto 不在目录里', [{ op: 'set', path: ['defaultPreset'], value: 'auto' }], 'unknown permission preset'],
+      ['派生档 custom 不可写', [{ op: 'set', path: ['defaultPreset'], value: 'custom' }], 'unknown permission preset'],
       ['非字符串挡位', [{ op: 'set', path: ['defaultPreset'], value: 3 }], 'unknown permission preset'],
       ['未知字段', [{ op: 'set', path: ['approvalMode'], value: 'never' }], 'defaultPreset'],
       ['删除语义', [{ op: 'unset', path: ['defaultPreset'] }], 'has no removable key'],

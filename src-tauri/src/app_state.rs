@@ -44,9 +44,10 @@ pub struct AppState {
     /// 正在跑的能力探针（SH-132）：设置页据此显示「检测中」而不是「未验证」。
     /// 与任务生命周期无关——探针是后台增强，任务结束不该打断它。
     pub probing: Arc<crate::capability::Inflight>,
-    /// 会话尚未建档时先切的档位（草稿）：贴到 id 上，等首条任务落盘时写进档案。
+    /// 会话尚未建档时先选的权限预设（草稿）：贴到 id 上，等首条任务落盘时写进档案。
     /// 进程内、不落盘——这份选择本来就没被持久化过，重启丢掉是诚实的。
-    draft_sandbox: Mutex<std::collections::HashMap<String, crate::config::SandboxMode>>,
+    /// 存预设而不是两维：先切档再发首条消息时，审批档也必须跟着走（自主档的整个意义）。
+    draft_preset: Mutex<std::collections::HashMap<String, crate::permission::preset::Preset>>,
     /// 「另存为」票据（审计 H2 批 1）：`export_session_log` 的 `dest` 不再收路径，
     /// 只收这里签发的随机票据，确保只能写用户本人在原生对话框里选过的位置。
     pub save_tickets: crate::session_export::SaveTicketStore,
@@ -91,7 +92,7 @@ impl AppState {
             active_subagents: Mutex::new(None),
             mcp: Arc::new(crate::mcp_client::runtime::McpRuntime::new(&config_root)),
             probing: Arc::new(crate::capability::Inflight::default()),
-            draft_sandbox: Mutex::new(std::collections::HashMap::new()),
+            draft_preset: Mutex::new(std::collections::HashMap::new()),
             save_tickets: crate::session_export::SaveTicketStore::new(),
             media_roots: RwLock::new(Vec::new()),
             fallback_root,
@@ -228,36 +229,37 @@ impl AppState {
         Ok(())
     }
 
-    /// 任务启动时重置会话策略（SH-120）：审批档回到 config、沙箱档取
-    /// **本会话档案里的最后一档**（没有则 config 部署默认），并重新装载前缀白名单
-    /// ——运行中切换过的档位不跨任务、不跨会话泄漏。
-    pub fn reset_policy(&self, sandbox: Option<crate::config::SandboxMode>) {
-        self.refresh_derived_policy(sandbox);
+    /// 任务启动时重置会话策略（SH-120）：**从预设一次性取两维**——审批档不再从
+    /// config 单独读，否则「预设绑两维」在运行时又裂成两条路。
+    /// 没有会话预设 = 跟随 config 部署默认；运行中切换过的档位不跨任务、不跨会话泄漏。
+    pub fn reset_policy(&self, preset: Option<crate::permission::preset::Preset>) {
+        self.refresh_derived_policy(preset);
     }
 
-    /// 记下"还没建档的会话"选的档位；首条任务落盘时由调用方取走并写进档案。
-    pub fn put_draft_sandbox(&self, session_id: &str, mode: crate::config::SandboxMode) {
-        self.draft_sandbox
+    /// 记下"还没建档的会话"选的预设；首条任务落盘时由调用方取走并写进档案。
+    pub fn put_draft_preset(&self, session_id: &str, preset: crate::permission::preset::Preset) {
+        self.draft_preset
             .lock()
-            .expect("draft sandbox 锁中毒")
-            .insert(session_id.to_string(), mode);
+            .expect("draft preset 锁中毒")
+            .insert(session_id.to_string(), preset);
     }
 
-    /// 取走草稿档位（取走即清，避免下一次误用）。
-    pub fn take_draft_sandbox(&self, session_id: &str) -> Option<crate::config::SandboxMode> {
-        self.draft_sandbox
+    /// 取走草稿预设（取走即清，避免下一次误用）。
+    pub fn take_draft_preset(&self, session_id: &str) -> Option<crate::permission::preset::Preset> {
+        self.draft_preset
             .lock()
-            .expect("draft sandbox 锁中毒")
+            .expect("draft preset 锁中毒")
             .remove(session_id)
     }
 
     /// config → 运行时策略的**唯一**同步点（构造、配置变更、任务启动都走这里）。
-    fn refresh_derived_policy(&self, sandbox: Option<crate::config::SandboxMode>) {
+    fn refresh_derived_policy(&self, preset: Option<crate::permission::preset::Preset>) {
         let cfg = self.config();
-        self.policy.reset(crate::permission::SessionPolicy {
-            approval: cfg.approval.mode,
-            sandbox: sandbox.unwrap_or(cfg.sandbox.mode),
-        });
+        let (sandbox, approval) = preset.map_or(
+            (cfg.sandbox.mode, cfg.approval.mode),
+            |preset| (preset.sandbox, preset.approval),
+        );
+        self.policy.reset(crate::permission::SessionPolicy { approval, sandbox });
         let (rules, rejected) =
             crate::permission::PrefixAllowlist::from_config(&cfg.approval.allow_prefixes);
         for reason in rejected {
@@ -446,32 +448,39 @@ mod tests {
         assert_ne!(a, b);
     }
 
-    /// 新会话不带 `sandboxMode` 时走**部署默认档**，不沿用上一任务切过的高档。
+    /// 新会话不带预设时走**部署默认档**，不沿用上一任务切过的高档。
     ///
-    /// 前端 a1 修复的后端对侧：`send_task(sandbox_mode: None)` → `reset_policy(None)`。
-    /// 反向对照：把 `unwrap_or(cfg.sandbox.mode)` 改成「有上次快照就沿用」，本用例变红。
+    /// 前端 a1 修复的后端对侧：`send_task(permission_preset: None)` → `reset_policy(None)`。
+    /// 同时守「预设绑两维」：切到自主档必须连审批档一起换，只换一半就是本缺陷本身。
     #[test]
     fn reset_policy_none_falls_back_to_config_default() {
         let (_dir, s) = state();
-        let default_mode = s.config().sandbox.mode;
+        let cfg = s.config();
         assert_eq!(
-            default_mode,
+            cfg.sandbox.mode,
             crate::config::SandboxMode::ReadOnly,
             "部署默认必须是只读，否则「不带档位」本身就是一次隐式提权"
         );
 
-        s.reset_policy(Some(crate::config::SandboxMode::DangerFullAccess));
+        let auto = *crate::permission::preset::from_id("workspace-write-auto").unwrap();
+        s.reset_policy(Some(auto));
         assert_eq!(
             s.policy.snapshot().sandbox,
-            crate::config::SandboxMode::DangerFullAccess
+            crate::config::SandboxMode::WorkspaceWrite
+        );
+        assert_eq!(
+            s.policy.snapshot().approval,
+            crate::config::ApprovalMode::Never,
+            "预设必须把两维一起装载"
         );
 
         s.reset_policy(None);
         assert_eq!(
             s.policy.snapshot().sandbox,
-            default_mode,
-            "没有会话档位时必须回部署默认，不许沿用上一任务的高档"
+            cfg.sandbox.mode,
+            "没有会话预设时必须回部署默认，不许沿用上一任务的高档"
         );
+        assert_eq!(s.policy.snapshot().approval, cfg.approval.mode);
     }
 
     #[test]

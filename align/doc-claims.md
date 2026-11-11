@@ -120,7 +120,7 @@ A（文档有、代码找不到）/ B（不可机械判定）/ 通过数，退�
 | R2-062 | 04:L43 | `allowlist_hit` \| `allowlist_hit`、`rule_id` | SH-120 新增（additive） | `allowlist_hit` 变体 + 三字段 | 符号 | |
 | R2-063 | 04:L48 | `model_retry` \| `model_retry`、`retry_id` | `ModelRetry` 变体 | 符号 | |
 | R2-064 | 04:L68 | 子代理事件（SH-053，additive，**已实现**）：`subagent_spawned {child_id, task, name, label, created_at_ms}`… | `subagent_spawned`、`subagent_exited`、`subagent_message` | 符号 | |
-| R2-065 | 04:L76 | `send_task` \| `send_task`、`sandbox_mode` | `send_task` 的 `sandbox_mode` | 符号 | |
+| R2-065 | 04:L76 | `send_task` \| `send_task`、`permission_preset` | `send_task` 的 `permission_preset` | 符号 | 2026-11-11 权限预设对齐：`send_task` 由「沙箱单维」改成「预设 id」，两维由预设表装载 |
 | R2-066 | 04:L83 | `archive_session` / `unarchive_session` | `archive_session`、`unarchive_session` | 命令 | |
 | R2-067 | 04:L84 | `pin_session` / `unpin_session` | `pin_session`、`unpin_session` | 命令 | |
 | R2-068 | 04:L85 | `insert_session_before` | `insert_session_before` | 命令 | |
@@ -137,8 +137,8 @@ A（文档有、代码找不到）/ B（不可机械判定）/ 通过数，退�
 | R2-079 | 04:L101 | `read_session_events` \| `read_session_events`、`afterEventId` | `read_session_events` | 命令 | |
 | R2-080 | 04:L102 | `latest_session_event_id` | `latest_session_event_id` | 命令 | |
 | R2-081 | 04:L103 | `sandbox_status` \| `sandbox_status`、`enforcement` | `{mode, os, os_enabled, enforcement, profile, note}` | `sandbox_status` | 命令 | |
-| R2-082 | 04:L104 | `session_sandbox_mode` | `session_sandbox_mode` | 命令 | |
-| R2-083 | 04:L105 | `set_session_sandbox_mode` | `set_session_sandbox_mode` | 命令 | |
+| R2-082 | 04:L104 | `session_permission_preset` | `session_permission_preset` | 命令 | 2026-11-11 权限预设对齐：读面收预设 id（旧档案精确匹配，不命中回 `custom`） |
+| R2-083 | 04:L105 | `set_session_permission_preset` | `set_session_permission_preset` | 命令 | 2026-11-11 权限预设对齐：会话切档的**单一写入面**（收 id，不写 `config.toml`） |
 | R2-084 | 04:L106 | `gateway_info` \| `gateway_info` | `{port, token}` | `gateway_info` | 命令 | |
 | R2-085 | 04:L107 | `workspace_file_stat` / `workspace_file_read` / `workspace_file_read_bytes` / `workspace_file_list` | `workspace_file_stat` / `workspace_file_read` / `workspace_file_read_bytes` / `workspace_file_list` | 命令 | |
 | R2-086 | 04:L108 | `search_sessions` …（`<data_root>/cache/session-search.db`…） | `search_sessions` + db 路径 | 命令 | |
@@ -159,7 +159,6 @@ A（文档有、代码找不到）/ B（不可机械判定）/ 通过数，退�
 | R2-101 | 04:L123 | `compact_session` \| `{agentId}` | 命令 | 命令 | |
 | R2-102 | 04:L124 | `frontend_ready` \| `frontend_ready` | 命令 | 命令 | |
 | R2-103 | 04:L125 | `rename_session` \| `rename_session`、`agent_id` | 命令 | 命令 | |
-| R2-104 | 04:L126 | `set_approval_mode` \| `{mode}` | 命令 | 命令 | |
 | R2-105 | 04:L127 | `session_of_agent` \| `session_of_agent` | 命令 | 命令 | |
 | R2-106 | 04:L128 | `send_subagent_message` | `send_subagent_message` | 命令 | |
 | R2-107 | 04:L129 | `interrupt_subagent` | `interrupt_subagent` | 命令 | |
@@ -238,6 +237,10 @@ A（文档有、代码找不到）/ B（不可机械判定）/ 通过数，退�
 | R2-180 | 12:L129 | `src-tauri/src/compaction/mod.rs`…`session_compact.rs` 接线 | `session_compact.rs` | 文件 | |
 | R2-181 | 12:L131 | `src-tauri/src/subagent_registry/mod.rs`：状态机、子令牌级联、并发上限、`wait_agent` 收口 | `subagent_registry/mod.rs` | 文件 | |
 | R2-182 | 04:L97 | `get_product_dirs` 返回 `{configRoot, dataRoot, workspaceRoot, homeDir}` | `configRoot`、`dataRoot`、`workspaceRoot`、`homeDir` | 符号 | 盲区 1 的活例：四个驼峰名在 Rust/TS 源码里零字面量，由 `#[serde(rename_all = "camelCase")]` 生成 |
+| R2-183 | 04:L329 | `PermissionPreset` \| `{preset, at_ms}` \| **会话内权限预设切换事件** | `PermissionPreset` | 符号 | 2026-11-11 权限预设对齐：新档案只写预设 id，`SandboxMode` 降为只读兼容 |
+| R2-184 | 04:L92 | `save_settings` 安全面收成**一个预设 id**：沙箱与审批由预设表一起写 | `permission_preset` | 符号 | 同上：两维不存在只改一维的入口 |
+| R2-185 | 04:L92 | `get_settings` 额外回 `permissionPreset` | `permissionPreset` | 字面量 | 同上：非标准组合如实给 `custom` |
+| R2-186 | 04:L104 | 不命中如实回 `custom`（绝不猜「最像的」） | `CUSTOM` | 符号 | 同上：派生值不可选、不可作默认 |
 
 ---
 
@@ -271,7 +274,10 @@ A（文档有、代码找不到）/ B（不可机械判定）/ 通过数，退�
 
 ## 最近一次重跑
 
-- 2026-11-11，HEAD `f9545be`：182 行断言，通过 305 个判定点 / A 0 / B 5，退出码 0。
+- 2026-11-11，第二笔工作区（基于 HEAD `4573527`）：185 行断言，通过 307 个判定点 / A 0 / B 5，退出码 0。
+  本轮改动只涉及本线：`send_task` / `session_permission_preset` / `set_session_permission_preset`
+  三行随命令改名更新，`set_approval_mode` 行随命令删除而删；新增 R2-183~186（`PermissionPreset`
+  事件、`save_settings` 的 `permission_preset`、`get_settings` 的 `permissionPreset`、派生值 `CUSTOM`）。
 - 三条盲区规则的活例（`-ShowPass` 可见）：`configRoot` → `serde-camel -> config_root`；
   `allowlist_hit` 类 → `wire-variant -> AllowlistHit`；5 处 `#[test]` → `rust-test`。
 - 反向对照（证明会红）：塞一个不存在的符号 → A + 退出码 1；清单不存在 / 解析 0 行 /

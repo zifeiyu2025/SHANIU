@@ -24,8 +24,10 @@ pub struct Resumed {
     pub workspace_root: String,
     /// 档案里被应用的压缩锚点数（SH-032 落地后用于核对）。
     pub applied_compactions: usize,
-    /// 会话内最后一次档位切换（无则 None = 跟随部署默认）。
+    /// 会话内最后一次档位切换（无则 None = 跟随部署默认）。旧档案字段。
     pub sandbox_mode: Option<String>,
+    /// 会话内最后一次权限预设切换（新档案；无则 None = 回落到 `sandbox_mode`/部署默认）。
+    pub permission_preset: Option<String>,
     /// 档案里记录过的系统提示词版本（按写入顺序）。旧档案为空 = 未记录。
     pub prompt_versions: Vec<SystemPromptRecord>,
     /// 末行半截写被丢弃的行数。
@@ -74,12 +76,16 @@ pub fn resume(path: &Path) -> Result<Resumed, RolloutError> {
     let mut applied = 0usize;
     // 档位事件不进模型历史，只取最后一条作为本会话的当前档位。
     let mut sandbox_mode: Option<String> = None;
+    // 预设事件同理。两者都存在时以**预设**为准：新档案只写预设，旧档案只有沙箱档，
+    // 同一档案里两种事件混排只可能出现在升级过渡期，那时预设是更晚、更完整的那次选择。
+    let mut permission_preset: Option<String> = None;
     // 系统提示词版本不进模型历史（每轮由 SessionPrompt 重新组装），只做审计与回放。
     let mut prompt_versions: Vec<SystemPromptRecord> = Vec::new();
     for item in &archive.items {
         match item {
             RolloutItem::ResponseItem { item: h, .. } => history.push(h.clone()),
             RolloutItem::SandboxMode { mode, .. } => sandbox_mode = Some(mode.clone()),
+            RolloutItem::PermissionPreset { preset, .. } => permission_preset = Some(preset.clone()),
             RolloutItem::SystemPrompt { text, sha256, at_ms, turn } => {
                 // 自洽校验：档案被手工改动/写坏时，宁可拒绝 resume 也不能把它当真历史展示。
                 // 只校验"文本与指纹是否匹配"，不拿当前配置重算——那等于用推测覆盖事实。
@@ -152,6 +158,7 @@ pub fn resume(path: &Path) -> Result<Resumed, RolloutError> {
         workspace_root,
         applied_compactions: applied,
         sandbox_mode,
+        permission_preset,
         prompt_versions,
         torn_tail_lines: archive.torn_tail_lines,
         damaged_lines: archive.damaged_lines,

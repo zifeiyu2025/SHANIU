@@ -82,6 +82,13 @@ pub enum RolloutItem {
     /// 事件回放当前档位（进程在不在都不影响）。部署默认仍由设置页写 config。
     /// 最后一条生效——切多次就是多条事件，不做原地改写（档案 append-only）。
     SandboxMode { mode: String, at_ms: u64 },
+    /// 会话内权限**预设**切换（`/permission <preset>` 的宿主面，2026-11-11）。
+    ///
+    /// 与 [`RolloutItem::SandboxMode`] 的关系：预设绑定 `(sandbox, approval)` 两维，
+    /// 新档案只写这一条；`sandbox_mode` 保留为旧档案的读取兼容（`last_permission_preset`
+    /// 在没有预设事件时回落到它）。`preset` 存 id（如 `workspace-write-auto`），
+    /// 不存两维——id 才是用户选的那个东西，两维展开会让「自定义组合」无法表达。
+    PermissionPreset { preset: String, at_ms: u64 },
     /// 退出流程里的“强制中止”留痕：取消信号已发，但等待超时后进程仍要退出。
     ///
     /// 为什么必须有这一条：直接 kill 会在档案里留下一条没人能解释的中断；
@@ -230,6 +237,26 @@ pub fn last_sandbox_mode(path: &Path) -> Option<String> {
         }
         if let Ok(RolloutItem::SandboxMode { mode, .. }) = serde_json::from_str::<RolloutItem>(&line) {
             last = Some(mode);
+        }
+    }
+    last
+}
+
+/// 读档案里**最后一条**权限预设事件；没有该事件（旧档案 / 从没切过）返回 None。
+///
+/// 旧档案只有 `sandbox_mode` 事件：调用方拿到 `None` 后再用 [`last_sandbox_mode`] +
+/// 当前 config 的审批档合成一个「自定义」预设。回落不在这里做，因为本函数只回答
+/// 「档案里写了什么」，合成需要 config，属于装配层。
+pub fn last_permission_preset(path: &Path) -> Option<String> {
+    let file = File::open(path).ok()?;
+    let mut last = None;
+    for line in BufReader::new(file).lines() {
+        let line = line.ok()?;
+        if !line.contains("\"permission_preset\"") {
+            continue;
+        }
+        if let Ok(RolloutItem::PermissionPreset { preset, .. }) = serde_json::from_str::<RolloutItem>(&line) {
+            last = Some(preset);
         }
     }
     last

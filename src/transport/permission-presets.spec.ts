@@ -5,7 +5,7 @@ import {
   displayPermissionPresetDescription,
   PERMISSION_UNAVAILABLE as PERMISSION_UNAVAILABLE_UI,
 } from '../dsh/packages/client/ui-permission-presets/src/client/presentation.ts'
-import { PERMISSION_PRESET_OPTIONS, PERMISSION_UNAVAILABLE, PRESET_TO_SANDBOX } from './permission-presets'
+import { PERMISSION_PRESET_OPTIONS, PERMISSION_UNAVAILABLE, PRESET_TO_SANDBOX, PRESET_BUNDLES, CUSTOM_PERMISSION_PRESET, presetOfBundle, presetOfSettings } from './permission-presets'
 import type { SandboxModeWire } from '../sandbox-status/wire'
 
 /**
@@ -49,6 +49,48 @@ describe('权限挡位说明行（P3-16）', () => {
       .toBe('Unreadable')
     // 它不是挡位：目录里没有它，也不能被当成某一档
     expect(PERMISSION_PRESET_OPTIONS.map(option => option.value)).not.toContain(PERMISSION_UNAVAILABLE)
+  })
+
+  it('每档绑定 (sandbox, approval) 两维，三档对齐 DSH、一档为自主档', () => {
+    // 两维必须成对：只映射沙箱维是自主档失效的成因（选了 never、沙箱还是只读）。
+    expect(PRESET_BUNDLES['read-only']).toEqual({ sandbox: 'read_only', approval: 'on_request' })
+    expect(PRESET_BUNDLES['workspace-write']).toEqual({ sandbox: 'workspace_write', approval: 'on_request' })
+    expect(PRESET_BUNDLES['danger-full-access']).toEqual({ sandbox: 'danger_full_access', approval: 'never' })
+    expect(PRESET_BUNDLES['workspace-write-auto']).toEqual({ sandbox: 'workspace_write', approval: 'never' })
+    // 宿主里没有 full_access 这一维值：它是 config-only，不进预设
+    expect(Object.values(PRESET_BUNDLES).map(bundle => bundle.approval)).not.toContain('full_access')
+  })
+
+  it('非标准组合一律派生 custom，绝不回落成具体档', () => {
+    for (const [sandbox, approval] of [
+      ['workspace_write', 'on_failure'],
+      ['workspace_write', 'full_access'],
+      ['read_only', 'never'],
+      ['danger_full_access', 'on_request'],
+      ['danger_full_access', 'full_access'],
+    ] as const) {
+      expect(presetOfBundle(sandbox, approval)).toBe(CUSTOM_PERMISSION_PRESET)
+    }
+    // 宿主显式给 custom 时原样保留；旧宿主没这个字段时按两维反推
+    expect(presetOfSettings({ permissionPreset: CUSTOM_PERMISSION_PRESET, sandboxMode: 'workspace_write', approvalMode: 'never' }))
+      .toBe(CUSTOM_PERMISSION_PRESET)
+    expect(presetOfSettings({ sandboxMode: 'workspace_write', approvalMode: 'never' }))
+      .toBe('workspace-write-auto')
+    // custom 不可选：目录里没有它
+    expect(PERMISSION_PRESET_OPTIONS.map(option => option.value)).not.toContain(CUSTOM_PERMISSION_PRESET)
+  })
+
+  it('自主档的文案来自 vendored 词典，且界面不出现「扩展」字样', () => {
+    expect(displayPermissionPreset('workspace-write-auto', 'workspace-write-auto', key => accessZh[key]))
+      .toBe('工作区内自动')
+    expect(displayPermissionPresetDescription('workspace-write-auto', key => accessZh[key]))
+      .toBe('在工作区内读写与执行，不再逐次确认')
+    expect(displayPermissionPreset('workspace-write-auto', 'workspace-write-auto', key => accessEn[key]))
+      .toBe('Workspace Write (auto)')
+    // 内部标记不许漏到用户可见文案里
+    expect(displayPermissionPreset('workspace-write-auto', 'workspace-write-auto', key => accessZh[key]))
+      .not.toContain('扩展')
+    expect(displayPermissionPreset('custom', 'custom', key => accessZh[key])).toBe('自定义')
   })
 
   it('PRESET_TO_SANDBOX 与 SandboxModeWire 的值集合必须相等', () => {

@@ -72,7 +72,7 @@ export default defineConfig({
     setupFiles: ['./src/test-setup.ts'],
     // vendored DSH 树自带上游测试（tests/*.spec.ts，依赖上游 host 运行时），
     // 不属于 SHANIU 验收面；SH-005~008 的 DSH 测试按批次单独甄别引入。
-    exclude: ['**/node_modules/**', 'src/dsh/**'],
+    exclude: ['**/node_modules/**', 'src/dsh/**', 'target/**'],
     // 零测试文件必须报错：测试文件被误改名或删除时，`pnpm test` 会用 0 个用例退 0，
     // 门禁静默变绿（AGENTS §4.2「响度只许增，不许降」）。测试面已随 SH-007/008 建齐，
     // 不存在「迁移期没有测试」的假红。

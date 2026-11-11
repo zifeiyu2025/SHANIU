@@ -46,6 +46,7 @@ const PERMISSION_PRESETS = [
   { value: 'read-only', name: 'read-only', description: '只读查看，不产生任何写入' },
   { value: 'workspace-write', name: 'workspace-write', description: '仅在工作区内读写' },
   { value: 'danger-full-access', name: 'danger-full-access', description: '不受工作区边界限制' },
+  { value: 'workspace-write-auto', name: 'workspace-write-auto', description: '仅在工作区内读写，不再逐次确认' },
 ] as const
 
 const DEFAULT_PERMISSION = 'read-only'

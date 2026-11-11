@@ -26,7 +26,7 @@ import type { WorkspaceId } from '@deepseek-ai/dsh-workspace/types'
 import type { MessageId } from '@deepseek-ai/dsh-llm'
 import { createSettingsFace } from './settings-face'
 import {
-  PERMISSION_PRESETS, PERMISSION_PRESET_OPTIONS, PERMISSION_UNAVAILABLE, presetOfSandbox, sandboxOfPreset,
+  PERMISSION_PRESETS, PERMISSION_PRESET_OPTIONS, PERMISSION_UNAVAILABLE, PRESET_BUNDLES,
 } from './permission-presets'
 import { CommandDefinitionId } from '@deepseek-ai/dsh-commands/brand'
 import type { CommandDescriptor } from '@deepseek-ai/dsh-commands/types'
@@ -956,18 +956,20 @@ export function createAdapter(options: AdapterOptions): { remote: unknown; dispo
    */
   const sessionPresetCache = new Map<string, string>()
   /**
-   * 读宿主档案失败的会话。与「档案没记录档位」（`session_sandbox_mode` 回 null，
+   * 读宿主档案失败的会话。与「档案没记录档位」（`session_permission_preset` 回 null，
    * 此时跟随部署默认是对的）不是一回事：读失败时不能回落到任何具体档，
    * 否则「读不到」会被渲染成「只读」，用户按错误前提去点确认。
    */
   const sessionPresetUnreadable = new Set<string>()
 
-  /** 读宿主 durable 的本会话档位并写入缓存；读失败只记 unknown，不伪造一个档。 */
+  /** 读宿主 durable 的本会话预设并写入缓存；读失败只记 unknown，不伪造一个档。 */
   const loadSessionPermission = async (sessionId: string): Promise<void> => {
     if (sessionPresetCache.has(sessionId)) return
     try {
-      const mode = await bridge.invoke<string | null>('session_sandbox_mode', { sessionId })
-      sessionPresetCache.set(sessionId, presetOfSandbox(mode ?? face.sandboxMode()))
+      const preset = await bridge.invoke<string | null>('session_permission_preset', { sessionId })
+      // 宿主回 `custom` 时原样保留：它是"当前组合不在预设表里"的如实回答，
+      // 不是"没有记录"（那个是 null，才跟随部署默认）。
+      sessionPresetCache.set(sessionId, preset ?? face.permissionPreset())
       sessionPresetUnreadable.delete(sessionId)
     } catch {
       sessionPresetUnreadable.add(sessionId)
@@ -979,7 +981,7 @@ export function createAdapter(options: AdapterOptions): { remote: unknown; dispo
     if (known !== undefined) return known
     return sessionPresetUnreadable.has(sessionId)
       ? PERMISSION_UNAVAILABLE
-      : presetOfSandbox(face.sandboxMode())
+      : face.permissionPreset()
   }
   const permissionsProjection = (sessionId: string): Record<string, unknown> => ({
     currentValue: currentPermission(sessionId),
@@ -2290,8 +2292,8 @@ export function createAdapter(options: AdapterOptions): { remote: unknown; dispo
    * 注入面（SH-053），空闲态下等价动作就是走这条与用户输入完全相同的提交链。
    */
   const submitPromptNow = async (sessionId: string | undefined, text: string, rpcId?: string, displayText?: string, images: readonly PromptImageRef[] = []): Promise<void> => {
-    // 新会话不继承任何会话的档位：不带 `sandboxMode`，由宿主按部署默认建档
-    // （`send_task(sandbox_mode: None)` → config 的 `[sandbox] mode`）。
+    // 新会话不继承任何会话的档位：不带 `permissionPreset`，由宿主按部署默认建档
+    // （`send_task(permission_preset: None)` → config 的 `[sandbox] mode` + `[approval] mode`）。
     // 用户要给新会话提权，得在新会话里自己设一次——这是有意的摩擦，
     // 跨会话传档等于把「这一次提权」变成永久提权（授权作用域越界）。
     const agentId = await bridge.invoke<string>('send_task', {
@@ -3273,9 +3275,10 @@ export function createAdapter(options: AdapterOptions): { remote: unknown; dispo
 
   /**
    * `remote.permissionPresets`：权限挡位目录（形状照上游 PermissionCatalog，mock 同款）。
-   * 目录是静态三挡（映射见 PRESET_TO_SANDBOX 注记），defaultPreset 动态反推自宿主
-   * 当前沙箱档——宿主重启后 UI 显示的就是 config.toml 里真实生效的那档。静态目录
-   * 不会失效，所以不发上游的 `permission-presets/catalog-changed` 失效事件。
+   * 目录由 `PRESET_BUNDLES` 派生（四挡：三挡对齐 DSH + 一档本仓库自主档），
+   * `defaultPreset` 取宿主按预设表精确匹配的结果（非标准组合如实给 `custom`）——
+   * 宿主重启后 UI 显示的就是 config.toml 里真实生效的那档。静态目录不会失效，
+   * 所以不发上游的 `permission-presets/catalog-changed` 失效事件。
    */
   const permissionPresetsNamespace = {
     catalog: async () => {
@@ -3286,7 +3289,7 @@ export function createAdapter(options: AdapterOptions): { remote: unknown; dispo
       return OK({
         options,
         defaultOptions: options.map(option => ({ ...option })),
-        defaultPreset: presetOfSandbox(face.sandboxMode()),
+        defaultPreset: face.permissionPreset(),
       })
     },
   }
@@ -3565,21 +3568,21 @@ export function createAdapter(options: AdapterOptions): { remote: unknown; dispo
               : `current preset ${current} (available: ${PERMISSION_PRESETS.join(', ')})`,
           }
         } else {
-          const sandbox = sandboxOfPreset(requested)
-          if (sandbox === undefined) {
+          if (PRESET_BUNDLES[requested] === undefined) {
             result = {
               kind: 'error',
               text: `unknown preset "${requested}" (available: ${PERMISSION_PRESETS.join(', ')})`,
             }
           } else {
             try {
-              // 会话内切档只写本会话档案（宿主 `set_session_sandbox_mode`）：
+              // 会话内切档只写本会话档案（宿主 `set_session_permission_preset`）：
               // **绝不写 config.toml**——那是设置页的职责。重进会话靠档案事件回放。
-              const applied = await bridge.invoke<string>('set_session_sandbox_mode', {
+              // 传 id 而不是沙箱档：审批档必须跟着沙箱档一起装载，否则就是自主档失效的成因。
+              const applied = await bridge.invoke<string>('set_session_permission_preset', {
                 sessionId,
-                mode: sandbox,
+                preset: requested,
               })
-              sessionPresetCache.set(sessionId, presetOfSandbox(applied))
+              sessionPresetCache.set(sessionId, applied)
               result = { kind: 'success', text: `preset ${requested}` }
             } catch (reason) {
               // wire 契约：失败以 result.error 回给客户端，不是 rejection——UI 的错误

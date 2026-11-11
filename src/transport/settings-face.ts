@@ -25,7 +25,7 @@ import type { ModelCatalog, ModelCatalogFailure, ModelProviderGroup, ModelSelect
 import type { SettingsDescribeValue, SettingsNamespaceView, SettingsPathOpView } from '@deepseek-ai/dsh-settings/types'
 import type { JsonValue } from '@deepseek-ai/dsh-util-values'
 import {
-  PERMISSION_PRESETS, PRESET_TO_SANDBOX, presetOfSandbox,
+  CUSTOM_PERMISSION_PRESET, PRESET_BUNDLES, PERMISSION_PRESETS, presetOfSettings,
 } from './permission-presets'
 import { PROVIDER_CATALOG } from './provider-catalog'
 import type { HostBridge } from './tauri'
@@ -81,6 +81,11 @@ interface SettingsSnapshot {
   readonly hasApiKey: boolean
   readonly sandboxMode: string
   readonly approvalMode: string
+  /**
+   * 宿主按预设表精确匹配出的当前档（命中给 id，非标准组合给 `custom`）。
+   * 旧宿主没有这个字段：读取侧用 {@link presetOfSettings} 按两维反推。
+   */
+  readonly permissionPreset?: string
   readonly activeProvider: string
   readonly providerRevision: number
   readonly providers: readonly HostProviderRow[]
@@ -167,12 +172,17 @@ export interface SettingsFace {
    */
   activeContextWindow(): number | undefined
   /**
-   * 把沙箱档写进宿主 config（`save_settings` 的 sandbox_mode 参数）。其余必填参数
-   * （base_url/model/workspace_root）传快照现值原样写回，宿主按"只改沙箱档"的保存处理；
-   * approval_mode 不传 = 不动那一维（后端裁决矩阵当前不消费它）。读不到文档或宿主
-   * 拒绝时抛错，由调用方映射成 wire 失败。
+   * 当前权限预设（`get_settings` 的 `permissionPreset`；旧宿主按两维反推）。
+   * 可能是派生值 `custom`：它如实表达"当前组合不在预设表里"，**不可写**。
    */
-  applySandboxMode(sandboxMode: string): Promise<void>
+  permissionPreset(): string
+  /**
+   * 把权限预设写进宿主（`save_settings` 的 `permission_preset` 参数）。其余必填参数
+   * （base_url/model/workspace_root）传快照现值原样写回，宿主按"只改安全面"的保存处理。
+   * 沙箱与审批由宿主预设表**一起**写——这条命令之外没有只改一维的入口。
+   * 读不到文档或宿主拒绝时抛错，由调用方映射成 wire 失败。
+   */
+  applyPermissionPreset(preset: string): Promise<void>
   /**
    * 挡位写入成功后的**唯一**收尾链：`permissionRevision += 1` → 广播
    * `settings/document-updated('permission', rev)` → 返回写后视图。
@@ -478,16 +488,16 @@ export function createSettingsFace(bridge: HostBridge, options: SettingsFaceOpti
    * 找不到就静默不写（`settings-store.ts:109-116` 的 `select` 直接 return）——这正是
    * "挡位点了没反应、连报错都没有"的根因之一。
    *
-   * `value.defaultPreset` 反推自宿主当前沙箱档（`presetOfSandbox`，与芯片目录、
-   * `/permission` 命令共用同一张映射表），所以重启后这里显示的就是 config.toml 里
-   * 真实生效的那一档，不是一份客户端记忆。
+   * `value.defaultPreset` 取自宿主回显的 `permissionPreset`（旧宿主由两维精确反推，
+   * 与芯片目录、`/permission` 命令共用同一张映射表），所以重启后这里显示的就是
+   * config.toml 里真实生效的那一档，不是一份客户端记忆。
    */
   const viewOfPermission = (): SettingsNamespaceView => ({
     // DSH 给这个域注册了专用设置行（PermissionRow），不需要再按 schema 自动生成页面。
     autoGenerate: false,
     ns: 'permission',
     schema: PERMISSION_SCHEMA,
-    value: { defaultPreset: presetOfSandbox(sandboxMode()) },
+    value: { defaultPreset: permissionPreset() },
     applies: 'live',
     secrets: [],
     revision: permissionRevision,
@@ -766,6 +776,20 @@ export function createSettingsFace(bridge: HostBridge, options: SettingsFaceOpti
     return snapshot?.sandboxMode ?? 'read_only'
   }
 
+  /**
+   * 当前预设：宿主给了 `permissionPreset` 就用它（含派生值 `custom`），否则按两维反推。
+   * 两条路都不命中具体档时就是 `custom`——这里绝不 fallback 成 `read-only`，
+   * 否则「`full_access` 审批」会在界面上伪装成只读档。
+   */
+  function permissionPreset(): string {
+    if (snapshot === undefined) return 'read-only'
+    return presetOfSettings({
+      permissionPreset: snapshot.permissionPreset,
+      sandboxMode: snapshot.sandboxMode,
+      approvalMode: snapshot.approvalMode,
+    })
+  }
+
   function activeContextWindow(): number | undefined {
     const selection = activeSelection()
     if (selection.provider === '' || selection.model === '') return undefined
@@ -774,11 +798,12 @@ export function createSettingsFace(bridge: HostBridge, options: SettingsFaceOpti
     return model !== undefined && model.contextWindow > 0 ? model.contextWindow : undefined
   }
 
-  const applySandboxMode = async (mode: string): Promise<void> => {
+  const applyPermissionPreset = async (preset: string): Promise<void> => {
     await ensure()
-    if (snapshot === undefined) throw new Error('host settings unavailable; cannot switch sandbox preset')
-    // 非法档位由宿主 save_settings 校验并报错（lib.rs 的 SANDBOX_MODE_NAMES），
+    if (snapshot === undefined) throw new Error('host settings unavailable; cannot switch permission preset')
+    // 非法挡位由宿主 save_settings 校验并报错（lib.rs 的 preset_names），
     // 这里不预判一份平行清单——两处清单迟早漂移，宿主那份才是事实来源。
+    // 派生值 `custom` 也交给宿主拒绝：它不可写，但也不该在客户端被静默吞掉。
     //
     // 键名必须是 **camelCase**：宿主那侧是裸 `#[tauri::command] fn save_settings(base_url: String, …)`
     // （lib.rs，没有 `rename_all`），Tauri 2 按默认规则把 Rust 形参名映射成 JS 侧的
@@ -790,14 +815,14 @@ export function createSettingsFace(bridge: HostBridge, options: SettingsFaceOpti
       baseUrl: snapshot.baseUrl,
       model: snapshot.model,
       workspaceRoot: snapshot.workspaceRoot,
-      sandboxMode: mode,
+      permissionPreset: preset,
     })
     await read()
   }
 
   /**
    * 挡位写入成功后的唯一收尾链（两条写路径共用，见 {@link SettingsFace.commitPermissionPreset}）。
-   * 修订号 +1 → 广播 → 返回**写后**视图（`applySandboxMode` 已经重读过快照，
+   * 修订号 +1 → 广播 → 返回**写后**视图（`applyPermissionPreset` 已经重读过快照，
    * 所以这里的 `defaultPreset` 是宿主回显的档，不是我们记的愿望）。
    */
   const commitPreset = (): SettingsNamespaceView => {
@@ -811,8 +836,8 @@ export function createSettingsFace(bridge: HostBridge, options: SettingsFaceOpti
    * `[{ op: 'set', path: ['defaultPreset'], value: <preset> }]`。其余形状一律如实拒绝
    * 并给原因——静默收下的用户可见表现与"点了没反应"完全一样，是最难归因的那种失败。
    *
-   * 落点复用 {@link applySandboxMode}：宿主 `[sandbox] mode` 是唯一事实源，写完顺手
-   * 重读快照，所以本次应答里的 `value.defaultPreset` 已经是宿主回显的新档（不是我们
+   * 落点复用 {@link applyPermissionPreset}：宿主预设表是唯一事实源（沙箱与审批成对写），
+   * 写完顺手重读快照，所以本次应答里的 `value.defaultPreset` 已经是宿主回显的新档（不是我们
    * 自己记的那份愿望）。
    */
   const mutatePermission = async (
@@ -841,13 +866,14 @@ export function createSettingsFace(bridge: HostBridge, options: SettingsFaceOpti
       return refused(new RemoteError('settings/rejected', `permission namespace has a single writable field defaultPreset, got ${where}`, { ns }))
     }
     const preset = typeof op.value === 'string' ? op.value : ''
-    const sandbox = PRESET_TO_SANDBOX[preset]
-    if (sandbox === undefined) {
+    // `custom` 不是可写项：它是派生状态，写进去等于把一个"组合不在表里"的
+    // 观察结果当成选择。宿主也会拒，这里先给更准的原因。
+    if (preset === CUSTOM_PERMISSION_PRESET || PRESET_BUNDLES[preset] === undefined) {
       return refused(new RemoteError('settings/rejected',
         `unknown permission preset ${typeof op.value === 'string' ? op.value : JSON.stringify(op.value)} (available: ${PERMISSION_PRESETS.join(' / ')})`, { ns }))
     }
     try {
-      await applySandboxMode(sandbox)
+      await applyPermissionPreset(preset)
     } catch (reason) {
       // 宿主拒绝（非法档、写盘失败）原样回显：伪装成"成功但没变"会让用户以为
       // 是自己没点中，而真正的失败原因已经丢了。
@@ -1133,9 +1159,10 @@ export function createSettingsFace(bridge: HostBridge, options: SettingsFaceOpti
     },
     activeSelection,
     sandboxMode,
+    permissionPreset,
     workspaces: (): readonly { id: string; path: string; title: string }[] => snapshot?.workspaces ?? [],
     activeContextWindow,
-    applySandboxMode,
+    applyPermissionPreset,
     commitPermissionPreset: commitPreset,
     workspaceRoot: () => snapshot?.workspaceRoot ?? '',
     workspaceTitle: () => {

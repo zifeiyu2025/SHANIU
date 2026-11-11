@@ -5,6 +5,7 @@
 //! 审批 UI 不可伪造：裁决只接受后端校验过的 request_id 回执。
 
 pub mod policy;
+pub mod preset;
 
 use std::collections::{HashMap, HashSet};
 use std::sync::{Arc, Mutex};

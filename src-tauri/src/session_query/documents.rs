@@ -165,6 +165,7 @@ pub fn build_documents(items: &[RolloutItem], created_at: u64) -> Vec<SearchDoc>
             RolloutItem::SessionMeta { .. }
             | RolloutItem::SubagentRef { .. }
             | RolloutItem::SandboxMode { .. }
+            | RolloutItem::PermissionPreset { .. }
             | RolloutItem::AbortNote { .. }
             | RolloutItem::TurnEnd { .. }
             | RolloutItem::SystemPrompt { .. } => {}

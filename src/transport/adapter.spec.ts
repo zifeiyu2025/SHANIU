@@ -9,6 +9,7 @@ import { assertSessionWireEvent } from '../dsh/packages/api/session-controller/s
 import { ClientSessions } from '../dsh/packages/api/session-controller/src/client/sessions/service.ts'
 import { ClientWorkspaceModel } from '../dsh/packages/api/workspace-controller/src/client/model.ts'
 import { createAdapter } from './adapter'
+import { PRESET_BUNDLES } from './permission-presets'
 import { registerExportTrigger } from './command-triggers'
 import type { HostBridge } from './tauri'
 import type { AgentEvent, EventMsg } from './types'
@@ -21,7 +22,8 @@ const HOST_SETTINGS = {
   workspaceRoot: 'W',
   hasApiKey: true,
   sandboxMode: 'workspace_write',
-  approvalMode: 'ask',
+  approvalMode: 'on_request',
+  permissionPreset: 'workspace-write',
   activeProvider: 'longcat',
   providerRevision: 4,
   providers: [
@@ -94,7 +96,7 @@ function scriptedBridge(
   // 才能测到"切换后 UI 显示新挡位"而不是停在旧值。
   const state = structuredClone(settings)
   // 会话档位的宿主替身状态（每份桥独立）：只按会话记，不进 settings——与集成铁律一致。
-  const sessionSandbox = new Map<string, string>()
+  const sessionPreset = new Map<string, string>()
   return {
     calls,
     async invoke<T>(command: string, args?: Record<string, unknown>): Promise<T> {
@@ -190,23 +192,31 @@ function scriptedBridge(
         state['baseUrl'] = args?.['baseUrl']
         state['model'] = args?.['model']
         state['workspaceRoot'] = args?.['workspaceRoot']
-        if (args?.['sandboxMode'] !== undefined) state['sandboxMode'] = args['sandboxMode']
+        if (args?.['permissionPreset'] !== undefined) {
+          const bundle = PRESET_BUNDLES[String(args['permissionPreset'])]
+          if (bundle === undefined) throw new Error(`未知权限预设: ${String(args['permissionPreset'])}`)
+          // 与宿主同语义：预设把两维一起写，不存在只改沙箱的保存
+          state['sandboxMode'] = bundle.sandbox
+          state['approvalMode'] = bundle.approval
+          state['permissionPreset'] = args['permissionPreset']
+        }
         return undefined as T
       }
-      // 会话档位（对齐 DSH 的 sandbox/mode 会话事件）：按会话持久，**不碰 settings**。
-      // 替身与宿主同语义：set 只写该会话，read 没切过就回 null（前端回落部署默认）。
-      if (command === 'set_session_sandbox_mode') {
+      // 会话档位（对齐 DSH 的 permission preset 会话事件）：按会话持久，**不碰 settings**。
+      // 替身与宿主同语义：set 只写该会话，read 没切过就回 null（前端回落部署默认）；
+      // 收 id 而不是沙箱档——两维由 PRESET_BUNDLES 一起装载。
+      if (command === 'set_session_permission_preset') {
         if (sandboxHandler !== undefined) return sandboxHandler(args) as T
         const id = String(args?.['sessionId'] ?? '')
-        const mode = String(args?.['mode'] ?? '')
-        if (!['read_only', 'workspace_write', 'danger_full_access'].includes(mode)) {
-          throw new Error(`未知沙箱档: ${mode}`)
+        const preset = String(args?.['preset'] ?? '')
+        if (PRESET_BUNDLES[preset] === undefined) {
+          throw new Error(`未知权限预设: ${preset}`)
         }
-        sessionSandbox.set(id, mode)
-        return mode as T
+        sessionPreset.set(id, preset)
+        return preset as T
       }
-      if (command === 'session_sandbox_mode') {
-        return (sessionSandbox.get(String(args?.['sessionId'] ?? '')) ?? null) as T
+      if (command === 'session_permission_preset') {
+        return (sessionPreset.get(String(args?.['sessionId'] ?? '')) ?? null) as T
       }
       if (command === 'create_session') return 'agent-new' as T
       if (command === 'send_task') {
@@ -2156,11 +2166,13 @@ describe('权限挡位与底部指标的数据面', () => {
       defaultOptions: { value: string }[]
       defaultPreset: string
     }
-    expect(catalog.options.map(option => option.value)).toEqual(['read-only', 'workspace-write', 'danger-full-access'])
+    expect(catalog.options.map(option => option.value))
+      .toEqual(['read-only', 'workspace-write', 'danger-full-access', 'workspace-write-auto'])
     // 说明行是界面文案，只能来自界面词典：宿主目录带 description 就会被下拉 detail
     // 原样渲染成中文（en 界面串语言），所以这里锁住「不下发」。
     expect(catalog.options.every(option => !('description' in option))).toBe(true)
-    expect(catalog.defaultOptions.map(option => option.value)).toEqual(['read-only', 'workspace-write', 'danger-full-access'])
+    expect(catalog.defaultOptions.map(option => option.value))
+      .toEqual(['read-only', 'workspace-write', 'danger-full-access', 'workspace-write-auto'])
     expect(catalog.defaultPreset).toBe('workspace-write')
 
     // 切挡前的快照基线：没有自己的档位事件 → 跟随部署默认
@@ -2170,13 +2182,14 @@ describe('权限挡位与底部指标的数据面', () => {
     expect(snap1.projections.values['permissions']).toEqual({ currentValue: 'workspace-write' })
     await before.return?.(undefined)
 
-    // 提交：/permission → 宿主的 set_session_sandbox_mode（会话事件），**不写 save_settings**。
+    // 提交：/permission → 宿主的 set_session_permission_preset（会话事件），**不写 save_settings**。
+    // 传 id 而不是沙箱档：审批维必须跟着沙箱维一起装载（自主档失效的根因就是两维分头写）。
     const callsBefore = bridge.calls.length
     const result = await face.commands.execute('agent-new', '/permission danger-full-access')
     expect(result).toMatchObject({ ok: true, value: { result: { kind: 'success', text: 'preset danger-full-access' } } })
     const newCalls = bridge.calls.slice(callsBefore)
-    expect(newCalls.find(call => call.command === 'set_session_sandbox_mode')?.args)
-      .toEqual({ sessionId: 'agent-new', mode: 'danger_full_access' })
+    expect(newCalls.find(call => call.command === 'set_session_permission_preset')?.args)
+      .toEqual({ sessionId: 'agent-new', preset: 'danger-full-access' })
     // §4.2 反向对照：没有写回配置文件。只断言"界面变了"是不够的——误点 chip 的
     // 后果正是永久改了部署默认，这条断言就是防它的。
     expect(newCalls.some(call => call.command === 'save_settings')).toBe(false)
@@ -2258,14 +2271,14 @@ describe('权限挡位与底部指标的数据面', () => {
     const bridge = scriptedBridge(
       undefined, [], undefined, undefined, undefined, undefined, undefined, undefined, undefined,
       undefined, undefined,
-      () => { throw new Error('沙箱模式取值非法，可用：read_only / workspace_write / danger_full_access') },
+      () => { throw new Error('未知权限预设 `danger-full-access`，可用：read-only / workspace-write / danger-full-access / workspace-write-auto') },
     )
     const { remote, dispose } = createAdapter({ bridge })
     const face = faceOf2(remote)
     const result = await face.commands.execute('agent-new', '/permission danger-full-access')
     expect(result).toMatchObject({
       ok: true,
-      value: { result: { kind: 'error', text: expect.stringContaining('沙箱模式取值非法') } },
+      value: { result: { kind: 'error', text: expect.stringContaining('未知权限预设') } },
     })
     const catalog = (await face.permissionPresets.catalog())['value'] as { defaultPreset: string }
     expect(catalog.defaultPreset).toBe('workspace-write')
@@ -2279,7 +2292,7 @@ describe('权限挡位与底部指标的数据面', () => {
     const bridge: ReturnType<typeof scriptedBridge> = {
       ...base,
       invoke: async <T,>(command: string, args?: Record<string, unknown>): Promise<T> => {
-        if (command === 'session_sandbox_mode') throw new Error('durable 记录不可读')
+        if (command === 'session_permission_preset') throw new Error('durable 记录不可读')
         return base.invoke<T>(command, args)
       },
     }
@@ -2326,7 +2339,7 @@ describe('权限挡位与底部指标的数据面', () => {
     )
     expect(result['ok']).toBe(true)
     expect(bridge.calls.find(call => call.command === 'save_settings')?.args)
-      .toMatchObject({ sandboxMode: 'read_only' })
+      .toMatchObject({ permissionPreset: 'read-only' })
 
     // 两条写面（/permission 命令与设置行）必须给出同一种确认：一帧 permissions 投影。
     // 少了这一帧，用户在设置页改完档，回到对话页芯片上还是旧档。
@@ -2809,7 +2822,7 @@ describe('Plan 芯片与客户端排队', () => {
     const unknown = await face.commands.execute('agent-new', '/permission yolo')
     expect(unknown).toMatchObject({
       ok: true,
-      value: { result: { kind: 'error', text: 'unknown preset "yolo" (available: read-only, workspace-write, danger-full-access)' } },
+      value: { result: { kind: 'error', text: 'unknown preset "yolo" (available: read-only, workspace-write, danger-full-access, workspace-write-auto)' } },
     })
     dispose()
   })

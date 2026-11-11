@@ -551,23 +551,19 @@ fn send_task(
     app: tauri::AppHandle,
     task: String,
     agent_id: Option<String>,
-    sandbox_mode: Option<String>,
+    permission_preset: Option<String>,
     images: Option<Vec<ImageAttachmentInput>>,
 ) -> Result<String, SendTaskError> {
     let images = images.unwrap_or_default();
-    // 只接受已知档位；拼错就拒绝，不静默回落到更宽的档（§11.3 退化红线）。
-    let sandbox = match sandbox_mode.as_deref().map(str::trim).filter(|m| !m.is_empty()) {
-        Some(raw) => Some(
-            config::SandboxMode::parse(raw)
-                .ok_or_else(|| format!("未知沙箱档: {raw}"))?,
-        ),
-        None => None,
-    };
+    // 只接受已知预设；拼错、传 `custom` 都拒绝，不静默回落到更宽的档（§11.3 退化红线）。
+    // 收 id 而不是两维：审批档必须跟着沙箱档一起走，分头传会重现「选了自主档、
+    // 沙箱却没动」的中间态。
+    let preset = parse_preset_arg(permission_preset.as_deref())?;
     let state = app.state::<AppState>();
     let task = preflight_send(&state, &task, &images)?;
     match agent_id.filter(|id| !id.trim().is_empty()) {
         Some(id) => {
-            continue_session(&app, &state, id.clone(), &task, sandbox, &images)
+            continue_session(&app, &state, id.clone(), &task, preset, &images)
                 .map_err(SendTaskError::Plain)?;
             Ok(id)
         }
@@ -578,7 +574,7 @@ fn send_task(
                 return Err("带图片的任务需要先创建会话".into());
             }
             let (agent, cancel, new_id) =
-                build_new_session(&state, state.workspace_root().as_path(), sandbox)?;
+                build_new_session(&state, state.workspace_root().as_path(), preset)?;
             // 首条消息 = 标题自动生成的触发点（first-prompt 节奏）：后台辅助请求，
             // 不阻塞主回合；失败/关开关/没密钥都静默保持截断 fallback。
             // 传的是剥掉 marker 的文本：标题生成也是「发给模型的文本」。
@@ -614,7 +610,7 @@ fn continue_session(
     state: &AppState,
     agent_id: String,
     task: &str,
-    draft_sandbox: Option<config::SandboxMode>,
+    draft_preset: Option<permission::preset::Preset>,
     images: &[ImageAttachmentInput],
 ) -> Result<(), String> {
     // 先解析附件：路径/尺寸/媒体类型都以磁盘内容为准，坏附件在读档案前就拒绝。
@@ -674,15 +670,28 @@ fn continue_session(
     } else {
         state.resume_workspace(&archived_workspace)?
     };
-    // 会话档位：档案里的最后一条事件优先；草稿态（还没建档时先切了档）次之；
-    // 都没有就跟随部署默认。
+    // 会话权限预设的优先级：档案里的最后一条预设事件 > 旧档案的沙箱档（配当前
+    // 审批档合成自定义）> 本次请求显式带的预设 > 未建档时的草稿；都没有就跟随部署默认。
     // 取走草稿（无论是否采用都清掉，避免陈旧选择贴到以后的同名任务上）。
-    let host_draft = state.take_draft_sandbox(&agent_id);
-    let session_sandbox = resumed
-        .sandbox_mode
+    let host_draft = state.take_draft_preset(&agent_id);
+    let config_approval = state.config().approval.mode;
+    let session_preset = resumed
+        .permission_preset
         .as_deref()
-        .and_then(config::SandboxMode::parse)
-        .or(draft_sandbox)
+        .and_then(permission::preset::from_id)
+        .copied()
+        .or_else(|| {
+            resumed
+                .sandbox_mode
+                .as_deref()
+                .and_then(config::SandboxMode::parse)
+                .map(|sandbox| {
+                    permission::preset::resolve(sandbox, config_approval)
+                        .copied()
+                        .unwrap_or_else(|| permission::preset::Preset::custom(sandbox, config_approval))
+                })
+        })
+        .or(draft_preset)
         .or(host_draft);
     let writer = rollout::RolloutWriter::open_existing(&resumed.path)
         .map_err(|e| format!("档案续写打不开: {e}"))?;
@@ -691,7 +700,7 @@ fn continue_session(
         &agent_id,
         if session_workspace.as_os_str().is_empty() { state.workspace_root() } else { session_workspace },
         Some(Arc::new(writer)),
-        session_sandbox,
+        session_preset,
     )?;
     let sink: Arc<dyn events::EventSink> = Arc::new(events::TauriEventSink::root(app.clone(), agent_id).with_journal(Arc::new(event_journal::FileEventJournal::new(app.state::<AppState>().data_root().join(config::SESSIONS_DIR)))).with_broadcast(app.state::<gateway::GatewayHub>().broadcast_sender()).with_viewers(app.state::<gateway::GatewayHub>().viewers()));
     // spawn 的 future 必须是 'static：借用的 app 只能换成 owned 句柄再 move 进去。
@@ -742,15 +751,19 @@ fn list_sessions(app: tauri::AppHandle) -> Vec<rollout::SessionSummary> {
 ///
 /// 只写**本会话档案**，绝不写 `config.toml`——这是会话内切换与设置页默认值的分界线。
 /// 重进会话靠档案里最后一条事件回放当前档位，进程重启也不丢。
+/// 切换会话权限预设（`/permission <preset>` 与会话头的档位菜单共用）。
+///
+/// 收 id 而不是两维是**单一写入面**：沙箱与审批在任何入口都只能被一起改，
+/// 不存在「只改沙箱」的路径——那条路径正是自主档失效的成因。
 #[tauri::command]
-fn set_session_sandbox_mode(
+fn set_session_permission_preset(
     app: tauri::AppHandle,
     session_id: String,
-    mode: String,
+    preset: String,
 ) -> Result<String, String> {
     let state = app.state::<AppState>();
-    let parsed = config::SandboxMode::parse(mode.trim())
-        .ok_or_else(|| format!("未知沙箱档: {mode}"))?;
+    let parsed = *permission::preset::from_id(preset.trim())
+        .ok_or_else(|| format!("未知权限预设 `{}`，可用：{}", preset.trim(), preset_names()))?;
     let path = state
         .data_root()
         .join(rollout::ROLLOUT_DIR)
@@ -759,32 +772,64 @@ fn set_session_sandbox_mode(
         let writer = rollout::RolloutWriter::open_existing(&path)
             .map_err(|e| format!("会话档案打不开: {e}"))?;
         writer
-            .append(&rollout::RolloutItem::SandboxMode {
-                mode: parsed.as_str().to_string(),
+            .append(&rollout::RolloutItem::PermissionPreset {
+                preset: parsed.id.to_string(),
                 at_ms: now_ms(),
             })
-            .map_err(|e| format!("写入会话档位失败: {e}"))?;
+            .map_err(|e| format!("写入会话权限预设失败: {e}"))?;
     } else {
         // 还没建档（输入框里先切档）：贴到会话 id 上，首条任务落盘时写进档案。
-        state.put_draft_sandbox(&session_id, parsed);
+        state.put_draft_preset(&session_id, parsed);
     }
     // 只有目标就是当前跑着的会话时才动运行时快照；别的会话等它自己启动时再装载，
     // 否则 A 会话的切档会借共享句柄泄进 B（§4.2 反向对照要证的就是这条）。
     if state.active_agent().as_deref() == Some(session_id.as_str()) {
-        state.policy.set_sandbox(parsed);
+        state.policy.reset(permission::SessionPolicy {
+            approval: parsed.approval,
+            sandbox: parsed.sandbox,
+        });
     }
-    Ok(parsed.as_str().to_string())
+    Ok(parsed.id.to_string())
 }
 
-/// 读会话当前档位（未建档 / 从没切过 → None，前端回落部署默认）。
+/// 读会话当前权限预设（未建档 / 从没切过 → None，前端回落部署默认）。
+///
+/// 旧档案只有沙箱档：用「旧沙箱档 + 当前部署审批档」合成，再按预设表**精确匹配**——
+/// 命中就给 id，不命中如实返回 `custom`，绝不猜一个「最像的」。
 #[tauri::command]
-fn session_sandbox_mode(app: tauri::AppHandle, session_id: String) -> Option<String> {
+fn session_permission_preset(app: tauri::AppHandle, session_id: String) -> Option<String> {
     let state = app.state::<AppState>();
     let path = state
         .data_root()
         .join(rollout::ROLLOUT_DIR)
         .join(format!("{session_id}.jsonl"));
-    rollout::last_sandbox_mode(&path)
+    if let Some(preset) = rollout::last_permission_preset(&path) {
+        return Some(preset);
+    }
+    let sandbox = rollout::last_sandbox_mode(&path)
+        .as_deref()
+        .and_then(config::SandboxMode::parse)?;
+    Some(permission::preset::id_of(sandbox, state.config().approval.mode).to_string())
+}
+
+/// 把所有预设 id 列成一行给错误提示用（表本身在 `permission::preset`，这里不复制）。
+fn preset_names() -> String {
+    permission::preset::PRESETS
+        .iter()
+        .map(|preset| preset.id)
+        .collect::<Vec<_>>()
+        .join(" / ")
+}
+
+/// 解析前端传来的预设 id：空/缺省 = 不指定；未知值与派生值 `custom` 一律拒绝。
+fn parse_preset_arg(raw: Option<&str>) -> Result<Option<permission::preset::Preset>, String> {
+    match raw.map(str::trim).filter(|id| !id.is_empty()) {
+        Some(id) => permission::preset::from_id(id)
+            .copied()
+            .map(Some)
+            .ok_or_else(|| format!("未知权限预设 `{id}`，可用：{}", preset_names())),
+        None => Ok(None),
+    }
 }
 
 /// 读一页会话事件信封（SH-094 批 1）：`after_event_id` 之后、最多 `limit` 条。
@@ -1068,6 +1113,7 @@ fn project_slots(items: &[rollout::RolloutItem]) -> Vec<Slot> {
             rollout::RolloutItem::SessionMeta { .. }
             | rollout::RolloutItem::SubagentRef { .. }
             | rollout::RolloutItem::SandboxMode { .. }
+            | rollout::RolloutItem::PermissionPreset { .. }
             | rollout::RolloutItem::AbortNote { .. }
             | rollout::RolloutItem::SystemPrompt { .. } => {}
         }
@@ -1757,20 +1803,20 @@ fn create_session(
 fn build_new_session(
     state: &AppState,
     workspace_root: &Path,
-    sandbox: Option<config::SandboxMode>,
+    preset: Option<permission::preset::Preset>,
 ) -> Result<(Arc<agent_loop::AgentLoop>, tokio_util::sync::CancellationToken, String), String> {
     let (writer, agent_id) = new_session_writer(state, workspace_root, None)?;
-    if let Some(mode) = sandbox {
-        // 新会话的初始档位（输入框先切档、再发首条消息）：落进档案，跟会话走。
+    if let Some(preset) = preset {
+        // 新会话的初始预设（输入框先切档、再发首条消息）：落进档案，跟会话走。
         writer
-            .append(&rollout::RolloutItem::SandboxMode {
-                mode: mode.as_str().to_string(),
+            .append(&rollout::RolloutItem::PermissionPreset {
+                preset: preset.id.to_string(),
                 at_ms: now_ms(),
             })
-            .map_err(|e| format!("写入会话档位失败: {e}"))?;
+            .map_err(|e| format!("写入会话权限预设失败: {e}"))?;
     }
     let (agent, cancel) =
-        build_agent_with(state, &agent_id, workspace_root.to_path_buf(), Some(writer), sandbox)?;
+        build_agent_with(state, &agent_id, workspace_root.to_path_buf(), Some(writer), preset)?;
     Ok((agent, cancel, agent_id))
 }
 
@@ -1886,7 +1932,7 @@ fn build_agent_with(
     agent_id: &str,
     workspace_root: PathBuf,
     writer: Option<Arc<rollout::RolloutWriter>>,
-    session_sandbox: Option<config::SandboxMode>,
+    session_preset: Option<permission::preset::Preset>,
 ) -> Result<(Arc<agent_loop::AgentLoop>, tokio_util::sync::CancellationToken), String> {
     let cfg = state.config();
     // 生效端点由配置层解析（active 服务商命中 → 那家；否则回落 [model]）。
@@ -1941,9 +1987,8 @@ fn build_agent_with(
             tracing::warn!("MCP 工具注册冲突（已跳过）: {error}");
         }
     }
-    // SH-120 + 档位会话化：任务启动时把审批档重置回 config，沙箱档取本会话档案里的
-    // 最后一档（没有则部署默认）。
-    state.reset_policy(session_sandbox);
+    // SH-120 + 预设会话化：任务启动时按**一个预设**重置两维（没有则部署默认）。
+    state.reset_policy(session_preset);
     let agent = agent_loop::AgentLoop::from_config(
         backend,
         Arc::new(router),
@@ -1976,16 +2021,6 @@ fn approve(app: tauri::AppHandle, request_id: String, decision: String) -> Resul
     };
     app.state::<AppState>().broker.resolve(&request_id, decision);
     Ok(())
-}
-
-/// 运行中切换审批档（SH-120 / ADR-007）：只作用于**当前会话**，从下一个 turn 生效。
-/// 不写 config.toml——写成全局默认就是"全局开关"，ADR-008 明确否掉。
-/// `full_access` 的前提（danger 沙箱）不满足时返回错误，不静默回落。
-#[tauri::command]
-fn set_approval_mode(app: tauri::AppHandle, mode: String) -> Result<(), String> {
-    let parsed: config::ApprovalMode = serde_json::from_value(serde_json::Value::String(mode.clone()))
-        .map_err(|_| format!("未知审批档 `{mode}`，可选 {APPROVAL_MODE_NAMES}"))?;
-    app.state::<AppState>().policy.set_approval(parsed)
 }
 
 /// 保存 API Key（DPAPI 加密落盘，docs §9.1 secrets\）。
@@ -2105,6 +2140,9 @@ fn get_settings(app: tauri::AppHandle) -> Result<serde_json::Value, String> {
         // 不在这里手写字符串——手写就会与 config.toml 里的写法漂移成两套名字。
         "sandboxMode": serde_json::to_value(cfg.sandbox.mode).map_err(|e| e.to_string())?,
         "approvalMode": serde_json::to_value(cfg.approval.mode).map_err(|e| e.to_string())?,
+        // 预设视图（单一读面）：命中预设给 id，非标准组合如实给 `custom`。
+        // 两维仍单独下发是给状态条/诊断用的只读信息，**不构成写面**。
+        "permissionPreset": permission::preset::id_of(cfg.sandbox.mode, cfg.approval.mode),
         // 生效档的协议族 id 与服务商文档（多服务商口径，04 §4）
         "activeProvider": if cfg.active_provider.is_empty() { active.id.clone() } else { cfg.active_provider.clone() },
         "providerRevision": cfg.provider_revision,
@@ -2178,7 +2216,10 @@ fn sandbox_status(app: tauri::AppHandle) -> sandbox::SandboxStatus {
 
 /// 报错时列给用户的合法档位名。它必须与 `config.rs` 的枚举同源——
 /// `safety_mode_names_match_enums` 用穷举后的序列化结果逐字比对，加一档忘改这里会直接红。
+/// 只在测试里用：写面已经收成预设 id，这两份清单留着守枚举漂移。
+#[cfg(test)]
 const SANDBOX_MODE_NAMES: &str = "read_only / workspace_write / danger_full_access";
+#[cfg(test)]
 const APPROVAL_MODE_NAMES: &str = "never / on_failure / on_request / full_access";
 
 /// 保存设置：模型端点/工作区入 config.toml，API Key（可选填）DPAPI 加密落盘。
@@ -2189,8 +2230,7 @@ fn save_settings(
     model: String,
     workspace_root: String,
     api_key: Option<String>,
-    sandbox_mode: Option<String>,
-    approval_mode: Option<String>,
+    permission_preset: Option<String>,
 ) -> Result<(), String> {
     let state = app.state::<AppState>();
     let mut cfg: AppConfig = state.config();
@@ -2234,17 +2274,15 @@ fn save_settings(
         state.check_workspace_root(&candidate)?;
     }
     cfg.workspace.root = trimmed_root;
-    // 安全面两档：None = 不改，所以旧调用形态（不传这两个键）行为完全不变。
+    // 安全面收成一个预设：None = 不改，所以旧调用形态（不传这个键）行为完全不变。
     // 非法值必须报错而不是静默保留旧值——"点了保存却没生效、界面还显示旧档位"是安全
     // 设置里最坏的一类失败：用户会以为自己已经收紧（或放宽）了，实际什么都没变。
-    // 解析复用 serde 而不是手写 match，这样名字永远与 config.toml 里的写法同源。
-    if let Some(mode) = sandbox_mode {
-        cfg.sandbox.mode = serde_json::from_value(serde_json::Value::String(mode))
-            .map_err(|_| format!("沙箱模式取值非法，可用：{}", SANDBOX_MODE_NAMES))?;
-    }
-    if let Some(mode) = approval_mode {
-        cfg.approval.mode = serde_json::from_value(serde_json::Value::String(mode))
-            .map_err(|_| format!("审批模式取值非法，可用：{}", APPROVAL_MODE_NAMES))?;
+    // 两维由预设表**一起**写，不存在只改沙箱或只改审批的入口。
+    if let Some(id) = permission_preset.as_deref().map(str::trim).filter(|id| !id.is_empty()) {
+        let preset = permission::preset::from_id(id)
+            .ok_or_else(|| format!("未知权限预设 `{id}`，可用：{}", preset_names()))?;
+        cfg.sandbox.mode = preset.sandbox;
+        cfg.approval.mode = preset.approval;
     }
     // 写入文件名必须与读取路径同源（生效档的 secret_name）：这里再写死一个
     // "openai-responses"，多服务商下就是"存进去读不到"的另一副面孔。
@@ -3104,9 +3142,8 @@ pub fn run() {
             insert_workspace_before,
             cancel_task,
             approve,
-            set_approval_mode,
-            set_session_sandbox_mode,
-            session_sandbox_mode,
+            set_session_permission_preset,
+            session_permission_preset,
             send_subagent_message,
             interrupt_subagent,
             store_api_key,

@@ -229,12 +229,13 @@ describe('mock 添加工作区', () => {
 })
 
 describe('mock 权限挡位目录', () => {
-  it('目录只含三个内置挡位：实验档 auto 不出现，默认表与目录同表', async () => {
+  it('目录只含内置挡位与本仓自主档：实验档 auto 不出现，默认表与目录同表', async () => {
     const catalog = await remote.permissionPresets.catalog()
     if (!catalog.ok) throw new Error(`catalog 失败：${catalog.error.message}`)
-    // auto（模型自动审查）在 SHANIU 后端没有对应语义，用户裁定不进目录
+    // auto（模型自动审查）在 SHANIU 后端没有对应语义，用户裁定不进目录；
+    // workspace-write-auto 是本仓扩展档（区内写入与执行不再逐次确认），界面按普通档展示。
     expect(catalog.value.options.map(option => option.value))
-      .toEqual(['read-only', 'workspace-write', 'danger-full-access'])
+      .toEqual(['read-only', 'workspace-write', 'danger-full-access', 'workspace-write-auto'])
     expect(catalog.value.defaultOptions.map(option => option.value))
       .toEqual(catalog.value.options.map(option => option.value))
     expect(catalog.value.defaultPreset).toBe('read-only')
