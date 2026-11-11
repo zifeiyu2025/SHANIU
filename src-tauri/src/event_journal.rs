@@ -133,7 +133,11 @@ pub fn read_after(
     let mut events = Vec::new();
     let mut has_more = false;
     for line in BufReader::new(file).lines() {
-        let Ok(line) = line else { break };
+        // 与 `latest_event_id` 同口径（M7）：`lines()` 的 `Err` 是**读取失败**
+        // （非法 UTF-8 / I/O 错），不是坏行。当 EOF 处理会让调用方拿到一个短页 +
+        // `has_more:false`，误以为已追平，后面的事件永久丢失且没有任何痕迹；
+        // JSON 解析失败才是坏行，才 `continue`。
+        let line = line.map_err(|e| format!("事件日志读取失败（{}）: {e}", path.display()))?;
         let line = line.trim();
         if line.is_empty() {
             continue;
@@ -185,7 +189,10 @@ pub fn owner_session_of_agent(dir: &Path, agent_id: &str) -> Result<Option<Strin
     for path in paths {
         let Ok(file) = std::fs::File::open(&path) else { continue };
         for line in BufReader::new(file).lines() {
-            let Ok(line) = line else { break };
+            // 同 `read_after`：读失败必须上抛，否则反查会返回 `Ok(None)`，
+            // 调用方把「读不出来」当成「没有这个 agent」，泳道开成空面板。
+            let line =
+                line.map_err(|e| format!("事件日志读取失败（{}）: {e}", path.display()))?;
             let line = line.trim();
             if line.is_empty() {
                 continue;
@@ -388,6 +395,40 @@ mod tests {
         file.flush().unwrap();
 
         let err = latest_event_id(&dir, "s1").expect_err("读错误必须上抛，不能当 EOF 返回旧游标");
+        assert!(err.contains("读取失败"), "错误文案要点名读取失败：{err}");
+        assert!(err.contains("s1.events.jsonl"), "错误要带路径便于定位：{err}");
+    }
+
+    /// D1 反向对照（续播路径）：`read_after` 曾把读错误当 EOF，返回一个短页 +
+    /// `has_more:false`，调用方据此认为已追平，后面的事件永久丢失且无痕迹。
+    /// 撤掉修复（改回 `let Ok(line) = line else { break }`）本用例必须变红。
+    #[test]
+    fn read_after_fails_loudly_on_read_error() {
+        let dir = temp_dir();
+        append(&dir, &event("s1", "01", 1)).unwrap();
+        let path = dir.join("s1.events.jsonl");
+        let mut file = OpenOptions::new().append(true).open(&path).unwrap();
+        file.write_all(b"\xff\xfe\n").unwrap();
+        file.flush().unwrap();
+
+        let err = read_after(&dir, "s1", None, 10)
+            .expect_err("读错误必须上抛，不能返回一个伪造的『已读完』短页");
+        assert!(err.contains("读取失败"), "错误文案要点名读取失败：{err}");
+        assert!(err.contains("s1.events.jsonl"), "错误要带路径便于定位：{err}");
+    }
+
+    /// D1 反向对照（反查路径）：读错误不能让反查返回 `Ok(None)`——那会被调用方
+    /// 读成「没有这个 agent」，泳道直接开成空面板。
+    #[test]
+    fn owner_session_of_agent_fails_loudly_on_read_error() {
+        let dir = temp_dir();
+        let path = dir.join("s1.events.jsonl");
+        let mut file = OpenOptions::new().create(true).append(true).open(&path).unwrap();
+        file.write_all(b"\xff\xfe\n").unwrap();
+        file.flush().unwrap();
+
+        let err = owner_session_of_agent(&dir, "child-a")
+            .expect_err("读错误必须上抛，不能把『读不出来』当成『没有这个 agent』");
         assert!(err.contains("读取失败"), "错误文案要点名读取失败：{err}");
         assert!(err.contains("s1.events.jsonl"), "错误要带路径便于定位：{err}");
     }
