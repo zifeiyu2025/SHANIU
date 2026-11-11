@@ -197,7 +197,7 @@ A（文档有、代码找不到）/ B（不可机械判定）/ 通过数，退�
 | R2-139 | 04:L741 | `error_code` 取受控词表（`agent_loop/error_codes.rs`），不得写成自由文本 | `agent_loop/error_codes.rs` | 文件 | 2026-11-11 裁决后文档措辞已改（`dc37515`），不再是「枚举」 |
 | R2-140 | 04:L751 | **产物路径只有一种形态**：`evals/results/<epoch>-<pid>-<role>.json` | `fmt:eval-result-filename` | 结构 | 文件名运行期生成；验 `format!` 模板 |
 | R2-141 | 04:L769 | 前端启动时与后端握手 `protocol_version` | `protocol_version` | 字面量 | |
-| R2-142 | 08:L6 | 本版版本号 `0.2.4`（`package.json` / `src-tauri/Cargo.toml` / `src-tauri/tauri.conf.json` 三处一致…） | `0.2.4` | 配置 | |
+| R2-142 | 08:L6 | 本版版本号 `0.2.5`（`package.json` / `src-tauri/Cargo.toml` / `src-tauri/tauri.conf.json` 三处一致…） | `0.2.5` | 配置 | |
 | R2-143 | 08:L14 | `tauri.conf.json` 的 `bundle.active` 为 `false`…`pnpm release:portable` | `bundle.active=false` + npm script | 配置 | |
 | R2-144 | 08:L15 | 兜底 `SHANIU-Portable-<版本>.zip`（`SHANIU.exe` + `portable.marker` + `README.txt`） | `portable.marker` | 字面量 | |
 | R2-145 | 08:L17 | 判定顺序 `SHANIU_DATA_DIR` > 已有记录 > `portable.marker`… | `SHANIU_DATA_DIR` | 字面量 | |
