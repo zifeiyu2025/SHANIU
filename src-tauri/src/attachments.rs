@@ -5,13 +5,15 @@
 //! 元数据，不触碰 rollout。批 1 接文件与图片**暂存**（图片只存原字节，不做归一化），
 //! 历史附件的投影/回读留给批 2。
 //!
-//! 本模块零业务依赖（std + base64/serde/ulid），数据根由组合根传入；FF-1 E38。
+//! 本模块零业务依赖（std + base64/serde/ulid + 基础设施 `clock`），数据根由组合根传入；FF-1 E38。
 
 use std::fs;
 use std::path::{Path, PathBuf};
 
 use base64::Engine as _;
 use serde::{Deserialize, Serialize};
+
+use crate::clock::now_ms;
 
 /// 单次上传硬上限：与保存对话框/预览读面的 32 MiB 口径一致。
 pub const MAX_UPLOAD_BYTES: usize = 32 * 1024 * 1024;
@@ -117,13 +119,6 @@ fn session_dir(root: &Path, session_id: &str) -> Result<PathBuf, String> {
         return Err(format!("非法的会话 id：{session_id}"));
     }
     Ok(root.join("attachments").join(session_id))
-}
-
-fn now_ms() -> u64 {
-    std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)
-        .map(|d| d.as_millis() as u64)
-        .unwrap_or(0)
 }
 
 /// 附件目录占用（设置页只读一行）。

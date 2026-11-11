@@ -14,13 +14,13 @@
 
 use std::collections::BTreeMap;
 use std::sync::Mutex;
-use std::time::{SystemTime, UNIX_EPOCH};
 
 use serde::Serialize;
 use tauri::Manager;
 use tokio::sync::oneshot;
 
 use crate::app_state::AppState;
+use crate::clock::now_ms;
 
 /// 输出环保留上限（UTF-8 字节）。与前端渲染尾部 128KiB 对齐后留一倍余量。
 pub const RING_CAP_BYTES: usize = 256 * 1024;
@@ -362,13 +362,6 @@ fn not_found(session_id: &str, job_id: &str) -> JobOpError {
 /// 终态判定：只有这三个值不再算“在跑的事”。
 fn is_terminal(status: &str) -> bool {
     matches!(status, "completed" | "killed" | "failed")
-}
-
-fn now_ms() -> u64 {
-    SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .map(|duration| duration.as_millis() as u64)
-        .unwrap_or(0)
 }
 
 // ============================== Tauri 命令 ==============================

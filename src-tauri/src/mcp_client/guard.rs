@@ -11,10 +11,11 @@
 //!   才是主防线；纯语义改写、自定义编码不在本模块的承诺范围内。
 
 use std::collections::HashMap;
-use std::time::{SystemTime, UNIX_EPOCH};
 
 use serde::{Deserialize, Serialize};
 use unicode_normalization::UnicodeNormalization;
+
+use crate::clock::now_ms;
 
 /// 规范化结果。`stripped_invisible` 记录被剥掉的控制/零宽/双向控制符数量——
 /// 只要非零本身就是可疑信号（A-R2），哪怕文本表面上无害。
@@ -416,13 +417,6 @@ impl ExemptionStore {
         }
         store
     }
-}
-
-fn now_ms() -> u64 {
-    SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .map(|duration| duration.as_millis() as u64)
-        .unwrap_or(0)
 }
 
 #[cfg(test)]

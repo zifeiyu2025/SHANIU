@@ -37,6 +37,7 @@ use windows::Win32::Storage::FileSystem::{
 };
 
 use super::windows_impl::wide;
+use crate::clock::now_ms;
 
 const BACKUP_MAGIC: &[u8; 8] = b"SHNIACL1";
 const BACKUP_EXT: &str = "dacl";
@@ -439,13 +440,6 @@ impl AclManager {
         }
         tracing::info!(action, path = %path.display(), sid, access, result, "目录授权审计");
     }
-}
-
-fn now_ms() -> u64 {
-    std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)
-        .map(|elapsed| elapsed.as_millis() as u64)
-        .unwrap_or(0)
 }
 
 /// SID → `S-1-15-2-...` 文本（审计与幂等键都用它）。

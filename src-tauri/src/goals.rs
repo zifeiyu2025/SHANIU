@@ -18,12 +18,12 @@
 
 use std::path::{Path, PathBuf};
 use std::sync::Mutex;
-use std::time::{SystemTime, UNIX_EPOCH};
 
 use serde::{Deserialize, Serialize};
 use tauri::Manager;
 
 use crate::app_state::AppState;
+use crate::clock::now_ms;
 
 /// 目标目录名（相对 `data_root`）。
 pub const GOALS_DIR: &str = "goals";
@@ -95,13 +95,6 @@ struct GoalStore {
 
 /// 单进程内的读改写闸：Tauri 命令可能并发到达，CAS 必须基于同一份最新状态判定。
 static GOAL_LOCK: Mutex<()> = Mutex::new(());
-
-fn now_ms() -> u64 {
-    SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .map(|d| d.as_millis() as u64)
-        .unwrap_or(0)
-}
 
 /// 会话 id 只允许档案面同一组安全字符，避免路径穿越。
 fn goal_path(data_root: &Path, session_id: &str) -> Result<PathBuf, GoalOpError> {

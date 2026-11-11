@@ -10,6 +10,7 @@ pub mod app_state;
 pub mod attachments;
 /// 模型能力声明与实测探针（SH-132，docs/04 §4.1）。
 pub mod capability;
+pub mod clock;
 pub mod config;
 pub mod compaction;
 pub mod event_journal;
@@ -62,6 +63,7 @@ use tauri::{
 
 use agent_loop::ModelBackend;
 use app_state::AppState;
+use clock::now_ms;
 use config::AppConfig;
 
 /// 冒烟探针用的远程调试端口：只认显式环境变量，非法值直接忽略。
@@ -1770,13 +1772,6 @@ fn build_new_session(
     let (agent, cancel) =
         build_agent_with(state, &agent_id, workspace_root.to_path_buf(), Some(writer), sandbox)?;
     Ok((agent, cancel, agent_id))
-}
-
-fn now_ms() -> u64 {
-    std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)
-        .map(|d| d.as_millis() as u64)
-        .unwrap_or_default()
 }
 
 fn new_session_writer(

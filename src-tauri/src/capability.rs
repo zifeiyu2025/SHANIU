@@ -21,13 +21,13 @@ use std::collections::{BTreeMap, HashSet};
 use std::io::Cursor;
 use std::path::{Path, PathBuf};
 use std::sync::Mutex;
-use std::time::{SystemTime, UNIX_EPOCH};
 
 use base64::Engine;
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 use tauri::Manager;
 
+use crate::clock::now_ms;
 use crate::config::{CapabilityRecord, CapabilitySource, ModelProfile, ProviderProfile};
 
 pub const CACHE_FILE: &str = "capabilities.json";
@@ -270,13 +270,6 @@ fn cache_key_for(base_url: &str, protocol: &str, model: &str, api_key: &str, ver
 fn key_fingerprint(api_key: &str) -> String {
     let digest = Sha256::digest(api_key.as_bytes());
     digest.iter().take(8).map(|b| format!("{b:02x}")).collect()
-}
-
-fn now_ms() -> u64 {
-    SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .map(|d| d.as_millis() as u64)
-        .unwrap_or(0)
 }
 
 // ============================== 端点元数据 ==============================

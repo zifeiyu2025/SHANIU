@@ -21,6 +21,7 @@ use std::sync::Arc;
 use futures::StreamExt;
 use tokio_util::sync::CancellationToken;
 
+use crate::clock::now_ms;
 use crate::config::AppConfig;
 use crate::events::{EventMsg, ToolCallResult};
 use crate::model_client::{
@@ -266,17 +267,6 @@ fn replace_with_summary(
         // 注意这并不违反 04 §6.1 不变量③：那条禁止的是把摘要塞进 **system**。
         [HistoryItem::Message { role: Role::User, text: summary.to_string(), reasoning: None }],
     );
-}
-
-/// 档案时间戳：事件发生时刻（Unix 毫秒）。
-///
-/// 刻意不复用序列化时刻：导出/搜索/审计都按它排序，写成"导出那一刻"会让整份
-/// 历史的时间轴塌缩成几个点（A0-4 的根因）。
-fn now_ms() -> u64 {
-    std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)
-        .map(|since| since.as_millis() as u64)
-        .unwrap_or(0)
 }
 
 /// 把任务开始时的环境快照插到**最后一条用户消息之前**。

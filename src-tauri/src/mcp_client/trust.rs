@@ -14,11 +14,11 @@
 
 use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
-use std::time::{SystemTime, UNIX_EPOCH};
 
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 
+use crate::clock::now_ms;
 use crate::events::RiskLevel;
 
 use super::fingerprint::{sha256_hex, FingerprintInput};
@@ -538,13 +538,6 @@ fn replace_file(tmp: &Path, target: &Path) -> std::io::Result<()> {
         }
         Err(error) => Err(error),
     }
-}
-
-fn now_ms() -> u64 {
-    SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .map(|duration| duration.as_millis() as u64)
-        .unwrap_or(0)
 }
 
 #[cfg(test)]
