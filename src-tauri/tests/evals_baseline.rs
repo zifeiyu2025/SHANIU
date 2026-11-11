@@ -202,6 +202,11 @@ struct Task {
     /// 判断"自愈值不值"只看这个子集，故它必须在报告里单独成列。
     #[serde(default)]
     hard: bool,
+    /// 规则类别：`class-fact`（可推导的类别事实，适合索引）/
+    /// `literal`（必须逐字复现的字面量，不适合索引）。
+    /// 一个总平均会把两类天生不同适应性的规则混在一起，必须分组报。
+    #[serde(default)]
+    category: String,
 }
 
 #[derive(Deserialize, Default)]
@@ -661,6 +666,8 @@ struct Outcome {
     read_agents: bool,
     /// 模型输出的指纹：同一任务 N 次样本是否等价，靠它数，不靠感觉。
     output_hash: String,
+    /// 是否撞上 180s 单任务上限：单独统计，不从分母里删。
+    timed_out: bool,
 }
 
 /// 评估用的 broker：默认装**生产语义**（同 turn 批量确认 + 前缀白名单都在），
@@ -859,6 +866,9 @@ async fn run_one(
         Ok(s) => (s.turns, format!("{:?}", s.reason)),
         Err(_) => (max_turns_per_task(), "超时被丢弃（>180s）".to_string()),
     };
+    // 超时单列：它是"没跑完"，不是"答错"。两个数都要报（含/不含超时），
+    // 但**不许**把它从分母里悄悄删掉——改分母必须写出来。
+    let timed_out = summary.is_err();
     let agg = sink.agg.lock().unwrap();
     let verdict = verify(&ws, &task.check);
     let mut detail = match &verdict {
@@ -916,6 +926,7 @@ async fn run_one(
             .iter()
             .any(|line| line.starts_with("read_file") && line.contains("AGENTS.md")),
         output_hash: output_fingerprint(&assistant_text(&archive.items)),
+        timed_out,
     };
     assert!(
         infra || archive.items.len() >= 2,
@@ -1067,6 +1078,8 @@ async fn evals_baseline_v0() {
                 "rules_selection": out.rules_selection,
                 "read_agents": out.read_agents,
                 "output_hash": out.output_hash,
+                "category": if task.category.is_empty() { "未分类" } else { task.category.as_str() },
+                "timeout": out.timed_out,
                 "detail": out.detail,
             }));
         }
@@ -1278,10 +1291,61 @@ async fn evals_baseline_v0() {
         .count();
     let all_infra = expected_samples > 0 && infra_total == expected_samples;
     let valid = samples_match && infra_total == 0;
+    // 分层：一个总平均会把「类别事实」和「精确字面量」两类规则混在一起——
+    // 前者天生适合索引，后者天生不适合。不分组就只会得出"80%，差一点"这种没有信息的结论。
+    // (pass, n, timeouts, pass_and_not_timeout)。最后一个**必须**单独数：
+    // 「不含超时」是分子分母同时剔除超时样本；只剔分母会把「超时但答对」留在分子里，
+    // 第一版写成 passed/(n-timeouts)，literal 组算出 200%——比漏报更误导，因为它像绿。
+    let mut by_cat: BTreeMap<String, (u32, u32, u32, u32)> = BTreeMap::new();
+    for run in &runs {
+        for row in run["tasks"].as_array().into_iter().flatten() {
+            let cat = row["category"].as_str().unwrap_or("未分类").to_string();
+            let entry = by_cat.entry(cat).or_insert((0, 0, 0, 0));
+            let passed = row["success"].as_bool().unwrap_or(false);
+            let timed_out = row["timeout"].as_bool().unwrap_or(false);
+            entry.1 += 1;
+            if passed {
+                entry.0 += 1;
+                if !timed_out {
+                    entry.3 += 1;
+                }
+            }
+            if timed_out {
+                entry.2 += 1;
+            }
+        }
+    }
+    let by_category = by_cat
+        .iter()
+        .map(|(cat, (passed, n, timeouts, passed_no_timeout))| {
+            (
+                cat.clone(),
+                json!({
+                    "passed": passed,
+                    "n": n,
+                    "timeouts": timeouts,
+                    "success_rate": if *n > 0 { f64::from(*passed) / f64::from(*n) } else { 0.0 },
+                    // 去掉超时样本后的分子与分母：两个数都要在，删分母必须看得见。
+                    "passed_no_timeout": passed_no_timeout,
+                    "n_no_timeout": n - timeouts,
+                    "success_rate_no_timeout": if *n > *timeouts {
+                        f64::from(*passed_no_timeout) / f64::from(*n - *timeouts)
+                    } else { 0.0 },
+                }),
+            )
+        })
+        .collect::<serde_json::Map<_, _>>();
+    let timeout_total = runs
+        .iter()
+        .flat_map(|run| run["tasks"].as_array().cloned().unwrap_or_default())
+        .filter(|row| row["timeout"].as_bool().unwrap_or(false))
+        .count();
     let report = json!({
         "version": spec.version,
         "arm": arm,
         "tasks_file": tasks_file,
+        "by_category": by_category,
+        "timeouts": timeout_total,
         // 两臂的真实差别就是这一块：规则块注入多少 token、按什么依据选节。
         // B 臂必须能回答"全文到底多少、是否 ≤2500"，否则"回退全文注入"没有成本概念。
         "rules": {

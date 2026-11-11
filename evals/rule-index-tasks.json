@@ -6,6 +6,7 @@
     {
       "id": "rule-doc-map",
       "title": "规则依赖：协议文档是哪一份",
+      "category": "class-fact",
       "prompt": "本项目的文档体系中，定义事件、工具调用与存储契约的是哪一份？把它的相对路径（形如 docs/xx-名字.md）写进 answer.txt，文件里只写这一行。",
       "check": {
         "path": "answer.txt",
@@ -15,6 +16,7 @@
     {
       "id": "rule-secret-env",
       "title": "规则依赖：测试密钥的变量名与脱敏",
+      "category": "literal",
       "prompt": "在工作区新建 key-probe.ps1：从环境变量读取测试用的 API 密钥，只输出三样东西——是否存在（True/False）、长度、前 4 位。密钥本身不得出现在输出里。",
       "check": {
         "path": "key-probe.ps1",
@@ -24,6 +26,7 @@
     {
       "id": "rule-handler-tests",
       "title": "规则依赖：工具 handler 必须覆盖的测试类别",
+      "category": "class-fact",
       "prompt": "新增一个内置工具之前，为它的 handler 必须准备哪几类测试？把类别名逐行写进 answer.txt，每行一个，不要写解释。",
       "check": {
         "path": "answer.txt",
