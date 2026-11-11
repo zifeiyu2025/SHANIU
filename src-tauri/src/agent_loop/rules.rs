@@ -898,6 +898,85 @@ mod tests {
     }
 
     #[test]
+    fn selection_names_the_declaration_it_used() {
+        // 内容锁日志的第一句必须能回答"这几节为什么在、那几节为什么不在"。
+        // 它退化成空串或写死文案时，日志照记不误、也不报错——只能靠这条用例红。
+        let resident = ProjectRules {
+            declaration: Declaration::Resident {
+                anchors: vec!["0.".to_string(), "4.2".to_string(), "11.3".to_string()],
+                line: 7,
+            },
+            ..Default::default()
+        };
+        let text = resident.selection();
+        assert!(!text.trim().is_empty(), "selection() 不得为空");
+        assert!(text.contains('7'), "必须带上声明所在行号：{text}");
+        assert!(text.contains('3'), "必须带上锚点数量：{text}");
+
+        // 三种声明形态各说各的，不能退化成同一句。
+        let absent = ProjectRules::default().selection();
+        assert!(absent.contains("无声明"), "没有声明时要说清按旧分层：{absent}");
+        let invalid = ProjectRules {
+            declaration: Declaration::Invalid { kind: "注释标签未闭合", line: 9 },
+            ..Default::default()
+        }
+        .selection();
+        assert!(invalid.contains("声明无效"), "声明坏掉时必须说出来：{invalid}");
+        assert!(invalid.contains('9'), "必须带上坏声明所在行号：{invalid}");
+        assert_ne!(text, absent);
+        assert_ne!(text, invalid);
+    }
+
+    /// 按 token 口径造标题：CJK 1 字 = 1 token，正好用来顶 `NOTE_TOKEN_CAP` 的边界。
+    fn cjk(tokens: usize) -> String {
+        "甲".repeat(tokens)
+    }
+
+    #[test]
+    fn dropped_note_keeps_at_least_one_title_and_stops_above_the_cap() {
+        // 单条标题就超上限：`listed.len() > 1` 是"至少留一条"的守卫。
+        // 改成 `>=`/`==`/`||` 都会把它弹掉，留痕只剩"例如："后面一片空白。
+        let huge = cjk(NOTE_TOKEN_CAP + 80);
+        let note = dropped_note(std::slice::from_ref(&huge));
+        assert!(note.contains(&huge), "单条超长标题也必须列出来：{note}");
+
+        // 多条都超上限：必须真的截断，后面的标题不许出现
+        // （`<` 会让守卫永假、把全部标题都列上）。
+        let many: Vec<String> = (0..5).map(|i| format!("{i}号{}", cjk(NOTE_TOKEN_CAP))).collect();
+        let truncated = dropped_note(&many);
+        assert!(!truncated.contains(&many[4]), "超出上限时必须停止列举：{truncated}");
+
+        // 恰好等于上限：判据是「超过才截」，等于时必须保留（`==`/`>=` 会误截）。
+        // 长度靠搜索得出，和 NOTE_TOKEN_CAP 绑在一起，不写死数字。
+        let mut boundary_title = None;
+        for n in 0..=NOTE_TOKEN_CAP * 2 {
+            let a = cjk(n);
+            if estimate_tokens(&render_note(2, &[a.as_str(), "乙"])) == NOTE_TOKEN_CAP {
+                boundary_title = Some(a);
+                break;
+            }
+        }
+        let a = boundary_title.expect("应存在恰好顶到 NOTE_TOKEN_CAP 的标题长度");
+        let b = "乙".to_string();
+        let boundary = dropped_note(&[a.clone(), b.clone()]);
+        assert!(boundary.contains(&a), "恰好等于上限时第一条必须在：{boundary}");
+        assert!(boundary.contains(&b), "恰好等于上限时不得回退（超过才截）：{boundary}");
+    }
+
+    #[test]
+    fn render_note_says_complete_or_examples() {
+        let a = cjk(10);
+        let b = "乙".repeat(10);
+        let full = render_note(2, &[a.as_str(), b.as_str()]);
+        assert!(full.contains(&a) && full.contains(&b), "列全时必须给出全部标题：{full}");
+        assert!(!full.contains("例如"), "列全时不该说「例如」：{full}");
+
+        let partial = render_note(3, &[a.as_str(), b.as_str()]);
+        assert!(partial.contains("例如"), "只列部分时该说「例如」：{partial}");
+        assert!(partial.contains('3'), "总数必须是 3 而不是被列出的 2：{partial}");
+    }
+
+    #[test]
     fn fingerprint_tracks_full_text_not_clipped_text() {
         // 预算裁剪后 text 可能相同，但指纹必须随原文变化——否则"内容锁"锁不住漂移。
         let dir = temp_dir("fingerprint");
