@@ -26,6 +26,9 @@ export interface TurnErrorInfo {
 /** 一次模型请求重试的阶段（与 Rust `RetryPhase` 同形）。 */
 export type RetryPhase = 'scheduled' | 'started' | 'exhausted';
 
+/** 压缩触发原因（与 Rust `CompactionTrigger` 同形）。 */
+export type CompactionTrigger = 'pressure' | 'manual';
+
 export type EventMsg =
   | { type: 'turn_started'; turn: number }
   | { type: 'turn_completed'; turn: number; reason: TurnEndReason; error?: TurnErrorInfo }
@@ -46,7 +49,10 @@ export type EventMsg =
   | { type: 'subagent_exited'; child_id: string; status: SubagentExitStatus; summary: string }
   | { type: 'subagent_message'; child_id: string; sender_id: string; text: string; rpc_id?: string | null }
   | { type: 'rollout_degraded'; message: string }
-  | { type: 'system_prompt'; text: string; sha256: string; at_ms: number; turn: number; step: number };
+  | { type: 'system_prompt'; text: string; sha256: string; at_ms: number; turn: number; step: number }
+  | { type: 'compaction_started'; compaction_id: string; trigger: CompactionTrigger; range_start: number; range_end: number; estimated_tokens: number; budget_tokens: number; turn: number | null }
+  | { type: 'compaction_summarized'; compaction_id: string; trigger: CompactionTrigger; range_start: number; range_end: number; shadowed_items: number; shadowed_tokens: number; summary: string }
+  | { type: 'compaction_ended'; compaction_id: string; ok: boolean; error?: string | null; history_tokens_after?: number | null };
 
 export interface AgentEvent {
   event_id: string;

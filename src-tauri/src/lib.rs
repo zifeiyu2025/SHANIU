@@ -2384,14 +2384,29 @@ fn get_plan_mode(app: tauri::AppHandle, session_id: String) -> bool {
 /// 复用 SH-032 的锚点格式与回放语义（`rollout::resume`），总结请求是对齐
 /// `session_title` 形态的独立辅助请求（`session_compact::compact_now`）。**运行中
 /// 会话拒绝**：回合内的自动压缩与这里的锚点写如果并发，两份锚点的区间会互相
-/// 指错（区间语义建立在"锚点按记录顺序、对当时重放长度生效"上）——单任务闸下
-/// 守住"目标会话不是活动任务"即可。
+/// 指错（区间语义建立在"锚点按记录顺序、对当时重放长度生效"上）。
+///
+/// 锁用宿主既有的任务槽（`begin_task`），而不是只比一次 `active_agent`：
+/// - 只比一次是**检查-使用**竞态：检查通过后、总结请求返回前，用户再发一条消息就
+///   能起新回合，两边同时改历史/写锚点；
+/// - 占用任务槽后，压缩期间的新回合会被 `begin_task` 挡住（回「已有任务在运行」），
+///   压的就是"打包那一刻"的会话，不会再变；
+/// - 顺带让停止按钮生效：`cancel_active` 发出的令牌会被总结流 `select!` 收到，
+///   取消后锚点不写（档案未改动），并如实回「压缩被用户取消」。
+/// 代价：任务槽是应用级的，压缩期间**其它会话**也起不了新回合。可接受（压缩是
+/// 短时辅助请求），但别把它当成"只锁这个会话"。
 #[tauri::command]
 async fn compact_session(app: tauri::AppHandle, agent_id: String) -> Result<Option<session_compact::CompactOutcome>, String> {
     let state = app.state::<AppState>();
-    if state.active_agent().as_deref() == Some(agent_id.as_str()) {
+    let cancel = tokio_util::sync::CancellationToken::new();
+    if !state.begin_task(&agent_id, cancel.clone()) {
         return Err("会话正在运行：请等当前任务结束（或停止它）再压缩".into());
     }
+    // Drop 守卫：成功、失败、取消、panic 都必须释放任务槽，否则「压缩中」会把应用卡死。
+    let app_for_slot = app.clone();
+    let _task_slot = app_state::TaskSlotGuard::new(move || {
+        app_for_slot.state::<AppState>().end_task()
+    });
     let cfg = state.config();
     let active = cfg.effective_model();
     // 辅助请求不启用推理档（与标题生成同一裁决：档位属于主回合的采样质量选择，
@@ -2413,8 +2428,18 @@ async fn compact_session(app: tauri::AppHandle, agent_id: String) -> Result<Opti
         .join(rollout::ROLLOUT_DIR)
         .join(format!("{agent_id}.jsonl"));
     let resumed = rollout::resume::resume(&path).map_err(|e| format!("档案读不回: {e}"))?;
+    // 事件面：手动压缩与自动压缩同一条事件流，重开会话/换客户端时也能对上时间线。
+    let sink: Arc<dyn events::EventSink> = Arc::new(
+        events::TauriEventSink::root(app.clone(), agent_id.clone())
+            .with_journal(Arc::new(event_journal::FileEventJournal::new(
+                app.state::<AppState>().data_root().join(config::SESSIONS_DIR),
+            )))
+            .with_broadcast(app.state::<gateway::GatewayHub>().broadcast_sender())
+            .with_viewers(app.state::<gateway::GatewayHub>().viewers()),
+    );
     // state 的借用止于上面最后一次取值（NLL），不跨下面的 await 点。
-    session_compact::compact_now(&provider, &api_key, &resumed, budget).await
+    session_compact::compact_now(&provider, &api_key, &resumed, budget, sink.as_ref(), &cancel)
+        .await
 }
 
 /// 产品目录视图：前端用它把默认工作区基线落到宿主解析出的 `<数据根>\Workspace`。

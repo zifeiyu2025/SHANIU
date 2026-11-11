@@ -16,7 +16,8 @@
 use futures::StreamExt;
 
 use crate::compaction::{self, Target};
-use crate::model_client::{self, HistoryItem, ModelStreamEvent};
+use crate::events::{CompactionTrigger, EventMsg, EventSink};
+use crate::model_client::{self, HistoryItem, ModelStreamEvent, Role};
 use crate::model_client::provider::ProviderConfig;
 use crate::rollout::resume::Resumed;
 use crate::rollout::RolloutItem;
@@ -47,25 +48,108 @@ const MAX_OUTPUT_TOKENS: u64 = 8192;
 /// 执行一次手动压缩。成功 = 锚点已落盘；`Ok(None)` = 没有可压的历史（调用方回
 /// "No compactable history yet."）。任何 `Err` 都保证档案未被改动（锚点是最后一步，
 /// 且写在内存里成功之后）。
+///
+/// `sink` 用来发 `compaction_started / summarized / ended`：手动压缩同样是**有损操作**，
+/// 只在命令回执里说一句「压了多少」不够——重开会话或换客户端就再也没有过程可对。
+/// `cancel` 由宿主在 `/compact` 期间登记为活动任务，停止按钮与它同源。
 pub async fn compact_now(
     provider: &ProviderConfig,
     api_key: &str,
     resumed: &Resumed,
     budget: usize,
+    sink: &dyn EventSink,
+    cancel: &tokio_util::sync::CancellationToken,
 ) -> Result<Option<CompactOutcome>, String> {
     let Some(target) = compaction::plan_manual(&resumed.history, budget) else {
         return Ok(None);
     };
-    let summary = summarize(provider, api_key, &resumed.history, target).await?;
+    let compaction_id = compaction::new_id();
+    emit(
+        sink,
+        EventMsg::CompactionStarted {
+            compaction_id: compaction_id.clone(),
+            trigger: CompactionTrigger::Manual,
+            range_start: as_u32(target.range_start),
+            range_end: as_u32(target.range_end),
+            estimated_tokens: as_u32(compaction::history_tokens(&resumed.history)),
+            budget_tokens: as_u32(budget),
+            turn: None,
+        },
+    );
+    let summary = match summarize(provider, api_key, &resumed.history, target, cancel).await {
+        Ok(summary) => summary,
+        Err(error) => {
+            // 失败也要发 ended：只回主命令的话，事件流里这条压缩会永远停在「开始」。
+            emit_ended(sink, &compaction_id, Err(error.clone()));
+            return Err(error);
+        }
+    };
+    let shadowed_items = target.range_end - target.range_start;
+    let shadowed_tokens = compaction::history_tokens(
+        &resumed.history[target.range_start..target.range_end],
+    );
+    // 与回合内同口径：替换后的历史 = 保留段 + 一条摘要 user 消息。
+    let history_tokens_after = compaction::history_tokens(&resumed.history[target.range_end..])
+        + compaction::history_tokens(&[HistoryItem::Message {
+            role: Role::User,
+            text: summary.clone(),
+            reasoning: None,
+        }]);
     let outcome = CompactOutcome {
         summary: summary.clone(),
-        shadowed_items: target.range_end - target.range_start,
-        shadowed_tokens: compaction::history_tokens(
-            &resumed.history[target.range_start..target.range_end],
-        ),
+        shadowed_items,
+        shadowed_tokens,
     };
-    write_anchor(resumed, target, summary)?;
+    if let Err(error) = write_anchor(resumed, target, summary.clone()) {
+        emit_ended(sink, &compaction_id, Err(error.clone()));
+        return Err(error);
+    }
+    emit(
+        sink,
+        EventMsg::CompactionSummarized {
+            compaction_id: compaction_id.clone(),
+            trigger: CompactionTrigger::Manual,
+            range_start: as_u32(target.range_start),
+            range_end: as_u32(target.range_end),
+            shadowed_items: as_u32(shadowed_items),
+            shadowed_tokens: as_u32(shadowed_tokens),
+            summary,
+        },
+    );
+    emit_ended(sink, &compaction_id, Ok(as_u32(history_tokens_after)));
     Ok(Some(outcome))
+}
+
+/// 事件载荷用 u32：前端/日志都不需要 usize 的位宽，统一在这里收敛，避免散落的 `as`。
+fn as_u32(value: usize) -> u32 {
+    u32::try_from(value).unwrap_or(u32::MAX)
+}
+
+fn emit(sink: &dyn EventSink, msg: EventMsg) {
+    // 压缩是增强流程，事件投递失败不该把已落盘的压缩判成失败（与 rollout 降级同原则）。
+    if let Err(error) = sink.emit(&msg) {
+        tracing::warn!(%error, "压缩事件投递失败（不影响压缩结果）");
+    }
+}
+
+fn emit_ended(
+    sink: &dyn EventSink,
+    compaction_id: &str,
+    result: Result<u32, String>,
+) {
+    let (ok, error, history_tokens_after) = match result {
+        Ok(tokens) => (true, None, Some(tokens)),
+        Err(error) => (false, Some(error), None),
+    };
+    emit(
+        sink,
+        EventMsg::CompactionEnded {
+            compaction_id: compaction_id.to_string(),
+            ok,
+            error,
+            history_tokens_after,
+        },
+    );
 }
 
 /// 发总结请求并取回摘要。不带工具声明（与回合内同理由：端点多算声明开销，且给模型
@@ -75,6 +159,7 @@ async fn summarize(
     api_key: &str,
     history: &[HistoryItem],
     target: Target,
+    cancel: &tokio_util::sync::CancellationToken,
 ) -> Result<String, String> {
     let request = compaction::build_request(history, &target);
     let mut body = if provider.is_responses() {
@@ -95,25 +180,38 @@ async fn summarize(
     let consumed = tokio::time::timeout(
         std::time::Duration::from_millis(COMPACT_TIMEOUT_MS),
         async {
-            while let Some(event) = stream.next().await {
+            loop {
+                let event = tokio::select! {
+                    // 取消优先：停止按钮按下后不再等这次流收口，锚点也不会写（档案未改动）。
+                    _ = cancel.cancelled() => return Err(SummarizeStop::Cancelled),
+                    event = stream.next() => event,
+                };
                 match event {
-                    ModelStreamEvent::OutputTextDelta { delta } => text.push_str(&delta),
-                    ModelStreamEvent::Failed { message, .. } => {
-                        return Err(format!("压缩总结流失败: {message}"))
+                    None => break,
+                    Some(ModelStreamEvent::OutputTextDelta { delta }) => text.push_str(&delta),
+                    Some(ModelStreamEvent::Failed { message, .. }) => {
+                        return Err(SummarizeStop::Failed(format!("压缩总结流失败: {message}")))
                     }
-                    ModelStreamEvent::Completed { .. } => break,
-                    _ => {} // 思考增量与结构化项不进摘要
+                    Some(ModelStreamEvent::Completed { .. }) => break,
+                    Some(_) => {} // 思考增量与结构化项不进摘要
                 }
             }
-            Ok::<(), String>(())
+            Ok::<(), SummarizeStop>(())
         },
     )
     .await;
     match consumed {
         Err(_) => Err(format!("压缩总结超过 {}ms 超时（档案未改动）", COMPACT_TIMEOUT_MS)),
-        Ok(Err(e)) => Err(e),
+        Ok(Err(SummarizeStop::Cancelled)) => Err("压缩被用户取消（档案未改动）".into()),
+        Ok(Err(SummarizeStop::Failed(message))) => Err(message),
         Ok(Ok(())) => compaction::extract_summary(&text),
     }
+}
+
+/// 总结流提前结束的两种原因：取消不是失败，文案要区别开。
+enum SummarizeStop {
+    Cancelled,
+    Failed(String),
 }
 
 /// 把锚点追加进档案。独立打开 writer 而不是复用回合内的句柄：本命令只在会话**没有**

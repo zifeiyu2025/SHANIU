@@ -339,6 +339,77 @@ pub enum EventMsg {
         /// 记录时的步（与 `tool/call` 等事件同一口径）。
         step: u32,
     },
+    /// 上下文压缩开始（additive）。
+    ///
+    /// 压缩是**有损操作**：从这一刻到 [`EventMsg::CompactionEnded`] 之间，历史会被
+    /// 一段摘要替换。不发这条，用户只会看到「上下文忽然变短」（甚至连这个都看不到），
+    /// 无法回答「刚才发生了什么」——与被吞掉的失败是同一类问题。
+    CompactionStarted {
+        /// 一次压缩的唯一标识，串起 started / summarized / ended 三条。
+        compaction_id: String,
+        trigger: CompactionTrigger,
+        /// 被替换的历史区间 `[range_start, range_end)`（回放后历史的下标）。
+        range_start: u32,
+        range_end: u32,
+        /// 触发时的上下文规模（与预算判据同口径的字节估算）。
+        estimated_tokens: u32,
+        /// 触发时的 token 预算；0 = 未启用压缩，不会出现本事件。
+        budget_tokens: u32,
+        /// 回合序号；`None` = 回合外手动 `/compact`。
+        turn: Option<u32>,
+    },
+    /// 摘要已生成、历史已替换：记录**丢了什么**（additive）。
+    ///
+    /// 只有区间与摘要，没有原文——原文仍在档案里（rollout 只追加不删）。要找回被丢的
+    /// 内容，看这条事件的区间 + 档案即可；要判断「变短之后剩了什么」，看 `summary`。
+    CompactionSummarized {
+        compaction_id: String,
+        trigger: CompactionTrigger,
+        range_start: u32,
+        range_end: u32,
+        /// 被摘要取代的历史条目数（= `range_end - range_start`）。
+        shadowed_items: u32,
+        /// 被取代区间的 token 估算（与预算判据同口径）。
+        shadowed_tokens: u32,
+        /// 摘要全文：它替换了被丢弃的区间。
+        summary: String,
+    },
+    /// 压缩结束（additive）：成功与失败都发。
+    ///
+    /// 失败也必须落到这里。只发 `Error` 的话，UI 无法把「一次失败的压缩」与
+    /// 「一次普通的工具失败」分开，事后也没有时间线可对。
+    CompactionEnded {
+        compaction_id: String,
+        ok: bool,
+        /// 失败原因；成功时缺省（`skip_serializing_if` 保证不产生该键）。
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        error: Option<String>,
+        /// 压缩后的历史规模（成功时给）。
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        history_tokens_after: Option<u32>,
+    },
+}
+
+/// 压缩触发原因（additive）。
+///
+/// 刻意不预留「上下文溢出」：本仓库只有预算压力与手动两条路径，多一个永不产出的
+/// 变体就是「写了没接上」（AGENTS §4.4）。真接入溢出触发时再连同消费方一起加。
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum CompactionTrigger {
+    /// 回合内上下文达到预算（ADR-001）。
+    Pressure,
+    /// 用户主动 `/compact`（回合外）。
+    Manual,
+}
+
+impl CompactionTrigger {
+    /// FF-2 单一事实源（SH-078）：同 `TurnEndReason::all_variants` 的穷举约定。
+    pub fn all_variants() -> &'static [Self] {
+        match Self::Pressure {
+            Self::Pressure | Self::Manual => &[Self::Pressure, Self::Manual],
+        }
+    }
 }
 
 /// 事件出口抽象：agent_loop 及各模块经此广播（便于测试注入与 M1 复用）。

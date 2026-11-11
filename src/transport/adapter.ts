@@ -1843,6 +1843,50 @@ export function createAdapter(options: AdapterOptions): { remote: unknown; dispo
           },
         }, { surfaceOp: 'append' })
         return
+      case 'compaction_started':
+        // 有损操作必须出声（对齐上游 `compaction/start`）：起点先落 journal，之后
+        // 无论成功、失败还是取消，时间线上都能回答「这次上下文为什么变短」。
+        pushEvent(journal, 'compaction/start', {
+          turn: journal.turn,
+          compactionId: msg.compaction_id,
+        })
+        return
+      case 'compaction_summarized': {
+        // 摘要与「丢了什么」同一条（对齐上游 `compaction/summary`）。上游的
+        // `shadowedSeqs` 是会话 seq 集合，我们没有等价物——不编造，只给真实的
+        // token 数与摘要；条数由下面的通知说清楚。
+        pushEvent(journal, 'compaction/summary', {
+          turn: journal.turn,
+          compactionId: msg.compaction_id,
+          summary: [{ type: 'text', text: msg.summary }],
+          shadowedTokenCount: msg.shadowed_tokens,
+        })
+        // 手动 `/compact` 由命令卡片自己展示结果，不重复插通知；自动压缩在聊天里
+        // 没有别的痕迹，不补这一行用户只会发现「上下文忽然变短」。
+        if (msg.trigger === 'pressure') {
+          const text = `上下文已压缩：${msg.shadowed_items} 条历史（约 ${msg.shadowed_tokens} token）`
+            + '被一条摘要取代，原文仍保留在会话档案里。'
+          pushEvent(journal, 'developer/message', {
+            turn: journal.turn,
+            step: journal.step,
+            message: {
+              id: `shaniu-compacted-${msg.compaction_id}`,
+              role: 'developer',
+              source: { kind: 'compaction-notice' as const, form: 'notice' as const, summary: text },
+              content: [{ type: 'text', text }],
+            },
+          }, { surfaceOp: 'append' })
+        }
+        return
+      }
+      case 'compaction_ended':
+        // 失败也必须有终点：只发 error 的话，这条压缩会在时间线上永远停在「开始」。
+        pushEvent(journal, 'compaction/end', {
+          turn: journal.turn,
+          compactionId: msg.compaction_id,
+          ...(msg.error ? { error: msg.error } : {}),
+        })
+        return
       case 'system_prompt':
         // 提示词入轨迹：映射成上游的 `system/message`，只在该版本首次出现时由后端发出。
         // 用 `journal.turn/step`（DSH 口径）而不是后端的采样轮次：后者是 turn 内的

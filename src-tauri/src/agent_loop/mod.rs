@@ -309,21 +309,25 @@ impl AgentLoop {
         target: crate::compaction::Target,
         instructions: &str,
         cancel: &tokio_util::sync::CancellationToken,
-    ) -> Result<(), String> {
+    ) -> Result<CompactionStats, CompactAbort> {
         let request = crate::compaction::build_request(history, &target);
         // 总结请求不带工具声明：它不需要调工具，带上只会让端点多算一份声明开销，
         // 并给模型一个"还可以继续查"的错误暗示。
-        let mut stream = self
-            .backend
-            .stream(&request, &[], instructions)
-            .await
-            .map_err(|e| format!("压缩请求发起失败，本轮中止：{e}"))?;
+        // 建连阶段也参与取消竞争：端点不回响应头时，只竞争流上的 `next_item` 等于
+        // 「停止按钮对压缩无效」，而压缩正占着应用级任务槽——那会把整个应用挂住。
+        // 与主循环建连处的取消竞争同一形态（`cancel_while_opening_stream_stops_promptly`）。
+        let opening = self.backend.stream(&request, &[], instructions);
+        let mut stream = tokio::select! {
+            _ = cancel.cancelled() => return Err(CompactAbort::Cancelled),
+            result = opening => result
+                .map_err(|e| CompactAbort::Failed(format!("压缩请求发起失败，本轮中止：{e}")))?,
+        };
         let mut summary = String::new();
         loop {
             let mut stream_pin = stream.as_mut();
             let next_item = stream_pin.next();
             tokio::select! {
-                _ = cancel.cancelled() => return Err("压缩被用户取消".to_string()),
+                _ = cancel.cancelled() => return Err(CompactAbort::Cancelled),
                 item = next_item => match item {
                     None => break,
                     Some(ModelStreamEvent::OutputTextDelta { delta }) => summary.push_str(&delta),
@@ -332,7 +336,11 @@ impl AgentLoop {
                 }
             }
         }
-        let summary = crate::compaction::extract_summary(&summary)?;
+        let summary = crate::compaction::extract_summary(&summary).map_err(CompactAbort::Failed)?;
+        // 先记账再动历史：区间被 splice 掉之后就再也算不出「丢了哪些、多少 token」。
+        let shadowed_items = target.range_end - target.range_start;
+        let shadowed_tokens =
+            crate::compaction::history_tokens(&history[target.range_start..target.range_end]);
 
         if let Some(writer) = rollout {
             // 写失败在这里静默是刻意的：见上面第 2 点。
@@ -352,15 +360,47 @@ impl AgentLoop {
             // 2. 摘要不是"模型说过的话"，而是交给下一个模型的交接指令——语义上就是 user 侧输入。
             //    codex 同此：`CompactionSummary::role()` 返回 "user"。
             // 注意这并不违反 04 §6.1 不变量③：那条禁止的是把摘要塞进 **system**。
-            [HistoryItem::Message { role: Role::User, text: summary, reasoning: None }],
+            [HistoryItem::Message { role: Role::User, text: summary.clone(), reasoning: None }],
         );
         *recorded = history.len();
+        let history_tokens_after = crate::compaction::history_tokens(history);
         tracing::info!(
-            compressed_items = target.range_end - target.range_start,
+            compressed_items = shadowed_items,
             history_len = history.len(),
             "上下文已压缩（SH-032）"
         );
-        Ok(())
+        Ok(CompactionStats {
+            summary,
+            shadowed_items: u32::try_from(shadowed_items).unwrap_or(u32::MAX),
+            shadowed_tokens: u32::try_from(shadowed_tokens).unwrap_or(u32::MAX),
+            history_tokens_after: u32::try_from(history_tokens_after).unwrap_or(u32::MAX),
+        })
+    }
+}
+
+/// 一次成功压缩的产出：用来填 `compaction_summarized / ended` 的载荷。
+struct CompactionStats {
+    summary: String,
+    shadowed_items: u32,
+    shadowed_tokens: u32,
+    history_tokens_after: u32,
+}
+
+/// 压缩中止的两种性质。
+///
+/// 取消不能当失败：用户主动停止被记成「本轮失败」，就会被错误统计、错误提示，
+/// 也和后端其它取消路径（`TurnEndReasonLocal::Cancelled`）不一致。
+enum CompactAbort {
+    Cancelled,
+    Failed(String),
+}
+
+impl CompactAbort {
+    fn message(&self) -> String {
+        match self {
+            Self::Cancelled => "压缩被用户取消".to_string(),
+            Self::Failed(text) => text.clone(),
+        }
     }
 }
 
@@ -767,13 +807,71 @@ impl AgentLoop {
                 history,
                 self.token_budget,
             ) {
-                if let Err(message) = self
+                // 有损操作必须出声：先落「开始了」，再压；失败/取消都要落到 ended，
+                // 否则用户只看到上下文变短，却没有任何时间线可对（compaction 可见性）。
+                let compaction_id = crate::compaction::new_id();
+                let started_at = crate::compaction::history_tokens(history);
+                emit(
+                    &sink,
+                    EventMsg::CompactionStarted {
+                        compaction_id: compaction_id.clone(),
+                        trigger: crate::events::CompactionTrigger::Pressure,
+                        range_start: u32::try_from(target.range_start).unwrap_or(u32::MAX),
+                        range_end: u32::try_from(target.range_end).unwrap_or(u32::MAX),
+                        estimated_tokens: u32::try_from(observed_input_tokens.max(started_at))
+                            .unwrap_or(u32::MAX),
+                        budget_tokens: u32::try_from(self.token_budget).unwrap_or(u32::MAX),
+                        turn: Some(turn),
+                    },
+                );
+                match self
                     .compact_in_place(rollout, history, recorded, target, &instructions, cancel)
                     .await
                 {
-                    emit(&sink, EventMsg::Error { message });
-                    reason = TurnEndReasonLocal::Failed;
-                    break 'outer;
+                    Ok(stats) => {
+                        emit(
+                            &sink,
+                            EventMsg::CompactionSummarized {
+                                compaction_id: compaction_id.clone(),
+                                trigger: crate::events::CompactionTrigger::Pressure,
+                                range_start: u32::try_from(target.range_start).unwrap_or(u32::MAX),
+                                range_end: u32::try_from(target.range_end).unwrap_or(u32::MAX),
+                                shadowed_items: stats.shadowed_items,
+                                shadowed_tokens: stats.shadowed_tokens,
+                                summary: stats.summary,
+                            },
+                        );
+                        emit(
+                            &sink,
+                            EventMsg::CompactionEnded {
+                                compaction_id,
+                                ok: true,
+                                error: None,
+                                history_tokens_after: Some(stats.history_tokens_after),
+                            },
+                        );
+                    }
+                    Err(abort) => {
+                        let message = abort.message();
+                        emit(
+                            &sink,
+                            EventMsg::CompactionEnded {
+                                compaction_id,
+                                ok: false,
+                                error: Some(message.clone()),
+                                history_tokens_after: None,
+                            },
+                        );
+                        match abort {
+                            // 取消按取消收口：不记 Error，也不算失败轮。
+                            CompactAbort::Cancelled => reason = TurnEndReasonLocal::Cancelled,
+                            CompactAbort::Failed(_) => {
+                                emit(&sink, EventMsg::Error { message });
+                                reason = TurnEndReasonLocal::Failed;
+                            }
+                        }
+                        break 'outer;
+                    }
                 }
             }
 
@@ -1691,6 +1789,15 @@ mod tests {
         })
     }
 
+    /// 压缩用例专用：端点报回大用量。压缩判据取 `max(观测值, 字节估算)`，
+    /// 只有观测值足够大，才能把触发点精确放在"第 1 轮结束后"——而不是第 1 轮
+    /// 开头（那时历史里已有用户消息 + 环境 system 两条，配小预算会立刻触发）。
+    fn big_usage_ev() -> ModelStreamEvent {
+        ModelStreamEvent::Completed {
+            usage: Usage { input_tokens: 500_000, cached_input_tokens: None, output_tokens: 5 },
+        }
+    }
+
     // ---- 用例 ----
 
     #[tokio::test]
@@ -1883,6 +1990,169 @@ mod tests {
         // 显式关闭压缩仍然是关闭
         assert_eq!(compact_token_budget(0, 128_000), 0);
         assert_eq!(compact_token_budget(0, 0), 0);
+    }
+
+    /// 压缩可见性：自动压缩必须留下 `started → summarized → ended` 三条事件。
+    /// 只打日志的实现下，用户唯一能观察到的是"上下文忽然变短"——说不出为什么、
+    /// 丢了哪些、丢了多少。
+    #[tokio::test]
+    async fn auto_compaction_emits_started_summarized_ended_in_order() {
+        let (mut agent, store, cancel, _broker) = make_loop(vec![
+            // 第 1 轮：一个工具调用 + 端点报回大用量 → 第 2 轮开头判定超预算
+            vec![fn_call_ev(), big_usage_ev()],
+            // 压缩请求（不带工具声明）：只回摘要文本
+            vec![
+                ModelStreamEvent::OutputTextDelta { delta: "摘要正文".into() },
+                usage_ev(),
+            ],
+            // 压缩之后真正的第 2 轮采样
+            vec![
+                ModelStreamEvent::OutputTextDelta { delta: "完成".into() },
+                usage_ev(),
+            ],
+        ]);
+        // 预算 100：第 1 轮开头（估算 24 token）不触发；第 2 轮开头观测到 50 万才触发
+        agent.token_budget = 100;
+        let summary = agent.run_task("任务", Arc::new(CapturingSink(store.clone())), cancel).await;
+        let events = store.lock().unwrap();
+        assert_eq!(summary.reason, TurnEndReason::Completed, "事件流：{events:?}");
+
+        let compaction: Vec<&EventMsg> = events
+            .iter()
+            .filter(|e| {
+                matches!(
+                    e,
+                    EventMsg::CompactionStarted { .. }
+                        | EventMsg::CompactionSummarized { .. }
+                        | EventMsg::CompactionEnded { .. }
+                )
+            })
+            .collect();
+        // 顺序是契约的一部分：ended 必须先说明成败，才轮到摘要成为"当前历史"
+        assert!(
+            matches!(compaction.as_slice(), [
+                EventMsg::CompactionStarted { .. },
+                EventMsg::CompactionSummarized { .. },
+                EventMsg::CompactionEnded { .. },
+            ]),
+            "压缩三条事件缺失或乱序：{events:?}"
+        );
+
+        let EventMsg::CompactionStarted {
+            compaction_id,
+            trigger,
+            range_start,
+            range_end,
+            estimated_tokens,
+            budget_tokens,
+            turn,
+        } = compaction[0]
+        else {
+            unreachable!()
+        };
+        assert_eq!(*trigger, crate::events::CompactionTrigger::Pressure, "自动路径的触发原因是预算压力");
+        assert_eq!(*range_start, 0, "压缩从最旧的一条起算");
+        assert!(*range_end >= 1, "至少要压掉一条，且不能把全部历史压空");
+        assert_eq!(*estimated_tokens, 500_000, "触发量取端点观测值，而不是偏低的字节估算");
+        assert_eq!(*budget_tokens, 100);
+        assert_eq!(*turn, Some(2), "压缩发生在第 2 轮采样之前");
+
+        let EventMsg::CompactionSummarized {
+            compaction_id: summarized_id,
+            shadowed_items,
+            shadowed_tokens,
+            summary,
+            ..
+        } = compaction[1]
+        else {
+            unreachable!()
+        };
+        assert_eq!(summarized_id, compaction_id, "三条事件必须配成同一组");
+        assert_eq!(*shadowed_items, *range_end - *range_start, "被替换的条目数要与区间一致");
+        assert!(*shadowed_tokens > 0, "被丢掉的量必须可量化，不能只报条目数");
+        assert_eq!(summary, "摘要正文");
+
+        let EventMsg::CompactionEnded { ok, error, history_tokens_after, .. } = compaction[2] else {
+            unreachable!()
+        };
+        assert!(*ok);
+        assert_eq!(*error, None);
+        assert!(history_tokens_after.is_some(), "成功后要给出压缩后的历史量");
+        // 成功路径不许额外报错
+        assert!(
+            !events.iter().any(|e| matches!(e, EventMsg::Error { .. })),
+            "压缩成功不应产出 error 事件：{events:?}"
+        );
+    }
+
+    /// 压缩期间按停止（含"端点还没回响应头"这一段）：必须收口为**取消**，不是失败。
+    ///
+    /// 反向对照：把 `CompactAbort::Cancelled` 改回按失败处理，本用例立刻变红
+    /// （多出 `EventMsg::Error`、回合被记成 `Failed`）。
+    #[tokio::test]
+    async fn cancel_during_compaction_ends_as_cancelled_not_failed() {
+        struct HangingCompactionBackend {
+            calls: std::sync::atomic::AtomicUsize,
+            entered: Arc<tokio::sync::Notify>,
+        }
+
+        #[async_trait::async_trait]
+        impl ModelBackend for HangingCompactionBackend {
+            async fn stream(
+                &self,
+                _history: &[HistoryItem],
+                _tools: &[ToolDeclaration],
+                _instructions: &str,
+            ) -> Result<ModelStream, crate::model_client::ModelError> {
+                if self.calls.fetch_add(1, std::sync::atomic::Ordering::SeqCst) == 0 {
+                    // 第 1 轮采样：工具调用 + 大用量，让压缩在**第 2 轮开头**触发
+                    return Ok(Box::pin(futures::stream::iter(vec![fn_call_ev(), big_usage_ev()])));
+                }
+                // 第 2 次调用 = 压缩请求：先告知测试再挂住，模拟端点不回响应头
+                self.entered.notify_one();
+                futures::future::pending().await
+            }
+        }
+
+        let entered = Arc::new(tokio::sync::Notify::new());
+        let (mut agent, store, cancel, _broker) = make_loop_with_backend(Arc::new(
+            HangingCompactionBackend {
+                calls: std::sync::atomic::AtomicUsize::new(0),
+                entered: entered.clone(),
+            },
+        ));
+        agent.token_budget = 100;
+        let run = agent.run_task("任务", Arc::new(CapturingSink(store.clone())), cancel.clone());
+        tokio::pin!(run);
+
+        // 等压缩请求真的发出去了再取消：提前取消测的是别的东西（还没开始压）
+        tokio::select! {
+            _ = entered.notified() => {}
+            _ = &mut run => panic!("压缩请求未发出就结束了：{:?}", store.lock().unwrap()),
+        }
+        cancel.cancel();
+        let summary = tokio::time::timeout(std::time::Duration::from_secs(1), run)
+            .await
+            .expect("取消必须能打断压缩请求的建连；超时 = 任务槽被压缩永久占用");
+        assert_eq!(summary.reason, TurnEndReason::Cancelled, "用户取消不是失败轮");
+
+        let events = store.lock().unwrap();
+        assert!(
+            events.iter().any(|e| matches!(
+                e,
+                EventMsg::CompactionEnded { ok: false, error: Some(message), .. }
+                    if message == "压缩被用户取消"
+            )),
+            "取消也要落到 ended，并如实写明原因：{events:?}"
+        );
+        assert!(
+            !events.iter().any(|e| matches!(e, EventMsg::CompactionSummarized { .. })),
+            "取消时没有摘要，不许伪造 summarized：{events:?}"
+        );
+        assert!(
+            !events.iter().any(|e| matches!(e, EventMsg::Error { .. })),
+            "取消不是错误，不许发 error 事件：{events:?}"
+        );
     }
 
     #[tokio::test]

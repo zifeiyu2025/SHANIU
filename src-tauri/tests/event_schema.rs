@@ -11,12 +11,12 @@
 
 use serde::Serialize;
 use shaniu_lib::events::{
-    AgentEvent, ApprovalDecision, EventMsg, IoChannel, RetryPhase, RiskLevel, SubagentExitStatus, ToolCallResult,
-    TurnEndReason, TurnErrorInfo,
+    AgentEvent, ApprovalDecision, CompactionTrigger, EventMsg, IoChannel, RetryPhase, RiskLevel,
+    SubagentExitStatus, ToolCallResult, TurnEndReason, TurnErrorInfo,
 };
 
 /// 与 src/transport/types.ts 的 type 判别值逐一对应。
-const EXPECTED_TAGS: [&str; 20] = [
+const EXPECTED_TAGS: [&str; 23] = [
     "turn_started",
     "turn_completed",
     "agent_message_delta",
@@ -37,6 +37,9 @@ const EXPECTED_TAGS: [&str; 20] = [
     "subagent_message",
     "rollout_degraded",
     "system_prompt",
+    "compaction_started",
+    "compaction_summarized",
+    "compaction_ended",
 ];
 
 fn all_variants() -> Vec<EventMsg> {
@@ -150,6 +153,38 @@ fn all_variants() -> Vec<EventMsg> {
             turn: 1,
             step: 0,
         },
+        // 压缩可见性（additive）：开始 → 摘要 → 结束。三种触发/成败分支都要进序列化覆盖。
+        EventMsg::CompactionStarted {
+            compaction_id: "cmp-1-0".into(),
+            trigger: CompactionTrigger::Pressure,
+            range_start: 0,
+            range_end: 12,
+            estimated_tokens: 51_200,
+            budget_tokens: 50_000,
+            turn: Some(3),
+        },
+        EventMsg::CompactionSummarized {
+            compaction_id: "cmp-1-0".into(),
+            trigger: CompactionTrigger::Pressure,
+            range_start: 0,
+            range_end: 12,
+            shadowed_items: 12,
+            shadowed_tokens: 51_200,
+            summary: "用户要求排查搜索可靠性；已定位三条路径。".into(),
+        },
+        // ended 的两个分支：成功只带 history_tokens_after，失败只带 error
+        EventMsg::CompactionEnded {
+            compaction_id: "cmp-1-0".into(),
+            ok: true,
+            error: None,
+            history_tokens_after: Some(900),
+        },
+        EventMsg::CompactionEnded {
+            compaction_id: "cmp-2-0".into(),
+            ok: false,
+            error: Some("压缩被用户取消".into()),
+            history_tokens_after: None,
+        },
     ];
     // 编译期穷举证明（SH-078）：无通配臂 match，EventMsg 新增变体而不更新上面的 vec 时编译失败；
     // vec 更新后 tag 集合随之扩大，EXPECTED_TAGS 不同步则标签集测试必红——双向闭环。
@@ -174,7 +209,10 @@ fn all_variants() -> Vec<EventMsg> {
             | EventMsg::SubagentExited { .. }
             | EventMsg::SubagentMessage { .. }
             | EventMsg::RolloutDegraded { .. }
-            | EventMsg::SystemPrompt { .. } => {}
+            | EventMsg::SystemPrompt { .. }
+            | EventMsg::CompactionStarted { .. }
+            | EventMsg::CompactionSummarized { .. }
+            | EventMsg::CompactionEnded { .. } => {}
         }
     }
     variants
@@ -446,6 +484,7 @@ fn every_enum_variant_is_mirrored_in_frontend_types() {
     assert_union_covers("TurnEndReason", TurnEndReason::all_variants());
     assert_union_covers("SubagentExitStatus", SubagentExitStatus::all_variants());
     assert_union_covers("RetryPhase", RetryPhase::all_variants());
+    assert_union_covers("CompactionTrigger", CompactionTrigger::all_variants());
 }
 
 /// SH-079：EventMsg tag 与前端镜像**机械绑定**（此前 EXPECTED_TAGS 与 types.ts 无人校验关联）。

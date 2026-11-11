@@ -51,6 +51,8 @@ declare module '@deepseek-ai/dsh-llm' {
     'compact-checkpoint': CompactionCheckpointSource
     /** 档案降级提示（宿主注入的一次性通知，不参与模型请求）。 */
     'archive-degraded': { kind: 'archive-degraded'; form: 'notice'; summary: string }
+    /** 自动压缩的一次性告知：上下文因为达到预算被有损替换，回答"为什么变短、丢了什么"。 */
+    'compaction-notice': { kind: 'compaction-notice'; form: 'notice'; summary: string }
   }
 }
 

@@ -47,6 +47,23 @@ pub struct Target {
     pub range_end: usize,
 }
 
+/// 一次压缩的唯一标识：毫秒时间戳 + 进程内序号。
+///
+/// 用途只是把 `compaction_started / summarized / ended` 三条事件配成一组（含日志回放）。
+/// 不引 ULID：进程内序号 + 单调时间戳足以保证同一会话的事件流不撞号，而这个 id
+/// 不参与任何持久化键或安全判定。
+pub fn new_id() -> String {
+    static SEQ: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+    let now = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_millis())
+        .unwrap_or(0);
+    format!(
+        "cmp-{now}-{}",
+        SEQ.fetch_add(1, std::sync::atomic::Ordering::Relaxed)
+    )
+}
+
 pub fn approx_tokens(text: &str) -> usize {
     text.len().div_ceil(APPROX_BYTES_PER_TOKEN)
 }
