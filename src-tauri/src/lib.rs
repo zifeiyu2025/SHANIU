@@ -457,6 +457,40 @@ fn normalize_mime(raw: &str) -> String {
     }
 }
 
+/// 按 `ImageRef.path` 从附件目录读回字节。
+///
+/// 只认 `<data_root>/attachments/<owner_session>/<receipt>.bin` 这一段相对路径，
+/// **不收当前会话 id**：`fork_session` 复制出的引用仍指向父会话目录（spec §5.2）。
+/// 路径形状不对就返回 `None`（不猜、不拼、不跟 `..`）。
+fn read_archived_image(data_root: &Path, image: &images::ImageRef) -> Option<Vec<u8>> {
+    let receipt = image.attachment_id.as_deref()?;
+    let mut components = Path::new(&image.path).components();
+    if components.next()?.as_os_str() != "attachments" {
+        return None;
+    }
+    let owner = match components.next()? {
+        std::path::Component::Normal(name) => name.to_str()?,
+        _ => return None,
+    };
+    let file = match components.next()? {
+        std::path::Component::Normal(name) => name.to_str()?,
+        _ => return None,
+    };
+    if components.next().is_some() || file != format!("{receipt}.bin") {
+        return None;
+    }
+    attachments::read_full(data_root, owner, receipt)
+        .ok()
+        .map(|(_media_type, bytes)| bytes)
+}
+
+/// 重开会话时把历史图片的字节补回 `image_store`（生产调用点：`continue_session`）。
+///
+/// 单独暴露成函数是为了让集成测试走同一条生产路径，而不是在测试里复制一份读盘逻辑。
+pub fn rehydrate_attachments(data_root: &Path, refs: &[images::ImageRef]) -> (usize, usize) {
+    images::rehydrate(refs, |image| read_archived_image(data_root, image))
+}
+
 /// 提交前的纯判据：剥 marker → 空任务判定 → 视觉门禁。
 ///
 /// 门禁必须发生在 `build_new_session` / `begin_task` 之前：让请求发出去再等端点
@@ -582,6 +616,26 @@ fn continue_session(
         session_title::spawn_generation(app.clone(), agent_id.clone(), task.to_string());
     }
     let mut history = resumed.history;
+    // 重开档案时把历史图片的字节补回进程缓存：档案只存引用，字节在附件目录。
+    // 按引用自带的 `path` 定位（fork 后仍指向父会话目录），不按当前 agent_id 拼。
+    let archived_refs: Vec<images::ImageRef> = history
+        .iter()
+        .filter_map(|item| match item {
+            model_client::HistoryItem::ImageMessage { images, .. } => Some(images.as_slice()),
+            _ => None,
+        })
+        .flatten()
+        .cloned()
+        .collect();
+    let (restored, failed) = rehydrate_attachments(&state.data_root(), &archived_refs);
+    if restored > 0 || failed > 0 {
+        tracing::info!(
+            agent_id = %agent_id,
+            restored,
+            failed,
+            "重开会话：历史图片字节已回灌（失败只影响该张图）"
+        );
+    }
     if image_refs.is_empty() {
         history.push(model_client::HistoryItem::Message {
             role: model_client::Role::User,

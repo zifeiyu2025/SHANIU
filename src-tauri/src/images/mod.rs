@@ -72,6 +72,42 @@ pub fn sha256_hex(bytes: &[u8]) -> String {
         .collect()
 }
 
+/// 按档案里的引用把字节补回进程缓存（重开会话用）。
+///
+/// 定位只有一条路：读字节的实现只拿到 [`ImageRef`]，也就是只能按 `path` 找
+/// （`attachments/<owner_session>/<id>.bin`）。**签名里没有当前 `session_id`**——
+/// 分叉会话的引用仍指向父会话目录，按当前会话拼路径必然落空（spec §5.2）。
+///
+/// 返回 `(还原数, 失败数)`。失败只记日志、不中断：单张图丢了不该让整个会话开不了。
+pub fn rehydrate<F>(refs: &[ImageRef], mut read: F) -> (usize, usize)
+where
+    F: FnMut(&ImageRef) -> Option<Vec<u8>>,
+{
+    let mut restored = 0usize;
+    let mut failed = 0usize;
+    for image in refs {
+        // 没有回执的引用（`view_image` 回填）本来就没有可回读的字节来源。
+        if image.attachment_id.is_none() || image_store::contains(&image.sha256) {
+            continue;
+        }
+        match read(image) {
+            Some(bytes) if sha256_hex(&bytes) == image.sha256 => {
+                image_store::put(&image.sha256, &image.mime, &bytes);
+                restored += 1;
+            }
+            Some(_) => {
+                failed += 1;
+                tracing::warn!(path = %image.path, "历史图片字节与档案哈希不一致，已跳过");
+            }
+            None => {
+                failed += 1;
+                tracing::warn!(path = %image.path, "历史图片字节缺失，已跳过（附件被手工清理或数据根已迁移）");
+            }
+        }
+    }
+    (restored, failed)
+}
+
 /// 从图片文件头解析出的真实格式与尺寸（**不信任上传方声明**）。
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct ImageInfo {

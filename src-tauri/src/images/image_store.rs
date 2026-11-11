@@ -84,6 +84,11 @@ pub fn data_url(hash: &str) -> Option<String> {
     lock().data_url(hash)
 }
 
+/// 缓存里是否已有这张图。回灌前先问一句，避免重复读盘/重复 base64。
+pub fn contains(hash: &str) -> bool {
+    lock().entries.contains_key(hash)
+}
+
 /// 当前缓存里的条目数（测试与自检用）。
 pub fn len() -> usize {
     lock().len()
