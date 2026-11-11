@@ -76,6 +76,9 @@ pub enum SearchFailure {
     Blocked,
     /// 连不上、超时、TLS 失败。
     Network,
+    /// 用户/宿主取消。单独成类，才能一路映射回 `ToolError::Cancelled`，
+    /// 让本轮按取消收口，而不是当成一次工具失败继续跑。
+    Cancelled,
 }
 
 #[derive(Debug, Clone)]
@@ -107,6 +110,7 @@ impl SearchError {
                 "网络请求失败（{}）。可稍后重试；若持续失败，改用 web_fetch 或换关键词。",
                 self.detail
             ),
+            SearchFailure::Cancelled => "已取消".to_string(),
         }
     }
 }
@@ -263,7 +267,10 @@ impl SearchProvider for Bing {
                 Ok(hits)
             }
             Err(error) => {
-                self.record_failure(error.kind);
+                // 取消不是「搜索不健康」：不能把它记进失败计数、更不能由此进冷却。
+                if error.kind != SearchFailure::Cancelled {
+                    self.record_failure(error.kind);
+                }
                 Err(error)
             }
         }
@@ -305,7 +312,7 @@ impl SearchProvider for FallbackProvider {
         let mut failures: Vec<(SearchFailure, String)> = Vec::new();
         for provider in &self.providers {
             if cancel.is_cancelled() {
-                return Err(SearchError::new(SearchFailure::Network, "已取消"));
+                return Err(SearchError::new(SearchFailure::Cancelled, "已取消"));
             }
             match provider.search(query, limit, cancel).await {
                 Ok(hits) => return Ok(hits),
@@ -315,9 +322,10 @@ impl SearchProvider for FallbackProvider {
                 )),
             }
         }
-        // 分类取「最可执行」的那一种：被拦截可以稍后重试或转 web_fetch，
-        // 改版说明结构变了，网络错误只能重试。
-        let kind = if failures.iter().any(|(kind, _)| *kind == SearchFailure::Blocked) {
+        // 取消优先：它不是「某一家挂了」，而是整轮不该继续。
+        let kind = if failures.iter().any(|(kind, _)| *kind == SearchFailure::Cancelled) {
+            SearchFailure::Cancelled
+        } else if failures.iter().any(|(kind, _)| *kind == SearchFailure::Blocked) {
             SearchFailure::Blocked
         } else if failures.iter().any(|(kind, _)| *kind == SearchFailure::Parse) {
             SearchFailure::Parse
@@ -335,7 +343,7 @@ impl SearchProvider for FallbackProvider {
 
 fn map_web_error(error: WebError) -> SearchError {
     match error {
-        WebError::Cancelled => SearchError::new(SearchFailure::Network, "已取消"),
+        WebError::Cancelled => SearchError::new(SearchFailure::Cancelled, "已取消"),
         other => SearchError::new(SearchFailure::Network, other.to_string()),
     }
 }
@@ -743,11 +751,15 @@ impl ToolExecutor for WebSearch {
             .clamp(1, MAX_RESULTS);
 
         let started = Instant::now();
-        let hits = self
-            .provider
-            .search(query, limit, &ctx.cancel)
-            .await
-            .map_err(|error| ToolError::Execution(format!("web_search 失败：{}", error.guidance())))?;
+        let hits = self.provider.search(query, limit, &ctx.cancel).await.map_err(|error| {
+            // 取消必须映射回取消，不能变成一次普通工具失败：否则本轮会带着
+            // 「搜索出错」继续跑，用户按了停止却看到模型继续。
+            if error.kind == SearchFailure::Cancelled {
+                ToolError::Cancelled
+            } else {
+                ToolError::Execution(format!("web_search 失败：{}", error.guidance()))
+            }
+        })?;
         let elapsed = started.elapsed();
 
         let mut body = String::new();
@@ -977,6 +989,76 @@ mod tests {
         let error = chain.search("x", 5, &CancellationToken::new()).await.unwrap_err();
         assert_eq!(error.kind, SearchFailure::Network);
         assert!(error.detail.contains("failing"));
+    }
+
+    // ---------------------------- 取消语义 ----------------------------
+
+    struct CancelledProvider;
+
+    #[async_trait]
+    impl SearchProvider for CancelledProvider {
+        fn id(&self) -> &'static str {
+            "cancelled"
+        }
+        async fn search(
+            &self,
+            _query: &str,
+            _limit: usize,
+            _cancel: &CancellationToken,
+        ) -> Result<Vec<SearchHit>, SearchError> {
+            Err(SearchError::new(SearchFailure::Cancelled, "已取消"))
+        }
+    }
+
+    struct CancelledFetcher;
+
+    #[async_trait]
+    impl Fetcher for CancelledFetcher {
+        async fn fetch(
+            &self,
+            _url: &str,
+            _cancel: &CancellationToken,
+        ) -> Result<WebResponse, WebError> {
+            Err(WebError::Cancelled)
+        }
+    }
+
+    #[test]
+    fn web_error_cancelled_maps_to_search_cancelled() {
+        assert_eq!(map_web_error(WebError::Cancelled).kind, SearchFailure::Cancelled);
+    }
+
+    #[tokio::test]
+    async fn tool_maps_cancelled_search_to_tool_cancelled() {
+        let tool = WebSearch::new(Arc::new(CancelledProvider));
+        let error = tool
+            .execute(serde_json::json!({"query": "x"}), &context())
+            .await
+            .unwrap_err();
+        // 反向对照：把映射改回 `Execution`（或让 Cancelled 落进 Network），这条必红。
+        assert!(matches!(error, ToolError::Cancelled), "取消不得被当成普通工具失败");
+    }
+
+    #[tokio::test]
+    async fn cancelled_fetch_does_not_enter_cooldown() {
+        let bing = Bing::new(Arc::new(CancelledFetcher));
+        let cancel = CancellationToken::new();
+        // 连续两次都应是取消：若把取消记进失败计数，第二次会变成「冷却中」的 Blocked。
+        for _ in 0..2 {
+            let error = bing.search("x", 5, &cancel).await.unwrap_err();
+            assert_eq!(
+                error.kind,
+                SearchFailure::Cancelled,
+                "取消不得被记成网络失败或触发冷却：{error:?}"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn fallback_reports_cancelled() {
+        let chain = FallbackProvider::new(vec![Arc::new(CancelledProvider)]);
+        let error = chain.search("x", 5, &CancellationToken::new()).await.unwrap_err();
+        assert_eq!(error.kind, SearchFailure::Cancelled);
     }
 
     struct StubProvider {
