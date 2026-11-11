@@ -1640,17 +1640,22 @@ export function createAdapter(options: AdapterOptions): { remote: unknown; dispo
     // 标题只回答「是什么」：来源 + 风险 + 工具 + 一句话对象。
     // 完整参数不进标题——`JSON.stringify` 把换行转义成 `\n`（两位字符），任何有限长度
     // 都会在多文件补丁/长命令上截断（spec §1.1）。原文由详情槽按 `call_id` 取。
-    const reason = `${origin}风险 ${msg.risk}：${msg.tool}${approvalSubject(msg)}`
-    // 批量范围必须写在卡片上：事件传的是「覆盖多远」这个事实（`same-args`），
-    // 措辞由前端映射——把中文塞进协议等于把措辞变成契约。
-    const description = batchScopeText(msg.batch_scope)
+    const title = `${origin}风险 ${msg.risk}：${msg.tool}${approvalSubject(msg)}`
+    // 正文回答「为什么现在问」和「批准覆盖多远」：`msg.reason` 是后端给的原因，
+    // `batch_scope` 是范围标识（措辞由前端映射，中文不进协议）。两者互补，
+    // 原因已经说过的内容不再重复一次。
+    const scopeText = batchScopeText(msg.batch_scope)
+    const reasonText = msg.reason?.trim()
+    const description = [reasonText, scopeText]
+      .filter((part): part is string => part !== undefined && part !== '')
+      .join(' ') || undefined
     let decision = 'deny'
     try {
       const outcome = await listener.call(approvalScope?.(sessionId), {
         agent: { id: sessionId },
         toolName: msg.tool,
-        reason,
-        displayReason: { en: reason },
+        reason: title,
+        displayReason: { en: title },
         ...(msg.call_id === undefined ? {} : { callId: msg.call_id }),
         ...(description === undefined ? {} : { description }),
       }, next)

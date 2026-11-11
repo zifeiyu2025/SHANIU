@@ -1453,12 +1453,36 @@ describe('适配层的命令面映射', () => {
       risk: 'execute',
       call_id: 'c-11',
       batch_scope: 'same-args',
+      reason: '该命令不在允许列表，且当前档位要求逐条确认',
     })
     await vi.waitFor(() => { expect(seen).toHaveLength(1) })
     expect(seen[0]!['callId']).toBe('c-11')
+    // 正文 = 原因 + 范围：后端 reason 回答「为什么现在问」，batch_scope 只补「覆盖多远」
+    expect(String(seen[0]!['description'])).toContain('该命令不在允许列表')
     expect(String(seen[0]!['description'])).toContain('本轮内再次发起完全相同的调用不再询问')
-    // 标题短：命令只做一句话对象，完整命令由详情槽展示
+    // 标题短：命令只做一句话对象，完整命令由详情槽展示；原因不进标题（否则正文重复一遍）
     expect(seen[0]!['reason']).toBe('风险 execute：unified_exec（git status）')
+    dispose()
+  })
+
+  it('只有后端原因没有批量范围时，原因单独成为卡片描述', async () => {
+    const bridge = scriptedBridge()
+    const { remote, dispose } = createAdapter({ bridge })
+    const seen: Record<string, unknown>[] = []
+    faceOf(remote).$on('approval/request', async (request: Record<string, unknown>) => {
+      seen.push(request)
+      return 'rejected'
+    })
+    bridge.emit('agent-new', {
+      type: 'exec_approval_request',
+      request_id: 'r12b',
+      tool: 'apply_patch',
+      args: { patch: '*** Begin Patch\n*** End Patch' },
+      risk: 'write_in_workspace',
+      reason: '补丁会修改工作区外的文件',
+    })
+    await vi.waitFor(() => { expect(seen).toHaveLength(1) })
+    expect(seen[0]!['description']).toBe('补丁会修改工作区外的文件')
     dispose()
   })
 
