@@ -1,0 +1,34 @@
+/*
+ * 「默认目录」一行的样式。
+ * 与相邻的通用设置行同一节奏（16px 上下 + 一条分隔线，见 config-readonly.css）；
+ * 颜色只引用已定义的 `--dsw-alias-*` 令牌。
+ */
+
+.default-dir-row {
+  display: flex;
+  flex-direction: column;
+  gap: 4px;
+  padding: 16px 0;
+  border-bottom: 0.5px solid var(--dsw-alias-border-l2);
+}
+
+.default-dir-title {
+  color: var(--dsw-alias-label-primary);
+  font-size: 13px;
+  font-weight: 600;
+}
+
+.default-dir-path {
+  color: var(--dsw-alias-label-primary);
+  font-family: ui-monospace, SFMono-Regular, Menlo, monospace;
+  font-size: 12px;
+  overflow-wrap: anywhere;
+}
+
+.default-dir-hint {
+  margin: 0;
+  color: var(--dsw-alias-label-secondary);
+  font-size: 12px;
+  line-height: 18px;
+  overflow-wrap: anywhere;
+}
