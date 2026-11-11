@@ -81,8 +81,53 @@ impl KeyCheck {
     }
 }
 
-/// 端点校验的核心实现。`api_key` 必须非空（调用方已判断）；错误永不携带密钥。
+/// 端点校验的入口：与 [`check_endpoint_key_inner`] 同语义，只是**每条返回都记一条日志**。
+///
+/// A0 要求「日志里能对上原始响应」：401 之前只出现在界面上，日志里查不到。日志只记
+/// 结构化字段（状态码、错误体里的 code/message），密钥本身从不入参也不入日志。
 pub async fn check_endpoint_key(
+    base_url: &str,
+    headers: &BTreeMap<String, String>,
+    api_key: &str,
+) -> KeyCheck {
+    let check = check_endpoint_key_inner(base_url, headers, api_key).await;
+    log_check(base_url, &check);
+    check
+}
+
+/// 结论落日志。`provider_message` 来自 `model_client` 的脱敏字段，这里再截断，
+/// 避免超长错误体把日志撑爆。
+fn log_check(base_url: &str, check: &KeyCheck) {
+    let provider_message = check
+        .provider_message
+        .as_deref()
+        .map(|message| truncate(message, MAX_LOG_MESSAGE_CHARS))
+        .unwrap_or_default();
+    tracing::info!(
+        endpoint = base_url,
+        state = ?check.state,
+        reason = %check.reason,
+        http_status = check.http_status,
+        provider_code = check.provider_code.as_deref().unwrap_or(""),
+        provider_message = %provider_message,
+        latency_ms = check.latency_ms,
+        "密钥校验结论"
+    );
+}
+
+/// 日志里错误体摘要的字符上限。
+const MAX_LOG_MESSAGE_CHARS: usize = 200;
+
+fn truncate(text: &str, max_chars: usize) -> String {
+    if text.chars().count() <= max_chars {
+        return text.to_string();
+    }
+    let head: String = text.chars().take(max_chars).collect();
+    format!("{head}…")
+}
+
+/// 端点校验的核心实现。`api_key` 必须非空（调用方已判断）；错误永不携带密钥。
+async fn check_endpoint_key_inner(
     base_url: &str,
     headers: &BTreeMap<String, String>,
     api_key: &str,
@@ -232,9 +277,21 @@ fn model_list_present(body: &str) -> bool {
 /// 区分"密钥错"和"网络不通"，把它们都折叠成一条错误字符串就回到 A0 之前了。
 #[tauri::command]
 pub async fn check_api_key(app: tauri::AppHandle, provider: String) -> KeyCheck {
+    let provider_id = provider.trim().to_string();
+    let check = check_api_key_inner(&app, &provider_id).await;
+    // 命令层再记一条带服务商 id 的结论：`check_endpoint_key` 只记端点，不记是谁。
+    tracing::info!(
+        provider = %provider_id,
+        state = ?check.state,
+        reason = %check.reason,
+        "密钥校验命令返回"
+    );
+    check
+}
+
+async fn check_api_key_inner(app: &tauri::AppHandle, provider_id: &str) -> KeyCheck {
     let state = app.state::<crate::app_state::AppState>();
     let cfg = state.config();
-    let provider_id = provider.trim();
     let Some(row) = cfg.providers.iter().find(|p| p.id == provider_id) else {
         return KeyCheck::new(
             KeyCheckState::Unknown,
@@ -296,6 +353,69 @@ mod tests {
     fn run(url: &str) -> KeyCheck {
         let runtime = tokio::runtime::Runtime::new().expect("运行时");
         runtime.block_on(check_endpoint_key(url, &BTreeMap::new(), "test-key"))
+    }
+
+    /// 内存日志出口：把 subscriber 的输出收进 `Arc<Mutex<Vec<u8>>>` 供断言。
+    #[derive(Clone)]
+    struct SharedWriter(std::sync::Arc<std::sync::Mutex<Vec<u8>>>);
+
+    impl Write for SharedWriter {
+        fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+            self.0.lock().expect("锁").extend_from_slice(buf);
+            Ok(buf.len())
+        }
+
+        fn flush(&mut self) -> std::io::Result<()> {
+            Ok(())
+        }
+    }
+
+    impl tracing_subscriber::fmt::MakeWriter<'_> for SharedWriter {
+        type Writer = SharedWriter;
+
+        fn make_writer(&self) -> Self::Writer {
+            self.clone()
+        }
+    }
+
+    /// A0 第 2 条：密钥校验的 401 必须在日志里能对上原始响应。
+    /// 反向对照：把 `check_endpoint_key` 的外层收口去掉（直接调 inner），本用例必红。
+    #[test]
+    fn logs_401_with_provider_code_and_never_the_key() {
+        let url = stub(
+            "401 Unauthorized",
+            r#"{"error":{"code":"invalid_api_key","message":"Incorrect API key provided"}}"#,
+        );
+        let buffer = std::sync::Arc::new(std::sync::Mutex::new(Vec::<u8>::new()));
+        let subscriber = tracing_subscriber::fmt()
+            .with_writer(SharedWriter(buffer.clone()))
+            .with_ansi(false)
+            .with_max_level(tracing::Level::INFO)
+            .finish();
+        let runtime = tokio::runtime::Runtime::new().expect("运行时");
+        // 用全局订阅器而不是线程级 `with_default`：并行跑测试时，别的用例会挂更窄的
+        // 线程级订阅器（如只收 WARN），guard 掉线时的 `rebuild_interest_cache` 会把
+        // tracing 的**全局**最大级别压到 WARN，随后本用例的 INFO 在宏的快速路径上就被
+        // 丢掉了（实测：单线程绿、并行红）。全局订阅器参与同一次重算，INFO 不会被压掉。
+        tracing::subscriber::set_global_default(subscriber)
+            .expect("本测试进程的第一个全局订阅器");
+        let result = runtime.block_on(check_endpoint_key(
+            &url,
+            &BTreeMap::new(),
+            "sk-secret-should-not-appear",
+        ));
+        let logs = String::from_utf8(buffer.lock().expect("锁").clone()).expect("utf8 日志");
+
+        assert_eq!(result.state, KeyCheckState::Invalid);
+        assert!(logs.contains("http_status=401"), "日志要对上 401，实际：{logs}");
+        assert!(
+            logs.contains("invalid_api_key"),
+            "日志要带端点的错误 code（脱敏字段），实际：{logs}"
+        );
+        assert!(
+            !logs.contains("sk-secret-should-not-appear"),
+            "密钥绝不能进日志，实际：{logs}"
+        );
     }
 
     /// 反向对照：删掉 `model_list_present` 判断，200 的空壳响应会被判成有效。
