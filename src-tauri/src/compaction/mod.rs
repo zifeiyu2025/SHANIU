@@ -129,6 +129,41 @@ pub fn history_tokens(items: &[HistoryItem]) -> usize {
     items.iter().map(item_tokens).sum()
 }
 
+/// 从尾部往前装，算出「保留哪些」的切点：`[0, range_end)` 是要压掉的区间。
+///
+/// 三条不变量是这层抽象**唯一**的存在理由，改任何一条都会让某条路径的行为变坏：
+/// 1. **严格大于**：判据是 `kept + cost > keep_allowance`，保留额度**刚好**装得下一条时
+///    必须留下它。写成 `>=` 会在边界上少留一条，压得比配置口径更狠。
+/// 2. **至少留一条**：`split >= len` 时钳到 `len - 1`。全压掉会让下一轮看到的历史只剩
+///    一段摘要，模型连"刚才那条命令的输出是什么"都无从得知。
+/// 3. **钳到 1**：`range_end` 至少为 1。判据已经说超预算、而按字节估算整段都装得进
+///    保留额度时（观测值含推理 token 与工具声明开销，字节估算看不见），退化成压掉
+///    最旧的一条让每轮稳定回收一点，而不是返回 `[0,0)` 空转。
+///
+/// 调用方各自的门槛（预算是否为 0、条数是否够、阈值是否达到、`keep_allowance` 怎么算）
+/// **不在这里**：自动与手动两条路径的门槛本就不同，合进来就得加参数分叉，得不偿失。
+/// 前置条件：`items.len() >= 2`，由调用方保证。
+fn tail_target(items: &[HistoryItem], keep_allowance: usize) -> Target {
+    let mut kept = 0usize;
+    let mut split = items.len();
+    for index in (0..items.len()).rev() {
+        let cost = item_tokens(&items[index]);
+        // 不变量①：严格大于——刚好装得下的那条必须留下。
+        if kept + cost > keep_allowance {
+            split = index + 1;
+            break;
+        }
+        kept += cost;
+        split = index;
+    }
+    // 不变量②：至少留最后一条不压，哪怕它自己就超了保留额度。
+    if split >= items.len() {
+        split = items.len() - 1;
+    }
+    // 不变量③：绝不空压。
+    Target { range_start: 0, range_end: split.max(1) }
+}
+
 /// 是否需要压缩，以及压哪一段。
 ///
 /// `observed_tokens` 是上一次采样端点报回的真实用量（含推理 token 与工具声明开销，
@@ -150,32 +185,8 @@ pub fn plan_if_needed(observed_tokens: usize, items: &[HistoryItem], budget: usi
         return None;
     }
 
-    // 从尾部往前装，装不下的那些进摘要。
-    let keep_allowance = budget.saturating_mul(KEEP_RATIO_PERCENT) / 100;
-    let mut kept = 0usize;
-    let mut split = items.len();
-    for index in (0..items.len()).rev() {
-        let cost = item_tokens(&items[index]);
-        if kept + cost > keep_allowance {
-            split = index + 1;
-            break;
-        }
-        kept += cost;
-        split = index;
-    }
-    // 至少留最后一条不压，哪怕它自己就超了保留额度：全压掉会让下一轮看到的历史
-    // 只剩一段摘要，模型连"刚才那条命令的输出是什么"都无从得知。
-    if split >= items.len() {
-        split = items.len() - 1;
-    }
-    if split == 0 {
-        // 判据已经说超预算，但按字节估算整段历史都装得进保留额度——这说明**估算低估了**：
-        // 推理 token 与工具声明的开销不计入字节估算，而观测值把它们算在内。
-        // 此时不能"没有可压的就放弃"：观测值才是端点的真相，继续增长下一轮就会溢出。
-        // 退化成至少压掉最旧的一条，让每一轮稳定回收一点。
-        split = 1;
-    }
-    Some(Target { range_start: 0, range_end: split })
+    // 从尾部往前装，装不下的那些进摘要。三条不变量见 [`tail_target`]。
+    Some(tail_target(items, budget.saturating_mul(KEEP_RATIO_PERCENT) / 100))
 }
 
 /// 手动压缩（`/compact`，SH-115）的目标规划：与 [`plan_if_needed`] 同一条尾部保留
@@ -197,21 +208,7 @@ pub fn plan_manual(items: &[HistoryItem], budget: usize) -> Option<Target> {
     } else {
         budget.saturating_mul(KEEP_RATIO_PERCENT) / 100
     };
-    let mut kept = 0usize;
-    let mut split = items.len();
-    for index in (0..items.len()).rev() {
-        let cost = item_tokens(&items[index]);
-        if kept + cost > keep_allowance {
-            split = index + 1;
-            break;
-        }
-        kept += cost;
-        split = index;
-    }
-    if split >= items.len() {
-        split = items.len() - 1;
-    }
-    Some(Target { range_start: 0, range_end: split.max(1) })
+    Some(tail_target(items, keep_allowance))
 }
 
 /// 构造总结请求：被压区间的全部条目 + 末尾一条总结指令。
@@ -322,7 +319,40 @@ mod tests {
     fn observed_usage_alone_can_trigger_compaction_even_when_estimate_is_low() {
         // 端点报了 600k token（含推理与工具声明开销），字节估算看不到那部分
         let items = vec![msg(Role::User, "短"), msg(Role::Assistant, "短")];
-        assert!(plan_if_needed(600_000, &items, 500_000).is_some());
+        // 估算装得下保留额度、但观测值已顶到预算：不能空压成 [0,0)，必须至少压掉最旧一条。
+        let target = plan_if_needed(600_000, &items, 500_000).expect("观测值超预算必须给出区间");
+        assert_eq!(
+            target,
+            Target { range_start: 0, range_end: 1 },
+            "退化时必须压掉最旧一条，否则这一轮回收为零、下一轮继续溢出"
+        );
+    }
+
+    /// 保留额度**刚好**装得下一条时必须装下：判据是严格大于。
+    ///
+    /// 反向对照：把 `kept + cost > keep_allowance` 写成 `>=`，最后两条会被挤掉一条，
+    /// 区间从 `[0,2)` 变成 `[0,3)`，本用例立刻红。自动/手动两条路径共用同一段装填，
+    /// 所以两边都钉一遍。
+    #[test]
+    fn keep_allowance_boundary_keeps_the_item_that_fits_exactly() {
+        // 每条 60_000 字节 ≈ 15_000 token（4 字节/token）；budget 100_000 → 额度 30_000
+        let big = "x".repeat(60_000);
+        let items: Vec<HistoryItem> = (0..4).map(|_| msg(Role::User, &big)).collect();
+        assert_eq!(item_tokens(&items[0]), 15_000, "构造前提：每条恰好 15_000 token");
+
+        let manual = plan_manual(&items, 100_000).expect("手动压缩总要给出目标");
+        assert_eq!(
+            manual,
+            Target { range_start: 0, range_end: 2 },
+            "额度刚好装下最后两条时，第二条必须留下"
+        );
+
+        let auto = plan_if_needed(100_000, &items, 100_000).expect("观测值已顶到预算");
+        assert_eq!(
+            auto,
+            Target { range_start: 0, range_end: 2 },
+            "自动路径与手动路径必须同一口径"
+        );
     }
 
     #[test]
