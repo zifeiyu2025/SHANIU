@@ -241,6 +241,11 @@ A（文档有、代码找不到）/ B（不可机械判定）/ 通过数，退�
 | R2-184 | 04:L92 | `save_settings` 安全面收成**一个预设 id**：沙箱与审批由预设表一起写 | `permission_preset` | 符号 | 同上：两维不存在只改一维的入口 |
 | R2-185 | 04:L92 | `get_settings` 额外回 `permissionPreset` | `permissionPreset` | 字面量 | 同上：非标准组合如实给 `custom` |
 | R2-186 | 04:L104 | 不命中如实回 `custom`（绝不猜「最像的」） | `CUSTOM` | 符号 | 同上：派生值不可选、不可作默认 |
+| R2-187 | 01:L265 | 风险分**五级**…`plan-review` | `PlanReview` | 符号 | 2026-11-12 补漏：ADR-003 原文只写四级，`plan-review` 从代码与 04 §1.2 反向补齐 |
+| R2-188 | 01:L265 | 预授权档放行**必须**留下 `plan-review:pre-authorized` 审计事件 | `plan-review:pre-authorized` | 字面量 | 同上：无人值守下计划评审不得静默 |
+| R2-189 | 01:L265 | 逐工具风险的事实源是 `risk_of` | `risk_of` | 符号 | 同上 |
+| R2-190 | 02:L70 | `job_output` / `job_list` / `job_kill` 入工具表 | `job_output`、`job_list`、`job_kill` | 符号 | 2026-11-12 补漏：三个作业工具此前只有 04 的命令表，没有风险归属表 |
+| R2-191 | 01:L266 | 派生态 `custom` 不可选 | `CUSTOM` | 符号 | 2026-11-12：两维绑定与派生值 |
 
 ---
 
@@ -274,10 +279,9 @@ A（文档有、代码找不到）/ B（不可机械判定）/ 通过数，退�
 
 ## 最近一次重跑
 
-- 2026-11-11，第二笔工作区（基于 HEAD `4573527`）：185 行断言，通过 307 个判定点 / A 0 / B 5，退出码 0。
-  本轮改动只涉及本线：`send_task` / `session_permission_preset` / `set_session_permission_preset`
-  三行随命令改名更新，`set_approval_mode` 行随命令删除而删；新增 R2-183~186（`PermissionPreset`
-  事件、`save_settings` 的 `permission_preset`、`get_settings` 的 `permissionPreset`、派生值 `CUSTOM`）。
+- 2026-11-12，第三笔（文档补漏，基于 `bec2cd0` + 工作区）：190 行断言，通过 314 个判定点 / A 0 / B 5，退出码 0。
+  本轮新增 R2-187~191：`docs/01` ADR-003 的五级风险与 `plan-review` 审计事件、`risk_of` 事实源、
+  派生态不可选；`docs/02` §2.2.1 的后台作业三工具。
 - 三条盲区规则的活例（`-ShowPass` 可见）：`configRoot` → `serde-camel -> config_root`；
   `allowlist_hit` 类 → `wire-variant -> AllowlistHit`；5 处 `#[test]` → `rust-test`。
 - 反向对照（证明会红）：塞一个不存在的符号 → A + 退出码 1；清单不存在 / 解析 0 行 /
