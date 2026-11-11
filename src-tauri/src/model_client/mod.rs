@@ -764,6 +764,7 @@ mod tests {
             tokens: 25,
             mime: "image/png".into(),
             attachment_id: None,
+            bytes: Some(128),
         }
     }
 

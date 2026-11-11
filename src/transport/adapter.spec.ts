@@ -75,6 +75,8 @@ function scriptedBridge(
   journal?: AgentEvent[],
   /** 会话档位写入的宿主替身（throw = 切档被拒）。放最后，避免挪动既有位置参数。 */
   sandboxHandler?: (args: Record<string, unknown> | undefined) => unknown,
+  /** `send_task` 的宿主替身（throw {code,message} = 类型化失败，如视觉门禁）。 */
+  sendTaskHandler?: (args: Record<string, unknown> | undefined) => unknown,
 ): ScriptedBridge {
   const calls: ScriptedBridge['calls'] = []
   const handlers = new Set<(event: AgentEvent) => void>()
@@ -207,7 +209,10 @@ function scriptedBridge(
         return (sessionSandbox.get(String(args?.['sessionId'] ?? '')) ?? null) as T
       }
       if (command === 'create_session') return 'agent-new' as T
-      if (command === 'send_task') return (args?.agentId ?? 'agent-new') as T
+      if (command === 'send_task') {
+        if (sendTaskHandler !== undefined) return sendTaskHandler(args) as T
+        return (args?.agentId ?? 'agent-new') as T
+      }
       if (command === 'load_session') {
         // SH-056 批 2：给了事件档案就以它判断"该会话有没有自己的 rollout"——
         // 子代理没有独立档案，宿主对缺失档案是抛错（不是空表），替身照做；
@@ -462,7 +467,7 @@ describe('SH-116 批 1：附件 prompt 拼装', () => {
     dispose()
   })
 
-  it('图片附件：journal 带 image 块、任务带隐藏标记，session.attachment 可读回', async () => {
+  it('图片附件：引用走结构化 images 参数、任务文本不含 marker，session.attachment 可读回', async () => {
     const bridge = scriptedBridge(undefined, [], undefined, undefined, undefined, undefined, undefined, undefined, () => ({
       name: 'shot.png', mediaType: 'image/png', bytes: 4, data: btoa('png!'), truncated: false, width: 2, height: 3,
     }))
@@ -473,9 +478,20 @@ describe('SH-116 批 1：附件 prompt 拼装', () => {
       content: [{ type: 'file', receiptId: '01ARZ3NDEKTSV4RRFFQ69G5FAV' }, { type: 'text', text: '看图' }],
     })
     expect(result['ok']).toBe(true)
-    const task = String(bridge.calls.find(call => call.command === 'send_task')?.args?.['task'] ?? '')
-    expect(task).toContain('<!-- shaniu-image:')
+    const sent = bridge.calls.find(call => call.command === 'send_task')?.args
+    const task = String(sent?.['task'] ?? '')
+    // marker 不得进入任何发给模型的文本（留给本地回显与旧档案解码）。
+    expect(task).not.toContain('<!-- shaniu-image:')
     expect(task).toContain('看图')
+    // 结构化引用：与 Rust `ImageAttachmentInput` 的 camelCase 逐字段相等。
+    expect(sent?.['images']).toEqual([{
+      attachmentId: '01ARZ3NDEKTSV4RRFFQ69G5FAV',
+      mediaType: 'image/png',
+      bytes: 4,
+      width: 2,
+      height: 3,
+      name: 'shot.png',
+    }])
 
     const iterator = session.follow({ address: { kind: 'session', sessionId: 'agent-new' } })
     const snapshot = (await iterator.next()).value as Record<string, unknown>
@@ -499,7 +515,28 @@ describe('SH-116 批 1：附件 prompt 拼装', () => {
     dispose()
   })
 
-  it('档案回放：用户文本里的图片标记重建为 image 内容块，标题不带标记', async () => {
+  it('视觉门禁：send_task 返回 MODEL_NO_VISION 时 prompt 失败并把模型名原样带回', async () => {
+    const bridge = scriptedBridge(
+      undefined, [], undefined, undefined, undefined, undefined, undefined, undefined,
+      () => ({ name: 'shot.png', mediaType: 'image/png', bytes: 4, data: btoa('png!'), truncated: false, width: 2, height: 3 }),
+      undefined, undefined, undefined,
+      () => { throw { code: 'MODEL_NO_VISION', model: 'LongCat-2.5', message: '当前模型 LongCat-2.5 不支持图片输入，请换用支持视觉的模型后再发送图片' } },
+    )
+    const { remote, dispose } = createAdapter({ bridge })
+    const result = await faceOf(remote).session.prompt({
+      sessionId: 'agent-new',
+      requestId: 'rpc-novision',
+      content: [{ type: 'file', receiptId: '01ARZ3NDEKTSV4RRFFQ69G5FAV' }],
+    })
+    expect(result['ok']).toBe(false)
+    const error = result['error'] as { message: string }
+    // 门禁文案点名当前模型：用户得知道换哪个模型才对。
+    expect(error.message).toContain('LongCat-2.5')
+    expect(error.message).toContain('不支持图片')
+    dispose()
+  })
+
+  it('旧档案回放：用户文本里的图片标记重建为 image 内容块，标题不带标记', async () => {
     const marker = `<!-- shaniu-image:${encodeURIComponent(JSON.stringify({
       attachmentId: '01ARZ3NDEKTSV4RRFFQ69G5FAV', mediaType: 'image/png', bytes: 4, width: 2, height: 3, name: 'shot.png',
     }))} -->`
@@ -520,6 +557,51 @@ describe('SH-116 批 1：附件 prompt 拼装', () => {
     expect(content[0]).toMatchObject({ type: 'image', attachment: { attachmentId: '01ARZ3NDEKTSV4RRFFQ69G5FAV' } })
     expect(content[1]).toEqual({ type: 'text', text: '看图' })
     expect(snapshot.projections.values.title).not.toContain('shaniu-image')
+    await iterator.return?.(undefined)
+    dispose()
+  })
+
+  it('档案回放：优先用 entry.images 重建 image 块，正文里没有 marker 也不影响', async () => {
+    const archive = [
+      {
+        kind: 'message',
+        role: 'user',
+        text: '看图',
+        images: [{
+          path: 'attachments/agent-new/01ARZ3NDEKTSV4RRFFQ69G5FAV.bin',
+          sha256: 'ab'.repeat(32),
+          width: 2,
+          height: 3,
+          tokens: 1,
+          mime: 'image/png',
+          attachment_id: '01ARZ3NDEKTSV4RRFFQ69G5FAV',
+          bytes: 4,
+        }],
+      },
+      { kind: 'message', role: 'assistant', text: '看到了' },
+    ]
+    const bridge = scriptedBridge(undefined, archive)
+    const { remote, dispose } = createAdapter({ bridge })
+    const session = faceOf(remote).session
+    const iterator = session.follow({ address: { kind: 'session', sessionId: 'agent-new' } })
+    const snapshot = (await iterator.next()).value as {
+      projections: { values: { title: string | null } }
+    }
+    const user = eventsOf(snapshot as unknown as Record<string, unknown>).find(event => event['type'] === 'user/message')
+    const content = (user?.['data'] as { content: Record<string, unknown>[] }).content
+    expect(content[0]).toEqual({
+      type: 'image',
+      attachment: {
+        attachmentId: '01ARZ3NDEKTSV4RRFFQ69G5FAV',
+        mediaType: 'image/png',
+        bytes: 4,
+        width: 2,
+        height: 3,
+      },
+    })
+    expect(content[1]).toEqual({ type: 'text', text: '看图' })
+    // 标题不参与本用例：只确认回放不会把引用序列化进标题。
+    expect(snapshot.projections.values.title ?? '').not.toContain('shaniu-image')
     await iterator.return?.(undefined)
     dispose()
   })
@@ -2480,6 +2562,45 @@ describe('Plan 芯片与客户端排队', () => {
     expect(bridge.calls.filter(call => call.command === 'send_task')[1]?.args).toEqual({ task: '排队第二条', agentId: 'agent-new' })
     // 队列清空：重开快照不再挂 inbox
     expect((await projectionValuesOf(session, 'agent-new'))['inbox']).toBeUndefined()
+    dispose()
+  })
+
+  it('排队补发：带图项遇到 MODEL_NO_VISION 不重试，队列移除并留一条通知', async () => {
+    let sends = 0
+    const bridge = scriptedBridge(
+      undefined, [], undefined, undefined, undefined, undefined, undefined, undefined,
+      () => ({ name: 'shot.png', mediaType: 'image/png', bytes: 4, data: btoa('png!'), truncated: false, width: 2, height: 3 }),
+      undefined, undefined, undefined,
+      (args) => {
+        sends += 1
+        if (args?.['images'] !== undefined) {
+          throw { code: 'MODEL_NO_VISION', model: 'LongCat-2.5', message: '当前模型 LongCat-2.5 不支持图片输入' }
+        }
+        return 'agent-new'
+      },
+    )
+    const { remote, dispose } = createAdapter({ bridge })
+    const session = faceOf3(remote).session
+    await session.prompt({ sessionId: 'agent-new', requestId: 'rpc-nv1', content: [{ type: 'text', text: '第一条' }] })
+    const queued = await session.prompt({
+      sessionId: 'agent-new',
+      requestId: 'rpc-nv2',
+      content: [{ type: 'file', receiptId: '01ARZ3NDEKTSV4RRFFQ69G5FAV' }, { type: 'text', text: '带图那条' }],
+    })
+    expect(queued).toMatchObject({ ok: true, value: { accepted: true } })
+
+    bridge.emit('agent-new', { type: 'turn_completed', turn: 1, reason: 'completed' })
+    await vi.waitFor(async () => {
+      expect((await projectionValuesOf(session, 'agent-new'))['inbox']).toBeUndefined()
+    })
+    // 门禁不是瞬时失败：只尝试一次，不进入 5 次重试。
+    expect(sends).toBe(2)
+    const paged = (await session.page({ sessionId: 'agent-new' }))['value'] as { records: { event: Record<string, unknown> }[] }
+    const notice = eventsOf(paged).find(event => event['type'] === 'developer/message')
+    expect(notice).toBeDefined()
+    // page 里是 journal 事件信封：正文在 data.message.content，不在 data.content。
+    const message = (notice?.['data'] as { message: { content: { text: string }[] } }).message
+    expect(message.content[0]?.text).toContain('LongCat-2.5')
     dispose()
   })
 

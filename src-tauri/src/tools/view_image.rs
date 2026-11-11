@@ -208,6 +208,7 @@ impl ToolExecutor for ViewImage {
             mime: mime.to_string(),
             // 工具回填没有附件回执：这个引用不参与重开后的字节回灌。
             attachment_id: None,
+            bytes: Some(sent.len() as u64),
         };
         let shape = if resized {
             format!("{source_width}×{source_height} → {width}×{height}（已缩放）")

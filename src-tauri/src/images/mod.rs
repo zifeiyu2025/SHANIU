@@ -25,6 +25,10 @@ pub struct ImageRef {
     /// 恒为 `None`；只有它是 `Some` 时，进程重启后才可能按 hash 回灌字节（rehydrate）。
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub attachment_id: Option<String>,
+    /// 编码后的实际字节数。前端 `ImageAttachmentRef.bytes` 需要它来与 DSH 的图片引用同形；
+    /// 旧档案没有这个键，缺省 `None`（展示层按未知处理，不编造 0）。
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub bytes: Option<u64>,
 }
 
 /// 前端任务文本里的图片隐藏标记前缀（整行形态：`<!-- shaniu-image:{json} -->`）。

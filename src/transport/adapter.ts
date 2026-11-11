@@ -43,6 +43,21 @@ const OK = <T>(value: T) => ({ ok: true as const, value })
 const FAIL = (message: string) =>
   ({ ok: false as const, error: new RemoteError('gateway/internal', message, {}) })
 
+/** 宿主错误 → 可读文案。视觉门禁是 `{ code, message }` 结构化对象，优先取 message。 */
+function hostErrorText(reason: unknown): string {
+  if (typeof reason === 'object' && reason !== null) {
+    const message = (reason as { message?: unknown }).message
+    if (typeof message === 'string' && message !== '') return message
+  }
+  return reason instanceof Error ? reason.message : String(reason)
+}
+
+/** 视觉门禁：带图但当前模型不支持。重试不会变好，必须直接告诉用户。 */
+function isModelNoVision(reason: unknown): boolean {
+  return typeof reason === 'object' && reason !== null
+    && (reason as { code?: unknown }).code === 'MODEL_NO_VISION'
+}
+
 /**
  * 宿主的会话 id 是裸字符串；进 DSH 的类型化载荷时补上品牌。品牌运行时即擦除
  * （铸造函数在宿主编译域，typecheck 域外），这里的显式转换表达"裸 id 进类型化载荷"。
@@ -314,9 +329,25 @@ interface Journal {
  * 字段名跟着 Rust 的 serde 走：这里刻意**不**重命名，改名就会和后端序列化结果漂移。
  */
 type SessionEntry =
-  | { kind: 'message'; role: string; text: string; reasoning?: string; at_ms?: number }
+  | { kind: 'message'; role: string; text: string; reasoning?: string; at_ms?: number; images?: SessionImageRefWire[] }
   | { kind: 'tool_call'; call_id: string; tool: string; arguments: string; output?: string; at_ms?: number }
   | { kind: 'turn_end'; turn: number; reason: string; at_ms: number; error?: TurnErrorInfo }
+
+/**
+ * 档案里图片引用的 wire 形状（`src-tauri/src/images/mod.rs` 的 `ImageRef`）。
+ * 字段名跟 Rust serde 走，不重命名；`attachment_id` / `bytes` 是后加的可选键
+ * （旧档案没有）。
+ */
+interface SessionImageRefWire {
+  readonly path: string
+  readonly sha256: string
+  readonly width: number
+  readonly height: number
+  readonly tokens: number
+  readonly mime: string
+  readonly attachment_id?: string
+  readonly bytes?: number
+}
 
 /**
  * 会话附件在 prompt 里的落地形状（SH-116 批 1）：宿主只暂存文件字节，模型侧
@@ -354,13 +385,39 @@ interface PromptImageRef {
 const IMAGE_MARKER_PREFIX = '<!-- shaniu-image:'
 
 /**
- * 图片引用在**任务文本**里的隐藏标记：rollout 只存用户消息文本，没有附件字段；
- * 用一行 HTML 注释（渲染时不可见）把引用带过去，重开档案时解析回 image 内容块。
+ * 档案引用 → 展示引用（与 DSH `ImageAttachmentRef` 同形）。落档时没有保存文件名，
+ * 这里省略 `name`；没有 `attachment_id` 的引用（`view_image` 回填）没有可回读的
+ * 附件来源，不能当成可解析的图片块，直接丢弃。
  */
-function encodeImageMarker(image: PromptImageRef): string {
-  return `${IMAGE_MARKER_PREFIX}${encodeURIComponent(JSON.stringify(image))} -->`
+function archiveImageToPrompt(ref: SessionImageRefWire): PromptImageRef | undefined {
+  if (ref.attachment_id === undefined) return undefined
+  return {
+    attachmentId: ref.attachment_id,
+    mediaType: ref.mime,
+    bytes: ref.bytes ?? 0,
+    width: ref.width,
+    height: ref.height,
+  }
 }
 
+/** 展示引用 → `send_task` 的结构化参数（Rust `ImageAttachmentInput`，camelCase）。 */
+function toSendTaskImages(images: readonly PromptImageRef[]): Record<string, unknown>[] {
+  return images.map(image => ({
+    attachmentId: image.attachmentId,
+    mediaType: image.mediaType,
+    bytes: image.bytes,
+    width: image.width,
+    height: image.height,
+    ...(image.name === undefined ? {} : { name: image.name }),
+  }))
+}
+
+/**
+ * **旧档案兼容**：早期前端把图片引用编码成任务文本里的一行 HTML 注释
+ * （`<!-- shaniu-image:{json} -->`）。新版本走 `send_task` 的结构化 `images`
+ * 参数（对齐 DSH `AttachmentStore.admitPromptContent` 的"编码上传 → 引用"模型），
+ * 标记只保留解码能力，不再写入。
+ */
 /** 从档案用户文本里剥离图片标记；返回干净正文与可重建的图片引用。 */
 function decodeImageMarkers(text: string): { text: string; images: PromptImageRef[] } {
   const images: PromptImageRef[] = []
@@ -482,7 +539,7 @@ async function composePromptText(
         name: read.name,
       }
       images.push(image)
-      append(`${attachmentBlock(read.name, read.mediaType, read.bytes)}\n${encodeImageMarker(image)}`)
+      append(attachmentBlock(read.name, read.mediaType, read.bytes))
     } else if (TEXTUAL_MEDIA.test(read.mediaType) || TEXTUAL_EXT.test(read.name)) {
       append(attachmentBlock(read.name, read.mediaType, read.bytes, base64ToText(read.data), read.truncated))
     } else {
@@ -1264,9 +1321,31 @@ export function createAdapter(options: AdapterOptions): { remote: unknown; dispo
       let sent = false
       for (let attempt = 0; attempt < 5 && !sent; attempt += 1) {
         try {
-          await bridge.invoke<string>('send_task', { task: item.text, agentId: sessionId })
+          await bridge.invoke<string>('send_task', {
+            task: item.text,
+            agentId: sessionId,
+            ...(item.images === undefined || item.images.length === 0
+              ? {}
+              : { images: toSendTaskImages(item.images) }),
+          })
           sent = true
-        } catch {
+        } catch (reason) {
+          // 视觉门禁不是瞬时拒绝：重试五次也不会通过。这条已从队列取出，直接丢弃
+          // 并留一条通知（对齐 `rollout_degraded` 的 `developer/message` 形态）。
+          if (isModelNoVision(reason)) {
+            const text = hostErrorText(reason)
+            pushEvent(journal, 'developer/message', {
+              turn: journal.turn,
+              step: journal.step,
+              message: {
+                id: `shaniu-novision-${item.id}`,
+                role: 'developer',
+                source: { kind: 'model-no-vision' as const, form: 'notice' as const, summary: text },
+                content: [{ type: 'text', text }],
+              },
+            }, { surfaceOp: 'append' })
+            return
+          }
           await delay(250)
         }
       }
@@ -1453,7 +1532,13 @@ export function createAdapter(options: AdapterOptions): { remote: unknown; dispo
         if (entry.kind === 'message' && entry.role === 'user') {
           startTurn()
           openStep(0)
-          const parsed = decodeImageMarkers(entry.text)
+          // 新档案带结构化 `images`；旧档案只有正文里的 marker，按旧形态解码。
+          const archived = (entry.images ?? [])
+            .map(archiveImageToPrompt)
+            .filter((image): image is PromptImageRef => image !== undefined)
+          const parsed = archived.length === 0
+            ? decodeImageMarkers(entry.text)
+            : { text: entry.text, images: archived }
           pushEvent(journal, 'user/message', {
             id: `shaniu-replay-user-${index}`,
             role: 'user',
@@ -2103,6 +2188,9 @@ export function createAdapter(options: AdapterOptions): { remote: unknown; dispo
       task: text,
       agentId: sessionId,
       ...(draftSandbox === undefined ? {} : { sandboxMode: draftSandbox }),
+      // 图片引用走结构化参数（对齐 DSH 的 admission：UI 只交引用，宿主读字节并校验）；
+      // 无图时不发这个键，`{ task, agentId }` 的既有形状不变。
+      ...(images.length === 0 ? {} : { images: toSendTaskImages(images) }),
     })
     const journal = journalOf(agentId)
     const shown = displayText ?? text
@@ -2281,7 +2369,13 @@ export function createAdapter(options: AdapterOptions): { remote: unknown; dispo
           return OK({ accepted: true })
         }
       }
-      submitPromptNow(request.sessionId, text, request.requestId, composed.displayText, composed.images)
+      try {
+        await submitPromptNow(request.sessionId, text, request.requestId, composed.displayText, composed.images)
+      } catch (reason) {
+        // 视觉门禁等结构化错误必须回到输入区，而不是变成未处理的 rejection：
+        // 后端没接任务，前端也不该留下乐观回显。
+        return FAIL(hostErrorText(reason))
+      }
       return OK({ accepted: true })
     },
     cancel: async (request: { sessionId?: string } = {}) => {
@@ -3151,7 +3245,14 @@ export function createAdapter(options: AdapterOptions): { remote: unknown; dispo
             pushCommandDone(sessionId, run.commandId, result)
             return OK({ result })
           }
-          await submitPromptNow(sessionId, message)
+          try {
+            await submitPromptNow(sessionId, message)
+          } catch (reason) {
+            // 与输入区同一条错误口径：命令卡片直接显示后端原话（如视觉门禁）。
+            const result = { kind: 'error' as const, text: hostErrorText(reason) }
+            pushCommandDone(sessionId, run.commandId, result)
+            return OK({ result })
+          }
         }
         const result = {
           kind: 'success' as const,

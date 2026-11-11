@@ -437,6 +437,7 @@ fn resolve_attachment_images(
             tokens: tools::view_image::estimate_tokens(actual.width, actual.height),
             mime: actual.mime.to_string(),
             attachment_id: Some(input.attachment_id.clone()),
+            bytes: Some(bytes.len() as u64),
         });
     }
     Ok(refs)
@@ -3732,6 +3733,7 @@ mod session_projection_tests {
             tokens: 1,
             mime: "image/png".into(),
             attachment_id: Some("01J0000000000000000000000A".into()),
+            bytes: Some(4),
         };
         let items = vec![RolloutItem::ResponseItem {
             item: HistoryItem::ImageMessage {
