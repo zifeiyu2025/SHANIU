@@ -567,6 +567,29 @@ impl AgentLoop {
         let emit = |sink: &Arc<dyn crate::events::EventSink>, msg: EventMsg| {
             let _ = sink.emit(&msg);
         };
+        // 档案写入失败 = 降级，不是失败。
+        //
+        // 观测（轨迹/审计）不能决定主流程成败：磁盘满或 ACL 挡一下，用户要的是把话
+        // 说完，而不是「这轮对话失败」再加一个看不出原因的错误。这里只记 warn + 发一条
+        // 用户可见的降级通知（只发一次），本轮照常继续；游标停在失败条目上，磁盘恢复后
+        // 下一轮会自然补齐。
+        let degrade_rollout = |sink: &Arc<dyn crate::events::EventSink>, message: String| {
+            tracing::warn!(
+                target: "rollout",
+                attempts = MAX_ROLLOUT_WRITE_ATTEMPTS,
+                %message,
+                "会话档案写入失败，本轮继续；轨迹可能不完整"
+            );
+            if !self.rollout_broke.swap(true, std::sync::atomic::Ordering::Relaxed) {
+                emit(
+                    sink,
+                    EventMsg::RolloutDegraded {
+                        message: format!("本轮轨迹可能不完整：{message}"),
+                    },
+                );
+            }
+        };
+
         // SH-091：技能目录在每次任务开始时发现一次。目录为空时系统提示不加技能段，
         // 且不向模型声明 `skill` 工具——避免无技能工作区的 token 开销与假能力。
         let skill_summaries = crate::skills::discover(&self.workspace_root);
@@ -685,8 +708,8 @@ impl AgentLoop {
                         }
                     }
                     let at_ms = now_ms();
-                    // 先落档案、再发事件：档案不可写即中止本轮（保留既有硬错误语义），
-                    // 避免档案与运行态分叉。
+                    // 先落档案、再发事件：档案写不进去时仍要发事件，让轨迹至少能看到
+                    // 这一版提示词，同时由降级通知说明「档案可能不完整」。
                     if let Some(writer) = rollout {
                         let item = crate::rollout::RolloutItem::SystemPrompt {
                             text: instructions.clone(),
@@ -705,16 +728,12 @@ impl AgentLoop {
                             }
                         }
                         if let Some(e) = last_error {
-                            emit(
+                            degrade_rollout(
                                 &sink,
-                                EventMsg::Error {
-                                    message: format!(
-                                        "系统提示词写入档案失败（连续 {MAX_ROLLOUT_WRITE_ATTEMPTS} 次），已停止本轮：{e}"
-                                    ),
-                                },
+                                format!(
+                                    "系统提示词写入档案失败（连续 {MAX_ROLLOUT_WRITE_ATTEMPTS} 次）：{e}"
+                                ),
                             );
-                            reason = TurnEndReasonLocal::Failed;
-                            break 'outer;
                         }
                     }
                     emit(
@@ -1313,22 +1332,16 @@ impl AgentLoop {
                 });
             }
             // 轮末落盘：崩溃只丢当前轮，之前各轮的档案已经 flush 到位。
-            // 档案不可写 = 硬错误：继续跑只会让档案与运行态分叉（审计 H3）。
+            // 档案不可写只降级（审计 H3 的"硬错误"已按观测不绑架主流程的原则推翻）：
+            // 游标停在失败条目上，磁盘恢复后下一轮会补齐；本轮继续跑完。
             if let Err(message) = self.flush_history(rollout, history, recorded) {
-                if !self.rollout_broke.swap(true, std::sync::atomic::Ordering::Relaxed) {
-                    emit(&sink, EventMsg::Error { message });
-                }
-                reason = TurnEndReasonLocal::Failed;
-                break 'outer;
+                degrade_rollout(&sink, message);
             }
         }
 
         // 覆盖所有 break 路径（取消/失败/预算耗尽）——它们都从这里收口
         if let Err(message) = self.flush_history(rollout, history, recorded) {
-            if !self.rollout_broke.swap(true, std::sync::atomic::Ordering::Relaxed) {
-                emit(&sink, EventMsg::Error { message });
-            }
-            reason = TurnEndReasonLocal::Failed;
+            degrade_rollout(&sink, message);
         }
 
         // A0-3：回合结局必须落档。导出/统计只认这一行；不写就等于把失败当成功。

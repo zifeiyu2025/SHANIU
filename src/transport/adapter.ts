@@ -1829,6 +1829,20 @@ export function createAdapter(options: AdapterOptions): { remote: unknown; dispo
         }, { surfaceOp: 'append' })
         return
       }
+      case 'rollout_degraded':
+        // 观测失败不冒充失败：对话照常收口，这里只插一条宿主通知（form: 'notice'，
+        // 与上游 ContextForm 的一次性告知同义），不参与模型请求。
+        pushEvent(journal, 'developer/message', {
+          turn: journal.turn,
+          step: journal.step,
+          message: {
+            id: `shaniu-degraded-${journal.seq + 1}`,
+            role: 'developer',
+            source: { kind: 'archive-degraded' as const, form: 'notice' as const, summary: msg.message },
+            content: [{ type: 'text', text: msg.message }],
+          },
+        }, { surfaceOp: 'append' })
+        return
       case 'system_prompt':
         // 提示词入轨迹：映射成上游的 `system/message`，只在该版本首次出现时由后端发出。
         // 用 `journal.turn/step`（DSH 口径）而不是后端的采样轮次：后者是 turn 内的

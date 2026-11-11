@@ -16,7 +16,7 @@ use shaniu_lib::events::{
 };
 
 /// 与 src/transport/types.ts 的 type 判别值逐一对应。
-const EXPECTED_TAGS: [&str; 19] = [
+const EXPECTED_TAGS: [&str; 20] = [
     "turn_started",
     "turn_completed",
     "agent_message_delta",
@@ -35,6 +35,7 @@ const EXPECTED_TAGS: [&str; 19] = [
     "subagent_spawned",
     "subagent_exited",
     "subagent_message",
+    "rollout_degraded",
     "system_prompt",
 ];
 
@@ -139,6 +140,8 @@ fn all_variants() -> Vec<EventMsg> {
         EventMsg::SubagentExited { child_id: "01JCHILD".into(), status: SubagentExitStatus::Failed, summary: "失败".into() },
         EventMsg::SubagentExited { child_id: "01JCHILD".into(), status: SubagentExitStatus::Cancelled, summary: "已取消".into() },
         EventMsg::SubagentMessage { child_id: "01JCHILD".into(), sender_id: "root".into(), text: "请改看 transport".into(), rpc_id: Some("rpc-9".into()) },
+        // 档案降级：对话继续，但轨迹可能不完整
+        EventMsg::RolloutDegraded { message: "本轮轨迹可能不完整：磁盘已满".into() },
         // 提示词入轨迹（additive）：载荷原样 round-trip
         EventMsg::SystemPrompt {
             text: "你是 SHANIU。\n## 工作区\nD:\\ws".into(),
@@ -170,6 +173,7 @@ fn all_variants() -> Vec<EventMsg> {
             | EventMsg::SubagentSpawned { .. }
             | EventMsg::SubagentExited { .. }
             | EventMsg::SubagentMessage { .. }
+            | EventMsg::RolloutDegraded { .. }
             | EventMsg::SystemPrompt { .. } => {}
         }
     }

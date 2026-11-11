@@ -49,6 +49,8 @@ import type {
 declare module '@deepseek-ai/dsh-llm' {
   interface MessageSourceMap {
     'compact-checkpoint': CompactionCheckpointSource
+    /** 档案降级提示（宿主注入的一次性通知，不参与模型请求）。 */
+    'archive-degraded': { kind: 'archive-degraded'; form: 'notice'; summary: string }
   }
 }
 

@@ -318,6 +318,12 @@ pub enum EventMsg {
         #[serde(default, skip_serializing_if = "Option::is_none")]
         rpc_id: Option<String>,
     },
+    /// 档案降级（additive）：轨迹落盘失败，但对话继续。
+    ///
+    /// 为什么不是 `Error`：写档案是观测，不是主流程。磁盘满/ACL 挡一下不该让本轮
+    /// 失败；但也必须让用户知道「这轮轨迹可能不完整」，并留一条可被后续诊断读到
+    /// 的状态（本事件随 journal 落盘，日志侧另有 `tracing::warn!`）。
+    RolloutDegraded { message: String },
     /// 系统提示词版本（additive，A0 之后的「提示词入轨迹」）。
     ///
     /// 只在**实际下发的那条路径**上、内容指纹变化时发出：同一 run 的多轮不重复。

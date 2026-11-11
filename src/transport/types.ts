@@ -45,6 +45,7 @@ export type EventMsg =
   | { type: 'subagent_spawned'; child_id: string; task: string; name: string; label: string; created_at_ms: number }
   | { type: 'subagent_exited'; child_id: string; status: SubagentExitStatus; summary: string }
   | { type: 'subagent_message'; child_id: string; sender_id: string; text: string; rpc_id?: string | null }
+  | { type: 'rollout_degraded'; message: string }
   | { type: 'system_prompt'; text: string; sha256: string; at_ms: number; turn: number; step: number };
 
 export interface AgentEvent {

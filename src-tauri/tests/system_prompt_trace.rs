@@ -311,6 +311,81 @@ async fn changed_prompt_produces_a_second_version() {
     assert_eq!(prompt_records(&path).len(), 2, "每个 run 恰好一条，不随轮数增长");
 }
 
+/// 降级判据：档案写不进去时，对话必须正常收口，只留一条可见的「轨迹可能不完整」。
+///
+/// 用独占文件锁模拟"目录/文件不可写"：`File::lock` 在 Windows 上走 `LockFileEx`，
+/// 另一句柄对锁定区间的写入会失败，效果等同磁盘满/ACL 拒绝，但无需改 ACL。
+/// Unix 的 flock 是建议锁、不阻塞写入，所以这里只跑 Windows（本项目交付平台）。
+#[cfg(windows)]
+#[tokio::test]
+async fn archive_write_failure_degrades_instead_of_failing_the_turn() {
+    use shaniu_lib::events::TurnEndReason;
+
+    let dir = temp_dir("degrade");
+    let rollout_dir = dir.join("rollouts");
+    std::fs::create_dir_all(&rollout_dir).unwrap();
+    let path = rollout_dir.join("deg.jsonl");
+
+    let writer = Arc::new(RolloutWriter::create(&rollout_dir, &meta("deg", &dir)).unwrap());
+    // 建档已完成（meta 已落盘），再上锁：之后的 system_prompt / 历史 / TurnEnd 写入都会失败。
+    let lock = std::fs::OpenOptions::new()
+        .read(true)
+        .write(true)
+        .open(&path)
+        .unwrap();
+    lock.lock().expect("无法锁定档案文件");
+
+    let backend = Arc::new(Capturing::new(vec![vec![ModelStreamEvent::OutputTextDelta {
+        delta: "档案写不进去也要把话说完".into(),
+    }]]));
+    let (agent, broker) = loop_with(&dir, backend, writer, SandboxMode::WorkspaceWrite, 3);
+    let sink = Arc::new(Recording::new(broker));
+    let summary = agent.run_task("任务", sink.clone(), CancellationToken::new()).await;
+
+    let events = sink.events.lock().unwrap().clone();
+    // 反向对照：改回「写失败即中止」，下面两条必红（TurnCompleted 会变成 failed）。
+    assert!(
+        matches!(
+            events.iter().find_map(|m| match m {
+                EventMsg::TurnCompleted { reason, .. } => Some(*reason),
+                _ => None,
+            }),
+            Some(TurnEndReason::Completed)
+        ),
+        "档案不可写不得把本轮判失败：{events:?}"
+    );
+    assert_eq!(summary.turns, 1, "对话应正常跑完这一轮");
+
+    let degraded: Vec<&String> = events
+        .iter()
+        .filter_map(|m| match m {
+            EventMsg::RolloutDegraded { message } => Some(message),
+            _ => None,
+        })
+        .collect();
+    assert_eq!(degraded.len(), 1, "降级通知必须只发一次，不随重试刷屏");
+    assert!(
+        degraded[0].contains("轨迹可能不完整"),
+        "通知必须让用户知道轨迹不完整：{}",
+        degraded[0]
+    );
+
+    // 释放锁后，下一轮应能自然补齐（游标停在失败条目上，不在失败时丢历史）。
+    drop(lock);
+    let backend = Arc::new(Capturing::new(vec![vec![ModelStreamEvent::OutputTextDelta {
+        delta: "恢复".into(),
+    }]]));
+    let writer = Arc::new(RolloutWriter::open_existing(&path).unwrap());
+    let (agent, broker) = loop_with(&dir, backend, writer, SandboxMode::WorkspaceWrite, 3);
+    agent
+        .run_task("恢复后继续", Arc::new(Recording::new(broker)), CancellationToken::new())
+        .await;
+    assert!(
+        !prompt_records(&path).is_empty(),
+        "锁释放后系统提示词应补写进档案（降级不是丢弃）"
+    );
+}
+
 #[test]
 fn journal_redacts_system_prompt_like_every_other_event() {
     let dir = temp_dir("redact");
