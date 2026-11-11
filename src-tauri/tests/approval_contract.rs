@@ -80,10 +80,10 @@ impl ModelBackend for ScriptedBackend {
     }
 }
 
-/// 一轮内发多次同类工具调用（SH-118④ 的"连续 3 次只问 1 次"样本）。
+/// 一轮内发多次同类工具调用；每次的 `arguments` 可相同（验证批量）或不同（验证不批量）。
 struct MultiCallBackend {
     tool: String,
-    call_ids: Vec<String>,
+    calls: Vec<(String, String)>,
 }
 
 #[async_trait]
@@ -100,12 +100,12 @@ impl ModelBackend for MultiCallBackend {
         let events = if tool_already_ran {
             vec![ModelStreamEvent::OutputTextDelta { delta: "完成".into() }]
         } else {
-            self.call_ids
+            self.calls
                 .iter()
-                .map(|call_id| {
+                .map(|(call_id, arguments)| {
                     ModelStreamEvent::OutputItem(ResponseItem::FunctionCall {
                         name: self.tool.clone(),
-                        arguments: "{}".into(),
+                        arguments: arguments.clone(),
                         call_id: call_id.clone(),
                     })
                 })
@@ -138,7 +138,7 @@ impl ModelBackend for SequentialBackend {
         } else {
             vec![ModelStreamEvent::OutputItem(ResponseItem::FunctionCall {
                 name: self.tool.clone(),
-                arguments: "{}".into(),
+                arguments: r#"{"command":"git status"}"#.into(),
                 call_id: format!("c{}", self.emitted.fetch_add(1, Ordering::SeqCst) + 1),
             })]
         };
@@ -379,14 +379,20 @@ async fn never_mode_does_not_prompt_or_escalate_on_sandbox_denial() {
     );
 }
 
-// ============================== 批量确认（SH-118④） ==============================
+// ============================== 批量确认（D3：参数完全相同才批量） ==============================
 
-/// 同一 turn 连续 3 次同类调用：只产生 1 个审批事件，三次都真的执行。
+/// D3：同一 turn 内**参数完全相同**的调用只产生 1 个审批事件，三次都真的执行。
+/// 卡片必须写明范围（`batch_scope`），用户有权知道这句话覆盖了多远。
 #[tokio::test]
-async fn same_turn_batches_three_calls_into_one_prompt() {
+async fn same_turn_identical_calls_batch_into_one_prompt() {
+    let command = r#"{"command":"git status"}"#;
     let backend = Arc::new(MultiCallBackend {
         tool: "unified_exec".into(),
-        call_ids: vec!["c1".into(), "c2".into(), "c3".into()],
+        calls: vec![
+            ("c1".into(), command.into()),
+            ("c2".into(), command.into()),
+            ("c3".into(), command.into()),
+        ],
     });
     let h = harness_with(backend, "unified_exec", 2);
     let events = h.events.clone();
@@ -394,6 +400,19 @@ async fn same_turn_batches_three_calls_into_one_prompt() {
     let task = tokio::spawn(async move { h.run().await });
 
     let (request_id, _reason) = wait_for_request(&events, 0).await;
+    let scope = events
+        .lock()
+        .unwrap()
+        .iter()
+        .find_map(|e| match e {
+            EventMsg::ExecApprovalRequest { batch_scope, .. } => Some(batch_scope.clone()),
+            _ => None,
+        });
+    assert_eq!(
+        scope,
+        Some(Some("same-args".to_string())),
+        "命令类批准后确实会开窗口，卡片必须写明范围"
+    );
     assert!(broker.resolve(&request_id, ApprovalDecision::Allow));
 
     let (summary, hits, events) = task.await.unwrap();
@@ -405,7 +424,42 @@ async fn same_turn_batches_three_calls_into_one_prompt() {
             .filter(|e| matches!(e, EventMsg::ExecApprovalRequest { .. }))
             .count(),
         1,
-        "同一 turn 同类调用只问一次"
+        "同一 turn 内参数完全相同的调用只问一次"
+    );
+}
+
+/// D3 反向契约：命令变了风险就变——批准 `git status` 不得连带 `git push --force`。
+/// 第三次回到 `git status` 也重新询问：窗口只有一个槽位，被中间那次覆盖。
+#[tokio::test]
+async fn same_turn_different_commands_prompt_each_time() {
+    let backend = Arc::new(MultiCallBackend {
+        tool: "unified_exec".into(),
+        calls: vec![
+            ("c1".into(), r#"{"command":"git status"}"#.into()),
+            ("c2".into(), r#"{"command":"git push --force"}"#.into()),
+            ("c3".into(), r#"{"command":"git status"}"#.into()),
+        ],
+    });
+    let h = harness_with(backend, "unified_exec", 2);
+    let events = h.events.clone();
+    let broker = h.broker.clone();
+    let task = tokio::spawn(async move { h.run().await });
+
+    for index in 0..3 {
+        let (request_id, _reason) = wait_for_request(&events, index).await;
+        assert!(broker.resolve(&request_id, ApprovalDecision::Allow));
+    }
+
+    let (summary, hits, events) = task.await.unwrap();
+    assert_eq!(summary.reason, shaniu_lib::events::TurnEndReason::Completed);
+    assert_eq!(hits, 3, "每次批准后都要真的执行");
+    assert_eq!(
+        events
+            .iter()
+            .filter(|e| matches!(e, EventMsg::ExecApprovalRequest { .. }))
+            .count(),
+        3,
+        "参数一变就必须重新确认：批准 A 不等于批准 B"
     );
 }
 
@@ -444,7 +498,11 @@ async fn batch_window_does_not_cross_turns() {
 async fn destructive_calls_never_batch() {
     let backend = Arc::new(MultiCallBackend {
         tool: "mcp__danger__op".into(),
-        call_ids: vec!["c1".into(), "c2".into(), "c3".into()],
+        calls: vec![
+            ("c1".into(), "{}".into()),
+            ("c2".into(), "{}".into()),
+            ("c3".into(), "{}".into()),
+        ],
     });
     let h = harness_with(backend, "mcp__danger__op", 2);
     let events = h.events.clone();

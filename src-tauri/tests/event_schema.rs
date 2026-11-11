@@ -64,7 +64,7 @@ fn all_variants() -> Vec<EventMsg> {
             error: Some("用户拒绝".into()),
             result: Some(ToolCallResult::Denied),
         },
-        EventMsg::ExecApprovalRequest { request_id: "r1".into(), tool: "unified_exec".into(), args: serde_json::json!({}), risk: RiskLevel::Destructive, agent_id: None, task_summary: None, reason: None },
+        EventMsg::ExecApprovalRequest { request_id: "r1".into(), tool: "unified_exec".into(), args: serde_json::json!({}), risk: RiskLevel::Destructive, agent_id: None, task_summary: None, reason: None, call_id: None, batch_scope: None },
         // SH-054：审批冒泡的 additive 字段（子代理来源）也必须进快照
         EventMsg::ExecApprovalRequest {
             request_id: "r2".into(),
@@ -75,6 +75,10 @@ fn all_variants() -> Vec<EventMsg> {
             task_summary: Some("统计仓库文件数".into()),
             // SH-118⑤ / SH-120：风险原因（additive）
             reason: Some("执行命令需要人工确认".into()),
+            // 审批卡详情定位（additive）：不让前端解析 `appr-` 前缀
+            call_id: Some("c2".into()),
+            // 批量范围（additive，A0 收紧后）：只有 Execute 且参数指纹可算时才有值
+            batch_scope: Some("same-args".into()),
         },
         EventMsg::ExecApprovalResolved { request_id: "r1".into(), decision: ApprovalDecision::Deny },
         // SH-120：前缀白名单放行审计（additive）

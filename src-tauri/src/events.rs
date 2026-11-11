@@ -206,6 +206,16 @@ pub enum EventMsg {
         /// 风险原因（SH-118⑤，additive）：用户在批什么、为什么现在问。
         #[serde(default, skip_serializing_if = "Option::is_none")]
         reason: Option<String>,
+        /// 关联的工具调用 id（additive）：审批卡详情区按它回聊天快照取完整参数。
+        /// 不从 `request_id` 里解析 `appr-` 前缀——那是约定不是契约，格式一变就无声失效，
+        /// 而失效的表现是「详情又白了」。
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        call_id: Option<String>,
+        /// 批准后批量覆盖的范围（additive），值是范围标识不是文案：
+        /// `"same-args"` = 本轮内参数完全相同的调用不再询问。
+        /// `None` = 批准只对这一次生效。用户必须能在卡片上看到这句话覆盖了多远。
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        batch_scope: Option<String>,
     },
     ExecApprovalResolved { request_id: String, decision: ApprovalDecision },
     /// 命令前缀白名单命中（SH-120 / ADR-007③，additive）：放行依据必须可事后追溯——

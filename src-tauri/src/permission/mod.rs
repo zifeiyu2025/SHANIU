@@ -62,14 +62,16 @@ pub struct GateEnv<'a> {
     pub cancel: &'a CancellationToken,
 }
 
-/// 一次审批询问的元信息：风险档 + 风险原因 + 是否允许 `AllowAlways` 写入会话记忆。
-/// 打包成一个参数是因为这三项一起决定"这张审批卡长什么样、批完记不记"，
+/// 一次审批询问的元信息：风险档 + 风险原因 + 是否允许 `AllowAlways` 写入会话记忆 + 是否为提权询问。
+/// 打包成一个参数是因为这几项一起决定"这张审批卡长什么样、批完记不记"，
 /// 铺开 9 个参数会让调用点看不出哪些是身份、哪些是提示。
 #[derive(Debug, Clone, Copy)]
 struct ApprovalPrompt<'a> {
     risk: RiskLevel,
     reason: Option<&'a str>,
     remember: bool,
+    /// 提权询问（on-failure）：只影响请求 id，不允许批量，也不写会话记忆。
+    escalation: bool,
 }
 
 /// 审批 broker：pending 请求表 + execute 级会话记忆（按 agent_id 分域）+ 命令前缀白名单。
@@ -90,12 +92,17 @@ pub struct ApprovalBroker {
     batch_disabled: std::sync::atomic::AtomicBool,
 }
 
-/// 批量确认窗口的内容：只记身份与工具，不记参数——参数不同的调用同样算"同一类操作"，
-/// 这正是"连续 3 次只问 1 次"要的效果。
+/// 批量确认窗口的内容：身份 + 工具 + **这一次的参数指纹**。
+///
+/// 旧实现只记 `(agent_id, tool)`，参数一变也照样放行：批准 `git status` 会连带
+/// `git push --force`（两者都是 `unified_exec`）。风险随参数变化，批量就必须跟着
+/// 参数走；写入类（`WriteInWorkspace`）完全退出批量，每个补丁单独确认。
 #[derive(Debug, Clone, PartialEq, Eq)]
 struct BatchGrant {
     agent_id: String,
     tool: String,
+    /// `batch_key` 的输出：参数规范化后的完整指纹。
+    key: String,
 }
 
 impl ApprovalBroker {
@@ -167,28 +174,34 @@ impl ApprovalBroker {
             .expect("remembered 锁中毒")
             .get(subject.agent_id)
             .is_some_and(|tools| tools.contains(tool));
-        // 同一 turn 内的批量确认（SH-118④）：本轮已经为用户批准过的 (agent, tool)
-        // 不再逐次弹窗。作用域只有"一个 turn + 一个代理 + 一个工具"，turn 开始即清空；
-        // destructive 永不进入批量（它本来每次必问）。
+        // 同一 turn 内的批量确认（SH-118④，A0 后收紧）：作用域 = 一个 turn + 一个代理
+        // + 一个工具 + **完全相同的参数**。批准 `git status` 不再连带 `git push --force`；
+        // 写入类连窗口都不开（`batch_key` 返回 None），每个补丁单独确认。
+        let batch_token = Self::batch_key(risk, args);
         let batched = !self
             .batch_disabled
             .load(std::sync::atomic::Ordering::SeqCst)
-            && self
-                .batch
-                .lock()
-                .expect("batch 锁中毒")
-                .as_ref()
-                .is_some_and(|grant| grant.agent_id == subject.agent_id && grant.tool == tool);
+            && batch_token.as_ref().is_some_and(|key| {
+                self.batch
+                    .lock()
+                    .expect("batch 锁中毒")
+                    .as_ref()
+                    .is_some_and(|grant| {
+                        grant.agent_id == subject.agent_id
+                            && grant.tool == tool
+                            && &grant.key == key
+                    })
+            });
         match policy::decide(risk, policy.approval, policy.sandbox, remembered) {
             Decision::Allow => GateOutcome::Allowed,
             Decision::Deny => GateOutcome::Forbidden,
-            Decision::Prompt if batched && risk != RiskLevel::Destructive => GateOutcome::Allowed,
+            Decision::Prompt if batched => GateOutcome::Allowed,
             Decision::Prompt => {
                 self.request_approval(
                     tool,
                     args,
                     call_id,
-                    ApprovalPrompt { risk, reason: Some(prompt_reason(risk)), remember: true },
+                    ApprovalPrompt { risk, reason: Some(prompt_reason(risk)), remember: true, escalation: false },
                     subject,
                     env,
                 )
@@ -222,8 +235,8 @@ impl ApprovalBroker {
         self.request_approval(
             tool,
             args,
-            &format!("{call_id}-escalate"),
-            ApprovalPrompt { risk: RiskLevel::Execute, reason: Some(&reason), remember: false },
+            call_id,
+            ApprovalPrompt { risk: RiskLevel::Execute, reason: Some(&reason), remember: false, escalation: true },
             subject,
             env,
         )
@@ -231,6 +244,9 @@ impl ApprovalBroker {
     }
 
     /// 发审批请求并挂起等待；取消时撤单。
+    ///
+    /// `escalation` 只影响请求 id 与批量说明：提权询问要能和普通审批区分开，
+    /// 但卡片详情仍按原始 `call_id` 去聊天快照取参数（否则提权卡只剩一句话）。
     async fn request_approval(
         &self,
         tool: &str,
@@ -240,8 +256,12 @@ impl ApprovalBroker {
         subject: GateSubject<'_>,
         env: GateEnv<'_>,
     ) -> GateOutcome {
-        let ApprovalPrompt { risk, reason, remember } = prompt;
-        let request_id = format!("appr-{call_id}");
+        let ApprovalPrompt { risk, reason, remember, escalation } = prompt;
+        let request_id = if escalation {
+            format!("appr-{call_id}-escalate")
+        } else {
+            format!("appr-{call_id}")
+        };
         let (tx, rx) = tokio::sync::oneshot::channel::<ApprovalDecision>();
         self.pending
             .lock()
@@ -258,6 +278,14 @@ impl ApprovalBroker {
             task_summary: subject.task_summary.map(str::to_string),
             // SH-118⑤：审批上下文要带风险原因，用户才知道自己在批什么。
             reason: reason.map(str::to_string),
+            // 卡片的详情区按它取完整参数（additive）。
+            call_id: Some(call_id.to_string()),
+            // 批准后批量会覆盖多远：只有 Execute、参数指纹可算、且批量没被关掉时才开窗口。
+            // 写入类与提权询问永远是 None——批准一次就只算一次。
+            batch_scope: (remember
+                && !self.batch_disabled.load(std::sync::atomic::Ordering::SeqCst)
+                && Self::batch_key(risk, args).is_some())
+            .then(|| "same-args".to_string()),
         }) {
             // M2：卡片送不到 = 用户不可能看到、也就不可能批准 = 唯一安全的裁决是拒绝。
             // 不能等：没有回执来源，下面的 `select!` 会永久挂起整个回合。
@@ -278,14 +306,14 @@ impl ApprovalBroker {
                 // 「允许一次」后，同进程后续 execute 全部静默放行（真机复测发现）。
                 Ok(ApprovalDecision::Allow) => {
                     if remember {
-                        self.grant_batch(tool, risk, subject.agent_id);
+                        self.grant_batch(tool, args, risk, subject.agent_id);
                     }
                     GateOutcome::Allowed
                 }
                 Ok(d @ ApprovalDecision::AllowAlways) => {
                     if remember {
                         self.remember_if_execute(tool, risk, subject.agent_id);
-                        self.grant_batch(tool, risk, subject.agent_id);
+                        self.grant_batch(tool, args, risk, subject.agent_id);
                     }
                     GateOutcome::from(d)
                 }
@@ -312,15 +340,71 @@ impl ApprovalBroker {
         }
     }
 
-    /// 用户已批准 → 本 turn 内同类调用免问。destructive 永不批量。
-    fn grant_batch(&self, tool: &str, risk: RiskLevel, agent_id: &str) {
-        if risk == RiskLevel::Destructive {
+    /// 用户已批准 → 本 turn 内**参数完全相同**的同类调用免问。
+    /// 非 Execute 一律不开窗口：写入类每次必问（D3 拍板），Destructive 本来每次必问。
+    fn grant_batch(&self, tool: &str, args: &Value, risk: RiskLevel, agent_id: &str) {
+        let Some(key) = Self::batch_key(risk, args) else {
             return;
-        }
+        };
         *self.batch.lock().expect("batch 锁中毒") = Some(BatchGrant {
             agent_id: agent_id.to_string(),
             tool: tool.to_string(),
+            key,
         });
+    }
+
+    /// 批量的参数指纹：**整份参数完全一致才算同一类**。
+    ///
+    /// 为什么不是「可执行文件 + 子命令」：`git commit` 与 `git commit --amend`、
+    /// `docker run` 与 `docker run --privileged` 会落在同一个粗粒度键上——风险明明随
+    /// 旗标变了却仍被放行。既然没法穷举"哪个旗标改变风险"，就只能退到最保守的判据：
+    /// 参数完全相同。代价是重复度下降、多弹卡，这是用户明确选过的交换。
+    ///
+    /// 返回 None = 不批量：非 Execute（写入类每次必问）、参数不是非空对象、
+    /// 或 `command` 存在却不是非空字符串（拿不到"这一次到底是什么"就没法比）。
+    fn batch_key(risk: RiskLevel, args: &Value) -> Option<String> {
+        if risk != RiskLevel::Execute {
+            return None;
+        }
+        let object = args.as_object()?;
+        if object.is_empty() {
+            return None;
+        }
+        if let Some(command) = object.get("command") {
+            match command.as_str() {
+                Some(text) if !text.trim().is_empty() => {}
+                _ => return None,
+            }
+        }
+        Some(Self::canonical_json(args))
+    }
+
+    /// 键顺序无关的紧凑 JSON：同一份参数不管字段顺序如何都得到同一个指纹。
+    fn canonical_json(value: &Value) -> String {
+        match value {
+            Value::Object(map) => {
+                let mut keys: Vec<&String> = map.keys().collect();
+                keys.sort_unstable();
+                let body = keys
+                    .into_iter()
+                    .map(|key| {
+                        let quoted = Value::String(key.clone()).to_string();
+                        format!("{quoted}:{}", Self::canonical_json(&map[key]))
+                    })
+                    .collect::<Vec<_>>()
+                    .join(",");
+                format!("{{{body}}}")
+            }
+            Value::Array(items) => {
+                let body = items
+                    .iter()
+                    .map(Self::canonical_json)
+                    .collect::<Vec<_>>()
+                    .join(",");
+                format!("[{body}]")
+            }
+            other => other.to_string(),
+        }
     }
 
     /// 前端回执入口（approve 命令）；返回是否命中 pending。
@@ -1009,6 +1093,265 @@ mod tests {
             tokio::time::sleep(std::time::Duration::from_millis(10)).await;
         }
         assert!(prompted, "destructive 档必须弹审批");
+        assert_eq!(gate.await.unwrap(), GateOutcome::Denied);
+    }
+
+    /// 等挂起请求出现（最多 2s）。新用例统一走这里，不改既有用例的轮询写法。
+    async fn wait_pending(broker: &ApprovalBroker, request_id: &str) -> bool {
+        for _ in 0..200 {
+            if broker.has_pending(request_id) {
+                return true;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+        }
+        false
+    }
+
+    /// 取一次审批卡事件里的 `(call_id, batch_scope)`，用于断言卡片上写了什么。
+    fn approval_fields(capture: &CaptureSink, request_id: &str) -> Option<(Option<String>, Option<String>)> {
+        capture.events.lock().unwrap().iter().find_map(|event| match event {
+            EventMsg::ExecApprovalRequest { request_id: id, call_id, batch_scope, .. } if id == request_id => {
+                Some((call_id.clone(), batch_scope.clone()))
+            }
+            _ => None,
+        })
+    }
+
+    const ON_REQUEST_WS: policy::SessionPolicy = policy::SessionPolicy {
+        approval: ApprovalMode::OnRequest,
+        sandbox: SandboxMode::WorkspaceWrite,
+    };
+
+    /// D3 拍板：**写入类完全退出批量**。同一 turn 内参数完全相同的两次补丁，
+    /// 第二次仍必须弹卡；卡片上也不得出现批量范围。
+    ///
+    /// 反向对照：把 `batch_key` 里的 `risk != Execute` 判断去掉，本用例会红
+    /// （第二次直接放行，`wait_pending` 返回 false）。
+    #[tokio::test]
+    async fn write_tool_never_batches_even_with_identical_args() {
+        let broker = Arc::new(ApprovalBroker::new());
+        let cancel = CancellationToken::new();
+        let capture = Arc::new(CaptureSink::default());
+        let sink: Arc<dyn EventSink> = capture.clone();
+        let patch = serde_json::json!({"patch": "*** Begin Patch\n*** Update File: a.rs\n@@\n-old\n+new\n*** End Patch"});
+
+        let gate1 = tokio::spawn({
+            let broker = broker.clone();
+            let cancel = cancel.clone();
+            let sink = sink.clone();
+            let patch = patch.clone();
+            async move {
+                broker
+                    .gate("apply_patch", &patch, "w1", ON_REQUEST_WS, GateSubject::root("root"), GateEnv { sink: &sink, cancel: &cancel })
+                    .await
+            }
+        });
+        assert!(wait_pending(&broker, "appr-w1").await, "首次写入必须弹卡");
+        assert_eq!(
+            approval_fields(&capture, "appr-w1"),
+            Some((Some("w1".to_string()), None)),
+            "写入类不得声明批量范围，且卡片要带原始 call_id"
+        );
+        assert!(broker.resolve("appr-w1", ApprovalDecision::Allow));
+        assert_eq!(gate1.await.unwrap(), GateOutcome::Allowed);
+
+        // 参数完全相同也不行：批准 A 不等于批准 B
+        let gate2 = tokio::spawn({
+            let broker = broker.clone();
+            let cancel = cancel.clone();
+            let sink = sink.clone();
+            let patch = patch.clone();
+            async move {
+                broker
+                    .gate("apply_patch", &patch, "w2", ON_REQUEST_WS, GateSubject::root("root"), GateEnv { sink: &sink, cancel: &cancel })
+                    .await
+            }
+        });
+        assert!(
+            wait_pending(&broker, "appr-w2").await,
+            "写入类第二次必须重新弹卡：参数相同也不批量"
+        );
+        assert!(broker.resolve("appr-w2", ApprovalDecision::Deny));
+        assert_eq!(gate2.await.unwrap(), GateOutcome::Denied);
+    }
+
+    /// D3：命令类只在**参数完全相同的同一 turn 内**复用批准，且首次卡片必须声明范围。
+    /// 跨 turn 窗口清空，同一命令重新弹卡。
+    #[tokio::test]
+    async fn identical_exec_command_batches_within_turn_and_declares_scope() {
+        let broker = Arc::new(ApprovalBroker::new());
+        let cancel = CancellationToken::new();
+        let capture = Arc::new(CaptureSink::default());
+        let sink: Arc<dyn EventSink> = capture.clone();
+        let exec_args = serde_json::json!({"command": "git status"});
+
+        let gate1 = tokio::spawn({
+            let broker = broker.clone();
+            let cancel = cancel.clone();
+            let sink = sink.clone();
+            let exec_args = exec_args.clone();
+            async move {
+                broker
+                    .gate("unified_exec", &exec_args, "e1", ON_REQUEST_WS, GateSubject::root("root"), GateEnv { sink: &sink, cancel: &cancel })
+                    .await
+            }
+        });
+        assert!(wait_pending(&broker, "appr-e1").await);
+        assert_eq!(
+            approval_fields(&capture, "appr-e1"),
+            Some((Some("e1".to_string()), Some("same-args".to_string()))),
+            "命令类批准后确实会开窗口，卡片必须写明范围"
+        );
+        assert!(broker.resolve("appr-e1", ApprovalDecision::Allow));
+        assert_eq!(gate1.await.unwrap(), GateOutcome::Allowed);
+
+        // 同一 turn、同一参数：不再询问
+        let same = broker
+            .gate("unified_exec", &exec_args, "e2", ON_REQUEST_WS, GateSubject::root("root"), GateEnv { sink: &sink, cancel: &cancel })
+            .await;
+        assert_eq!(same, GateOutcome::Allowed, "参数完全相同的调用应复用本 turn 的批准");
+        assert!(!broker.has_pending("appr-e2"), "批量命中不应产生新的审批卡");
+
+        // 新 turn：窗口清空，必须重新询问
+        broker.begin_turn("root");
+        let gate3 = tokio::spawn({
+            let broker = broker.clone();
+            let cancel = cancel.clone();
+            let sink = sink.clone();
+            let exec_args = exec_args.clone();
+            async move {
+                broker
+                    .gate("unified_exec", &exec_args, "e3", ON_REQUEST_WS, GateSubject::root("root"), GateEnv { sink: &sink, cancel: &cancel })
+                    .await
+            }
+        });
+        assert!(wait_pending(&broker, "appr-e3").await, "批量不跨 turn");
+        assert!(broker.resolve("appr-e3", ApprovalDecision::Deny));
+        assert_eq!(gate3.await.unwrap(), GateOutcome::Denied);
+    }
+
+    /// D3 核心反向对照：批准 `git status` 不得连带 `git push --force`。
+    /// 旧 `(agent_id, tool)` 批量下第二次会直接放行；改为参数指纹后必须重新弹卡。
+    #[tokio::test]
+    async fn different_exec_command_in_same_turn_must_prompt_again() {
+        let broker = Arc::new(ApprovalBroker::new());
+        let cancel = CancellationToken::new();
+        let sink = sink();
+
+        let gate1 = tokio::spawn({
+            let broker = broker.clone();
+            let cancel = cancel.clone();
+            let sink = sink.clone();
+            async move {
+                broker
+                    .gate("unified_exec", &serde_json::json!({"command": "git status"}), "d1", ON_REQUEST_WS, GateSubject::root("root"), GateEnv { sink: &sink, cancel: &cancel })
+                    .await
+            }
+        });
+        assert!(wait_pending(&broker, "appr-d1").await);
+        assert!(broker.resolve("appr-d1", ApprovalDecision::Allow));
+        assert_eq!(gate1.await.unwrap(), GateOutcome::Allowed);
+
+        let gate2 = tokio::spawn({
+            let broker = broker.clone();
+            let cancel = cancel.clone();
+            let sink = sink.clone();
+            async move {
+                broker
+                    .gate(
+                        "unified_exec",
+                        &serde_json::json!({"command": "git push --force"}),
+                        "d2",
+                        ON_REQUEST_WS,
+                        GateSubject::root("root"),
+                        GateEnv { sink: &sink, cancel: &cancel },
+                    )
+                    .await
+            }
+        });
+        assert!(
+            wait_pending(&broker, "appr-d2").await,
+            "命令变了风险就变了：不得复用 `git status` 的批准"
+        );
+        assert!(broker.resolve("appr-d2", ApprovalDecision::Deny));
+        assert_eq!(gate2.await.unwrap(), GateOutcome::Denied);
+    }
+
+    /// D3 附加断言：`AllowAlways` 当前 UI 不可达，但即使被送达，
+    /// 写入类也**不得**写会话记忆或开批量窗口——否则将来接上第三态就是无声扩权。
+    #[tokio::test]
+    async fn allow_always_on_write_tool_grants_nothing_beyond_this_call() {
+        let broker = Arc::new(ApprovalBroker::new());
+        let cancel = CancellationToken::new();
+        let sink = sink();
+        let patch = serde_json::json!({"patch": "*** Begin Patch\n*** Update File: a.rs\n@@\n-old\n+new\n*** End Patch"});
+
+        let gate1 = tokio::spawn({
+            let broker = broker.clone();
+            let cancel = cancel.clone();
+            let sink = sink.clone();
+            let patch = patch.clone();
+            async move {
+                broker
+                    .gate("apply_patch", &patch, "aa1", ON_REQUEST_WS, GateSubject::root("root"), GateEnv { sink: &sink, cancel: &cancel })
+                    .await
+            }
+        });
+        assert!(wait_pending(&broker, "appr-aa1").await);
+        assert!(broker.resolve("appr-aa1", ApprovalDecision::AllowAlways));
+        assert_eq!(gate1.await.unwrap(), GateOutcome::Allowed);
+
+        let gate2 = tokio::spawn({
+            let broker = broker.clone();
+            let cancel = cancel.clone();
+            let sink = sink.clone();
+            let patch = patch.clone();
+            async move {
+                broker
+                    .gate("apply_patch", &patch, "aa2", ON_REQUEST_WS, GateSubject::root("root"), GateEnv { sink: &sink, cancel: &cancel })
+                    .await
+            }
+        });
+        assert!(
+            wait_pending(&broker, "appr-aa2").await,
+            "AllowAlways 只能放行这一次的写入，不得写 remembered_execute 或开批量窗口"
+        );
+        assert!(broker.resolve("appr-aa2", ApprovalDecision::Deny));
+        assert_eq!(gate2.await.unwrap(), GateOutcome::Denied);
+    }
+
+    /// 提权询问（on-failure）：卡片仍要能定位到原始 call_id，但**永不声明批量范围**。
+    #[tokio::test]
+    async fn escalation_prompt_carries_call_id_but_never_batch_scope() {
+        let broker = Arc::new(ApprovalBroker::new());
+        let cancel = CancellationToken::new();
+        let capture = Arc::new(CaptureSink::default());
+        let sink: Arc<dyn EventSink> = capture.clone();
+
+        let gate = tokio::spawn({
+            let broker = broker.clone();
+            let cancel = cancel.clone();
+            let sink = sink.clone();
+            async move {
+                broker
+                    .request_escalation(
+                        "unified_exec",
+                        &serde_json::json!({"command": "rm -rf build"}),
+                        "esc1",
+                        "只读沙箱禁止执行",
+                        GateSubject::root("root"),
+                        GateEnv { sink: &sink, cancel: &cancel },
+                    )
+                    .await
+            }
+        });
+        assert!(wait_pending(&broker, "appr-esc1-escalate").await);
+        assert_eq!(
+            approval_fields(&capture, "appr-esc1-escalate"),
+            Some((Some("esc1".to_string()), None)),
+            "提权卡要用原始 call_id 取详情，但「只这一次」不能声明批量"
+        );
+        assert!(broker.resolve("appr-esc1-escalate", ApprovalDecision::Deny));
         assert_eq!(gate.await.unwrap(), GateOutcome::Denied);
     }
 }
