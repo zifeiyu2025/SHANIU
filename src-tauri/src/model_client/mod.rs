@@ -763,6 +763,7 @@ mod tests {
             height: 128,
             tokens: 25,
             mime: "image/png".into(),
+            attachment_id: None,
         }
     }
 

@@ -119,12 +119,6 @@ fn shrink(image: &DynamicImage) -> Result<(Vec<u8>, u32, u32), ToolError> {
     Ok((buffer, target_w, target_h))
 }
 
-fn sha256_hex(bytes: &[u8]) -> String {
-    use sha2::Digest as _;
-    let digest = sha2::Sha256::digest(bytes);
-    digest.iter().map(|byte| format!("{byte:02x}")).collect()
-}
-
 #[async_trait]
 impl ToolExecutor for ViewImage {
     fn spec(&self) -> &ToolSpec {
@@ -197,7 +191,7 @@ impl ToolExecutor for ViewImage {
         } else {
             (original.clone(), original_mime, source_width, source_height, false)
         };
-        let hash = sha256_hex(&sent);
+        let hash = crate::images::sha256_hex(&sent);
         image_store::put(&hash, mime, &sent);
         if let Some(budget) = &ctx.images {
             let mut guard = budget
@@ -212,6 +206,8 @@ impl ToolExecutor for ViewImage {
             height,
             tokens: estimate_tokens(width, height),
             mime: mime.to_string(),
+            // 工具回填没有附件回执：这个引用不参与重开后的字节回灌。
+            attachment_id: None,
         };
         let shape = if resized {
             format!("{source_width}×{source_height} → {width}×{height}（已缩放）")

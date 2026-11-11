@@ -326,6 +326,170 @@ async fn quit_after_cancel(app: tauri::AppHandle) -> Result<(), String> {
     Ok(())
 }
 
+/// `send_task` / `resume_session` 的失败形态。
+///
+/// 视觉门禁是**结构化对象**（前端按 `code` 分支），其余既有错误保持字符串——
+/// `untagged` 让「任务为空」「未知沙箱档」这类文案原样到达前端，不为一个新门禁
+/// 把所有调用面的错误形状都改一遍。
+#[derive(Debug, serde::Serialize)]
+#[serde(untagged)]
+pub enum SendTaskError {
+    NoVision(ModelNoVision),
+    Plain(String),
+}
+
+/// 带图但当前模型看不了图：不写档案、不开回合，直接让用户换模型。
+#[derive(Debug, serde::Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ModelNoVision {
+    pub code: &'static str,
+    pub model: String,
+    pub message: String,
+}
+
+impl std::fmt::Display for SendTaskError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::NoVision(inner) => f.write_str(&inner.message),
+            Self::Plain(message) => f.write_str(message),
+        }
+    }
+}
+
+impl std::error::Error for SendTaskError {}
+
+impl From<String> for SendTaskError {
+    fn from(message: String) -> Self {
+        Self::Plain(message)
+    }
+}
+
+impl From<&str> for SendTaskError {
+    fn from(message: &str) -> Self {
+        Self::Plain(message.to_string())
+    }
+}
+
+/// `send_task` / `resume_session` 的图片入参：前端（浏览器）侧解码后的声明。
+///
+/// 这些值**只当线索**：真正的 mime / 尺寸 / 字节数以磁盘文件内容为准，
+/// 核对不一致直接拒绝（见 [`resolve_attachment_images`]）。
+#[derive(Debug, Clone, serde::Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ImageAttachmentInput {
+    pub attachment_id: String,
+    pub media_type: String,
+    pub bytes: u64,
+    pub width: u32,
+    pub height: u32,
+    #[serde(default)]
+    pub name: Option<String>,
+}
+
+/// 把附件回执读成可入请求的 `ImageRef`，并把字节放进 `image_store`。
+///
+/// 放在组合根而不是 `images`/`attachments`：FF-1 的允许边表里 `images` 不能指向
+/// `attachments` 或 `tools`，这里两样都要用，属于组合根的职责。
+///
+/// 核对顺序：字节数 → 文件头格式 → 尺寸。任何一项与声明不符都拒绝，
+/// 绝不「先用声明值发出去再说」——声明错了，端点只会回一个难懂的 400。
+fn resolve_attachment_images(
+    data_root: &Path,
+    session_id: &str,
+    inputs: &[ImageAttachmentInput],
+) -> Result<Vec<images::ImageRef>, String> {
+    let mut refs = Vec::with_capacity(inputs.len());
+    for input in inputs {
+        let (_, bytes) = attachments::read_full(data_root, session_id, &input.attachment_id)?;
+        if input.bytes != bytes.len() as u64 {
+            return Err(format!(
+                "附件 {} 字节数与声明不一致（实际 {}，声明 {}）",
+                input.attachment_id,
+                bytes.len(),
+                input.bytes
+            ));
+        }
+        let actual = images::sniff_image(&bytes).ok_or_else(|| {
+            format!(
+                "附件 {} 不是受支持的图片（仅 PNG/JPEG/GIF/WEBP）",
+                input.attachment_id
+            )
+        })?;
+        if normalize_mime(&input.media_type) != actual.mime {
+            return Err(format!(
+                "附件 {} 的实际格式是 {}，与声明的 {} 不一致",
+                input.attachment_id, actual.mime, input.media_type
+            ));
+        }
+        if actual.width != input.width || actual.height != input.height {
+            return Err(format!(
+                "附件 {} 的实际尺寸是 {}×{}，与声明的 {}×{} 不一致",
+                input.attachment_id, actual.width, actual.height, input.width, input.height
+            ));
+        }
+        let hash = images::sha256_hex(&bytes);
+        images::image_store::put(&hash, actual.mime, &bytes);
+        refs.push(images::ImageRef {
+            path: format!("attachments/{session_id}/{}.bin", input.attachment_id),
+            sha256: hash,
+            width: actual.width,
+            height: actual.height,
+            tokens: tools::view_image::estimate_tokens(actual.width, actual.height),
+            mime: actual.mime.to_string(),
+            attachment_id: Some(input.attachment_id.clone()),
+        });
+    }
+    Ok(refs)
+}
+
+/// 只统一大小写/参数与非标准别名；不做「猜格式」，猜的部分交给文件头。
+fn normalize_mime(raw: &str) -> String {
+    let base = raw
+        .split(';')
+        .next()
+        .unwrap_or("")
+        .trim()
+        .to_ascii_lowercase();
+    match base.as_str() {
+        "image/jpg" | "image/pjpeg" => "image/jpeg".to_string(),
+        other => other.to_string(),
+    }
+}
+
+/// 提交前的纯判据：剥 marker → 空任务判定 → 视觉门禁。
+///
+/// 门禁必须发生在 `build_new_session` / `begin_task` 之前：让请求发出去再等端点
+/// 回 400，既慢又把「模型看不了图」说成了「服务端错误」。
+fn preflight_send(
+    state: &AppState,
+    task: &str,
+    images: &[ImageAttachmentInput],
+) -> Result<String, SendTaskError> {
+    let stripped = images::strip_markers(task);
+    if stripped.trim().is_empty() && images.is_empty() {
+        return Err("任务为空".into());
+    }
+    let active = state.config().effective_model();
+    vision_gate_for(&active.model, active.vision, images)?;
+    Ok(stripped)
+}
+
+/// 视觉门禁本体（纯函数，便于两个方向都有断言）。
+fn vision_gate_for(
+    model: &str,
+    vision: bool,
+    images: &[ImageAttachmentInput],
+) -> Result<(), SendTaskError> {
+    if images.is_empty() || vision {
+        return Ok(());
+    }
+    Err(SendTaskError::NoVision(ModelNoVision {
+        code: "MODEL_NO_VISION",
+        model: model.to_string(),
+        message: format!("当前模型 {model} 不支持图片输入，请换成支持视觉的模型后再发送图片"),
+    }))
+}
+
 /// 提交任务，并返回**本次使用的 agent_id**。
 ///
 /// `agent_id` 为 None = 新会话（现场建档）；为 Some = 续写那份档案（SH-033 的
@@ -338,10 +502,9 @@ fn send_task(
     task: String,
     agent_id: Option<String>,
     sandbox_mode: Option<String>,
-) -> Result<String, String> {
-    if task.trim().is_empty() {
-        return Err("任务为空".into());
-    }
+    images: Option<Vec<ImageAttachmentInput>>,
+) -> Result<String, SendTaskError> {
+    let images = images.unwrap_or_default();
     // 只接受已知档位；拼错就拒绝，不静默回落到更宽的档（§11.3 退化红线）。
     let sandbox = match sandbox_mode.as_deref().map(str::trim).filter(|m| !m.is_empty()) {
         Some(raw) => Some(
@@ -351,16 +514,24 @@ fn send_task(
         None => None,
     };
     let state = app.state::<AppState>();
+    let task = preflight_send(&state, &task, &images)?;
     match agent_id.filter(|id| !id.trim().is_empty()) {
         Some(id) => {
-            continue_session(&app, &state, id.clone(), &task, sandbox)?;
+            continue_session(&app, &state, id.clone(), &task, sandbox, &images)
+                .map_err(SendTaskError::Plain)?;
             Ok(id)
         }
         None => {
+            // 新会话的档案 id 由后端生成，而附件是按会话 id 落盘的；没有 id 就没有
+            // 附件目录可读，别把「找不到图」伪装成上传失败。
+            if !images.is_empty() {
+                return Err("带图片的任务需要先创建会话".into());
+            }
             let (agent, cancel, new_id) =
                 build_new_session(&state, state.workspace_root().as_path(), sandbox)?;
             // 首条消息 = 标题自动生成的触发点（first-prompt 节奏）：后台辅助请求，
             // 不阻塞主回合；失败/关开关/没密钥都静默保持截断 fallback。
+            // 传的是剥掉 marker 的文本：标题生成也是「发给模型的文本」。
             session_title::spawn_generation(app.clone(), new_id.clone(), task.clone());
             let sink: Arc<dyn events::EventSink> =
                 Arc::new(events::TauriEventSink::root(app.clone(), new_id.clone()).with_journal(Arc::new(event_journal::FileEventJournal::new(app.state::<AppState>().data_root().join(config::SESSIONS_DIR)))).with_broadcast(app.state::<gateway::GatewayHub>().broadcast_sender()).with_viewers(app.state::<gateway::GatewayHub>().viewers()));
@@ -386,13 +557,18 @@ fn send_task(
 /// （`open_existing`，不重新建档）、已落盘条数作为写入起点（`persisted`，避免把旧历史
 /// 重写一遍）。历史合法性由 `rollout::resume` 的重放规则保证；这里不再"修"历史——
 /// 静默补配对会掩盖档案损坏，而档案损坏必须由上层显式处理。
+///
+/// `task` 必须是**已剥 marker** 的文本（两个入口都先过 `preflight_send`）。
 fn continue_session(
     app: &tauri::AppHandle,
     state: &AppState,
     agent_id: String,
     task: &str,
     draft_sandbox: Option<config::SandboxMode>,
+    images: &[ImageAttachmentInput],
 ) -> Result<(), String> {
+    // 先解析附件：路径/尺寸/媒体类型都以磁盘内容为准，坏附件在读档案前就拒绝。
+    let image_refs = resolve_attachment_images(&state.data_root(), &agent_id, images)?;
     let path = state
         .data_root()
         .join(rollout::ROLLOUT_DIR)
@@ -405,11 +581,19 @@ fn continue_session(
         session_title::spawn_generation(app.clone(), agent_id.clone(), task.to_string());
     }
     let mut history = resumed.history;
-    history.push(model_client::HistoryItem::Message {
-        role: model_client::Role::User,
-        text: task.to_string(),
-        reasoning: None,
-    });
+    if image_refs.is_empty() {
+        history.push(model_client::HistoryItem::Message {
+            role: model_client::Role::User,
+            text: task.to_string(),
+            reasoning: None,
+        });
+    } else {
+        history.push(model_client::HistoryItem::ImageMessage {
+            role: model_client::Role::User,
+            text: task.to_string(),
+            images: image_refs,
+        });
+    }
 
     // resume 复检：档案里的旧根可能指向旧版数据根/它的祖先，按**当前**数据根重判。
     // 命中即 fail-closed（`resume_workspace`），不拿它跑任务，也不静默改成默认根
@@ -457,13 +641,21 @@ fn continue_session(
 }
 
 /// 重启后恢复会话并续跑新任务（SH-031）。
+///
+/// 与 `send_task(Some(id))` 同一条主体：marker 剥离、空任务判定、视觉门禁
+/// 都在 `preflight_send` 里，别在两条入口各写一份。
 #[tauri::command]
-fn resume_session(app: tauri::AppHandle, agent_id: String, task: String) -> Result<(), String> {
-    if task.trim().is_empty() {
-        return Err("任务为空".into());
-    }
+fn resume_session(
+    app: tauri::AppHandle,
+    agent_id: String,
+    task: String,
+    images: Option<Vec<ImageAttachmentInput>>,
+) -> Result<(), SendTaskError> {
+    let images = images.unwrap_or_default();
     let state = app.state::<AppState>();
-    continue_session(&app, &state, agent_id, &task, None)
+    let task = preflight_send(&state, &task, &images)?;
+    continue_session(&app, &state, agent_id, &task, None, &images)
+        .map_err(SendTaskError::Plain)
 }
 
 /// 会话列表（SH-033）：档案目录里的摘要，按更新时间倒序。
@@ -640,6 +832,10 @@ pub enum SessionEntry {
         /// 事件落档时刻；`0` = 旧档案未记录，前端必须标"记录时刻不可信"（A0-4）。
         #[serde(default)]
         at_ms: u64,
+        /// 用户附件图片的结构化引用（只有 ImageMessage 有；旧档案没有这个键）。
+        /// 展示与重放都读它，而不是把图片压成正文里的 `[图片: …]` 文本。
+        #[serde(default, skip_serializing_if = "Vec::is_empty")]
+        images: Vec<images::ImageRef>,
     },
     ToolCall {
         call_id: String,
@@ -694,6 +890,7 @@ fn project_entries(items: &[rollout::RolloutItem]) -> Vec<SessionEntry> {
                 text: text.clone(),
                 reasoning: reasoning.clone(),
                 at_ms: *at_ms,
+                images: Vec::new(),
             }),
             rollout::RolloutItem::ResponseItem {
                 item: model_client::HistoryItem::FunctionCall { name, arguments, call_id },
@@ -720,20 +917,14 @@ fn project_entries(items: &[rollout::RolloutItem]) -> Vec<SessionEntry> {
                 reasoning: None,
                 // 压缩锚点没有独立时刻；getattr 不到就标不可信，不借导出时刻。
                 at_ms: 0,
+                images: Vec::new(),
             }),
-            // 带图消息按普通消息回放：只展示文字与图片路径引用，绝不还原字节
-            // （UI 取字节有独立预览通道，不走会话档案）。
+            // 带图消息保留结构化引用：展示层自己决定怎么渲染图片卡片，
+            // 重放也不再依赖正文里的历史 marker。字节永远不进档案。
             rollout::RolloutItem::ResponseItem {
                 item: model_client::HistoryItem::ImageMessage { role, text, images },
                 at_ms,
             } => {
-                let mut shown = text.clone();
-                for image in images {
-                    shown.push_str(&format!(
-                        "\n[图片: {}（{}×{}，约 {} tokens）]",
-                        image.path, image.width, image.height, image.tokens
-                    ));
-                }
                 out.push(SessionEntry::Message {
                     role: match role {
                         model_client::Role::User => "user",
@@ -741,9 +932,10 @@ fn project_entries(items: &[rollout::RolloutItem]) -> Vec<SessionEntry> {
                         model_client::Role::System => "system",
                     }
                     .to_string(),
-                    text: shown,
+                    text: text.clone(),
                     reasoning: None,
                     at_ms: *at_ms,
+                    images: images.clone(),
                 });
             }
             // 回合结局：如实带给导出/审计，不进对话历史。
@@ -3333,6 +3525,51 @@ mod session_projection_tests {
         }
     }
 
+    #[test]
+    fn image_message_projects_structured_refs_not_placeholder_text() {
+        // 图片引用走结构化字段：正文是用户原话，不再被拼上 `[图片: …]`。
+        // 重放也因此不必依赖旧档案正文里的 marker。
+        let reference = crate::images::ImageRef {
+            path: "attachments/s/01J0000000000000000000000A.bin".into(),
+            sha256: "ab".repeat(32),
+            width: 4,
+            height: 3,
+            tokens: 1,
+            mime: "image/png".into(),
+            attachment_id: Some("01J0000000000000000000000A".into()),
+        };
+        let items = vec![RolloutItem::ResponseItem {
+            item: HistoryItem::ImageMessage {
+                role: Role::User,
+                text: "看这张".into(),
+                images: vec![reference.clone()],
+            },
+            at_ms: 7,
+        }];
+        match &project_entries(&items)[0] {
+            SessionEntry::Message { text, images: refs, at_ms, .. } => {
+                assert_eq!(text, "看这张", "正文不得被拼上占位文本");
+                assert_eq!(refs, &vec![reference]);
+                assert_eq!(*at_ms, 7);
+            }
+            other => panic!("期望 Message，得到 {other:?}"),
+        }
+    }
+
+    #[test]
+    fn plain_message_keeps_old_wire_shape_without_images_key() {
+        // 无图消息的序列化形状必须与旧档案完全一致（additive 字段不外泄）。
+        let entry = SessionEntry::Message {
+            role: "user".into(),
+            text: "x".into(),
+            reasoning: None,
+            at_ms: 0,
+            images: Vec::new(),
+        };
+        let wire = serde_json::to_value(&entry).expect("serialize");
+        assert!(wire.get("images").is_none(), "空图片列表不得写出 images 键");
+    }
+
     /// 档位清单与枚举同源（SH-040）。
     ///
     /// 这里刻意用**序列化结果**而不是手写第二份字符串来比对：如果哪天给枚举加一档
@@ -3523,5 +3760,224 @@ mod workspace_scope_tests {
         )
         .unwrap_err();
         assert!(err.contains("不在目录中"), "任意 exe 路径必须被拒: {err}");
+    }
+}
+
+/// 提交前置（marker 剥离 / 空任务 / 视觉门禁）的用例。
+#[cfg(test)]
+mod preflight_send_tests {
+    use super::{preflight_send, vision_gate_for, ImageAttachmentInput, SendTaskError};
+    use crate::app_state::AppState;
+    use crate::config::AppConfig;
+
+    fn state(dir: &crate::test_support::TestTempDir) -> AppState {
+        AppState::new(AppConfig::default(), dir.join("config.toml"), dir.join("data"))
+    }
+
+    fn image_input() -> ImageAttachmentInput {
+        ImageAttachmentInput {
+            attachment_id: "01J0000000000000000000000A".into(),
+            media_type: "image/png".into(),
+            bytes: 10,
+            width: 4,
+            height: 3,
+            name: Some("a.png".into()),
+        }
+    }
+
+    #[test]
+    fn marker_never_reaches_the_model_text() {
+        let dir = crate::test_support::TestTempDir::new("preflight-strip");
+        let state = state(&dir);
+        let stripped = preflight_send(
+            &state,
+            "看这张\n<!-- shaniu-image:%7B%7D -->\n解释一下",
+            &[],
+        )
+        .expect("无图也应通过");
+        assert_eq!(stripped, "看这张\n解释一下");
+        assert!(!stripped.contains("shaniu-image"));
+    }
+
+    #[test]
+    fn marker_only_text_without_images_is_an_empty_task() {
+        let dir = crate::test_support::TestTempDir::new("preflight-empty");
+        let state = state(&dir);
+        let error = preflight_send(&state, "<!-- shaniu-image:x -->", &[]).unwrap_err();
+        assert!(matches!(error, SendTaskError::Plain(message) if message == "任务为空"));
+    }
+
+    #[test]
+    fn image_without_vision_is_rejected_and_writes_nothing() {
+        let dir = crate::test_support::TestTempDir::new("preflight-novision");
+        let state = state(&dir);
+        let active = state.config().effective_model();
+        assert!(!active.vision, "默认配置没有声明视觉，用例前提");
+        let error = preflight_send(&state, "看这张", &[image_input()]).unwrap_err();
+        match error {
+            SendTaskError::NoVision(info) => {
+                assert_eq!(info.code, "MODEL_NO_VISION");
+                assert_eq!(info.model, active.model);
+                assert!(
+                    info.message.contains(&active.model),
+                    "文案必须点名当前模型: {}",
+                    info.message
+                );
+            }
+            other => panic!("应为结构化 NoVision，实际 {other:?}"),
+        }
+        // 门禁在建档之前：数据根下不该出现任何档案。
+        let rollouts = dir.join("data").join(crate::rollout::ROLLOUT_DIR);
+        let archived = std::fs::read_dir(&rollouts)
+            .map(|entries| entries.count())
+            .unwrap_or(0);
+        assert_eq!(archived, 0, "门禁拒绝后不得写档案");
+    }
+
+    #[test]
+    fn vision_gate_allows_images_when_model_declares_vision() {
+        let images = [image_input()];
+        assert!(vision_gate_for("vision-model", true, &images).is_ok());
+        // 无图时视觉开关无关。
+        assert!(vision_gate_for("text-only", false, &[]).is_ok());
+        // 反向：视觉关闭 + 有图必拒。
+        let error = vision_gate_for("text-only", false, &images).unwrap_err();
+        assert!(matches!(error, SendTaskError::NoVision(info) if info.code == "MODEL_NO_VISION"));
+    }
+}
+
+/// 附件 → `ImageRef` 的核对用例：前端声明与实际文件内容不一致必须拒绝。
+#[cfg(test)]
+mod attachment_images_tests {
+    use super::{resolve_attachment_images, ImageAttachmentInput};
+    use crate::images::{image_store, sha256_hex};
+    use base64::Engine as _;
+
+    fn png(width: u32, height: u32) -> Vec<u8> {
+        let image = image::RgbImage::from_pixel(width, height, image::Rgb([1, 2, 3]));
+        let mut bytes = Vec::new();
+        image
+            .write_to(
+                &mut std::io::Cursor::new(&mut bytes),
+                image::ImageFormat::Png,
+            )
+            .unwrap();
+        bytes
+    }
+
+    fn stored_png(
+        root: &crate::test_support::TestTempDir,
+        width: u32,
+        height: u32,
+    ) -> (String, Vec<u8>) {
+        let bytes = png(width, height);
+        let stored = crate::attachments::store(
+            root,
+            "sess-1",
+            "shot.png",
+            "image/png",
+            &base64::engine::general_purpose::STANDARD.encode(&bytes),
+            Some(width),
+            Some(height),
+        )
+        .expect("store png");
+        (stored.receipt_id, bytes)
+    }
+
+    fn input(id: &str, mime: &str, bytes: u64, width: u32, height: u32) -> ImageAttachmentInput {
+        ImageAttachmentInput {
+            attachment_id: id.to_string(),
+            media_type: mime.to_string(),
+            bytes,
+            width,
+            height,
+            name: Some("shot.png".into()),
+        }
+    }
+
+    #[test]
+    fn builds_image_refs_from_actual_file_content() {
+        let root = crate::test_support::TestTempDir::new("images-from-attach");
+        let (id, bytes) = stored_png(&root, 12, 9);
+        let refs = resolve_attachment_images(
+            &root,
+            "sess-1",
+            &[input(&id, "image/png", bytes.len() as u64, 12, 9)],
+        )
+        .expect("resolve");
+        assert_eq!(refs.len(), 1);
+        assert_eq!(refs[0].attachment_id.as_deref(), Some(id.as_str()));
+        assert_eq!(refs[0].path, format!("attachments/sess-1/{id}.bin"));
+        assert_eq!((refs[0].width, refs[0].height), (12, 9));
+        assert_eq!(refs[0].mime, "image/png");
+        assert_eq!(refs[0].sha256, sha256_hex(&bytes));
+        assert!(image_store::data_url(&refs[0].sha256).is_some());
+    }
+
+    #[test]
+    fn rejects_declared_mime_that_contradicts_file_header() {
+        let root = crate::test_support::TestTempDir::new("images-bad-mime");
+        let (id, bytes) = stored_png(&root, 21, 13);
+        // 前端声称是 JPEG，文件头是 PNG。
+        let error = resolve_attachment_images(
+            &root,
+            "sess-1",
+            &[input(&id, "image/jpeg", bytes.len() as u64, 21, 13)],
+        )
+        .expect_err("mime 不一致必须拒绝");
+        assert!(error.contains("实际格式是 image/png"), "{error}");
+        assert!(
+            image_store::data_url(&sha256_hex(&bytes)).is_none(),
+            "拒绝的附件不得进缓存"
+        );
+    }
+
+    #[test]
+    fn rejects_declared_size_that_contradicts_file_header() {
+        let root = crate::test_support::TestTempDir::new("images-bad-size");
+        let (id, bytes) = stored_png(&root, 33, 17);
+        let error = resolve_attachment_images(
+            &root,
+            "sess-1",
+            &[input(&id, "image/png", bytes.len() as u64, 320, 200)],
+        )
+        .expect_err("尺寸不一致必须拒绝");
+        assert!(error.contains("实际尺寸是 33×17"), "{error}");
+    }
+
+    #[test]
+    fn rejects_declared_byte_count_that_contradicts_file() {
+        let root = crate::test_support::TestTempDir::new("images-bad-bytes");
+        let (id, bytes) = stored_png(&root, 7, 5);
+        let error = resolve_attachment_images(
+            &root,
+            "sess-1",
+            &[input(&id, "image/png", bytes.len() as u64 + 1, 7, 5)],
+        )
+        .expect_err("字节数不一致必须拒绝");
+        assert!(error.contains("字节数与声明不一致"), "{error}");
+    }
+
+    #[test]
+    fn rejects_non_image_attachment() {
+        let root = crate::test_support::TestTempDir::new("images-not-image");
+        let junk: &[u8] = b"definitely not a png";
+        let stored = crate::attachments::store(
+            &root,
+            "sess-1",
+            "fake.png",
+            "image/png",
+            &base64::engine::general_purpose::STANDARD.encode(junk),
+            Some(4),
+            Some(4),
+        )
+        .expect("store bytes");
+        let error = resolve_attachment_images(
+            &root,
+            "sess-1",
+            &[input(&stored.receipt_id, "image/png", junk.len() as u64, 4, 4)],
+        )
+        .expect_err("非图片内容必须拒绝");
+        assert!(error.contains("不是受支持的图片"), "{error}");
     }
 }

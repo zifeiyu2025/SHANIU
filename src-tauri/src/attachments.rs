@@ -234,6 +234,36 @@ pub fn read(
     })
 }
 
+/// 读回**完整**字节（无截断）与元数据里记录的媒体类型。
+///
+/// 只给「把附件真正送进模型」用：文本预览走 [`read`] 的窗口，图片必须拿全量字节，
+/// 否则发出去的是半张图。安全边界不变：会话 id 与回执 id 都要过 [`session_dir`] /
+/// [`parse_receipt`]，`MAX_UPLOAD_BYTES` 仍是上限。
+pub fn read_full(
+    data_root: &Path,
+    session_id: &str,
+    receipt_id: &str,
+) -> Result<(String, Vec<u8>), String> {
+    let dir = session_dir(data_root, session_id)?;
+    let id = parse_receipt(receipt_id)?;
+    let meta_path = dir.join(format!("{id}.json"));
+    let data_path = dir.join(format!("{id}.bin"));
+    let meta_body = fs::read(&meta_path).map_err(|e| format!("附件不存在或元数据缺失: {e}"))?;
+    let meta: Meta = serde_json::from_slice(&meta_body).map_err(|e| format!("附件元数据损坏: {e}"))?;
+    let bytes = fs::read(&data_path).map_err(|e| format!("附件字节缺失: {e}"))?;
+    if bytes.is_empty() {
+        return Err("附件为空".into());
+    }
+    if bytes.len() > MAX_UPLOAD_BYTES {
+        return Err(format!(
+            "附件超过上限（{} 字节 > {} 字节）",
+            bytes.len(),
+            MAX_UPLOAD_BYTES
+        ));
+    }
+    Ok((meta.media_type, bytes))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
