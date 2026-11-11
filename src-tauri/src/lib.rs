@@ -2604,6 +2604,14 @@ fn get_product_dirs() -> config::ProductDirsView {
     config::resolve_dirs_from_env().view()
 }
 
+/// 附件目录占用（设置页只读一行）：总文件数与总字节数。
+///
+/// 读失败原样报错而不是返回 0——0 会被误读成「没有附件」。
+#[tauri::command]
+fn attachment_stats(app: tauri::AppHandle) -> Result<attachments::AttachmentStats, String> {
+    attachments::stats(&app.state::<AppState>().data_root())
+}
+
 /// 读取系统剪贴板的纯文本（输入框右键菜单「粘贴」）。
 ///
 /// 桌面必须走宿主：WebView2 的 `navigator.clipboard.readText()` 走权限提示，
@@ -3103,6 +3111,7 @@ pub fn run() {
             get_plan_mode,
             set_plan_mode,
             get_product_dirs,
+            attachment_stats,
             read_session_events,
             latest_session_event_id,
             session_of_agent,

@@ -126,6 +126,61 @@ fn now_ms() -> u64 {
         .unwrap_or(0)
 }
 
+/// 附件目录占用（设置页只读一行）。
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct AttachmentStats {
+    pub file_count: u64,
+    pub total_bytes: u64,
+}
+
+/// 遍历 `<data_root>/attachments/<session>/` 下所有 `.bin`，累计数量与字节数。
+///
+/// 只读 `metadata()`，不读文件内容；只下探一层会话目录，不跟符号链接出界。
+/// 目录不存在返回 `(0, 0)`；其余读取失败原样报错——界面据此显示「—」，不显示 0。
+pub fn stats(data_root: &Path) -> Result<AttachmentStats, String> {
+    let mut stats = AttachmentStats {
+        file_count: 0,
+        total_bytes: 0,
+    };
+    let sessions = match std::fs::read_dir(data_root.join("attachments")) {
+        Ok(entries) => entries,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(stats),
+        Err(error) => return Err(format!("读取附件目录失败：{error}")),
+    };
+    for session in sessions {
+        let session = session.map_err(|error| format!("读取附件目录失败：{error}"))?;
+        let kind = session
+            .file_type()
+            .map_err(|error| format!("读取附件目录失败：{error}"))?;
+        if !kind.is_dir() {
+            continue;
+        }
+        let files = std::fs::read_dir(session.path())
+            .map_err(|error| format!("读取附件目录失败：{error}"))?;
+        for file in files {
+            let file = file.map_err(|error| format!("读取附件目录失败：{error}"))?;
+            let kind = file
+                .file_type()
+                .map_err(|error| format!("读取附件文件类型失败：{error}"))?;
+            if !kind.is_file() {
+                continue;
+            }
+            let path = file.path();
+            if path.extension().and_then(|value| value.to_str()) != Some("bin") {
+                continue;
+            }
+            let size = file
+                .metadata()
+                .map_err(|error| format!("读取附件文件信息失败：{error}"))?
+                .len();
+            stats.file_count += 1;
+            stats.total_bytes = stats.total_bytes.saturating_add(size);
+        }
+    }
+    Ok(stats)
+}
+
 /// 暂存一份文件/图片字节；返回给 file-upload 客户端消费的回执。
 pub fn store(
     data_root: &Path,
@@ -370,5 +425,26 @@ mod tests {
         assert_eq!(stored.file.as_ref().expect("file").name, "<b>.txt");
         // 路径穿越不能影响落点：字节文件在 ULID 名下
         assert!(root.join("attachments/sess-1").join(format!("{}.bin", stored.receipt_id)).is_file());
+    }
+
+    #[test]
+    fn stats_counts_only_bin_files_under_session_dirs() {
+        let root = temp_root("stats");
+        // 目录还不存在：是 0，不是错误。
+        assert_eq!(
+            stats(&root).expect("empty stats"),
+            AttachmentStats { file_count: 0, total_bytes: 0 }
+        );
+
+        let encoded = base64::engine::general_purpose::STANDARD.encode(b"png-bytes");
+        store(&root, "sess-1", "a.png", "image/png", &encoded, Some(2), Some(3)).expect("store first");
+        store(&root, "sess-2", "b.png", "image/png", &encoded, Some(2), Some(3)).expect("store second");
+        // 元数据 `.json` 与游离文件不该计入：统计只认 `.bin`。
+        std::fs::write(root.join("attachments").join("stray.txt"), b"ignore").expect("stray");
+
+        let summary = stats(&root).expect("stats");
+        assert_eq!(summary.file_count, 2);
+        // 两张图同一份内容：总字节 = 两倍原始长度（`.json` 元数据不计入）。
+        assert_eq!(summary.total_bytes, 2 * b"png-bytes".len() as u64);
     }
 }

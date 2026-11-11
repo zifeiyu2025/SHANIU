@@ -82,6 +82,8 @@ import { apply as modelConfigApply, inject as modelConfigInject } from './model-
 import { apply as modelCapabilitiesApply, inject as modelCapabilitiesInject } from './model-capabilities'
 // 默认目录说明（A0-6）：通用设置页一行只读信息，不改工作区选择逻辑。
 import { apply as defaultDirApply, inject as defaultDirInject } from './default-dir'
+// 附件占用（A0-7）：通用设置页一行只读统计，只让量级可见，不提供清理。
+import { apply as attachmentUsageApply, inject as attachmentUsageInject } from './attachment-usage'
 import { apply as sandboxStatusApply, inject as sandboxStatusInject } from './sandbox-status'
 import { apply as userTerminalSourceApply, inject as userTerminalSourceInject } from './terminal-source'
 import { apply as trayHintApply, inject as trayHintInject } from './tray-hint'
@@ -375,6 +377,8 @@ export async function bootShaniu(container: HTMLElement, options: BootOptions = 
     { inject: modelCapabilitiesInject, apply: modelCapabilitiesApply },
     // 默认目录说明：`data\Workspace` 只在实际使用时创建，界面必须与这条行为一致。
     { inject: defaultDirInject, apply: defaultDirApply },
+    // 附件占用：只报数，不当清理入口（清理是破坏性操作，先让量级可见）。
+    { inject: attachmentUsageInject, apply: attachmentUsageApply },
     // MCP 信任页（SH-063）：首连指纹审查 / 逐工具风险 / 撤销信任与豁免。
     { inject: mcpTrustInject, apply: mcpTrustApply },
     // 沙箱状态条（SH-021）：常驻展示权限档 / 强制完整度 / OS 机制（网络不参与档位，不展示）。

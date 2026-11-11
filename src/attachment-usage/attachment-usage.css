@@ -1,0 +1,33 @@
+/*
+ * 「附件占用」一行的样式。
+ * 与相邻的通用设置行同一节奏（16px 上下 + 一条分隔线，见 default-dir.css）；
+ * 颜色只引用已定义的 `--dsw-alias-*` 令牌。
+ */
+
+.attachment-usage-row {
+  display: flex;
+  flex-direction: column;
+  gap: 4px;
+  padding: 16px 0;
+  border-bottom: 0.5px solid var(--dsw-alias-border-l2);
+}
+
+.attachment-usage-title {
+  color: var(--dsw-alias-label-primary);
+  font-size: 13px;
+  font-weight: 600;
+}
+
+.attachment-usage-value {
+  color: var(--dsw-alias-label-primary);
+  font-family: ui-monospace, SFMono-Regular, Menlo, monospace;
+  font-size: 12px;
+}
+
+.attachment-usage-hint {
+  margin: 0;
+  color: var(--dsw-alias-label-secondary);
+  font-size: 12px;
+  line-height: 18px;
+  overflow-wrap: anywhere;
+}
