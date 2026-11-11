@@ -1,0 +1,179 @@
+/* 审批卡详情：结构化摘要 + 卡片内可展开的完整原文。 */
+.detail {
+  display: flex;
+  flex-direction: column;
+  gap: 8px;
+  min-width: 0;
+}
+
+.files {
+  display: flex;
+  flex-direction: column;
+  gap: 6px;
+  margin: 0;
+  padding: 0;
+  list-style: none;
+}
+
+.file {
+  display: flex;
+  flex-direction: column;
+  gap: 2px;
+  min-width: 0;
+}
+
+.fileHead {
+  display: flex;
+  align-items: baseline;
+  flex-wrap: wrap;
+  gap: 6px;
+  min-width: 0;
+}
+
+.path {
+  color: var(--dsw-alias-label-primary);
+  font-family: var(--ds-font-family-code);
+  font-size: 13px;
+  line-height: 20px;
+  word-break: break-all;
+}
+
+.op {
+  flex-shrink: 0;
+  color: var(--dsw-alias-label-secondary);
+  font-size: 12px;
+  line-height: 18px;
+}
+
+.lines {
+  display: inline-flex;
+  gap: 6px;
+  flex-shrink: 0;
+  font-family: var(--ds-font-family-code);
+  font-size: 12px;
+  line-height: 18px;
+}
+
+.added { color: var(--dsw-alias-state-success-primary); }
+
+.removed { color: var(--dsw-alias-state-error-primary); }
+
+.hunk {
+  color: var(--dsw-alias-label-tertiary);
+  font-family: var(--ds-font-family-code);
+  font-size: 12px;
+  line-height: 18px;
+  padding-left: 12px;
+  word-break: break-all;
+}
+
+.command {
+  margin: 0;
+  color: var(--dsw-alias-label-primary);
+  font-family: var(--ds-font-family-code);
+  font-size: 13px;
+  line-height: 20px;
+  /* 换行与缩进是判据的一部分：pre-wrap 保留，break-word 防溢出。 */
+  white-space: pre-wrap;
+  overflow-wrap: anywhere;
+}
+
+.meta {
+  color: var(--dsw-alias-label-tertiary);
+  font-size: 12px;
+  line-height: 18px;
+}
+
+.kv {
+  display: flex;
+  flex-direction: column;
+  gap: 4px;
+  margin: 0;
+}
+
+.kvRow {
+  display: flex;
+  gap: 8px;
+  min-width: 0;
+}
+
+.kvRow dt {
+  flex-shrink: 0;
+  min-width: 96px;
+  color: var(--dsw-alias-label-tertiary);
+  font-family: var(--ds-font-family-code);
+  font-size: 12px;
+  line-height: 18px;
+}
+
+.kvRow dd {
+  margin: 0;
+  min-width: 0;
+  color: var(--dsw-alias-label-primary);
+  font-family: var(--ds-font-family-code);
+  font-size: 12px;
+  line-height: 18px;
+  word-break: break-all;
+}
+
+.warn {
+  color: var(--dsw-alias-state-warn-primary);
+  font-size: 13px;
+  line-height: 20px;
+}
+
+.preview {
+  margin: 0;
+  max-height: 120px;
+  overflow: auto;
+  color: var(--dsw-alias-label-tertiary);
+  font-family: var(--ds-font-family-code);
+  font-size: 12px;
+  line-height: 18px;
+  white-space: pre-wrap;
+  overflow-wrap: anywhere;
+}
+
+.rawBlock {
+  min-width: 0;
+}
+
+.summary {
+  cursor: pointer;
+  color: var(--dsw-alias-label-secondary);
+  font-size: 12px;
+  line-height: 18px;
+}
+
+.rawHeader {
+  display: flex;
+  justify-content: flex-end;
+  padding-top: 2px;
+}
+
+.copy {
+  cursor: pointer;
+  border: 0;
+  background: transparent;
+  padding: 0;
+  color: var(--dsw-alias-label-tertiary);
+  font-size: 12px;
+  line-height: 18px;
+}
+
+.copy:hover { color: var(--dsw-alias-label-primary); }
+
+.raw {
+  margin: 4px 0 0;
+  max-height: 320px;
+  overflow: auto;
+  padding: 8px;
+  border-radius: var(--dsw-radius-md);
+  background: var(--dsw-alias-markdown-code-block);
+  color: var(--dsw-alias-label-secondary);
+  font-family: var(--ds-font-family-code);
+  font-size: 12px;
+  line-height: 18px;
+  white-space: pre-wrap;
+  overflow-wrap: anywhere;
+}

@@ -68,6 +68,8 @@ export interface ApprovalPresentationRequest {
   readonly reason?: string
   /** Localized presentation copy; the audit reason remains unchanged. */
   readonly displayReason?: { readonly en: string; readonly [locale: string]: string }
+  /** Caller-owned scope statement rendered as the card description. */
+  readonly description?: string
   /** Cancellation projected from the Host waterfall. */
   readonly signal?: AbortSignal
 }
@@ -94,6 +96,8 @@ export class PendingApproval {
   readonly reason: string | undefined
   /** Localized presentation copy, when supplied by the asker. */
   readonly displayReason: ApprovalPresentationRequest['displayReason']
+  /** Caller-owned scope statement, when supplied by the asker. */
+  readonly description: string | undefined
   /** Result returned by the Remote Event listener to the Host waterfall. */
   readonly result: Promise<ApprovalDecision>
 
@@ -116,6 +120,7 @@ export class PendingApproval {
     this.callId = request.callId
     this.reason = request.reason
     this.displayReason = request.displayReason
+    this.description = request.description
     const completion = Promise.withResolvers<ApprovalDecision>()
     this.result = completion.promise
     this.#resolve = completion.resolve

@@ -71,6 +71,11 @@ export interface ApprovalRequestEvent {
   readonly reason?: string
   /** Localized presentation only; never persisted in approval audit events. */
   readonly displayReason?: { readonly en: string; readonly [locale: string]: string }
+  /**
+   * Caller-owned scope statement shown as the card description (additive).
+   * Used to state how far one approval reaches (e.g. identical calls for this turn).
+   */
+  readonly description?: string
   /** Cancellation lifetime of the pending request. */
   readonly signal?: AbortSignal
 }
