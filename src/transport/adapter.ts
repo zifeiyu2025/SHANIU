@@ -36,7 +36,7 @@ import {
   relaySourceOf, settledNoticeOf, timingProjectionOf,
   type SubagentCatalogEntry, type SubagentCatalogEventData, type SubagentTimingState,
 } from './subagent-wire'
-import type { AgentEvent, EventMsg, TurnErrorInfo } from './types'
+import type { AgentEvent, CompactionTrigger, EventMsg, TurnErrorInfo } from './types'
 import { archiveImageToPrompt, type PromptImageRef, type SessionImageRefWire } from './image-ref'
 import type { HostBridge } from './tauri'
 
@@ -615,6 +615,13 @@ export function createAdapter(options: AdapterOptions): { remote: unknown; dispo
   const now = options.now ?? ((): number => replayClock ?? Date.now())
   const journals = new Map<string, Journal>()
   const titles = new Map<string, string>()
+  /**
+   * compactionId → 触发原因。`CompactionEnded` 不带 trigger（只有 started/summarized 带），
+   * 而失败通知要不要插取决于手动还是自动：手动 `/compact` 的结局由命令卡片自己展示，
+   * 再插一条就是重复。契约上每次压缩都必然有成对的 started/ended（失败/取消也发 ended），
+   * 所以这里不会无界增长。
+   */
+  const compactionTriggers = new Map<string, CompactionTrigger>()
   /**
    * 审批监听器（DSH 的 ui-approval 在装配时注册）。`this` 由 typert 派发时绑定，
    * 所以这里保留函数本体、由调用点用 `.call(scope, …)` 触发。
@@ -1954,6 +1961,7 @@ export function createAdapter(options: AdapterOptions): { remote: unknown; dispo
       case 'compaction_started':
         // 有损操作必须出声（对齐上游 `compaction/start`）：起点先落 journal，之后
         // 无论成功、失败还是取消，时间线上都能回答「这次上下文为什么变短」。
+        compactionTriggers.set(msg.compaction_id, msg.trigger)
         pushEvent(journal, 'compaction/start', {
           turn: journal.turn,
           compactionId: msg.compaction_id,
@@ -1987,14 +1995,39 @@ export function createAdapter(options: AdapterOptions): { remote: unknown; dispo
         }
         return
       }
-      case 'compaction_ended':
-        // 失败也必须有终点：只发 error 的话，这条压缩会在时间线上永远停在「开始」。
+      case 'compaction_ended': {
+        // 成败必须分流，不能只看 `error` 是否非空：后端「写失败 → 回滚内存历史」的方案
+        // 会发 `ok:false` 且不带 `error`，而 UI 只认 `error` 判成败
+        // （trajectory-compaction-definition.ts：status = error === undefined ? 'complete' : 'error'）。
+        // 只透传 `error` 的话，刚被显式化的失败会在前端被抹平成正常结束。
+        const trigger = compactionTriggers.get(msg.compaction_id)
+        compactionTriggers.delete(msg.compaction_id)
+        const reason = typeof msg.error === 'string' && msg.error.trim() !== '' ? msg.error : undefined
+        const failure = msg.ok ? undefined : (reason ?? '宿主未给出原因')
         pushEvent(journal, 'compaction/end', {
           turn: journal.turn,
           compactionId: msg.compaction_id,
-          ...(msg.error ? { error: msg.error } : {}),
+          // 失败但宿主没给原因时也必须给一句话：`compaction/end` 的 `error` 是唯一的
+          // 失败信号，空着等于把失败说成成功。
+          ...(failure === undefined ? {} : { error: reason ?? `压缩未生效（${failure}）` }),
         })
+        // 手动 `/compact` 的结局由命令卡片（`command/done`）自己展示，不再重复；
+        // 自动压缩没有别的痕迹，失败时不补这一行，用户只会发现「上下文没变短」。
+        if (failure !== undefined && trigger !== 'manual') {
+          const text = `上下文压缩未生效：${failure}。历史保持原样，可以继续对话。`
+          pushEvent(journal, 'developer/message', {
+            turn: journal.turn,
+            step: journal.step,
+            message: {
+              id: `shaniu-compact-failed-${msg.compaction_id}`,
+              role: 'developer',
+              source: { kind: 'compaction-notice' as const, form: 'notice' as const, summary: text },
+              content: [{ type: 'text', text }],
+            },
+          }, { surfaceOp: 'append' })
+        }
         return
+      }
       case 'system_prompt':
         // 提示词入轨迹：映射成上游的 `system/message`，只在该版本首次出现时由后端发出。
         // 用 `journal.turn/step`（DSH 口径）而不是后端的采样轮次：后者是 turn 内的

@@ -1178,6 +1178,77 @@ describe('适配层把 EventMsg 流映射成 DSH 会话 journal', () => {
     await iterator.return?.(undefined)
     dispose()
   })
+
+  it('压缩失败（ok:false 且没有 error）也必须可见：end 带失败原因，自动压缩补一条通知', async () => {
+    // 后端「写失败 → 回滚内存历史」的方案只发 `CompactionEnded{ok:false}`，不带 error。
+    // UI 的成败判据是 `compaction/end.data.error` 是否为空（上游
+    // trajectory-compaction-definition.ts），空着就把失败渲染成正常结束。
+    const bridge = scriptedBridge()
+    const { remote, dispose } = createAdapter({ bridge })
+    const session = faceOf(remote).session
+    await session.prompt({ sessionId: 'agent-compact', requestId: 'rpc-c1', content: [{ type: 'text', text: '长任务' }] })
+    bridge.emit('agent-compact', {
+      type: 'compaction_started', compaction_id: 'c1', trigger: 'pressure',
+      range_start: 0, range_end: 3, estimated_tokens: 900, budget_tokens: 800, turn: 1,
+    })
+    bridge.emit('agent-compact', { type: 'compaction_ended', compaction_id: 'c1', ok: false })
+
+    const iterator = session.follow({ address: { kind: 'session', sessionId: 'agent-compact' } })
+    const journal = eventsOf((await iterator.next()).value as Record<string, unknown>)
+    const ended = journal.find(event => event['type'] === 'compaction/end')?.['data'] as { error?: string }
+    expect(ended.error).toBe('压缩未生效（宿主未给出原因）')
+    const notice = journal.find(event => event['type'] === 'developer/message')?.['data'] as {
+      message: { source: { form?: string }; content: { text: string }[] }
+    }
+    expect(notice.message.source.form).toBe('notice')
+    expect(notice.message.content[0]?.text).toBe('上下文压缩未生效：宿主未给出原因。历史保持原样，可以继续对话。')
+    journal.forEach(event => expect(() => assertSessionWireEvent(event)).not.toThrow())
+
+    await iterator.return?.(undefined)
+    dispose()
+  })
+
+  it('压缩成功不带 error，也不插失败通知', async () => {
+    const bridge = scriptedBridge()
+    const { remote, dispose } = createAdapter({ bridge })
+    const session = faceOf(remote).session
+    await session.prompt({ sessionId: 'agent-ok', requestId: 'rpc-c2', content: [{ type: 'text', text: '长任务' }] })
+    bridge.emit('agent-ok', {
+      type: 'compaction_started', compaction_id: 'c2', trigger: 'pressure',
+      range_start: 0, range_end: 3, estimated_tokens: 900, budget_tokens: 800, turn: 1,
+    })
+    bridge.emit('agent-ok', { type: 'compaction_ended', compaction_id: 'c2', ok: true, history_tokens_after: 200 })
+
+    const iterator = session.follow({ address: { kind: 'session', sessionId: 'agent-ok' } })
+    const journal = eventsOf((await iterator.next()).value as Record<string, unknown>)
+    const ended = journal.find(event => event['type'] === 'compaction/end')?.['data'] as Record<string, unknown>
+    expect(ended).not.toHaveProperty('error')
+    expect(journal.some(event => event['type'] === 'developer/message')).toBe(false)
+
+    await iterator.return?.(undefined)
+    dispose()
+  })
+
+  it('手动压缩失败由命令卡片展示，不再插一条通知（不重复）', async () => {
+    const bridge = scriptedBridge()
+    const { remote, dispose } = createAdapter({ bridge })
+    const session = faceOf(remote).session
+    await session.prompt({ sessionId: 'agent-manual', requestId: 'rpc-c3', content: [{ type: 'text', text: '长任务' }] })
+    bridge.emit('agent-manual', {
+      type: 'compaction_started', compaction_id: 'c3', trigger: 'manual',
+      range_start: 0, range_end: 3, estimated_tokens: 900, budget_tokens: 800, turn: null,
+    })
+    bridge.emit('agent-manual', { type: 'compaction_ended', compaction_id: 'c3', ok: false })
+
+    const iterator = session.follow({ address: { kind: 'session', sessionId: 'agent-manual' } })
+    const journal = eventsOf((await iterator.next()).value as Record<string, unknown>)
+    expect((journal.find(event => event['type'] === 'compaction/end')?.['data'] as { error?: string }).error)
+      .toBe('压缩未生效（宿主未给出原因）')
+    expect(journal.some(event => event['type'] === 'developer/message')).toBe(false)
+
+    await iterator.return?.(undefined)
+    dispose()
+  })
 })
 
 describe('适配层的命令面映射', () => {
