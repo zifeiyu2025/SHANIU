@@ -246,6 +246,28 @@ where
     }
 }
 
+/// 把 `[target.range_start, target.range_end)` 换成一条 **user** 摘要消息。
+///
+/// 与 `rollout::resume` 重放 `Compacted` 锚点时的公式必须逐项一致——
+/// `memory_compaction_matches_resume_replay` 用例把两边对起来，改动任何一侧都会红。
+fn replace_with_summary(
+    history: &mut Vec<HistoryItem>,
+    target: crate::compaction::Target,
+    summary: &str,
+) {
+    history.splice(
+        target.range_start..target.range_end,
+        // 摘要必须是 **user** 而不是 assistant。两个理由各自独立、都成立：
+        // 1. thinking 档端点要求重放的每条 assistant 消息都带回 `reasoning_content`
+        //    （SH-083），而摘要没有 reasoning——以 assistant 身份进历史就直接 400。
+        //    这不是理论风险：1500 预算的真机基线里 `search-and-report` 就是这么挂的。
+        // 2. 摘要不是"模型说过的话"，而是交给下一个模型的交接指令——语义上就是 user 侧输入。
+        //    codex 同此：`CompactionSummary::role()` 返回 "user"。
+        // 注意这并不违反 04 §6.1 不变量③：那条禁止的是把摘要塞进 **system**。
+        [HistoryItem::Message { role: Role::User, text: summary.to_string(), reasoning: None }],
+    );
+}
+
 /// 档案时间戳：事件发生时刻（Unix 毫秒）。
 ///
 /// 刻意不复用序列化时刻：导出/搜索/审计都按它排序，写成"导出那一刻"会让整份
@@ -370,17 +392,7 @@ impl AgentLoop {
                 .map_err(CompactAbort::ArchiveUnavailable)?;
         }
 
-        history.splice(
-            target.range_start..target.range_end,
-            // 摘要必须是 **user** 而不是 assistant。两个理由各自独立、都成立：
-            // 1. thinking 档端点要求重放的每条 assistant 消息都带回 `reasoning_content`
-            //    （SH-083），而摘要没有 reasoning——以 assistant 身份进历史就直接 400。
-            //    这不是理论风险：1500 预算的真机基线里 `search-and-report` 就是这么挂的。
-            // 2. 摘要不是"模型说过的话"，而是交给下一个模型的交接指令——语义上就是 user 侧输入。
-            //    codex 同此：`CompactionSummary::role()` 返回 "user"。
-            // 注意这并不违反 04 §6.1 不变量③：那条禁止的是把摘要塞进 **system**。
-            [HistoryItem::Message { role: Role::User, text: summary.clone(), reasoning: None }],
-        );
+        replace_with_summary(history, target, &summary);
         *recorded = history.len();
         let history_tokens_after = crate::compaction::history_tokens(history);
         tracing::info!(
@@ -2323,6 +2335,79 @@ mod tests {
             "必须重试满次数再放弃，避免一次瞬时占用就把压缩作废"
         );
         assert!(error.contains("本次压缩未生效"), "文案要说明压缩没有发生：{error}");
+    }
+
+    /// 压缩有两份实现：回合内的内存替换（[`replace_with_summary`]）与 `rollout::resume`
+    /// 重放锚点。两者必须产出同一份历史——这正是「档案与运行态分叉」最容易复发的地方。
+    /// 断言逐项相等（`Vec<HistoryItem>` 的 PartialEq），不是比长度。
+    ///
+    /// 反向对照：把 resume 侧摘要的 role 改成 `System`（或让区间多留一条原消息），本用例红。
+    #[test]
+    fn memory_compaction_matches_resume_replay() {
+        use crate::rollout::resume::resume;
+        use crate::rollout::{ConfigSnapshot, RolloutItem, RolloutWriter};
+
+        let dir = crate::test_support::TestTempDir::new("compact-replay");
+        let items: Vec<HistoryItem> = vec![
+            HistoryItem::Message { role: Role::User, text: "u0".into(), reasoning: None },
+            HistoryItem::Message {
+                role: Role::Assistant,
+                text: "a1".into(),
+                reasoning: Some("思考 1".into()),
+            },
+            HistoryItem::Message { role: Role::User, text: "u2".into(), reasoning: None },
+            HistoryItem::Message { role: Role::Assistant, text: "a3".into(), reasoning: None },
+            HistoryItem::Message { role: Role::User, text: "u4".into(), reasoning: None },
+        ];
+        let meta = RolloutItem::SessionMeta {
+            session_id: "sess".into(),
+            agent_id: "agent".into(),
+            parent_id: None,
+            created_at: 0,
+            config_snapshot: ConfigSnapshot::default(),
+        };
+        let writer = RolloutWriter::create(&dir, &meta).unwrap();
+        for item in &items {
+            writer
+                .append(&RolloutItem::ResponseItem { item: item.clone(), at_ms: 0 })
+                .unwrap();
+        }
+        // 两次锚点：第二次的区间基于第一次压缩**之后**的历史，步骤语义必须与运行态一致。
+        let first = crate::compaction::Target { range_start: 1, range_end: 4 };
+        writer
+            .append(&RolloutItem::Compacted {
+                range_start: first.range_start,
+                range_end: first.range_end,
+                summary: "第一次交接摘要".into(),
+            })
+            .unwrap();
+        let second = crate::compaction::Target { range_start: 0, range_end: 2 };
+        writer
+            .append(&RolloutItem::Compacted {
+                range_start: second.range_start,
+                range_end: second.range_end,
+                summary: "第二次交接摘要".into(),
+            })
+            .unwrap();
+        let path = writer.path().to_path_buf();
+        drop(writer);
+
+        let resumed = resume(&path).unwrap();
+        assert_eq!(resumed.applied_compactions, 2, "两条锚点都应生效");
+
+        let mut memory = items.clone();
+        replace_with_summary(&mut memory, first, "第一次交接摘要");
+        replace_with_summary(&mut memory, second, "第二次交接摘要");
+
+        assert_eq!(memory, resumed.history, "内存压缩与档案重放必须逐项相等");
+        assert!(
+            matches!(
+                &memory[0],
+                HistoryItem::Message { role: Role::User, text, .. } if text == "第二次交接摘要"
+            ),
+            "摘要必须以 user 身份占据区间位置：{:?}",
+            memory[0]
+        );
     }
 
     /// A0-3：失败回合的档案结局必须写 `failed`，不能默认 `completed`。
