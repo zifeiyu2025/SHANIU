@@ -316,19 +316,7 @@ impl AclManager {
             // 备份删不掉 = 下次启动 `recover_pending` 会重放这份「授权前快照」，
             // 把此后对同一目录的合法授权一并抹掉。不能 `let _`：并进错误文案，
             // 让调用方知道 DACL 之外还留了一个待处理的备份。
-            let backup_note = if wrote_backup {
-                match std::fs::remove_file(&backup_path) {
-                    Ok(()) => String::new(),
-                    Err(remove_error) if backup_path.exists() => format!(
-                        "；且原始 DACL 备份删除失败（{}）：{remove_error}。下次启动会按它还原，\
-                         可能覆盖此后对同一目录的合法授权，请手工删除",
-                        backup_path.display()
-                    ),
-                    Err(_) => String::new(),
-                }
-            } else {
-                String::new()
-            };
+            let backup_note = backup_rollback_note(wrote_backup, &backup_path);
             self.audit(
                 "grant",
                 &normalized,
@@ -367,42 +355,28 @@ impl AclManager {
         let removed = revoke_ace(&normalized, sid).inspect_err(|error| {
             self.audit("revoke", &normalized, &sid_text, "-", "error", Some(error));
         })?;
-        if removed {
-            // 该路径上已无其它授权 → 备份文件也删掉，
-            // 否则退出还原会把刚撤销的 ACE 又写回去。
+        // 先记账、再清备份。`granted` 必须反映磁盘现状（ACE 此刻确实已经撤销）：
+        // 留着旧条目会让后续同键 `grant` 命中 `contains` 直接返回 Ok，留下一条
+        // 「已授权」却没有 ACE 的假记录——那比备份残留更难发现。
+        self.granted.remove(&(normalized.clone(), sid_text.clone()));
+        let other_grants = self.granted.iter().any(|(path, _)| *path == normalized);
+        if !other_grants {
+            // 该路径上已无其它授权 → 备份文件也删掉，否则下次启动 `recover_pending`
+            // 会把它原样重放，把刚撤销的 ACE 又写回去。
             //
-            // 删失败**不能吞**：备份还在 = 下次启动 `recover_pending` 会把它原样重放，
-            // 而审计已经记了 revoke ok——重启后的 DACL 会和用户看到的结果相反。
-            // 宁可这次撤销显式失败，并把条目留在 `granted` 里等重试。
-            let other_grants = self
-                .granted
-                .iter()
-                .any(|(path, other)| *path == normalized && other.as_str() != sid_text.as_str());
-            if !other_grants {
-                let backup = self.backup_path(&normalized);
-                if let Err(error) = std::fs::remove_file(&backup) {
-                    // 备份本来就不存在（幂等跳过路径没写过备份）不算失败。
-                    if backup.exists() {
-                        let message =
-                            format!("删除 DACL 备份失败（{}）：{error}", backup.display());
-                        self.audit(
-                            "revoke",
-                            &normalized,
-                            &sid_text,
-                            "-",
-                            "error",
-                            Some(&message),
-                        );
-                        return Err(format!(
-                            "撤销「{}」的沙箱 ACE 已生效，但{message}；不删掉备份的话，\
-                             下次启动会把它还原回来，请关闭占用该文件的程序后重试",
-                            normalized.display()
-                        ));
-                    }
-                }
+            // 删失败**不能吞**：审计会记 revoke ok，而重启后的 DACL 与用户看到的结果相反。
+            // 这里**不**以 `removed` 为前提：上一次失败可能正是「ACE 已撤、备份没删掉」，
+            // 用户重试时 `revoke_ace` 返回 false，遗留备份仍必须清掉。
+            let backup = self.backup_path(&normalized);
+            if let Err(message) = remove_backup(&backup) {
+                self.audit("revoke", &normalized, &sid_text, "-", "error", Some(&message));
+                return Err(format!(
+                    "撤销「{}」的沙箱 ACE 已生效，但{message}；\
+                     不删掉备份的话，下次启动会把它还原回来，请关闭占用该文件的程序后重试",
+                    normalized.display()
+                ));
             }
         }
-        self.granted.remove(&(normalized.clone(), sid_text.clone()));
         if removed {
             self.audit("revoke", &normalized, &sid_text, "-", "ok", None);
         }
@@ -914,6 +888,31 @@ pub(crate) fn write_backup_file(path: &Path, object: &Path, snapshot: &[u8]) -> 
         .map_err(|e| format!("提交 ACL 备份文件失败（{}）: {e}", path.display()))
 }
 
+/// 删掉一份 DACL 备份。**备份不存在算成功**（幂等跳过路径本来就没写备份），
+/// 存在但删不掉必须上抛：下次启动 `recover_pending` 会无条件重放它。
+fn remove_backup(backup: &Path) -> Result<(), String> {
+    match std::fs::remove_file(backup) {
+        Ok(()) => Ok(()),
+        Err(_) if !backup.exists() => Ok(()),
+        Err(error) => Err(format!("删除 DACL 备份失败（{}）：{error}", backup.display())),
+    }
+}
+
+/// `grant` 失败回滚时清掉刚写的备份，返回要并进错误文案的补充说明（成功 / 没写过 → 空串）。
+/// 单独成函数是为了让「删不掉时的完整文案」能被直接断言——这条路径在 `grant` 里
+/// 需要同时满足「写过备份 + 应用 DACL 失败 + 备份被占用」，没有注入点无法复现。
+fn backup_rollback_note(wrote_backup: bool, backup: &Path) -> String {
+    if !wrote_backup {
+        return String::new();
+    }
+    match remove_backup(backup) {
+        Ok(()) => String::new(),
+        Err(note) => format!(
+            "；且{note}。下次启动会按它还原，可能覆盖此后对同一目录的合法授权，请手工删除"
+        ),
+    }
+}
+
 fn restore_backup_file(path: &Path) -> Result<(), String> {
     let blob = std::fs::read(path)
         .map_err(|e| format!("读取备份文件失败（{}）: {e}", path.display()))?;
@@ -1360,6 +1359,79 @@ mod tests {
             !has_explicit_grant(&target, sid_b.as_psid(), Access::Write.mask()).unwrap(),
             "还原后另一个 SID 的 ACE 也应消失"
         );
+    }
+
+    /// 备份删不掉时撤销必须报错，而不是记 `revoke ok`：留着备份，下次启动
+    /// `recover_pending` 会把刚撤销的 ACE 原样还原，而用户看到的是「已撤销」。
+    #[test]
+    fn revoke_reports_locked_backup_and_retry_cleans_it_up() {
+        use std::os::windows::fs::OpenOptionsExt;
+
+        let ws = temp_dir("revoke-locked");
+        let target = ws.join("target");
+        std::fs::create_dir_all(&target).unwrap();
+        let sid = super::super::appcontainer::internet_client_capability().unwrap();
+        let mut manager = AclManager::new(ws.join("backups"));
+        manager.grant(&target, sid.as_psid(), Access::Write).unwrap();
+        let backup = manager.backup_path(&normalize(&target));
+        assert!(backup.exists(), "授权后应留下原始 DACL 备份");
+
+        // 独占打开（不共享删除）：`remove_file` 必然失败，不需要给产品代码加注入点。
+        let lock =
+            std::fs::OpenOptions::new().read(true).share_mode(0).open(&backup).unwrap();
+        let error = manager
+            .revoke(&target, sid.as_psid())
+            .expect_err("备份删不掉时撤销必须报错");
+        assert!(error.contains("删除 DACL 备份失败"), "{error}");
+        assert!(
+            error.contains(&backup.display().to_string()),
+            "错误文案必须带备份路径：{error}"
+        );
+        assert!(
+            !has_explicit_grant(&target, sid.as_psid(), Access::Write.mask()).unwrap(),
+            "ACE 确实已经撤销，报错不能掩盖这个事实"
+        );
+        let audit = std::fs::read_to_string(ws.join("acl-audit.jsonl")).unwrap();
+        let revoke_lines: Vec<&str> =
+            audit.lines().filter(|line| line.contains("\"action\":\"revoke\"")).collect();
+        assert!(!revoke_lines.is_empty(), "撤销必须落审计：{audit}");
+        assert!(
+            revoke_lines.iter().all(|line| !line.contains("\"result\":\"ok\"")),
+            "没删掉备份不能记 ok：{audit}"
+        );
+
+        drop(lock);
+        // 重试：ACE 已不在（`revoke_ace` 返回 false），但遗留备份仍必须被清掉。
+        assert!(!manager.revoke(&target, sid.as_psid()).unwrap());
+        assert!(!backup.exists(), "重试必须清掉遗留备份，否则下次启动会把它还原");
+        assert_eq!(manager.restore_all().unwrap(), 0, "没有备份可还原");
+    }
+
+    /// `grant` 失败回滚时备份删不掉：文案必须明说，否则用户不知道 DACL 之外
+    /// 还留着一份会在下次启动重放的快照。
+    #[test]
+    fn failed_grant_reports_backup_that_could_not_be_removed() {
+        use std::os::windows::fs::OpenOptionsExt;
+
+        let ws = temp_dir("grant-rollback");
+        let backup = ws.join("locked.dacl");
+        std::fs::write(&backup, b"stale").unwrap();
+        // 独占打开（不共享删除），`remove_file` 必然失败。
+        // 只读属性不行：Rust 的 `remove_file` 在 Windows 上会先清掉该属性再删。
+        let lock =
+            std::fs::OpenOptions::new().read(true).share_mode(0).open(&backup).unwrap();
+
+        let note = backup_rollback_note(true, &backup);
+        assert!(note.contains("删除 DACL 备份失败"), "{note}");
+        assert!(note.contains(&backup.display().to_string()), "{note}");
+        assert!(note.contains("请手工删除"), "{note}");
+        // 没写过备份时不该凭空冒出这句（幂等跳过路径没有可清理的东西）。
+        assert_eq!(backup_rollback_note(false, &backup), "");
+        // 备份不存在 = 成功，不算失败。
+        remove_backup(&ws.join("absent.dacl")).expect("没有备份不应算失败");
+
+        drop(lock);
+        remove_backup(&backup).expect("解除占用后应能删掉");
     }
 
     #[test]
