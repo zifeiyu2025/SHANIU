@@ -811,6 +811,11 @@ mod tests {
                 "常驻小节不得被截断（{anchor}）：{:?}",
                 rules.clipped
             );
+            assert!(
+                !rules.dropped.iter().any(|title| title == &section.title()),
+                "常驻小节不得进 dropped（{anchor}）：{:?}",
+                rules.dropped
+            );
         }
 
         // 两条最容易被挤掉的红线单独点名，诊断信息更具体。
