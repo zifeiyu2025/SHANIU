@@ -69,6 +69,7 @@ fn message(role: Role, text: &str) -> RolloutItem {
             text: text.to_string(),
             reasoning: None,
         },
+        at_ms: 0,
     }
 }
 
@@ -79,6 +80,7 @@ fn call(name: &str, arguments: &str, call_id: &str) -> RolloutItem {
             arguments: arguments.to_string(),
             call_id: call_id.to_string(),
         },
+        at_ms: 0,
     }
 }
 
@@ -88,6 +90,7 @@ fn output(call_id: &str, text: &str) -> RolloutItem {
             call_id: call_id.to_string(),
             output: text.to_string(),
         },
+        at_ms: 0,
     }
 }
 

@@ -64,7 +64,7 @@ pub fn resume(path: &Path) -> Result<Resumed, RolloutError> {
     let mut sandbox_mode: Option<String> = None;
     for item in &archive.items {
         match item {
-            RolloutItem::ResponseItem { item: h } => history.push(h.clone()),
+            RolloutItem::ResponseItem { item: h, .. } => history.push(h.clone()),
             RolloutItem::SandboxMode { mode, .. } => sandbox_mode = Some(mode.clone()),
             RolloutItem::Compacted { range_start, range_end, summary } => {
                 let (start, end) = (*range_start, *range_end);
@@ -146,10 +146,13 @@ fn paired_prefix(items: &[RolloutItem]) -> bool {
     let mut outputs: Vec<&str> = Vec::new();
     for item in items {
         match item {
-            RolloutItem::ResponseItem { item: HistoryItem::FunctionCall { call_id, .. } } => {
+            RolloutItem::ResponseItem { item: HistoryItem::FunctionCall { call_id, .. }, .. } => {
                 calls.push(call_id.as_str())
             }
-            RolloutItem::ResponseItem { item: HistoryItem::FunctionCallOutput { call_id, .. } } => {
+            RolloutItem::ResponseItem {
+                item: HistoryItem::FunctionCallOutput { call_id, .. },
+                ..
+            } => {
                 outputs.push(call_id.as_str())
             }
             _ => {}
@@ -221,18 +224,21 @@ mod tests {
     fn msg(text: &str) -> RolloutItem {
         RolloutItem::ResponseItem {
             item: HistoryItem::Message { role: Role::User, text: text.into(), reasoning: None },
+            at_ms: 1,
         }
     }
 
     fn call(id: &str) -> RolloutItem {
         RolloutItem::ResponseItem {
             item: HistoryItem::FunctionCall { name: "t".into(), arguments: "{}".into(), call_id: id.into() },
+            at_ms: 2,
         }
     }
 
     fn out(id: &str) -> RolloutItem {
         RolloutItem::ResponseItem {
             item: HistoryItem::FunctionCallOutput { call_id: id.into(), output: "o".into() },
+            at_ms: 3,
         }
     }
 

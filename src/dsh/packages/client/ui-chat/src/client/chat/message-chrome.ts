@@ -3,7 +3,7 @@
 import type { Translate } from '@deepseek-ai/dsh-client-ui-slots'
 
 /** The date-template share of the conversation dictionary the clock consumes. */
-export type ClockTranslate = Translate<'clock.md' | 'clock.ymd'>
+export type ClockTranslate = Translate<'clock.md' | 'clock.ymd' | 'clock.unreliable'>
 
 /** The elapsed-duration share of the conversation dictionary. */
 export type RunDurationTranslate =
@@ -79,11 +79,14 @@ export function formatTokensPerSecond(tps: number): string {
  * years → the `clock.ymd` template + clock. Pure: the date templates arrive
  * through the caller's locale seat.
  * @param time - Unix epoch ms from the source session event.
- * @param t - translate seat supplying the `clock.md` / `clock.ymd` templates.
+ * @param t - translate seat supplying the `clock.md` / `clock.ymd` / `clock.unreliable` templates.
  * @param now - Reference instant for the day/year cut (defaults to wall clock).
  * @returns Date-aware clock string (24-hour, zero-padded time).
  */
 export function formatMessageClock(time: number, t: ClockTranslate, now: number = Date.now()): string {
+  // SHANIU：`time <= 0` = 档案没有记录事件时刻（旧档案）。显示"记录时刻不可用"，
+  // 不能把 0 当成 1970 年或换成当前时钟——那等于在档案上写假时间。
+  if (!(time > 0)) return t('clock.unreliable')
   const d = new Date(time)
   const n = new Date(now)
   const clock = `${pad2(d.getHours())}:${pad2(d.getMinutes())}`

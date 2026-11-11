@@ -306,7 +306,7 @@ fn read_referenced(
     };
     let mut conversation: Vec<(String, String)> = Vec::new();
     for item in &archive.items {
-        if let crate::rollout::RolloutItem::ResponseItem { item } = item {
+        if let crate::rollout::RolloutItem::ResponseItem { item, .. } = item {
             match item {
                 HistoryItem::Message { role: Role::User, text, .. } if !text.trim().is_empty() => {
                     conversation.push(("user".into(), text.clone()))
@@ -485,7 +485,7 @@ mod tests {
         };
         let mut body = serde_json::to_string(&meta).unwrap();
         for (role, text) in messages {
-            let item = RolloutItem::ResponseItem { item: message(*role, text) };
+            let item = RolloutItem::ResponseItem { item: message(*role, text), at_ms: 0 };
             body.push('\n');
             body.push_str(&serde_json::to_string(&item).unwrap());
         }

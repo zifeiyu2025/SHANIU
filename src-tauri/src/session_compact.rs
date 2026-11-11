@@ -168,6 +168,7 @@ mod tests {
                         text: format!("用户消息 {i}"),
                         reasoning: None,
                     },
+                    at_ms: 0,
                 })
                 .unwrap();
             writer
@@ -177,6 +178,7 @@ mod tests {
                         text: format!("助手回复 {i}"),
                         reasoning: None,
                     },
+                    at_ms: 0,
                 })
                 .unwrap();
         }

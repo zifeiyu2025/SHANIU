@@ -113,6 +113,7 @@ fn rollout_lines_never_contain_registered_key() {
                 text: format!("帮我用 {key} 跑一下"),
                 reasoning: None,
             },
+            at_ms: 0,
         })
         .unwrap();
     writer
@@ -122,6 +123,7 @@ fn rollout_lines_never_contain_registered_key() {
                 text: format!("好的，我会用 {key}（不会写进任何日志）"),
                 reasoning: None,
             },
+            at_ms: 0,
         })
         .unwrap();
     drop(writer);

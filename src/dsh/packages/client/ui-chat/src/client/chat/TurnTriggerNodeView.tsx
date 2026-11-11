@@ -38,6 +38,7 @@ export function TurnTriggerNodeView({ node, t }: Pick<ChatNodeViewProps<'turn-tr
       <span>{t(details.title)}</span>
     </div>
   )
+  const known = node.data.time > 0
   const date = new Date(node.data.time)
   const time = formatMessageClock(node.data.time, t)
   return (
@@ -45,7 +46,10 @@ export function TurnTriggerNodeView({ node, t }: Pick<ChatNodeViewProps<'turn-tr
       <button className={css.header} type="button" aria-expanded={open} aria-controls={bodyId} onClick={() => { setOpen(!open) }}>
         <span className={css.icon} aria-hidden><TriggerIcon size={14} /></span>
         <span className={css.title}>{t(details.title)}</span>
-        <time className={css.time} dateTime={date.toISOString()}>{time}</time>
+        {/* SHANIU：旧档案没有记录时刻时只写文字，不挂一个 1970 的 dateTime。 */}
+        {known
+          ? <time className={css.time} dateTime={date.toISOString()}>{time}</time>
+          : <span className={css.time}>{time}</span>}
         <IconChevronDownOutlineRegular size={12} className={open ? css.openChevron : css.chevron} />
       </button>
       {open && <div id={bodyId} className={css.body}>

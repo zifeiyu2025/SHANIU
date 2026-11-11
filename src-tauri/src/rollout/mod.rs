@@ -59,7 +59,15 @@ pub enum RolloutItem {
     },
     /// 模型侧的一条完整记录。刻意用命名载荷而不是 newtype：
     /// `HistoryItem` 自身是内部标签枚举，newtype 变体与之嵌套会产生 `type` 键冲突。
-    ResponseItem { item: HistoryItem },
+    ResponseItem {
+        item: HistoryItem,
+        /// 事件落档时刻（Unix 毫秒）。
+        ///
+        /// `0` = 旧档案没有记录时刻（A0-4）：读侧必须标"时刻不可信"，
+        /// 绝不能用导出/回放那一刻冒充事件发生时刻。
+        #[serde(default)]
+        at_ms: u64,
+    },
     /// 压缩锚点：`[range_start, range_end)` 区间的历史被 summary 取代（SH-032 用）。
     Compacted {
         range_start: usize,
@@ -500,7 +508,7 @@ fn summarize(path: &Path) -> Option<SessionSummary> {
         if !title.is_empty() {
             continue;
         }
-        if let Ok(RolloutItem::ResponseItem { item: HistoryItem::Message { role, text, .. } }) =
+        if let Ok(RolloutItem::ResponseItem { item: HistoryItem::Message { role, text, .. }, .. }) =
             serde_json::from_str(&line)
         {
             if role == crate::model_client::Role::User {
@@ -619,6 +627,7 @@ mod tests {
             item: crate::model_client::HistoryItem::Message {
                 role: crate::model_client::Role::User, text: "任务".into(), reasoning: None,
             },
+            at_ms: 0,
         })
         .unwrap();
         let path = w.path().to_path_buf();
@@ -632,9 +641,9 @@ mod tests {
         let dir = temp_dir();
         let w = RolloutWriter::create(&dir, &meta("agent-rt")).unwrap();
         let items = vec![
-            RolloutItem::ResponseItem { item: HistoryItem::Message { role: Role::User, text: "任务".into(), reasoning: None } },
-            RolloutItem::ResponseItem { item: HistoryItem::FunctionCall { name: "read_file".into(), arguments: "{}".into(), call_id: "c1".into() } },
-            RolloutItem::ResponseItem { item: HistoryItem::FunctionCallOutput { call_id: "c1".into(), output: "内容".into() } },
+            RolloutItem::ResponseItem { item: HistoryItem::Message { role: Role::User, text: "任务".into(), reasoning: None }, at_ms: 1_000 },
+            RolloutItem::ResponseItem { item: HistoryItem::FunctionCall { name: "read_file".into(), arguments: "{}".into(), call_id: "c1".into() }, at_ms: 1_500 },
+            RolloutItem::ResponseItem { item: HistoryItem::FunctionCallOutput { call_id: "c1".into(), output: "内容".into() }, at_ms: 2_000 },
             RolloutItem::Compacted { range_start: 0, range_end: 2, summary: "前两轮摘要".into() },
             RolloutItem::SubagentRef { child_id: "child-1".into(), rollout_path: "rollouts/child-1.jsonl".into() },
         ];
@@ -658,6 +667,7 @@ mod tests {
                 serde_json::to_string(&meta("t")).unwrap(),
                 serde_json::to_string(&RolloutItem::ResponseItem {
                     item: HistoryItem::Message { role: Role::Assistant, text: "答".into(), reasoning: None },
+                    at_ms: 0,
                 })
                 .unwrap(),
             ),
@@ -676,6 +686,7 @@ mod tests {
                 serde_json::to_string(&meta("t")).unwrap(),
                 serde_json::to_string(&RolloutItem::ResponseItem {
                     item: HistoryItem::Message { role: Role::Assistant, text: "答".into(), reasoning: None },
+                    at_ms: 0,
                 })
                 .unwrap(),
             ),
@@ -694,6 +705,7 @@ mod tests {
         let path = dir.join("agent-damaged.jsonl");
         let good = serde_json::to_string(&RolloutItem::ResponseItem {
             item: HistoryItem::Message { role: Role::User, text: "有效".into(), reasoning: None },
+            at_ms: 0,
         })
         .unwrap();
         std::fs::write(
@@ -722,6 +734,7 @@ mod tests {
                 "not-json\n{}\n",
                 serde_json::to_string(&RolloutItem::ResponseItem {
                     item: HistoryItem::Message { role: Role::User, text: "x".into(), reasoning: None },
+                    at_ms: 0,
                 })
                 .unwrap()
             ),
@@ -749,6 +762,7 @@ mod tests {
                     text: "答".into(),
                     reasoning: None,
                 },
+                at_ms: 0,
             })
             .unwrap()
             .as_bytes(),
@@ -774,6 +788,7 @@ mod tests {
             format!("{}\n",
                 serde_json::to_string(&RolloutItem::ResponseItem {
                     item: HistoryItem::Message { role: Role::User, text: "x".into(), reasoning: None },
+                    at_ms: 0,
                 })
                 .unwrap()),
         )
@@ -788,6 +803,7 @@ mod tests {
             &dir,
             &RolloutItem::ResponseItem {
                 item: HistoryItem::Message { role: Role::User, text: "x".into(), reasoning: None },
+                at_ms: 0,
             },
         )
         .unwrap_err();
@@ -807,11 +823,13 @@ mod tests {
         writer
             .append(&RolloutItem::ResponseItem {
                 item: HistoryItem::Message { role: Role::User, text: first_task.into(), reasoning: None },
+                at_ms: 0,
             })
             .unwrap();
         writer
             .append(&RolloutItem::ResponseItem {
                 item: HistoryItem::Message { role: Role::Assistant, text: "收到".into(), reasoning: None },
+                at_ms: 0,
             })
             .unwrap();
         writer.path().to_path_buf()

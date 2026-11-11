@@ -53,7 +53,7 @@ fn anchor_written_by_compaction_replays_into_a_shorter_but_complete_history() {
 
     let writer = RolloutWriter::create(&dir, &meta("a1")).unwrap();
     for item in &items {
-        writer.append(&RolloutItem::ResponseItem { item: item.clone() }).unwrap();
+        writer.append(&RolloutItem::ResponseItem { item: item.clone(), at_ms: 0 }).unwrap();
     }
     let path = writer.path().to_path_buf();
     drop(writer);
@@ -111,7 +111,7 @@ fn summary_lands_as_a_user_message_not_an_assistant_one() {
     let items = vec![user_msg("任务"), big_output("c0", 40_000), big_output("c1", 40_000)];
     let writer = RolloutWriter::create(&dir, &meta("a2")).unwrap();
     for item in &items {
-        writer.append(&RolloutItem::ResponseItem { item: item.clone() }).unwrap();
+        writer.append(&RolloutItem::ResponseItem { item: item.clone(), at_ms: 0 }).unwrap();
     }
     let path = writer.path().to_path_buf();
     let target = compaction::plan_if_needed(0, &items, 20_000).unwrap();
@@ -146,7 +146,7 @@ fn out_of_range_target_is_rejected_by_resume() {
     let dir = temp_dir("oor");
     let writer = RolloutWriter::create(&dir, &meta("a3")).unwrap();
     writer
-        .append(&RolloutItem::ResponseItem { item: user_msg("只有一条") })
+        .append(&RolloutItem::ResponseItem { item: user_msg("只有一条"), at_ms: 0 })
         .unwrap();
     let path = writer.path().to_path_buf();
     writer
@@ -184,7 +184,7 @@ fn compacted_history_still_satisfies_thinking_mode_reasoning_requirement() {
     }
     let writer = RolloutWriter::create(&dir, &meta("a4")).unwrap();
     for item in &items {
-        writer.append(&RolloutItem::ResponseItem { item: item.clone() }).unwrap();
+        writer.append(&RolloutItem::ResponseItem { item: item.clone(), at_ms: 0 }).unwrap();
     }
     let path = writer.path().to_path_buf();
     let target = compaction::plan_if_needed(0, &items, 30_000).unwrap();

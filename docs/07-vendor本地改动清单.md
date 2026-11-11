@@ -42,6 +42,7 @@
 | 21 | `packages/client/ui-primitives/src/markdown/{render.tsx,MarkdownDelegate.tsx,MarkdownText.module.css}` | 图片加载失败态由纯 `<span>` 改为：目标为绝对 http(s) 且宿主提供 `openExternal` 标签时渲染 `<button type="button">`（点击调全局 `window.open`，由装配期宿主垫片落到 `open_external_url`），其余目标保持纯文本；`fileImages.labels` 增加可选 `openExternal`；新增 `.imageAltAction` 样式 | SH-137：裸 `<a href>` 在 Tauri 里会把整个应用导航到外网，且用户明确要求「失败图片可点 + 非 http(s) 不渲染链接」；`<span>` 无焦点、无提示 | 2026-11-10（SH-137）。**同步上游时**：上游若已把失败图片做成可点，删本地实现；同步后必须确认仍是按钮/宿主 IPC 而非裸锚点 |
 | 22 | `packages/client/ui-chat/src/client/{locale.ts,chat/ChatView.tsx}` | 8 套语言词典各加 `image.openExternal`（共 8 条）；`ChatView` 的 `fileImages.labels` 传入该键 | 失败图片的「在浏览器打开」提示是 UI 文案，不写死在 JSX；与 `image.*` 其余键同处维护 | 同上。**同步上游时**：上游若已加等价键，删本地 8 条改指上游键 |
 | 23 | `packages/client/ui-conversation/src/client/contract/records.ts`、`packages/client/ui-chat/src/client/conversation-nodes/{turn-error.ts,event-projection.ts}`、`packages/client/ui-chat/src/client/chat/{MessageItem.tsx,MessageItem.module.css}`、`packages/client/ui-chat/src/client/locale.ts` | 上游行为：`TurnErrorNode` 只有一句 `message` + `code`，没有任何原始诊断。本地：`TurnErrorNode` 增加可选 `detail`（HTTP 状态 / 端点 code / 端点 message，宿主已脱敏），`displayFailure` 透传（AUTH 也保留 detail），`TurnErrorItem` 增加可展开的 `<details>` 与复制按钮，8 套词典各加 `message.turnError.detail/.copy/.copied`。**diff 形态 = 纯附加**：所有新字段可选，未提供时渲染与上游完全一致 | A0 走查：401 在 UI 上只有"本轮运行失败"，用户与支持都无法对账；一句人话与原始证据必须同时可见 | 2026-11-11（A0-2）。**同步上游时**：上游若已提供等价原始诊断，删本地字段与组件改动改跟上游；只保留 `detail` 的构造（`adapter.ts` 属外壳层，不在此表） |
+| 24 | `packages/client/ui-chat/src/client/chat/{message-chrome.ts,TurnTriggerNodeView.tsx}`、`packages/client/ui-chat/src/client/locale.ts` | 上游行为：`formatMessageClock(time, …)` 无条件 `new Date(time)`，`0` 会显示成 1970 年；回合头 `<time dateTime={…}>` 同理。本地：`time <= 0` 视为「档案未记录时刻」，返回词典键 `clock.unreliable`（8 套语言各 1 条），回合头在未知时改用 `<span>` 不挂 `dateTime`。**diff 形态 = 纯附加分支**：`time > 0` 时与上游逐字一致 | A0 走查：旧档案没有事件时刻，回放曾用打开会话那一刻冒充，重开后时间全变成同一分钟；修复后新档有真实时刻，旧档必须明说「记录时刻不可用」而不是显示 1970 或假时钟 | 2026-11-11（A0-4）。**同步上游时**：上游若自己区分了「无时刻」，删本地分支改跟上游；同步后必须确认 `time = 0` 不再渲染成 1970 |
 
 第 9 行的文件（全部只做类型修复）：
 
@@ -84,6 +85,7 @@ packages/client/ui-primitives/src/image-drag.ts
 | 文件 | 偏离 | 理由 | 时间 |
 | --- | --- | --- | --- |
 | `src/header-actions/ExplorerButton.tsx`、`src/header-actions/explorer-button.css` | 保留 DSH `ui-open-in-app/OpenTargetButton.module.css` 紧凑态的 24px 高 / 11px / 0.5px `border-l4` 描边，但**去掉 chevron 半区与其分隔线**，整颗按钮一个点击区 | 上游那半个 chevron 是真实的下拉入口；本项目只有一个打开目标（系统文件管理器），画出来却不能展开属于无效交互诱导，比没有更糟 | 2026-11-10（v0.2.1，08 修） |
+| `src/header-actions/session-events.ts` | 导出的 JSONL 事件在 `time` 之外多一个可选 `timeUnreliable: true`（**只在档案没有事件时刻时出现**）；同时 `time` 取档案 `at_ms`，不再取导出那一刻 | 旧档案没记事件时刻，`time` 只能写 0；不加标记就等于把 0 当成真实时间交给审计。字段是附加的，上游 formatter 不读；有真实时刻时输出的键与上游一致 | 2026-11-11（A0-4）。**同步上游时**：上游事件模型若支持"时刻未知"，改用上游字段；否则保留，并在导出说明里维持该键 |
 
 ## 同步上游时怎么用
 

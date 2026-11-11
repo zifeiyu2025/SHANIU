@@ -199,8 +199,11 @@ where
     F: FnMut(&crate::rollout::RolloutItem) -> Result<(), crate::rollout::RolloutError>,
 {
     while *recorded < history.len() {
-        let entry =
-            crate::rollout::RolloutItem::ResponseItem { item: history[*recorded].clone() };
+        let entry = crate::rollout::RolloutItem::ResponseItem {
+            item: history[*recorded].clone(),
+            // 落档时刻即事件发生时刻：导出/回放/搜索都按它排序（A0-4）。
+            at_ms: now_ms(),
+        };
         let mut last_error = None;
         for _ in 0..MAX_ROLLOUT_WRITE_ATTEMPTS {
             match append(&entry) {
@@ -1720,7 +1723,8 @@ mod tests {
         assert_eq!(summary.reason, TurnEndReason::Cancelled);
     }
 
-    /// 审计 H3：写入失败时游标必须停在失败条目前；连续失败触顶后返回硬错误，
+
+    /// 审计 H3：写入失败时游标必须停在失败条目前；连续失败触顶后返回硬错误，
     /// 而不是把游标推到 `history.len()` 让这些条目永久不落盘。
     #[test]
     fn archive_cursor_stops_at_the_failed_item_and_hard_fails_at_threshold() {
@@ -2581,11 +2585,13 @@ mod tests {
         referenced
             .append(&RolloutItem::ResponseItem {
                 item: HistoryItem::Message { role: Role::User, text: "被引用的问题".into(), reasoning: None },
+                at_ms: 0,
             })
             .unwrap();
         referenced
             .append(&RolloutItem::ResponseItem {
                 item: HistoryItem::Message { role: Role::Assistant, text: "被引用的回答".into(), reasoning: None },
+                at_ms: 0,
             })
             .unwrap();
 

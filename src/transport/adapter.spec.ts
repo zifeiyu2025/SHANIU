@@ -1469,6 +1469,46 @@ describe('适配层的命令面映射', () => {
     expect(reason.kind).toBe('unknown')
   })
 
+  it('重开档案按条目 at_ms 还原时间：不再把整段历史压成打开会话那一刻', async () => {
+    const archive = [
+      { kind: 'message', role: 'user', text: '问', at_ms: 1_700_000_000_000 },
+      { kind: 'message', role: 'assistant', text: '答', at_ms: 1_700_000_012_000 },
+      {
+        kind: 'turn_end',
+        turn: 1,
+        reason: 'completed',
+        at_ms: 1_700_000_013_000,
+      },
+    ]
+    const reopened = createAdapter({ bridge: scriptedBridge(undefined, archive) })
+    const iterator = faceOf(reopened.remote).session.follow({ address: { kind: 'session', sessionId: 'agent-old' } })
+    const events = eventsOf((await iterator.next()).value as Record<string, unknown>)
+    await iterator.return?.(undefined)
+    reopened.dispose()
+
+    const timeOf = (type: string): unknown => events.find(event => event['type'] === type)?.['time']
+    // 反向对照：回放改回统一取 `Date.now()`（修复前），这三个值会全部相等。
+    expect(timeOf('turn/start')).toBe(1_700_000_000_000)
+    expect(timeOf('assistant/message')).toBe(1_700_000_012_000)
+    expect(timeOf('turn/end')).toBe(1_700_000_013_000)
+  })
+
+  it('旧档案没有 at_ms → 回放事件 time 为 0，界面据此显示记录时刻不可用', async () => {
+    const archive = [
+      { kind: 'message', role: 'user', text: '问' },
+      { kind: 'message', role: 'assistant', text: '答' },
+    ]
+    const reopened = createAdapter({ bridge: scriptedBridge(undefined, archive) })
+    const iterator = faceOf(reopened.remote).session.follow({ address: { kind: 'session', sessionId: 'agent-old' } })
+    const events = eventsOf((await iterator.next()).value as Record<string, unknown>)
+    await iterator.return?.(undefined)
+    reopened.dispose()
+
+    for (const event of events) {
+      expect(event['time']).toBe(0)
+    }
+  })
+
   it('模型席位只反映宿主真实配置，选模写回服务商文档并推投影', async () => {
     const bridge = scriptedBridge()
     const { remote, dispose } = createAdapter({ bridge })

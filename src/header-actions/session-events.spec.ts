@@ -121,4 +121,33 @@ describe('档案条目 → 逻辑事件', () => {
     // 反向对照：缺省 completed 会把所有旧档案的失败回合洗成成功。
     expect(end.data['reason']).toBe('unknown')
   })
+
+  it('事件时间取档案 at_ms，不再让整份导出只有一两个时间', () => {
+    const events = sessionEntriesToEvents([
+      { kind: 'message', role: 'user', text: '问', at_ms: 1_700_000_000_000 },
+      { kind: 'message', role: 'assistant', text: '答', at_ms: 1_700_000_012_000 },
+      { kind: 'tool_call', call_id: 'c1', tool: 'unified_exec', arguments: '{}', output: 'ok', at_ms: 1_700_000_013_000 },
+    ], '标题')
+
+    const times = events.map(event => (event as { time: number }).time)
+    // 反向对照：改回 `time: Date.now()`（导出那一刻），不同事件会塌成同一毫秒或仅剩标题/收口两个值。
+    expect(times).toEqual(expect.arrayContaining([
+      1_700_000_000_000,
+      1_700_000_012_000,
+      1_700_000_013_000,
+    ]))
+    expect(ofType(events, 'turn/start')[0]?.time).toBe(1_700_000_000_000)
+  })
+
+  it('旧档案没有 at_ms → time 为 0 且标 timeUnreliable，不假装时间可信', () => {
+    const events = sessionEntriesToEvents([
+      { kind: 'message', role: 'user', text: '问' },
+      { kind: 'message', role: 'assistant', text: '答' },
+    ], '标题')
+
+    for (const event of events as Array<{ time: number; timeUnreliable?: boolean }>) {
+      expect(event.time).toBe(0)
+      expect(event.timeUnreliable).toBe(true)
+    }
+  })
 })

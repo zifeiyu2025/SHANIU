@@ -635,6 +635,9 @@ pub enum SessionEntry {
         text: String,
         #[serde(skip_serializing_if = "Option::is_none")]
         reasoning: Option<String>,
+        /// 事件落档时刻；`0` = 旧档案未记录，前端必须标"记录时刻不可信"（A0-4）。
+        #[serde(default)]
+        at_ms: u64,
     },
     ToolCall {
         call_id: String,
@@ -642,6 +645,9 @@ pub enum SessionEntry {
         arguments: String,
         #[serde(skip_serializing_if = "Option::is_none")]
         output: Option<String>,
+        /// 事件落档时刻；`0` = 旧档案未记录（A0-4）。
+        #[serde(default)]
+        at_ms: u64,
     },
     /// 回合结局（A0-3）。旧档案没有这一条，导出侧必须标 `unknown` 而不是成功。
     TurnEnd {
@@ -663,6 +669,7 @@ fn project_entries(items: &[rollout::RolloutItem]) -> Vec<SessionEntry> {
     for item in items {
         if let rollout::RolloutItem::ResponseItem {
             item: model_client::HistoryItem::FunctionCallOutput { call_id, output },
+            ..
         } = item
         {
             outputs.insert(call_id.clone(), output.clone());
@@ -674,6 +681,7 @@ fn project_entries(items: &[rollout::RolloutItem]) -> Vec<SessionEntry> {
         match item {
             rollout::RolloutItem::ResponseItem {
                 item: model_client::HistoryItem::Message { role, text, reasoning },
+                at_ms,
             } => out.push(SessionEntry::Message {
                 role: match role {
                     model_client::Role::User => "user",
@@ -683,18 +691,22 @@ fn project_entries(items: &[rollout::RolloutItem]) -> Vec<SessionEntry> {
                 .to_string(),
                 text: text.clone(),
                 reasoning: reasoning.clone(),
+                at_ms: *at_ms,
             }),
             rollout::RolloutItem::ResponseItem {
                 item: model_client::HistoryItem::FunctionCall { name, arguments, call_id },
+                at_ms,
             } => out.push(SessionEntry::ToolCall {
                 call_id: call_id.clone(),
                 tool: name.clone(),
                 arguments: arguments.clone(),
                 output: outputs.get(call_id).cloned(),
+                at_ms: *at_ms,
             }),
             // 已并进对应的 ToolCall，不单独成条。
             rollout::RolloutItem::ResponseItem {
                 item: model_client::HistoryItem::FunctionCallOutput { .. },
+                ..
             } => {}
             // 压缩锚点在 resume 时的语义就是"用 summary 取代那段区间"，
             // 展示也必须一致，否则用户会看到区间原文而模型看到的是摘要——两份真相。
@@ -704,11 +716,14 @@ fn project_entries(items: &[rollout::RolloutItem]) -> Vec<SessionEntry> {
                 role: "user".to_string(),
                 text: summary.clone(),
                 reasoning: None,
+                // 压缩锚点没有独立时刻；getattr 不到就标不可信，不借导出时刻。
+                at_ms: 0,
             }),
             // 带图消息按普通消息回放：只展示文字与图片路径引用，绝不还原字节
             // （UI 取字节有独立预览通道，不走会话档案）。
             rollout::RolloutItem::ResponseItem {
                 item: model_client::HistoryItem::ImageMessage { role, text, images },
+                at_ms,
             } => {
                 let mut shown = text.clone();
                 for image in images {
@@ -726,6 +741,7 @@ fn project_entries(items: &[rollout::RolloutItem]) -> Vec<SessionEntry> {
                     .to_string(),
                     text: shown,
                     reasoning: None,
+                    at_ms: *at_ms,
                 });
             }
             // 回合结局：如实带给导出/审计，不进对话历史。
@@ -3169,18 +3185,21 @@ mod session_projection_tests {
     fn msg(role: Role, text: &str) -> RolloutItem {
         RolloutItem::ResponseItem {
             item: HistoryItem::Message { role, text: text.into(), reasoning: None },
+            at_ms: 0,
         }
     }
 
     fn call(name: &str, args: &str, id: &str) -> RolloutItem {
         RolloutItem::ResponseItem {
             item: HistoryItem::FunctionCall { name: name.into(), arguments: args.into(), call_id: id.into() },
+            at_ms: 0,
         }
     }
 
     fn out(id: &str, output: &str) -> RolloutItem {
         RolloutItem::ResponseItem {
             item: HistoryItem::FunctionCallOutput { call_id: id.into(), output: output.into() },
+            at_ms: 0,
         }
     }
 
@@ -3220,6 +3239,38 @@ mod session_projection_tests {
         match &project_entries(&items)[0] {
             SessionEntry::ToolCall { output, .. } => assert_eq!(output, &None),
             other => panic!("期望 ToolCall，得到 {other:?}"),
+        }
+    }
+
+    #[test]
+    fn projection_carries_archive_timestamp_verbatim_and_keeps_old_archive_zero() {
+        // 落档时刻是事件发生时刻，投影只搬运、绝不"用打开会话那一刻"补（A0-4）。
+        let items = vec![
+            RolloutItem::ResponseItem {
+                item: HistoryItem::Message { role: Role::User, text: "带时刻".into(), reasoning: None },
+                at_ms: 1_712_345_678_901,
+            },
+            RolloutItem::ResponseItem {
+                item: HistoryItem::FunctionCall { name: "t".into(), arguments: "{}".into(), call_id: "c1".into() },
+                at_ms: 1_712_345_679_000,
+            },
+            // 旧档案没有 at_ms：读回来是 0，必须原样出去，交给前端标"记录时刻不可信"。
+            msg(Role::Assistant, "旧消息"),
+        ];
+        let entries = project_entries(&items);
+        match &entries[0] {
+            SessionEntry::Message { at_ms, .. } => assert_eq!(*at_ms, 1_712_345_678_901),
+            other => panic!("期望 Message，得到 {other:?}"),
+        }
+        match &entries[1] {
+            SessionEntry::ToolCall { at_ms, .. } => assert_eq!(*at_ms, 1_712_345_679_000),
+            other => panic!("期望 ToolCall，得到 {other:?}"),
+        }
+        match &entries[2] {
+            SessionEntry::Message { at_ms, .. } => {
+                assert_eq!(*at_ms, 0, "旧档案不得被补成当前时刻，否则就是假装记录可信")
+            }
+            other => panic!("期望 Message，得到 {other:?}"),
         }
     }
 
@@ -3268,6 +3319,7 @@ mod session_projection_tests {
         // 否则"重开旧会话"和"刚跑完"看到的上下文不一样。
         let items = vec![RolloutItem::ResponseItem {
             item: HistoryItem::Message { role: Role::Assistant, text: "答案".into(), reasoning: Some("思路".into()) },
+            at_ms: 0,
         }];
         match &project_entries(&items)[0] {
             SessionEntry::Message { reasoning, .. } => assert_eq!(reasoning.as_deref(), Some("思路")),

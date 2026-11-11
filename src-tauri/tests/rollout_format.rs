@@ -143,7 +143,7 @@ async fn rollout_file_matches_history_after_one_task() {
         .items
         .iter()
         .filter_map(|i| match i {
-            RolloutItem::ResponseItem { item } => Some(item.clone()),
+            RolloutItem::ResponseItem { item, .. } => Some(item.clone()),
             // 结局行不进模型历史（回归时单独断言），这里只取正文。
             RolloutItem::TurnEnd { .. } => None,
             other => panic!("本轮不该出现 {other:?}"),
@@ -244,6 +244,7 @@ fn meta_only_archive_resumes_to_empty_history_and_still_appends() {
     writer
         .append(&RolloutItem::ResponseItem {
             item: HistoryItem::Message { role: Role::User, text: "第一条消息".into(), reasoning: None },
+            at_ms: 0,
         })
         .unwrap();
     drop(writer);

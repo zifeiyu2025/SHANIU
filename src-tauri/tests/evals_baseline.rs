@@ -481,7 +481,7 @@ impl RepairSignals {
         use shaniu_lib::rollout::RolloutItem;
         let mut signals = Self::default();
         for item in items {
-            let RolloutItem::ResponseItem { item } = item else { continue };
+            let RolloutItem::ResponseItem { item, .. } = item else { continue };
             let HistoryItem::Message { role, text, .. } = item else { continue };
             if *role != Role::System {
                 continue;
@@ -810,7 +810,7 @@ async fn run_one(
     // 请求就失败"是同一种噪声。现在标记 infra 继续跑，该样本仍以"失败"计入
     // （保守，不排除噪声），报告里单列 infra 数量。
     let has_assistant_output = archive.items.iter().any(|item| {
-        let shaniu_lib::rollout::RolloutItem::ResponseItem { item } = item else { return false; };
+        let shaniu_lib::rollout::RolloutItem::ResponseItem { item, .. } = item else { return false; };
         match item {
             HistoryItem::Message { role, .. } => *role != Role::User,
             HistoryItem::ImageMessage { role, .. } => *role != Role::User,

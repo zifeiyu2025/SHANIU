@@ -17,10 +17,14 @@
  *   却又不是——不如不塞，在偏差里写清。
  *
  * **已知偏差**（不改上游 formatter 的代价，逐条记在 docs/05）：
- * ① `seq` / `time` 是本地合成的单调值，不是真实日志序号（formatter 不读，仅用于满足类型）；
+ * ① `seq` 是本地合成的单调值，不是真实日志序号（formatter 不读，仅用于满足类型）；
  * ② `assistant/message` 的 `source`（provider/model 溯源）在 SHANIU 档案里没有等价物，
  *    填最小合法形状——formatter 只读 `content`，读不到这部分；
  * ③ `step` 恒为 1：档案不记步号，而 formatter 的分段只用 turn，不用 step。
+ *
+ * **时间（A0-4）**：`time` 一律取档案里的事件落档时刻 `at_ms`，不再用导出那一刻
+ * （那会让整份导出只有一两个不同时间）。旧档案没有 `at_ms`：写 `time: 0` 并附
+ * `timeUnreliable: true`，明说自己不可信，绝不拿当前时钟冒充。
  */
 import type { SessionEvent } from '@deepseek-ai/dsh-session/types'
 import type { SessionTitleEventData } from '@deepseek-ai/dsh-session-title/types'
@@ -42,13 +46,22 @@ declare module '@deepseek-ai/dsh-session/types' {
 
 /** 宿主 `load_session` 返回的一条历史（与 `src-tauri/src/lib.rs` 的 `SessionEntry` 对应）。 */
 export type SessionEntryLike =
-  | { readonly kind: 'message'; readonly role: string; readonly text: string; readonly reasoning?: string }
+  | {
+    readonly kind: 'message'
+    readonly role: string
+    readonly text: string
+    readonly reasoning?: string
+    /** 事件落档时刻（Unix 毫秒）；缺省或 0 = 旧档案未记录（A0-4）。 */
+    readonly at_ms?: number
+  }
   | {
     readonly kind: 'tool_call'
     readonly call_id: string
     readonly tool: string
     readonly arguments: string
     readonly output?: string
+    /** 事件落档时刻；缺省或 0 = 旧档案未记录（A0-4）。 */
+    readonly at_ms?: number
   }
   | {
     /** 回合结局（A0-3）：`completed` / `cancelled` / `failed` / `budget_exhausted`。 */
@@ -58,6 +71,14 @@ export type SessionEntryLike =
     readonly at_ms: number
     readonly error?: TurnErrorInfo
   }
+
+/** 一条档案条目的时间：有落档时刻就用它，否则如实标不可信（不拿导出时刻冒充）。 */
+function entryTime(entry: { readonly at_ms?: number }): { time: number; unreliable: boolean } {
+  const at = entry.at_ms
+  return typeof at === 'number' && at > 0
+    ? { time: at, unreliable: false }
+    : { time: 0, unreliable: true }
+}
 
 /** 合成事件的载体：`SessionEvent` 是带条件字段的判别联合，逐字段构造过不了收窄，这里统一承载。 */
 type Mutable<T> = { -readonly [K in keyof T]: T[K] }
@@ -78,14 +99,24 @@ export function sessionEntriesToEvents(
   let turn = 0
   let open = false
 
-  const push = (event: Record<string, unknown>): void => {
+  /** 推入一条事件：`time` 取档案时刻，未知则 0 + `timeUnreliable`（只加不改已有字段）。 */
+  const push = (event: Record<string, unknown>, at: { time: number; unreliable: boolean }): void => {
     seq += 1
-    events.push({ ...event, seq } as Mutable<SessionEvent>)
+    events.push({
+      ...event,
+      time: at.time,
+      ...at.unreliable ? { timeUnreliable: true } : {},
+      seq,
+    } as Mutable<SessionEvent>)
   }
 
   // 标题事件放在最前：formatter 用 `findLast(event => type === 'session/title')`，
-  // 只放一条即可；放最前面也符合"标题先于正文"的阅读顺序。
-  push({ type: 'session/title', time: Date.now(), data: { title } })
+  // 只放一条即可；放最前面也符合"标题先于正文"的阅读顺序。标题本身没有发生时刻，
+  // 取档案里第一条可靠时间；整份档案都没有就标不可信。
+  const firstKnown = entries.find(entry => 'at_ms' in entry && (entry.at_ms ?? 0) > 0)
+  push({ type: 'session/title', data: { title } }, firstKnown === undefined
+    ? { time: 0, unreliable: true }
+    : entryTime(firstKnown))
 
   /**
    * 收口当前回合。
@@ -96,33 +127,32 @@ export function sessionEntriesToEvents(
    */
   const closeTurn = (
     reason = 'unknown',
-    atMs?: number,
+    at?: { time: number; unreliable: boolean },
     error?: TurnErrorInfo,
   ): void => {
     if (!open) return
     push({
       type: 'turn/end',
-      time: atMs ?? Date.now(),
       data: error === undefined ? { turn, reason } : { turn, reason, error },
-    })
+    }, at ?? { time: 0, unreliable: true })
     open = false
   }
 
   for (const entry of entries) {
     // 结局行由宿主在回合收口时写入；它不属于新回合，只负责关闭当前回合。
     if (entry.kind === 'turn_end') {
-      if (entry.turn === turn) closeTurn(entry.reason, entry.at_ms, entry.error)
+      if (entry.turn === turn) closeTurn(entry.reason, entryTime(entry), entry.error)
       continue
     }
     if (entry.kind === 'message') {
       if (entry.role === 'user') {
         closeTurn()
         turn += 1
-        push({ type: 'turn/start', time: Date.now(), data: { turn } })
+        const at = entryTime(entry)
+        push({ type: 'turn/start', data: { turn } }, at)
         open = true
         push({
           type: 'user/message',
-          time: Date.now(),
           surfaceOp: 'append',
           data: {
             id: `shaniu-user-${String(seq)}`,
@@ -130,13 +160,12 @@ export function sessionEntriesToEvents(
             content: [{ type: 'text', text: entry.text }],
             source: { kind: 'user' },
           },
-        })
+        }, at)
         continue
       }
       if (entry.role !== 'assistant') continue // system / developer 不在 formatter 的渲染面内
       push({
         type: 'assistant/message',
-        time: Date.now(),
         surfaceOp: 'append',
         data: {
           turn,
@@ -149,21 +178,20 @@ export function sessionEntriesToEvents(
           },
           stream: [],
         },
-      })
+      }, entryTime(entry))
       continue
     }
 
     // tool_call：调用与结果配对展开。`callId` 用档案里的 call_id，
     // formatter 靠它把 result 回填到同一条 ToolEntry 上。
+    const at = entryTime(entry)
     push({
       type: 'tool/call',
-      time: Date.now(),
       data: { turn, step: 1, callId: entry.call_id, name: entry.tool, arguments: entry.arguments },
-    })
+    }, at)
     if (entry.output !== undefined) {
       push({
         type: 'tool/result',
-        time: Date.now(),
         surfaceOp: 'append',
         data: {
           turn,
@@ -176,7 +204,7 @@ export function sessionEntriesToEvents(
             toolCallId: entry.call_id,
           },
         },
-      })
+      }, at)
     }
   }
 

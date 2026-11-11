@@ -278,8 +278,8 @@ interface Journal {
  * 字段名跟着 Rust 的 serde 走：这里刻意**不**重命名，改名就会和后端序列化结果漂移。
  */
 type SessionEntry =
-  | { kind: 'message'; role: string; text: string; reasoning?: string }
-  | { kind: 'tool_call'; call_id: string; tool: string; arguments: string; output?: string }
+  | { kind: 'message'; role: string; text: string; reasoning?: string; at_ms?: number }
+  | { kind: 'tool_call'; call_id: string; tool: string; arguments: string; output?: string; at_ms?: number }
   | { kind: 'turn_end'; turn: number; reason: string; at_ms: number; error?: TurnErrorInfo }
 
 /**
@@ -645,7 +645,16 @@ export function createAdapter(options: AdapterOptions): { remote: unknown; dispo
 
   const pushEvent = (journal: Journal, type: string, data: unknown, extra: Record<string, unknown> = {}): number => {
     journal.seq += 1
-    journal.log.append({ type: 'event', event: { type, seq: journal.seq, time: now(), ...extra, data } })
+    journal.log.append({
+      type: 'event',
+      event: {
+        type,
+        seq: journal.seq,
+        time: now(),
+        ...extra,
+        data,
+      },
+    })
     return journal.seq
   }
 
@@ -1387,111 +1396,121 @@ export function createAdapter(options: AdapterOptions): { remote: unknown; dispo
       pushTurnStart(undefined, journal)
     }
 
-    entries.forEach((entry, index) => {
-      if (entry.kind === 'turn_end') {
-        // 结局行：新档案才有；旧档案走到末尾时 closeTurn() 会落 unknown。
-        if (entry.turn === journal.turn) closeTurn(archiveTurnReason(entry.reason, entry.error))
+    // 回放期间所有事件时刻都来自档案；没有任何条目时刻时是 0，读侧据此显示
+    // 「记录时刻不可用」，绝不回落到打开会话那一刻（A0-4）。
+    replayClock = 0
+    try {
+      entries.forEach((entry, index) => {
+        // 每条档案条目带自己的落档时刻：本条事件取它，不再取打开会话那一刻。
+        replayClock = 'at_ms' in entry && (entry.at_ms ?? 0) > 0 ? entry.at_ms : 0
+        if (entry.kind === 'turn_end') {
+          // 结局行：新档案才有；旧档案走到末尾时 closeTurn() 会落 unknown。
+          if (entry.turn === journal.turn) closeTurn(archiveTurnReason(entry.reason, entry.error))
+          journal.entryToSeq[index] = journal.seq
+          return
+        }
+        if (entry.kind === 'message' && entry.role === 'user') {
+          startTurn()
+          openStep(0)
+          const parsed = decodeImageMarkers(entry.text)
+          pushEvent(journal, 'user/message', {
+            id: `shaniu-replay-user-${index}`,
+            role: 'user',
+            content: [
+              ...parsed.images.map(image => ({ type: 'image', attachment: image })),
+              ...(parsed.text === '' ? [] : [{ type: 'text', text: parsed.text }]),
+            ],
+            source: { kind: 'user' },
+          }, { surfaceOp: 'append' })
+        } else if (entry.kind === 'message') {
+          // 档案开头就是助手消息（压缩锚点之类）：也得给它一个回合，否则这条消息
+          // 在界面上没有归属，会被静默丢掉。
+          if (!journal.taskOpen) startTurn()
+          if (!stepOpen) {
+            journal.step += 1
+            openStep(journal.step)
+          } else if (stepHasAssistant) {
+            // 同一个 step 里已经有过一次助手输出 → 这是下一次采样迭代，换 step
+            closeStep()
+            journal.step += 1
+            openStep(journal.step)
+          }
+          stepHasAssistant = true
+          const content: Record<string, unknown>[] = []
+          if (entry.reasoning !== undefined && entry.reasoning !== '') content.push({ type: 'reasoning', text: entry.reasoning })
+          content.push({ type: 'text', text: entry.text })
+          pushEvent(journal, 'assistant/message', {
+            turn: journal.turn,
+            step: journal.step,
+            message: {
+              id: `shaniu-replay-assistant-${index}`,
+              role: 'assistant',
+              content,
+              source: { kind: 'model', ...face.activeSelection() },
+            },
+            stream: [],
+          }, { surfaceOp: 'append' })
+        } else {
+          if (!journal.taskOpen) startTurn()
+          if (!stepOpen) { journal.step += 1; openStep(journal.step) }
+          pushEvent(journal, 'tool/call', {
+            turn: journal.turn,
+            step: journal.step,
+            callId: entry.call_id,
+            name: entry.tool,
+            arguments: entry.arguments,
+          })
+          // todo/write 重建（SH-108）：档案没有独立的 journal 事件，事实源就是这条
+          // 工具调用记录本身。推导规则与实时路径同构——调用留下了结果、参数通过
+          // parseTodos 的同一组谓词（后端校验被拒的调用只留错误文本，重演谓词即得
+          // 同一裁决），才补一条 todo/write；位置在上游序列的 tool/call 与 tool/result 之间。
+          if (entry.tool === 'todo_write' && entry.output !== undefined) {
+            let args: unknown
+            try {
+              args = JSON.parse(entry.arguments)
+            } catch {
+              args = undefined
+            }
+            const todos = parseTodos(args)
+            if (todos !== undefined) {
+              journal.todos = todos
+              pushEvent(journal, 'todo/write', { todos })
+            }
+          }
+          const exited = entry.output !== undefined
+            ? /\[exit code: (-?\d+)\]\s*$/.exec(entry.output)?.[1]
+            : undefined
+          const failed = entry.output === undefined || (exited !== undefined && exited !== '0')
+          pushEvent(journal, 'tool/result', {
+            turn: journal.turn,
+            step: journal.step,
+            message: {
+              id: `shaniu-replay-result-${index}`,
+              role: 'tool',
+              source: { kind: 'tool', callId: entry.call_id },
+              toolCallId: entry.call_id,
+              content: entry.output === undefined || entry.output === ''
+                ? []
+                : [{ type: 'text', text: entry.output }],
+              isError: failed,
+            },
+            ...(entry.output === undefined
+              ? { error: { name: 'Interrupted', code: 'interrupted', reason: '该调用没有留下结果' } }
+              : {}),
+          }, { surfaceOp: 'append' })
+          // 计划态从档案重建：有输出 = 工具真的执行过（enter 免审批必执行；exit 获批
+          // 才有输出，denied/中断不留）。被别的会话事件更晚翻转的边角属已知近似
+          // （宿主 PlanState 全局，见 SH-105 注记）。
+          if (entry.tool === 'enter_plan_mode' && !failed) setPlanActive(true)
+          if (entry.tool === 'exit_plan_mode' && !failed) setPlanActive(false)
+        }
         journal.entryToSeq[index] = journal.seq
-        return
-      }
-      if (entry.kind === 'message' && entry.role === 'user') {
-        startTurn()
-        openStep(0)
-        const parsed = decodeImageMarkers(entry.text)
-        pushEvent(journal, 'user/message', {
-          id: `shaniu-replay-user-${index}`,
-          role: 'user',
-          content: [
-            ...parsed.images.map(image => ({ type: 'image', attachment: image })),
-            ...(parsed.text === '' ? [] : [{ type: 'text', text: parsed.text }]),
-          ],
-          source: { kind: 'user' },
-        }, { surfaceOp: 'append' })
-      } else if (entry.kind === 'message') {
-        // 档案开头就是助手消息（压缩锚点之类）：也得给它一个回合，否则这条消息
-        // 在界面上没有归属，会被静默丢掉。
-        if (!journal.taskOpen) startTurn()
-        if (!stepOpen) {
-          journal.step += 1
-          openStep(journal.step)
-        } else if (stepHasAssistant) {
-          // 同一个 step 里已经有过一次助手输出 → 这是下一次采样迭代，换 step
-          closeStep()
-          journal.step += 1
-          openStep(journal.step)
-        }
-        stepHasAssistant = true
-        const content: Record<string, unknown>[] = []
-        if (entry.reasoning !== undefined && entry.reasoning !== '') content.push({ type: 'reasoning', text: entry.reasoning })
-        content.push({ type: 'text', text: entry.text })
-        pushEvent(journal, 'assistant/message', {
-          turn: journal.turn,
-          step: journal.step,
-          message: {
-            id: `shaniu-replay-assistant-${index}`,
-            role: 'assistant',
-            content,
-            source: { kind: 'model', ...face.activeSelection() },
-          },
-          stream: [],
-        }, { surfaceOp: 'append' })
-      } else {
-        if (!journal.taskOpen) startTurn()
-        if (!stepOpen) { journal.step += 1; openStep(journal.step) }
-        pushEvent(journal, 'tool/call', {
-          turn: journal.turn,
-          step: journal.step,
-          callId: entry.call_id,
-          name: entry.tool,
-          arguments: entry.arguments,
-        })
-        // todo/write 重建（SH-108）：档案没有独立的 journal 事件，事实源就是这条
-        // 工具调用记录本身。推导规则与实时路径同构——调用留下了结果、参数通过
-        // parseTodos 的同一组谓词（后端校验被拒的调用只留错误文本，重演谓词即得
-        // 同一裁决），才补一条 todo/write；位置在上游序列的 tool/call 与 tool/result 之间。
-        if (entry.tool === 'todo_write' && entry.output !== undefined) {
-          let args: unknown
-          try {
-            args = JSON.parse(entry.arguments)
-          } catch {
-            args = undefined
-          }
-          const todos = parseTodos(args)
-          if (todos !== undefined) {
-            journal.todos = todos
-            pushEvent(journal, 'todo/write', { todos })
-          }
-        }
-        const exited = entry.output !== undefined
-          ? /\[exit code: (-?\d+)\]\s*$/.exec(entry.output)?.[1]
-          : undefined
-        const failed = entry.output === undefined || (exited !== undefined && exited !== '0')
-        pushEvent(journal, 'tool/result', {
-          turn: journal.turn,
-          step: journal.step,
-          message: {
-            id: `shaniu-replay-result-${index}`,
-            role: 'tool',
-            source: { kind: 'tool', callId: entry.call_id },
-            toolCallId: entry.call_id,
-            content: entry.output === undefined || entry.output === ''
-              ? []
-              : [{ type: 'text', text: entry.output }],
-            isError: failed,
-          },
-          ...(entry.output === undefined
-            ? { error: { name: 'Interrupted', code: 'interrupted', reason: '该调用没有留下结果' } }
-            : {}),
-        }, { surfaceOp: 'append' })
-        // 计划态从档案重建：有输出 = 工具真的执行过（enter 免审批必执行；exit 获批
-        // 才有输出，denied/中断不留）。被别的会话事件更晚翻转的边角属已知近似
-        // （宿主 PlanState 全局，见 SH-105 注记）。
-        if (entry.tool === 'enter_plan_mode' && !failed) setPlanActive(true)
-        if (entry.tool === 'exit_plan_mode' && !failed) setPlanActive(false)
-      }
-      journal.entryToSeq[index] = journal.seq
-    })
-    closeTurn()
+      })
+      // 末尾收口：取最后一条条目的时刻；旧档案没有 at_ms → 0（读侧显示「记录时刻不可用」）。
+      closeTurn()
+    } finally {
+      replayClock = undefined
+    }
     return journal
   }
 

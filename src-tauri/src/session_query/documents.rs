@@ -41,6 +41,7 @@ pub fn build_documents(items: &[RolloutItem], created_at: u64) -> Vec<SearchDoc>
     for item in items {
         if let RolloutItem::ResponseItem {
             item: HistoryItem::FunctionCallOutput { call_id, output },
+            ..
         } = item
         {
             outputs.insert(call_id.clone(), output.clone());
@@ -72,6 +73,7 @@ pub fn build_documents(items: &[RolloutItem], created_at: u64) -> Vec<SearchDoc>
         match item {
             RolloutItem::ResponseItem {
                 item: HistoryItem::Message { role, text, .. },
+                ..
             } => {
                 // reasoning_content 是模型协议回放字段，不是用户可见语义文本
                 // （上游 extraction.ts 的 reasoning block 明确返回 []），不进索引。
@@ -84,6 +86,7 @@ pub fn build_documents(items: &[RolloutItem], created_at: u64) -> Vec<SearchDoc>
             }
             RolloutItem::ResponseItem {
                 item: HistoryItem::FunctionCall { name, arguments, call_id },
+                ..
             } => {
                 push(
                     join_text(&[name.trim(), arguments.trim()]),
@@ -103,6 +106,7 @@ pub fn build_documents(items: &[RolloutItem], created_at: u64) -> Vec<SearchDoc>
             // 输出已并进它自己的调用，不单独成条（与回放投影一致）。
             RolloutItem::ResponseItem {
                 item: HistoryItem::FunctionCallOutput { .. },
+                ..
             } => {}
             // 压缩锚点的语义就是「用摘要取代区间」，展示投影取 user 角色，索引同口径。
             RolloutItem::Compacted { summary, .. } => {
@@ -116,6 +120,7 @@ pub fn build_documents(items: &[RolloutItem], created_at: u64) -> Vec<SearchDoc>
             // 带图消息只索引文字与图片路径：字节不在档案里，索引也没得可索引。
             RolloutItem::ResponseItem {
                 item: HistoryItem::ImageMessage { role, text, images },
+                ..
             } => {
                 let paths = images
                     .iter()
