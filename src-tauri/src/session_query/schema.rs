@@ -6,6 +6,7 @@
 //! - 版本不匹配的已识别派生索引原地重置（只 DROP 认识的表），文件本身不删；
 //! - 文件缺失或真损坏才安全重建（损坏件**改名保留**，不误删、不改写任何 rollout 档案）。
 
+use std::collections::HashSet;
 use std::fs;
 use std::path::{Path, PathBuf};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
@@ -206,12 +207,15 @@ fn reset_derived_schema(conn: &Connection, tables: &[String]) -> Result<(), rusq
     Ok(())
 }
 
-/// 损坏件最多保留几份。
+/// 损坏件保留 **第一份 + 最近两份**（总数上限）。
+///
+/// 不采用单纯「最近 N 份」：轮转删除先删最早的，而最早那份恰恰是**第一次损坏的
+/// 原始现场**——后面几份可能只是同一个 bug 在重复发生，只留最近的等于把唯一干净
+/// 样本丢掉，等想查的时候已经没有可对照的基线。
 ///
 /// 自创（参考源里都没有自动上限）：DSH `storage-domain` 的 backup-and-skip 只隔离不清理；
 /// ZCode `settingService.ts` 的 `.corrupt-<ts>` 交给「存储清理」界面由用户删；
-/// codex 无对应机制。这里取「保留最近 N 份」——既能事后取证，又不让 `cache/` 被
-/// 历史垃圾撑起来。清理是尽力而为，失败不影响重建。
+/// codex 无对应机制。清理是尽力而为，失败不影响重建。
 pub(crate) const QUARANTINE_KEEP: usize = 3;
 
 /// 把损坏的索引文件改名保留（含 WAL/SHM/journal 附属），再让调用方新建。
@@ -262,39 +266,63 @@ fn quarantine(path: &Path) -> Result<(), SearchError> {
     Ok(())
 }
 
-/// 只留最近 `QUARANTINE_KEEP` 份损坏件。
+/// 隔离件文件名里的毫秒时间戳：`{name}.corrupt-{pid}-{stamp}[-{counter}]`。
 ///
-/// `newest` 是刚隔离出来的那一份，永远保留；其余按修改时间倒序（同时间按文件名倒序，
-/// 名字里带毫秒时间戳）取前面的。主件与它的 `-wal/-shm/-journal` 一起清。
+/// 不能用 mtime 排序：`rename` 会保留原文件的修改时间，一份「今天刚改名」的隔离件
+/// 可能带着几个月前的 mtime —— 按 mtime 会把第一次损坏的现场误判成最新的，
+/// 恰好把要保的那份删掉。文件名里的 stamp 才是隔离发生的真实先后。
+fn quarantine_stamp(file_name: &str, prefix: &str) -> Option<u128> {
+    let rest = file_name.strip_prefix(prefix)?;
+    let mut parts = rest.split('-');
+    parts.next()?; // pid：不参与排序
+    parts.next()?.parse().ok()
+}
+
+/// 保留**第一份 + 最近两份**，其余连同 `-wal/-shm/-journal` 一起清掉。
+///
+/// `newest` 是刚隔离出来的那一份，无条件保留（即使它的 stamp 因时钟回拨排不进最新两份）。
 fn prune_quarantined(newest: &Path, name: &str) {
     let Some(dir) = newest.parent() else { return };
     let prefix = format!("{name}.corrupt-");
     let Ok(entries) = fs::read_dir(dir) else { return };
-    let mut found: Vec<(SystemTime, PathBuf)> = entries
+    let mut found: Vec<(u128, PathBuf)> = entries
         .flatten()
         .filter_map(|entry| {
             let file_name = entry.file_name().to_string_lossy().into_owned();
             // 附属件跟着主件走，不作为独立候选。
-            if !file_name.starts_with(&prefix)
-                || ["-wal", "-shm", "-journal"]
-                    .iter()
-                    .any(|suffix| file_name.ends_with(suffix))
+            if ["-wal", "-shm", "-journal"]
+                .iter()
+                .any(|suffix| file_name.ends_with(suffix))
             {
                 return None;
             }
-            let modified = entry
-                .metadata()
-                .and_then(|meta| meta.modified())
-                .unwrap_or(UNIX_EPOCH);
-            Some((modified, entry.path()))
+            let stamp = quarantine_stamp(&file_name, &prefix)?;
+            Some((stamp, entry.path()))
         })
         .collect();
+    if found.len() <= QUARANTINE_KEEP {
+        return;
+    }
+    // 新 → 旧；同一毫秒按文件名倒序（counter 大的更新）。
     found.sort_by(|a, b| {
         b.0.cmp(&a.0)
             .then_with(|| b.1.file_name().cmp(&a.1.file_name()))
     });
-    for (_, old) in found.into_iter().skip(QUARANTINE_KEEP) {
-        if old == newest {
+
+    // 保留集：刚隔离的一份 + 最早的一份（首次损坏现场）+ 最新的若干份补足上限。
+    let mut keep: HashSet<PathBuf> = HashSet::new();
+    keep.insert(newest.to_path_buf());
+    if let Some((_, oldest)) = found.last() {
+        keep.insert(oldest.clone());
+    }
+    for (_, path) in found.iter().take(QUARANTINE_KEEP - 1) {
+        if keep.len() >= QUARANTINE_KEEP {
+            break;
+        }
+        keep.insert(path.clone());
+    }
+    for (_, old) in &found {
+        if keep.contains(old) {
             continue;
         }
         tracing::debug!(path = %old.display(), "清理过旧的损坏索引保留件");

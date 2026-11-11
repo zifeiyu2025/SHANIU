@@ -446,6 +446,17 @@ fn observe_archives(rollouts: &Path) -> Result<ObservedArchives, SearchError> {
             ObservedSession { id, revision, created_at, documents },
         );
     }
+    if !unreadable.is_empty() {
+        // 计数给用户（`skipped_sessions` 只说「这次不完整」），id 给排障：
+        // 只看到「3 个会话无法检索」时无从下手，日志里必须能点名具体是哪几个档案。
+        // 落点是 `shaniu.log`（config.rs `LOG_FILE_PREFIX`），逐条 warn 之外再给一条
+        // 汇总，grep 一次就能拿到全量列表。
+        tracing::warn!(
+            count = unreadable.len(),
+            sessions = %unreadable.join(","),
+            "本次搜索跳过了读不回来的会话档案"
+        );
+    }
     Ok(ObservedArchives { sessions, unreadable })
 }
 

@@ -638,9 +638,12 @@ fn index_failure_enters_cooldown_without_touching_the_file_again() {
     );
 }
 
-/// 隔离件只留最近几份，`cache/` 不被历史垃圾撑起来。
+/// 隔离件保留「第一份 + 最近两份」：第一次损坏的现场不能被轮转删掉。
+///
+/// 反向对照：把 `prune_quarantined` 改回旧的 `found.into_iter().skip(QUARANTINE_KEEP)`
+/// （单纯保留最近 N 份），stamp 最小的 `-0000000000001` 会被删，第一条断言立刻红。
 #[test]
-fn quarantine_keeps_only_the_most_recent_copies() {
+fn quarantine_keeps_the_first_copy_and_the_two_most_recent() {
     let fx = Fixture::new("quarantine-cap");
     let cache = fx.root.join(config::CACHE_DIR);
     fs::create_dir_all(&cache).unwrap();
@@ -665,12 +668,41 @@ fn quarantine_keeps_only_the_most_recent_copies() {
     assert_eq!(
         kept.len(),
         schema::QUARANTINE_KEEP,
-        "只留最近 {} 份隔离件，实际：{kept:?}",
-        schema::QUARANTINE_KEEP
+        "保留份数必须是上限内，实际：{kept:?}"
+    );
+    assert!(
+        kept.iter().any(|name| name.contains("-0000000000001")),
+        "第一份（首次损坏现场）必须保留，实际：{kept:?}"
     );
     assert!(
         kept.iter().any(|name| name.contains("-0000000000005")),
-        "被保留的应是较新的几份：{kept:?}"
+        "最近两份之一必须保留，实际：{kept:?}"
+    );
+    for dropped in ["-0000000000002", "-0000000000003", "-0000000000004"] {
+        assert!(
+            !kept.iter().any(|name| name.contains(dropped)),
+            "中间那几份应被清理，实际：{kept:?}"
+        );
+    }
+}
+
+/// 跳过的档案必须能点名到具体 id，不能只有计数。
+///
+/// 计数是给用户的（`skipped_sessions`），id 是给排障的：日志按这份列表输出
+/// （`observe_archives` 末尾的汇总 warn），所以这里直接断言它的内容。
+#[test]
+fn unreadable_archive_ids_are_listed_for_diagnostics() {
+    let fx = Fixture::new("diag-ids");
+    write_archive(&fx, "good", &[message(Role::User, "可读的正文")]);
+    fs::write(fx.archive_path("broken-one"), b"{ this is not a rollout\n").unwrap();
+
+    let observed =
+        super::observe_archives(&fx.root.join(rollout::ROLLOUT_DIR)).unwrap();
+    assert!(observed.sessions.contains_key("good"));
+    assert_eq!(
+        observed.unreadable,
+        vec!["broken-one".to_string()],
+        "日志要能点名具体是哪个会话档案，而不是只给一个数字"
     );
 }
 
