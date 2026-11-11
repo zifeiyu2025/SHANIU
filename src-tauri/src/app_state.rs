@@ -21,9 +21,11 @@ pub struct AppState {
     /// 从 config_path 反推会把档案写错地方。
     data_root: PathBuf,
     session_seq: AtomicU32,
-    /// 当前活动任务（None = 空闲）：(会话 id, 取消令牌)。会话 id 供归档/置顶
+    /// 当前活动任务（None = 空闲）：(会话 id, 任务种类, 取消令牌)。会话 id 供归档/置顶
     /// 等操作判断"目标会话是否正在跑"（SH-100）——单任务闸下它就是唯一的那个。
-    active_task: Mutex<Option<(String, CancellationToken)>>,
+    /// 种类供 `busy_message` 说清"谁在忙、忙什么"：任务槽是应用级的，只说
+    /// "已有任务在运行"会让另一个空会话的用户完全找不到原因。
+    active_task: Mutex<Option<(String, TaskKind, CancellationToken)>>,
     /// 审批 broker（approve 命令回执入口）。
     pub broker: Arc<ApprovalBroker>,
     /// 会话策略句柄（SH-120）：任务运行中切换审批档，下一 turn 生效。
@@ -271,13 +273,16 @@ impl AppState {
         new_session_id(seq)
     }
 
-    /// 登记活动任务（带会话 id）；已有任务在跑时返回 false（防重入）。
-    pub fn begin_task(&self, agent_id: &str, cancel: CancellationToken) -> bool {
+    /// 登记活动任务（带会话 id 与种类）；已有任务在跑时返回 false（防重入）。
+    ///
+    /// 种类不是装饰：任务槽是**应用级**的，压缩也会占用它（避免与回合并发写锚点）。
+    /// 被挡的一方必须能从错误文案里看出"是哪个会话、在做什么"。
+    pub fn begin_task(&self, agent_id: &str, kind: TaskKind, cancel: CancellationToken) -> bool {
         let mut guard = self.active_task.lock().expect("active_task 锁中毒");
         if guard.is_some() {
             return false;
         }
-        *guard = Some((agent_id.to_string(), cancel));
+        *guard = Some((agent_id.to_string(), kind, cancel));
         true
     }
 
@@ -303,13 +308,35 @@ impl AppState {
             .lock()
             .expect("active_task 锁中毒")
             .as_ref()
-            .map(|(id, _)| id.clone())
+            .map(|(id, _, _)| id.clone())
+    }
+
+    /// 任务槽被占用时给发起方看的说明：**必须能定位到是谁**。
+    ///
+    /// 任务槽是应用级的（压缩期间也会占着它），所以用户在自己那个空会话里发消息
+    /// 会被挡。只说"已有任务在运行"等于把原因藏起来：用户明明看到自己这儿是空的。
+    /// `self_agent_id` 是发起方自己的会话，用来区分"本会话在忙"和"别的会话在忙"。
+    pub fn busy_message(&self, self_agent_id: &str) -> String {
+        let guard = self.active_task.lock().expect("active_task 锁中毒");
+        let Some((agent_id, kind, _)) = guard.as_ref() else {
+            // 竞态：判忙之后占用方刚好收口。如实说"刚结束"，别编一个占用者。
+            return "任务槽刚被释放，请重新发送".to_string();
+        };
+        let what = match kind {
+            TaskKind::Turn => "正在执行任务",
+            TaskKind::Compaction => "正在压缩上下文（压缩期间整个应用不能开始新回合）",
+        };
+        if agent_id == self_agent_id {
+            format!("本会话{what}，请等它结束或先停止")
+        } else {
+            format!("会话 {agent_id} {what}，请稍候再发送")
+        }
     }
 
     /// 取消活动任务；无任务返回 false。
     pub fn cancel_active(&self) -> bool {
         match self.active_task.lock().expect("active_task 锁中毒").clone() {
-            Some((_, token)) => {
+            Some((_, _, token)) => {
                 token.cancel();
                 true
             }
@@ -320,6 +347,16 @@ impl AppState {
     pub fn has_active_task(&self) -> bool {
         self.active_task.lock().expect("active_task 锁中毒").is_some()
     }
+}
+
+/// 任务槽的占用种类。压缩也占槽（防止与回合并发写压缩锚点），
+/// 因此"谁在忙"必须能说清是回合还是压缩。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum TaskKind {
+    /// 正常回合（`send_task`）。
+    Turn,
+    /// 手动压缩（`compact_session`）：应用级独占，期间任何会话都起不了新回合。
+    Compaction,
 }
 
 /// 任务槽 Drop 守卫：无论任务 future 正常结束、被取消（abort/drop）还是 **panic**，
@@ -472,8 +509,8 @@ mod tests {
         let (_dir, s) = state();
         assert!(!s.has_active_task());
         let token = CancellationToken::new();
-        assert!(s.begin_task("sess-1", token.clone()));
-        assert!(!s.begin_task("sess-2", CancellationToken::new()), "重入必须被拒");
+        assert!(s.begin_task("sess-1", TaskKind::Turn, token.clone()));
+        assert!(!s.begin_task("sess-2", TaskKind::Turn, CancellationToken::new()), "重入必须被拒");
         assert!(s.has_active_task());
         assert_eq!(s.active_agent().as_deref(), Some("sess-1"));
         assert!(s.cancel_active());
@@ -484,12 +521,36 @@ mod tests {
         assert!(!s.cancel_active());
     }
 
+    /// 任务槽是应用级的：被挡的人必须能从错误文案里看出**是哪个会话、在做什么**。
+    ///
+    /// 反向对照：把文案改回"已有任务在运行"，下面两条关于具体占用者的断言即红——
+    /// 那正是用户在自己空会话里发消息时"找不到原因"的形态。
+    #[test]
+    fn busy_message_names_the_occupant_and_its_kind() {
+        let (_dir, s) = state();
+        assert!(s.begin_task("sess-A", TaskKind::Compaction, CancellationToken::new()));
+
+        let other = s.busy_message("sess-B");
+        assert!(other.contains("sess-A"), "必须点名占用者：{other}");
+        assert!(other.contains("压缩上下文"), "必须说清在做什么：{other}");
+        assert!(other.contains("整个应用"), "应用级闸要说明影响面：{other}");
+
+        // 本会话自己占着槽时，文案要换成"本会话"，不能让用户去找别的会话
+        let own = s.busy_message("sess-A");
+        assert!(own.starts_with("本会话"), "{own}");
+        assert!(!own.contains("sess-A"), "自己占槽时不必报 id：{own}");
+
+        s.end_task();
+        // 判忙与取占用者之间的竞态：占用方已收口时不许编一个占用者出来
+        assert!(s.busy_message("sess-B").contains("刚被释放"));
+    }
+
     #[test]
     fn subagent_registry_lives_only_for_the_active_task() {
         let (_dir, s) = state();
         assert!(s.subagents().is_none(), "空闲态没有可 steering 的注册表");
         let registry = Arc::new(crate::subagent_registry::SubagentRegistry::new(2));
-        assert!(s.begin_task("sess-1", CancellationToken::new()));
+        assert!(s.begin_task("sess-1", TaskKind::Turn, CancellationToken::new()));
         s.set_subagents(Some(registry.clone()));
         assert!(Arc::ptr_eq(&s.subagents().expect("任务期应能取到注册表"), &registry));
         s.end_task();
@@ -504,14 +565,14 @@ mod tests {
         let state = Arc::new(s);
         let worker = state.clone();
         let handle = tokio::spawn(async move {
-            assert!(worker.begin_task("sess-1", CancellationToken::new()));
+            assert!(worker.begin_task("sess-1", TaskKind::Turn, CancellationToken::new()));
             let _guard = TaskSlotGuard::new(move || worker.end_task());
             panic!("模拟 agent future panic");
         });
         assert!(handle.await.is_err(), "任务 future 应以 panic 结束");
         assert!(!state.has_active_task(), "panic 后任务槽必须释放");
         assert!(
-            state.begin_task("sess-2", CancellationToken::new()),
+            state.begin_task("sess-2", TaskKind::Turn, CancellationToken::new()),
             "下一个任务必须能拿到槽，否则就是永久卡死"
         );
     }
@@ -523,7 +584,7 @@ mod tests {
         let state = Arc::new(s);
         let worker = state.clone();
         let handle = tokio::spawn(async move {
-            assert!(worker.begin_task("sess-1", CancellationToken::new()));
+            assert!(worker.begin_task("sess-1", TaskKind::Turn, CancellationToken::new()));
             let _guard = TaskSlotGuard::new(move || worker.end_task());
             futures::future::pending::<()>().await;
         });
@@ -533,7 +594,7 @@ mod tests {
         handle.abort();
         let _ = handle.await;
         assert!(!state.has_active_task(), "取消/abort 后任务槽必须释放");
-        assert!(state.begin_task("sess-2", CancellationToken::new()));
+        assert!(state.begin_task("sess-2", TaskKind::Turn, CancellationToken::new()));
     }
 
     #[test]

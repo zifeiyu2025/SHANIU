@@ -862,90 +862,134 @@ pub enum SessionEntry {
 /// 工具输出在档案里排在**同轮全部调用之后**（"先全部 call、再全部 output"，SH-031 的
 /// `nearest_safe_cut` 正是靠这个形状才敢只在配对边界截断）。展示要按调用顺序把输出带上，
 /// 所以先建一遍 `call_id → output` 索引，再按原序输出，`FunctionCallOutput` 本身不再成条。
-fn project_entries(items: &[rollout::RolloutItem]) -> Vec<SessionEntry> {
-    let mut outputs: std::collections::HashMap<String, String> = std::collections::HashMap::new();
+fn project_entries(items: &[rollout::RolloutItem]) -> Result<Vec<SessionEntry>, String> {
+    let mut slots = project_slots(items);
+    // 锚点必须按记录顺序、对**当时**的槽位序列生效——与 `rollout::resume` 的
+    // `history.splice(start..end, [summary])` 逐条对齐，否则同一份档案在
+    // 「模型看到的历史」与「用户看到的视图」会分叉。
     for item in items {
-        if let rollout::RolloutItem::ResponseItem {
-            item: model_client::HistoryItem::FunctionCallOutput { call_id, output },
-            ..
-        } = item
-        {
+        if let rollout::RolloutItem::Compacted { range_start, range_end, summary } = item {
+            apply_compaction(
+                &mut slots,
+                *range_start,
+                *range_end,
+                summary_entry(summary),
+            )?;
+        }
+    }
+
+    let mut outputs: std::collections::HashMap<String, String> = std::collections::HashMap::new();
+    for slot in &slots {
+        if let Slot::Output { call_id, output } = slot {
             outputs.insert(call_id.clone(), output.clone());
         }
     }
 
+    let mut out = Vec::with_capacity(slots.len());
+    for slot in slots {
+        match slot {
+            Slot::Message(entry) | Slot::Summary(entry) | Slot::Audit(entry) => out.push(entry),
+            Slot::Call { call_id, tool, arguments, at_ms } => out.push(SessionEntry::ToolCall {
+                output: outputs.get(&call_id).cloned(),
+                call_id,
+                tool,
+                arguments,
+                at_ms,
+            }),
+            // 已并进对应的 ToolCall，不单独成条。
+            Slot::Output { .. } => {}
+        }
+    }
+    Ok(out)
+}
+
+/// 投影槽位：只有**会进历史序列**的条目才占压缩锚点的序号。
+///
+/// 锚点区间 `[range_start, range_end)` 的语义建立在 `rollout::resume` 重放出的
+/// `history` 上，而那个序列里工具输出是独立一项、`TurnEnd` 之类审计记录不在其中。
+/// 投影若用"档案行号"当序号，锚点就会指到别的条目上——比显示双份更糟的错位。
+enum Slot {
+    /// 普通消息（含图片消息）：投影即成品。
+    Message(SessionEntry),
+    /// 一次工具调用：输出在投影时按 `call_id` 补上。
+    Call { call_id: String, tool: String, arguments: String, at_ms: u64 },
+    /// 工具输出：占历史序号，但不单独成条。
+    Output { call_id: String, output: String },
+    /// 锚点把区间换成的摘要（取代区间后同样占一个历史序号）。
+    Summary(SessionEntry),
+    /// 回合结局：审计记录，不占序号，也不该被压缩区间吞掉。
+    Audit(SessionEntry),
+}
+
+impl Slot {
+    fn is_history(&self) -> bool {
+        !matches!(self, Slot::Audit(_))
+    }
+}
+
+/// 角色取 user：与 resume 回放、thinking 档协议三者同源（摘要没有
+/// `reasoning_content`，以 assistant 身份喂端点会 400）。
+fn summary_entry(summary: &str) -> SessionEntry {
+    SessionEntry::Message {
+        role: "user".to_string(),
+        text: summary.to_string(),
+        reasoning: None,
+        // 压缩锚点没有独立时刻；取不到就标不可信，不借用导出时刻。
+        at_ms: 0,
+        images: Vec::new(),
+    }
+}
+
+fn project_slots(items: &[rollout::RolloutItem]) -> Vec<Slot> {
     let mut out = Vec::with_capacity(items.len());
     for item in items {
         match item {
             rollout::RolloutItem::ResponseItem {
                 item: model_client::HistoryItem::Message { role, text, reasoning },
                 at_ms,
-            } => out.push(SessionEntry::Message {
-                role: match role {
-                    model_client::Role::User => "user",
-                    model_client::Role::Assistant => "assistant",
-                    model_client::Role::System => "system",
-                }
-                .to_string(),
+            } => out.push(Slot::Message(SessionEntry::Message {
+                role: role_name(role),
                 text: text.clone(),
                 reasoning: reasoning.clone(),
                 at_ms: *at_ms,
                 images: Vec::new(),
-            }),
+            })),
             rollout::RolloutItem::ResponseItem {
                 item: model_client::HistoryItem::FunctionCall { name, arguments, call_id },
                 at_ms,
-            } => out.push(SessionEntry::ToolCall {
+            } => out.push(Slot::Call {
                 call_id: call_id.clone(),
                 tool: name.clone(),
                 arguments: arguments.clone(),
-                output: outputs.get(call_id).cloned(),
                 at_ms: *at_ms,
             }),
-            // 已并进对应的 ToolCall，不单独成条。
             rollout::RolloutItem::ResponseItem {
-                item: model_client::HistoryItem::FunctionCallOutput { .. },
+                item: model_client::HistoryItem::FunctionCallOutput { call_id, output },
                 ..
-            } => {}
-            // 压缩锚点在 resume 时的语义就是"用 summary 取代那段区间"，
-            // 展示也必须一致，否则用户会看到区间原文而模型看到的是摘要——两份真相。
-            // 角色取 user：与 resume 回放、thinking 档协议三者必须同源（摘要没有
-            // reasoning_content，以 assistant 身份喂端点会 400）。
-            rollout::RolloutItem::Compacted { summary, .. } => out.push(SessionEntry::Message {
-                role: "user".to_string(),
-                text: summary.clone(),
-                reasoning: None,
-                // 压缩锚点没有独立时刻；getattr 不到就标不可信，不借导出时刻。
-                at_ms: 0,
-                images: Vec::new(),
-            }),
+            } => out.push(Slot::Output { call_id: call_id.clone(), output: output.clone() }),
+            // 压缩锚点本身在这里不产出条目：它的位置与内容由 `apply_compaction`
+            // 在槽位序列上做替换（先收全部槽位、再按记录顺序应用锚点）。
+            rollout::RolloutItem::Compacted { .. } => {}
             // 带图消息保留结构化引用：展示层自己决定怎么渲染图片卡片，
             // 重放也不再依赖正文里的历史 marker。字节永远不进档案。
             rollout::RolloutItem::ResponseItem {
                 item: model_client::HistoryItem::ImageMessage { role, text, images },
                 at_ms,
-            } => {
-                out.push(SessionEntry::Message {
-                    role: match role {
-                        model_client::Role::User => "user",
-                        model_client::Role::Assistant => "assistant",
-                        model_client::Role::System => "system",
-                    }
-                    .to_string(),
-                    text: text.clone(),
-                    reasoning: None,
-                    at_ms: *at_ms,
-                    images: images.clone(),
-                });
-            }
+            } => out.push(Slot::Message(SessionEntry::Message {
+                role: role_name(role),
+                text: text.clone(),
+                reasoning: None,
+                at_ms: *at_ms,
+                images: images.clone(),
+            })),
             // 回合结局：如实带给导出/审计，不进对话历史。
             rollout::RolloutItem::TurnEnd { turn, reason, at_ms, error } => {
-                out.push(SessionEntry::TurnEnd {
+                out.push(Slot::Audit(SessionEntry::TurnEnd {
                     turn: *turn,
                     reason: reason.clone(),
                     at_ms: *at_ms,
                     error: error.clone(),
-                });
+                }))
             }
             // 首行 meta 不是历史；子代理引用要等 SH-056 的泳道 UI 才有展示形态；
             // 档位事件是控制面记录，退出留痕是审计记录——都不进对话历史。
@@ -961,6 +1005,62 @@ fn project_entries(items: &[rollout::RolloutItem]) -> Vec<SessionEntry> {
     out
 }
 
+fn role_name(role: &model_client::Role) -> String {
+    match role {
+        model_client::Role::User => "user",
+        model_client::Role::Assistant => "assistant",
+        model_client::Role::System => "system",
+    }
+    .to_string()
+}
+
+/// 第 `n` 个历史槽位在槽位序列里的下标（`n` 等于历史长度时无对应项 = 追加到末尾）。
+fn history_position(slots: &[Slot], n: usize) -> Option<usize> {
+    slots
+        .iter()
+        .enumerate()
+        .filter(|(_, slot)| slot.is_history())
+        .nth(n)
+        .map(|(index, _)| index)
+}
+
+/// 在槽位序列上重放一次压缩锚点：区间内的历史槽位被一条摘要取代。
+///
+/// 与 `rollout::resume` 的区间校验同口径：越界即报错，而不是"能显示多少显示多少"。
+/// 档案里原文**不删**（有损操作要能追回去），但视图里不该再出现——否则用户会以为
+/// 压缩没生效，而模型那边早已只看到摘要。
+fn apply_compaction(
+    slots: &mut Vec<Slot>,
+    range_start: usize,
+    range_end: usize,
+    summary: SessionEntry,
+) -> Result<(), String> {
+    let history_len = slots.iter().filter(|slot| slot.is_history()).count();
+    if range_start > range_end || range_end > history_len {
+        return Err(format!(
+            "压缩锚点区间 [{range_start},{range_end}) 超出已重放长度 {history_len}"
+        ));
+    }
+    let Some(first) = history_position(slots, range_start) else {
+        // 空档案上的空区间：等价于在末尾插一条摘要（resume 的 splice 同结果）。
+        slots.push(Slot::Summary(summary));
+        return Ok(());
+    };
+    let mut index = first;
+    let mut remaining = range_end - range_start;
+    while remaining > 0 {
+        if slots[index].is_history() {
+            slots.remove(index);
+            remaining -= 1;
+        } else {
+            // 夹在区间里的 TurnEnd 是审计记录：不占序号，也不该被吞掉。
+            index += 1;
+        }
+    }
+    slots.insert(first, Slot::Summary(summary));
+    Ok(())
+}
+
 /// 读回一个会话的历史条目，供前端渲染（SH-033 的"打开会话"）。
 ///
 /// 走 `rollout::read` 的严格口径：档案中间坏行必须报错，绝不能给前端一份"看起来完整、
@@ -973,7 +1073,7 @@ fn load_session(app: tauri::AppHandle, agent_id: String) -> Result<Vec<SessionEn
         .join(rollout::ROLLOUT_DIR)
         .join(format!("{agent_id}.jsonl"));
     let archive = rollout::read(&path).map_err(|e| format!("档案读不回: {e}"))?;
-    Ok(project_entries(&archive.items))
+    project_entries(&archive.items).map_err(|e| format!("档案读不回: {e}"))
 }
 
 /// 会话全文搜索（SH-113）：宿主侧 SQLite FTS5 派生索引。
@@ -1754,8 +1854,8 @@ fn build_agent_with(
     }
 
     let cancel = tokio_util::sync::CancellationToken::new();
-    if !state.begin_task(agent_id, cancel.clone()) {
-        return Err("已有任务在运行".into());
+    if !state.begin_task(agent_id, app_state::TaskKind::Turn, cancel.clone()) {
+        return Err(state.busy_message(agent_id));
     }
 
     let backend: Arc<dyn ModelBackend> = Arc::new(agent_loop::ResponsesBackend { provider, api_key });
@@ -2389,7 +2489,8 @@ fn get_plan_mode(app: tauri::AppHandle, session_id: String) -> bool {
 /// 锁用宿主既有的任务槽（`begin_task`），而不是只比一次 `active_agent`：
 /// - 只比一次是**检查-使用**竞态：检查通过后、总结请求返回前，用户再发一条消息就
 ///   能起新回合，两边同时改历史/写锚点；
-/// - 占用任务槽后，压缩期间的新回合会被 `begin_task` 挡住（回「已有任务在运行」），
+/// - 占用任务槽后，压缩期间的新回合会被 `begin_task` 挡住（回 `busy_message`：
+///   点名「会话 X 正在压缩上下文」——应用级闸必须让被挡的人知道卡在哪），
 ///   压的就是"打包那一刻"的会话，不会再变；
 /// - 顺带让停止按钮生效：`cancel_active` 发出的令牌会被总结流 `select!` 收到，
 ///   取消后锚点不写（档案未改动），并如实回「压缩被用户取消」。
@@ -2399,8 +2500,8 @@ fn get_plan_mode(app: tauri::AppHandle, session_id: String) -> bool {
 async fn compact_session(app: tauri::AppHandle, agent_id: String) -> Result<Option<session_compact::CompactOutcome>, String> {
     let state = app.state::<AppState>();
     let cancel = tokio_util::sync::CancellationToken::new();
-    if !state.begin_task(&agent_id, cancel.clone()) {
-        return Err("会话正在运行：请等当前任务结束（或停止它）再压缩".into());
+    if !state.begin_task(&agent_id, app_state::TaskKind::Compaction, cancel.clone()) {
+        return Err(state.busy_message(&agent_id));
     }
     // Drop 守卫：成功、失败、取消、panic 都必须释放任务槽，否则「压缩中」会把应用卡死。
     let app_for_slot = app.clone();
@@ -3436,7 +3537,7 @@ mod session_projection_tests {
             out("c2", "文件内容"),
             out("c1", "a.txt\nb.txt"),
         ];
-        let entries = project_entries(&items);
+        let entries = project_entries(&items).expect("投影成功");
         assert_eq!(entries.len(), 3, "两条调用 + 一条用户消息，输出不单独成条");
         match &entries[1] {
             SessionEntry::ToolCall { call_id, tool, output, .. } => {
@@ -3459,7 +3560,7 @@ mod session_projection_tests {
     fn unpaired_call_keeps_output_none() {
         // 取消或审批拒绝的轮次：有 call 无 output，投影不能凭空补一个成功输出
         let items = vec![call("unified_exec", "{}", "c1")];
-        match &project_entries(&items)[0] {
+        match &project_entries(&items).expect("投影成功")[0] {
             SessionEntry::ToolCall { output, .. } => assert_eq!(output, &None),
             other => panic!("期望 ToolCall，得到 {other:?}"),
         }
@@ -3480,7 +3581,7 @@ mod session_projection_tests {
             // 旧档案没有 at_ms：读回来是 0，必须原样出去，交给前端标"记录时刻不可信"。
             msg(Role::Assistant, "旧消息"),
         ];
-        let entries = project_entries(&items);
+        let entries = project_entries(&items).expect("投影成功");
         match &entries[0] {
             SessionEntry::Message { at_ms, .. } => assert_eq!(*at_ms, 1_712_345_678_901),
             other => panic!("期望 Message，得到 {other:?}"),
@@ -3497,25 +3598,94 @@ mod session_projection_tests {
         }
     }
 
+    /// 压缩锚点在视图里的语义必须与 resume 完全一致：**摘要取代区间**。
+    ///
+    /// 反向对照：撤掉 `apply_compaction` 的区间删除（只插摘要、不删原文），
+    /// 本用例立刻变红——那正是修复前的行为：用户重开会话看到「摘要 + 原文」并存，
+    /// 会以为压缩根本没生效，而模型那边早就只看到摘要了。
     #[test]
-    fn compaction_anchor_projects_as_user_summary() {
-        // resume 时锚点的语义就是"摘要取代区间"，展示必须一致，
-        // 否则用户看到区间原文而模型看到的是摘要——两份真相。
-        // 角色取 user 与回放同源：摘要没有 reasoning_content，以 assistant 身份
-        // 喂 thinking 端点会 400（SH-032 的真机回归就是这么撞出来的）。
+    fn compaction_anchor_replaces_the_range_in_the_view() {
         let items = vec![
+            // 首行 meta 不占历史序号：锚点若按"档案行号"数，从这一行起就会错位
+            RolloutItem::SessionMeta {
+                session_id: "s".into(),
+                agent_id: "a".into(),
+                parent_id: None,
+                created_at: 1,
+                config_snapshot: ConfigSnapshot::default(),
+            },
             msg(Role::User, "早期任务"),
-            RolloutItem::Compacted { range_start: 0, range_end: 3, summary: "已压缩的上下文".into() },
+            msg(Role::Assistant, "早期回复"),
+            RolloutItem::ResponseItem {
+                item: HistoryItem::FunctionCall { name: "t".into(), arguments: "{}".into(), call_id: "c1".into() },
+                at_ms: 5,
+            },
+            // 工具输出占历史序号：区间按「历史序列」数，不是按档案行数
+            RolloutItem::ResponseItem {
+                item: HistoryItem::FunctionCallOutput { call_id: "c1".into(), output: "旧输出".into() },
+                at_ms: 6,
+            },
+            RolloutItem::Compacted { range_start: 0, range_end: 2, summary: "已压缩的上下文".into() },
+            msg(Role::Assistant, "压缩后的新回复"),
         ];
-        let entries = project_entries(&items);
-        assert_eq!(entries.len(), 2);
-        match &entries[1] {
+        let entries = project_entries(&items).expect("锚点区间合法");
+        // 期望：摘要（取代前两条）+ 区间外的工具调用（输出仍在）+ 锚点之后的新回复
+        assert_eq!(entries.len(), 3, "被取代的条目不得再出现在视图里：{entries:?}");
+        match &entries[0] {
+            // 角色取 user 与回放同源：摘要没有 reasoning_content，以 assistant 身份
+            // 喂 thinking 端点会 400（SH-032 的真机回归就是这么撞出来的）。
             SessionEntry::Message { role, text, .. } => {
                 assert_eq!(role, "user");
                 assert_eq!(text, "已压缩的上下文");
             }
             other => panic!("期望 Message，得到 {other:?}"),
         }
+        match &entries[1] {
+            SessionEntry::ToolCall { call_id, output, .. } => {
+                assert_eq!(call_id, "c1");
+                assert_eq!(output.as_deref(), Some("旧输出"));
+            }
+            other => panic!("期望 ToolCall，得到 {other:?}"),
+        }
+        assert!(
+            !entries.iter().any(|e| matches!(
+                e,
+                SessionEntry::Message { text, .. } if text == "早期任务"
+            )),
+            "被压缩区间里的原文不得混进正常视图：{entries:?}"
+        );
+    }
+
+    /// 夹在压缩区间里的 `TurnEnd` 是审计记录：不占锚点序号，也不该被区间吞掉。
+    #[test]
+    fn compaction_anchor_keeps_interleaved_turn_end_audit_records() {
+        let items = vec![
+            msg(Role::User, "第一条"),
+            RolloutItem::TurnEnd {
+                turn: 1,
+                reason: "completed".into(),
+                at_ms: 3,
+                error: None,
+            },
+            msg(Role::Assistant, "第二条"),
+            RolloutItem::Compacted { range_start: 0, range_end: 2, summary: "摘要".into() },
+        ];
+        let entries = project_entries(&items).expect("锚点区间合法");
+        assert_eq!(entries.len(), 2, "摘要取代两条历史，TurnEnd 原样留着：{entries:?}");
+        assert!(matches!(&entries[0], SessionEntry::Message { text, .. } if text == "摘要"));
+        assert!(matches!(&entries[1], SessionEntry::TurnEnd { turn: 1, .. }));
+    }
+
+    /// 越界锚点必须报错，而不是"能显示多少显示多少"：resume 会直接拒绝加载，
+    /// 视图若给出一份看似正常的历史，两边就又对不上了。
+    #[test]
+    fn out_of_range_compaction_anchor_is_rejected() {
+        let items = vec![
+            msg(Role::User, "only"),
+            RolloutItem::Compacted { range_start: 0, range_end: 5, summary: "摘要".into() },
+        ];
+        let error = project_entries(&items).expect_err("越界锚点必须拒绝");
+        assert!(error.contains("[0,5)"), "{error}");
     }
 
     #[test]
@@ -3531,7 +3701,7 @@ mod session_projection_tests {
             RolloutItem::SubagentRef { child_id: "c".into(), rollout_path: "p".into() },
             msg(Role::Assistant, "正文"),
         ];
-        let entries = project_entries(&items);
+        let entries = project_entries(&items).expect("投影成功");
         assert_eq!(entries.len(), 1, "首行 meta 与子代理引用不是历史；SH-056 的泳道 UI 才有后者的展示形态");
         assert!(matches!(&entries[0], SessionEntry::Message { role, .. } if role == "assistant"));
     }
@@ -3544,7 +3714,7 @@ mod session_projection_tests {
             item: HistoryItem::Message { role: Role::Assistant, text: "答案".into(), reasoning: Some("思路".into()) },
             at_ms: 0,
         }];
-        match &project_entries(&items)[0] {
+        match &project_entries(&items).expect("投影成功")[0] {
             SessionEntry::Message { reasoning, .. } => assert_eq!(reasoning.as_deref(), Some("思路")),
             other => panic!("期望 Message，得到 {other:?}"),
         }
@@ -3571,7 +3741,7 @@ mod session_projection_tests {
             },
             at_ms: 7,
         }];
-        match &project_entries(&items)[0] {
+        match &project_entries(&items).expect("投影成功")[0] {
             SessionEntry::Message { text, images: refs, at_ms, .. } => {
                 assert_eq!(text, "看这张", "正文不得被拼上占位文本");
                 assert_eq!(refs, &vec![reference]);
