@@ -475,7 +475,14 @@ function Loaded({ injected, renderSlot }: { injected: ModelsSectionFace; renderS
                   {row.entry.provider === 'deepseek-account'
                     ? (
                       <span className={styles['accountStatus']}>
-                        <span className={`${styles['credentialDot']} ${styles['credentialDotConfigured']}`} aria-hidden="true" />
+                        {/* SHANIU: 这个绿点自己不说是什么（旁边才有「已登录」），
+                            补 title/aria-label 让悬停或读屏也能得到同一句。 */}
+                        <span
+                          className={`${styles['credentialDot']} ${styles['credentialDotConfigured']}`}
+                          role="img"
+                          aria-label={t('accountSignedIn')}
+                          title={t('accountSignedIn')}
+                        />
                         {t('accountSignedIn')}
                       </span>
                     )

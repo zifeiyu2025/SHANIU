@@ -33,11 +33,14 @@
   color: var(--dsw-alias-state-warn-label);
 }
 
+/* SHANIU: 这条只说明「配置已写进本机」，不替密钥有效性下结论——保存成功和密钥能用
+   是两件事。成功绿会让人把「已保存」读成「校验通过」（A0 走查抓到错 key 也是绿的），
+   所以改用中性色；有效性只在能力卡片的密钥三态（有效 / 无效 / 无法确认）里说。 */
 .savedNotice {
   margin: 0;
   font-size: 12px;
   line-height: 18px;
-  color: var(--dsw-alias-state-success-primary);
+  color: var(--dsw-alias-label-secondary);
 }
 
 .rows {
