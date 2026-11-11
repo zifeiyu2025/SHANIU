@@ -1409,13 +1409,52 @@ describe('适配层的命令面映射', () => {
     bridge.emit('agent-new', { type: 'agent_message_delta', delta: '正文' })
     bridge.emit('agent-new', { type: 'turn_completed', turn: 1, reason: 'completed' })
 
-    const whole = (await session.page({ sessionId: 'agent-new' }))['value'] as { records: { event: Record<string, unknown> }[]; cursor: number }
+    const whole = (await session.page({ sessionId: 'agent-new' }))['value'] as { records: { event: Record<string, unknown> }[]; hasMore: boolean }
     expect(whole.records.map(record => record.event['type'])).toEqual([
       'turn/start', 'step/start', 'user/message', 'assistant/message', 'step/end', 'turn/end',
     ])
-    expect(whole.cursor).toBe(5)
+    // cursor 属于 SessionEventsPage，不属于 SessionPage：多返回一个键就是造契约外的事实
+    expect(whole).not.toHaveProperty('cursor')
+    expect(whole.hasMore).toBe(false)
     const windowed = (await session.page({ sessionId: 'agent-new', throughSeq: 2 }))['value'] as { records: { event: { seq: number } }[] }
     expect(windowed.records.map(record => record.event.seq)).toEqual([0, 1, 2])
+    dispose()
+  })
+
+  it('page 按 maxMessages 截断并把 hasMore 说真话，beforeSeq 排他', async () => {
+    const bridge = scriptedBridge()
+    const { remote, dispose } = createAdapter({ bridge })
+    const session = faceOf(remote).session
+    for (const [index, text] of ['一', '二', '三'].entries()) {
+      await session.prompt({ sessionId: 'agent-page', requestId: `rpc-p${String(index)}`, content: [{ type: 'text', text }] })
+      bridge.emit('agent-page', { type: 'agent_message_delta', delta: `答${text}` })
+      bridge.emit('agent-page', { type: 'turn_completed', turn: index + 1, reason: 'completed' })
+    }
+
+    // 三个回合各 6 条事件；maxMessages=2 只够最后一个回合，切点退到 turn/start
+    const last = (await session.page({ sessionId: 'agent-page', maxMessages: 2 }))['value'] as {
+      records: { event: { seq: number; type: string } }[]; hasMore: boolean
+    }
+    expect(last.records.map(record => record.event.type)).toEqual([
+      'turn/start', 'step/start', 'user/message', 'assistant/message', 'step/end', 'turn/end',
+    ])
+    expect(last.hasMore).toBe(true)
+    const oldest = last.records[0]!.event.seq
+    expect(oldest).toBeGreaterThan(0)
+
+    // beforeSeq 排他：下一页的第一条就是上一页更早的邻居，不重复交付
+    const middle = (await session.page({ sessionId: 'agent-page', beforeSeq: oldest, maxMessages: 2 }))['value'] as {
+      records: { event: { seq: number } }[]; hasMore: boolean
+    }
+    expect(Math.max(...middle.records.map(record => record.event.seq))).toBe(oldest - 1)
+    expect(middle.hasMore).toBe(true)
+
+    // 翻到最早一页时 hasMore 必须翻成 false，否则客户端会一直请求空页
+    const first = (await session.page({ sessionId: 'agent-page', beforeSeq: middle.records[0]!.event.seq, maxMessages: 2 }))['value'] as {
+      records: { event: { seq: number } }[]; hasMore: boolean
+    }
+    expect(first.records[0]!.event.seq).toBe(0)
+    expect(first.hasMore).toBe(false)
     dispose()
   })
 

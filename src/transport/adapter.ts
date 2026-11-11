@@ -2631,14 +2631,48 @@ export function createAdapter(options: AdapterOptions): { remote: unknown; dispo
         return FAIL(`读取历史附件失败：${message}`)
       }
     },
-    page: async (request: { sessionId?: string; throughSeq?: number } = {}) => {
+    page: async (request: {
+      sessionId?: string
+      throughSeq?: number
+      beforeSeq?: number
+      maxMessages?: number
+    } = {}) => {
       const journal = request.sessionId === undefined ? undefined : journals.get(request.sessionId)
-      if (journal === undefined) return OK({ records: [], hasMore: false, cursor: -1 })
+      // `SessionPage` 只有 records/hasMore：cursor 是 `SessionEventsPage` 的字段，
+      // 这里多返回一个客户端不认识的键，等于让「契约之外的事实」先存在再说。
+      if (journal === undefined) return OK({ records: [], hasMore: false })
       const through = request.throughSeq ?? journal.seq
-      const records = journal.log
+      const before = request.beforeSeq
+      const pool = journal.log
         .eventsUpTo(journal.log.length)
-        .filter(entry => FrameLog.eventSeq(entry) <= through)
-      return OK({ records, hasMore: false, cursor: records.length === 0 ? -1 : through })
+        .filter((entry) => {
+          const seq = FrameLog.eventSeq(entry)
+          // beforeSeq 排他（它指向「当前已加载的最早一条」，不能重复返回）
+          return seq <= through && (before === undefined || seq < before)
+        })
+      const maxMessages = request.maxMessages
+      if (maxMessages === undefined || maxMessages <= 0 || pool.length === 0) {
+        return OK({ records: pool, hasMore: false })
+      }
+      // 从末尾倒扫，数到第 maxMessages 条 append 消息就停；切割点再退到该回合的
+      // `turn/start`，否则工具调用会和它的结果落在两页里，客户端只能看到半个回合。
+      let cut = pool.length
+      let count = 0
+      for (let index = pool.length - 1; index >= 0; index--) {
+        const event = pool[index]!['event'] as { type?: string; surfaceOp?: string }
+        if (event.surfaceOp !== 'append' || (event.type !== 'user/message' && event.type !== 'assistant/message')) continue
+        count += 1
+        if (count < maxMessages) continue
+        cut = index
+        for (let back = index; back >= 0; back--) {
+          if ((pool[back]!['event'] as { type?: string }).type === 'turn/start') {
+            cut = back
+            break
+          }
+        }
+        break
+      }
+      return OK({ records: pool.slice(cut), hasMore: cut > 0 })
     },
     projections: async () => OK(null),
     search: async (request: { query?: string; retry?: boolean } = {}) => {
