@@ -36,8 +36,8 @@ import {
   relaySourceOf, settledNoticeOf, timingProjectionOf,
   type SubagentCatalogEntry, type SubagentCatalogEventData, type SubagentTimingState,
 } from './subagent-wire'
-import type { AgentEvent, CompactionTrigger, EventMsg, TurnErrorInfo } from './types'
-import { archiveImageToPrompt, type PromptImageRef, type SessionImageRefWire } from './image-ref'
+import type { AgentEvent, CompactionTrigger, EventMsg, SessionEntryLike, TurnErrorInfo } from './types'
+import { archiveImageToPrompt, type PromptImageRef } from './image-ref'
 import type { HostBridge } from './tauri'
 
 const OK = <T>(value: T) => ({ ok: true as const, value })
@@ -330,15 +330,6 @@ interface Journal {
   /** 进行中工具调用的参数（callId → 解析后的 args；todo/write 推导与结算都要用）。 */
   callArgs: Map<string, unknown>
 }
-
-/**
- * `load_session` 的档案投影（与 `src-tauri/src/lib.rs` 的 `SessionEntry` 同形）。
- * 字段名跟着 Rust 的 serde 走：这里刻意**不**重命名，改名就会和后端序列化结果漂移。
- */
-type SessionEntry =
-  | { kind: 'message'; role: string; text: string; reasoning?: string; at_ms?: number; images?: SessionImageRefWire[] }
-  | { kind: 'tool_call'; call_id: string; tool: string; arguments: string; output?: string; at_ms?: number }
-  | { kind: 'turn_end'; turn: number; reason: string; at_ms: number; error?: TurnErrorInfo }
 
 /**
  * 会话附件在 prompt 里的落地形状（SH-116 批 1）：宿主只暂存文件字节，模型侧
@@ -1458,7 +1449,7 @@ export function createAdapter(options: AdapterOptions): { remote: unknown; dispo
    * - 终态：档案里的工具输出**已经**带着后端写的 `[exit code: N]` 尾标记，这里只
    *   读它、不再追加一次。
    */
-  const replayArchive = (entries: readonly SessionEntry[]): Journal => {
+  const replayArchive = (entries: readonly SessionEntryLike[]): Journal => {
     const journal = newJournal(now())
     let stepOpen = false
     /**
@@ -2145,7 +2136,7 @@ export function createAdapter(options: AdapterOptions): { remote: unknown; dispo
    * 本地再从档案派生会把它盖掉（重启后用户改过的名字就丢了）。
    */
   const rebuildFromArchive = async (sessionId: string): Promise<Journal | undefined> => {
-    const entries = await bridge.invoke<SessionEntry[]>('load_session', { agentId: sessionId })
+    const entries = await bridge.invoke<SessionEntryLike[]>('load_session', { agentId: sessionId })
     if (entries.length === 0) return undefined
     const replayed = replayArchive(entries)
     journals.set(sessionId, replayed)

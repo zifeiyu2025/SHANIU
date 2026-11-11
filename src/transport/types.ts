@@ -1,3 +1,5 @@
+import type { SessionImageRefWire } from './image-ref'
+
 export type TurnEndReason = 'completed' | 'cancelled' | 'failed' | 'budget_exhausted';
 export type IoChannel = 'stdout' | 'stderr';
 export type RiskLevel = 'read' | 'write_in_workspace' | 'execute' | 'destructive' | 'plan_review';
@@ -6,6 +8,49 @@ export type ToolCallResult = 'ok' | 'error' | 'cancelled' | 'denied';
 export type SubagentExitStatus = 'done' | 'failed' | 'cancelled';
 
 export type JsonValue = null | boolean | number | string | JsonValue[] | { [key: string]: JsonValue };
+
+/**
+ * 宿主 `load_session` 返回的一条档案条目（与 `src-tauri/src/lib.rs` 的 `SessionEntry` 同形）。
+ *
+ * **唯一一份声明**：它有两个消费面——实时 journal 回放（`adapter.ts`）与导出/复制
+ * Markdown（`header-actions/session-events.ts`），两者的**转换逻辑**各自保留（一个直接落
+ * journal 事件，一个翻译成上游 `SessionEvent`），但字段定义只能有一份。此前两处各写一份，
+ * 漂移已经发生过一次：`images` 只出现在其中一份上，导出因此丢掉用户图片（D1）。
+ *
+ * 字段名跟 Rust serde 走，不重命名——改名就会和后端序列化结果漂移。
+ */
+export type SessionEntryLike =
+  | {
+    readonly kind: 'message'
+    readonly role: string
+    readonly text: string
+    readonly reasoning?: string
+    /**
+     * 用户消息附带的图片引用（`src-tauri/src/lib.rs` 的 `Message.images`）。
+     * 导出/复制读它，而不是把图片压成正文里的 `[图片: …]` 文本——上游 formatter
+     * 本来就认 `image` 块（`markdown.ts` 的 `visibleContent`）。
+     */
+    readonly images?: readonly SessionImageRefWire[]
+    /** 事件落档时刻（Unix 毫秒）；缺省或 0 = 旧档案未记录（A0-4）。 */
+    readonly at_ms?: number
+  }
+  | {
+    readonly kind: 'tool_call'
+    readonly call_id: string
+    readonly tool: string
+    readonly arguments: string
+    readonly output?: string
+    /** 事件落档时刻；缺省或 0 = 旧档案未记录（A0-4）。 */
+    readonly at_ms?: number
+  }
+  | {
+    /** 回合结局（A0-3）：`completed` / `cancelled` / `failed` / `budget_exhausted`。 */
+    readonly kind: 'turn_end'
+    readonly turn: number
+    readonly reason: string
+    readonly at_ms: number
+    readonly error?: TurnErrorInfo
+  }
 
 /**
  * 回合失败的结构化原因（与 Rust `TurnErrorInfo` 同形，审计 A0）。

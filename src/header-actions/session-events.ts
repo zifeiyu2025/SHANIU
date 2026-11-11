@@ -28,8 +28,14 @@
  */
 import type { SessionEvent } from '@deepseek-ai/dsh-session/types'
 import type { SessionTitleEventData } from '@deepseek-ai/dsh-session-title/types'
-import type { TurnErrorInfo } from '../transport/types'
-import { archiveImageToPrompt, type SessionImageRefWire } from '../transport/image-ref'
+import type { SessionEntryLike, TurnErrorInfo } from '../transport/types'
+import { archiveImageToPrompt } from '../transport/image-ref'
+
+// 对外仍从这个模块导出 `SessionEntryLike`（导出/复制路径的既有 import 不改名），
+// 但**声明只有一份**，在 `../transport/types`：实时 journal 回放与这里共用同一份字段定义，
+// 只有转换逻辑各写一份。此前两处各写一份声明，`images` 只出现在其中一份上，
+// 导出因此丢图（D1）——同一 wire 两份声明就是漂移的源头。
+export type { SessionEntryLike }
 
 /**
  * `session/title` 事件的类型增强。
@@ -44,40 +50,6 @@ declare module '@deepseek-ai/dsh-session/types' {
     'session/title': SessionTitleEventData
   }
 }
-
-/** 宿主 `load_session` 返回的一条历史（与 `src-tauri/src/lib.rs` 的 `SessionEntry` 对应）。 */
-export type SessionEntryLike =
-  | {
-    readonly kind: 'message'
-    readonly role: string
-    readonly text: string
-    readonly reasoning?: string
-    /**
-     * 用户消息附带的图片引用（`src-tauri/src/lib.rs` 的 `Message.images`）。
-     * 导出/复制读它，而不是把图片压成正文里的 `[图片: …]` 文本——上游 formatter
-     * 本来就认 `image` 块（`markdown.ts` 的 `visibleContent`）。
-     */
-    readonly images?: readonly SessionImageRefWire[]
-    /** 事件落档时刻（Unix 毫秒）；缺省或 0 = 旧档案未记录（A0-4）。 */
-    readonly at_ms?: number
-  }
-  | {
-    readonly kind: 'tool_call'
-    readonly call_id: string
-    readonly tool: string
-    readonly arguments: string
-    readonly output?: string
-    /** 事件落档时刻；缺省或 0 = 旧档案未记录（A0-4）。 */
-    readonly at_ms?: number
-  }
-  | {
-    /** 回合结局（A0-3）：`completed` / `cancelled` / `failed` / `budget_exhausted`。 */
-    readonly kind: 'turn_end'
-    readonly turn: number
-    readonly reason: string
-    readonly at_ms: number
-    readonly error?: TurnErrorInfo
-  }
 
 /** 一条档案条目的时间：有落档时刻就用它，否则如实标不可信（不拿导出时刻冒充）。 */
 function entryTime(entry: { readonly at_ms?: number }): { time: number; unreliable: boolean } {
