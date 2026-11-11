@@ -1208,10 +1208,71 @@ describe('适配层的命令面映射', () => {
     await vi.waitFor(() => { expect(seen).toHaveLength(1) })
     expect(seen[0]!.self).toBe(scope)
     expect(seen[0]!.request).toMatchObject({ agent: { id: 'agent-new' }, toolName: 'write_file' })
-    // args/risk 不在 DSH 的载荷声明里，必须并进 reason，否则卡片只写工具名不说执行什么
-    expect(String(seen[0]!.request['reason'])).toContain('write_file')
-    expect(String(seen[0]!.request['reason'])).toContain('a.txt')
+    // 标题只说「是什么」：完整参数改由详情槽按 call_id 取，不再把 JSON 前缀塞进 reason。
+    expect(seen[0]!.request['reason']).toBe('风险 write_in_workspace：write_file')
+    expect(seen[0]!.request['callId']).toBeUndefined()
     expect(bridge.calls.find(call => call.command === 'approve')?.args).toEqual({ requestId: 'r9', decision: 'allow' })
+    dispose()
+  })
+
+  it('审批载荷透传 call_id 让详情槽可用，并把批量范围落成卡片描述', async () => {
+    const bridge = scriptedBridge()
+    const { remote, dispose } = createAdapter({ bridge })
+    const seen: Record<string, unknown>[] = []
+    faceOf(remote).$on('approval/request', async (request: Record<string, unknown>) => {
+      seen.push(request)
+      return 'rejected'
+    })
+    bridge.emit('agent-new', {
+      type: 'exec_approval_request',
+      request_id: 'r11',
+      tool: 'unified_exec',
+      args: { command: 'git status' },
+      risk: 'execute',
+      call_id: 'c-11',
+      batch_scope: 'same-args',
+    })
+    await vi.waitFor(() => { expect(seen).toHaveLength(1) })
+    expect(seen[0]!['callId']).toBe('c-11')
+    expect(String(seen[0]!['description'])).toContain('本轮内再次发起完全相同的调用不再询问')
+    // 标题短：命令只做一句话对象，完整命令由详情槽展示
+    expect(seen[0]!['reason']).toBe('风险 execute：unified_exec（git status）')
+    dispose()
+  })
+
+  it('未识别的批量范围标识要显式暴露，不能静默当成不批量', async () => {
+    const bridge = scriptedBridge()
+    const { remote, dispose } = createAdapter({ bridge })
+    const seen: Record<string, unknown>[] = []
+    faceOf(remote).$on('approval/request', async (request: Record<string, unknown>) => {
+      seen.push(request)
+      return 'rejected'
+    })
+    bridge.emit('agent-new', {
+      type: 'exec_approval_request',
+      request_id: 'r12',
+      tool: 'unified_exec',
+      args: { command: 'ls' },
+      risk: 'execute',
+      batch_scope: 'future-scope',
+    })
+    await vi.waitFor(() => { expect(seen).toHaveLength(1) })
+    expect(String(seen[0]!['description'])).toContain('future-scope')
+    dispose()
+  })
+
+  it('未知的审批结果一律按拒绝收口，绝不映射成 allow_always', async () => {
+    // AC7：AllowAlways 当前 UI 不可达。将来若有人把 DSH 的新状态映射成 allow_always，
+    // 这条用例必须红——否则「本会话该工具永久免问」会被无声接上。
+    const bridge = scriptedBridge()
+    const { remote, dispose } = createAdapter({ bridge })
+    faceOf(remote).$on('approval/request', (async () => 'allowed-always') as never)
+    bridge.emit('agent-new', { type: 'exec_approval_request', request_id: 'r13', tool: 'unified_exec', args: {}, risk: 'execute' })
+    await vi.waitFor(() => {
+      expect(bridge.calls.find(call => call.command === 'approve')?.args).toEqual({ requestId: 'r13', decision: 'deny' })
+    })
+    expect(bridge.calls.filter(call => call.command === 'approve').map(call => (call.args as { decision: string }).decision))
+      .not.toContain('allow_always')
     dispose()
   })
 

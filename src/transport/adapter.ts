@@ -50,6 +50,42 @@ const FAIL = (message: string) =>
 const asSessionId = (id: string) => id as unknown as SessionId
 const asWorkspaceId = (id: string) => id as unknown as WorkspaceId
 
+/**
+ * 审批卡标题里的一句话对象：只说「是什么」。
+ *
+ * 完整参数不进标题——`JSON.stringify` 会把换行转义成 `\n`（两个字符），160 字符实际
+ * 覆盖不到 80 个真实字符，任何有限长度都会在多文件补丁/长命令上截断。原文由详情槽
+ * 按 `call_id` 从聊天快照取（spec §1.1 / D1）。
+ */
+function approvalSubject(msg: Extract<EventMsg, { type: 'exec_approval_request' }>): string {
+  const args = msg.args
+  if (args === null || typeof args !== 'object' || Array.isArray(args)) return ''
+  const fields = args as Record<string, unknown>
+  if (msg.tool === 'apply_patch') {
+    const patch = fields['patch']
+    if (typeof patch !== 'string') return ''
+    const files = patch.match(/^\*\*\* (?:Add|Update|Delete) File: /gm)?.length ?? 0
+    return files === 0 ? '' : `（${files} 个文件）`
+  }
+  const command = fields['command']
+  if (typeof command !== 'string') return ''
+  const firstLine = command.split('\n', 1)[0]?.trim() ?? ''
+  if (firstLine === '') return ''
+  return `（${firstLine.length > 60 ? `${firstLine.slice(0, 60)}…` : firstLine}）`
+}
+
+/**
+ * `batch_scope` 是范围标识，不是文案：协议里不写中文，措辞在这里映射。
+ * 未识别的标识必须显式暴露——静默当成「不批量」会让卡片少说一句它本应说的事。
+ */
+function batchScopeText(scope: string | undefined): string | undefined {
+  if (scope === undefined) return undefined
+  if (scope === 'same-args') {
+    return '批准后，本轮内再次发起完全相同的调用不再询问；参数有任何变化都会重新确认。'
+  }
+  return `批准范围标识为 ${scope}（前端未识别，请按该标识的含义理解覆盖范围）`
+}
+
 /** 上游 token-meter 的用量四桶（usage-projection.ts bucketsFrom 的 wire 形状）。 */
 interface TokenBuckets {
   readonly uncachedInputTokens: number
@@ -1528,10 +1564,6 @@ export function createAdapter(options: AdapterOptions): { remote: unknown; dispo
     const next = async (): Promise<never> => {
       throw new RemoteError('gateway/internal', 'approval/request 没有下游处理者', {})
     }
-    // 载荷照 user-approval 的事件声明（ApprovalRequestEvent）：必填只有 toolName，
-    // 卡片把 reason 当描述文本。`args`/`risk` 不在声明里，直接塞进去会被无声忽略——
-    // 表现就是卡片只写"要执行工具"而不说执行什么，所以把它们并进 reason。
-    const preview = JSON.stringify(msg.args)
     // 来源代理与任务摘要：优先用后端事件里的权威字段（ADR-103）；
     // 泳道元数据只在事件没带字段时兜底。泳道未建立时反推必然失败——那正是
     // "子代理的审批显示在父时间线上、却看不出是谁在要权限"的根因。
@@ -1542,7 +1574,13 @@ export function createAdapter(options: AdapterOptions): { remote: unknown; dispo
     const origin = originName === undefined
       ? ''
       : `子代理 ${originName}${originTask === undefined ? '' : `（${originTask}）`}：`
-    const reason = `${origin}风险 ${msg.risk}：${msg.tool} ${preview.length > 160 ? `${preview.slice(0, 160)}…` : preview}`
+    // 标题只回答「是什么」：来源 + 风险 + 工具 + 一句话对象。
+    // 完整参数不进标题——`JSON.stringify` 把换行转义成 `\n`（两位字符），任何有限长度
+    // 都会在多文件补丁/长命令上截断（spec §1.1）。原文由详情槽按 `call_id` 取。
+    const reason = `${origin}风险 ${msg.risk}：${msg.tool}${approvalSubject(msg)}`
+    // 批量范围必须写在卡片上：事件传的是「覆盖多远」这个事实（`same-args`），
+    // 措辞由前端映射——把中文塞进协议等于把措辞变成契约。
+    const description = batchScopeText(msg.batch_scope)
     let decision = 'deny'
     try {
       const outcome = await listener.call(approvalScope?.(sessionId), {
@@ -1550,6 +1588,8 @@ export function createAdapter(options: AdapterOptions): { remote: unknown; dispo
         toolName: msg.tool,
         reason,
         displayReason: { en: reason },
+        ...(msg.call_id === undefined ? {} : { callId: msg.call_id }),
+        ...(description === undefined ? {} : { description }),
       }, next)
       // DSH 的 PendingApproval 只回答 allowed-once / rejected；「本会话记住」需要
       // SH-025 把这档语义接进审批卡，这里不自造第三态。
