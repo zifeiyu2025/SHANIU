@@ -776,6 +776,9 @@ pub struct ModelConfig {
     pub model: String,
     /// 每任务最大轮数（风险 R3：无限循环烧 token）。
     pub max_turns: u32,
+    /// 单个采样步最多重试几次模型请求（0 = 关闭重试）。默认 5，装配时封顶 8。
+    /// 只对瞬态失败（限流 / 超时 / 网络 / 5xx / 空响应）生效，且只在首个可见增量前。
+    pub max_retries: u32,
 }
 
 impl Default for ModelConfig {
@@ -785,6 +788,7 @@ impl Default for ModelConfig {
             base_url: String::new(),
             model: String::new(),
             max_turns: 32,
+            max_retries: 5,
         }
     }
 }

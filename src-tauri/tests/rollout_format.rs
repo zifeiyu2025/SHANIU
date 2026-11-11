@@ -105,6 +105,7 @@ async fn rollout_file_matches_history_after_one_task() {
         session_id: None,
         jobs: None,
         stop_hook: None,
+        retry: shaniu_lib::model_client::RetryPolicy::disabled(),
     };
     let sink: Arc<dyn EventSink> = Arc::new(NullSink);
     let summary = agent.run_task("读 a.txt", sink, CancellationToken::new()).await;

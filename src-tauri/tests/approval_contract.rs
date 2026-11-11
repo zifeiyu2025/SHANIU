@@ -186,6 +186,7 @@ fn harness_with(backend: Arc<dyn ModelBackend>, tool_name: &str, max_turns: u32)
         session_id: None,
         jobs: None,
         stop_hook: None,
+        retry: shaniu_lib::model_client::RetryPolicy::disabled(),
     };
     Harness { agent, hits, events, broker, cancel: CancellationToken::new() }
 }
@@ -266,6 +267,7 @@ fn on_failure_harness(approval: ApprovalMode) -> OnFailureHarness {
         session_id: None,
         jobs: None,
         stop_hook: None,
+        retry: shaniu_lib::model_client::RetryPolicy::disabled(),
     };
     OnFailureHarness { agent, hits, danger_hits, events, broker, cancel: CancellationToken::new() }
 }

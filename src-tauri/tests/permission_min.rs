@@ -127,6 +127,7 @@ fn engine(router: ToolRouter, backend: Arc<dyn ModelBackend>) -> AgentLoop {
         session_id: None,
         jobs: None,
         stop_hook: None,
+        retry: shaniu_lib::model_client::RetryPolicy::disabled(),
     }
 }
 

@@ -155,6 +155,10 @@ pub struct AgentLoop {
     /// 结束前否决点（SH-121②）。`None` = 不否决（测试与纯后端路径的默认）。
     /// 生产装配在 [`AgentLoop::from_config`] 注入 [`PlanModeStopHook`]。
     pub stop_hook: Option<Arc<dyn StopHook>>,
+    /// 模型请求重试策略（`04 §4 [model].max_retries`）：只决定“能不能再试、等多久”，
+    /// 事件与取消由采样循环负责。测试一律 [`crate::model_client::RetryPolicy::disabled`]，
+    /// 保证既有脚本后端的行为不变。
+    pub retry: crate::model_client::RetryPolicy,
 }
 
 /// 档案写入的连续失败阈值：同一条目重试这么多次仍失败，视为档案不可写。
@@ -402,6 +406,8 @@ impl AgentLoop {
             session_id: None,
             jobs: None,
             stop_hook: Some(Arc::new(PlanModeStopHook)),
+            // 手写配置把次数调大只会让一次失败拖成几分钟（500ms→8s 累加），封顶 8。
+            retry: crate::model_client::RetryPolicy::new(cfg.model.max_retries.min(8)),
         }
     }
 
@@ -1433,6 +1439,7 @@ mod tests {
             session_id: None,
             jobs: None,
             stop_hook: None,
+            retry: crate::model_client::RetryPolicy::disabled(),
         };
         (agent, store, CancellationToken::new(), broker)
     }
@@ -2001,6 +2008,7 @@ mod tests {
             session_id: None,
             jobs: None,
             stop_hook: None,
+            retry: crate::model_client::RetryPolicy::disabled(),
         };
         let sink = Arc::new(CapturingSink(store.clone()));
         let run = tokio::spawn(async move {
@@ -2149,6 +2157,7 @@ mod tests {
             session_id: None,
             jobs: None,
             stop_hook: None,
+            retry: crate::model_client::RetryPolicy::disabled(),
         };
         let sink: Arc<dyn EventSink> = Arc::new(AutoApproveSink { store: store.clone(), broker });
         let summary = agent
@@ -2242,6 +2251,7 @@ mod tests {
             session_id: None,
             jobs: None,
             stop_hook: None,
+            retry: crate::model_client::RetryPolicy::disabled(),
         };
         let sink = Arc::new(CapturingSink(store.clone()));
         agent
@@ -2386,6 +2396,7 @@ mod tests {
             session_id: None,
             jobs: None,
             stop_hook: None,
+            retry: crate::model_client::RetryPolicy::disabled(),
         };
         (agent, recorded, store)
     }
@@ -2623,6 +2634,7 @@ mod tests {
             session_id: None,
             jobs: None,
             stop_hook: None,
+            retry: crate::model_client::RetryPolicy::disabled(),
         };
         let (sink, _store) = CapturingSink::new();
         let task = format!(

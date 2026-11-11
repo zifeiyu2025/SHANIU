@@ -100,6 +100,7 @@ fn engine(live: Arc<AtomicUsize>) -> Arc<AgentLoop> {
         session_id: None,
         jobs: None,
         stop_hook: None,
+        retry: shaniu_lib::model_client::RetryPolicy::disabled(),
     })
 }
 

@@ -62,6 +62,7 @@ mod tests {
             base_url: base.into(),
             model: "test-model".into(),
             max_turns: 8,
+            max_retries: 0,
         }
     }
 

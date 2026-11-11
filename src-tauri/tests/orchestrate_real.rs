@@ -81,6 +81,7 @@ async fn root_spawns_two_real_children_and_collects_their_answers() {
         session_id: Some("qa-orchestrate".into()),
         jobs: None,
         stop_hook: None,
+        retry: shaniu_lib::model_client::RetryPolicy::disabled(),
     });
 
     let registry = Arc::new(SubagentRegistry::new(2));

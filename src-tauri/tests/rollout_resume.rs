@@ -124,6 +124,7 @@ fn loop_with(agent_ws: &Path, backend: Arc<Scripted>, writer: Arc<RolloutWriter>
         session_id: None,
         jobs: None,
         stop_hook: None,
+        retry: shaniu_lib::model_client::RetryPolicy::disabled(),
     }
 }
 
@@ -336,6 +337,7 @@ async fn resume_continues_real_work_on_a_real_endpoint() {
             session_id: None,
             jobs: None,
             stop_hook: None,
+            retry: shaniu_lib::model_client::RetryPolicy::disabled(),
         };
         (agent, broker)
     };
