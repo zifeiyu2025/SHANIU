@@ -10,6 +10,7 @@
 
 pub mod anomaly;
 pub mod budget;
+pub mod error_codes;
 pub mod instance;
 pub mod prompt;
 pub mod repair;
