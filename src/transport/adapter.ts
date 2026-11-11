@@ -37,6 +37,7 @@ import {
   type SubagentCatalogEntry, type SubagentCatalogEventData, type SubagentTimingState,
 } from './subagent-wire'
 import type { AgentEvent, EventMsg, TurnErrorInfo } from './types'
+import { archiveImageToPrompt, type PromptImageRef, type SessionImageRefWire } from './image-ref'
 import type { HostBridge } from './tauri'
 
 const OK = <T>(value: T) => ({ ok: true as const, value })
@@ -340,22 +341,6 @@ type SessionEntry =
   | { kind: 'turn_end'; turn: number; reason: string; at_ms: number; error?: TurnErrorInfo }
 
 /**
- * 档案里图片引用的 wire 形状（`src-tauri/src/images/mod.rs` 的 `ImageRef`）。
- * 字段名跟 Rust serde 走，不重命名；`attachment_id` / `bytes` 是后加的可选键
- * （旧档案没有）。
- */
-interface SessionImageRefWire {
-  readonly path: string
-  readonly sha256: string
-  readonly width: number
-  readonly height: number
-  readonly tokens: number
-  readonly mime: string
-  readonly attachment_id?: string
-  readonly bytes?: number
-}
-
-/**
  * 会话附件在 prompt 里的落地形状（SH-116 批 1）：宿主只暂存文件字节，模型侧
  * 以 `<attachment>` 文本块接收；文本按 128 KiB 窗口内联（截断标注），二进制只给
  * 占位。图片上传在 fetch 钩子处显式拒绝，这里的 image 分支只处理历史/内联形态。
@@ -378,33 +363,7 @@ interface AttachmentReadWire {
   readonly height?: number
 }
 
-/** 持久图片引用：与 DSH `ImageAttachmentRef` 同形，随 user/message 内容落 journal。 */
-interface PromptImageRef {
-  readonly attachmentId: string
-  readonly mediaType: string
-  readonly bytes: number
-  readonly width: number
-  readonly height: number
-  readonly name?: string
-}
-
 const IMAGE_MARKER_PREFIX = '<!-- shaniu-image:'
-
-/**
- * 档案引用 → 展示引用（与 DSH `ImageAttachmentRef` 同形）。落档时没有保存文件名，
- * 这里省略 `name`；没有 `attachment_id` 的引用（`view_image` 回填）没有可回读的
- * 附件来源，不能当成可解析的图片块，直接丢弃。
- */
-function archiveImageToPrompt(ref: SessionImageRefWire): PromptImageRef | undefined {
-  if (ref.attachment_id === undefined) return undefined
-  return {
-    attachmentId: ref.attachment_id,
-    mediaType: ref.mime,
-    bytes: ref.bytes ?? 0,
-    width: ref.width,
-    height: ref.height,
-  }
-}
 
 /** 展示引用 → `send_task` 的结构化参数（Rust `ImageAttachmentInput`，camelCase）。 */
 function toSendTaskImages(images: readonly PromptImageRef[]): Record<string, unknown>[] {

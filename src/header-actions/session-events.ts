@@ -29,6 +29,7 @@
 import type { SessionEvent } from '@deepseek-ai/dsh-session/types'
 import type { SessionTitleEventData } from '@deepseek-ai/dsh-session-title/types'
 import type { TurnErrorInfo } from '../transport/types'
+import { archiveImageToPrompt, type SessionImageRefWire } from '../transport/image-ref'
 
 /**
  * `session/title` 事件的类型增强。
@@ -51,6 +52,12 @@ export type SessionEntryLike =
     readonly role: string
     readonly text: string
     readonly reasoning?: string
+    /**
+     * 用户消息附带的图片引用（`src-tauri/src/lib.rs` 的 `Message.images`）。
+     * 导出/复制读它，而不是把图片压成正文里的 `[图片: …]` 文本——上游 formatter
+     * 本来就认 `image` 块（`markdown.ts` 的 `visibleContent`）。
+     */
+    readonly images?: readonly SessionImageRefWire[]
     /** 事件落档时刻（Unix 毫秒）；缺省或 0 = 旧档案未记录（A0-4）。 */
     readonly at_ms?: number
   }
@@ -157,7 +164,15 @@ export function sessionEntriesToEvents(
           data: {
             id: `shaniu-user-${String(seq)}`,
             role: 'user',
-            content: [{ type: 'text', text: entry.text }],
+            content: [
+              { type: 'text', text: entry.text },
+              // 附件不是正文的一部分：图片按 `image` 块交给 formatter，否则导出/复制
+              // 会把一次带图提问写成一个没有图片的纯文本气泡。
+              ...(entry.images ?? []).flatMap((image) => {
+                const attachment = archiveImageToPrompt(image)
+                return attachment === undefined ? [] : [{ type: 'image' as const, attachment }]
+              }),
+            ],
             source: { kind: 'user' },
           },
         }, at)

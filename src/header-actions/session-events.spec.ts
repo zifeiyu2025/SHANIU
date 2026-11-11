@@ -1,4 +1,5 @@
 import { describe, expect, it } from 'vitest'
+import { formatSessionMarkdown } from '../dsh/packages/session-query/session-log-export/src/markdown'
 import { sessionEntriesToEvents } from './session-events'
 
 /** 取出某类事件，便于按类型断言（不关心其余字段）。 */
@@ -21,6 +22,37 @@ describe('档案条目 → 逻辑事件', () => {
     expect(ends.map(event => (event.data as { turn: number }).turn)).toEqual([1, 2])
     // 末尾一定有收口：formatter 靠 turn/end 结束当前回合
     expect((events.at(-1) as { type: string }).type).toBe('turn/end')
+  })
+
+  it('用户消息的图片按附件块导出，不压成正文文本', () => {
+    const events = sessionEntriesToEvents([
+      {
+        kind: 'message',
+        role: 'user',
+        text: '看看这张图',
+        images: [
+          {
+            path: '/data/images/a.png', sha256: 'abc', width: 800, height: 600,
+            tokens: 120, mime: 'image/png', attachment_id: 'att-1', bytes: 2048,
+          },
+          // 没有 attachment_id 的引用（`view_image` 回填）不可回读，不能当图片块
+          { path: '/tmp/b.png', sha256: 'def', width: 10, height: 10, tokens: 1, mime: 'image/png' },
+        ],
+      },
+      { kind: 'message', role: 'assistant', text: '收到' },
+    ], '标题')
+
+    const content = (ofType(events, 'user/message')[0]?.data as { content: Record<string, unknown>[] }).content
+    expect(content[0]).toEqual({ type: 'text', text: '看看这张图' })
+    expect(content[1]).toEqual({
+      type: 'image',
+      attachment: { attachmentId: 'att-1', mediaType: 'image/png', bytes: 2048, width: 800, height: 600 },
+    })
+    expect(content).toHaveLength(2)
+
+    // 端到端：上游 formatter 把 image 块渲染成可见的附件行，而不是丢掉
+    const markdown = formatSessionMarkdown(events)
+    expect(markdown).toContain('[Image: attachment (800×600, 2048 bytes)]')
   })
 
   it('工具调用与结果成对展开，callId 保持一致', () => {
