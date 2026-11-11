@@ -26,6 +26,45 @@ const APPROX_BYTES_PER_TOKEN: usize = 4;
 /// 这条是设计选择，04 §6.4 只规定了摘要必含字段、没规定保留比例。
 const KEEP_RATIO_PERCENT: usize = 30;
 
+/// 模型行未声明 `context_window` 时用于推导压缩阈值的保守窗口。
+///
+/// 取 128K 而不是乐观值：窗口未知时宁可早压（多花一次摘要），也不能沿用 50 万预算——
+/// 那等于永不压缩，128K 模型跑到一半直接 400，代价比多压几次大得多。
+pub const FALLBACK_CONTEXT_WINDOW: usize = 128_000;
+
+/// 单个上下文窗口允许占用的量：窗口 × 80%，留 20% 给下一轮回复与工具结果。
+fn window_allowance(window: usize) -> usize {
+    let window = if window == 0 { FALLBACK_CONTEXT_WINDOW } else { window };
+    window.saturating_mul(4) / 5
+}
+
+/// 自动压缩阈值：`min(配置预算, 窗口 × 80%)`。
+///
+/// - `configured == 0`：显式关闭压缩，保持 0（不替用户改主意）；
+/// - `window == 0`（模型未声明）：按 [`FALLBACK_CONTEXT_WINDOW`] 推导，调用方负责告警；
+/// - 其余：留 20% 给下一轮回复与工具结果。
+///
+/// 回合内自动压缩与手动 `/compact` **必须**共用这一份口径（见 [`manual_token_budget`]）：
+/// 两处各算一遍时，手动路径拿到的是未经窗口裁剪的配置值，会出现「压完仍然超窗口」。
+pub fn compact_token_budget(configured: usize, window: usize) -> usize {
+    if configured == 0 {
+        return 0;
+    }
+    configured.min(window_allowance(window))
+}
+
+/// 手动压缩阈值：用户显式要求压缩时，`configured == 0` 不能解释成「关掉」。
+///
+/// 用 0 直接进 [`plan_manual`] 会算出「保留 0 条尾部」，把历史压到只剩最后一条——
+/// 那不是任何人的预期。这里的 0 表示「不设配置上限」，于是按窗口算：与自动路径
+/// 同一个窗口口径，只是不因为「关掉自动压缩」而拒绝用户显式要求的这一次。
+pub fn manual_token_budget(configured: usize, window: usize) -> usize {
+    if configured == 0 {
+        return window_allowance(window);
+    }
+    configured.min(window_allowance(window))
+}
+
 /// 摘要提示词。五个必含字段逐条来自 04 §6.4：
 /// 任务目标 / 已完成事项 / 关键文件与改动 / 未解决问题 / 下一步。
 ///
@@ -217,6 +256,35 @@ mod tests {
 
     fn out(id: &str, output: &str) -> HistoryItem {
         HistoryItem::FunctionCallOutput { call_id: id.into(), output: output.into() }
+    }
+
+    /// 压缩阈值必须跟着窗口走：`context_window = 0` 曾被短路成"照用 50 万预算"，
+    /// 128K 模型跑满也不会压缩，等端点 400 才暴露（2026-11-10 修复）。
+    #[test]
+    fn compact_budget_follows_window_and_never_uses_configured_limit_blindly() {
+        // 已知窗口：80% 封顶，配置更小时以配置为准
+        assert_eq!(compact_token_budget(500_000, 128_000), 102_400);
+        assert_eq!(compact_token_budget(50_000, 128_000), 50_000);
+        // 未知窗口：按保守窗口推导，而不是退回到 50 万
+        assert_eq!(compact_token_budget(500_000, 0), 102_400);
+        assert!(compact_token_budget(500_000, 0) < 500_000);
+        // 显式关闭压缩仍然是关闭
+        assert_eq!(compact_token_budget(0, 128_000), 0);
+        assert_eq!(compact_token_budget(0, 0), 0);
+    }
+
+    /// I1 / P3 反向对照：手动压缩不能再拿未经窗口裁剪的配置值。
+    /// 撤掉修复（`manual_token_budget` 直接返回 `configured`）时第一条断言变红——
+    /// 500K 配置 + 128K 窗口会保留 15 万 token 尾巴，压完仍然超窗口。
+    #[test]
+    fn manual_budget_is_clamped_by_window_and_survives_disabled_auto_compaction() {
+        assert_eq!(manual_token_budget(500_000, 128_000), 102_400);
+        // `token_budget = 0` 只关自动压缩；用户显式 `/compact` 按窗口算，
+        // 不能算出「保留 0 条尾部」把历史压到只剩最后一条。
+        assert_eq!(manual_token_budget(0, 128_000), 102_400);
+        assert_eq!(manual_token_budget(0, 0), 102_400);
+        // 配置小于窗口时仍以配置为准
+        assert_eq!(manual_token_budget(50_000, 128_000), 50_000);
     }
 
     #[test]
