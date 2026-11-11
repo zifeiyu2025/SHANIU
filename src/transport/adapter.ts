@@ -37,7 +37,7 @@ import {
   type SubagentCatalogEntry, type SubagentCatalogEventData, type SubagentTimingState,
 } from './subagent-wire'
 import type { AgentEvent, CompactionTrigger, EventMsg, SessionEntryLike, TurnErrorInfo } from './types'
-import { archiveImageToPrompt, type PromptImageRef } from './image-ref'
+import { archiveImageToPrompt, imageContentBlocks, type PromptImageRef } from './image-ref'
 import type { HostBridge } from './tauri'
 
 const OK = <T>(value: T) => ({ ok: true as const, value })
@@ -111,13 +111,23 @@ interface TokenBuckets {
 }
 
 /**
+ * `session.search` wire 的一条命中（与 vendored `SessionSearchResultItem` 同形）。
+ * 单独命名而不是内联：搜索结果在命令面、`SearchPageWire` 与未来消费方之间
+ * 只能有一个形状。
+ */
+interface SearchHitWire {
+  readonly sessionId: string
+  readonly snippet: string
+}
+
+/**
  * 宿主 `search_sessions` 的返回（SH-113）：与 vendored `session.search` wire
  * 一一对应——`items` 只有 `sessionId` + `snippet`，`hasMore` 是「命中会话数超过
  * 宿主固定上限、请收窄查询」提示（`slots.ts:280`），**不是**分页/续页信号。
  * DSH 客户端没有 Show more 请求、不传 cursor/limit，故命令面也只有 `{query}`。
  */
 interface SearchPageWire {
-  readonly items: readonly { sessionId: string; snippet: string }[]
+  readonly items: readonly SearchHitWire[]
   readonly hasMore: boolean
   /**
    * 宿主本次**跳过**的会话档案数（读不回来：被占用、权限、半截文件）。
@@ -125,12 +135,6 @@ interface SearchPageWire {
    * `本次搜索跳过了读不回来的会话档案`），排障按那条汇总查。
    */
   readonly skippedSessions?: number
-}
-
-/** `session.search` wire 的一条命中（与 vendored `SessionSearchResultItem` 同形）。 */
-interface SearchHitWire {
-  readonly sessionId: string
-  readonly snippet: string
 }
 
 /**
@@ -908,7 +912,6 @@ export function createAdapter(options: AdapterOptions): { remote: unknown; dispo
    * 没有则回落部署默认（`config.toml`）。会话内切档只写本会话档案，不写配置
    * ——这是与设置页那行的分界线（对齐 DSH 的 `sandbox/mode` 会话事件）。
    */
-  const sessionPresetLoaded = new Set<string>()
   const sessionPresetCache = new Map<string, string>()
   /**
    * 读宿主档案失败的会话。与「档案没记录档位」（`session_sandbox_mode` 回 null，
@@ -919,11 +922,10 @@ export function createAdapter(options: AdapterOptions): { remote: unknown; dispo
 
   /** 读宿主 durable 的本会话档位并写入缓存；读失败只记 unknown，不伪造一个档。 */
   const loadSessionPermission = async (sessionId: string): Promise<void> => {
-    if (sessionPresetLoaded.has(sessionId)) return
+    if (sessionPresetCache.has(sessionId)) return
     try {
       const mode = await bridge.invoke<string | null>('session_sandbox_mode', { sessionId })
       sessionPresetCache.set(sessionId, presetOfSandbox(mode ?? face.sandboxMode()))
-      sessionPresetLoaded.add(sessionId)
       sessionPresetUnreadable.delete(sessionId)
     } catch {
       sessionPresetUnreadable.add(sessionId)
@@ -1266,7 +1268,7 @@ export function createAdapter(options: AdapterOptions): { remote: unknown; dispo
       id: `shaniu-user-${journal.seq + 1}`,
       role: 'user',
       content: [
-        ...(item.images ?? []).map(image => ({ type: 'image', attachment: image })),
+        ...imageContentBlocks(item.images ?? []),
         ...(shown === '' ? [] : [{ type: 'text', text: shown }]),
       ],
       source: { kind: 'user', rpcId: item.requestId },
@@ -1512,7 +1514,7 @@ export function createAdapter(options: AdapterOptions): { remote: unknown; dispo
             id: `shaniu-replay-user-${index}`,
             role: 'user',
             content: [
-              ...parsed.images.map(image => ({ type: 'image', attachment: image })),
+              ...imageContentBlocks(parsed.images),
               ...(parsed.text === '' ? [] : [{ type: 'text', text: parsed.text }]),
             ],
             source: { kind: 'user' },
@@ -2256,7 +2258,7 @@ export function createAdapter(options: AdapterOptions): { remote: unknown; dispo
       id: `shaniu-user-${journal.seq + 1}`,
       role: 'user',
       content: [
-        ...images.map(image => ({ type: 'image', attachment: image })),
+        ...imageContentBlocks(images),
         ...(shown === '' ? [] : [{ type: 'text', text: shown }]),
       ],
       source: { kind: 'user', ...(rpcId === undefined ? {} : { rpcId }) },
@@ -3519,7 +3521,6 @@ export function createAdapter(options: AdapterOptions): { remote: unknown; dispo
                 mode: sandbox,
               })
               sessionPresetCache.set(sessionId, presetOfSandbox(applied))
-              sessionPresetLoaded.add(sessionId)
               result = { kind: 'success', text: `preset ${requested}` }
             } catch (reason) {
               // wire 契约：失败以 result.error 回给客户端，不是 rejection——UI 的错误
@@ -3642,7 +3643,6 @@ export function createAdapter(options: AdapterOptions): { remote: unknown; dispo
    * 清缓存重读（有事件的会话仍读回自己的档），再逐会话推帧。
    */
   const refreshPermissionsAll = async (): Promise<void> => {
-    sessionPresetLoaded.clear()
     sessionPresetCache.clear()
     await Promise.all([...journals.keys()].map(id => loadSessionPermission(id)))
     for (const id of journals.keys()) pushPermission(id)

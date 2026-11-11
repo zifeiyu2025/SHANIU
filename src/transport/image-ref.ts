@@ -47,3 +47,16 @@ export function archiveImageToPrompt(ref: SessionImageRefWire): PromptImageRef |
     height: ref.height,
   }
 }
+
+/**
+ * 图片引用 → `user/message` 的 `image` 内容块。
+ *
+ * 三个地方都要铺同样的块：实时提交、回合收口的排队补发、旧档案回放。块键写错
+ * （例如把 `attachment` 写成 `ref`）不会报错，只会让模型收到一个空块、界面却显示
+ * 已发送——所以形状只在这里构造一次。
+ */
+export function imageContentBlocks(
+  images: readonly PromptImageRef[],
+): { type: 'image'; attachment: PromptImageRef }[] {
+  return images.map(image => ({ type: 'image' as const, attachment: image }))
+}
