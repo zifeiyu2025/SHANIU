@@ -27,10 +27,12 @@ pub mod schema;
 #[cfg(test)]
 mod tests;
 
-use std::collections::{BTreeMap, HashMap};
+use std::collections::{BTreeMap, HashMap, HashSet};
 use std::fs;
 use std::hash::{DefaultHasher, Hash, Hasher};
 use std::path::{Path, PathBuf};
+use std::sync::Mutex;
+use std::time::{Duration, Instant};
 
 use rusqlite::{params, Transaction};
 use serde::{Deserialize, Serialize};
@@ -82,6 +84,109 @@ pub struct SearchHit {
 pub struct SearchPage {
     pub items: Vec<SearchHit>,
     pub has_more: bool,
+    /// 本次搜索**跳过**的会话档案数（读不回来：被占用、权限、半截文件）。
+    ///
+    /// 局部失败不该升级成全局失败：坏的是某一个会话的档案，不能罚到所有会话头上。
+    /// 但少给了就必须说出来——`skipped_sessions > 0` 表示「这次结果不完整」，
+    /// 与「标注缺失好过标注错位」同一条原则：缺失要说出来，不能悄悄少给。
+    pub skipped_sessions: u32,
+}
+
+/// 索引失败后的冷却时长：这段时间内不再尝试打开索引文件。
+///
+/// 行为对齐 codex `codex-mcp/src/client_tool_catalog.rs:175-232`：失败后记下
+/// `retry_not_before`，冷却期内的再次请求直接返回，不再重新抓取（它取 5 秒，
+/// 那里是进程内的内存目录；我们面对的是磁盘/权限故障，取 30 秒）。
+const INDEX_FAILURE_COOLDOWN: Duration = Duration::from_secs(30);
+
+/// 一条失败记忆：哪条索引、什么原因、什么时候、当时的文件状态。
+struct IndexFailure {
+    path: PathBuf,
+    message: String,
+    at: Instant,
+    /// 失败时索引文件的指纹（大小 + 修改时间）。文件被换掉/删掉/重建后指纹变化，
+    /// 说明"现场被改过了"，就不该继续用旧失败拦着——用户清磁盘、换文件后
+    /// 不必等满冷却或点重试。
+    stamp: Option<(u64, Option<std::time::SystemTime>)>,
+}
+
+/// 失败记忆表：按索引路径各记一条。进程内通常只有一条（一个 `data_root`），
+/// 但测试与多根场景会并行，单槽会被互相覆盖，所以按路径分开存。
+static INDEX_FAILURES: Mutex<Vec<IndexFailure>> = Mutex::new(Vec::new());
+
+/// 最多保留几条失败记忆（防止无界增长；正常只有一个 `data_root`）。
+const FAILURE_SLOTS: usize = 8;
+
+// 测试专用：打开索引的尝试次数。用于证明冷却期真的没有再去碰文件，
+// 而不是"又撞了一次墙但恰好返回了同一条错误"。
+// 用线程局部量：测试并行跑，全局计数会把别的用例的尝试次数算进来。
+#[cfg(test)]
+thread_local! {
+    static OPEN_ATTEMPTS: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+}
+
+#[cfg(test)]
+pub(crate) fn open_attempts() -> usize {
+    OPEN_ATTEMPTS.with(std::cell::Cell::get)
+}
+
+fn failure_slot() -> std::sync::MutexGuard<'static, Vec<IndexFailure>> {
+    // 失败记忆只是 hint，锁中毒不该让搜索整体不可用。
+    INDEX_FAILURES.lock().unwrap_or_else(|poisoned| poisoned.into_inner())
+}
+
+/// 索引文件的当前指纹：不存在时为 `None`。
+fn index_stamp(index_path: &Path) -> Option<(u64, Option<std::time::SystemTime>)> {
+    let meta = fs::metadata(index_path).ok()?;
+    Some((meta.len(), meta.modified().ok()))
+}
+
+/// 冷却期内：返回上次的同一条错误（同一个 code、同一个原因），不再触碰索引文件。
+fn cooldown_message(index_path: &Path) -> Option<String> {
+    let guard = failure_slot();
+    let failure = guard.iter().find(|failure| failure.path == index_path)?;
+    if failure.at.elapsed() >= INDEX_FAILURE_COOLDOWN {
+        return None;
+    }
+    // 现场被改过（文件被删/被换/被重建）就不再拦：那可能正是用户在自救。
+    if failure.stamp != index_stamp(index_path) {
+        return None;
+    }
+    Some(format!(
+        "{}（索引仍不可用，{} 秒内不再重复尝试，可手动重试）",
+        failure.message,
+        INDEX_FAILURE_COOLDOWN.as_secs()
+    ))
+}
+
+fn remember_failure(index_path: &Path, message: &str) {
+    let mut guard = failure_slot();
+    let failure = IndexFailure {
+        path: index_path.to_path_buf(),
+        message: message.to_string(),
+        at: Instant::now(),
+        stamp: index_stamp(index_path),
+    };
+    match guard.iter_mut().find(|slot| slot.path == index_path) {
+        Some(slot) => *slot = failure,
+        None => {
+            if guard.len() == FAILURE_SLOTS {
+                // 淘汰最老的一条：记忆只是 hint，丢掉不影响正确性。
+                guard.remove(0);
+            }
+            guard.push(failure);
+        }
+    }
+}
+
+/// 一次成功搜索只清掉**自己这条路径**的失败记忆，不影响别的索引路径。
+fn clear_failure(index_path: &Path) {
+    failure_slot().retain(|failure| failure.path != index_path);
+}
+
+/// 清掉全部失败记忆：重试入口调用它，下一次搜索重新尝试打开索引。
+pub fn retry_index_now() {
+    failure_slot().clear();
 }
 
 /// 一次搜索的完整入口（被 `lib.rs::search_sessions` 命令壳调用）。
@@ -91,21 +196,42 @@ pub struct SearchPage {
 /// 连 SQLite 都不打开（首搜惰性更彻底）。
 pub fn search(data_root: &Path, raw_query: &str) -> Result<SearchPage, SearchError> {
     if raw_query.trim().is_empty() {
-        return Ok(SearchPage { items: Vec::new(), has_more: false });
+        return Ok(SearchPage { items: Vec::new(), has_more: false, skipped_sessions: 0 });
     }
     let normalized = query::normalize_query(raw_query)?;
 
     // first-search 惰性打开：启动阶段完全不碰 SQLite。
     let index_path = data_root.join(config::CACHE_DIR).join(INDEX_FILE);
-    let mut conn = schema::open_index(&index_path)?;
+    if let Some(message) = cooldown_message(&index_path) {
+        return Err(SearchError::IndexFailed(message));
+    }
 
     let rollouts = data_root.join(rollout::ROLLOUT_DIR);
+    let result = search_with_index(&index_path, &rollouts, &normalized.expression);
+    match &result {
+        Ok(_) => clear_failure(&index_path),
+        // 只有索引侧的失败才进冷却；档案侧的局部失败已经在 reconcile 里降级了。
+        Err(SearchError::IndexFailed(message)) => remember_failure(&index_path, message),
+        Err(_) => {}
+    }
+    result
+}
+
+fn search_with_index(
+    index_path: &Path,
+    rollouts: &Path,
+    expression: &str,
+) -> Result<SearchPage, SearchError> {
+    #[cfg(test)]
+    OPEN_ATTEMPTS.with(|attempts| attempts.set(attempts.get() + 1));
+    let mut conn = schema::open_index(index_path)?;
+
     let tx = conn
         .transaction()
         .map_err(|e| SearchError::IndexFailed(format!("开启索引对账事务失败: {e}")))?;
-    reconcile(&tx, &rollouts)?;
+    let skipped_sessions = reconcile(&tx, rollouts)?;
     // 多取一条判断「是否超过上限」；SQL 内部已按 session_id 分组只留最强命中。
-    let rows = run_query(&tx, &normalized.expression, RESULT_LIMIT + 1)?;
+    let rows = run_query(&tx, expression, RESULT_LIMIT + 1)?;
     tx.commit()
         .map_err(|e| SearchError::IndexFailed(format!("提交索引对账失败: {e}")))?;
 
@@ -125,7 +251,12 @@ pub fn search(data_root: &Path, raw_query: &str) -> Result<SearchPage, SearchErr
             SearchHit { session_id: row.session_id, snippet }
         })
         .collect();
-    Ok(SearchPage { items, has_more })
+    Ok(SearchPage {
+        items,
+        has_more,
+        // 截到 wire 的类型范围：它的唯一用途是「这次结果不完整」的数量提示。
+        skipped_sessions: u32::try_from(skipped_sessions).unwrap_or(u32::MAX),
+    })
 }
 
 /// 一行查询结果的中间形状（只保留生成 snippet 所需的字段）。
@@ -187,29 +318,36 @@ fn revision_of(bytes: &[u8]) -> String {
 /// 一次串行对账（上游 `_reconcile` 的 SHANIU 等价）：
 /// 列出磁盘快照 → 与 base 的逐会话 revision 比对 → 只读新增/变化档案 → 抽语义文档
 /// → 在一个事务里把变化会话写入 TEMP live 表（shadow base）并同步更新 base → bump generation。
-fn reconcile(tx: &Transaction<'_>, rollouts: &Path) -> Result<(), SearchError> {
+///
+/// 返回本次**读不回来而跳过**的档案数；`> 0` 表示这次结果不完整，必须交给调用方。
+fn reconcile(tx: &Transaction<'_>, rollouts: &Path) -> Result<usize, SearchError> {
     tx.execute("DELETE FROM temp.live_docs", [])
         .and_then(|_| tx.execute("DELETE FROM temp.live_sessions", []))
         .map_err(|e| SearchError::IndexFailed(format!("清空 live 观察表失败: {e}")))?;
 
     let indexed = read_indexed_revisions(tx)?;
     let observed = observe_archives(rollouts)?;
+    let skipped = observed.unreadable.len();
+    let unreadable: HashSet<&String> = observed.unreadable.iter().collect();
 
     let mut changed: Vec<ObservedSession> = Vec::new();
-    for session in observed.values() {
+    for session in observed.sessions.values() {
         match indexed.get(&session.id) {
             Some(revision) if revision == &session.revision => {}
             _ => changed.push(session.clone()),
         }
     }
+    // 读不回来的档案不等于「已删除」：删掉它已索引的行，等于因为一次读失败
+    // 把历史内容从搜索里抹掉（codex `client_tool_catalog.rs:9` 对同类情况的口径是
+    // 保留 last good catalog）。保留旧行 + 计入 skipped，宁可给稍旧的命中。
     let deleted: Vec<String> = indexed
         .keys()
-        .filter(|id| !observed.contains_key(*id))
+        .filter(|id| !observed.sessions.contains_key(*id) && !unreadable.contains(*id))
         .cloned()
         .collect();
     let has_writes = !changed.is_empty() || !deleted.is_empty();
     if !has_writes {
-        return Ok(());
+        return Ok(skipped);
     }
 
     let generation = schema::read_generation(tx)?.parse::<i64>().unwrap_or(0) + 1;
@@ -227,7 +365,7 @@ fn reconcile(tx: &Transaction<'_>, rollouts: &Path) -> Result<(), SearchError> {
         params![generation],
     )
     .map_err(|e| SearchError::IndexFailed(format!("更新索引世代失败: {e}")))?;
-    Ok(())
+    Ok(skipped)
 }
 
 /// 一个磁盘上观察到的会话（本次搜索的当前态）。
@@ -239,14 +377,28 @@ struct ObservedSession {
     documents: Vec<documents::SearchDoc>,
 }
 
+/// 一次磁盘观察的结果：读得回来的会话，以及读不回来的档案 id。
+///
+/// 「单个档案读不回来」是局部失败，不是全局失败：坏的是某一个会话，不该罚到
+/// 所有会话头上（DSH `session-query/src/corpus.ts:30-33,139-176` 把批次结果
+/// 定义成逐会话 `fulfilled | rejected`，只有取消才整体中止）。
+struct ObservedArchives {
+    sessions: BTreeMap<String, ObservedSession>,
+    /// 读不回来的档案 id：对账时不能被当成「已删除」，并且要计入 `skipped_sessions`。
+    unreadable: Vec<String>,
+}
+
 /// 扫描 rollout 目录，对每个 `.jsonl` 算 revision；变化的会话顺带抽出语义文档。
 /// 只读：整个函数对 rollouts 目录没有任何写操作（AGENTS §3 + SH-113 验收红线）。
-fn observe_archives(rollouts: &Path) -> Result<BTreeMap<String, ObservedSession>, SearchError> {
-    let mut out = BTreeMap::new();
+fn observe_archives(rollouts: &Path) -> Result<ObservedArchives, SearchError> {
+    let mut sessions = BTreeMap::new();
+    let mut unreadable = Vec::new();
     let entries = match fs::read_dir(rollouts) {
         Ok(entries) => entries,
         // 目录不存在 = 首次运行的正常状态（与 rollout::list 同口径），不是错误。
-        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(out),
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
+            return Ok(ObservedArchives { sessions, unreadable })
+        }
         Err(e) => {
             return Err(SearchError::ArchiveReadFailed(format!(
                 "读取会话档案目录失败 {}: {e}",
@@ -265,24 +417,36 @@ fn observe_archives(rollouts: &Path) -> Result<BTreeMap<String, ObservedSession>
         let Some(id) = path.file_stem().map(|s| s.to_string_lossy().into_owned()) else {
             continue;
         };
-        let bytes = fs::read(&path).map_err(|e| {
-            SearchError::ArchiveReadFailed(format!("读取会话档案失败 {}: {e}", path.display()))
-        })?;
+        // 单个档案读不回来（被占用、权限、写了一半）：跳过它继续索引其余的，
+        // 并把它记进 `unreadable`。跳过 ≠ 假装它不存在——调用方必须把数量交出去。
+        let bytes = match fs::read(&path) {
+            Ok(bytes) => bytes,
+            Err(e) => {
+                tracing::warn!(session = %id, path = %path.display(), "会话档案读不回来，本次搜索跳过: {e}");
+                unreadable.push(id);
+                continue;
+            }
+        };
         let revision = revision_of(&bytes);
-        let archive = rollout::read(&path).map_err(|e| {
-            SearchError::ArchiveReadFailed(format!("会话档案 {} 读不回: {e}", path.display()))
-        })?;
+        let archive = match rollout::read(&path) {
+            Ok(archive) => archive,
+            Err(e) => {
+                tracing::warn!(session = %id, path = %path.display(), "会话档案解析失败，本次搜索跳过: {e}");
+                unreadable.push(id);
+                continue;
+            }
+        };
         let created_at = match &archive.meta {
             RolloutItem::SessionMeta { created_at, .. } => *created_at,
             _ => 0,
         };
         let documents = documents::build_documents(&archive.items, created_at);
-        out.insert(
+        sessions.insert(
             id.clone(),
             ObservedSession { id, revision, created_at, documents },
         );
     }
-    Ok(out)
+    Ok(ObservedArchives { sessions, unreadable })
 }
 
 fn read_indexed_revisions(

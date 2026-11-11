@@ -16,7 +16,7 @@ use crate::session_query::documents;
 use crate::session_query::query;
 use crate::session_query::schema;
 use crate::session_query::{
-    search, SearchError, INDEX_FILE, RESULT_LIMIT, SNIPPET_CHARS,
+    open_attempts, retry_index_now, search, SearchError, INDEX_FILE, RESULT_LIMIT, SNIPPET_CHARS,
 };
 
 static SEQ: AtomicUsize = AtomicUsize::new(0);
@@ -282,6 +282,42 @@ fn corrupt_index_is_quarantined_and_rebuilt_without_deleting_it() {
         .any(|entry| entry.file_name().to_string_lossy().contains("corrupt-"));
     assert!(preserved, "损坏索引必须改名保留，不能误删");
 }
+
+/// 单个档案读不回来只跳过它自己：其余会话照常出结果，且必须报告「这次不完整」。
+///
+/// 反向对照：把 `observe_archives` 里的跳过改回 `?` 直接返回，本用例在 `search` 处
+/// 直接拿到 `Err`，两条断言都到不了——必须红。
+#[test]
+fn one_unreadable_archive_is_skipped_and_reported_not_fatal() {
+    let fx = Fixture::new("partial");
+    write_archive(&fx, "good", &[message(Role::User, "这次搜索必须仍然命中")]);
+    fs::write(fx.archive_path("broken"), b"{ this is not a rollout\n").unwrap();
+
+    let page = search(&fx.root, "这次搜索").unwrap();
+    assert_eq!(ids(&page), vec!["good".to_string()], "坏档案不能拖垮整次搜索");
+    assert_eq!(page.skipped_sessions, 1, "少给了一条就必须说出来，不能悄悄少给");
+}
+
+/// 已索引的会话后来读不回来：保留旧命中（读失败 ≠ 删除），并计入 skipped。
+///
+/// 反向对照：把 `reconcile` 里 `deleted` 的 `!unreadable.contains` 去掉，这份档案会
+/// 被当成已删除、旧索引行被清掉，第一条断言立刻红。
+#[test]
+fn previously_indexed_session_survives_a_transient_unreadable_archive() {
+    let fx = Fixture::new("retain");
+    write_archive(&fx, "keep", &[message(Role::User, "保留旧命中的正文")]);
+    assert_eq!(search(&fx.root, "保留旧命中").unwrap().items.len(), 1);
+
+    fs::write(fx.archive_path("keep"), b"{ truncated").unwrap();
+    let page = search(&fx.root, "保留旧命中").unwrap();
+    assert_eq!(
+        ids(&page),
+        vec!["keep".to_string()],
+        "一次读失败不等于删除，旧命中必须保留（宁可稍旧，不能凭空消失）"
+    );
+    assert_eq!(page.skipped_sessions, 1);
+}
+
 
 /// 运行中的会话新写入正文/工具输出（rollout 逐行 flush）后，下一次搜索立刻能搜到。
 #[test]
@@ -557,6 +593,87 @@ fn search_waits_for_a_concurrent_writer_instead_of_failing() {
         "第二个连接必须真的等待过锁，实际 {elapsed:?}"
     );
 }
+
+/// 索引建不起来时记住失败：冷却期内不再打开索引文件，错误码与原因不变。
+///
+/// 反向对照：去掉 `search()` 里的 `cooldown_message` 前置检查，第二次搜索会再打开
+/// 一次索引，计数变成 +2，本用例红。
+#[test]
+fn index_failure_enters_cooldown_without_touching_the_file_again() {
+    let fx = Fixture::new("cooldown");
+    retry_index_now();
+    // 把 cache 目录做成普通文件：索引路径不可创建，open_index 必然 IndexFailed。
+    fs::write(fx.root.join(config::CACHE_DIR), b"not a directory").unwrap();
+    write_archive(&fx, "a", &[message(Role::User, "冷却期内的正文")]);
+
+    let before = open_attempts();
+    let first = search(&fx.root, "冷却期内");
+    let second = search(&fx.root, "冷却期内");
+    let after = open_attempts();
+
+    assert!(
+        matches!(first, Err(SearchError::IndexFailed(_))),
+        "索引打不开必须报错，不能拿空结果冒充「没搜到」"
+    );
+    assert_eq!(after - before, 1, "冷却期内不该再打开索引文件：撞一次墙就够");
+
+    let (Err(SearchError::IndexFailed(first)), Err(SearchError::IndexFailed(second))) =
+        (&first, &second)
+    else {
+        panic!("两次都应是 IndexFailed");
+    };
+    assert!(
+        second.contains(first.as_str()),
+        "冷却期返回的必须还是同一条原因：{first} vs {second}"
+    );
+    assert!(second.contains("不再重复尝试"));
+
+    // 重试入口：清掉记忆后必须真的重新尝试（这面墙还在，所以计数 +1）。
+    retry_index_now();
+    let _ = search(&fx.root, "冷却期内");
+    assert_eq!(
+        open_attempts() - after,
+        1,
+        "手动重试必须能绕过冷却、真的再试一次"
+    );
+}
+
+/// 隔离件只留最近几份，`cache/` 不被历史垃圾撑起来。
+#[test]
+fn quarantine_keeps_only_the_most_recent_copies() {
+    let fx = Fixture::new("quarantine-cap");
+    let cache = fx.root.join(config::CACHE_DIR);
+    fs::create_dir_all(&cache).unwrap();
+    for stamp in 1..=5 {
+        fs::write(
+            cache.join(format!("{INDEX_FILE}.corrupt-0-{stamp:013}")),
+            b"older quarantine",
+        )
+        .unwrap();
+    }
+    write_archive(&fx, "a", &[message(Role::User, "上限清理后的正文")]);
+    fs::write(fx.index_path(), b"this is definitely not a sqlite database").unwrap();
+
+    assert_eq!(search(&fx.root, "上限清理后的正文").unwrap().items.len(), 1);
+    let mut kept: Vec<String> = fs::read_dir(&cache)
+        .unwrap()
+        .flatten()
+        .map(|entry| entry.file_name().to_string_lossy().into_owned())
+        .filter(|name| name.contains(".corrupt-"))
+        .collect();
+    kept.sort();
+    assert_eq!(
+        kept.len(),
+        schema::QUARANTINE_KEEP,
+        "只留最近 {} 份隔离件，实际：{kept:?}",
+        schema::QUARANTINE_KEEP
+    );
+    assert!(
+        kept.iter().any(|name| name.contains("-0000000000005")),
+        "被保留的应是较新的几份：{kept:?}"
+    );
+}
+
 
 /// 索引层：被压缩锚点取代的原文标 `shadowed`，摘要与区间外内容仍是 `current`。
 ///

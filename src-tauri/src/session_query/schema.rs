@@ -206,6 +206,14 @@ fn reset_derived_schema(conn: &Connection, tables: &[String]) -> Result<(), rusq
     Ok(())
 }
 
+/// 损坏件最多保留几份。
+///
+/// 自创（参考源里都没有自动上限）：DSH `storage-domain` 的 backup-and-skip 只隔离不清理；
+/// ZCode `settingService.ts` 的 `.corrupt-<ts>` 交给「存储清理」界面由用户删；
+/// codex 无对应机制。这里取「保留最近 N 份」——既能事后取证，又不让 `cache/` 被
+/// 历史垃圾撑起来。清理是尽力而为，失败不影响重建。
+pub(crate) const QUARANTINE_KEEP: usize = 3;
+
 /// 把损坏的索引文件改名保留（含 WAL/SHM/journal 附属），再让调用方新建。
 /// 目标是"不误删"，所以 rename 失败一律报错而不是强行覆盖。
 fn quarantine(path: &Path) -> Result<(), SearchError> {
@@ -250,7 +258,52 @@ fn quarantine(path: &Path) -> Result<(), SearchError> {
             let _ = fs::rename(&side, PathBuf::from(side_target));
         }
     }
+    prune_quarantined(&target, &name);
     Ok(())
+}
+
+/// 只留最近 `QUARANTINE_KEEP` 份损坏件。
+///
+/// `newest` 是刚隔离出来的那一份，永远保留；其余按修改时间倒序（同时间按文件名倒序，
+/// 名字里带毫秒时间戳）取前面的。主件与它的 `-wal/-shm/-journal` 一起清。
+fn prune_quarantined(newest: &Path, name: &str) {
+    let Some(dir) = newest.parent() else { return };
+    let prefix = format!("{name}.corrupt-");
+    let Ok(entries) = fs::read_dir(dir) else { return };
+    let mut found: Vec<(SystemTime, PathBuf)> = entries
+        .flatten()
+        .filter_map(|entry| {
+            let file_name = entry.file_name().to_string_lossy().into_owned();
+            // 附属件跟着主件走，不作为独立候选。
+            if !file_name.starts_with(&prefix)
+                || ["-wal", "-shm", "-journal"]
+                    .iter()
+                    .any(|suffix| file_name.ends_with(suffix))
+            {
+                return None;
+            }
+            let modified = entry
+                .metadata()
+                .and_then(|meta| meta.modified())
+                .unwrap_or(UNIX_EPOCH);
+            Some((modified, entry.path()))
+        })
+        .collect();
+    found.sort_by(|a, b| {
+        b.0.cmp(&a.0)
+            .then_with(|| b.1.file_name().cmp(&a.1.file_name()))
+    });
+    for (_, old) in found.into_iter().skip(QUARANTINE_KEEP) {
+        if old == newest {
+            continue;
+        }
+        tracing::debug!(path = %old.display(), "清理过旧的损坏索引保留件");
+        for suffix in ["", "-wal", "-shm", "-journal"] {
+            let mut candidate = old.as_os_str().to_os_string();
+            candidate.push(suffix);
+            let _ = fs::remove_file(PathBuf::from(candidate));
+        }
+    }
 }
 
 fn ensure_persistent_schema(conn: &mut Connection) -> Result<(), SearchError> {
