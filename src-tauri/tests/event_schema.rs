@@ -16,7 +16,7 @@ use shaniu_lib::events::{
 };
 
 /// 与 src/transport/types.ts 的 type 判别值逐一对应。
-const EXPECTED_TAGS: [&str; 18] = [
+const EXPECTED_TAGS: [&str; 19] = [
     "turn_started",
     "turn_completed",
     "agent_message_delta",
@@ -35,6 +35,7 @@ const EXPECTED_TAGS: [&str; 18] = [
     "subagent_spawned",
     "subagent_exited",
     "subagent_message",
+    "system_prompt",
 ];
 
 fn all_variants() -> Vec<EventMsg> {
@@ -138,6 +139,14 @@ fn all_variants() -> Vec<EventMsg> {
         EventMsg::SubagentExited { child_id: "01JCHILD".into(), status: SubagentExitStatus::Failed, summary: "失败".into() },
         EventMsg::SubagentExited { child_id: "01JCHILD".into(), status: SubagentExitStatus::Cancelled, summary: "已取消".into() },
         EventMsg::SubagentMessage { child_id: "01JCHILD".into(), sender_id: "root".into(), text: "请改看 transport".into(), rpc_id: Some("rpc-9".into()) },
+        // 提示词入轨迹（additive）：载荷原样 round-trip
+        EventMsg::SystemPrompt {
+            text: "你是 SHANIU。\n## 工作区\nD:\\ws".into(),
+            sha256: "a1b2c3".into(),
+            at_ms: 1_760_000_000_000,
+            turn: 1,
+            step: 0,
+        },
     ];
     // 编译期穷举证明（SH-078）：无通配臂 match，EventMsg 新增变体而不更新上面的 vec 时编译失败；
     // vec 更新后 tag 集合随之扩大，EXPECTED_TAGS 不同步则标签集测试必红——双向闭环。
@@ -160,7 +169,8 @@ fn all_variants() -> Vec<EventMsg> {
             | EventMsg::TokenUsage { .. }
             | EventMsg::SubagentSpawned { .. }
             | EventMsg::SubagentExited { .. }
-            | EventMsg::SubagentMessage { .. } => {}
+            | EventMsg::SubagentMessage { .. }
+            | EventMsg::SystemPrompt { .. } => {}
         }
     }
     variants

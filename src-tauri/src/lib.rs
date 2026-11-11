@@ -757,10 +757,13 @@ fn project_entries(items: &[rollout::RolloutItem]) -> Vec<SessionEntry> {
             }
             // 首行 meta 不是历史；子代理引用要等 SH-056 的泳道 UI 才有展示形态；
             // 档位事件是控制面记录，退出留痕是审计记录——都不进对话历史。
+            // 系统提示词同样不进：它在轨迹视图里由 `system/message` 事件承载，
+            // 这里再投影一份会造成两份真相。
             rollout::RolloutItem::SessionMeta { .. }
             | rollout::RolloutItem::SubagentRef { .. }
             | rollout::RolloutItem::SandboxMode { .. }
-            | rollout::RolloutItem::AbortNote { .. } => {}
+            | rollout::RolloutItem::AbortNote { .. }
+            | rollout::RolloutItem::SystemPrompt { .. } => {}
         }
     }
     out

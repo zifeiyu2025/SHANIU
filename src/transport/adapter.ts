@@ -1829,6 +1829,25 @@ export function createAdapter(options: AdapterOptions): { remote: unknown; dispo
         }, { surfaceOp: 'append' })
         return
       }
+      case 'system_prompt':
+        // 提示词入轨迹：映射成上游的 `system/message`，只在该版本首次出现时由后端发出。
+        // 用 `journal.turn/step`（DSH 口径）而不是后端的采样轮次：后者是 turn 内的
+        // 第几次请求，直接写进 turn 会让卡片显示错误的会话轮次（同 tool/call 的折叠约定）。
+        // `append` 语义由上游 `inspectSystemPrompt` 解释：第一张为初始提示词，之后自动标
+        // 「系统提示词已更新」。
+        // 文本已在后端 journal 落盘前统一脱敏；这里不做二次处理，否则展示的就不是模型
+        // 实际收到的那份。
+        pushEvent(journal, 'system/message', {
+          turn: journal.turn,
+          step: journal.step,
+          message: {
+            id: `shaniu-system-${journal.seq + 1}`,
+            role: 'system',
+            source: { kind: 'system-prompt' as const },
+            content: [{ type: 'text', text: msg.text }],
+          },
+        }, { surfaceOp: 'append' })
+        return
       case 'model_retry':
         // 重试不是新 UI：上游 `RetryNodeView` 由两个 durable 会话事件驱动——
         // `llm/retry`（即将等待）与 `llm/retry-started`（等待结束、已重发）。

@@ -26,10 +26,22 @@ pub struct Resumed {
     pub applied_compactions: usize,
     /// 会话内最后一次档位切换（无则 None = 跟随部署默认）。
     pub sandbox_mode: Option<String>,
+    /// 档案里记录过的系统提示词版本（按写入顺序）。旧档案为空 = 未记录。
+    pub prompt_versions: Vec<SystemPromptRecord>,
     /// 末行半截写被丢弃的行数。
     pub torn_tail_lines: usize,
     /// 中间坏行（已跳过）的 1-based 行号；空 = 档案完好。重放出来的历史因此可能缺条目。
     pub damaged_lines: Vec<usize>,
+}
+
+/// 档案里的一条系统提示词版本（只读快照，供审计与轨迹回放）。
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SystemPromptRecord {
+    /// 落盘后的文本（写入时已经过统一脱敏）。
+    pub text: String,
+    pub sha256: String,
+    pub at_ms: u64,
+    pub turn: u32,
 }
 
 /// 重放档案 → 历史。
@@ -62,10 +74,31 @@ pub fn resume(path: &Path) -> Result<Resumed, RolloutError> {
     let mut applied = 0usize;
     // 档位事件不进模型历史，只取最后一条作为本会话的当前档位。
     let mut sandbox_mode: Option<String> = None;
+    // 系统提示词版本不进模型历史（每轮由 SessionPrompt 重新组装），只做审计与回放。
+    let mut prompt_versions: Vec<SystemPromptRecord> = Vec::new();
     for item in &archive.items {
         match item {
             RolloutItem::ResponseItem { item: h, .. } => history.push(h.clone()),
             RolloutItem::SandboxMode { mode, .. } => sandbox_mode = Some(mode.clone()),
+            RolloutItem::SystemPrompt { text, sha256, at_ms, turn } => {
+                // 自洽校验：档案被手工改动/写坏时，宁可拒绝 resume 也不能把它当真历史展示。
+                // 只校验"文本与指纹是否匹配"，不拿当前配置重算——那等于用推测覆盖事实。
+                let actual = rollout::sha256_hex(text);
+                if &actual != sha256 {
+                    return Err(RolloutError::Corrupted {
+                        line: 0,
+                        message: format!(
+                            "系统提示词行校验失败（sha256 不符；档案内记录 {sha256}，实算 {actual}）"
+                        ),
+                    });
+                }
+                prompt_versions.push(SystemPromptRecord {
+                    text: text.clone(),
+                    sha256: sha256.clone(),
+                    at_ms: *at_ms,
+                    turn: *turn,
+                });
+            }
             RolloutItem::Compacted { range_start, range_end, summary } => {
                 let (start, end) = (*range_start, *range_end);
                 if end > history.len() || start > end {
@@ -119,6 +152,7 @@ pub fn resume(path: &Path) -> Result<Resumed, RolloutError> {
         workspace_root,
         applied_compactions: applied,
         sandbox_mode,
+        prompt_versions,
         torn_tail_lines: archive.torn_tail_lines,
         damaged_lines: archive.damaged_lines,
     })
@@ -347,5 +381,69 @@ mod tests {
         std::fs::write(&path, "{}\n").unwrap();
         let err = RolloutWriter::open_existing(&path).map(|_| ()).unwrap_err();
         assert!(matches!(err, RolloutError::Corrupted { .. }), "非 session_meta 首行必须拒绝：{err}");
+    }
+
+    #[test]
+    fn system_prompt_round_trips_and_is_verified() {
+        let dir = temp_dir("prompt");
+        let path = dir.join("p.jsonl");
+        let raw = "你是 SHANIU。\n## 工作区\nD:\\ws\n";
+        // 与写入侧同口径：指纹对落盘文本（脱敏后）计算。
+        let stored = crate::config::redact(raw);
+        let sha = crate::rollout::sha256_hex(&stored);
+        let w = RolloutWriter::create(&dir, &meta("p")).unwrap();
+        w.append(&RolloutItem::SystemPrompt {
+            text: raw.into(),
+            sha256: sha.clone(),
+            at_ms: 9,
+            turn: 1,
+        })
+        .unwrap();
+        w.append(&msg("任务")).unwrap();
+        drop(w);
+
+        let r = resume(&path).unwrap();
+        assert_eq!(r.prompt_versions.len(), 1);
+        assert_eq!(r.prompt_versions[0].sha256, sha);
+        assert_eq!(r.prompt_versions[0].turn, 1);
+        // 提示词不进模型历史：它每轮重新组装，混进历史会逐轮累积。
+        assert_eq!(r.history.len(), 1);
+    }
+
+    #[test]
+    fn tampered_system_prompt_is_rejected_not_ignored() {
+        let dir = temp_dir("prompt-bad");
+        let path = dir.join("p.jsonl");
+        let stored = "原始提示词";
+        let sha = crate::rollout::sha256_hex(stored);
+        let w = RolloutWriter::create(&dir, &meta("p")).unwrap();
+        w.append(&RolloutItem::SystemPrompt {
+            text: stored.into(),
+            sha256: sha,
+            at_ms: 1,
+            turn: 1,
+        })
+        .unwrap();
+        drop(w);
+
+        // 反向对照：不改 → 能 resume（上面的 round_trips 用例已覆盖，这里再锁一次）
+        assert!(resume(&path).is_ok());
+
+        // 手工改一个字符：档案已不自洽，必须硬错误而不是当成"未记录"。
+        let tampered = std::fs::read_to_string(&path).unwrap().replace("原始提示词", "原始提示语");
+        std::fs::write(&path, tampered).unwrap();
+        let err = resume(&path).unwrap_err();
+        assert!(matches!(err, RolloutError::Corrupted { .. }), "篡改必须拒绝 resume：{err}");
+    }
+
+    #[test]
+    fn legacy_archive_without_system_prompt_has_no_versions() {
+        let dir = temp_dir("prompt-legacy");
+        let path = dir.join("old.jsonl");
+        let w = RolloutWriter::create(&dir, &meta("old")).unwrap();
+        w.append(&msg("旧会话")).unwrap();
+        drop(w);
+        let r = resume(&path).unwrap();
+        assert!(r.prompt_versions.is_empty(), "旧档案只能显示未记录，禁止回填");
     }
 }

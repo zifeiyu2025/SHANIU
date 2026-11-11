@@ -318,6 +318,21 @@ pub enum EventMsg {
         #[serde(default, skip_serializing_if = "Option::is_none")]
         rpc_id: Option<String>,
     },
+    /// 系统提示词版本（additive，A0 之后的「提示词入轨迹」）。
+    ///
+    /// 只在**实际下发的那条路径**上、内容指纹变化时发出：同一 run 的多轮不重复。
+    /// 载荷是实际下发的原文，落 journal 时由既有 `config::redact` 统一脱敏；
+    /// 不要在这里预处理，否则轨迹里看到的就不是模型看到的那份。
+    SystemPrompt {
+        text: String,
+        /// 落盘文本的指纹，前端据此判断版本是否变化。
+        sha256: String,
+        at_ms: u64,
+        /// 记录时的轮次。
+        turn: u32,
+        /// 记录时的步（与 `tool/call` 等事件同一口径）。
+        step: u32,
+    },
 }
 
 /// 事件出口抽象：agent_loop 及各模块经此广播（便于测试注入与 M1 复用）。

@@ -124,13 +124,23 @@ async fn rollout_file_matches_history_after_one_task() {
     }
     assert_eq!(first["config_snapshot"]["model"], "m");
 
-    // 其余行是 response_item；最后一行必须是回合结局（A0-3），不能只有正文没有收口。
+    // 其余行是 response_item（正文）或 system_prompt（提示词入轨迹）；
+    // 最后一行必须是回合结局（A0-3），不能只有正文没有收口。
     let (end, body) = lines[1..].split_last().expect("至少要有回合结局行");
+    let mut prompt_lines = 0;
     for line in body {
         let v: serde_json::Value = serde_json::from_str(line).unwrap();
-        assert_eq!(v["type"], "response_item", "档案正文只能是 response_item，收到 {v}");
-        assert!(v.get("item").is_some(), "response_item 必须带 item 载荷");
+        match v["type"].as_str().unwrap_or("") {
+            "response_item" => assert!(v.get("item").is_some(), "response_item 必须带 item 载荷"),
+            "system_prompt" => {
+                prompt_lines += 1;
+                assert!(v["text"].as_str().is_some_and(|t| !t.is_empty()), "提示词不能为空");
+                assert!(v["sha256"].as_str().is_some_and(|s| s.len() == 64), "必须带 sha256 指纹");
+            }
+            other => panic!("档案正文只允许 response_item / system_prompt，收到 {other}: {v}"),
+        }
     }
+    assert_eq!(prompt_lines, 1, "一次 run 只落一条系统提示词");
     let end: serde_json::Value = serde_json::from_str(end).unwrap();
     assert_eq!(end["type"], "turn_end", "档案收口必须是 turn_end，收到 {end}");
     assert_eq!(end["reason"], "completed");
@@ -147,6 +157,8 @@ async fn rollout_file_matches_history_after_one_task() {
             RolloutItem::ResponseItem { item, .. } => Some(item.clone()),
             // 结局行不进模型历史（回归时单独断言），这里只取正文。
             RolloutItem::TurnEnd { .. } => None,
+            // 提示词不是对话历史：模型每轮由 SessionPrompt 重新组装，混进来会逐轮累积。
+            RolloutItem::SystemPrompt { .. } => None,
             other => panic!("本轮不该出现 {other:?}"),
         })
         .collect();

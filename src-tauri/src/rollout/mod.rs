@@ -100,6 +100,31 @@ pub enum RolloutItem {
         #[serde(default)]
         error: Option<crate::events::TurnErrorInfo>,
     },
+    /// 本次任务实例实际下发的系统提示词（原文；落盘前由 [`RolloutWriter::append`] 统一脱敏）。
+    ///
+    /// 只在**内容指纹变化**时追加，因此同一 run 的多轮不会重复落盘。
+    /// `sha256` 对**落盘后的文本**计算：落盘文本经过脱敏过滤器，若对原文计算，
+    /// resume 自洽校验会把含密钥的正常档案误判为损坏。
+    SystemPrompt {
+        /// 实际发给模型的文本（内存态原文）。
+        text: String,
+        /// 落盘文本的 sha256（小写十六进制）。
+        sha256: String,
+        /// 落档时刻（Unix 毫秒）。与 `turn` 一起定位跨 run 的记录。
+        at_ms: u64,
+        /// 记录时的轮次（本次 run 内从 1 起）。
+        #[serde(default)]
+        turn: u32,
+    },
+}
+
+/// 系统提示词落盘文本的 sha256。
+///
+/// 调用方必须传入**将要落盘的那份文本**（即经 `config::redact` 之后的内容），
+/// 否则 resume 侧 `sha256(存档文本) == sha256 字段` 会失败。
+pub fn sha256_hex(text: &str) -> String {
+    use sha2::{Digest, Sha256};
+    format!("{:x}", Sha256::digest(text.as_bytes()))
 }
 
 #[derive(Debug, thiserror::Error)]
@@ -205,6 +230,27 @@ pub fn last_sandbox_mode(path: &Path) -> Option<String> {
         }
         if let Ok(RolloutItem::SandboxMode { mode, .. }) = serde_json::from_str::<RolloutItem>(&line) {
             last = Some(mode);
+        }
+    }
+    last
+}
+
+/// 读档案里**最后一条**系统提示词记录的指纹；没有记录（旧档案 / 从未落档）返回 None。
+///
+/// 用于 resume 后的版本漂移检测（R2）：漂移只告警，不拒绝启动——换模型、换档位、
+/// 工作区变化都会合法地产生新提示词。子串预筛的理由同 [`last_sandbox_mode`]。
+pub fn last_prompt_sha(path: &Path) -> Option<String> {
+    let file = File::open(path).ok()?;
+    let mut last = None;
+    for line in BufReader::new(file).lines() {
+        let line = line.ok()?;
+        if !line.contains("\"type\":\"system_prompt\"") {
+            continue;
+        }
+        if let Ok(RolloutItem::SystemPrompt { sha256, .. }) =
+            serde_json::from_str::<RolloutItem>(&line)
+        {
+            last = Some(sha256);
         }
     }
     last

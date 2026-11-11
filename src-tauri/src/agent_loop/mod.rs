@@ -559,12 +559,14 @@ impl AgentLoop {
         // 任务内冻结的系统提示（DSH `systemPromptUpdate: 'in-history'`）：只组装一次，
         // 易变量（时间 / Git / 权限档 / 计划态）走尾部 system 消息，保证前缀逐字节稳定。
         let mut session_prompt: Option<prompt::SessionPrompt> = None;
+        // 本 run 已落档的系统提示词指纹。只记一次：提示词在 run 内冻结，多轮重复记录
+        // 会让档案体积随轮数线性增长（二十轮无变化 = 二十份同样的几万 token）。
+        let mut recorded_prompt: Option<String> = None;
         // 结束前否决点是否已经用过（SH-121②：每次任务最多一次）。
         let mut stop_vetoed = false;
         let emit = |sink: &Arc<dyn crate::events::EventSink>, msg: EventMsg| {
             let _ = sink.emit(&msg);
         };
-
         // SH-091：技能目录在每次任务开始时发现一次。目录为空时系统提示不加技能段，
         // 且不向模型声明 `skill` 工具——避免无技能工作区的 token 开销与假能力。
         let skill_summaries = crate::skills::discover(&self.workspace_root);
@@ -646,6 +648,88 @@ impl AgentLoop {
                 history.push(HistoryItem::Message { role: Role::System, text: note, reasoning: None });
             }
             let instructions = session_prompt.instructions().to_string();
+            // 系统提示词入轨迹：记录点必须在**实际下发路径**上——`instructions` 就是紧接着
+            // 要交给 model_client 的那一份。不要事后重新 `assemble()` 再存，那存的是
+            // "应该发的内容"，一旦与实际下发分叉就再也查不出来。
+            //
+            // 指纹对**落盘文本**计算：rollout 写入前统一脱敏（M6 不变量），若对原文算 hash，
+            // 含密钥的正常档案会在 resume 自洽校验里被误判为损坏。
+            {
+                let sha = crate::rollout::sha256_hex(&crate::config::redact(&instructions));
+                let should_record = match &recorded_prompt {
+                    None => true,
+                    Some(last) if last == &sha => false,
+                    Some(_) => {
+                        tracing::error!(
+                            target: "prompt",
+                            turn,
+                            session_id = session_id.as_deref().unwrap_or("-"),
+                            "同一 run 内系统提示词发生变化——冻结策略被破坏，记录新版本"
+                        );
+                        true
+                    }
+                };
+                if should_record {
+                    // R2：resume 后新提示词与档案最后一条不同 → 合法漂移（换模型/换档位/
+                    // 工作区变化），只告警，不得拒绝启动。
+                    if let Some(writer) = rollout {
+                        if let Some(previous) = crate::rollout::last_prompt_sha(writer.path()) {
+                            if previous != sha {
+                                tracing::warn!(
+                                    target: "prompt",
+                                    turn,
+                                    session_id = session_id.as_deref().unwrap_or("-"),
+                                    "系统提示词与档案记录不同（合法变化：换模型 / 换档位 / 工作区变化）"
+                                );
+                            }
+                        }
+                    }
+                    let at_ms = now_ms();
+                    // 先落档案、再发事件：档案不可写即中止本轮（保留既有硬错误语义），
+                    // 避免档案与运行态分叉。
+                    if let Some(writer) = rollout {
+                        let item = crate::rollout::RolloutItem::SystemPrompt {
+                            text: instructions.clone(),
+                            sha256: sha.clone(),
+                            at_ms,
+                            turn,
+                        };
+                        let mut last_error = None;
+                        for _ in 0..MAX_ROLLOUT_WRITE_ATTEMPTS {
+                            match writer.append(&item) {
+                                Ok(()) => {
+                                    last_error = None;
+                                    break;
+                                }
+                                Err(e) => last_error = Some(e),
+                            }
+                        }
+                        if let Some(e) = last_error {
+                            emit(
+                                &sink,
+                                EventMsg::Error {
+                                    message: format!(
+                                        "系统提示词写入档案失败（连续 {MAX_ROLLOUT_WRITE_ATTEMPTS} 次），已停止本轮：{e}"
+                                    ),
+                                },
+                            );
+                            reason = TurnEndReasonLocal::Failed;
+                            break 'outer;
+                        }
+                    }
+                    emit(
+                        &sink,
+                        EventMsg::SystemPrompt {
+                            text: instructions.clone(),
+                            sha256: sha.clone(),
+                            at_ms,
+                            turn,
+                            step: 0,
+                        },
+                    );
+                    recorded_prompt = Some(sha);
+                }
+            }
             // 计划态下只向模型声明只读工具 + exit_plan_mode（ADR-003 双层防御第一层）
             let declarations = declarations_for(
                 &self.router,
@@ -1609,12 +1693,14 @@ mod tests {
         let events = store.lock().unwrap();
         let tags: Vec<&str> = events.iter().map(|e| match e {
             EventMsg::TurnStarted { .. } => "turn_started",
+            // 提示词入轨迹：首个 turn 在实际下发前记一条（每个 run 恰好一次）。
+            EventMsg::SystemPrompt { .. } => "system_prompt",
             EventMsg::AgentMessageDelta { .. } => "delta",
             EventMsg::TokenUsage { .. } => "usage",
             EventMsg::TurnCompleted { .. } => "turn_completed",
             other => panic!("意外事件: {other:?}"),
         }).collect();
-        assert_eq!(tags, ["turn_started", "delta", "usage", "turn_completed"]);
+        assert_eq!(tags, ["turn_started", "system_prompt", "delta", "usage", "turn_completed"]);
     }
 
     /// 结束前否决点：始终否决的钩子也只能再要一轮（每次任务上限一次），
