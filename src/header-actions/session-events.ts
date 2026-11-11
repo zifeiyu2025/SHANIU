@@ -22,6 +22,12 @@
  *    填最小合法形状——formatter 只读 `content`，读不到这部分；
  * ③ `step` 恒为 1：档案不记步号，而 formatter 的分段只用 turn，不用 step。
  *
+ * **与实时回放（`transport/adapter.ts`）的字段集不同是有意为之**：实时路径要覆盖
+ * journal 的全部语义（reasoning 流、工具参数、用量），导出只保留可读正文——
+ * 这里不读 `reasoning`（推理进导出是噪声），而 `images` 必须读（不读就丢图，D1）。
+ * 看到两份翻译的字段清单不一致时，先判断是否属于这几条，**不要当成 bug 抹平**：
+ * 合并它们会把「jit 日志」与「可读文档」两个目标混成一个。
+ *
  * **时间（A0-4）**：`time` 一律取档案里的事件落档时刻 `at_ms`，不再用导出那一刻
  * （那会让整份导出只有一两个不同时间）。旧档案没有 `at_ms`：写 `time: 0` 并附
  * `timeUnreliable: true`，明说自己不可信，绝不拿当前时钟冒充。
@@ -151,6 +157,9 @@ export function sessionEntriesToEvents(
         continue
       }
       if (entry.role !== 'assistant') continue // system / developer 不在 formatter 的渲染面内
+      // 刻意不导出 `reasoning`（推理过程）：导出面向人读，推理噪声大；实时回放
+      // （adapter.ts 的 replayArchive）才需要它。两条翻译路径读的字段集不同是有意为之，
+      // 不是漏——新字段要不要进导出，按「导出给人看」这条判据单独决定。
       push({
         type: 'assistant/message',
         surfaceOp: 'append',
