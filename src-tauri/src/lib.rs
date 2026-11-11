@@ -46,6 +46,8 @@ pub mod user_terminal;
 pub mod test_support;
 pub mod tool_router;
 pub mod tools;
+/// A0-2：关窗提示的系统层出口（托盘气泡）。应用内提示在 `hide()` 之后不可见。
+pub mod tray_notify;
 pub mod workspace_files;
 
 use std::path::{Path, PathBuf};
@@ -182,6 +184,17 @@ fn quit_survey_of(app: &tauri::AppHandle) -> QuitSurvey {
         running_terminals,
         pending_approvals,
     )
+}
+
+/// 关窗提示里「还有多少事在跑」的唯一口径（`CloseRequested` 与托盘菜单「后台运行说明」共用；
+/// 退出盘点走 `QuitSurvey::busy`，不用这个计数）。
+///
+/// 只数会随窗口一起消失、但进程仍在替它干活的东西：活动会话、后台作业、用户终端。
+/// 待审批不计入——它挂在某个在跑的会话或作业上，数进去会重复。
+fn tray_running_count(survey: &QuitSurvey) -> usize {
+    usize::from(survey.active_session.is_some())
+        + survey.running_jobs.len()
+        + survey.running_terminals
 }
 
 /// 强制中止要写进哪些会话的档案：活动会话 + 仍在跑的作业所属会话，去重保序。
@@ -3170,32 +3183,56 @@ pub fn run() {
             // 关闭 = 隐藏到系统托盘（不退出）；真正退出走托盘菜单「退出」
             // 或会话头「更多操作 → 退出 SHANIU」（`quit_app`）。
             //
-            // 为什么每次关闭都发提示：只隐藏、无提示会让用户以为已经退出；单实例锁
-            // 落地后再双击会得到“已被占用”，体感就是“再也打不开”。提示必须说明
-            // “程序还在、怎么真正退出”，有终端在跑时再带上数量。
+            // A0-2：提示**必须落在应用之外**。窗口一 hide，应用内的任何 toast 都看不见，
+            // 所以「还在后台」由托盘气泡发出（`tray_notify`）。不延迟 hide：用户点关闭
+            // 就是要它立刻消失，多等是把实现困难转嫁给用户。
+            //
+            // 门控：只在「有任务在跑」或「本进程首次收托盘」时弹；其余情况只更新
+            // tooltip（常驻、悬停可见），之后想再看走托盘菜单「后台运行说明」。
             if let tauri::WindowEvent::CloseRequested { api, .. } = event {
                 if window.label() == "main" {
                     api.prevent_close();
-                    let count = window
-                        .app_handle()
-                        .try_state::<user_terminal::UserTerminalManager>()
-                        .map(|state| state.active_count())
-                        .unwrap_or(0);
+                    let app = window.app_handle();
+                    let running = tray_running_count(&quit_survey_of(app));
                     let first = !TRAY_HINT_SHOWN.swap(true, Ordering::SeqCst);
-                    let _ = window.emit(
-                        user_terminal::TRAY_HINT_EVENT,
-                        user_terminal::TrayHint { count, first },
-                    );
-                    // 提示 toast 可能被错过；托盘 tooltip 让“还在后台”持续可见。
-                    if let Some(tray) = window.app_handle().tray_by_id("main") {
-                        let tooltip = if count > 0 {
-                            format!("SHANIU 仍在后台运行（{count} 个终端）· 右键退出")
+                    // tooltip 是气泡被系统屏蔽时的退路：它必须**每次都**更新，
+                    // 不能只在弹气泡时更新（否则屏蔽后就是「什么都没发生」）。
+                    if let Some(tray) = app.tray_by_id("main") {
+                        let tooltip = if running > 0 {
+                            format!("SHANIU 仍在后台运行（{running} 项任务）· 右键退出")
                         } else {
                             "SHANIU 仍在后台运行 · 右键退出".to_string()
                         };
                         let _ = tray.set_tooltip(Some(tooltip.as_str()));
                     }
-                    let _ = window.hide();
+                    if let Some((title, body)) = tray_notify::balloon_payload(running, first) {
+                        match tray_notify::show_balloon(title, &body) {
+                            Ok(()) => tracing::info!(
+                                running,
+                                first,
+                                "关窗提示已发到系统托盘气泡（Win11 可能按系统通知设置显示或屏蔽）"
+                            ),
+                            // 气泡发不出去不是静默失败：tooltip 已更新，日志留痕便于对账。
+                            Err(error) => tracing::warn!(
+                                running,
+                                first,
+                                "关窗气泡发送失败，退回 tooltip（悬停可见）：{error}"
+                            ),
+                        }
+                    } else {
+                        tracing::info!(running, "非首次且无任务在跑：只更新 tooltip，不弹气泡");
+                    }
+                    // 应用内提示只在窗口因异常没能隐藏时才有意义（那时它才可见）。
+                    match window.hide() {
+                        Ok(()) => {}
+                        Err(error) => {
+                            tracing::warn!("隐藏主窗口失败，退回应用内提示：{error}");
+                            let _ = window.emit(
+                                user_terminal::TRAY_HINT_EVENT,
+                                user_terminal::TrayHint { count: running, first },
+                            );
+                        }
+                    }
                 }
             }
         })
@@ -3276,10 +3313,12 @@ pub fn run() {
                     Err(e) => tracing::warn!("WebSocket gateway 绑定失败（事件仍走 Tauri 广播）: {e}"),
                 }
             });
-            // 系统托盘：菜单 = 显示 / 退出；左键单击图标 = 显示主窗口
+            // 系统托盘：菜单 = 显示 / 后台运行说明 / 退出；左键单击图标 = 显示主窗口
             let show = MenuItem::with_id(app, "show", "显示", true, None::<&str>)?;
+            // 「后台运行说明」是关窗气泡不弹时的主动入口：用户之后想看，随时能再读一遍。
+            let hint = MenuItem::with_id(app, "hint", "后台运行说明", true, None::<&str>)?;
             let quit = MenuItem::with_id(app, "quit", "退出", true, None::<&str>)?;
-            let tray_menu = Menu::with_items(app, &[&show, &quit])?;
+            let tray_menu = Menu::with_items(app, &[&show, &hint, &quit])?;
             TrayIconBuilder::with_id("main")
                 .icon(app.default_window_icon().expect("缺少应用图标").clone())
                 .tooltip("SHANIU")
@@ -3287,6 +3326,14 @@ pub fn run() {
                 .show_menu_on_left_click(false)
                 .on_menu_event(|app, event| match event.id().as_ref() {
                     "show" => show_main_window(app),
+                    "hint" => {
+                        // 不受「首次 / 有任务」门控：这是用户主动要看的。
+                        let running = tray_running_count(&quit_survey_of(app));
+                        let (title, body) = tray_notify::menu_hint_payload(running);
+                        if let Err(error) = tray_notify::show_balloon(title, &body) {
+                            tracing::warn!("托盘「后台运行说明」气泡发送失败：{error}");
+                        }
+                    }
                     "quit" => {
                         // 真退前先查有没有在跑的事：有就让前端给三个选项，
                         // 没有就直接退出（别让无任务的用户也点两次）。
@@ -3323,8 +3370,8 @@ pub fn run() {
 #[cfg(test)]
 mod quit_flow_tests {
     use super::{
-        assemble_quit_survey, forced_abort_targets, record_forced_abort_at, wait_until_idle,
-        QuitJob,
+        assemble_quit_survey, forced_abort_targets, record_forced_abort_at, tray_running_count,
+        wait_until_idle, QuitJob,
     };
     use crate::rollout::{ConfigSnapshot, RolloutItem};
     use std::time::Duration;
@@ -3346,6 +3393,23 @@ mod quit_flow_tests {
         assert!(assemble_quit_survey(None, vec![job("j1", None)], 0, 0).busy);
         assert!(assemble_quit_survey(None, Vec::new(), 1, 0).busy);
         assert!(assemble_quit_survey(None, Vec::new(), 0, 1).busy);
+    }
+
+    /// 关窗气泡口径：只有 agent 任务在跑（没有终端/作业）也必须算「还有事在跑」。
+    /// 反向对照：把 `tray_running_count` 改回只数终端，第一条断言必红。
+    #[test]
+    fn tray_running_count_includes_agent_session() {
+        let agent_only = assemble_quit_survey(Some(String::from("sess-1")), Vec::new(), 0, 0);
+        assert_eq!(tray_running_count(&agent_only), 1);
+
+        let mixed = assemble_quit_survey(
+            Some(String::from("sess-1")),
+            vec![job("j1", None), job("j2", None)],
+            2,
+            1,
+        );
+        // 待审批不重复计数（它挂在在跑的会话/作业上）。
+        assert_eq!(tray_running_count(&mixed), 5);
     }
 
     #[test]
