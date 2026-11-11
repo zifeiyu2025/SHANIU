@@ -592,6 +592,67 @@ describe('适配层把 EventMsg 流映射成 DSH 会话 journal', () => {
     dispose()
   })
 
+  it('模型重试：scheduled 落 llm/retry、started 落 llm/retry-started、exhausted 不落', async () => {
+    const bridge = scriptedBridge()
+    const { remote, dispose } = createAdapter({ bridge })
+    const session = faceOf(remote).session
+
+    await session.prompt({ sessionId: 'agent-retry', requestId: 'rpc-retry', content: [{ type: 'text', text: '你好' }] })
+    const scheduled = {
+      type: 'model_retry' as const,
+      turn: 1,
+      retry: 1,
+      max_retries: 5,
+      phase: 'scheduled' as const,
+      delay_ms: 8_000,
+      code: 'RATE_LIMIT',
+      message: '请求过于频繁，已被限流',
+      retry_id: '01JRETRY',
+    }
+    bridge.emit('agent-retry', scheduled)
+    bridge.emit('agent-retry', { ...scheduled, phase: 'started', delay_ms: 0 })
+    // 放弃不落 journal：上游没有对应事件，终局原因由 turn_completed 给。
+    bridge.emit('agent-retry', {
+      ...scheduled,
+      retry: 2,
+      phase: 'exhausted',
+      delay_ms: 0,
+      message: '服务端要求等待 120 秒，超过上限 10 秒，已放弃重试',
+    })
+    bridge.emit('agent-retry', { type: 'agent_message_delta', delta: '答案' })
+    bridge.emit('agent-retry', { type: 'turn_completed', turn: 1, reason: 'completed' })
+
+    const iterator = session.follow({ address: { kind: 'session', sessionId: 'agent-retry' } })
+    const snapshot = (await iterator.next()).value as Record<string, unknown>
+    const journal = eventsOf(snapshot)
+
+    journal.forEach((event, index) => {
+      // seq 必须逐条 +1：插一条“已放弃”会在这里立刻暴露。
+      expect(event['seq']).toBe(index)
+      expect(() => assertSessionWireEvent(event)).not.toThrow()
+    })
+    const retry = journal.filter(event => event['type'] === 'llm/retry')
+    const started = journal.filter(event => event['type'] === 'llm/retry-started')
+    expect(retry).toHaveLength(1)
+    expect(started).toHaveLength(1)
+    expect(retry[0]?.['data']).toMatchObject({
+      retryId: '01JRETRY',
+      turn: 1,
+      step: 0,
+      mode: 'normal',
+      policyKey: 'default',
+      retry: 1,
+      maxRetries: 5,
+      delayMs: 8_000,
+      failure: { code: 'RATE_LIMIT', message: '请求过于频繁，已被限流' },
+    })
+    expect(started[0]?.['data']).toEqual({ retryId: '01JRETRY', turn: 1, step: 0, retry: 1 })
+    expect(journal.some(event => String(event['data']).includes('已放弃重试'))).toBe(false)
+
+    await iterator.return?.(undefined)
+    dispose()
+  })
+
   it('失败回合把结构化错误写进 turn/end（401 → AUTH，原始诊断可展开）', async () => {
     const bridge = scriptedBridge()
     const { remote, dispose } = createAdapter({ bridge })

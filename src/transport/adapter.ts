@@ -1824,6 +1824,35 @@ export function createAdapter(options: AdapterOptions): { remote: unknown; dispo
         }, { surfaceOp: 'append' })
         return
       }
+      case 'model_retry':
+        // 重试不是新 UI：上游 `RetryNodeView` 由两个 durable 会话事件驱动——
+        // `llm/retry`（即将等待）与 `llm/retry-started`（等待结束、已重发）。
+        // 后端把三阶段压成一条 `model_retry`，这里只做翻译。
+        // `exhausted` 刻意不落 journal：上游没有对应事件，且随后的
+        // `turn_completed(failed)` 已给出终局原因，多落一条会在时间线上留个悬空节点。
+        if (msg.phase === 'scheduled') {
+          pushEvent(journal, 'llm/retry', {
+            retryId: msg.retry_id,
+            turn: journal.turn,
+            // 后端的一次 turn 对应 DSH 的一个 step（见 turn_started 的折叠注记）。
+            step: journal.step,
+            provider: 'shaniu',
+            mode: 'normal',
+            policyKey: 'default',
+            retry: msg.retry,
+            maxRetries: msg.max_retries,
+            delayMs: msg.delay_ms,
+            failure: { message: msg.message, code: msg.code },
+          })
+        } else if (msg.phase === 'started') {
+          pushEvent(journal, 'llm/retry-started', {
+            retryId: msg.retry_id,
+            turn: journal.turn,
+            step: journal.step,
+            retry: msg.retry,
+          })
+        }
+        return
       case 'error':
         // 全局错误不终结回合（回合终结只认 turn_completed）：这里只定稿已有的流，
         // 错误文案由随后的 turn_completed 呈现，避免在此造出一个假回合。
