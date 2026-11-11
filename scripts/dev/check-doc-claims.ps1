@@ -38,8 +38,11 @@
     2 = 环境不可比（清单缺失 / 解析出 0 行 / 源码树为空 / 断言的文档文件不存在 /
         清单引用了脚本没有的结构检查），此时**不下结论**——不可比就不给绿。
 
-  本脚本与 CI 的关系：只在本地跑，不替代 `cargo test`。它查的是「docs 的符号级承诺还在不在」，
-  查不了「实现是否正确」，也查不了测试有没有分辨力（见清单的 B 类）。
+  本脚本与 CI 的关系：`ci.yml` 的 `gate` 里有一个同名独立 step（纯文本扫描，秒级，与
+  `check-deps.ps1` 一起放在最前面）。CI 把退出码 1 和 2 都判红：环境不可比在本仓里只可能
+  是清单缺失 / 格式漂移 / 源码树没检出，放过它就等于「缺前置条件静默通过」，是最坏的绿。
+  它不替代 `cargo test`——查的是「docs 的符号级承诺还在不在」，查不了「实现是否正确」，
+  也查不了测试有没有分辨力（见清单的 B 类）。
 
 .PARAMETER Claims
   断言清单。默认 `align/doc-claims.md`。
@@ -471,7 +474,11 @@ if ($bClass.Count -gt 0) {
 if ($gaps.Count -gt 0) {
     Write-Host ""
     Write-Host "== A 类：文档有、代码找不到 =="
-    $gaps | ForEach-Object { "A`t{0}`t{1}`t{2}`t{3}" -f $_.id, $_.pos, $_.key, $_.reason }
+    # 带上原句：失败时要能直接定位「哪句承诺没兑现」。只给 ID 和位置还得回去翻清单，
+    # 而这条输出正是 CI 里唯一能看到的失败上下文。
+    $quotes = @{}
+    foreach ($r in $results) { $quotes[$r.id] = $r.quote }
+    $gaps | ForEach-Object { "A`t{0}`t{1}`t{2}`t{3}`t{4}" -f $_.id, $_.pos, $_.key, $quotes[$_.id], $_.reason }
     Write-Host ""
     Write-Host "$logPrefix 有 A 类缺口：要么改代码兑现，要么按裁决改文档并同步本清单" -ForegroundColor Red
     exit 1

@@ -65,6 +65,39 @@ jobs:
           }
           exit $code
 
+      # ── 文档断言核查（align/doc-claims.md）────────────────────────────────
+      # 与下面「上游对齐账本」并列的第二条红线，但放在最前面：与 check-deps 同属纯文本扫描、
+      # 无编译依赖、秒级完成，docs 漂移能立刻失败，不必等 clippy/test 十分钟后才暴露。
+      # 为什么不塞进 check-deps 或 ledger step：两条红线各自独立，失败时不用读日志就知道是哪一类。
+      # 退出码三态照本地契约：0 干净 / 1 有 A 类缺口 / 2 环境不可比。
+      # **2 同样判红**：在本仓里 2 只可能是清单缺失、清单格式漂移、源码树没检出、断言引用的
+      # 文档文件不存在——全是仓库自身坏了。放过去就等于「缺前置条件静默通过」，是最坏的一种绿。
+      # 脚本自身抛错（而非判定失败）走 exit 3，与上面 check-deps 的约定一致。
+      - name: 文档断言核查（A 类缺口 / 环境不可比 均红）
+        shell: pwsh
+        run: |
+          # GHA 的 pwsh 步骤自带 $ErrorActionPreference='stop'，脚本抛错会变成终止性错误，
+          # 不兜住就会被读成「代码有缺口」——那是两回事，必须分开报
+          try {
+            $out = (& ./scripts/dev/check-doc-claims.ps1 *>&1 | Out-String -Width 400)
+            $code = $LASTEXITCODE
+          }
+          catch {
+            Write-Host "::error title=文档断言核查脚本自身错误::$($_.Exception.Message)"
+            exit 3
+          }
+          $out | Write-Host
+          # 缺口逐条生成 annotation：job 摘要里直接看到位置与原句，不用翻日志
+          if ($code -eq 1) {
+            ($out -split "`n") | Where-Object { $_ -match '^A\t' } | ForEach-Object {
+              Write-Host ('::error title=文档断言缺口::' + ($_ -replace "`t", ' '))
+            }
+          }
+          elseif ($code -eq 2) {
+            Write-Host '::error title=文档断言核查环境不可比::退出码 2：清单缺失 / 解析 0 行 / 源码树过小 / 清单引用了未知结构检查'
+          }
+          exit $code
+
       - name: clippy（告警即失败）
         working-directory: src-tauri
         run: cargo clippy --all-targets -- -D warnings
