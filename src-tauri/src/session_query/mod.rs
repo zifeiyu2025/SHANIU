@@ -61,6 +61,12 @@ pub enum SearchError {
     ArchiveReadFailed(String),
 }
 
+/// 命中一段已被压缩的原文时，snippet 前置的标注。
+///
+/// 「能查到」与「还在生效」是两件事：原文确实还在档案里，但模型当前只看到摘要。
+/// 只给前半句，用户会以为模型还记得那段，然后基于这个假设做判断。
+pub const SHADOWED_SNIPPET_PREFIX: &str = "〔该段已被压缩，模型当前不再看到〕";
+
 /// `session.search` wire 的一条命中（DSH `SessionSearchResultItem`）：只有两键。
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
@@ -107,9 +113,16 @@ pub fn search(data_root: &Path, raw_query: &str) -> Result<SearchPage, SearchErr
     let items: Vec<SearchHit> = rows
         .into_iter()
         .take(RESULT_LIMIT as usize)
-        .map(|row| SearchHit {
-            session_id: row.session_id,
-            snippet: query::make_snippet(&row.marked_text, SNIPPET_CHARS),
+        .map(|row| {
+            let snippet = query::make_snippet(&row.marked_text, SNIPPET_CHARS);
+            // wire 只有 {sessionId, snippet} 两键（与上游同形）：标注随 snippet 走，
+            // 不新增字段——新字段没有消费方就是"写了没接上"。
+            let snippet = if row.surface == "shadowed" {
+                format!("{SHADOWED_SNIPPET_PREFIX} {snippet}")
+            } else {
+                snippet
+            };
+            SearchHit { session_id: row.session_id, snippet }
         })
         .collect();
     Ok(SearchPage { items, has_more })
@@ -119,6 +132,8 @@ pub fn search(data_root: &Path, raw_query: &str) -> Result<SearchPage, SearchErr
 struct QueryRow {
     session_id: String,
     marked_text: String,
+    /// `current` / `shadowed`：这段原文是否还在模型当前的历史里。
+    surface: String,
 }
 
 /// 执行 UNION + 排名 + 限量查询。排名按上游口径：
@@ -149,6 +164,7 @@ fn run_query(
                 Ok(QueryRow {
                     session_id: row.get::<_, String>("session_id")?,
                     marked_text: row.get::<_, String>("marked_text")?,
+                    surface: row.get::<_, String>("surface")?,
                 })
             },
         )

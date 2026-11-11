@@ -500,7 +500,12 @@ fn schema_ownership_is_conservative_and_supports_in_place_version_reset() {
     }
     let page = search(&fx.root, "schema").unwrap();
     assert_eq!(page.items.len(), 1, "认识的不兼容派生 schema 必须能原地重置并重建索引");
-    assert_eq!(schema::SCHEMA_VERSION, 1);
+    // 重建后落在**当前**版本上（断言版本落盘，而不是常量自证）
+    let conn = Connection::open(fx.index_path()).unwrap();
+    let version: i64 = conn
+        .query_row("PRAGMA user_version", [], |row| row.get(0))
+        .unwrap();
+    assert_eq!(version, schema::SCHEMA_VERSION);
 }
 
 /// 连接参数（2026-11-11）：WAL + 5 秒忙等待。旧代码只有 application_id，
@@ -549,6 +554,76 @@ fn search_waits_for_a_concurrent_writer_instead_of_failing() {
     );
     assert!(
         elapsed >= Duration::from_millis(250),
-        "第二个连接必须真的等待过写锁，实际 {elapsed:?}"
+        "第二个连接必须真的等待过锁，实际 {elapsed:?}"
+    );
+}
+
+/// 索引层：被压缩锚点取代的原文标 `shadowed`，摘要与区间外内容仍是 `current`。
+///
+/// 序号口径与 `rollout::resume` 一致——工具输出**占**历史序号。锚点 0..2 吃掉
+/// 「消息 + 调用」，输出自己那一项仍在历史里，所以它的文档仍是 `current`。
+#[test]
+fn documents_mark_compacted_originals_as_shadowed() {
+    let items = vec![
+        message(Role::User, "旧目标：端口 3306"),
+        call("unified_exec", "{\"cmd\":\"ls\"}", "c1"),
+        output("c1", "旧工具输出"),
+        RolloutItem::Compacted { range_start: 0, range_end: 2, summary: "摘要：数据库配置已确定".into() },
+        message(Role::Assistant, "压缩后的新回复"),
+    ];
+    let docs = documents::build_documents(&items, 1_700_000_000_000);
+
+    // 索引文本按 query::fts_text 归一化过（CJK 字间插零宽空格），比对前先还原
+    let plain = |text: &str| text.replace('\u{200b}', "");
+    let surface_of = |needle: &str| {
+        docs.iter()
+            .find(|doc| plain(&doc.text).contains(needle))
+            .unwrap_or_else(|| panic!("缺少包含 {needle} 的文档：{docs:?}"))
+            .surface
+    };
+    assert_eq!(surface_of("3306"), "shadowed", "被摘要取代的原文字档仍在，但模型当前不再看到");
+    assert_eq!(surface_of("unified_exec"), "shadowed", "调用与它占的区间一起被取代");
+    assert_eq!(surface_of("旧工具输出"), "current", "输出是独立历史项，锚点没覆盖它");
+    assert_eq!(surface_of("已确定"), "current", "摘要本身就是当前内容");
+    assert_eq!(surface_of("压缩后的新回复"), "current");
+}
+
+/// 端到端：搜到被压缩的原文时，snippet 必须自带「模型当前不再看到」的标注；
+/// 搜到仍在上下文里的内容时不加。
+///
+/// 反向对照：把 `build_documents` 的 surface 判定去掉（恒为 `current`），
+/// 第一条断言即红——那正是"能查到"被当成"还在生效"的形态。
+#[test]
+fn searching_a_compacted_original_says_the_model_no_longer_sees_it() {
+    let fx = Fixture::new("shadowed");
+    write_archive(
+        &fx,
+        "s1",
+        &[
+            message(Role::User, "确定端口为 3306"),
+            RolloutItem::Compacted {
+                range_start: 0,
+                range_end: 1,
+                summary: "摘要：已确定数据库配置".into(),
+            },
+            message(Role::Assistant, "收到"),
+        ],
+    );
+
+    let shadowed = search(&fx.root, "3306").unwrap();
+    assert_eq!(ids(&shadowed), vec!["s1".to_string()], "原文仍必须能搜到");
+    let snippet = &shadowed.items[0].snippet;
+    assert!(
+        snippet.starts_with(crate::session_query::SHADOWED_SNIPPET_PREFIX),
+        "搜到已压缩的原文必须标注模型当前不再看到：{snippet}"
+    );
+    assert!(snippet.contains("3306"), "标注不能吞掉命中内容：{snippet}");
+
+    let current = search(&fx.root, "数据库配置").unwrap();
+    assert_eq!(ids(&current), vec!["s1".to_string()]);
+    assert!(
+        !current.items[0].snippet.contains(crate::session_query::SHADOWED_SNIPPET_PREFIX),
+        "摘要仍在上下文里，不该被标注成已压缩：{}",
+        current.items[0].snippet
     );
 }

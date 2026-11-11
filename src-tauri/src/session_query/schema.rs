@@ -26,7 +26,11 @@ const BUSY_TIMEOUT: Duration = Duration::from_secs(5);
 /// 要防的事故。
 pub const APPLICATION_ID: i64 = 0x5348_4e51;
 /// SHANIU 派生索引的 schema 版本；不兼容版本原地重置。
-pub const SCHEMA_VERSION: i64 = 1;
+///
+/// v2：`surface` 不再恒为 `current`——被压缩锚点取代的原文记 `shadowed`
+/// （能搜到，但模型当前不再看到）。旧索引里的 `current` 已经失真，
+/// 必须靠版本号强制重建，而不是等档案下次变化才顺手修正。
+pub const SCHEMA_VERSION: i64 = 2;
 
 /// 认识的用户表（含 FTS5 的 shadow 表）。出现任何未知表即拒绝，绝不 DROP 别人的数据。
 const DERIVED_USER_TABLES: &[&str] = &[
