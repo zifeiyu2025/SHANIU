@@ -313,25 +313,38 @@ impl AclManager {
         ) {
             // 已经改了一半：立刻按备份还原，再报错。
             let restore = restore_from_snapshot(&normalized, &snapshot);
-            if wrote_backup {
-                let _ = std::fs::remove_file(&backup_path);
-            }
+            // 备份删不掉 = 下次启动 `recover_pending` 会重放这份「授权前快照」，
+            // 把此后对同一目录的合法授权一并抹掉。不能 `let _`：并进错误文案，
+            // 让调用方知道 DACL 之外还留了一个待处理的备份。
+            let backup_note = if wrote_backup {
+                match std::fs::remove_file(&backup_path) {
+                    Ok(()) => String::new(),
+                    Err(remove_error) if backup_path.exists() => format!(
+                        "；且原始 DACL 备份删除失败（{}）：{remove_error}。下次启动会按它还原，\
+                         可能覆盖此后对同一目录的合法授权，请手工删除",
+                        backup_path.display()
+                    ),
+                    Err(_) => String::new(),
+                }
+            } else {
+                String::new()
+            };
             self.audit(
                 "grant",
                 &normalized,
                 &sid_text,
                 access.label(),
                 "error",
-                Some(&error.message),
+                Some(&format!("{}{backup_note}", error.message)),
             );
             return Err(match restore {
                 Ok(()) => format!(
-                    "给「{}」加沙箱 ACE 失败，已按备份还原：{error}{}",
+                    "给「{}」加沙箱 ACE 失败，已按备份还原：{error}{}{backup_note}",
                     normalized.display(),
                     grant_hint(error.access_denied)
                 ),
                 Err(restore_error) => format!(
-                    "给「{}」加沙箱 ACE 失败，且按备份还原也失败（需人工检查 DACL）：{error}{}；{restore_error}",
+                    "给「{}」加沙箱 ACE 失败，且按备份还原也失败（需人工检查 DACL）：{error}{}；{restore_error}{backup_note}",
                     normalized.display(),
                     grant_hint(error.access_denied)
                 ),
@@ -354,13 +367,43 @@ impl AclManager {
         let removed = revoke_ace(&normalized, sid).inspect_err(|error| {
             self.audit("revoke", &normalized, &sid_text, "-", "error", Some(error));
         })?;
-        self.granted.remove(&(normalized.clone(), sid_text.clone()));
         if removed {
             // 该路径上已无其它授权 → 备份文件也删掉，
             // 否则退出还原会把刚撤销的 ACE 又写回去。
-            if !self.granted.iter().any(|(path, _)| *path == normalized) {
-                let _ = std::fs::remove_file(self.backup_path(&normalized));
+            //
+            // 删失败**不能吞**：备份还在 = 下次启动 `recover_pending` 会把它原样重放，
+            // 而审计已经记了 revoke ok——重启后的 DACL 会和用户看到的结果相反。
+            // 宁可这次撤销显式失败，并把条目留在 `granted` 里等重试。
+            let other_grants = self
+                .granted
+                .iter()
+                .any(|(path, other)| *path == normalized && other.as_str() != sid_text.as_str());
+            if !other_grants {
+                let backup = self.backup_path(&normalized);
+                if let Err(error) = std::fs::remove_file(&backup) {
+                    // 备份本来就不存在（幂等跳过路径没写过备份）不算失败。
+                    if backup.exists() {
+                        let message =
+                            format!("删除 DACL 备份失败（{}）：{error}", backup.display());
+                        self.audit(
+                            "revoke",
+                            &normalized,
+                            &sid_text,
+                            "-",
+                            "error",
+                            Some(&message),
+                        );
+                        return Err(format!(
+                            "撤销「{}」的沙箱 ACE 已生效，但{message}；不删掉备份的话，\
+                             下次启动会把它还原回来，请关闭占用该文件的程序后重试",
+                            normalized.display()
+                        ));
+                    }
+                }
             }
+        }
+        self.granted.remove(&(normalized.clone(), sid_text.clone()));
+        if removed {
             self.audit("revoke", &normalized, &sid_text, "-", "ok", None);
         }
         Ok(removed)
