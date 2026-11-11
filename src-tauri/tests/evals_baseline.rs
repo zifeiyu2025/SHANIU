@@ -653,6 +653,14 @@ struct Outcome {
     ms: u128,
     repair: RepairSignals,
     events: EventStats,
+    /// 本臂初始提示词里规则块的实际 token 数（`estimate_tokens` 口径，与生产同一函数）。
+    rules_tokens: usize,
+    /// 本臂的选节依据（`声明选节：第 N 行` / `无声明…`），随行入报告。
+    rules_selection: String,
+    /// 本次是否真的读了工作区里的 `AGENTS.md`：索引能不能把模型叫去读文件，只能靠它回答。
+    read_agents: bool,
+    /// 模型输出的指纹：同一任务 N 次样本是否等价，靠它数，不靠感觉。
+    output_hash: String,
 }
 
 /// 评估用的 broker：默认装**生产语义**（同 turn 批量确认 + 前缀白名单都在），
@@ -681,6 +689,66 @@ fn eval_decision() -> ApprovalDecision {
     }
 }
 
+/// 两臂唯一的差别：**初始提示词里的规则块**。
+///
+/// - `treatment`：仓库真实 `AGENTS.md` → 声明选节 → 常驻集 + 按需索引；
+/// - `control`：同一份文件、把声明改成「全部小节」→ 全文注入，无索引。
+///
+/// 工具面、任务描述、工作区内容三者完全相同，且 `AGENTS.md` **放在工作区里可读**：
+/// 否则 A 臂根本没有读文件的能力，实验只能证明「不给规则就做不对」，那是自证。
+fn seed_rules(ws: &Path, role: &str) -> (usize, String) {
+    let text = std::fs::read_to_string(repo_root().join("AGENTS.md"))
+        .expect("仓库根必须有 AGENTS.md");
+    let text = if role == "control" {
+        // 锚点直接从文件里数出来：手写清单会在下一次改文档时悄悄漏掉一节。
+        let anchors: Vec<String> = text
+            .lines()
+            .filter_map(|line| line.strip_prefix("### ").or_else(|| line.strip_prefix("## ")))
+            .map(|heading| heading.trim().to_string())
+            .collect();
+        let declaration = format!("<!-- shaniu-rules: resident {} -->", anchors.join(","));
+        text.lines()
+            .map(|line| {
+                if line.contains("shaniu-rules:") { declaration.clone() } else { line.to_string() }
+            })
+            .collect::<Vec<_>>()
+            .join("\n")
+    } else {
+        text
+    };
+    std::fs::write(ws.join("AGENTS.md"), &text).expect("写入工作区 AGENTS.md");
+    let rules = shaniu_lib::agent_loop::rules::discover(ws);
+    (
+        shaniu_lib::agent_loop::rules::estimate_tokens(&rules.text),
+        rules.selection(),
+    )
+}
+
+/// 模型输出指纹：同一任务跑 N 次，取指纹才能回答「N 次是不是同一份」。
+/// 温度不清零时差异本来就该出现；一旦 N 次逐字相同，样本量就是 1，不是 N。
+fn output_fingerprint(text: &str) -> String {
+    let mut hash: u64 = 0xcbf2_9ce4_8422_2325;
+    for byte in text.as_bytes() {
+        hash ^= u64::from(*byte);
+        hash = hash.wrapping_mul(0x0100_0000_01b3);
+    }
+    format!("{hash:016x}")
+}
+
+/// 档案里助手侧的全部文本（按出现顺序拼接）：指纹只认模型自己说的话，
+/// 不掺工具输出与系统提示——那两项两臂本来就不同。
+fn assistant_text(items: &[shaniu_lib::rollout::RolloutItem]) -> String {
+    let mut text = String::new();
+    for item in items {
+        let shaniu_lib::rollout::RolloutItem::ResponseItem { item, .. } = item else { continue };
+        if let HistoryItem::Message { role: Role::Assistant, text: body, .. } = item {
+            text.push_str(body);
+            text.push('\n');
+        }
+    }
+    text
+}
+
 async fn run_one(
     task: &Task,
     fixture: &BTreeMap<String, String>,
@@ -697,6 +765,9 @@ async fn run_one(
     seed_fixture(&ws, fixture);
     // 任务级覆盖层：同名键后写覆盖前写。
     seed_fixture(&ws, &task.fixture);
+    // 规则块按臂落盘：两臂的差别只有这一个文件里的声明，工具面与任务描述不动。
+    let role = std::env::var("SHANIU_EVAL_ROLE").unwrap_or_else(|_| "treatment".to_string());
+    let (rules_tokens, rules_selection) = seed_rules(&ws, &role);
 
     let plan_state = Arc::new(PlanState::new());
     let mut router = ToolRouter::new();
@@ -838,6 +909,13 @@ async fn run_one(
         ms,
         repair,
         events: EventStats::from_events(&agg.tool_events),
+        rules_tokens,
+        rules_selection,
+        read_agents: agg
+            .trace
+            .iter()
+            .any(|line| line.starts_with("read_file") && line.contains("AGENTS.md")),
+        output_hash: output_fingerprint(&assistant_text(&archive.items)),
     };
     assert!(
         infra || archive.items.len() >= 2,
@@ -887,8 +965,10 @@ async fn evals_baseline_v0() {
     };
     let backend = Arc::new(ResponsesBackend { provider: provider.clone(), api_key });
 
-    let raw = std::fs::read_to_string(repo_root().join("evals").join("tasks.json"))
-        .expect("evals/tasks.json 必须存在");
+    let tasks_file = std::env::var("SHANIU_EVAL_TASKS")
+        .unwrap_or_else(|_| "evals/tasks.json".to_string());
+    let raw = std::fs::read_to_string(repo_root().join(&tasks_file))
+        .unwrap_or_else(|e| panic!("任务集 {tasks_file} 读不到：{e}"));
     let spec: TasksFile = serde_json::from_str(&raw).expect("evals/tasks.json 解析失败");
     // 任务筛选：
     // - `SHANIU_EVAL_ONLY` 支持逗号分隔多 id（归因时重跑失败的那几个）；
@@ -945,7 +1025,7 @@ async fn evals_baseline_v0() {
                 passed += 1;
             }
             println!(
-                "[evals] run {run}/{repeats} {:<20} {} turns={} calls={} tok={}/{} appr={} 耗时={}ms {}",
+                "[evals] run {run}/{repeats} {:<20} {} turns={} calls={} tok={}/{} appr={} 读规则={} 规则tokens={} 耗时={}ms {}",
                 task.id,
                 if out.success { "PASS" } else { "FAIL" },
                 out.turns,
@@ -953,6 +1033,8 @@ async fn evals_baseline_v0() {
                 out.input_tokens,
                 out.output_tokens,
                 out.approvals,
+                if out.read_agents { "Y" } else { "N" },
+                out.rules_tokens,
                 out.ms,
                 out.detail,
             );
@@ -981,6 +1063,10 @@ async fn evals_baseline_v0() {
                 "repair": out.repair,
                 "repair_note": out.repair.note(out.success),
                 "events": out.events,
+                "rules_tokens": out.rules_tokens,
+                "rules_selection": out.rules_selection,
+                "read_agents": out.read_agents,
+                "output_hash": out.output_hash,
                 "detail": out.detail,
             }));
         }
@@ -1195,6 +1281,24 @@ async fn evals_baseline_v0() {
     let report = json!({
         "version": spec.version,
         "arm": arm,
+        "tasks_file": tasks_file,
+        // 两臂的真实差别就是这一块：规则块注入多少 token、按什么依据选节。
+        // B 臂必须能回答"全文到底多少、是否 ≤2500"，否则"回退全文注入"没有成本概念。
+        "rules": {
+            "mode": if role == "control" { "full-text" } else { "resident+index" },
+            "tokens": runs
+                .first()
+                .and_then(|run| run["tasks"].as_array())
+                .and_then(|rows| rows.first())
+                .and_then(|row| row["rules_tokens"].as_u64())
+                .unwrap_or(0),
+            "selection": runs
+                .first()
+                .and_then(|run| run["tasks"].as_array())
+                .and_then(|rows| rows.first())
+                .and_then(|row| row["rules_selection"].as_str())
+                .unwrap_or("-"),
+        },
         "repair_enabled": !repair_ablated,
         "role": role,
         "epoch_ms": SystemTime::now().duration_since(UNIX_EPOCH).unwrap().as_millis(),
