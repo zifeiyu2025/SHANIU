@@ -704,98 +704,140 @@ impl AgentLoop {
             if !skill_injections.is_empty() {
                 request_history.extend(skill_injections);
             }
-            // 建立流本身也要能被取消（审计 H1）：端点迟迟不回响应头时，
-            // 只在流建立之后检查取消等于"取消点永远到不了"。
-            let mut stream = tokio::select! {
-                _ = cancel.cancelled() => {
-                    reason = TurnEndReasonLocal::Cancelled;
-                    break 'outer;
-                }
-                opened = self.backend.stream(&request_history, &declarations, &instructions) => {
-                    match opened {
-                        Ok(s) => s,
-                        Err(e) => {
-                            emit(&sink, EventMsg::Error { message: e.human.clone() });
-                            turn_error = Some((&e).into());
-                            reason = TurnEndReasonLocal::Failed;
-                            break 'outer;
-                        }
-                    }
-                }
-            };
+            // 2) 一次采样 = 建流 + 消费流，失败统一收敛成 `Option<ModelError>`。
+            //    重试只发生在首个可见增量之前（见 `emitted_delta`）：已吐出的正文/思考
+            //    不能重来，否则用户会看到两遍。
+            let mut retries: u32 = 0;
+            let mut retry_chain: Option<String> = None;
+            let (assistant_text, mut reasoning_text, full_message, calls, usage) = 'sample: loop {
+                // 每次尝试独占的状态：重试之间直接丢弃——它们没进历史、没执行工具。
+                let mut emitted_delta = false;
+                let mut assistant_text = String::new();
+                let mut reasoning_text = String::new();
+                let mut full_message: Option<String> = None;
+                let mut calls: Vec<(String, String, String)> = Vec::new(); // (name, arguments, call_id)
+                let mut usage: Option<Usage> = None;
 
-            // 2) 消费流：转发增量、收集输出项
-            let mut assistant_text = String::new();
-            let mut reasoning_text = String::new();
-            let mut full_message: Option<String> = None;
-            let mut calls: Vec<(String, String, String)> = Vec::new(); // (name, arguments, call_id)
-            let mut usage: Option<Usage> = None;
-            loop {
-                // 流空闲/首包上限（审计 H1）：每个分片都重置计时，超过它说明连接已僵死。
-                let idle = tokio::time::sleep(crate::model_client::STREAM_IDLE_TIMEOUT);
-                tokio::pin!(idle);
-                let mut stream_pin = stream.as_mut(); // Pin<&mut dyn S>，Next 借用其存活
-                let next_item = stream_pin.next();
-                tokio::select! {
+                // 建立流本身也要能被取消（审计 H1）：端点迟迟不回响应头时，
+                // 只在流建立之后检查取消等于"取消点永远到不了"。
+                let opened = tokio::select! {
                     _ = cancel.cancelled() => {
                         reason = TurnEndReasonLocal::Cancelled;
                         break 'outer;
                     }
-                    _ = &mut idle => {
-                        let message = format!(
-                            "模型流空闲超过 {}s 未收到数据，已中断",
-                            crate::model_client::STREAM_IDLE_TIMEOUT.as_secs()
+                    opened = self.backend.stream(&request_history, &declarations, &instructions) => opened,
+                };
+
+                let failure = match opened {
+                    Err(error) => Some(error),
+                    Ok(mut stream) => {
+                        let mut failure: Option<crate::model_client::ModelError> = None;
+                        // 2.1) 消费流：转发增量、收集输出项
+                        loop {
+                            // 流空闲/首包上限（审计 H1）：每个分片都重置计时，超过它说明连接已僵死。
+                            let idle = tokio::time::sleep(crate::model_client::STREAM_IDLE_TIMEOUT);
+                            tokio::pin!(idle);
+                            let mut stream_pin = stream.as_mut(); // Pin<&mut dyn S>，Next 借用其存活
+                            let next_item = stream_pin.next();
+                            tokio::select! {
+                                _ = cancel.cancelled() => {
+                                    reason = TurnEndReasonLocal::Cancelled;
+                                    break 'outer;
+                                }
+                                _ = &mut idle => {
+                                    failure = Some(crate::model_client::ModelError::timeout(format!(
+                                        "模型流空闲超过 {}s 未收到数据，已中断",
+                                        crate::model_client::STREAM_IDLE_TIMEOUT.as_secs()
+                                    )));
+                                    break;
+                                }
+                                item = next_item => match item {
+                                    None => break,
+                                    Some(ModelStreamEvent::OutputTextDelta { delta }) => {
+                                        assistant_text.push_str(&delta);
+                                        // 硬约束①：正文一吐就不再重试（重试会重复正文）。
+                                        emitted_delta = true;
+                                        emit(&sink, EventMsg::AgentMessageDelta { delta });
+                                    }
+                                    // 思考增量单独成事件：它不是答案内容，前端要能折叠显示，
+                                    // FF-5 也要把它算进"首个可见反馈"（业界同一口径，见 latency_budget）
+                                    Some(ModelStreamEvent::ReasoningDelta { delta }) => {
+                                        reasoning_text.push_str(&delta);
+                                        // 硬约束①：推理增量同样算可见输出——重试会让"思考过程"出现两遍。
+                                        emitted_delta = true;
+                                        emit(&sink, EventMsg::ReasoningDelta { delta });
+                                    }
+                                    Some(ModelStreamEvent::OutputItem(ResponseItem::Message { role: _, text })) => {
+                                        full_message = Some(text);
+                                    }
+                                    Some(ModelStreamEvent::OutputItem(ResponseItem::FunctionCall { name, arguments, call_id })) => {
+                                        calls.push((name, arguments, call_id));
+                                    }
+                                    Some(ModelStreamEvent::Completed { usage: u }) => {
+                                        usage = Some(u);
+                                    }
+                                    Some(ModelStreamEvent::Failed { message, error }) => {
+                                        // 没有结构化错误时也要留下痕迹：结局不得被当成"正常结束"。
+                                        failure = Some(error.unwrap_or_else(|| crate::model_client::ModelError::from(message)));
+                                        break;
+                                    }
+                                }
+                            }
+                        }
+                        failure
+                    }
+                };
+
+                // 空响应：流正常结束却什么都没有。顺序是硬性的——**先看 `calls`**：
+                // 有工具调用说明这次采样已经产生副作用，重试会重复执行工具，绝不重试，
+                // 因此 `calls` 非空时直接视为"有输出"。
+                let failure = failure.or_else(|| {
+                    (calls.is_empty() && !emitted_delta && full_message.is_none() && usage.is_none())
+                        .then(crate::model_client::ModelError::empty_response)
+                });
+
+                let Some(error) = failure else {
+                    break 'sample (assistant_text, reasoning_text, full_message, calls, usage);
+                };
+
+                // 硬约束① 的第二半：已经 emit 过可见增量、或已经拿到 usage，就不允许再试。
+                // 前者会让正文/思考出现两遍；后者说明这次采样已按端点口径结算，重试会重复计账。
+                let outcome = if emitted_delta || usage.is_some() {
+                    give_up_without_retry_after(&error)
+                } else {
+                    await_retry(&self.retry, &sink, cancel, turn, retries, &mut retry_chain, &error).await
+                };
+                match outcome {
+                    RetryOutcome::Retry => {
+                        retries += 1;
+                        tracing::warn!(
+                            turn,
+                            retry = retries,
+                            code = error.code(),
+                            provider_message = error.provider_message.as_deref().unwrap_or("-"),
+                            "模型请求失败，即将重试"
                         );
-                        emit(&sink, EventMsg::Error { message: message.clone() });
-                        turn_error = Some(crate::events::TurnErrorInfo {
-                            code: "TIMEOUT".into(),
-                            message: "网络超时".into(),
-                            http_status: None,
-                            provider_code: None,
-                            provider_message: Some(message),
-                        });
+                        continue 'sample;
+                    }
+                    RetryOutcome::Cancelled => {
+                        reason = TurnEndReasonLocal::Cancelled;
+                        break 'outer;
+                    }
+                    RetryOutcome::GiveUp(final_error) => {
+                        // 失败必须留下能自修的信息（A0）：一句人话进 Error，结构化字段进 TurnCompleted。
+                        let shown = final_error
+                            .provider_message
+                            .clone()
+                            .unwrap_or_else(|| final_error.human.clone());
+                        emit(&sink, EventMsg::Error { message: shown });
+                        let mut info: crate::events::TurnErrorInfo = (&final_error).into();
+                        info.attempts = Some(retries);
+                        turn_error = Some(info);
                         reason = TurnEndReasonLocal::Failed;
                         break 'outer;
                     }
-                    item = next_item => match item {
-                        None => break,
-                        Some(ModelStreamEvent::OutputTextDelta { delta }) => {
-                            assistant_text.push_str(&delta);
-                            emit(&sink, EventMsg::AgentMessageDelta { delta });
-                        }
-                        // 思考增量单独成事件：它不是答案内容，前端要能折叠显示，
-                        // FF-5 也要把它算进"首个可见反馈"（业界同一口径，见 latency_budget）
-                        Some(ModelStreamEvent::ReasoningDelta { delta }) => {
-                            reasoning_text.push_str(&delta);
-                            emit(&sink, EventMsg::ReasoningDelta { delta });
-                        }
-                        Some(ModelStreamEvent::OutputItem(ResponseItem::Message { role: _, text })) => {
-                            full_message = Some(text);
-                        }
-                        Some(ModelStreamEvent::OutputItem(ResponseItem::FunctionCall { name, arguments, call_id })) => {
-                            calls.push((name, arguments, call_id));
-                        }
-                        Some(ModelStreamEvent::Completed { usage: u }) => {
-                            usage = Some(u);
-                        }
-                        Some(ModelStreamEvent::Failed { message, error }) => {
-                            emit(&sink, EventMsg::Error { message });
-                            turn_error = Some(match error {
-                                Some(error) => (&error).into(),
-                                // 流内失败没有结构化信息时也要留下痕迹：
-                                // 结局不得被前端当成"正常结束"。
-                                None => crate::events::TurnErrorInfo {
-                                    code: "UNKNOWN".into(),
-                                    message: "模型请求失败".into(),
-                                    ..Default::default()
-                                },
-                            });
-                            reason = TurnEndReasonLocal::Failed;
-                            break 'outer;
-                        }
-                    }
                 }
-            }
+            };
             if let Some(u) = usage {
                 // 实例级累计（ExitSummary 的 token_usage）。
                 totals.absorb(&u);
@@ -1301,6 +1343,102 @@ impl From<TurnEndReasonLocal> for crate::events::TurnEndReason {
 pub struct TurnSummary {
     pub turns: u32,
     pub reason: crate::events::TurnEndReason,
+}
+
+// ============================== 采样重试 ==============================
+
+/// 一次采样失败后的处置结论。
+enum RetryOutcome {
+    /// 已按退避等过一段、可以再发一次请求。
+    Retry,
+    /// 等待期间被取消：不发 `started`，直接走 `TurnCompleted(cancelled)`。
+    Cancelled,
+    /// 终局。错误可能被改写（`Retry-After` 超上限时换成可解释的那句话）。
+    GiveUp(crate::model_client::ModelError),
+}
+
+/// 非“因 `Retry-After` 超限”的终局：清掉端点要求，避免 `TurnErrorInfo.retry_after_secs`
+/// 记录一个与放弃原因无关的秒数。
+fn give_up_without_retry_after(error: &crate::model_client::ModelError) -> RetryOutcome {
+    let mut error = error.clone();
+    error.retry_after_ms = None;
+    RetryOutcome::GiveUp(error)
+}
+
+/// 决定这次采样失败是否重试；重试则发 `scheduled` → 可取消等待 → 发 `started`。
+///
+/// 调用方必须保证只在**首个可见增量之前**调用：本函数不认识流内容，`emitted_delta`
+/// 的判定在采样循环里（正文与推理增量任一 emit 过即禁止重试）。
+///
+/// 三条硬约束的落点：
+/// - 等待与取消令牌 `select!` 竞争，不是裸 `sleep`；
+/// - 次数用尽 / `Retry-After` 超上限都发 `exhausted`，且后者文案带出要求秒数与上限；
+/// - `max_retries == 0`（测试默认）时一次也不试，且不产生任何 `model_retry` 事件。
+async fn await_retry(
+    policy: &crate::model_client::RetryPolicy,
+    sink: &Arc<dyn crate::events::EventSink>,
+    cancel: &CancellationToken,
+    turn: u32,
+    retries_used: u32,
+    retry_chain: &mut Option<String>,
+    error: &crate::model_client::ModelError,
+) -> RetryOutcome {
+    use crate::events::RetryPhase;
+
+    if policy.max_retries == 0 || !crate::model_client::RetryPolicy::is_retryable(error.kind) {
+        return give_up_without_retry_after(error);
+    }
+
+    // 第几次重试，1 起；同一条重试链共用一个 id（不同采样步各自生成）。
+    let retry = retries_used + 1;
+    let max_retries = policy.max_retries;
+    let retry_id = retry_chain.get_or_insert_with(|| ulid::Ulid::generate().to_string()).clone();
+    let send = |phase: RetryPhase, delay_ms: u64, message: String| {
+        let _ = sink.emit(&EventMsg::ModelRetry {
+            turn,
+            retry,
+            max_retries,
+            phase,
+            delay_ms,
+            code: error.code().to_string(),
+            message,
+            retry_id: retry_id.clone(),
+        });
+    };
+
+    if retries_used >= max_retries {
+        send(RetryPhase::Exhausted, 0, format!("已重试 {retries_used} 次，仍失败：{}", error.human));
+        return give_up_without_retry_after(error);
+    }
+
+    let Some(delay) = policy.delay(retry, error.retry_after_ms, crate::model_client::random01()) else {
+        // 端点要求等待超过上限：放弃，但**必须说清为什么**（dsh 在这里只是静默跳过，
+        // 用户只知道“失败了”，不知道“服务端让等 30 秒而我们最多等 10 秒”）。
+        // 秒数取响应头原值，不四舍五入；上限取 max_delay 的整秒。
+        let required = error.retry_after_ms.unwrap_or(0) / 1000;
+        let message =
+            format!("服务端要求等待 {required} 秒，超过上限 {} 秒，已放弃重试", policy.max_delay.as_secs());
+        send(RetryPhase::Exhausted, 0, message.clone());
+        let mut gave_up = error.clone();
+        gave_up.human = message.clone();
+        gave_up.provider_message = Some(message);
+        // 保留 `retry_after_ms`：`TurnErrorInfo.retry_after_secs` 要靠它带出原始秒数。
+        return RetryOutcome::GiveUp(gave_up);
+    };
+
+    let delay_ms = u64::try_from(delay.as_millis()).unwrap_or(u64::MAX);
+    send(RetryPhase::Scheduled, delay_ms, error.human.clone());
+    let waited = tokio::select! {
+        _ = cancel.cancelled() => false,
+        _ = tokio::time::sleep(delay) => true,
+    };
+    if !waited {
+        // 取消发生在等待中：不发 started、不发 exhausted；前端由“有 scheduled、
+        // 无 started、回合已关闭”推导为 cancelled（与 dsh retry 节点一致）。
+        return RetryOutcome::Cancelled;
+    }
+    send(RetryPhase::Started, 0, error.human.clone());
+    RetryOutcome::Retry
 }
 
 #[cfg(test)]

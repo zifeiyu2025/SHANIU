@@ -657,11 +657,19 @@ pub async fn stream_body(
     .map_err(|e| ModelError::from_reqwest(&e))?;
     if !response.status().is_success() {
         let status = response.status();
+        // `Retry-After` 只有整数秒形态（HTTP-date 形态解析不出即当作没有）：
+        // 端点明确说了“多久后再来”，重试策略必须听它的，而不是自己的指数退避。
+        let retry_after_ms = response
+            .headers()
+            .get(reqwest::header::RETRY_AFTER)
+            .and_then(|value| value.to_str().ok())
+            .and_then(|text| text.trim().parse::<u64>().ok())
+            .map(|secs| secs.saturating_mul(1000));
         let body_text = response.text().await.unwrap_or_default();
         // 端点错误体常回显 request（含 Authorization）或自定义请求头。这里必须**先
         // 脱敏再截断**：先截断会让跨 200 字符边界的密钥只漏出半截，整串匹配不到，
         // 而这段文字会进错误串 → 模型上下文（审计 M9；journal 侧 M6 已堵）。
-        let error = ModelError::from_status(status.as_u16(), &body_text);
+        let error = ModelError::from_status(status.as_u16(), &body_text).with_retry_after(retry_after_ms);
         // 审计 A0：UI / 日志 / 导出三处都要能对上原始响应。这里落一行脱敏后的 warn，
         // 就是"日志里能查到这个 401"的落点；只输出字段名与脱敏值，不回显密钥。
         tracing::warn!(

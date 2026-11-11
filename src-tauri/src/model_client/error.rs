@@ -28,6 +28,8 @@ pub enum ModelErrorKind {
     EndpointUnsupported,
     /// 400/422：请求本身被拒。
     BadRequest,
+    /// 流正常结束，但没有任何增量、没有工具调用、也没有 usage。
+    EmptyResponse,
     /// 其它。
     Unknown,
 }
@@ -43,6 +45,9 @@ pub struct ModelError {
     pub provider_message: Option<String>,
     /// 给用户看的一句话。
     pub human: String,
+    /// 端点 `Retry-After` 响应头（毫秒）。只有非 2xx 响应才可能有；解析不出即 `None`。
+    /// 重试策略据此优先于指数退避（`model_client/retry.rs`）。
+    pub retry_after_ms: Option<u64>,
 }
 
 impl ModelError {
@@ -54,7 +59,13 @@ impl ModelError {
         provider_message: Option<String>,
         human: String,
     ) -> Self {
-        Self { kind, http_status, provider_code, provider_message, human }
+        Self { kind, http_status, provider_code, provider_message, human, retry_after_ms: None }
+    }
+
+    /// 带上端点的 `Retry-After`（毫秒）。重试策略据此优先于指数退避。
+    pub fn with_retry_after(mut self, retry_after_ms: Option<u64>) -> Self {
+        self.retry_after_ms = retry_after_ms;
+        self
     }
 
     /// 稳定错误码（前端按它做本地化与统计，不要依赖 HTTP 码）。
@@ -68,6 +79,7 @@ impl ModelError {
             ModelErrorKind::Server => "SERVER",
             ModelErrorKind::EndpointUnsupported => "ENDPOINT_UNSUPPORTED",
             ModelErrorKind::BadRequest => "BAD_REQUEST",
+            ModelErrorKind::EmptyResponse => "EMPTY_RESPONSE",
             ModelErrorKind::Unknown => "UNKNOWN",
         }
     }
@@ -100,6 +112,7 @@ impl ModelError {
             ModelErrorKind::Server => format!("模型服务端错误（HTTP {status}）"),
             ModelErrorKind::EndpointUnsupported => format!("该地址不支持此接口（HTTP {status}）"),
             ModelErrorKind::BadRequest => format!("请求被拒绝（HTTP {status}）"),
+            ModelErrorKind::EmptyResponse => "模型返回了空响应".to_string(),
             ModelErrorKind::Unknown => format!("未知错误（HTTP {status}）"),
         };
         Self::new(kind, Some(status), provider_code, provider_message, human)
@@ -138,6 +151,17 @@ impl ModelError {
     /// 本地限时（首包/流空闲）→ 超时。
     pub fn timeout(message: impl Into<String>) -> Self {
         Self::new(ModelErrorKind::Timeout, None, None, Some(sanitize(&message.into())), "网络超时".to_string())
+    }
+
+    /// 流正常结束却什么都没产出 → 空响应（可重试；判定见 `agent_loop`）。
+    pub fn empty_response() -> Self {
+        Self::new(
+            ModelErrorKind::EmptyResponse,
+            None,
+            None,
+            None,
+            "模型返回了空响应".to_string(),
+        )
     }
 
     /// SSE 断流等流内错误 → 网络问题。
@@ -215,6 +239,10 @@ impl From<&ModelError> for crate::events::TurnErrorInfo {
             http_status: error.http_status,
             provider_code: error.provider_code.clone(),
             provider_message: error.provider_message.clone(),
+            // 次数由采样循环填（它才知道本轮试了几次）；这里只搬运端点原值。
+            attempts: None,
+            // 仅在因 `Retry-After` 超过上限而放弃时有值；原样给秒，不四舍五入。
+            retry_after_secs: error.retry_after_ms.map(|ms| ms / 1000),
         }
     }
 }

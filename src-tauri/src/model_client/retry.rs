@@ -50,7 +50,11 @@ impl RetryPolicy {
     pub fn is_retryable(kind: ModelErrorKind) -> bool {
         matches!(
             kind,
-            ModelErrorKind::RateLimited | ModelErrorKind::Timeout | ModelErrorKind::Network | ModelErrorKind::Server
+            ModelErrorKind::RateLimited
+                | ModelErrorKind::Timeout
+                | ModelErrorKind::Network
+                | ModelErrorKind::Server
+                | ModelErrorKind::EmptyResponse
         )
     }
 
@@ -100,12 +104,13 @@ mod tests {
 
     /// 反向对照：把任意一个可重试类从白名单删掉，对应断言必红。
     #[test]
-    fn whitelist_is_exactly_the_four_transient_failures() {
+    fn whitelist_is_exactly_the_transient_failures() {
         for kind in [
             ModelErrorKind::RateLimited,
             ModelErrorKind::Timeout,
             ModelErrorKind::Network,
             ModelErrorKind::Server,
+            ModelErrorKind::EmptyResponse,
         ] {
             assert!(RetryPolicy::is_retryable(kind), "{kind:?} 属瞬态失败，必须可重试");
         }

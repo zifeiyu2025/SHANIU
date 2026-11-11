@@ -17,7 +17,14 @@ export interface TurnErrorInfo {
   http_status?: number
   provider_code?: string
   provider_message?: string
+  /** 本次失败前已经重试过几次（0 = 首次请求就失败）。 */
+  attempts?: number
+  /** 端点 `Retry-After` 原值（秒）。仅“因该值超过上限而放弃重试”时填写。 */
+  retry_after_secs?: number
 }
+
+/** 一次模型请求重试的阶段（与 Rust `RetryPhase` 同形）。 */
+export type RetryPhase = 'scheduled' | 'started' | 'exhausted';
 
 export type EventMsg =
   | { type: 'turn_started'; turn: number }
@@ -33,6 +40,7 @@ export type EventMsg =
   | { type: 'plan_delta'; delta: string }
   | { type: 'turn_diff'; files: string[] }
   | { type: 'error'; message: string }
+  | { type: 'model_retry'; turn: number; retry: number; max_retries: number; phase: RetryPhase; delay_ms: number; code: string; message: string; retry_id: string }
   | { type: 'token_usage'; turn: number; input_tokens: number; cached_input_tokens?: number | null; output_tokens: number }
   | { type: 'subagent_spawned'; child_id: string; task: string; name: string; label: string; created_at_ms: number }
   | { type: 'subagent_exited'; child_id: string; status: SubagentExitStatus; summary: string }

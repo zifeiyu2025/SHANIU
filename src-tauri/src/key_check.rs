@@ -198,6 +198,11 @@ fn from_model_error(error: ModelError) -> KeyCheck {
             "bad_request",
             "端点拒绝了这次查询，无法据此判断密钥".to_string(),
         ),
+        ModelErrorKind::EmptyResponse => (
+            KeyCheckState::Unknown,
+            "empty_response",
+            "端点返回了空响应，无法据此判断密钥".to_string(),
+        ),
         ModelErrorKind::Unknown => (KeyCheckState::Unknown, "unknown", error.human.clone()),
     };
     KeyCheck {

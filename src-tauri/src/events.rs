@@ -52,6 +52,33 @@ pub struct TurnErrorInfo {
     pub provider_code: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub provider_message: Option<String>,
+    /// 本次失败前已经重试过几次（0 = 首次请求就失败）。additive。
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub attempts: Option<u32>,
+    /// 端点 `Retry-After` 原值（秒）。仅“因该值超过上限而放弃重试”时填写。additive。
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub retry_after_secs: Option<u64>,
+}
+
+/// 一次模型请求重试的阶段（`model_retry` 事件的 `phase`，additive）。
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum RetryPhase {
+    /// 即将等待：`delay_ms` 是本次要等多久。
+    Scheduled,
+    /// 等待结束、重新建流之前。
+    Started,
+    /// 次数用尽，或因 `Retry-After` 超过上限而放弃。
+    Exhausted,
+}
+
+impl RetryPhase {
+    /// FF-2 单一事实源（SH-078）：同 `TurnEndReason::all_variants` 的穷举约定。
+    pub fn all_variants() -> &'static [Self] {
+        match Self::Scheduled {
+            Self::Scheduled | Self::Started | Self::Exhausted => &[Self::Scheduled, Self::Started, Self::Exhausted],
+        }
+    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -225,6 +252,26 @@ pub enum EventMsg {
     PlanDelta { delta: String },
     TurnDiff { files: Vec<String> },
     Error { message: String },
+    /// 模型请求重试（additive，A0 之后的“可见重试”）：三阶段都发，前端据此建节点。
+    ///
+    /// 只在**首个可见增量之前**发生（正文 / 推理增量都算可见输出）；目前已吐出的
+    /// 尝试绝不会重试，所以这个事件也绝不会跟着重复正文。
+    ModelRetry {
+        turn: u32,
+        /// 第几次重试，1 起。
+        retry: u32,
+        /// 本次采样允许的最大重试次数（不含首次请求）。
+        max_retries: u32,
+        phase: RetryPhase,
+        /// `scheduled` = 将要等待的毫秒；`started` / `exhausted` 恒为 0。
+        delay_ms: u64,
+        /// 与 `ModelError::code()` 同一套稳定码。
+        code: String,
+        /// 已脱敏的一句话原因。
+        message: String,
+        /// 同一条重试链的稳定 id；不同采样步不复用。
+        retry_id: String,
+    },
     TokenUsage {
         turn: u32,
         input_tokens: u32,

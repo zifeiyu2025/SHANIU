@@ -11,12 +11,12 @@
 
 use serde::Serialize;
 use shaniu_lib::events::{
-    AgentEvent, ApprovalDecision, EventMsg, IoChannel, RiskLevel, SubagentExitStatus, ToolCallResult, TurnEndReason,
-    TurnErrorInfo,
+    AgentEvent, ApprovalDecision, EventMsg, IoChannel, RetryPhase, RiskLevel, SubagentExitStatus, ToolCallResult,
+    TurnEndReason, TurnErrorInfo,
 };
 
 /// 与 src/transport/types.ts 的 type 判别值逐一对应。
-const EXPECTED_TAGS: [&str; 17] = [
+const EXPECTED_TAGS: [&str; 18] = [
     "turn_started",
     "turn_completed",
     "agent_message_delta",
@@ -30,6 +30,7 @@ const EXPECTED_TAGS: [&str; 17] = [
     "plan_delta",
     "turn_diff",
     "error",
+    "model_retry",
     "token_usage",
     "subagent_spawned",
     "subagent_exited",
@@ -50,6 +51,8 @@ fn all_variants() -> Vec<EventMsg> {
                 http_status: Some(401),
                 provider_code: Some("invalid_api_key".into()),
                 provider_message: Some("Invalid API key".into()),
+                attempts: Some(5),
+                retry_after_secs: Some(30),
             }),
         },
         EventMsg::AgentMessageDelta { delta: "你好".into() },
@@ -90,6 +93,37 @@ fn all_variants() -> Vec<EventMsg> {
         EventMsg::PlanDelta { delta: "step 1".into() },
         EventMsg::TurnDiff { files: vec!["a.rs".into()] },
         EventMsg::Error { message: "boom".into() },
+        // 模型请求重试（additive）：三阶段都要进 round-trip 与标签集合
+        EventMsg::ModelRetry {
+            turn: 1,
+            retry: 2,
+            max_retries: 5,
+            phase: RetryPhase::Scheduled,
+            delay_ms: 8_000,
+            code: "RATE_LIMIT".into(),
+            message: "请求过于频繁，已被限流".into(),
+            retry_id: "01JRETRY".into(),
+        },
+        EventMsg::ModelRetry {
+            turn: 1,
+            retry: 2,
+            max_retries: 5,
+            phase: RetryPhase::Started,
+            delay_ms: 0,
+            code: "RATE_LIMIT".into(),
+            message: "请求过于频繁，已被限流".into(),
+            retry_id: "01JRETRY".into(),
+        },
+        EventMsg::ModelRetry {
+            turn: 3,
+            retry: 1,
+            max_retries: 5,
+            phase: RetryPhase::Exhausted,
+            delay_ms: 0,
+            code: "RATE_LIMIT".into(),
+            message: "服务端要求等待 30 秒，超过上限 10 秒，已放弃重试".into(),
+            retry_id: "01JRETRY2".into(),
+        },
         EventMsg::TokenUsage { turn: 1, input_tokens: 10, cached_input_tokens: Some(4), output_tokens: 20 },
         // SH-053：三个 additive 子代理事件。exited 的三个终态都要进清单，
         // 否则 status 的某个变体可能从未被序列化验证过。
@@ -122,6 +156,7 @@ fn all_variants() -> Vec<EventMsg> {
             | EventMsg::PlanDelta { .. }
             | EventMsg::TurnDiff { .. }
             | EventMsg::Error { .. }
+            | EventMsg::ModelRetry { .. }
             | EventMsg::TokenUsage { .. }
             | EventMsg::SubagentSpawned { .. }
             | EventMsg::SubagentExited { .. }
@@ -396,6 +431,7 @@ fn every_enum_variant_is_mirrored_in_frontend_types() {
     assert_union_covers("IoChannel", IoChannel::all_variants());
     assert_union_covers("TurnEndReason", TurnEndReason::all_variants());
     assert_union_covers("SubagentExitStatus", SubagentExitStatus::all_variants());
+    assert_union_covers("RetryPhase", RetryPhase::all_variants());
 }
 
 /// SH-079：EventMsg tag 与前端镜像**机械绑定**（此前 EXPECTED_TAGS 与 types.ts 无人校验关联）。
