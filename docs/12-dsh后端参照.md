@@ -118,7 +118,7 @@
 | 会话事件持久化 | 追加写事件日志，`{type,seq,time,data}`，格式链 v0→v4 迁移，投影与查询分离 | `src-tauri/src/rollout/mod.rs` 逐行 flush 的 JSONL，坏行可见；`events.rs` 定义事件；`event_journal.rs` 提供分页/游标 | 异 | 不照搬格式链；保留"追加写 + 坏行可见 + 可回放"三条语义（已具备） |
 | 会话导出 | ZIP，支持 `includeDescendants`，另有 Markdown | `src-tauri/src/session_export/mod.rs` 导出 ZIP（会话 JSONL）；界面另有"复制会话为 Markdown" | 弱 | 改造后采纳：ZIP 内加清单与子会话选项（子代理已有父子边，具备条件） |
 | 模型流式拼装 | 累加器压缩 delta，可逆展开，时间戳与索引保留 | `src-tauri/src/model_client/mod.rs`、`provider.rs` 解析流式增量；`src-tauri/src/capability.rs` 记录模型能力（声明 + 实测探针，与流式无关） | 异 | 不采纳其数据结构；确认工具参数增量拼装与 usage 统计的等价性即可 |
-| 模型请求重试 | 可重试码白名单 + 指数退避 + 抖动 + 上限 + `Retry-After`，重试写会话 | **未检索到模型侧重试**：`src-tauri/src` 内仅 `mcp_client/runtime.rs:1827` 有重连退避 | 缺 | **优先照搬行为**（见 §5） |
+| 模型请求重试 | 可重试码白名单 + 指数退避 + 抖动 + 上限 + `Retry-After`，重试写会话 | **已实现**：`src-tauri/src/model_client/retry.rs:15` `RetryPolicy`——白名单 `:50`（`RateLimited`/`Timeout`/`Network`/`Server`/`EmptyResponse`，与 dsh 的五个码一一对应）、退避 `:67`（`initial * 2^(n-1)`、对称抖动 `:33`、封顶 `max_delay`，`Retry-After` 优先且超上限则放弃）；生产接线 `agent_loop/mod.rs:474` 从 `model.max_retries` 构造、`:1043` 应用；重试过程发 `model_retry` 事件（`events.rs:63-82`，`Scheduled`/`Started`/`Exhausted`），界面 `MessageItem.tsx:63-128` 显示倒计时与失败原因 | 弱 | 不照搬其 `always` 档（不封次数）与按 provider 固化策略——我们只有全局 `model.max_retries`（默认 5）。若将来需要按 provider 区分，再扩配置；行为面已够用 |
 | 工具注册与可见性 | 注册中心校验 schema，allow/deny + scope chain + shadow | `src-tauri/src/tool_router/spec.rs`、`mod.rs`：ToolSpec + 风险分级 + 执行器 | 异 | 不采纳其 scope chain；保留我们的风险分级 |
 | 审批 | 请求带 `{agent, toolName, callId, reason, signal}`，策略 `ask`/`never` | `src-tauri/src/permission/mod.rs`、`policy.rs`：集中裁决、`GateOutcome` 区分拒绝类型、审批不可绕过 | 等价 | 不采纳其两档策略；我们的档位更细 |
 | 权限预设 | 预设同时绑定 sandbox + approval，默认 `workspace-write/ask` | `src-tauri/src/config.rs` 的 sandbox/approval 分段；界面"权限"只读展示 | 弱 | 改造后采纳"档位绑定"的表达，做成可选预设；不动执行前生效点 |
@@ -130,13 +130,12 @@
 | 取消与中断 | AbortSignal 只读，分发前取消有专用错误码，取消不污染持久化 | `src-tauri/src/app_state.rs` 的 `begin_task`/`cancel_active`；`agent_loop/mod.rs` 的取消检查与 `ToolCallResult::Cancelled` | 等价 | 对齐错误码命名即可 |
 | 子代理 | 工具立即返回 activation，完成通知回传，子代理独立 durability | `src-tauri/src/subagent_registry/mod.rs`：状态机、子令牌级联、并发上限、`wait_agent` 收口 | 弱 | **改造后采纳**"立即返回 + 通知"（见 §5） |
 | 后台任务 | `jobs` + `jobs-local` + `tool-jobs` | `src-tauri/src/jobs.rs`、`tools/job_tools.rs` | 异 | 不采纳其实现；核对生命周期语义 |
-| 错误语义与文案 | 局部显式映射（压缩/格式），无全局错误码表 | `src-tauri/src/model_client/error.rs`：错误大类 + 人话映射 + 原始信息保留（Auth/Quota/RateLimited/Timeout/Network/Server/EndpointUnsupported/BadRequest） | 弱 | 照搬"稳定错误码 + 文案集中"；**先核界面是否已消费**（0.2.4 真机仍只显示「处理失败」，见 `docs/10` §9 第 7 条） |
+| 错误语义与文案 | 局部显式映射（压缩/格式），无全局错误码表 | `src-tauri/src/model_client/error.rs`：错误大类 + 人话映射 + 原始信息保留（Auth/Quota/RateLimited/Timeout/Network/Server/EndpointUnsupported/BadRequest） | 弱 | 照搬"稳定错误码 + 文案集中"；界面已消费：失败行按 `code` 本地化（`AUTH`→「API 密钥无效」等，`locale.ts:180-186`），可展开端点原文（`MessageItem.tsx:132-165`） |
 
 ## 5. 先行建议（明显优于我们，值得先做）
 
-1. **模型请求重试（`llm-retry` 的行为面）**：我们目前没有模型侧重试，只有 MCP 重连退避。限流、超时、传输断流、空响应这四类失败会让用户直接看到失败回合；按 dsh 的白名单 + 指数退避 + 抖动 + 上限 + `Retry-After` 落地，并把重试写成会话事件，收益最大且不依赖任何 Node 生态。
-2. **子代理"立即返回 activation + 完成通知"**：我们现在靠 `wait_agent` 同步收口，长任务会占住父回合。改为激活即返回、完成后以通知追加到父会话，可与现有父子边和事件协议复用。
-3. **会话导出补清单与子会话**：ZIP 里加条目清单与 `includeDescendants`，排障时不用让用户另外说明"导的是哪一层"。优先级低于前两项。
+1. **子代理"立即返回 activation + 完成通知"**：我们现在靠 `wait_agent` 同步收口，长任务会占住父回合。改为激活即返回、完成后以通知追加到父会话，可与现有父子边和事件协议复用。
+2. **会话导出补清单与子会话**：ZIP 里加条目清单与 `includeDescendants`，排障时不用让用户另外说明"导的是哪一层"。优先级低于前一项。
 
 ## 6. 维护规则
 
