@@ -5,7 +5,21 @@ import {
   displayPermissionPresetDescription,
   PERMISSION_UNAVAILABLE as PERMISSION_UNAVAILABLE_UI,
 } from '../dsh/packages/client/ui-permission-presets/src/client/presentation.ts'
-import { PERMISSION_PRESET_OPTIONS, PERMISSION_UNAVAILABLE } from './permission-presets'
+import { PERMISSION_PRESET_OPTIONS, PERMISSION_UNAVAILABLE, PRESET_TO_SANDBOX } from './permission-presets'
+import type { SandboxModeWire } from '../sandbox-status/wire'
+
+/**
+ * 宿主 `SandboxModeWire` 的穷尽表。
+ *
+ * 类型是 `Record<SandboxModeWire, string>`：wire 新增一档时这里缺键 → `tsc` 直接失败，
+ * 逼人回来对齐 `PRESET_TO_SANDBOX`。**不用生产依赖锁**（那会把纯 wire 模块
+ * `sandbox-status` 变成依赖中心），只让两侧的用例互相盯着。
+ */
+const WIRE_MODES: Record<SandboxModeWire, string> = {
+  read_only: 'read-only',
+  workspace_write: 'workspace-write',
+  danger_full_access: 'danger-full-access',
+}
 
 describe('权限挡位说明行（P3-16）', () => {
   it('宿主目录不下发说明：说明是界面文案，只能来自界面词典', () => {
@@ -35,5 +49,16 @@ describe('权限挡位说明行（P3-16）', () => {
       .toBe('Unreadable')
     // 它不是挡位：目录里没有它，也不能被当成某一档
     expect(PERMISSION_PRESET_OPTIONS.map(option => option.value)).not.toContain(PERMISSION_UNAVAILABLE)
+  })
+
+  it('PRESET_TO_SANDBOX 与 SandboxModeWire 的值集合必须相等', () => {
+    // 正向：映射产出的每个宿主档都必须是合法 wire 值（多一档 = 写进去的档宿主不认）
+    for (const mode of Object.values(PRESET_TO_SANDBOX)) {
+      expect(Object.keys(WIRE_MODES)).toContain(mode)
+    }
+    // 反向：每个 wire 值都要能在映射里找到挡位（少一档 = 界面上少一个可选项却没报错）
+    for (const [mode, preset] of Object.entries(WIRE_MODES)) {
+      expect(PRESET_TO_SANDBOX[preset]).toBe(mode)
+    }
   })
 })
