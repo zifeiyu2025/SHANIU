@@ -7,8 +7,8 @@
 ## 统计
 
 - 条目总数：3314
-- same：2683
-- drift：72
+- same：2680
+- drift：75
 - missing：0
 - not-applicable：559
 - 待复核（needs-review）：0
@@ -440,6 +440,9 @@
 | `packages/client/ui-settings-general/src/client/SettingsRoot.module.css` | drift | 已登记 | 设置按钮紧凑化并右对齐，纯样式（docs/07 #7） | 上游若已调整为同等形态，删本地补丁 |
 | `packages/client/ui-settings-general/src/client/chrome.module.css` | drift | 已登记 | 设置按钮紧凑化并右对齐，纯样式（docs/07 #7） | 上游若已调整为同等形态，删本地补丁 |
 | `packages/client/ui-settings-general/src/client/index.ts` | drift | 已登记 | 新增 settingsShell 服务（openSection），供宿主模型配置座位直达设置分段；拆卸链已接 disposeShell（docs/07 #15） | 上游若提供等价入口，删本地服务改调用方；保留时必须确认拆卸链仍调用 disposeShell |
+| `packages/client/ui-settings-models/src/client/ModelsSection.module.css` | drift | 已登记 | 「已保存」文案由成功绿改中性色，避免把「写进本机」读成「校验通过」（docs/07 #27） | 上游若自己区分「已保存」与「已校验」，删本地改动；保留时确认 .savedNotice 没有退回 success 色 |
+| `packages/client/ui-settings-models/src/client/ModelsSection.tsx` | drift | 已登记 | 账号行绿点补 role=img + title/aria-label，悬停与读屏都能得到「已登录」（docs/07 #27） | 上游若已给该绿点等价标签，删本地改动改跟上游 |
+| `packages/client/ui-settings-models/src/client/locales.ts` | drift | 已登记 | credentialConfigured 的 zh/en 改为「已配置（未校验有效性）」，不再暗示密钥有效（docs/07 #27） | 上游若自己区分「已保存」与「已校验」，删本地文案；保留时确认没有退回「已配置」这种读法 |
 | `packages/client/ui-settings-plugin-inventory/README.i18n.yaml` | not-applicable | 已登记 | 整包未 vendor（设置只留通用 + 模型，见 docs/07 #19） | 接入该能力时整包 vendor，并按 docs/07 登记改动 |
 | `packages/client/ui-settings-plugin-inventory/README.md` | not-applicable | 已登记 | 整包未 vendor（设置只留通用 + 模型，见 docs/07 #19） | 接入该能力时整包 vendor，并按 docs/07 登记改动 |
 | `packages/client/ui-settings-plugin-inventory/README.zh.md` | not-applicable | 已登记 | 整包未 vendor（设置只留通用 + 模型，见 docs/07 #19） | 接入该能力时整包 vendor，并按 docs/07 登记改动 |
