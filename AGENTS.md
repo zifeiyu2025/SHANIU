@@ -56,7 +56,7 @@
 | `**/Cargo.toml`、`**/package.json` | 按需新增依赖无需确认；版本主升级/删除需确认 | 部分 | 按 §6 依赖规则 |
 | `.github/`、CI 脚本 | 必须确认 | 是 | 交付管线 |
 
-### 2.1 并发会话与共享 Git 索引（提交纪律）
+### 2.1 提交约定
 
 一律 `git commit -m "<msg>" -- <文件...>`（禁用 `add -A`），提交后 `git show --name-only HEAD` 核对，多出的用 `git reset --mixed HEAD~1` 撤回（禁 `--hard`，会毁别人工作树）。E62 两次裸提交各卷进 5、7 个他人文件，改 pathspec 后只 1 个。
 
