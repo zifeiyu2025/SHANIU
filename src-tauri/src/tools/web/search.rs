@@ -35,12 +35,18 @@ pub const DEFAULT_RESULTS: usize = 5;
 const SNIPPET_CHARS: usize = 500;
 /// 查询长度上限，防止把整段文本当 query 打出去。
 const MAX_QUERY_CHARS: usize = 400;
-/// 连续失败多少次进入冷却。
-const FAILURES_BEFORE_COOLDOWN: u32 = 3;
-/// 被限流/改版后的冷却时长：短退避，等页面恢复。
+/// 首次失败就进入短冷却：不要等连续 3 次才让模型知道「搜索当前不可用」。
+const FIRST_FAILURE_COOLDOWN: Duration = Duration::from_secs(30);
+/// 第二次失败：再拉长一点，仍允许较快恢复。
+const SECOND_FAILURE_COOLDOWN: Duration = Duration::from_secs(60);
+/// 连续失败到这一档后，按失败类型进入长冷却。
+const FAILURES_BEFORE_LONG_COOLDOWN: u32 = 3;
+/// 被限流/改版后的长冷却：短退避，等页面恢复。
 const BLOCKED_COOLDOWN: Duration = Duration::from_secs(60);
-/// 网络不可达后的冷却时长：连续失败后短时间不再打请求，等网络恢复。
+/// 网络不可达后的长冷却：连续失败后短时间不再打请求，等网络恢复。
 const NETWORK_COOLDOWN: Duration = Duration::from_secs(600);
+/// 两次失败间隔超过它就把连续计数清零：昨天的网络抖动不该让今天的首次失败直接进长冷却。
+const FAILURE_STREAK_TTL: Duration = Duration::from_secs(600);
 /// 200 但正文小于此值：视为风控空壳页，而不是「确实没有结果」。
 const MIN_BODY_BYTES: usize = 500;
 
@@ -96,18 +102,21 @@ impl SearchError {
     }
 
     /// 给模型看的说明：不同分类给出不同的下一步建议。
+    ///
+    /// 一律以「搜索当前不可用」开头：首次失败就要把结论说清楚，而不是让模型从
+    /// 「网络错误」里自己猜，然后原地重试。
     pub fn guidance(&self) -> String {
         match self.kind {
             SearchFailure::Blocked => format!(
-                "搜索被限流或拦截（{}）。请稍后重试，或改用 web_fetch 直接抓已知 URL。",
+                "搜索当前不可用：被限流或拦截（{}）。请改用 web_fetch 直接抓已知 URL，或稍后重试。",
                 self.detail
             ),
             SearchFailure::Parse => format!(
-                "结果解析失败（{}）。搜索引擎页面结构可能已变化，请改用 web_fetch 打开具体页面。",
+                "搜索当前不可用：结果解析失败（{}），页面结构可能已变化。请改用 web_fetch 打开具体页面。",
                 self.detail
             ),
             SearchFailure::Network => format!(
-                "网络请求失败（{}）。可稍后重试；若持续失败，改用 web_fetch 或换关键词。",
+                "搜索当前不可用：网络请求失败（{}）。请改用 web_fetch 直接抓已知 URL，或稍后重试。",
                 self.detail
             ),
             SearchFailure::Cancelled => "已取消".to_string(),
@@ -162,6 +171,7 @@ impl Fetcher for WebClient {
 struct Health {
     consecutive_failures: u32,
     cooldown_until: Option<Instant>,
+    last_failure_at: Option<Instant>,
 }
 
 impl Health {
@@ -178,19 +188,36 @@ impl Health {
     fn success(&mut self) {
         self.consecutive_failures = 0;
         self.cooldown_until = None;
+        self.last_failure_at = None;
     }
 
+    /// 失败即进冷却（首次 30 秒，第二次 60 秒，三次起按类型进入长冷却）。
+    ///
+    /// 旧行为是「连续 3 次才冷却」：前两次模型只看到一条网络错误，既不知道服务不可用，
+    /// 也没有被推去用 web_fetch，往往原地重试。首次失败就该把话说清楚。
     fn failure(&mut self, kind: SearchFailure) {
+        let now = Instant::now();
+        // 超过 TTL 的失败不算「连续」，避免陈旧的抖动把今天的首次失败直接推到长冷却。
+        if self
+            .last_failure_at
+            .is_some_and(|at| now.duration_since(at) > FAILURE_STREAK_TTL)
+        {
+            self.consecutive_failures = 0;
+        }
         self.consecutive_failures += 1;
-        if self.consecutive_failures >= FAILURES_BEFORE_COOLDOWN {
-            let cooldown = if kind == SearchFailure::Network {
+        self.last_failure_at = Some(now);
+        let cooldown = if self.consecutive_failures >= FAILURES_BEFORE_LONG_COOLDOWN {
+            if kind == SearchFailure::Network {
                 NETWORK_COOLDOWN
             } else {
                 BLOCKED_COOLDOWN
-            };
-            self.cooldown_until = Some(Instant::now() + cooldown);
-            self.consecutive_failures = 0;
-        }
+            }
+        } else if self.consecutive_failures == 1 {
+            FIRST_FAILURE_COOLDOWN
+        } else {
+            SECOND_FAILURE_COOLDOWN
+        };
+        self.cooldown_until = Some(now + cooldown);
     }
 }
 
@@ -224,6 +251,17 @@ impl Bing {
         let mut guard = self.health.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
         guard.failure(kind);
     }
+
+    /// 记一次失败并把错误原样返回。取消不是「搜索不健康」，不计入失败计数。
+    ///
+    /// 抓取层与解析层的失败都要走这里：早先只在 `finish` 分支记账，网络错误经 `?`
+    /// 直接返回，永远进不了冷却——「第一次失败就告知不可用」也就无从谈起。
+    fn observed(&self, error: SearchError) -> SearchError {
+        if error.kind != SearchFailure::Cancelled {
+            self.record_failure(error.kind);
+        }
+        error
+    }
 }
 
 #[async_trait]
@@ -241,7 +279,10 @@ impl SearchProvider for Bing {
         if let Some(remaining) = self.cooldown_remaining() {
             return Err(SearchError::new(
                 SearchFailure::Blocked,
-                format!("连续失败后冷却中，还剩 {} 秒", remaining.as_secs() + 1),
+                format!(
+                    "搜索当前不可用：冷却中，还剩 {} 秒。请改用 web_fetch 直接抓已知 URL，或稍后重试。",
+                    remaining.as_secs() + 1
+                ),
             ));
         }
         let mut url = reqwest::Url::parse(BING.endpoint)
@@ -252,11 +293,11 @@ impl SearchProvider for Bing {
             // 多要一些再截断：Bing 的结果里会混入广告与站内模块。
             pairs.append_pair("count", &(limit * 2).to_string());
         }
-        let response = self
-            .fetcher
-            .fetch(url.as_str(), cancel)
-            .await
-            .map_err(map_web_error)?;
+        let response = match self.fetcher.fetch(url.as_str(), cancel).await {
+            Ok(response) => response,
+            // 抓取失败同样要记账，否则网络错误永远等不到冷却、也就不会告知不可用。
+            Err(error) => return Err(self.observed(map_web_error(error))),
+        };
         match finish(
             &response,
             |body| parse_bing(body, BING, limit),
@@ -266,13 +307,7 @@ impl SearchProvider for Bing {
                 self.record_success();
                 Ok(hits)
             }
-            Err(error) => {
-                // 取消不是「搜索不健康」：不能把它记进失败计数、更不能由此进冷却。
-                if error.kind != SearchFailure::Cancelled {
-                    self.record_failure(error.kind);
-                }
-                Err(error)
-            }
+            Err(error) => Err(self.observed(error)),
         }
     }
 }
@@ -1176,6 +1211,47 @@ mod tests {
         let chain = FallbackProvider::new(vec![Arc::new(CancelledProvider)]);
         let error = chain.search("x", 5, &CancellationToken::new()).await.unwrap_err();
         assert_eq!(error.kind, SearchFailure::Cancelled);
+    }
+
+    struct FailingFetcher;
+
+    #[async_trait]
+    impl Fetcher for FailingFetcher {
+        async fn fetch(
+            &self,
+            _url: &str,
+            _cancel: &CancellationToken,
+        ) -> Result<WebResponse, WebError> {
+            Err(WebError::Http("boom".into()))
+        }
+    }
+
+    #[tokio::test]
+    async fn first_failure_enters_cooldown_and_says_unavailable() {
+        let bing = Bing::new(Arc::new(FailingFetcher));
+        let cancel = CancellationToken::new();
+        let first = bing.search("x", 5, &cancel).await.unwrap_err();
+        assert_eq!(first.kind, SearchFailure::Network);
+        assert!(
+            first.guidance().contains("搜索当前不可用"),
+            "首次失败就要把结论说清楚：{}",
+            first.guidance()
+        );
+        assert!(
+            first.guidance().contains("web_fetch"),
+            "首次失败就要给出替代路径：{}",
+            first.guidance()
+        );
+
+        // 反向对照：把冷却阈值改回「连续 3 次」时，第二次会真的再打一次请求、仍是 Network，
+        // 这条断言随之变红。首次失败必须已经进入冷却。
+        let second = bing.search("x", 5, &cancel).await.unwrap_err();
+        assert_eq!(second.kind, SearchFailure::Blocked);
+        assert!(
+            second.guidance().contains("冷却中"),
+            "第二次调用应直接告知冷却中：{}",
+            second.guidance()
+        );
     }
 
     struct StubProvider {
