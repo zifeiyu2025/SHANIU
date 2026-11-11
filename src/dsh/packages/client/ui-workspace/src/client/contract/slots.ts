@@ -279,7 +279,18 @@ export type WorkspaceBrowserInjected = {
   searchSessions: (
     query: string,
     signal: AbortSignal,
-  ) => Promise<{ items: readonly SessionSearchResultItem[]; hasMore: boolean }>
+  ) => Promise<{
+    items: readonly SessionSearchResultItem[]
+    hasMore: boolean
+    /** Sessions the Host could not index for this request; the page is incomplete. */
+    skippedSessions?: number
+  }>
+  /**
+   * Clear the Host's index-failure memory so the next search really reopens the
+   * index. Optional: hosts without an index cooldown omit it, and the browser
+   * then shows no retry control.
+   */
+  retrySearchIndex?: () => Promise<void>
   /** Maximum number of merged rows rendered for one search. */
   searchResultLimit: number
   /** Open the Session rename dialog (a row title double-click); the rename action entry raises the same request. */

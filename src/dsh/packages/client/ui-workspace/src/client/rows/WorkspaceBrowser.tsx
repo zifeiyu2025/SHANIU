@@ -797,10 +797,19 @@ interface RemoteSearchState {
   status: 'idle' | 'loading' | 'ready' | 'error'
   items: readonly SessionSearchResultItem[]
   hasMore: boolean
+  /** Sessions the Host could not index for this page; the results are incomplete. */
+  skippedSessions: number
+  /** Failure text while `status === 'error'`; empty otherwise. */
+  error: string
 }
 
-/** Flat search body: local metadata matches plus the current Host result page. */
-function SearchResults({
+/**
+ * Flat search body: local metadata matches plus the current Host result page.
+ *
+ * Exported for the SHANIU acceptance test (`src/__tests__`): the upstream spec
+ * depends on an unvendored test runtime and never runs here (docs/05 SH-101).
+ */
+export function SearchResults({
   useSessions,
   useSessionStatus,
   open,
@@ -814,6 +823,7 @@ function SearchResults({
   usePanelInfo,
   useSessionAccess,
   t,
+  onRetry,
 }: Pick<WorkspaceBrowserProps, 'useSessions' | 'useSessionStatus' | 'open' | 't' | 'usePanelInfo' | 'useSessionAccess'> & {
   workspaces: readonly WorkspaceView[]
   archivedSessionIds: readonly SessionNode['id'][]
@@ -824,13 +834,15 @@ function SearchResults({
   query: string
   remote: RemoteSearchState
   resultLimit: number
+  /** Clear the Host's index-failure memory and search again; absent without a cooldown. */
+  onRetry?: () => void
 }) {
   const panelActive = usePanelInfo(info => info.activePanelId !== null)
   const list = useSessions(s => s)
   const statuses = useSessionStatus(s => s)
   const currentRemote = remote.query === query
     ? remote
-    : { query, status: 'loading' as const, items: [], hasMore: false }
+    : { query, status: 'loading' as const, items: [], hasMore: false, skippedSessions: 0, error: '' }
   const results = useMemo(
     () => deriveSearchResults(
       list,
@@ -880,8 +892,28 @@ function SearchResults({
             ))}
           </div>
         )}
-        {!pending && results.items.length === 0 && (
+        {currentRemote.status === 'error' && (
+          /* A failed search is not "no matches": say so and offer the retry that
+             clears the Host's failure memory before searching again. */
+          <div className={css.searchStatus} role="alert">
+            <span className={css.searchError}>
+              {t('search.failed')}：{currentRemote.error}
+            </span>
+            {onRetry !== undefined && (
+              <button type="button" className={css.emptyAction} onClick={onRetry}>
+                {t('search.retry')}
+              </button>
+            )}
+          </div>
+        )}
+        {!pending && currentRemote.status !== 'error' && results.items.length === 0 && (
           <div className={css.empty}>{t('search.noMatches')}</div>
+        )}
+        {currentRemote.skippedSessions > 0 && (
+          /* Missing rows are stated, not silently dropped: this page is incomplete. */
+          <div className={css.searchStatus} role="status">
+            {t('search.skipped', { n: currentRemote.skippedSessions })}
+          </div>
         )}
         {results.hasMore && (
           <div className={css.searchStatus}>
@@ -921,6 +953,7 @@ export function WorkspaceBrowser({
   unarchiveSession,
   createWorkspace,
   searchSessions,
+  retrySearchIndex,
   searchResultLimit,
   useDirectoryFlow,
   useHostInfo,
@@ -1106,7 +1139,11 @@ export function WorkspaceBrowser({
     status: 'idle',
     items: [],
     hasMore: false,
+    skippedSessions: 0,
+    error: '',
   })
+  /** Bumped by the retry control; the search effect depends on it, so a retry re-runs the query. */
+  const [searchRetry, setSearchRetry] = useState(0)
   const searchRoot = useRef<HTMLDivElement | null>(null)
   const searchInput = useRef<HTMLInputElement | null>(null)
   // The list area is this section's own vertical scroller; the sidebar hands wheel
@@ -1180,9 +1217,22 @@ export function WorkspaceBrowser({
     return () => { document.removeEventListener('click', onClick) }
   }, [normalizedQuery, wide, searchExpanded, searchOnExpand])
 
+  // Clear the Host's failure memory first, then re-run the query. Without an
+  // injected retry (hosts with no cooldown) this degrades to a plain re-search.
+  const retrySearch = useCallback((): void => {
+    const clear = retrySearchIndex === undefined ? Promise.resolve() : retrySearchIndex()
+    // A rejected clear still re-searches: the failure then surfaces in the
+    // result area instead of leaving the click with no visible effect.
+    clear.catch(() => undefined).finally(() => {
+      setSearchRetry(current => current + 1)
+    })
+  }, [retrySearchIndex])
+
   useEffect(() => {
     if (normalizedQuery === '') {
-      setRemoteSearch({ query: '', status: 'idle', items: [], hasMore: false })
+      setRemoteSearch({
+        query: '', status: 'idle', items: [], hasMore: false, skippedSessions: 0, error: '',
+      })
       return
     }
     const controller = new AbortController()
@@ -1191,6 +1241,8 @@ export function WorkspaceBrowser({
       status: 'loading',
       items: [],
       hasMore: false,
+      skippedSessions: 0,
+      error: '',
     })
     const timer = window.setTimeout(() => {
       searchSessions(normalizedQuery, controller.signal).then((result) => {
@@ -1200,14 +1252,18 @@ export function WorkspaceBrowser({
           status: 'ready',
           items: result.items,
           hasMore: result.hasMore,
+          skippedSessions: result.skippedSessions ?? 0,
+          error: '',
         })
-      }).catch(() => {
+      }).catch((reason: unknown) => {
         if (controller.signal.aborted) return
         setRemoteSearch({
           query: normalizedQuery,
           status: 'error',
           items: [],
           hasMore: false,
+          skippedSessions: 0,
+          error: reason instanceof Error ? reason.message : String(reason),
         })
       })
     }, SEARCH_DEBOUNCE_MS)
@@ -1215,7 +1271,7 @@ export function WorkspaceBrowser({
       window.clearTimeout(timer)
       controller.abort()
     }
-  }, [normalizedQuery, searchSessions])
+  }, [normalizedQuery, searchSessions, searchRetry])
 
   // The search results' restore button; the row actions own the rest of the
   // Session verbs as slot entries.
@@ -1376,6 +1432,7 @@ export function WorkspaceBrowser({
               query={normalizedQuery}
               remote={remoteSearch}
               resultLimit={searchResultLimit}
+              onRetry={retrySearchIndex === undefined ? undefined : retrySearch}
               t={t}
             />
           )

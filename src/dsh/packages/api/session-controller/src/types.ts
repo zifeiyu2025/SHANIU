@@ -256,12 +256,23 @@ export interface SessionListValue {
 /** Session search request. */
 export interface SessionSearchRequest {
   readonly query: string
+  /**
+   * Ask the Host to discard its index-failure memory before running this
+   * request. Hosts without a cooldown ignore it; the search itself is unchanged
+   * (an empty query still returns an empty page).
+   */
+  readonly retry?: boolean
 }
 
 /** Session search response value. */
 export interface SessionSearchValue {
   readonly items: readonly SessionSearchItem[]
   readonly hasMore: boolean
+  /**
+   * Sessions whose archives could not be read for this request, so the page is
+   * incomplete. Optional: hosts that index everything never set it.
+   */
+  readonly skippedSessions?: number
 }
 
 /** Request for a Session for a new conversation. */

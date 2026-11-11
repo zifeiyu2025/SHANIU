@@ -1148,6 +1148,15 @@ fn search_sessions(
     session_query::search(&state.data_root(), &query)
 }
 
+/// 手动重试会话搜索索引（SH-113）：清掉失败记忆，让下一次搜索真的重新打开索引。
+///
+/// 冷却只是「别让每次搜索都重撞一次墙」，不是「只能干等」——用户可能刚把磁盘清出来
+/// 或解除了文件占用。界面上的「重试」入口走这里，随后重新发起一次搜索。
+#[tauri::command]
+fn retry_session_index() {
+    session_query::retry_index_now();
+}
+
 /// 归档/置顶/排序操作的类型化错误（SH-100）：`code` 给前端按类映射 wire 错误码
 /// （上游 workspace-controller types.ts 的同一批语义），措辞怎么改都不破坏形状。
 #[derive(Debug, serde::Serialize)]
@@ -3072,6 +3081,7 @@ pub fn run() {
             list_sessions,
             load_session,
             search_sessions,
+            retry_session_index,
             fork_session,
             rename_session,
             archive_session,

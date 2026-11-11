@@ -468,7 +468,7 @@ export class SessionManager {
   async search(
     query: string,
     signal: AbortSignal,
-  ): Promise<RemoteResult<{ items: SessionSearchResultItem[]; hasMore: boolean }>> {
+  ): Promise<RemoteResult<{ items: SessionSearchResultItem[]; hasMore: boolean; skippedSessions?: number }>> {
     const result = await this.remote.session.search({ query }, signal)
     if (!result.ok) return result
     return {
@@ -476,6 +476,9 @@ export class SessionManager {
       value: {
         items: [...result.value.items],
         hasMore: result.value.hasMore,
+        ...(result.value.skippedSessions === undefined
+          ? {}
+          : { skippedSessions: result.value.skippedSessions }),
       },
     }
   }

@@ -120,7 +120,12 @@ export interface ISessions {
   search(
     query: string,
     signal: AbortSignal,
-  ): Promise<RemoteResult<{ items: SessionSearchResultItem[]; hasMore: boolean }>>
+  ): Promise<RemoteResult<{
+    items: SessionSearchResultItem[]
+    hasMore: boolean
+    /** Present when the Host skipped unreadable session archives; the page is then incomplete. */
+    skippedSessions?: number
+  }>>
   /**
    * Fork a session from an exact inclusive prefix of the source; on
    * resolution the child is catalogued and can be explicitly retained.

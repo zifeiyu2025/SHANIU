@@ -142,6 +142,17 @@ export function apply(ctx: Context): void {
     return result.value
   }
 
+  // The retry control outlives the cooldown: clear the Host's failure memory,
+  // then let the browser's next search reopen the index. The empty query keeps
+  // this call free of search work; `retry` is what the Host acts on.
+  const retrySearchIndex: WorkspaceBrowserInjected['retrySearchIndex'] = async () => {
+    const result = await ctx.remote.session.search(
+      { query: '', retry: true },
+      new AbortController().signal,
+    )
+    if (!result.ok) throw new Error(result.error.message)
+  }
+
   // Stable per-surface occupancy sources (the renderer's hook cache keys by
   // source identity): true while the surface's directory-flow hole is filled.
   const flowSource = (hole: 'sidebar.workspaces.directoryFlow' | 'conversation.hero.workspace.directoryFlow'): HostObservable<boolean> => ({
@@ -294,6 +305,7 @@ export function apply(ctx: Context): void {
     startSession: (workspaceId, options) => { uiWorkspace.startSession(workspaceId, options) },
     open: openSession,
     searchSessions,
+    retrySearchIndex,
     searchResultLimit: sessions.searchResultLimit,
     requestSessionRename,
     notifyArchivedNotOpenable: () => { notify({ kind: 'archivedNotOpenable' }) },

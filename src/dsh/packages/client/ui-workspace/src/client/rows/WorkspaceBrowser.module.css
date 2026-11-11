@@ -406,6 +406,11 @@
   color: var(--dsw-alias-label-tertiary);
 }
 
+/* A failed search states its reason; the retry control sits in the same row. */
+.searchError {
+  color: var(--dsw-alias-state-error-primary);
+}
+
 /* Pending content search: skeleton rows on searchResultRow metrics — a round
    leading glyph beside a title bar and a wider snippet bar, breathing through
    opacity (same pulse as the input-trigger menu skeleton). */

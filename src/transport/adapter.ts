@@ -118,6 +118,12 @@ interface TokenBuckets {
 interface SearchPageWire {
   readonly items: readonly { sessionId: string; snippet: string }[]
   readonly hasMore: boolean
+  /**
+   * 宿主本次**跳过**的会话档案数（读不回来：被占用、权限、半截文件）。
+   * 数字本身只够说「这次不完整」；具体 id 在宿主日志里（`shaniu.log` 的
+   * `本次搜索跳过了读不回来的会话档案`），排障按那条汇总查。
+   */
+  readonly skippedSessions?: number
 }
 
 /** `session.search` wire 的一条命中（与 vendored `SessionSearchResultItem` 同形）。 */
@@ -2581,11 +2587,20 @@ export function createAdapter(options: AdapterOptions): { remote: unknown; dispo
       return OK({ records, hasMore: false, cursor: records.length === 0 ? -1 : through })
     },
     projections: async () => OK(null),
-    search: async (request: { query?: string } = {}) => {
+    search: async (request: { query?: string; retry?: boolean } = {}) => {
+      // 界面「重试」先清掉宿主的失败记忆；这一步必须在空 query 短路之前，
+      // 否则带着 retry 的空请求会直接返回，冷却永远解不开。
+      if (request.retry === true) {
+        try {
+          await bridge.invoke('retry_session_index')
+        } catch (reason) {
+          return FAIL(`重试索引失败：${hostErrorText(reason)}`)
+        }
+      }
       const query = (typeof request.query === 'string' ? request.query : '').trim()
       // 空/纯空白按上游语义回空表（WorkspaceBrowser 自己也会短路空 query），
       // 且不该为它付宿主 SQLite 打开成本。
-      if (query === '') return OK({ items: [], hasMore: false })
+      if (query === '') return OK({ items: [], hasMore: false, skippedSessions: 0 })
       try {
         // DSH wire 只送 {query}：没有 cursor、没有 limit，宿主也不做续页。
         const page = await bridge.invoke<SearchPageWire>('search_sessions', { query })
@@ -2602,7 +2617,12 @@ export function createAdapter(options: AdapterOptions): { remote: unknown; dispo
           })
         }
         // hasMore 只驱动 UI 一行「结果较多，请收窄查询」提示，不是分页信号。
-        return OK({ items, hasMore: page?.hasMore === true })
+        // skippedSessions 同理：只驱动一行「N 个会话无法检索」，表示这次结果不完整。
+        return OK({
+          items,
+          hasMore: page?.hasMore === true,
+          skippedSessions: typeof page?.skippedSessions === 'number' ? page.skippedSessions : 0,
+        })
       } catch (reason) {
         // wire 契约：失败以 {ok:false} 回给客户端，不是 rejection。宿主给的是
         // {code,message}（session_query::SearchError 的序列化形状）；索引/查询/档案
