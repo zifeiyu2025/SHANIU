@@ -24,8 +24,13 @@ import { NS, type CapabilitiesKey } from './locales'
 import type { CapabilitiesWire, CapabilityModelWire, CapabilityViewWire, KeyCheckWire } from './wire'
 import './capabilities.css'
 
-/** 子集：与宿主 `capability::ITEMS` 的 id 一一对应（新增能力项时两处一起加）。 */
-const ITEMS = ['vision', 'tools', 'reasoning', 'context_window', 'max_output', 'builtin_web_search'] as const
+/**
+ * 子集：与宿主 `capability::ITEMS` 的 id 一一对应（新增能力项时两处一起加）。
+ *
+ * 注意：`builtin_web_search` 刻意不在列表里——端点托管搜索尚未接线（实际搜索永远走
+ * 本地 Bing 抓页），显示「托管搜索可用」会误导用户。接线后与宿主表一起加回。
+ */
+const ITEMS = ['vision', 'tools', 'reasoning', 'context_window', 'max_output'] as const
 type ItemId = typeof ITEMS[number]
 
 const ITEM_LABEL: Record<ItemId, CapabilitiesKey> = {
@@ -34,7 +39,6 @@ const ITEM_LABEL: Record<ItemId, CapabilitiesKey> = {
   reasoning: 'item.reasoning',
   context_window: 'item.context_window',
   max_output: 'item.max_output',
-  builtin_web_search: 'item.builtin_web_search',
 }
 
 const SOURCE_LABEL: Record<string, CapabilitiesKey> = {

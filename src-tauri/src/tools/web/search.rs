@@ -439,9 +439,15 @@ fn bing_confirms_no_results(html: &str) -> bool {
 /// Bing 的容器式解析：先找 `li.b_algo`，再在容器内找标题链接与摘要。
 fn parse_bing(html: &str, spec: BingSpec, limit: usize) -> Vec<SearchHit> {
     let mut hits = Vec::new();
-    for container in elements_by_class(html, spec.container_tag, spec.container_class) {
+    for (container_attrs, container) in
+        elements_by_class_with_attrs(html, spec.container_tag, spec.container_class)
+    {
         if hits.len() >= limit {
             break;
+        }
+        // 广告/推广位由 Bing 自己的结构标记声明，按标记剔除，不读正文猜。
+        if is_promoted(&container_attrs, &container) {
+            continue;
         }
         let Some((attrs, inner)) = elements_by_tag(&container, spec.heading_tag)
             .iter()
@@ -516,12 +522,26 @@ fn elements_by_class(html: &str, tag: &str, class: &str) -> Vec<String> {
     collect_elements(html, tag, Some(class))
 }
 
+/// 扫描指定标签里 class 命中的元素，返回（属性串, 内层 HTML）。
+///
+/// 解析广告位需要看容器自身的 class，`elements_by_class` 把它丢了。
+fn elements_by_class_with_attrs(html: &str, tag: &str, class: &str) -> Vec<(String, String)> {
+    collect_elements_raw(html, tag, Some(class))
+}
+
 /// 扫描指定标签的全部元素（不按 class 过滤），返回内层 HTML。
 fn elements_by_tag(html: &str, tag: &str) -> Vec<String> {
     collect_elements(html, tag, None)
 }
 
 fn collect_elements(html: &str, tag: &str, class: Option<&str>) -> Vec<String> {
+    collect_elements_raw(html, tag, class)
+        .into_iter()
+        .map(|(_, inner)| inner)
+        .collect()
+}
+
+fn collect_elements_raw(html: &str, tag: &str, class: Option<&str>) -> Vec<(String, String)> {
     let open = format!("<{tag}");
     let close = format!("</{tag}>");
     let mut out = Vec::new();
@@ -543,11 +563,113 @@ fn collect_elements(html: &str, tag: &str, class: Option<&str>) -> Vec<String> {
         let Some(end_offset) = matching_close(html, inner_start, tag) else { break };
         let end = end_offset - inner_start;
         if class.is_none_or(|class| has_class(attrs, class)) {
-            out.push(html[inner_start..inner_start + end].to_string());
+            out.push((
+                attrs.to_string(),
+                html[inner_start..inner_start + end].to_string(),
+            ));
         }
         index = inner_start + end + close.len();
     }
     out
+}
+
+/// 广告/推广容器的结构类名。Bing 用它们标记赞助结果。
+const AD_CONTAINER_CLASSES: &[&str] = &[
+    "b_ad",
+    "b_adTop",
+    "b_adBottom",
+    "b_adProvider",
+    "b_promoted",
+    "b_deepAds",
+];
+
+/// 广告徽标的结构类名（容器内出现即视为推广结果）。
+const AD_BADGE_CLASSES: &[&str] = &["b_adBadge", "b_adsLabel", "b_promotedLabel"];
+
+/// 是否推广结果：容器自身带广告类名，或内层出现广告徽标类名。
+///
+/// 只看 `class` 属性，不读正文——"广告"这两个字出现在正常网页里并不代表它是广告位。
+fn is_promoted(container_attrs: &str, container: &str) -> bool {
+    AD_CONTAINER_CLASSES
+        .iter()
+        .any(|class| has_class(container_attrs, class))
+        || has_any_class(container, AD_BADGE_CLASSES)
+}
+
+/// 页面任意元素的 `class` 是否命中给定集合（大小写不敏感，按空白切分 token）。
+fn has_any_class(html: &str, classes: &[&str]) -> bool {
+    let lower = html.to_ascii_lowercase();
+    let lowered: Vec<String> = classes.iter().map(|class| class.to_ascii_lowercase()).collect();
+    let mut from = 0;
+    while let Some(offset) = lower[from..].find("class=") {
+        let at = from + offset + "class=".len();
+        let rest = lower[at..].trim_start_matches(['"', '\'']);
+        let end = rest.find(['"', '\'']).unwrap_or(rest.len());
+        if rest[..end]
+            .split_whitespace()
+            .any(|token| lowered.iter().any(|class| token == class))
+        {
+            return true;
+        }
+        from = at + 1;
+    }
+    false
+}
+
+// ============================== 查询覆盖率 ==============================
+
+fn is_cjk(character: char) -> bool {
+    matches!(character, '\u{3400}'..='\u{4DBF}' | '\u{4E00}'..='\u{9FFF}' | '\u{F900}'..='\u{FAFF}')
+}
+
+/// 查询词切分。
+///
+/// 英文/数字按空白与 ASCII 标点切；含 CJK 时用字符 bigram——中文没有空格，
+/// 整串相等会把「北京天气」和「上海天气」判成完全无关，而它们共享「天气」。
+fn query_terms(query: &str) -> Vec<String> {
+    let mut terms = Vec::new();
+    if query.chars().any(is_cjk) {
+        let chars: Vec<char> = query
+            .chars()
+            .filter(|character| !character.is_whitespace() && !character.is_ascii_punctuation())
+            .collect();
+        if chars.len() == 1 {
+            terms.push(chars[0].to_string());
+        }
+        for window in chars.windows(2) {
+            let term: String = window.iter().collect();
+            if !terms.contains(&term) {
+                terms.push(term);
+            }
+        }
+        return terms;
+    }
+    for term in query
+        .split(|character: char| character.is_whitespace() || character.is_ascii_punctuation())
+        .filter(|term| !term.is_empty())
+    {
+        let term = term.to_ascii_lowercase();
+        if !terms.contains(&term) {
+            terms.push(term);
+        }
+    }
+    terms
+}
+
+/// 查询词在标题/摘要中的覆盖率（百分比，整数）。查询没有可用词时返回 `None`。
+///
+/// 这是一个客观量，不做硬过滤：删掉结果的风险大于收益，判断权留给模型。
+fn query_coverage(query: &str, title: &str, snippet: &str) -> Option<u32> {
+    let terms = query_terms(query);
+    if terms.is_empty() {
+        return None;
+    }
+    let haystack = format!("{title} {snippet}").to_lowercase();
+    let hit = terms
+        .iter()
+        .filter(|term| haystack.contains(term.as_str()))
+        .count();
+    Some((hit as u32 * 100) / terms.len() as u32)
 }
 
 /// 从 `from` 起找与当前开始标签配对的闭合标签（考虑同标签嵌套）。
@@ -778,24 +900,19 @@ impl ToolExecutor for WebSearch {
                 elapsed.as_millis()
             ));
             for (index, hit) in hits.iter().enumerate() {
-                body.push_str(&format!(
-                    "{}. {}\n   {}\n   来源={}{}\n",
-                    index + 1,
-                    hit.title,
-                    hit.url,
-                    hit.source,
-                    if hit.snippet.is_empty() {
-                        "\n   摘要：（无）"
-                    } else {
-                        ""
-                    }
-                ));
+                body.push_str(&format!("{}. {}\n", index + 1, hit.title));
+                // 逐条给出客观覆盖率：模型据此自己判断要不要采用，而不是被硬过滤掉。
+                if let Some(coverage) = query_coverage(query, &hit.title, &hit.snippet) {
+                    body.push_str(&format!("   命中率={coverage}%\n"));
+                }
+                body.push_str(&format!("   {}\n   来源={}\n", hit.url, hit.source));
                 if !hit.snippet.is_empty() {
                     body.push_str(&format!("   摘要：{}\n", hit.snippet));
                 }
             }
             body.push_str(
-                "提示：结果来自公开搜索页解析，可能不完整或过期；需要原文时用 web_fetch 打开链接核对。",
+                "提示：命中率是查询词在标题/摘要中的覆盖率，只是客观参考。覆盖率低的结果可能与问题无关，\
+                 不要硬套；如果都不相关，请直接说明没找到可靠来源。需要原文时用 web_fetch 打开链接核对。",
             );
         }
 
@@ -1113,6 +1230,55 @@ mod tests {
         assert!(output.output.starts_with("<<<WEB_SEARCH:"), "{}", output.output);
         assert!(output.output.contains("https://example.com/"));
         assert!(output.output.contains("END:"));
+    }
+
+    #[test]
+    fn ads_and_promoted_containers_are_dropped_by_structure() {
+        // 广告位由 Bing 自己的 class 标记声明：容器带 b_ad，或内层带 b_adBadge。
+        // 按结构剔除，不读正文——正常网页里出现「广告」两个字不算。
+        let html = r#"
+          <ol id="b_results">
+            <li class="b_algo b_ad"><h2><a href="https://ad.example.com/x">推广结果</a></h2></li>
+            <li class="b_algo"><h2><a href="https://ok.example.com/a">正常结果</a></h2></li>
+            <li class="b_algo"><div class="b_adBadge">广告</div><h2><a href="https://ad2.example.com/y">带徽标的推广</a></h2></li>
+          </ol>"#;
+        let hits = parse_bing(html, BING, 10);
+        assert_eq!(hits.len(), 1, "广告位必须被结构标记剔除：{hits:?}");
+        assert_eq!(hits[0].url, "https://ok.example.com/a");
+    }
+
+    #[test]
+    fn query_coverage_reports_objective_ratio() {
+        assert_eq!(query_coverage("rust async", "Async Rust", "本书讲 rust"), Some(100));
+        assert_eq!(query_coverage("rust tokio", "Async Rust", ""), Some(50));
+        // 查询没有可用词时不给数字，免得输出一个 0% 的假信号。
+        assert_eq!(query_coverage("", "标题", ""), None);
+    }
+
+    #[test]
+    fn cjk_query_uses_bigrams_not_whole_string() {
+        // 「北京天气」与「上海天气」共享「天气」，不能判成完全无关。
+        assert_eq!(query_coverage("北京天气", "上海天气", ""), Some(33));
+    }
+
+    #[tokio::test]
+    async fn tool_output_annotates_coverage_and_warns_about_low_match() {
+        let tool = WebSearch::new(Arc::new(StubProvider {
+            hits: vec![SearchHit {
+                title: "完全无关的页面".into(),
+                url: "https://x.example/1".into(),
+                snippet: "别的内容".into(),
+                source: "stub".into(),
+            }],
+        }));
+        let output = tool
+            .execute(serde_json::json!({"query": "rust async"}), &context())
+            .await
+            .unwrap();
+        assert!(output.output.contains("命中率=0%"), "{}", output.output);
+        // 低命中不能只给数字：必须明确告诉模型别硬套、并允许它说没找到。
+        assert!(output.output.contains("不要硬套"), "{}", output.output);
+        assert!(output.output.contains("没找到可靠来源"), "{}", output.output);
     }
 
     #[tokio::test]

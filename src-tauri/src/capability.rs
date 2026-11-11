@@ -106,13 +106,16 @@ pub struct CapabilityItem {
 /// 能力项登记表。**这里是唯一清单**：新增项只改这张表，配置、视图、设置页
 /// 都按 id 读取。未登记但出现在配置里的项不会被丢弃——设置页把它们归到
 /// "其他（保留）"，避免旧版本写下的能力项被一次保存抹掉。
+///
+/// TODO 托管搜索未接线：`builtin_web_search` 目前只是端点声明的能力，本仓库没有任何
+/// 代码消费它去发请求（实际搜索永远走本地 Bing 抓页）。接线前不放进这张表，
+/// 免得设置页显示「托管搜索可用」而实际没有；需要时再连同消费方一起加回来。
 pub const ITEMS: &[CapabilityItem] = &[
     CapabilityItem { id: "vision", label: "视觉输入", kind: CapabilityKind::Flag, probe: true },
     CapabilityItem { id: "tools", label: "工具调用", kind: CapabilityKind::Flag, probe: true },
     CapabilityItem { id: "reasoning", label: "推理档位", kind: CapabilityKind::Levels, probe: true },
     CapabilityItem { id: "context_window", label: "上下文窗口", kind: CapabilityKind::Number, probe: false },
     CapabilityItem { id: "max_output", label: "输出上限", kind: CapabilityKind::Number, probe: false },
-    CapabilityItem { id: "builtin_web_search", label: "端点托管搜索", kind: CapabilityKind::Flag, probe: false },
 ];
 
 pub fn item(id: &str) -> Option<&'static CapabilityItem> {
@@ -1872,7 +1875,8 @@ mod tests {
         assert_eq!(view["tools"]["state"], "probing");
         // 没有探针的项不能被写成「检测中」——它永远测不出来，装作在测就是撒谎。
         assert_eq!(view["context_window"]["state"], "unverified");
-        assert_eq!(view["builtin_web_search"]["state"], "unverified");
+        // 托管搜索未接线：刻意不在登记表里，视图也就不该出现（前端只渲染登记项）。
+        assert!(view.get("builtin_web_search").is_none());
         // 已经测出结论的项不受"正在测"影响。
         let mut outcomes = std::collections::BTreeMap::new();
         outcomes.insert(
