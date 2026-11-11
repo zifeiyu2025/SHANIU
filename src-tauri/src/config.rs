@@ -977,6 +977,16 @@ pub enum ApprovalMode {
 }
 
 impl ApprovalMode {
+    /// wire 值（与 `serde` 重命名一致，供审计与状态条复用）。
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Never => "never",
+            Self::OnFailure => "on_failure",
+            Self::OnRequest => "on_request",
+            Self::FullAccess => "full_access",
+        }
+    }
+
     /// 生效档：`full_access` 需要 `danger_full_access` 沙箱作为前提，
     /// 否则回落到 `on_request` 并返回回落说明（调用方负责播报，不静默）。
     pub fn effective(self, sandbox: SandboxMode) -> (Self, Option<&'static str>) {

@@ -908,6 +908,81 @@ mod tests {
         let _ = std::fs::remove_dir_all(&base);
     }
 
+    /// 绝对路径（不含 `..`）直接落在工作区外：`join` 会丢弃根，必须仍被拒。
+    #[cfg(windows)]
+    #[test]
+    fn absolute_path_outside_workspace_is_rejected() {
+        let base = std::env::temp_dir().join(format!("shaniu-abs-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&base);
+        let ws = base.join("ws");
+        std::fs::create_dir_all(&ws).unwrap();
+        let outside = base.join("outside.txt");
+        std::fs::write(&outside, "x").unwrap();
+        let err = resolve_for_write(&ws, &outside.to_string_lossy()).unwrap_err();
+        assert!(
+            matches!(err, ToolError::Execution(_)),
+            "工作区外的绝对路径必须拒绝：{}",
+            outside.display()
+        );
+        // 对照：工作区内的绝对路径仍可解析
+        let inside = ws.join("inside.txt");
+        assert!(resolve_for_write(&ws, &inside.to_string_lossy()).is_ok());
+        let _ = std::fs::remove_dir_all(&base);
+    }
+
+    /// 已存在的文件符号链接指向工作区外：`exists()` 为真，旧实现会 canonicalize
+    /// 后直接写穿；必须在解析阶段拒绝。
+    #[cfg(windows)]
+    #[test]
+    fn existing_symlink_to_outside_is_rejected() {
+        let base = std::env::temp_dir().join(format!("shaniu-link-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&base);
+        let ws = base.join("ws");
+        std::fs::create_dir_all(&ws).unwrap();
+        let outside = base.join("outside.txt");
+        std::fs::write(&outside, "secret").unwrap();
+        let link = ws.join("link.txt");
+        if let Err(e) = std::os::windows::fs::symlink_file(&outside, &link) {
+            eprintln!("SKIP：本机无法创建文件符号链接（需开发者模式/管理员）: {e}");
+            let _ = std::fs::remove_dir_all(&base);
+            return;
+        }
+        let err = resolve_for_write(&ws, "link.txt").unwrap_err();
+        assert!(matches!(err, ToolError::Execution(_)), "指向工作区外的已存在链接必须拒绝");
+        assert_eq!(std::fs::read(&outside).unwrap(), b"secret", "拒绝之后不得改写工作区外文件");
+        let _ = std::fs::remove_dir_all(&base);
+    }
+
+    /// 中间层目录 junction 指向工作区外：路径本身不带 `..`，靠重解析点属性识别。
+    #[cfg(windows)]
+    #[test]
+    fn junction_in_the_middle_is_rejected() {
+        let base = std::env::temp_dir().join(format!("shaniu-junc-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&base);
+        let ws = base.join("ws");
+        let outside = base.join("outside");
+        std::fs::create_dir_all(&ws).unwrap();
+        std::fs::create_dir_all(&outside).unwrap();
+        let link = ws.join("jump");
+        let status = std::process::Command::new("cmd")
+            .args(["/C", "mklink", "/J"])
+            .arg(&link)
+            .arg(&outside)
+            .stdout(std::process::Stdio::null())
+            .stderr(std::process::Stdio::null())
+            .status();
+        let created = matches!(status, Ok(s) if s.success()) && link.exists();
+        if !created {
+            eprintln!("SKIP：本机无法创建目录 junction");
+            let _ = std::fs::remove_dir_all(&base);
+            return;
+        }
+        let err = resolve_for_write(&ws, "jump/pwn.txt").unwrap_err();
+        assert!(matches!(err, ToolError::Execution(_)), "中间层 junction 指向工作区外时必须拒绝");
+        assert!(!outside.join("pwn.txt").exists(), "拒绝之后不得在工作区外留下文件");
+        let _ = std::fs::remove_dir_all(&base);
+    }
+
     #[tokio::test]
     async fn executes_registered_tool_by_name() {
         let router = router_with_noop();

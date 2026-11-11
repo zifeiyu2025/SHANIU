@@ -193,7 +193,23 @@ impl ApprovalBroker {
                     })
             });
         match policy::decide(risk, policy.approval, policy.sandbox, remembered) {
-            Decision::Allow => GateOutcome::Allowed,
+            Decision::Allow => {
+                // 计划评审在预授权档被放行时必须留痕：只写 `tracing::warn` 用户事后翻不到。
+                // 复用 `AllowlistHit`（事件流已有、不扩协议），rule_id 明说「预授权」。
+                if risk == RiskLevel::PlanReview {
+                    let (effective, _) = policy.approval.effective(policy.sandbox);
+                    let _ = env.sink.emit(&EventMsg::AllowlistHit {
+                        tool: tool.to_string(),
+                        command: format!(
+                            "sandbox={} approval={}",
+                            policy.sandbox.as_str(),
+                            effective.as_str()
+                        ),
+                        rule_id: "plan-review:pre-authorized".to_string(),
+                    });
+                }
+                GateOutcome::Allowed
+            }
             Decision::Deny => GateOutcome::Forbidden,
             Decision::Prompt if batched => GateOutcome::Allowed,
             Decision::Prompt => {
@@ -1122,57 +1138,73 @@ mod tests {
         sandbox: SandboxMode::WorkspaceWrite,
     };
 
-    /// D3 拍板：**写入类完全退出批量**。同一 turn 内参数完全相同的两次补丁，
-    /// 第二次仍必须弹卡；卡片上也不得出现批量范围。
+    /// ④-1 对齐 dsh：`workspace-write` 下区内写入不弹卡，也不再需要批量窗口。
     ///
-    /// 反向对照：把 `batch_key` 里的 `risk != Execute` 判断去掉，本用例会红
-    /// （第二次直接放行，`wait_pending` 返回 false）。
+    /// 反向对照：把 `decide` 的 `WriteInWorkspace + OnRequest` 改回 `Prompt`，
+    /// 本用例会红（多出审批卡事件）。
     #[tokio::test]
-    async fn write_tool_never_batches_even_with_identical_args() {
+    async fn write_tool_passes_without_prompt_in_workspace_write() {
         let broker = Arc::new(ApprovalBroker::new());
         let cancel = CancellationToken::new();
         let capture = Arc::new(CaptureSink::default());
         let sink: Arc<dyn EventSink> = capture.clone();
         let patch = serde_json::json!({"patch": "*** Begin Patch\n*** Update File: a.rs\n@@\n-old\n+new\n*** End Patch"});
 
-        let gate1 = tokio::spawn({
-            let broker = broker.clone();
-            let cancel = cancel.clone();
-            let sink = sink.clone();
-            let patch = patch.clone();
-            async move {
-                broker
-                    .gate("apply_patch", &patch, "w1", ON_REQUEST_WS, GateSubject::root("root"), GateEnv { sink: &sink, cancel: &cancel })
-                    .await
-            }
-        });
-        assert!(wait_pending(&broker, "appr-w1").await, "首次写入必须弹卡");
-        assert_eq!(
-            approval_fields(&capture, "appr-w1"),
-            Some((Some("w1".to_string()), None)),
-            "写入类不得声明批量范围，且卡片要带原始 call_id"
-        );
-        assert!(broker.resolve("appr-w1", ApprovalDecision::Allow));
-        assert_eq!(gate1.await.unwrap(), GateOutcome::Allowed);
-
-        // 参数完全相同也不行：批准 A 不等于批准 B
-        let gate2 = tokio::spawn({
-            let broker = broker.clone();
-            let cancel = cancel.clone();
-            let sink = sink.clone();
-            let patch = patch.clone();
-            async move {
-                broker
-                    .gate("apply_patch", &patch, "w2", ON_REQUEST_WS, GateSubject::root("root"), GateEnv { sink: &sink, cancel: &cancel })
-                    .await
-            }
-        });
+        for (call_id, args) in [("w1", patch.clone()), ("w2", serde_json::json!({"patch": "other"}))] {
+            let outcome = tokio::time::timeout(
+                std::time::Duration::from_millis(500),
+                broker.gate("apply_patch", &args, call_id, ON_REQUEST_WS, GateSubject::root("root"), GateEnv { sink: &sink, cancel: &cancel }),
+            )
+            .await
+            .expect("区内写入不得挂起等待审批");
+            assert_eq!(outcome, GateOutcome::Allowed, "区内写入不得弹审批");
+        }
+        assert!(broker.pending.lock().unwrap().is_empty(), "不得产生待审批请求");
         assert!(
-            wait_pending(&broker, "appr-w2").await,
-            "写入类第二次必须重新弹卡：参数相同也不批量"
+            !capture.events.lock().unwrap().iter().any(|event| matches!(event, EventMsg::ExecApprovalRequest { .. })),
+            "不得发出审批卡事件"
         );
-        assert!(broker.resolve("appr-w2", ApprovalDecision::Deny));
-        assert_eq!(gate2.await.unwrap(), GateOutcome::Denied);
+    }
+
+    /// 预授权档放行计划评审时必须在事件流留痕：用户事后能从时间线查到
+    /// 「模型自己批了自己的计划」，而不是只在日志文件里。
+    ///
+    /// 反向对照：去掉 `gate` 里的 `AllowlistHit` 发射，本用例变红。
+    #[tokio::test]
+    async fn plan_review_preauthorization_emits_visible_audit_event() {
+        let broker = Arc::new(ApprovalBroker::new());
+        let cancel = CancellationToken::new();
+        let capture = Arc::new(CaptureSink::default());
+        let sink: Arc<dyn EventSink> = capture.clone();
+
+        let outcome = broker
+            .gate(
+                "exit_plan_mode",
+                &serde_json::json!({}),
+                "p1",
+                policy::SessionPolicy { approval: ApprovalMode::Never, sandbox: SandboxMode::WorkspaceWrite },
+                GateSubject::root("root"),
+                GateEnv { sink: &sink, cancel: &cancel },
+            )
+            .await;
+        assert_eq!(outcome, GateOutcome::Allowed);
+
+        let events = capture.events.lock().unwrap();
+        let hit = events.iter().find_map(|event| match event {
+            EventMsg::AllowlistHit { tool, command, rule_id } => {
+                Some((tool.clone(), command.clone(), rule_id.clone()))
+            }
+            _ => None,
+        });
+        assert_eq!(
+            hit,
+            Some((
+                "exit_plan_mode".to_string(),
+                "sandbox=workspace_write approval=never".to_string(),
+                "plan-review:pre-authorized".to_string()
+            )),
+            "计划评审的预授权必须在事件流留下可查痕迹"
+        );
     }
 
     /// D3：命令类只在**参数完全相同的同一 turn 内**复用批准，且首次卡片必须声明范围。
@@ -1277,47 +1309,23 @@ mod tests {
         assert_eq!(gate2.await.unwrap(), GateOutcome::Denied);
     }
 
-    /// D3 附加断言：`AllowAlways` 当前 UI 不可达，但即使被送达，
-    /// 写入类也**不得**写会话记忆或开批量窗口——否则将来接上第三态就是无声扩权。
+    /// 写入不再弹卡之后，`AllowAlways` 在写入面上没有可达路径；同时必须保证
+    /// 写入**不得**因历史批准写会话记忆或开批量窗口（否则将来接上第三态就是无声扩权）。
     #[tokio::test]
-    async fn allow_always_on_write_tool_grants_nothing_beyond_this_call() {
+    async fn write_never_writes_memory_or_batch_window() {
         let broker = Arc::new(ApprovalBroker::new());
         let cancel = CancellationToken::new();
         let sink = sink();
         let patch = serde_json::json!({"patch": "*** Begin Patch\n*** Update File: a.rs\n@@\n-old\n+new\n*** End Patch"});
 
-        let gate1 = tokio::spawn({
-            let broker = broker.clone();
-            let cancel = cancel.clone();
-            let sink = sink.clone();
-            let patch = patch.clone();
-            async move {
-                broker
-                    .gate("apply_patch", &patch, "aa1", ON_REQUEST_WS, GateSubject::root("root"), GateEnv { sink: &sink, cancel: &cancel })
-                    .await
-            }
-        });
-        assert!(wait_pending(&broker, "appr-aa1").await);
-        assert!(broker.resolve("appr-aa1", ApprovalDecision::AllowAlways));
-        assert_eq!(gate1.await.unwrap(), GateOutcome::Allowed);
-
-        let gate2 = tokio::spawn({
-            let broker = broker.clone();
-            let cancel = cancel.clone();
-            let sink = sink.clone();
-            let patch = patch.clone();
-            async move {
-                broker
-                    .gate("apply_patch", &patch, "aa2", ON_REQUEST_WS, GateSubject::root("root"), GateEnv { sink: &sink, cancel: &cancel })
-                    .await
-            }
-        });
-        assert!(
-            wait_pending(&broker, "appr-aa2").await,
-            "AllowAlways 只能放行这一次的写入，不得写 remembered_execute 或开批量窗口"
-        );
-        assert!(broker.resolve("appr-aa2", ApprovalDecision::Deny));
-        assert_eq!(gate2.await.unwrap(), GateOutcome::Denied);
+        for call_id in ["aa1", "aa2"] {
+            let outcome = broker
+                .gate("apply_patch", &patch, call_id, ON_REQUEST_WS, GateSubject::root("root"), GateEnv { sink: &sink, cancel: &cancel })
+                .await;
+            assert_eq!(outcome, GateOutcome::Allowed);
+        }
+        assert!(broker.remembered_execute.lock().unwrap().is_empty(), "写入不得写会话记忆");
+        assert!(broker.batch.lock().unwrap().is_none(), "写入不得开批量窗口");
     }
 
     /// 提权询问（on-failure）：卡片仍要能定位到原始 call_id，但**永不声明批量范围**。

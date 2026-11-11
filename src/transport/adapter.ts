@@ -1733,7 +1733,7 @@ export function createAdapter(options: AdapterOptions): { remote: unknown; dispo
     const text = (pending.count === 1
       ? `系统已自动放行 ${pending.tool}`
       : `本轮 ${pending.count} 次 ${pending.tool} 已自动放行`)
-      + `：命中本次会话的允许列表（规则 ${pending.ruleId}），未弹审批。`
+      + `：依据 ${pending.ruleId}，未弹审批。`
     pushEvent(journal, 'developer/message', {
       turn: journal.turn,
       step: journal.step,

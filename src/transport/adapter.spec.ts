@@ -1149,7 +1149,7 @@ describe('适配层把 EventMsg 流映射成 DSH 会话 journal', () => {
     const notices = journal.filter(event => event['type'] === 'developer/message')
     expect(notices).toHaveLength(1)
     const text = (notices[0]?.['data'] as { message: { content: { text: string }[] } }).message.content[0]?.text
-    expect(text).toBe('本轮 3 次 shell 已自动放行：命中本次会话的允许列表（规则 git），未弹审批。')
+    expect(text).toBe('本轮 3 次 shell 已自动放行：依据 git，未弹审批。')
 
     await iterator.return?.(undefined)
     dispose()
@@ -1171,8 +1171,8 @@ describe('适配层把 EventMsg 流映射成 DSH 会话 journal', () => {
       .filter(event => event['type'] === 'developer/message')
       .map(event => ((event['data'] as { message: { content: { text: string }[] } }).message.content[0]?.text ?? ''))
     expect(texts).toEqual([
-      '本轮 2 次 shell 已自动放行：命中本次会话的允许列表（规则 git），未弹审批。',
-      '系统已自动放行 unified_exec：命中本次会话的允许列表（规则 ls），未弹审批。',
+      '本轮 2 次 shell 已自动放行：依据 git，未弹审批。',
+      '系统已自动放行 unified_exec：依据 ls，未弹审批。',
     ])
 
     await iterator.return?.(undefined)
@@ -1195,8 +1195,8 @@ describe('适配层把 EventMsg 流映射成 DSH 会话 journal', () => {
       .map(event => ((event['data'] as { message: { content: { text: string }[] } }).message.content[0]?.text ?? ''))
     // 合并后只报一条规则的话，「npm test 被哪条规则放行」就永远查不到了。
     expect(texts).toEqual([
-      '系统已自动放行 shell：命中本次会话的允许列表（规则 git），未弹审批。',
-      '系统已自动放行 shell：命中本次会话的允许列表（规则 npm），未弹审批。',
+      '系统已自动放行 shell：依据 git，未弹审批。',
+      '系统已自动放行 shell：依据 npm，未弹审批。',
     ])
 
     await iterator.return?.(undefined)

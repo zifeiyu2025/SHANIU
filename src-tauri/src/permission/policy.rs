@@ -4,11 +4,14 @@
 //! 规则矩阵（ADR-007 四档审批，随 turn 生效）：
 //! - read：一律放行；
 //! - write_in_workspace：只读沙箱拒绝；danger 放行；workspace-write 下
-//!   `never/on-failure/full-access` 放行、`on-request` 询问；
+//!   `on-request` 也放行（沙箱就是边界，对齐 dsh 的 workspace-write：区内写入不弹窗，
+//!   越界由 ACL 拒绝）；其余三档同样放行；
 //! - execute：只读沙箱拒绝（ADR-002：只读禁止命令执行）；`on-request` 下本会话记住过则放行、
 //!   否则询问；其余三档放行（`on-failure` 的提权询问发生在沙箱拒绝之后，不在门禁里）；
 //! - destructive：`on-request` 每次必问（永不记忆）；`never/on-failure` 直接拒绝（fail-closed，
 //!   不询问也不放行）；`full-access` 放行（前提是 danger 沙箱，由 `ApprovalMode::effective` 保证）。
+//! - plan_review：`on-request` 询问；预授权档放行并在事件流留痕（计划评审是人工会签，
+//!   不是风险分级；无人值守下不能出现「进得去出不来」）。
 
 use std::collections::HashSet;
 use std::sync::{Arc, Mutex, RwLock};
@@ -89,6 +92,10 @@ pub fn risk_of(tool_name: &str) -> RiskLevel {
         // terminal（SH-070，docs/02 ADR-106）：能起任意进程且是持久会话，按执行档。
         // 与 unified_exec 同档：不额外加严（沙箱边界仍是真边界），也不放宽。
         "terminal" => RiskLevel::Execute,
+        // job_*：输出与清单只读；kill 会终止进程，按执行档。
+        // 这三个工具曾漏登记而落到 Destructive，与工具描述教模型用 job_output 自相矛盾。
+        "job_output" | "job_list" => RiskLevel::Read,
+        "job_kill" => RiskLevel::Execute,
         // SH-052 编排四工具（docs/02 §2.2 风险分级）：派生/恢复/注入消息会改变
         // 子代理行为面，按写入档审批；wait_agent 只读结果，不审批（否则每等一次都要点一下）。
         "spawn_agent" | "resume_agent" | "send_agent_message" => RiskLevel::WriteInWorkspace,
@@ -115,12 +122,13 @@ pub fn decide(
             SandboxMode::ReadOnly => Decision::Deny,
             SandboxMode::DangerFullAccess => Decision::Allow,
             SandboxMode::WorkspaceWrite => match approval_mode {
-                // 沙箱就是边界：边界内的写入不再逐次打断
-                ApprovalMode::Never | ApprovalMode::OnFailure => Decision::Allow,
-                ApprovalMode::OnRequest => Decision::Prompt,
-                // effective 已把 full-access 在非 danger 沙箱下回落，这里不可达；
-                // 保守当作 on-request 处理，避免将来改 effective 时静默放宽。
-                ApprovalMode::FullAccess => Decision::Prompt,
+                // 沙箱就是边界：边界内的写入不再逐次打断（对齐 dsh 的 workspace-write，
+                // 越界由 ACL/路径校验拒绝，而不是靠审批兜底）。`full-access` 在非 danger
+                // 沙箱下已被 `effective` 钳成 `on-request`，两者在这里同为「不再问」。
+                ApprovalMode::Never
+                | ApprovalMode::OnFailure
+                | ApprovalMode::OnRequest
+                | ApprovalMode::FullAccess => Decision::Allow,
             },
         },
         RiskLevel::Execute => match sandbox_mode {
@@ -145,11 +153,14 @@ pub fn decide(
             ApprovalMode::OnRequest => Decision::Prompt,
             ApprovalMode::FullAccess => Decision::Allow,
         },
-        // 计划评审是用户对计划的人工会签，不是风险分级：非交互档不能自动放行，
-        // 否则模型可以自行退出计划态（AGENTS §11.3 退化红线）。
+        // 计划评审是用户对计划的人工会签，不是风险分级。交互档仍询问；预授权档
+        // （never/on-failure/full-access）放行——调用方必须在事件流留痕，否则无人值守下
+        // 就成了「模型自己批了自己的计划」而用户事后查不到。
         RiskLevel::PlanReview => match approval_mode {
             ApprovalMode::OnRequest => Decision::Prompt,
-            _ => Decision::Deny,
+            ApprovalMode::Never | ApprovalMode::OnFailure | ApprovalMode::FullAccess => {
+                Decision::Allow
+            }
         },
     }
 }
@@ -477,7 +488,8 @@ mod tests {
     #[test]
     fn write_is_gated_by_sandbox_mode() {
         assert_eq!(decide(RiskLevel::WriteInWorkspace, ApprovalMode::OnRequest, SandboxMode::ReadOnly, false), Decision::Deny);
-        assert_eq!(decide(RiskLevel::WriteInWorkspace, ApprovalMode::OnRequest, SandboxMode::WorkspaceWrite, false), Decision::Prompt);
+        // ④-1（对齐 dsh）：workspace-write 下区内写入不再询问——沙箱就是边界
+        assert_eq!(decide(RiskLevel::WriteInWorkspace, ApprovalMode::OnRequest, SandboxMode::WorkspaceWrite, false), Decision::Allow);
         assert_eq!(decide(RiskLevel::WriteInWorkspace, ApprovalMode::OnRequest, SandboxMode::DangerFullAccess, false), Decision::Allow);
         assert_eq!(risk_of("apply_patch"), RiskLevel::WriteInWorkspace);
         // SH-052（docs/02 §2.2）：编排工具不能吃未知工具的 destructive 默认档，
@@ -507,8 +519,8 @@ mod tests {
         }
         // 只读沙箱仍是硬边界：不询问 ≠ 绕过沙箱
         assert_eq!(decide(RiskLevel::Execute, ApprovalMode::Never, SandboxMode::ReadOnly, false), Decision::Deny);
-        // 计划评审不能被模型自行放行
-        assert_eq!(decide(RiskLevel::PlanReview, ApprovalMode::Never, SandboxMode::WorkspaceWrite, false), Decision::Deny);
+        // 计划评审在预授权档放行（调用方负责事件流留痕）
+        assert_eq!(decide(RiskLevel::PlanReview, ApprovalMode::Never, SandboxMode::WorkspaceWrite, false), Decision::Allow);
     }
 
     /// `on_failure`：门禁不打断（沙箱内放行），提权询问发生在沙箱拒绝之后；
@@ -519,7 +531,7 @@ mod tests {
         assert_eq!(decide(RiskLevel::Execute, ApprovalMode::OnFailure, SandboxMode::WorkspaceWrite, false), Decision::Allow);
         assert_eq!(decide(RiskLevel::Execute, ApprovalMode::OnFailure, SandboxMode::ReadOnly, false), Decision::Deny);
         assert_eq!(decide(RiskLevel::Destructive, ApprovalMode::OnFailure, SandboxMode::WorkspaceWrite, false), Decision::Deny);
-        assert_eq!(decide(RiskLevel::PlanReview, ApprovalMode::OnFailure, SandboxMode::WorkspaceWrite, false), Decision::Deny);
+        assert_eq!(decide(RiskLevel::PlanReview, ApprovalMode::OnFailure, SandboxMode::WorkspaceWrite, false), Decision::Allow);
     }
 
     /// `full_access`：前提是 danger 沙箱。前提不满足时 `effective` 回落 on_request，
@@ -534,9 +546,14 @@ mod tests {
             decide(RiskLevel::Destructive, ApprovalMode::FullAccess, SandboxMode::DangerFullAccess, false),
             Decision::Allow
         );
-        // 前提不满足：写操作回到 on_request（Prompt），不是 Allow
+        // 前提不满足：`effective` 回落 on_request；workspace-write 下两者都不再询问，
+        // 真正的边界是沙箱（`Destructive` 仍由 on_request 询问，见下一条用例）。
         assert_eq!(
             decide(RiskLevel::WriteInWorkspace, ApprovalMode::FullAccess, SandboxMode::WorkspaceWrite, false),
+            Decision::Allow
+        );
+        assert_eq!(
+            decide(RiskLevel::Destructive, ApprovalMode::FullAccess, SandboxMode::WorkspaceWrite, false),
             Decision::Prompt
         );
         let (effective, note) = ApprovalMode::FullAccess.effective(SandboxMode::WorkspaceWrite);
@@ -559,12 +576,54 @@ mod tests {
     }
 
     #[test]
-    fn plan_review_is_always_prompted() {
+    fn plan_review_prompts_only_in_interactive_mode() {
         for sandbox in [SandboxMode::ReadOnly, SandboxMode::WorkspaceWrite, SandboxMode::DangerFullAccess] {
             assert_eq!(decide(RiskLevel::PlanReview, ApprovalMode::OnRequest, sandbox, true), Decision::Prompt);
         }
+        // 预授权档放行：无人值守时不能「进得去出不来」；留痕由 permission::gate 负责
+        assert_eq!(decide(RiskLevel::PlanReview, ApprovalMode::Never, SandboxMode::WorkspaceWrite, false), Decision::Allow);
+        assert_eq!(decide(RiskLevel::PlanReview, ApprovalMode::OnFailure, SandboxMode::WorkspaceWrite, false), Decision::Allow);
+        assert_eq!(decide(RiskLevel::PlanReview, ApprovalMode::FullAccess, SandboxMode::DangerFullAccess, false), Decision::Allow);
         assert_eq!(risk_of("exit_plan_mode"), RiskLevel::PlanReview);
         assert_eq!(risk_of("enter_plan_mode"), RiskLevel::Read);
+    }
+
+    /// `job_*` 曾漏登记风险表而落到 `Destructive`：工具描述教模型用 `job_output`，
+    /// 策略在自主档却直接 Deny。这里锁死三档归属。
+    #[test]
+    fn job_tools_are_classified() {
+        assert_eq!(risk_of("job_output"), RiskLevel::Read);
+        assert_eq!(risk_of("job_list"), RiskLevel::Read);
+        assert_eq!(risk_of("job_kill"), RiskLevel::Execute);
+        assert_eq!(
+            decide(RiskLevel::Read, ApprovalMode::Never, SandboxMode::WorkspaceWrite, false),
+            Decision::Allow
+        );
+        assert_eq!(
+            decide(RiskLevel::Execute, ApprovalMode::Never, SandboxMode::WorkspaceWrite, false),
+            Decision::Allow
+        );
+    }
+
+    /// 守卫：注册表里**每一个**内置工具都必须在风险表里有归属。
+    /// 先断言扫描数量，防止「扫到 0 个也算通过」——这是 R3 的教训。
+    #[test]
+    fn every_registered_tool_has_a_non_destructive_risk() {
+        use crate::tool_router::{PlanState, ToolRouter};
+        use crate::tools::register_builtin;
+
+        let mut router = ToolRouter::new();
+        register_builtin(&mut router, std::sync::Arc::new(PlanState::new()), true);
+        let specs = router.specs();
+        assert_eq!(specs.len(), 20, "内置工具数变了：先更新风险表再改这个断言");
+        for spec in specs {
+            assert_ne!(
+                risk_of(&spec.name),
+                RiskLevel::Destructive,
+                "工具 `{}` 未登记风险档，落到 Destructive",
+                spec.name
+            );
+        }
     }
 
     /// SH-120：会话策略句柄的重置与切换——运行中切换只改在当前会话，
