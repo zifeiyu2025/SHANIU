@@ -50,6 +50,12 @@ pnpm-debug.log*
 # 一次性原型/脚本（AGENTS §7：不并入主代码路径）
 scratch/
 
+# 一次性真机排查脚本（`*_repro.rs`）：人工前置（本机 AppContainer 档 + `REPRO_WS` 指向
+# 手工准备的干净快照），直接 `cargo test` 会 panic，不是可自证的常驻测试；输出的数字已
+# 记在 docs/14:204 与 docs/16。文件留在工作树供沙箱改造那条线继续用，不入库。
+src-tauri/tests/sandbox_container_repro.rs
+src-tauri/tests/sandbox_repo_build_repro.rs
+
 # 真机验收截图/取证产物（体积大、可复现，状态记在 docs/05）
 artifacts/
 
