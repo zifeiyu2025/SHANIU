@@ -2270,6 +2270,9 @@ mod tests {
     /// 失败 → 否决一次 → 模型补一步让命令通过 → 放行；全程只否决一次。
     #[tokio::test]
     async fn verification_gate_vetoes_once_then_passes() {
+        // 会起沙箱进程：与建/删 AppContainer profile 的用例串行，否则
+        // CreateProcessAsUserW 可能撞上刚被回收的 profile（0x80070002 → EnvFailure）。
+        let _serial = crate::sandbox::appcontainer::PROFILE_TEST_MUTEX.lock().await;
         let (agent, store, cancel, _ws) = verify_demo(
             vec![
                 script_call_with(
@@ -2368,6 +2371,8 @@ mod tests {
     /// 饥饿序列：计划否决先吃掉自己那一票，验证闸门仍有票；两票各自只用一次。
     #[tokio::test]
     async fn verification_gate_does_not_starve_after_plan_veto() {
+        // 会起沙箱进程，与建/删 profile 的用例串行（同上）。
+        let _serial = crate::sandbox::appcontainer::PROFILE_TEST_MUTEX.lock().await;
         struct OnceVeto {
             calls: Mutex<u32>,
         }
@@ -2449,6 +2454,8 @@ mod tests {
     ///   （AppContainer 建 profile + 工作区 ACE 链），把它写进断言等于给环境立规矩。
     #[tokio::test]
     async fn verification_gate_times_out_instead_of_hanging() {
+        // 会起沙箱进程，与建/删 profile 的用例串行（同上）。
+        let _serial = crate::sandbox::appcontainer::PROFILE_TEST_MUTEX.lock().await;
         let (mut agent, store, cancel, _ws) = verify_demo(
             vec![
                 script_call_with("apply_patch", r#"{"body":"pub fn f() {}"}"#, "w1"),
