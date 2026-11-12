@@ -594,7 +594,7 @@ fn send_task(
     }
 }
 
-/// 档案降级可见化：坏行被跳过、撕裂行被丢弃、不安全尾部被截断时，**必须让用户看到**。
+/// 档案降级可见化：坏行被跳过、撕裂行被丢弃、落单工具调用被剔除时，**必须让用户看到**。
 ///
 /// 跳过坏行是读取策略而不是失败（`rollout::read` 的设计选择 2），但"悄悄少了几条
 /// 历史"等于篡改上下文。复用既有 `EventMsg::RolloutDegraded`——前端已有
@@ -621,7 +621,7 @@ fn notify_rollout_degraded(
         parts.push(format!("丢弃 {torn_tail_lines} 行末行撕裂的写入"));
     }
     if dropped_unsafe_tail > 0 {
-        parts.push(format!("重放截断丢弃 {dropped_unsafe_tail} 条工具调用配对不完整的尾部记录"));
+        parts.push(format!("重放丢弃 {dropped_unsafe_tail} 条落单的工具调用记录（有调用无输出）"));
     }
     tracing::warn!(
         agent_id,
@@ -639,9 +639,9 @@ fn notify_rollout_degraded(
 ///
 /// 恢复的三条硬要求都在这里成立：档案按 agent_id 定位、续跑**追加**到同一份档案
 /// （`open_existing`，不重新建档）、已落盘条数作为写入起点（`persisted`，避免把旧历史
-/// 重写一遍）。历史合法性由 `rollout::resume` 的重放规则保证：只重放配对完整的前缀，
-/// 不安全的尾部被截断并计数；这里不再"修"历史——静默补配对会掩盖档案损坏，而档案
-/// 损坏必须让人看得见（[`notify_rollout_degraded`]）。
+/// 重写一遍）。历史合法性由 `rollout::resume` 的重放规则保证：只丢落单的 `function_call`，
+/// 压缩锚点、控制面记录与正常消息照常重放；这里不再"修"历史——静默补配对会掩盖档案损坏，
+/// 档案损坏必须让人看得见（[`notify_rollout_degraded`]）。
 ///
 /// `task` 必须是**已剥 marker** 的文本（两个入口都先过 `preflight_send`）。
 fn continue_session(

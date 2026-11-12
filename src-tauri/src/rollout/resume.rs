@@ -3,8 +3,8 @@
 //! resume 的本质是"把档案重放成运行时的 `history`"，因此它的正确性判据只有一条：
 //! **重放出来的历史必须能直接喂给模型且不违反协议**。SH-082 已经证明，
 //! 一条 `function_call` 后面缺配对的 `function_call_output`，严格端点直接 400——
-//! 所以重放只取配对完整的前缀（尾部不安全的条目被截断并计数），fork 的截断点同理，
-//! 见 [`nearest_safe_cut`]。
+//! 所以重放只丢尾部"有 call 无 output"的落单调用，压缩锚点、控制面记录与正常消息
+//! 一条不丢。fork 仍按前缀截断，见 [`nearest_safe_cut`]。
 
 use std::path::{Path, PathBuf};
 
@@ -38,11 +38,12 @@ pub struct Resumed {
     pub torn_tail_lines: usize,
     /// 中间坏行（已跳过）的 1-based 行号；空 = 档案完好。重放出来的历史因此可能缺条目。
     pub damaged_lines: Vec<usize>,
-    /// 重放时因工具调用配对不完整而丢弃的尾部条目数（`items.len() - keep`）。
+    /// 重放时因工具调用配对不完整而丢弃的**落单 `function_call`** 条数。
     ///
-    /// 典型成因：崩溃时档案停在 `function_call` 之后、`function_call_output` 之前；
-    /// 或者中段坏行恰好吃掉了某个 output，使后面整段都不再配对。这些条目留在盘上，
-    /// 但不进模型历史——带着它们续写，第一条请求就会被严格端点 400（SH-082）。
+    /// 典型成因：崩溃时档案停在 `function_call` 之后、`function_call_output` 之前。
+    /// 这些条目留在盘上，但不进模型历史——带着它们续写，第一条请求就会被严格端点
+    /// 400（SH-082）。只数会进历史的 `ResponseItem`：`Compacted` 锚点与控制面/审计
+    /// 记录不参与配对，即使落在切点之后也照常重放，永远不会被这条计数代表。
     pub dropped_unsafe_tail: usize,
 }
 
@@ -74,16 +75,23 @@ pub struct SystemPromptRecord {
 /// 所以当初那条论证真正排除的只有 system，并没有支持 assistant。
 pub fn resume(path: &Path) -> Result<Resumed, RolloutError> {
     let archive = rollout::read(path)?;
-    // 只重放配对完整的前缀：尾部落单的 `function_call`（崩溃点、或被中段坏行拆散
-    // 的配对）留在盘上，但绝不进模型历史——带着它续写，第一条请求就 400（SH-082）。
-    // 截断不是"修补档案"：盘上内容一个字节都不动，只决定这次重放读到哪里。
-    let keep = nearest_safe_cut(&archive.items, archive.items.len());
-    let dropped_unsafe_tail = archive.items.len() - keep;
+    // 只丢弃尾部落单的 `function_call`（崩溃点，或被中段坏行拆散配对）：这些条目留在
+    // 盘上，但绝不进模型历史——带着它续写，第一条请求就 400（SH-082）。截断不是"修补
+    // 档案"：盘上内容一个字节都不动，只决定这次重放读到哪里。
+    //
+    // 切点只作用于会进历史的 `ResponseItem`：`Compacted` 锚点与控制面/审计记录本来就不
+    // 参与配对，落在切点之后也必须照常处理——锚点通常写在尾部，一刀切会把摘要连同
+    // "压缩成功"本身一起丢掉（SH-032 的验收正是在这里红的）。
+    let cut = nearest_safe_cut(&archive.items, archive.items.len());
+    let dropped_unsafe_tail = archive.items[cut..]
+        .iter()
+        .filter(|item| matches!(item, RolloutItem::ResponseItem { .. }))
+        .count();
     if dropped_unsafe_tail > 0 {
         tracing::warn!(
             path = %path.display(),
             dropped = dropped_unsafe_tail,
-            "档案尾部工具调用配对不完整：重放截断到最近安全点，被丢弃的条目不进模型历史"
+            "档案尾部工具调用配对不完整：重放跳过落单调用，被丢弃的条目不进模型历史"
         );
     }
     let (session_id, agent_id, parent_id, workspace_root) = match &archive.meta {
@@ -106,7 +114,10 @@ pub fn resume(path: &Path) -> Result<Resumed, RolloutError> {
     let mut permission_preset: Option<String> = None;
     // 系统提示词版本不进模型历史（每轮由 SessionPrompt 重新组装），只做审计与回放。
     let mut prompt_versions: Vec<SystemPromptRecord> = Vec::new();
-    for item in &archive.items[..keep] {
+    for (index, item) in archive.items.iter().enumerate() {
+        if index >= cut && matches!(item, RolloutItem::ResponseItem { .. }) {
+            continue;
+        }
         match item {
             RolloutItem::ResponseItem { item: h, .. } => history.push(h.clone()),
             RolloutItem::SandboxMode { mode, .. } => sandbox_mode = Some(mode.clone()),
@@ -192,13 +203,13 @@ pub fn resume(path: &Path) -> Result<Resumed, RolloutError> {
 }
 
 /// 从 `want` 往下找最近一个**安全截断点**：该位置之前的条目里，每个 `function_call`
-/// 都有配对的 `function_call_output`（按 `call_id` 双向集合包含判定，不校验出现顺序，
+/// 都有配对的 `function_call_output`（按 `call_id` 单向判定，不校验出现顺序，
 /// 也不看待配对条目本身是 message 还是工具记录）。
 ///
 /// 为什么不能直接按用户选的条数切：一轮的工具记录是"先全部 call、再全部 output"，
 /// 从中间截断就会留下有 call 无 output 的尾巴，续写出来的会话第一次请求就 400。
 ///
-/// 返回值只承诺一件事：**`[0, k)` 配对完整**。它不保证 `items[k]` 是 message——
+/// 返回值只承诺一件事：**`[0, k)` 可喂给模型**。它不保证 `items[k]` 是 message——
 /// `0`（没有任何安全前缀）与末尾（`want` 本身安全）都可能返回，工具段之外也可能
 /// 落在多条消息之间；调用方只能依赖"前缀可喂给模型"这一条契约。
 pub fn nearest_safe_cut(items: &[RolloutItem], want: usize) -> usize {
@@ -212,6 +223,12 @@ pub fn nearest_safe_cut(items: &[RolloutItem], want: usize) -> usize {
     0
 }
 
+/// `[0, items.len())` 里是否**每个调用都有输出**。
+///
+/// 只判这一个方向，不要求"每个输出都有调用"：截断只会制造有 call 无 output 的尾巴，
+/// 反过来（有 output 无 call）只会来自档案被外部裁剪/重排，`chat_messages` 明确容忍
+/// 它（"落单的 tool 输出……按 call_id 原样发出"）。要求双向包含会把这类档案的切点
+/// 一路退到 0，把正常消息与压缩锚点一起丢掉。
 fn paired_prefix(items: &[RolloutItem]) -> bool {
     let mut calls: Vec<&str> = Vec::new();
     let mut outputs: Vec<&str> = Vec::new();
@@ -229,7 +246,7 @@ fn paired_prefix(items: &[RolloutItem]) -> bool {
             _ => {}
         }
     }
-    calls.iter().all(|c| outputs.contains(c)) && outputs.iter().all(|o| calls.contains(o))
+    calls.iter().all(|call| outputs.contains(call))
 }
 
 /// fork 的结果：新档案路径 + 实际采用的截断点 + 因不安全而被回退掉的条目数。

@@ -314,11 +314,9 @@ fn anchor_written_after_an_unfinished_round_is_still_applied() {
 #[test]
 fn anchor_survives_an_unfinished_round_that_follows_it() {
     let dir = temp_dir("anchor-before-torn");
-    let mut writer = RolloutWriter::create(&dir, &meta("a7")).unwrap();
+    let writer = RolloutWriter::create(&dir, &meta("a7")).unwrap();
     for item in [user_msg("任务"), tool_call("c1"), big_output("c1", 1_000)] {
-        writer
-            .append(&RolloutItem::ResponseItem { item, at_ms: 0 })
-            .unwrap();
+        writer.append(&RolloutItem::ResponseItem { item, at_ms: 0 }).unwrap();
     }
     writer
         .append(&RolloutItem::Compacted { range_start: 0, range_end: 3, summary: "交接摘要".into() })
