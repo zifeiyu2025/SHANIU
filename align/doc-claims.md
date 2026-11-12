@@ -191,7 +191,7 @@ A（文档有、代码找不到）/ B（不可机械判定）/ 通过数，退�
 | R2-134 | 04:L648 | 文件头写 `<!-- shaniu-rules: resident 0.,1.0,2.,2.2,3.,4.2,4.3,11.3 -->` | 声明行前缀 `shaniu-rules:` | 字面量 | |
 | R2-135 | 04:L659 | `injected_rules_must_contain_iron_law_and_degradation_redline` … `ondemand_note_count_m…` | `injected_rules_must_contain_iron_law_and_degradation_redline` | 测试 | |
 | R2-136 | 04:L660 | `absent_declaration_falls_back_to_tier_layers_verbatim`、`broken_declaration_falls_back_to_legacy_with_banner_on_first_line` | `absent_declaration_falls_back_to_tier_layers_verbatim`、`broken_declaration_falls_back_to_legacy_with_banner_on_first_line` | 测试 | |
-| R2-137 | 04:L677 | 超过 `PROMPT_TOKEN_LIMIT = 2500` 的不变量① | `PROMPT_TOKEN_LIMIT` | 符号 | |
+| R2-137 | 04:L677 | 超过 `PROMPT_TOKEN_LIMIT = 3000` 的不变量①（上限已于 `80f2976` 调整） | `PROMPT_TOKEN_LIMIT` | 符号 | |
 | R2-138 | 04:L699 | `PER_TASK_TIMEOUT` 是**评测脚本的护栏**（`tests/evals_baseline.rs`）…（`SHANIU_EVAL_MAX_TURNS` 可改） | `PER_TASK_TIMEOUT`、`tests/evals_baseline.rs` | 文件+符号 | |
 | R2-139 | 04:L741 | `error_code` 取受控词表（`agent_loop/error_codes.rs`），不得写成自由文本 | `agent_loop/error_codes.rs` | 文件 | 2026-11-11 裁决后文档措辞已改（`dc37515`），不再是「枚举」 |
 | R2-140 | 04:L751 | **产物路径只有一种形态**：`evals/results/<epoch>-<pid>-<role>.json` | `fmt:eval-result-filename` | 结构 | 文件名运行期生成；验 `format!` 模板 |
