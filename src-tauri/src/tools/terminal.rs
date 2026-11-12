@@ -381,7 +381,8 @@ read（读取**自上次 read 之后**的新输出，可等待）、close（关�
         let program = std::env::var("COMSPEC").unwrap_or_else(|_| "cmd.exe".to_string());
         let spawned = sandbox::prepare_terminal(&TerminalRequest {
             policy: ctx.sandbox,
-            os: sandbox::current_os_mode(),
+            // 上下文显式指定优先，否则用进程默认（与 unified_exec 同一口径）。
+            os: ctx.os.unwrap_or_else(sandbox::current_os_mode),
             workspace_root: &ctx.workspace_root,
             program: &program,
             args: &[],

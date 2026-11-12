@@ -461,6 +461,11 @@ pub struct ToolContext {
     pub sink: Arc<dyn EventSink>,
     /// 沙箱策略（unified_exec 启动子进程时生效）。
     pub sandbox: crate::config::SandboxMode,
+    /// 本次调用使用的 OS 机制。`None` = 用进程默认（`sandbox::current_os_mode()`）。
+    ///
+    /// 显式字段的意义：AppContainer 专属行为（`dir` 替代列举、卷信息提示）必须能被
+    /// 单独用例钉死，而不是靠「别的用例改过全局」碰巧成立——那是并行测试互相污染的来源。
+    pub os: Option<crate::config::OsSandbox>,
     /// 会话作用域（SH-089）：后台作业的属主。测试与无会话路径为 None。
     pub session_id: Option<String>,
     /// 进程级作业注册表：`run_in_background` 与 job 工具从这里读写。
@@ -495,6 +500,7 @@ impl ToolContext {
             call_id: call_id.into(),
             sink,
             sandbox,
+            os: None,
             session_id: None,
             jobs: None,
             scope: None,

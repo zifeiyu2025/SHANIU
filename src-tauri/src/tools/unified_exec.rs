@@ -468,13 +468,15 @@ impl ToolExecutor for UnifiedExec {
             .get("run_in_background")
             .and_then(|v| v.as_bool())
             .unwrap_or(false);
+        // 本次调用实际使用的 OS 机制：上下文显式指定优先，否则用进程默认。
+        let os = ctx.os.unwrap_or_else(sandbox::current_os_mode);
 
         // SH-021 降级处理：AppContainer 内 cmd 的 `dir` 依赖卷信息，会静默退出（退出码 1、零输出）。
         // `dir` 是模型最常用的列举方式，静默空结果会被误判成"沙箱坏了"再绕路，
         // 所以在容器模式下把纯 `dir` 列举翻成宿主侧只读列举（仍受工作区根约束）。
         if !run_in_background
             && ctx.sandbox == crate::config::SandboxMode::WorkspaceWrite
-            && sandbox::current_os_mode() == crate::config::OsSandbox::AppContainer
+            && os == crate::config::OsSandbox::AppContainer
         {
             if let Some(request) = dir_listing(command) {
                 if let Ok(full) = resolve_in_workspace(&ctx.workspace_root, &request.target) {
@@ -498,7 +500,7 @@ impl ToolExecutor for UnifiedExec {
                 program: "cmd",
                 args: &["/C", command],
                 cwd: &cwd,
-                os: sandbox::current_os_mode(),
+                os,
             },
             tx.clone(),
         ) {
@@ -609,7 +611,7 @@ impl ToolExecutor for UnifiedExec {
                     // 从「零输出」改为「失败 + 容器模式」：既覆盖旧的静默形态，也避免模型
                     // 把 `拒绝访问。` 误读成授权配置错了。
                     if code != 0
-                        && sandbox::current_os_mode() == crate::config::OsSandbox::AppContainer
+                        && os == crate::config::OsSandbox::AppContainer
                     {
                         if let Some(program) = volume_dependent_program(command) {
                             text.push_str(&format!(
@@ -672,6 +674,13 @@ mod tests {
     fn workspace() -> crate::test_support::TestTempDir {
         // 自删临时目录：panic 也会清（2026-11-09 夹具规矩）。
         crate::test_support::TestTempDir::new("exec")
+    }
+
+    /// AppContainer 专属行为的用例上下文：档位钉在上下文里，不动全局 `OS_MODE`。
+    fn ctx_appcontainer(ws: &Path) -> ToolContext {
+        let mut context = ctx(ws);
+        context.os = Some(crate::config::OsSandbox::AppContainer);
+        context
     }
 
     #[tokio::test]
@@ -916,7 +925,7 @@ mod tests {
         std::fs::write(ws.join("alpha.txt"), "12345").unwrap();
         std::fs::create_dir_all(ws.join("nested")).unwrap();
         let out = UnifiedExec::new()
-            .execute(serde_json::json!({"command": "dir"}), &ctx(&ws))
+            .execute(serde_json::json!({"command": "dir"}), &ctx_appcontainer(&ws))
             .await
             .unwrap();
         assert!(out.success, "dir 替代列举应成功：{}", out.output);
@@ -930,7 +939,7 @@ mod tests {
     async fn dir_on_empty_dir_reports_counts_not_nothing() {
         let ws = workspace();
         let out = UnifiedExec::new()
-            .execute(serde_json::json!({"command": "dir"}), &ctx(&ws))
+            .execute(serde_json::json!({"command": "dir"}), &ctx_appcontainer(&ws))
             .await
             .unwrap();
         assert!(out.success, "{}", out.output);
@@ -958,7 +967,7 @@ mod tests {
     async fn unintercepted_dir_never_fails_silently() {
         let ws = workspace();
         let out = UnifiedExec::new()
-            .execute(serde_json::json!({"command": "dir /s"}), &ctx(&ws))
+            .execute(serde_json::json!({"command": "dir /s"}), &ctx_appcontainer(&ws))
             .await
             .unwrap();
         assert!(
