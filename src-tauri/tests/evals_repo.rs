@@ -33,6 +33,7 @@ use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 use serde::Deserialize;
 use serde_json::{json, Value};
 use shaniu_lib::agent_loop::{AgentLoop, ResponsesBackend};
+use shaniu_lib::clock::now_ms;
 use shaniu_lib::config::{ApprovalMode, SandboxMode};
 use shaniu_lib::events::{ApprovalDecision, EventMsg, EventSink};
 use shaniu_lib::model_client::provider::ProviderConfig;
@@ -52,13 +53,6 @@ fn repo_root() -> PathBuf {
         .parent()
         .expect("src-tauri 的上一级是仓库根")
         .to_path_buf()
-}
-
-fn now_ms() -> u128 {
-    SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .expect("系统时钟早于 1970")
-        .as_millis()
 }
 
 fn rel_path(path: &Path) -> String {
@@ -1096,7 +1090,7 @@ fn write_invalid_report(
     provider: &ProviderConfig,
     repeats: usize,
     repo: &Value,
-    epoch: u128,
+    epoch: u64,
 ) -> PathBuf {
     let report = json!({
         "version": 1,
@@ -1104,7 +1098,7 @@ fn write_invalid_report(
         "arm": "repo-baseline",
         "tasks_file": tasks_file,
         "base_commit": base_commit,
-        "epoch_ms": epoch as u64,
+        "epoch_ms": epoch,
         "process": { "pid": id() },
         "provider": provider.provider,
         "base_url": provider.base_url,
@@ -1546,7 +1540,7 @@ async fn evals_repo_v0() {
         "arm": "repo-baseline",
         "tasks_file": tasks_file,
         "base_commit": base_sha,
-        "epoch_ms": epoch as u64,
+        "epoch_ms": epoch,
         "process": { "pid": id() },
         "provider": provider.provider,
         "base_url": provider.base_url,
