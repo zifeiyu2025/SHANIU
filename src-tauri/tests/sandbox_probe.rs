@@ -656,3 +656,419 @@ async fn concurrent_execs_do_not_inherit_each_others_pipes() {
         "短命令的输出流被长命令进程继承的写端挂住了（HANDLE_LIST 白名单失效）"
     );
 }
+
+// ========================= 写约束模型（docs/16 第一期 A） =========================
+//
+// 这些用例**显式**走 `prepare_write_restricted`，不依赖 `SHANIU_SANDBOX_OS` 门控
+// （门控是进程级 OnceLock，测试进程里改 env 会互相污染）。旧机制的所有用例保持原样，
+// 二者并存即本期「新旧并存、默认不变」的验收面。
+
+/// 显式以「只约束写」的受限令牌执行一条命令，返回退出码与合并输出。
+async fn run_write_restricted_capture(
+    cwd: &Path,
+    program: &str,
+    args: &[&str],
+) -> (i32, String) {
+    let (tx, mut rx) = mpsc::channel::<shaniu_lib::sandbox::ExecLine>(256);
+    let collector = tokio::spawn(async move {
+        let mut output = String::new();
+        while let Some((_, text)) = rx.recv().await {
+            output.push_str(&text);
+            output.push('\n');
+        }
+        output
+    });
+    let request = shaniu_lib::sandbox::SpawnRequest {
+        policy: SandboxMode::WorkspaceWrite,
+        workspace_root: cwd,
+        program,
+        args,
+        cwd,
+        os: shaniu_lib::sandbox::current_os_mode(),
+    };
+    let spawn = shaniu_lib::sandbox::prepare_write_restricted(&request, tx)
+        .expect("写约束沙箱应可创建（fail-closed 之外的正常路径）");
+    let code = match spawn {
+        PreparedSpawn::Restricted(mut child) => child.wait().await.expect("等待子进程失败"),
+        PreparedSpawn::Plain(_) => panic!("写约束沙箱不得退化为无沙箱执行（FF-4）"),
+    };
+    let output = collector.await.expect("读线程不应 panic");
+    (code, output)
+}
+
+/// 区内写：写约束令牌在工作区根上有 allow ACE，必须成功（否则后面的拒绝可能是「根本没跑起来」）。
+#[tokio::test]
+async fn write_restricted_allows_write_inside_workspace() {
+    let ws = unique_dir("wr-in");
+    let target = ws.join("inside.txt");
+    let line = format!("echo inside> \"{}\"", target.display());
+    let (code, output) = run_write_restricted_capture(&ws, "cmd", &["/C", line.as_str()]).await;
+
+    assert_eq!(code, 0, "区内写退出码应为 0（输出：{output}）");
+    assert!(target.is_file(), "区内写应真实落盘（输出：{output}）");
+    std::fs::remove_dir_all(&ws).ok();
+}
+
+/// 本期核心：区外写**必须失败**，且失败信息可读。
+///
+/// 旧机制（AppContainer）今天已有同类断言；这条锁的是新令牌自己的写边界——
+/// 去掉 restricting SID 或工作区写 ACE，它立刻变红。
+#[tokio::test]
+async fn write_restricted_denies_write_outside_workspace() {
+    let ws = unique_dir("wr-deny");
+    let outside = outside_dir("wr-outside");
+    let target = outside.join("escaped.txt");
+    let line = format!("echo escaped> \"{}\"", target.display());
+
+    let (code, output) = run_write_restricted_capture(&ws, "cmd", &["/C", line.as_str()]).await;
+
+    assert!(
+        !target.exists(),
+        "区外写成功了：WRITE_RESTRICTED / restricting SID 未生效（退出码 {code}，输出：{output}）"
+    );
+    assert_ne!(code, 0, "区外写应失败并返回非 0（输出：{output}）");
+    assert!(
+        !output.trim().is_empty(),
+        "区外写被拒时必须给出可读错误，实际没有任何输出"
+    );
+    let readable = output.to_lowercase().contains("access") || output.contains("拒绝");
+    assert!(
+        readable,
+        "错误信息应能看出是权限拒绝（拒绝访问 / Access is denied），实际输出：{output}"
+    );
+
+    std::fs::remove_dir_all(&ws).ok();
+    std::fs::remove_dir_all(&outside).ok();
+}
+
+/// 读区外必须成功：本模型只约束写，读隔离按用户裁定下线。
+#[tokio::test]
+async fn write_restricted_allows_read_outside_workspace() {
+    let ws = unique_dir("wr-read");
+    let outside = outside_dir("wr-read-outside");
+    let secret = outside.join("secret.txt");
+    let marker = "SHANIU-WRITE-ONLY-READ-MARKER";
+    std::fs::write(&secret, marker).unwrap();
+
+    let line = format!("type \"{}\"", secret.display());
+    let (_code, output) = run_write_restricted_capture(&ws, "cmd", &["/C", line.as_str()]).await;
+
+    assert!(
+        output.contains(marker),
+        "读区外应成功（读不再受限），实际输出：{output}"
+    );
+    std::fs::remove_dir_all(&ws).ok();
+    std::fs::remove_dir_all(&outside).ok();
+}
+
+/// node 孙进程必须继承写限制：`cmd → node → fs.writeFileSync`。
+///
+/// 只验「子进程」不够：受限令牌在进程创建时被继承，真正的风险在孙进程自己新建对象
+/// （dsh 的 default DACL 修的就是这条）。本用例同时打区内（成功）与区外（失败）。
+#[tokio::test]
+async fn write_restricted_restricts_node_grandchild() {
+    if std::process::Command::new("node")
+        .arg("--version")
+        .output()
+        .is_err()
+    {
+        eprintln!("[node-probe] SKIP：本机 PATH 上没有 node，真机验收另跑（证据入库）");
+        return;
+    }
+
+    let ws = unique_dir("wr-node");
+    let outside = outside_dir("wr-node-outside");
+    let inside_target = ws.join("node-inside.txt");
+    let outside_target = outside.join("node-outside.txt");
+    // JS 字符串里的 Windows 反斜杠会被当转义符（`\n` 甚至变换行），统一换成 `/`。
+    let inside_js = inside_target.display().to_string().replace('\\', "/");
+    let outside_js = outside_target.display().to_string().replace('\\', "/");
+
+    let inside_line = format!(
+        "node -e \"require('fs').writeFileSync('{inside_js}','ok')\""
+    );
+    let (inside_code, inside_output) =
+        run_write_restricted_capture(&ws, "cmd", &["/C", inside_line.as_str()]).await;
+    assert_eq!(
+        inside_code, 0,
+        "孙进程写区内应成功（node 输出：{inside_output}）"
+    );
+    assert!(
+        inside_target.is_file(),
+        "孙进程写区内应落盘（node 输出：{inside_output}）"
+    );
+
+    let outside_line = format!(
+        "node -e \"require('fs').writeFileSync('{outside_js}','ok')\""
+    );
+    let (outside_code, outside_output) =
+        run_write_restricted_capture(&ws, "cmd", &["/C", outside_line.as_str()]).await;
+    assert!(
+        !outside_target.exists(),
+        "孙进程写区外成功了：限制没有跨进程继承（node 输出：{outside_output}）"
+    );
+    assert_ne!(
+        outside_code, 0,
+        "孙进程写区外应失败（node 输出：{outside_output}）"
+    );
+
+    std::fs::remove_dir_all(&ws).ok();
+    std::fs::remove_dir_all(&outside).ok();
+}
+
+/// 出网不受限（正向证据，需外网）：受限令牌只作用于文件写，不影响 socket。
+///
+/// 用 **node** 做客户端而不是 curl：Windows 自带的 curl 走 Schannel，
+/// 而 Schannel 在「带 restricting SID 的受限令牌」下 `AcquireCredentialsHandle`
+/// 直接返回 `SEC_E_NO_CREDENTIALS`（真机证据见
+/// `docs/evidence/2026-11-12/write-restricted/diag-tls-clients.txt`）。
+/// node/BoringSSL 与 cargo/rustls 不受影响，它们才是 harness 的实际出网路径。
+#[tokio::test]
+#[ignore = "需要外网：写约束令牌默认出网的真机验证"]
+async fn write_restricted_reaches_internet_without_any_grant() {
+    if std::process::Command::new("node")
+        .arg("--version")
+        .output()
+        .is_err()
+    {
+        eprintln!("[net-probe] SKIP：本机 PATH 上没有 node");
+        return;
+    }
+    let url = std::env::var("SHANIU_NETWORK_PROBE_URL")
+        .unwrap_or_else(|_| "https://www.baidu.com/".to_string());
+
+    let node_script = format!(
+        "require('https').get('{url}',r=>{{console.log('status='+r.statusCode);process.exit(0)}}).on('error',e=>{{console.error('error='+e.message);process.exit(1)}})"
+    );
+
+    let control = std::process::Command::new("node")
+        .args(["-e", node_script.as_str()])
+        .output()
+        .expect("需要 node 做对照");
+    let control_text = format!(
+        "{}{}",
+        String::from_utf8_lossy(&control.stdout),
+        String::from_utf8_lossy(&control.stderr)
+    );
+    assert!(
+        control.status.success() && control_text.contains("status=200"),
+        "对照组 node 未连通 {url}，出网用例结论不可信：{control_text}"
+    );
+
+    let ws = unique_dir("wr-net");
+    let (code, output) =
+        run_write_restricted_capture(&ws, "node", &["-e", node_script.as_str()]).await;
+    assert_eq!(code, 0, "写约束令牌不应影响出网（输出：{output}）");
+    assert!(
+        output.contains("status=200"),
+        "node 应拿到 200，实际输出：{output}"
+    );
+
+    std::fs::remove_dir_all(&ws).ok();
+}
+
+/// 宿主 loopback 可达：证明网络层没有因换令牌新增限制（AppContainer 的 loopback 隔离消失）。
+#[tokio::test]
+async fn write_restricted_can_reach_host_loopback() {
+    let server = LocalServer::start();
+    let url = format!("http://127.0.0.1:{}/", server.port);
+
+    let control = std::process::Command::new("curl")
+        .args([
+            "-s",
+            "-o",
+            "NUL",
+            "-w",
+            "%{http_code}",
+            "--max-time",
+            "3",
+            url.as_str(),
+        ])
+        .output()
+        .expect("需要系统 curl 做对照");
+    assert!(
+        control.status.success() && String::from_utf8_lossy(&control.stdout).trim() == "200",
+        "对照组 curl 未连通本地服务，loopback 用例结论不可信：{control:?}"
+    );
+
+    let ws = unique_dir("wr-loopback");
+    let (code, output) = run_write_restricted_capture(
+        &ws,
+        "curl",
+        &[
+            "-s",
+            "-o",
+            "NUL",
+            "-w",
+            "%{http_code}",
+            "--max-time",
+            "3",
+            url.as_str(),
+        ],
+    )
+    .await;
+    assert_eq!(code, 0, "写约束令牌下 loopback 应可达（输出：{output}）");
+    assert!(
+        output.contains("200"),
+        "curl 应返回 200，实际输出：{output}"
+    );
+
+    std::fs::remove_dir_all(&ws).ok();
+}
+
+/// 本机是否有可直接调用的 python（没有就 SKIP，不让用例变成环境依赖）。
+fn python_available() -> bool {
+    std::process::Command::new("python")
+        .arg("--version")
+        .output()
+        .map(|out| out.status.success())
+        .unwrap_or(false)
+}
+
+/// Python stdio 编码补丁必须落到 **danger 档 exec**（`Command::new` 直接继承环境那条路）。
+///
+/// 判据不是「变量存在」，而是真起一个 python 子进程读 `sys.stdout.encoding`。
+/// 注意口径：本机 Python 3.15 默认就是 UTF-8，本用例在它是 no-op；补丁主要对 ≤3.14 生效，
+/// 不要把它写成「已修复乱码」。
+#[tokio::test]
+async fn python_utf8_env_reaches_danger_exec() {
+    if !python_available() {
+        eprintln!("[py-probe] SKIP：本机 PATH 上没有 python");
+        return;
+    }
+    let ws = unique_dir("py-danger");
+    let args = ["-c", "import sys;print(sys.stdout.encoding)"];
+    let (tx, _rx) = mpsc::channel(4);
+    let spawn = prepare_spawn(SandboxMode::DangerFullAccess, "python", &args, &ws, tx)
+        .expect("danger 档应返回普通命令");
+    let PreparedSpawn::Plain(command) = spawn else {
+        panic!("danger 档不得走沙箱路径")
+    };
+    let mut command = command;
+    let output = command
+        .stdout(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::piped())
+        .output()
+        .await
+        .expect("启动 python 失败");
+    let text = format!(
+        "{}{}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert!(
+        text.trim().to_ascii_lowercase().contains("utf-8"),
+        "danger 档 python stdout.encoding 不是 utf-8：{text}"
+    );
+    std::fs::remove_dir_all(&ws).ok();
+}
+
+/// Python stdio 编码补丁必须落到 **逻辑回退 exec**（`lpEnvironment` 从 None 改为显式块）。
+///
+/// 逻辑回退走受限令牌 + 继承环境块；这里读的是真实子进程的 stdout 编码，不是环境变量快照。
+#[tokio::test]
+async fn python_utf8_env_reaches_logical_exec() {
+    if !python_available() {
+        eprintln!("[py-probe] SKIP：本机 PATH 上没有 python");
+        return;
+    }
+    let ws = unique_dir("py-logical");
+    // 用脚本文件而不是 `-c "..."`：CreateProcess 路径的参数引用规则会把含空格的
+    // `-c` 载荷拆开（旧路径既有行为，本期不扩面），写文件可以只验编码这一件事。
+    let script = ws.join("encoding_probe.py");
+    std::fs::write(&script, "import sys\nprint(sys.stdout.encoding)\n").unwrap();
+    let script_arg = script.to_string_lossy().into_owned();
+    let args: [&str; 1] = [script_arg.as_str()];
+    let (tx, mut rx) = mpsc::channel::<shaniu_lib::sandbox::ExecLine>(64);
+    let collector = tokio::spawn(async move {
+        let mut output = String::new();
+        while let Some((_, text)) = rx.recv().await {
+            output.push_str(&text);
+            output.push('\n');
+        }
+        output
+    });
+    let request = shaniu_lib::sandbox::SpawnRequest {
+        policy: SandboxMode::WorkspaceWrite,
+        workspace_root: &ws,
+        program: "python",
+        args: &args,
+        cwd: &ws,
+        os: shaniu_lib::config::OsSandbox::Logical,
+    };
+    let spawn = shaniu_lib::sandbox::prepare_spawn_with(request, tx)
+        .expect("逻辑回退应可创建（fail-closed 之外的正常路径）");
+    let code = match spawn {
+        PreparedSpawn::Restricted(mut child) => child.wait().await.expect("等待子进程失败"),
+        PreparedSpawn::Plain(_) => panic!("逻辑回退不得退化为无沙箱执行"),
+    };
+    let output = collector.await.expect("读线程不应 panic");
+    assert_eq!(code, 0, "逻辑回退下 python 应正常退出：{output}");
+    assert!(
+        output.to_ascii_lowercase().contains("utf-8"),
+        "逻辑回退下 python stdout.encoding 不是 utf-8：{output}"
+    );
+    std::fs::remove_dir_all(&ws).ok();
+}
+
+/// 已登记限制：带 restricting SID 的受限令牌下 **Schannel 客户端**不可用（docs/08 §5.4.1）。
+///
+/// 这条守的是「限制没变宽」，不是「网络有问题」：
+/// 1) 正向判据在 `write_restricted_reaches_internet_without_any_grant`（node/BoringSSL）；
+/// 2) 这里断言 curl（CURLE_SSL_CONNECT_ERROR，退出码 35）与 PowerShell（0x8009030E）
+///    仍然失败。哪天失败消失了，这条会红——那时再去 docs/08 §5.4.1 更新口径。
+///
+/// 反模式提醒：不要通过给凭据存储 / 用户 profile 加 ACE 来「修」它，那是把限制放宽，
+/// 不是修好客户端。
+#[tokio::test]
+#[ignore = "需要外网：Schannel 限制的现状断言"]
+async fn write_restricted_schannel_clients_fail_as_registered_limitation() {
+    let url = "https://www.baidu.com/";
+    let ws = unique_dir("wr-schannel");
+
+    let (curl_code, curl_out) = run_write_restricted_capture(
+        &ws,
+        "curl",
+        &[
+            "-sS",
+            "-o",
+            "NUL",
+            "-w",
+            "%{http_code}",
+            "--max-time",
+            "10",
+            url,
+        ],
+    )
+    .await;
+    assert_ne!(
+        curl_code, 0,
+        "curl 在写约束令牌下意外成功了：限制已变化，请先复核 docs/08 §5.4.1（输出：{curl_out}）"
+    );
+    assert!(
+        curl_code == 35 || curl_out.contains("35"),
+        "curl 应因 TLS 握手失败（35）而退出，实际退出码 {curl_code}，输出：{curl_out}"
+    );
+
+    let ps_line = format!(
+        "powershell -NoProfile -NonInteractive -Command \"try{{Invoke-WebRequest -UseBasicParsing '{url}' -TimeoutSec 10|Out-Null;'OK'}}catch{{'ERR:'+$_.Exception.Message}}\""
+    );
+    let (_ps_code, ps_out) =
+        run_write_restricted_capture(&ws, "cmd", &["/C", ps_line.as_str()]).await;
+    // PowerShell 在 catch 里打印后仍以 0 退出，所以判据看**输出形态**而不是进程码：
+    // 我们自己的 `try{...;'OK'}` 只在请求成功时才打印 OK。
+    assert!(
+        !ps_out.lines().any(|line| line.trim() == "OK"),
+        "PowerShell 在写约束令牌下意外成功了：{ps_out}"
+    );
+    let lowered = ps_out.to_ascii_lowercase();
+    assert!(
+        lowered.contains("0x8009030e")
+            || ps_out.contains("凭据")
+            || lowered.contains("credential")
+            || lowered.contains("err:"),
+        "PowerShell 的失败形态与登记限制不符（期望凭据错误）：{ps_out}"
+    );
+
+    std::fs::remove_dir_all(&ws).ok();
+}
