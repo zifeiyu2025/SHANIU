@@ -10,3 +10,7 @@ workspace/target/
 # 在这里显式放行（否则 docs/16 §9 引用的 drive.log 在 clone 后不存在）。
 !data-root/logs/
 !*.log
+
+# vite 开发服务器日志是 PowerShell 重定向出的 UTF-16 二进制，只证明 dev server 起过，
+# 无复核价值；出网/TLS 的证据在 diag-tls-clients.txt 与 probe-*.txt。
+vite.log
