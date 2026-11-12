@@ -243,14 +243,18 @@ fn sandbox_summary(config: &McpServerConfig, os: crate::config::OsSandbox) -> Sa
         })
         .collect();
     match os {
-        crate::config::OsSandbox::AppContainer => SandboxSummary {
-            kind: "app_container".to_string(),
-            profile: crate::sandbox::appcontainer::mcp_profile_name(&config.id)
-                .unwrap_or_default(),
-            workspace,
-            allowed_roots,
-            network: if config.allow_network { "allowed" } else { "denied" }.to_string(),
-        },
+        // 写约束档下 MCP server **仍由容器启停**（见 sandbox::prepare_stdio 的分支），
+        // 所以这里如实报 app_container，而不是把它写成 restricted_token。
+        crate::config::OsSandbox::AppContainer | crate::config::OsSandbox::RestrictedToken => {
+            SandboxSummary {
+                kind: "app_container".to_string(),
+                profile: crate::sandbox::appcontainer::mcp_profile_name(&config.id)
+                    .unwrap_or_default(),
+                workspace,
+                allowed_roots,
+                network: if config.allow_network { "allowed" } else { "denied" }.to_string(),
+            }
+        }
         crate::config::OsSandbox::Logical => SandboxSummary {
             kind: "logical".to_string(),
             profile: String::new(),

@@ -418,6 +418,13 @@ unsafe fn everyone_sid() -> Result<Vec<u8>, String> {
 /// 为什么必须做：受限令牌会继承用户的 default DACL，而那份 DACL 里没有 restricting
 /// SID；孙进程新建匿名管道（stdio）时 pass-2 检查失败 → `spawn EPERM`，所有派生进程
 /// 全挂。dsh `token.ts:96-145` 与 codex `token.rs:56-112` 都把这一步列为 fail-closed。
+///
+/// **2026-11-12 真机未解**：node 的 `spawnSync`/`execSync` 在本 DACL 下仍报
+/// `EPERM: spawnSync C:\WINDOWS\system32\cmd.exe`；同一令牌下 cmd 自身管道、
+/// python `subprocess`、`stdio:'inherit'` 的 spawn 都正常（见
+/// `docs/evidence/2026-11-12/write-only-default/drive-run4.log`）。按 dsh 口径把
+/// **写 SID** 的 `FILE_ALL_ACCESS` 也并进 default DACL 后**仍未改变**，故先回退，
+/// 不带未验证的授权放宽进主干。
 unsafe fn set_default_dacl(token: HANDLE, logon_sid: PSID) -> Result<(), String> {
     let owner_rights_text = wide("S-1-3-4");
     let mut owner_rights = PSID(std::ptr::null_mut());

@@ -65,14 +65,15 @@ pub struct SpawnRequest<'a> {
     pub os: OsSandbox,
 }
 
-/// 进程级 OS 沙箱机制（启动时由 `[sandbox] os` 注入；默认 AppContainer）。
+/// 进程级 OS 沙箱机制（启动时由 `[sandbox] os` 注入；默认只约束写的受限令牌）。
 static OS_MODE: AtomicU8 = AtomicU8::new(0);
 
 pub fn set_os_mode(mode: OsSandbox) {
     OS_MODE.store(
         match mode {
-            OsSandbox::AppContainer => 0,
-            OsSandbox::Logical => 1,
+            OsSandbox::RestrictedToken => 0,
+            OsSandbox::AppContainer => 1,
+            OsSandbox::Logical => 2,
         },
         Ordering::Relaxed,
     );
@@ -80,8 +81,9 @@ pub fn set_os_mode(mode: OsSandbox) {
 
 pub fn current_os_mode() -> OsSandbox {
     match OS_MODE.load(Ordering::Relaxed) {
-        1 => OsSandbox::Logical,
-        _ => OsSandbox::AppContainer,
+        1 => OsSandbox::AppContainer,
+        2 => OsSandbox::Logical,
+        _ => OsSandbox::RestrictedToken,
     }
 }
 
@@ -111,6 +113,8 @@ impl SandboxEnforcement {
 
 pub fn enforcement_of(os: OsSandbox, mode: SandboxMode) -> SandboxEnforcement {
     match (os, mode) {
+        // 写约束：写入边界由 OS（WRITE_RESTRICTED + restricting SID）强制，声明与事实一致。
+        (OsSandbox::RestrictedToken, _) => SandboxEnforcement::Full,
         (OsSandbox::AppContainer, _) => SandboxEnforcement::Full,
         (OsSandbox::Logical, SandboxMode::DangerFullAccess) => SandboxEnforcement::Full,
         (OsSandbox::Logical, _) => SandboxEnforcement::Partial,
@@ -119,31 +123,7 @@ pub fn enforcement_of(os: OsSandbox, mode: SandboxMode) -> SandboxEnforcement {
 
 /// 当前进程的强制完整度（状态条与工具结果共用同一处判定）。
 pub fn current_enforcement(mode: SandboxMode) -> SandboxEnforcement {
-    // 写约束模型：写入边界由 OS（WRITE_RESTRICTED + restricting SID）强制，
-    // 声明与事实一致 → `full`。这是本期唯一新增的 `full` 来源，默认关闭时不可达。
-    if use_restricted_token() {
-        return SandboxEnforcement::Full;
-    }
     enforcement_of(current_os_mode(), mode)
-}
-
-/// 第一期 A 的机制开关（docs/16 §7）。
-///
-/// `config.rs` 在本期冻结，所以新机制用环境变量门控：`SHANIU_SANDBOX_OS=restricted_token`。
-/// **不设或设成别的值 → 完全走旧机制**，行为与今天一致；`sandbox.os="logical"` 是用户
-/// 显式选择，优先级高于本开关（不会被 env 悄悄改成写约束模式）。
-pub fn restricted_token_enabled() -> bool {
-    static ENABLED: OnceLock<bool> = OnceLock::new();
-    *ENABLED.get_or_init(|| {
-        matches!(
-            std::env::var("SHANIU_SANDBOX_OS").as_deref(),
-            Ok("restricted_token")
-        )
-    })
-}
-
-fn use_restricted_token() -> bool {
-    restricted_token_enabled() && current_os_mode() == OsSandbox::AppContainer
 }
 
 /// 会真正落下执行副作用的工具：只有它们的输出才需要带上沙箱自报。
@@ -165,10 +145,7 @@ pub fn execution_note(tool: &str, mode: SandboxMode) -> Option<String> {
         current_enforcement(mode).as_str()
     );
     // 只有容器路径才有祖先链这回事；写约束模式没有祖先链，逻辑回退与全权模式也没有。
-    if mode == SandboxMode::WorkspaceWrite
-        && current_os_mode() == OsSandbox::AppContainer
-        && !restricted_token_enabled()
-    {
+    if mode == SandboxMode::WorkspaceWrite && current_os_mode() == OsSandbox::AppContainer {
         match ancestor_state() {
             AncestorState::Preparing => note.push_str(" ancestors=preparing"),
             AncestorState::NeedsAdmin => note.push_str(" ancestors=needs_admin"),
@@ -234,11 +211,9 @@ pub fn prepare_spawn_with(
         SandboxMode::WorkspaceWrite => {
             #[cfg(windows)]
             {
-                // 第一期 A：门控打开时走「只约束写」的受限令牌；默认关闭，旧分流不变。
-                if request.os == OsSandbox::AppContainer && restricted_token_enabled() {
-                    return prepare_write_restricted(&request, tx);
-                }
                 match request.os {
+                    // 默认：只约束写（WRITE_RESTRICTED 受限令牌 + 可继承 allow ACE）。
+                    OsSandbox::RestrictedToken => prepare_write_restricted(&request, tx),
                     OsSandbox::AppContainer => spawn_in_app_container(&request, tx),
                     OsSandbox::Logical => {
                         warn_logical_fallback_once();
@@ -299,7 +274,10 @@ pub fn prepare_terminal(
             windows_impl::spawn_unsandboxed_terminal(launch).map_err(SandboxError::CreateFailed)
         }
         SandboxMode::WorkspaceWrite => match request.os {
-            OsSandbox::AppContainer => {
+            // 写约束档的**交互终端**暂时仍走 AppContainer：本期只把一次性命令切到
+            // 受限令牌，终端保持今天的严格度（不劣于现状）。它比 exec 更严，属已知
+            // 不对称，列入 docs/16 §10 的后续项；不要为了「一致」把终端降级成无边界。
+            OsSandbox::RestrictedToken | OsSandbox::AppContainer => {
                 let (sid, capabilities) = app_container_scope(request.workspace_root)?;
                 windows_impl::spawn_appcontainer_terminal(
                     launch,
@@ -1191,19 +1169,13 @@ pub struct SandboxStatus {
 }
 
 pub fn status(mode: SandboxMode, os: OsSandbox) -> SandboxStatus {
-    // 写约束模型自报：没有容器、没有祖先链，写边界由令牌强制。
-    if os == OsSandbox::AppContainer && restricted_token_enabled() {
-        return SandboxStatus {
-            mode: mode.as_str(),
-            os: "restricted_token",
-            os_enabled: true,
-            enforcement: SandboxEnforcement::Full.as_str(),
-            profile: String::new(),
-            ancestor: AncestorState::Idle.as_str(),
-            note: "受限令牌约束写入（WRITE_RESTRICTED）；读与网络不约束，无需管理员".to_string(),
-        };
-    }
     let (os_name, os_enabled, note) = match os {
+        // 默认：写约束模型自报——没有容器、没有祖先链，写边界由令牌强制。
+        OsSandbox::RestrictedToken => (
+            "restricted_token",
+            true,
+            "受限令牌约束写入（WRITE_RESTRICTED）；读与网络不约束，无需管理员",
+        ),
         OsSandbox::AppContainer => (
             "app_container",
             true,
@@ -1222,7 +1194,7 @@ pub fn status(mode: SandboxMode, os: OsSandbox) -> SandboxStatus {
         enforcement: enforcement_of(os, mode).as_str(),
         profile: match os {
             OsSandbox::AppContainer => appcontainer::PROFILE_NAME.to_string(),
-            OsSandbox::Logical => String::new(),
+            OsSandbox::RestrictedToken | OsSandbox::Logical => String::new(),
         },
         // 只有容器路径才有「准备文件权限」这回事：逻辑回退与只读/全权档都不补，恒为 idle。
         ancestor: match (os, mode) {
@@ -1301,7 +1273,12 @@ pub fn prepare_stdio(
                 )
                 .map_err(SandboxError::CreateFailed)
             }
-            OsSandbox::AppContainer => spawn_mcp_in_app_container(&request, tx),
+            // MCP server 与交互终端一样**本期仍走容器**：写约束档只切一次性命令。
+            // 第三方长驻进程保留今天的容器边界，不劣于现状；写约束版的 stdio 启动
+            // 列入 docs/16 §10 后续项（需要 allowed_roots → 写 SID 的映射）。
+            OsSandbox::RestrictedToken | OsSandbox::AppContainer => {
+                spawn_mcp_in_app_container(&request, tx)
+            }
         },
     }
 }
@@ -1673,6 +1650,18 @@ mod tests {
         let container = status(SandboxMode::WorkspaceWrite, OsSandbox::AppContainer);
         assert!(container.os_enabled);
         assert_eq!(container.os, "app_container");
+    }
+
+    /// 默认机制的自我描述必须是「写受限」，且读不约束要写在 note 里。
+    #[test]
+    fn status_reports_restricted_token_as_default() {
+        let default = status(SandboxMode::WorkspaceWrite, OsSandbox::RestrictedToken);
+        assert_eq!(default.os, "restricted_token");
+        assert!(default.os_enabled);
+        assert_eq!(default.enforcement, "full");
+        assert!(default.profile.is_empty(), "写约束没有容器 profile");
+        assert!(default.note.contains("读与网络不约束"), "{}", default.note);
+        assert_eq!(default.ancestor, "idle", "写约束没有祖先链");
     }
 
     /// 强制完整度只看「宿主能不能真的把声明的档位强制到位」：
