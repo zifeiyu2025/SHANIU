@@ -35,11 +35,12 @@ use crate::config::{OsSandbox, SandboxMode};
 /// 2026-11-12.2：环境块补一句 Unix 命令口径——`ls`/`grep` 未必有（装了 Git 有时真能跑），
 /// 勿依赖，列目录用 `dir`、找文本用 `findstr`；读文件仍按既有条款用 `read_file`。
 /// 只是提示词，执行入口未变（仍是 `cmd /C`）。
-/// 2026-11-12.3：隔离机制行按**实际生效**的机制分支（见 [`write_restricted_active`]）。
+/// 2026-11-12.3：隔离机制行按**实际生效**的机制分支（见 [`isolation_label`]）。
 /// 写约束档下读区外是放行的，旧句「路径外一律拒绝」会让模型漏掉这个能力、
 /// 也会把「写被拒」误判成路径越界。
 /// 2026-11-12.4：`PROMPT_TOKEN_LIMIT` 2500 → 3000（对标 codex / dsh / ZCode，见常量注释）。
-pub const PROMPT_VERSION: &str = "2026-11-12.4";
+/// 2026-11-12.5：写约束成为**默认机制**，隔离机制行不再依赖环境变量开关。
+pub const PROMPT_VERSION: &str = "2026-11-12.5";
 
 /// 全文 token 上限（估算口径见 [`rules::estimate_tokens`]：CJK 1 字 1 token，ASCII 4 字符 1 token）。
 ///
@@ -324,7 +325,7 @@ fn environment_block(ctx: &PromptContext<'_>) -> String {
     text.push_str(&format!("- 权限档：{}\n", mode_label(ctx.sandbox)));
     text.push_str(&format!(
         "- 隔离机制：{}\n",
-        isolation_label(ctx.os, write_restricted_active(ctx.os))
+        isolation_label(ctx.os)
     ));
     text.push('\n');
     text
@@ -421,7 +422,7 @@ impl SessionPrompt {
         if next.os != self.facts.os {
             lines.push(format!(
                 "- 隔离机制：{}",
-                isolation_label(next.os, write_restricted_active(next.os))
+                isolation_label(next.os)
             ));
         }
         if next.plan_mode != self.facts.plan_mode {
@@ -446,28 +447,17 @@ fn mode_label(mode: SandboxMode) -> &'static str {
     }
 }
 
-/// 当前实际生效的是否「只约束写」的机制。
+/// 隔离机制文案：按**实际生效**的机制分支。
 ///
-/// 与 [`crate::sandbox::prepare_spawn_with`] 的分流条件逐字对齐：
-/// 只有 `os == AppContainer` 且开关打开时才走写约束分支。
-fn write_restricted_active(os: OsSandbox) -> bool {
-    os == OsSandbox::AppContainer && crate::sandbox::restricted_token_enabled()
-}
-
-/// 隔离机制文案。`write_restricted` 由 [`write_restricted_active`] 给出。
-///
-/// 写成纯函数（而不是在函数里自己读进程级开关）是为了让两档文案都能在测试里断言：
-/// 开关是 `OnceLock` 进程级缓存，测试里改环境变量既不安全也不可靠。
+/// 写成纯函数（而不是在函数里自己读进程级状态）是为了让三档文案都能在测试里断言。
 ///
 /// 措辞边界：只说「什么会被拒、什么不会」，不写错误码与 DACL/ACE/SID/令牌等内部术语。
-/// 两档文案按 [`rules::estimate_tokens`] 口径等长，切换机制不挤占 `PROMPT_TOKEN_LIMIT`。
-fn isolation_label(os: OsSandbox, write_restricted: bool) -> &'static str {
+/// 三档文案按 [`rules::estimate_tokens`] 口径等长，切换机制不挤占 `PROMPT_TOKEN_LIMIT`。
+fn isolation_label(os: OsSandbox) -> &'static str {
     match os {
-        OsSandbox::Logical => "逻辑沙箱（无路径级隔离；只有工具层校验）",
-        OsSandbox::AppContainer if write_restricted => {
-            "写受限（写入仅限授权位置，读不受限制；通常只拒写）"
-        }
+        OsSandbox::RestrictedToken => "写受限（写入仅限授权位置，读不受限制；通常只拒写）",
         OsSandbox::AppContainer => "AppContainer（OS 级；文件系统按路径授权，路径外一律拒绝）",
+        OsSandbox::Logical => "逻辑沙箱（无路径级隔离；只有工具层校验）",
     }
 }
 
@@ -528,6 +518,12 @@ fn sandbox_block(ctx: &PromptContext<'_>) -> String {
 - 沙箱只约束**文件写入范围**：文件工具仅能在当前工作区内写入，工作区外一律拒绝。\n\
 - 命令与终端**可以正常联网**（与宿主同一网络）：装依赖、git fetch/push、curl 直接用，不必先申请。\n",
     );
+    if ctx.os == OsSandbox::RestrictedToken {
+        text.push_str(
+            "- 当前机制**只约束写**：当前工作区、临时目录与工具链目录可写，其余位置写入被拒；\
+**读取不受限制**（可以读工作区外的文件），命令可以正常联网。\n",
+        );
+    }
     if ctx.os == OsSandbox::Logical {
         text.push_str(
             "- 注意：当前没有 OS 级路径隔离，「工作区外拒绝」只有工具层校验兜着——这是用户显式降级的结果，\
@@ -1138,13 +1134,13 @@ mod tests {
     /// 也会把「写被拒」误判成路径越界。两档措辞分别断言，不能只查句子存在。
     #[test]
     fn isolation_label_follows_effective_mechanism() {
-        let container = isolation_label(OsSandbox::AppContainer, false);
+        let container = isolation_label(OsSandbox::AppContainer);
         assert_eq!(
             container, "AppContainer（OS 级；文件系统按路径授权，路径外一律拒绝）",
             "容器档保持原句：读与写都受路径约束"
         );
 
-        let write_restricted = isolation_label(OsSandbox::AppContainer, true);
+        let write_restricted = isolation_label(OsSandbox::RestrictedToken);
         assert!(write_restricted.contains("写受限"), "必须点明只约束写：{write_restricted}");
         assert!(
             write_restricted.contains("读不受限制"),
@@ -1159,10 +1155,8 @@ mod tests {
             "写约束档不能沿用「读写都拒」的旧口径"
         );
 
-        let logical = isolation_label(OsSandbox::Logical, false);
+        let logical = isolation_label(OsSandbox::Logical);
         assert!(logical.contains("无路径级隔离"), "逻辑档必须点明没有路径级隔离");
-        // 分流条件里 os 优先：逻辑档不会因为开关打开就变成写约束档。
-        assert_eq!(logical, isolation_label(OsSandbox::Logical, true));
 
         for banned in ["DACL", "ACE", "SID", "令牌", "0x"] {
             for label in [container, write_restricted, logical] {
@@ -1173,26 +1167,32 @@ mod tests {
             }
         }
 
-        // 测试进程默认没开写约束开关，实际生成的提示必须落在容器档文案上。
-        if !crate::sandbox::restricted_token_enabled() {
-            let root = demo();
-            let text = system_instruction(&ctx(&root, SandboxMode::WorkspaceWrite, OsSandbox::AppContainer, false));
-            assert!(
-                text.contains(&format!("- 隔离机制：{container}")),
-                "未开写约束开关时必须用容器档措辞"
-            );
-            assert!(!text.contains("读不受限制"), "容器档不得宣称读不受限");
-        }
+        // 默认机制就是写约束：实际生成的提示必须落在「写受限」那句上。
+        let root = demo();
+        let text = system_instruction(&ctx(
+            &root,
+            SandboxMode::WorkspaceWrite,
+            OsSandbox::RestrictedToken,
+            false,
+        ));
+        assert!(
+            text.contains(&format!("- 隔离机制：{write_restricted}")),
+            "默认机制必须用写受限措辞"
+        );
+        assert!(
+            !text.contains(&format!("- 隔离机制：{container}")),
+            "默认机制下不得给模型 AppContainer 那句"
+        );
     }
 
-    /// 两档文案按同一口径等长：切机制不挤占 `PROMPT_TOKEN_LIMIT` 的余量。
+    /// 三档文案按同一口径等长：切机制不挤占 `PROMPT_TOKEN_LIMIT` 的余量。
     #[test]
     fn isolation_labels_share_the_budget() {
-        let container = rules::estimate_tokens(isolation_label(OsSandbox::AppContainer, false));
-        let write_restricted = rules::estimate_tokens(isolation_label(OsSandbox::AppContainer, true));
+        let container = rules::estimate_tokens(isolation_label(OsSandbox::AppContainer));
+        let write_restricted = rules::estimate_tokens(isolation_label(OsSandbox::RestrictedToken));
         assert_eq!(
             write_restricted, container,
-            "写约束档文案不得比容器档长（否则打开开关会顶破预算）"
+            "写约束档文案不得比容器档长（否则切机制会顶破预算）"
         );
     }
 
