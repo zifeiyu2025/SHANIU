@@ -34,6 +34,10 @@ fn big_output(id: &str, size: usize) -> HistoryItem {
     HistoryItem::FunctionCallOutput { call_id: id.into(), output: "z".repeat(size) }
 }
 
+fn tool_call(id: &str) -> HistoryItem {
+    HistoryItem::FunctionCall { name: "t".into(), arguments: "{}".into(), call_id: id.into() }
+}
+
 fn text_of(item: &HistoryItem) -> Option<&str> {
     match item {
         HistoryItem::Message { text, .. } => Some(text),
@@ -234,4 +238,104 @@ fn planner_never_emits_a_range_that_eats_the_whole_history() {
             );
         }
     }
+}
+
+/// 回归（CI 43292778234）：工具输出可以没有配对的调用——`chat_messages` 明确把这种
+/// 「落单输出」当正常输入（"只有外部裁剪/重排历史才会出现，按 call_id 原样发出"），
+/// 所以它**不是**不安全尾部。把配对判成双向包含会让这类档案的安全切点一路退到 0，
+/// 连写在尾部的压缩锚点一起丢掉：`applied_compactions` 归零，摘要与最新输出全部消失。
+#[test]
+fn orphan_tool_outputs_do_not_cut_away_the_tail_anchor() {
+    let dir = temp_dir("orphan-out");
+    let items = vec![user_msg("任务"), big_output("c0", 40_000), big_output("c1", 40_000)];
+    let writer = RolloutWriter::create(&dir, &meta("a5")).unwrap();
+    for item in &items {
+        writer.append(&RolloutItem::ResponseItem { item: item.clone(), at_ms: 0 }).unwrap();
+    }
+    let path = writer.path().to_path_buf();
+    let target = compaction::plan_if_needed(0, &items, 20_000).expect("120k 字节必须触发压缩");
+    writer
+        .append(&RolloutItem::Compacted {
+            range_start: target.range_start,
+            range_end: target.range_end,
+            summary: "摘要".into(),
+        })
+        .unwrap();
+    drop(writer);
+
+    let resumed = rollout::resume::resume(&path).unwrap();
+    assert_eq!(resumed.applied_compactions, 1, "写在尾部的锚点不得被截断丢掉");
+    assert!(
+        resumed.history.iter().any(|item| text_of(item) == Some("摘要")),
+        "摘要必须进重放出的历史，否则就是丢了上下文"
+    );
+    // 最新那条输出是模型下一步要用的，不能被一起截掉。
+    assert!(
+        matches!(
+            resumed.history.last().unwrap(),
+            HistoryItem::FunctionCallOutput { call_id, .. } if call_id == "c1"
+        ),
+        "保留段必须以最新工具输出收尾：{:#?}",
+        resumed.history
+    );
+    assert_eq!(resumed.dropped_unsafe_tail, 0, "没有任何落单调用，不该报截断");
+}
+
+/// 锚点写在一轮「有 call 无 output」的落单调用之后（崩溃后先 resume、再压缩就是这个形状）：
+/// 截断只能丢掉那条落单调用，锚点照常生效。
+#[test]
+fn anchor_written_after_an_unfinished_round_is_still_applied() {
+    let dir = temp_dir("anchor-after-torn");
+    let items = vec![user_msg("任务"), tool_call("c1"), big_output("c1", 1_000), tool_call("c2")];
+    let writer = RolloutWriter::create(&dir, &meta("a6")).unwrap();
+    for item in &items {
+        writer.append(&RolloutItem::ResponseItem { item: item.clone(), at_ms: 0 }).unwrap();
+    }
+    let path = writer.path().to_path_buf();
+    writer
+        .append(&RolloutItem::Compacted { range_start: 0, range_end: 3, summary: "交接摘要".into() })
+        .unwrap();
+    drop(writer);
+
+    let resumed = rollout::resume::resume(&path).unwrap();
+    assert_eq!(resumed.applied_compactions, 1, "锚点落在落单调用之后，也必须重放");
+    assert_eq!(resumed.dropped_unsafe_tail, 1, "只该丢 c2 这一条落单调用");
+    assert_eq!(
+        resumed.history.len(),
+        1,
+        "区间 [0,3) 应被换成一条摘要：{:#?}",
+        resumed.history
+    );
+    assert_eq!(text_of(&resumed.history[0]), Some("交接摘要"));
+}
+
+/// 锚点之后紧跟一轮未完成的工具调用（压缩之后又崩在 call 之后）：
+/// 锚点必须留下，只丢那条落单调用。
+#[test]
+fn anchor_survives_an_unfinished_round_that_follows_it() {
+    let dir = temp_dir("anchor-before-torn");
+    let mut writer = RolloutWriter::create(&dir, &meta("a7")).unwrap();
+    for item in [user_msg("任务"), tool_call("c1"), big_output("c1", 1_000)] {
+        writer
+            .append(&RolloutItem::ResponseItem { item, at_ms: 0 })
+            .unwrap();
+    }
+    writer
+        .append(&RolloutItem::Compacted { range_start: 0, range_end: 3, summary: "交接摘要".into() })
+        .unwrap();
+    // 崩溃点：c2 只有调用、没有输出。
+    writer.append(&RolloutItem::ResponseItem { item: tool_call("c2"), at_ms: 0 }).unwrap();
+    let path = writer.path().to_path_buf();
+    drop(writer);
+
+    let resumed = rollout::resume::resume(&path).unwrap();
+    assert_eq!(resumed.applied_compactions, 1, "锚点之后的落单调用不得连带丢掉锚点");
+    assert_eq!(resumed.dropped_unsafe_tail, 1, "只该丢 c2 这一条落单调用");
+    assert_eq!(
+        resumed.history.len(),
+        1,
+        "区间 [0,3) 应被换成一条摘要：{:#?}",
+        resumed.history
+    );
+    assert_eq!(text_of(&resumed.history[0]), Some("交接摘要"));
 }
