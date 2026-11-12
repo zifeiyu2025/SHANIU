@@ -253,9 +253,9 @@ pub struct TerminalRequest<'a> {
 
 /// 启动一个持久终端会话（ConPTY）。
 ///
-/// 三个沙箱档与一次性命令一一对应：read-only 拒绝、workspace-write 走
-/// AppContainer/Logical、danger-full-access 无令牌无容器。**无论哪档都挂 Job**，
-/// 因为 R106 要求「关闭会话即整树终止」，这条不随沙箱档放宽。
+/// workspace-write 的默认档与一次性命令一致：**写约束受限令牌**（只限制写，
+/// 读与网络不约束）；`app_container` 仍是可选档，`logical` 是显式回退。
+/// **无论哪档都挂 Job**，因为 R106 要求「关闭会话即整树终止」，这条不随沙箱档放宽。
 pub fn prepare_terminal(
     request: &TerminalRequest<'_>,
 ) -> Result<windows_impl::TerminalSpawn, SandboxError> {
@@ -274,10 +274,14 @@ pub fn prepare_terminal(
             windows_impl::spawn_unsandboxed_terminal(launch).map_err(SandboxError::CreateFailed)
         }
         SandboxMode::WorkspaceWrite => match request.os {
-            // 写约束档的**交互终端**暂时仍走 AppContainer：本期只把一次性命令切到
-            // 受限令牌，终端保持今天的严格度（不劣于现状）。它比 exec 更严，属已知
-            // 不对称，列入 docs/16 §10 的后续项；不要为了「一致」把终端降级成无边界。
-            OsSandbox::RestrictedToken | OsSandbox::AppContainer => {
+            // 默认档：与 exec 同一份写范围（工作区 + temp），令牌只约束写。
+            OsSandbox::RestrictedToken => {
+                let sids = grant_write_scope(request.workspace_root)?;
+                let write_sids: Vec<PSID> = sids.iter().map(|sid| sid.as_psid()).collect();
+                windows_impl::spawn_write_restricted_terminal(launch, &write_sids)
+                    .map_err(SandboxError::CreateFailed)
+            }
+            OsSandbox::AppContainer => {
                 let (sid, capabilities) = app_container_scope(request.workspace_root)?;
                 windows_impl::spawn_appcontainer_terminal(
                     launch,
@@ -333,46 +337,70 @@ pub fn prepare_write_restricted(
     request: &SpawnRequest<'_>,
     tx: mpsc::Sender<ExecLine>,
 ) -> Result<PreparedSpawn, SandboxError> {
-    let workspace_sid = write_sid::workspace_write_sid(request.workspace_root)
+    let sids = grant_write_scope(request.workspace_root)?;
+    let write_sids = [sids[0].as_psid(), sids[1].as_psid()];
+    let child = windows_impl::spawn_write_restricted_command(
+        request.program,
+        request.args,
+        request.cwd,
+        &write_sids,
+        tx,
+    )
+    .map_err(SandboxError::CreateFailed)?;
+    Ok(PreparedSpawn::Restricted(child))
+}
+
+/// 写约束档的写范围准备：派生「工作区写 SID + temp 写 SID」，
+/// 并给 `acl::write_scope(workspace_root)` 里的每个位置补持久、可继承的 allow ACE。
+///
+/// exec、交互终端、MCP server 三面**共用这一份**：它就是受限令牌 restricting 列表里
+/// 允许写的 SID 来源，任何一面自己另写一份，三面就会漂移。
+/// 返回值顺序固定为 `[工作区, temp]`，调用方据此构造 restricting 列表。
+/// **fail-closed**：任一目录授不上写权限就返回 Err，绝不降级。
+#[cfg(windows)]
+fn grant_write_scope(
+    workspace_root: &Path,
+) -> Result<Vec<write_sid::OwnedSid>, SandboxError> {
+    let workspace_sid = write_sid::workspace_write_sid(workspace_root)
         .map_err(SandboxError::CreateFailed)?;
     let temp_sid =
         write_sid::temp_write_sid(&std::env::temp_dir()).map_err(SandboxError::CreateFailed)?;
 
     let ledger = acl::persistent_ledger_path(&crate::config::resolve_dirs_from_env().data_root);
-    for dir in acl::write_scope(request.workspace_root) {
-        let is_workspace_root = acl::same_path(&dir, request.workspace_root);
+    for dir in acl::write_scope(workspace_root) {
+        let is_workspace_root = acl::same_path(&dir, workspace_root);
         let sid = if is_workspace_root {
             workspace_sid.as_psid()
         } else {
             temp_sid.as_psid()
         };
-        match with_acl(|acl| acl.grant_scope_persistent(&dir, sid, is_workspace_root, &ledger))? {
-            acl::ScopeGrant::Written { .. } | acl::ScopeGrant::AlreadyPresent => {}
-            acl::ScopeGrant::Denied(detail) => {
-                return Err(SandboxError::CreateFailed(format!(
-                    "{detail}。写约束沙箱无法给「{}」授写权限，拒绝在沙箱外执行",
-                    dir.display()
-                )))
-            }
-        }
+        grant_persistent(&dir, sid, is_workspace_root, &ledger)?;
     }
 
     tracing::info!(
-        workspace = %request.workspace_root.display(),
+        workspace = %workspace_root.display(),
         workspace_sid = workspace_sid.text(),
         temp_sid = temp_sid.text(),
         "写约束沙箱就绪：受限令牌 WRITE_RESTRICTED，读与网络不约束"
     );
+    Ok(vec![workspace_sid, temp_sid])
+}
 
-    let child = windows_impl::spawn_write_restricted_command(
-        request.program,
-        request.args,
-        request.cwd,
-        &[workspace_sid.as_psid(), temp_sid.as_psid()],
-        tx,
-    )
-    .map_err(SandboxError::CreateFailed)?;
-    Ok(PreparedSpawn::Restricted(child))
+/// 单条写 ACE 的持久授权：命中即跳过，失败一律 fail-closed。
+#[cfg(windows)]
+fn grant_persistent(
+    dir: &Path,
+    sid: PSID,
+    guarded: bool,
+    ledger: &Path,
+) -> Result<(), SandboxError> {
+    match with_acl(|acl| acl.grant_scope_persistent(dir, sid, guarded, ledger))? {
+        acl::ScopeGrant::Written { .. } | acl::ScopeGrant::AlreadyPresent => Ok(()),
+        acl::ScopeGrant::Denied(detail) => Err(SandboxError::CreateFailed(format!(
+            "{detail}。写约束沙箱无法给「{}」授写权限，拒绝在沙箱外执行",
+            dir.display()
+        ))),
+    }
 }
 
 /// 容器运行时 + 工作区写 ACE 的公共准备步骤。
@@ -1218,6 +1246,9 @@ fn warn_logical_fallback_once() {
 /// 启动一个 MCP stdio server 的请求（SH-060 / SH-064）。
 pub struct StdioRequest<'a> {
     pub policy: SandboxMode,
+    /// 本请求使用的 OS 机制（逐请求显式传入，不从全局 `OS_MODE` 猜：
+    /// 全局值只决定默认来源，测试与调用方必须能钉死自己走哪一档）。
+    pub os: OsSandbox,
     /// 配置里的 server id（派生容器 profile 名与临时目录）。
     pub server_id: &'a str,
     pub program: &'a str,
@@ -1237,14 +1268,16 @@ pub struct StdioRequest<'a> {
 /// 按策略准备 MCP stdio server（SH-060，X10：默认一律走沙箱）。
 ///
 /// - read-only：纯策略拒绝（只读沙箱不允许任何进程执行）；
+/// - workspace-write 的**默认档**（`restricted_token`）：写约束受限令牌 + Job + 句柄白名单，
+///   与 exec、交互终端同一份写范围（工作区 / 授权可写根 / 每 server 临时目录）；
 /// - workspace-write + `sandbox.os = "app_container"`：**逐 server 一个容器**，
-///   ACE 按 server 的 cwd/allowed_roots 逐条授权，网络默认允许（显式 `allow_network = false` 才不挂 `internetClient`）；
-/// - workspace-write + `sandbox.os = "logical"`：受限令牌 + Job（用户显式选择）；
+///   ACE 按 server 的 cwd/allowed_roots 逐条授权，网络按 `allow_network` 挂 `internetClient`；
+/// - workspace-write + `sandbox.os = "logical"`：仅受限令牌 + Job（用户显式选择）；
 /// - danger-full-access：**调用方必须先确认该 server 的 `unsandboxed=true` 且原因已记录**
 ///   （逐服务器显式豁免），这里才走未沙箱启动。
 ///
-/// 失败语义：容器/授权任何一步失败都返回 Err，调用方必须把该 server 置为 `blocked`。
-/// **绝不回退到受限令牌**——那会让用户以为它在容器里，实际没有路径边界。
+/// 失败语义：任一步失败都返回 Err，调用方必须把该 server 置为 `blocked`。
+/// **绝不回退到更弱的档**——那会让用户以为它在某个边界里，实际没有。
 pub fn prepare_stdio(
     request: StdioRequest<'_>,
     tx: mpsc::Sender<StdioEvent>,
@@ -1261,7 +1294,9 @@ pub fn prepare_stdio(
             tx,
         )
         .map_err(SandboxError::CreateFailed),
-        SandboxMode::WorkspaceWrite => match current_os_mode() {
+        SandboxMode::WorkspaceWrite => match request.os {
+            OsSandbox::RestrictedToken => spawn_mcp_in_write_restricted(&request, tx),
+            OsSandbox::AppContainer => spawn_mcp_in_app_container(&request, tx),
             OsSandbox::Logical => {
                 warn_logical_fallback_once();
                 windows_impl::spawn_restricted_stdio(
@@ -1273,14 +1308,85 @@ pub fn prepare_stdio(
                 )
                 .map_err(SandboxError::CreateFailed)
             }
-            // MCP server 与交互终端一样**本期仍走容器**：写约束档只切一次性命令。
-            // 第三方长驻进程保留今天的容器边界，不劣于现状；写约束版的 stdio 启动
-            // 列入 docs/16 §10 后续项（需要 allowed_roots → 写 SID 的映射）。
-            OsSandbox::RestrictedToken | OsSandbox::AppContainer => {
-                spawn_mcp_in_app_container(&request, tx)
-            }
         },
     }
+}
+
+/// 默认档：MCP server 跑在写约束受限令牌里。
+///
+/// 与容器档的差别只有一处策略：**读不受约束**，写只允许落在
+/// 「工作区根 / `workspace_access=write` 的 cwd 与 allowed_roots / 本 server 临时目录」。
+/// 每个可写根按路径确定性派生一个写 SID（`S-1-4-x-y`），补持久可继承 ACE，
+/// 再把这些 SID 一起放进 restricting 列表。
+///
+/// 只读根不补 ACE：本档读本来就无边界，补了也拦不住读，只会多一批 DACL 写入。
+/// 临时目录仍改指 `data_root/sandbox/mcp-temp/<id>`：server 的临时文件不该写进用户 TEMP，
+/// 也保证它一定在授权范围内。
+#[cfg(windows)]
+fn spawn_mcp_in_write_restricted(
+    request: &StdioRequest<'_>,
+    tx: mpsc::Sender<StdioEvent>,
+) -> Result<windows_impl::RestrictedStdioChild, SandboxError> {
+    let data_root = crate::config::resolve_dirs_from_env().data_root;
+    let server_temp = data_root
+        .join("sandbox")
+        .join("mcp-temp")
+        .join(request.server_id);
+    std::fs::create_dir_all(&server_temp).map_err(|error| {
+        SandboxError::CreateFailed(format!(
+            "创建 MCP 临时目录 {} 失败: {error}",
+            server_temp.display()
+        ))
+    })?;
+
+    let workspace_access = acl_access(request.workspace_access);
+    // 用户指定的根照旧先过数据根闸门：配置换个键不该绕过「不许摸会话档案」。
+    let mut desired = guarded_mcp_user_roots(request, &data_root, workspace_access)?;
+    desired.push((
+        server_temp.clone(),
+        acl::Access::Write,
+        acl::RootRole::Derived,
+    ));
+    let desired = acl::collapse(desired);
+
+    let ledger = acl::persistent_ledger_path(&data_root);
+    let mut owned = Vec::new();
+    for (path, access, _role) in desired {
+        if access != acl::Access::Write {
+            continue;
+        }
+        // 与工作区同一套确定性派生：同一个可写根在任何一次启动里都得到同一个 SID。
+        let sid = write_sid::workspace_write_sid(&path).map_err(SandboxError::CreateFailed)?;
+        let is_workspace_root = acl::same_path(&path, request.workspace_root);
+        grant_persistent(&path, sid.as_psid(), is_workspace_root, &ledger)?;
+        owned.push(sid);
+    }
+    let write_sids: Vec<PSID> = owned.iter().map(|sid| sid.as_psid()).collect();
+
+    let mut env = request.env.clone();
+    let temp_text = server_temp.to_string_lossy().to_string();
+    env.insert("TEMP".to_string(), temp_text.clone());
+    env.insert("TMP".to_string(), temp_text);
+
+    windows_impl::spawn_write_restricted_stdio(
+        request.program,
+        request.args,
+        request.cwd,
+        &env,
+        &write_sids,
+        tx,
+    )
+    .map_err(SandboxError::CreateFailed)
+}
+
+#[cfg(not(windows))]
+fn spawn_mcp_in_write_restricted(
+    _request: &StdioRequest<'_>,
+    _tx: mpsc::Sender<StdioEvent>,
+) -> Result<windows_impl::RestrictedStdioChild, SandboxError> {
+    Err(SandboxError::CreateFailed(
+        "workspace-write 沙箱当前仅支持 Windows（fail-closed）".into(),
+    ))
 }
 
 #[cfg(windows)]
@@ -1623,6 +1729,7 @@ mod tests {
         let err = match prepare_stdio(
             StdioRequest {
                 policy: SandboxMode::ReadOnly,
+                os: OsSandbox::RestrictedToken,
                 server_id: "probe",
                 program: "cmd",
                 args: &["/C", "echo"],
@@ -1710,16 +1817,19 @@ mod tests {
     }
 
     /// 非法 server id 派生不出容器名：必须**直接失败**，不能悄悄退回受限令牌。
+    ///
+    /// 走哪一档由 `StdioRequest.os` 显式钉死，不再改全局 `OS_MODE`：
+    /// 全局值只决定默认来源，测试里改它会和并行用例互相污染（2026-11-12 实测踩到）。
     #[cfg(windows)]
     #[test]
     fn invalid_server_id_fails_closed_instead_of_token_fallback() {
         let _serial = appcontainer::PROFILE_TEST_MUTEX.blocking_lock();
-        set_os_mode(OsSandbox::AppContainer);
         let dir = ws();
         let (tx, _rx) = mpsc::channel(4);
         let err = match prepare_stdio(
             StdioRequest {
                 policy: SandboxMode::WorkspaceWrite,
+                os: OsSandbox::AppContainer,
                 server_id: "Bad Id",
                 program: "cmd",
                 args: &["/C", "echo"],
@@ -1842,7 +1952,6 @@ mod tests {
     #[test]
     fn mcp_acl_grant_is_exact_and_release_revokes_it() {
         let _serial = appcontainer::PROFILE_TEST_MUTEX.blocking_lock();
-        set_os_mode(OsSandbox::AppContainer);
         let dir = ws();
         let target = dir.join("granted");
         std::fs::create_dir_all(&target).unwrap();
@@ -1889,7 +1998,6 @@ mod tests {
     #[test]
     fn overbroad_allowed_root_is_refused_and_audited() {
         let _serial = appcontainer::PROFILE_TEST_MUTEX.blocking_lock();
-        set_os_mode(OsSandbox::AppContainer);
         let dir = ws();
         let sub = dir.join("allowed-sub");
         std::fs::create_dir_all(&sub).unwrap();
@@ -1949,6 +2057,7 @@ mod tests {
         ) -> StdioRequest<'a> {
             StdioRequest {
                 policy: SandboxMode::WorkspaceWrite,
+                os: OsSandbox::RestrictedToken,
                 server_id: "guard-probe",
                 program: "cmd",
                 args: &[],
@@ -2025,7 +2134,6 @@ mod tests {
     #[test]
     fn mcp_null_device_grant_is_revoked_on_release() {
         let _serial = appcontainer::PROFILE_TEST_MUTEX.blocking_lock();
-        set_os_mode(OsSandbox::AppContainer);
         let device = Path::new(device_acl::NULL_DEVICE);
         let mask = device_acl::REQUIRED_MASK;
         let shared_present = || {
@@ -2076,12 +2184,14 @@ mod tests {
         );
     }
 
-    /// 真机：容器内启动 cmd，并读取工作区里的文件（验证 ACE 真的生效）。
+    /// 真机：**显式选 AppContainer** 时启动 cmd，并读取工作区里的文件（验证 ACE 真的生效）。
+    ///
+    /// 这一档不是默认路径（默认是写约束受限令牌，见 `mcp_server_runs_write_restricted_...`），
+    /// 但它是可选档，容器/ACE 链路必须继续有真机守门，不能因为默认切换就删掉。
     #[cfg(windows)]
     #[test]
     fn mcp_server_runs_inside_container_and_reads_workspace() {
         let _serial = appcontainer::PROFILE_TEST_MUTEX.blocking_lock();
-        set_os_mode(OsSandbox::AppContainer);
         let dir = ws();
         let marker = dir.join("marker.txt");
         std::fs::write(&marker, "container-read-ok").unwrap();
@@ -2094,6 +2204,7 @@ mod tests {
         let mut child = prepare_stdio(
             StdioRequest {
                 policy: SandboxMode::WorkspaceWrite,
+                os: OsSandbox::AppContainer,
                 server_id: &id,
                 program: &program,
                 args: &args,
@@ -2129,14 +2240,200 @@ mod tests {
         release_mcp_server(&id);
     }
 
+    /// 在指定的 OS 机制下启动一次 MCP stdio server（`cmd /C <line>`），返回退出码与输出。
+    ///
+    /// 输出收集必须在 `wait()` 之后继续读到通道关闭：读线程在进程 EOF 后才把所有行交出来，
+    /// `try_recv` 抢跑会漏行（旧容器用例那样写是碰运气）。
+    #[cfg(windows)]
+    fn run_mcp_stdio(os: OsSandbox, dir: &Path, line: &str) -> (i32, String) {
+        let id = format!("stdio-{}", std::process::id());
+        let args = ["/C", line];
+        let (tx, mut rx) = mpsc::channel(64);
+        let mut child = prepare_stdio(
+            StdioRequest {
+                policy: SandboxMode::WorkspaceWrite,
+                os,
+                server_id: &id,
+                program: "cmd",
+                args: &args,
+                cwd: dir,
+                workspace_root: dir,
+                workspace_access: WorkspaceAccess::Write,
+                allowed_roots: &[],
+                allow_network: false,
+                env: &BTreeMap::new(),
+                trusted_server_ids: &[],
+            },
+            tx,
+        )
+        .expect("workspace-write 下 MCP server 应能启动");
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .expect("测试用 runtime");
+        runtime.block_on(async {
+            let code = tokio::time::timeout(std::time::Duration::from_secs(30), child.wait())
+                .await
+                .expect("MCP server 应在 30s 内退出")
+                .unwrap();
+            let mut output = String::new();
+            while let Some(event) = tokio::time::timeout(
+                std::time::Duration::from_secs(10),
+                rx.recv(),
+            )
+            .await
+            .expect("等待输出通道关闭超时")
+            {
+                if let StdioEvent::Line(line) = event {
+                    output.push_str(&line);
+                    output.push('\n');
+                }
+            }
+            (code, output)
+        })
+    }
+
+    /// 默认档（写约束受限令牌）下：MCP server 起得来、能读工作区、能写工作区。
+    #[cfg(windows)]
+    #[test]
+    fn mcp_server_runs_write_restricted_and_reads_and_writes_workspace() {
+        let dir = ws();
+        std::fs::write(dir.join("marker.txt"), "wr-read-ok").unwrap();
+        let target = dir.join("out.txt");
+        // cwd 就是工作区根：用相对路径，避免 `cmd` 对引号的再解析干扰结论。
+        let line = "type marker.txt && echo written> out.txt && type out.txt";
+
+        let (code, output) = run_mcp_stdio(OsSandbox::RestrictedToken, &dir, line);
+
+        assert_eq!(code, 0, "默认档下 MCP server 应正常执行：{output}");
+        assert!(output.contains("wr-read-ok"), "应能读工作区文件：{output}");
+        assert!(target.is_file(), "应能写工作区文件（实际输出：{output}）");
+        assert!(
+            std::fs::read_to_string(&target)
+                .map(|text| text.contains("written"))
+                .unwrap_or(false),
+            "写入内容不对：{output}"
+        );
+    }
+
+    /// 默认档的核心不变量：MCP server **写区外仍必须被拒**（读不受限）。
+    ///
+    /// stdio 只把 stdout 转给 MCP 通道，stderr 不进 `StdioEvent`，所以这里断言
+    /// 「文件没出现 + 退出码非 0」两条硬事实，不依赖具体错误文案。
+    #[cfg(windows)]
+    #[test]
+    fn mcp_server_write_restricted_denies_write_outside_workspace() {
+        let dir = ws();
+        let home = std::env::var_os("USERPROFILE").expect("需要 USERPROFILE 定位区外目录");
+        let outside = PathBuf::from(home).join(format!("shaniu-mcp-outside-{}", std::process::id()));
+        std::fs::create_dir_all(&outside).unwrap();
+        let target = outside.join("escaped.txt");
+        let line = format!("echo escaped> \"{}\"", target.display());
+
+        let (code, output) = run_mcp_stdio(OsSandbox::RestrictedToken, &dir, &line);
+
+        assert!(
+            !target.exists(),
+            "MCP server 写区外成功：写约束令牌没有作用到 stdio 子进程（输出：{output}）"
+        );
+        assert_ne!(code, 0, "写区外必须失败：{output}");
+
+        std::fs::remove_dir_all(&outside).ok();
+    }
+
+    /// 默认档下交互终端要能开、能敲命令、能收到输出、能正常退出。
+    #[cfg(windows)]
+    #[test]
+    fn terminal_runs_write_restricted_and_executes_commands() {
+        use std::io::{Read as _, Write as _};
+
+        let dir = ws();
+        let program = std::env::var("COMSPEC").unwrap_or_else(|_| "cmd.exe".to_string());
+        let spawned = prepare_terminal(&TerminalRequest {
+            policy: SandboxMode::WorkspaceWrite,
+            os: OsSandbox::RestrictedToken,
+            workspace_root: &dir,
+            program: &program,
+            args: &[],
+            cwd: &dir,
+            cols: 100,
+            rows: 30,
+        })
+        .expect("默认档应能打开交互终端");
+
+        let mut writer = spawned.writer;
+        let mut reader = spawned.reader;
+        let (line_tx, line_rx) = std::sync::mpsc::channel::<String>();
+        std::thread::spawn(move || {
+            let mut buffer = [0u8; 4096];
+            while let Ok(count) = reader.read(&mut buffer) {
+                if count == 0 {
+                    break;
+                }
+                if line_tx
+                    .send(String::from_utf8_lossy(&buffer[..count]).to_string())
+                    .is_err()
+                {
+                    break;
+                }
+            }
+        });
+
+        let wait_for = |needle: &str| {
+            let mut seen = String::new();
+            let deadline = std::time::Instant::now() + std::time::Duration::from_secs(20);
+            while std::time::Instant::now() < deadline {
+                match line_rx.recv_timeout(std::time::Duration::from_millis(200)) {
+                    Ok(text) => {
+                        seen.push_str(&text);
+                        if seen.contains(needle) {
+                            return seen;
+                        }
+                    }
+                    Err(std::sync::mpsc::RecvTimeoutError::Timeout) => continue,
+                    Err(std::sync::mpsc::RecvTimeoutError::Disconnected) => break,
+                }
+            }
+            seen
+        };
+
+        writer.write_all(b"echo term-ok\r\n").unwrap();
+        writer.flush().unwrap();
+        let echo = wait_for("term-ok");
+        assert!(echo.contains("term-ok"), "终端应收得命令输出：{echo:?}");
+
+        writer.write_all(b"echo term> term-out.txt\r\n").unwrap();
+        writer.flush().unwrap();
+        let target = dir.join("term-out.txt");
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(20);
+        while std::time::Instant::now() < deadline && !target.is_file() {
+            std::thread::sleep(std::time::Duration::from_millis(100));
+        }
+        assert!(target.is_file(), "终端里敲的命令应真的执行（区内写）");
+
+        // 正常退出：`exit` 后 shell 进程应真的结束（ConPTY 的输出管道要等
+        // ClosePseudoConsole 才关，不能拿读端 EOF 当退出判据）。
+        writer.write_all(b"exit\r\n").unwrap();
+        writer.flush().unwrap();
+        drop(writer);
+        let mut exited = false;
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(20);
+        while std::time::Instant::now() < deadline {
+            if spawned.child.exit_code().is_some() {
+                exited = true;
+                break;
+            }
+            std::thread::sleep(std::time::Duration::from_millis(100));
+        }
+        assert!(exited, "`exit` 后 shell 进程应退出（ConPTY 未正常结束）");
+    }
+
     #[cfg(windows)]
     #[tokio::test]
     async fn workspace_write_runs_sandboxed_and_succeeds() {
-        // 与 MCP 容器用例共用一把锁：它们会把全局 `OS_MODE` 设成 AppContainer，
-        // 并行跑到这里会让 `prepare_spawn` 返回 AppContainer 变体而不是 Restricted
-        // （2026-11-09 全量跑实测踩到一次）。
+        // 与 MCP 容器用例共用一把锁：容器用例会建/删 profile，避免相互踩。
         let _serial = appcontainer::PROFILE_TEST_MUTEX.lock().await;
-        // 真实 Win32 沙箱 smoke：受限令牌 + Job + AppContainer 下运行 echo，退出码必须为 0
+        // 真实 Win32 沙箱 smoke：默认档（写约束受限令牌 + Job）下运行 echo，退出码必须为 0
         let dir = ws();
         let (tx, mut rx) = mpsc::channel(64);
         let mut child = match prepare_spawn(

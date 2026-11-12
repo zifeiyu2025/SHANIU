@@ -1015,9 +1015,10 @@ pub struct TerminalSpawn {
 enum TerminalMode<'a> {
     /// danger-full-access：用户明示，直接执行（仍挂 Job，保证整树可回收）。
     Unsandboxed,
-    /// `sandbox.os = "logical"` 的显式回退：受限令牌 + Job。
-    Restricted,
-    /// workspace-write 默认：受限令牌 + Job + AppContainer。
+    /// 受限令牌 + Job。`write_sids` 为空 = 逻辑档（只去特权）；
+    /// 非空 = 写约束档（`WRITE_RESTRICTED`，写按 SID 授权，读与网络不约束）。
+    Restricted { write_sids: &'a [PSID] },
+    /// 显式选 AppContainer 时的三层隔离：受限令牌 + Job + AppContainer。
     AppContainer {
         container: PSID,
         capabilities: &'a [PSID],
@@ -1054,7 +1055,7 @@ pub struct TerminalLaunch<'a> {
     pub rows: u16,
 }
 
-/// AppContainer 内的持久终端（默认路径）。
+/// AppContainer 内的持久终端（显式选档时的可选路径）。
 pub fn spawn_appcontainer_terminal(
     launch: TerminalLaunch<'_>,
     app_container_sid: PSID,
@@ -1071,9 +1072,21 @@ pub fn spawn_appcontainer_terminal(
     )
 }
 
+/// 写约束档（默认）内的持久终端：`WRITE_RESTRICTED` 受限令牌 + Job + ConPTY。
+///
+/// 与 exec 的差异在「输出通道」：终端走伪控制台（ConPTY），stdin/stdout 是
+/// 不可继承的匿名管道 + `PROC_THREAD_ATTRIBUTE_PSEUDOCONSOLE`，管道由**父进程**创建，
+/// 不需要子进程自己建对象，因此不会踩 docs/16 §10.7 的 node 管道 EPERM。
+pub fn spawn_write_restricted_terminal(
+    launch: TerminalLaunch<'_>,
+    write_sids: &[PSID],
+) -> Result<TerminalSpawn, String> {
+    spawn_terminal_impl(launch, TerminalMode::Restricted { write_sids })
+}
+
 /// 逻辑沙箱（受限令牌 + Job）内的持久终端。
 pub fn spawn_restricted_terminal(launch: TerminalLaunch<'_>) -> Result<TerminalSpawn, String> {
-    spawn_terminal_impl(launch, TerminalMode::Restricted)
+    spawn_terminal_impl(launch, TerminalMode::Restricted { write_sids: &[] })
 }
 
 /// danger-full-access 下的持久终端（无令牌/容器，仍挂 Job）。
@@ -1113,10 +1126,12 @@ fn spawn_terminal_impl(
     };
 
     unsafe {
-        // 纵深第 1 层：受限令牌（danger 档不建）
+        // 纵深第 1 层：受限令牌（danger 档不建）。写约束档把写 SID 一并带进来，
+        // 其余档传空切片，行为与改动前逐字节等价。
         let token_guard = match &mode {
             TerminalMode::Unsandboxed => None,
-            _ => Some(create_restricted_token(&[])?),
+            TerminalMode::Restricted { write_sids } => Some(create_restricted_token(write_sids)?),
+            TerminalMode::AppContainer { .. } => Some(create_restricted_token(&[])?),
         };
 
         // 纵深第 2 层：Job（创建时经 JOB_LIST 原子入 Job，无「先跑再入」窗口）
@@ -1963,11 +1978,12 @@ fn spawn_stderr_reader(mut read: std::fs::File, tail: Arc<Mutex<StderrTail>>) {
 /// 启动身份：决定用哪几层隔离（沙箱机制与身份一一对应）。
 #[derive(Clone, Copy)]
 enum StdioIdentity<'a> {
-    /// 仅留 SeChangeNotifyPrivilege 的受限令牌 + Job + 句柄白名单（默认）。
-    RestrictedToken,
+    /// 受限令牌 + Job + 句柄白名单（默认）。`write_sids` 为空 = 逻辑档；
+    /// 非空 = 写约束档（`WRITE_RESTRICTED`）。
+    RestrictedToken { write_sids: &'a [PSID] },
     /// 逐服务器显式豁免（X10）：仅 Job + 句柄白名单。
     Unsandboxed,
-    /// AppContainer + 受限令牌 + Job + 句柄白名单（SH-064 5a）。
+    /// AppContainer + 受限令牌 + Job + 句柄白名单（SH-064 5a，显式选档时）。
     AppContainer { sid: PSID, capabilities: &'a [PSID] },
 }
 
@@ -1989,7 +2005,8 @@ fn spawn_stdio(spec: &StdioSpawnSpec<'_>, tx: mpsc::Sender<StdioEvent>) -> Resul
     let cwd_wide = wide(spec.cwd.as_os_str());
     let environment_block = build_environment_block(&env);
     let mode = match spec.identity {
-        StdioIdentity::RestrictedToken => "受限令牌 + Job",
+        StdioIdentity::RestrictedToken { write_sids: [] } => "受限令牌 + Job",
+        StdioIdentity::RestrictedToken { .. } => "写约束受限令牌 + Job",
         StdioIdentity::Unsandboxed => "未沙箱（显式豁免）",
         StdioIdentity::AppContainer { .. } => "AppContainer + 受限令牌 + Job",
     };
@@ -1997,7 +2014,10 @@ fn spawn_stdio(spec: &StdioSpawnSpec<'_>, tx: mpsc::Sender<StdioEvent>) -> Resul
     unsafe {
         let token = match spec.identity {
             StdioIdentity::Unsandboxed => None,
-            _ => Some(create_restricted_token(&[])?),
+            StdioIdentity::RestrictedToken { write_sids } => {
+                Some(create_restricted_token(write_sids)?)
+            }
+            StdioIdentity::AppContainer { .. } => Some(create_restricted_token(&[])?),
         };
 
         // Job：KILL_ON_JOB_CLOSE，随句柄关闭收掉整棵树。
@@ -2137,7 +2157,32 @@ pub fn spawn_restricted_stdio(
             args,
             cwd,
             env,
-            identity: StdioIdentity::RestrictedToken,
+            identity: StdioIdentity::RestrictedToken { write_sids: &[] },
+            max_line_bytes: MAX_MCP_STDIO_LINE_BYTES,
+        },
+        tx,
+    )
+}
+
+/// 以「写约束受限令牌（`WRITE_RESTRICTED` + restricting SID）+ Job + 句柄白名单」启动 MCP stdio server。
+///
+/// `write_sids` 是允许写入的 SID 列表（工作区、temp 等）；进程对不在列表内的路径
+/// **读不受限、写被 OS 拒绝**。空列表等价于 [`spawn_restricted_stdio`]。
+pub fn spawn_write_restricted_stdio(
+    program: &str,
+    args: &[&str],
+    cwd: &Path,
+    env: &BTreeMap<String, String>,
+    write_sids: &[PSID],
+    tx: mpsc::Sender<StdioEvent>,
+) -> Result<RestrictedStdioChild, String> {
+    spawn_stdio(
+        &StdioSpawnSpec {
+            program,
+            args,
+            cwd,
+            env,
+            identity: StdioIdentity::RestrictedToken { write_sids },
             max_line_bytes: MAX_MCP_STDIO_LINE_BYTES,
         },
         tx,
@@ -2211,7 +2256,7 @@ fn spawn_restricted_stdio_with_max_line(
             args,
             cwd,
             env,
-            identity: StdioIdentity::RestrictedToken,
+            identity: StdioIdentity::RestrictedToken { write_sids: &[] },
             max_line_bytes,
         },
         tx,

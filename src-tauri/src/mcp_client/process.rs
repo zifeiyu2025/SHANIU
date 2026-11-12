@@ -173,6 +173,7 @@ impl McpProcess {
             sandbox::prepare_stdio(
                 sandbox::StdioRequest {
                     policy: mode,
+                    os: sandbox::current_os_mode(),
                     server_id: &server_id,
                     program: &program,
                     args: &arg_refs,

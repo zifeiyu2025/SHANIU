@@ -171,7 +171,7 @@ impl CoverageView {
 /// 状态条说已断、审查页说未生效、日志说允许，用户没法判断。
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, Default)]
 pub struct SandboxSummary {
-    /// `app_container` | `logical` | `unsandboxed`
+    /// `restricted_token` | `app_container` | `logical` | `unsandboxed`
     pub kind: String,
     /// 容器 profile 名（仅 `app_container` 非空）。
     #[serde(default)]
@@ -190,6 +190,9 @@ impl SandboxSummary {
     /// 单行描述：日志与界面标题共用，避免三处措辞漂移。
     pub fn line(&self) -> String {
         let mut text = match self.kind.as_str() {
+            "restricted_token" => {
+                "受限令牌（只约束写：写入仅限授权位置，读不受限制）".to_string()
+            }
             "app_container" => format!("AppContainer（profile {}）", self.profile),
             "logical" => "逻辑沙箱（仅受限令牌 + Job，无路径级写入边界）".to_string(),
             _ => "未沙箱（逐服务器显式豁免）".to_string(),
@@ -243,18 +246,30 @@ fn sandbox_summary(config: &McpServerConfig, os: crate::config::OsSandbox) -> Sa
         })
         .collect();
     match os {
-        // 写约束档下 MCP server **仍由容器启停**（见 sandbox::prepare_stdio 的分支），
-        // 所以这里如实报 app_container，而不是把它写成 restricted_token。
-        crate::config::OsSandbox::AppContainer | crate::config::OsSandbox::RestrictedToken => {
-            SandboxSummary {
-                kind: "app_container".to_string(),
-                profile: crate::sandbox::appcontainer::mcp_profile_name(&config.id)
-                    .unwrap_or_default(),
-                workspace,
-                allowed_roots,
-                network: if config.allow_network { "allowed" } else { "denied" }.to_string(),
+        // 默认档：server 由写约束受限令牌启停（见 sandbox::prepare_stdio），
+        // 没有容器、没有 profile，网络也没有 OS 隔离。
+        crate::config::OsSandbox::RestrictedToken => SandboxSummary {
+            kind: "restricted_token".to_string(),
+            profile: String::new(),
+            workspace,
+            allowed_roots,
+            // 只约束写：`allow_network = false` 在这里没有强制手段，不能报「已拒绝」。
+            network: if config.allow_network {
+                "allowed"
+            } else {
+                "not_isolated"
             }
-        }
+            .to_string(),
+        },
+        // 显式选 AppContainer 时才有容器 profile 与真正的网络能力边界。
+        crate::config::OsSandbox::AppContainer => SandboxSummary {
+            kind: "app_container".to_string(),
+            profile: crate::sandbox::appcontainer::mcp_profile_name(&config.id)
+                .unwrap_or_default(),
+            workspace,
+            allowed_roots,
+            network: if config.allow_network { "allowed" } else { "denied" }.to_string(),
+        },
         crate::config::OsSandbox::Logical => SandboxSummary {
             kind: "logical".to_string(),
             profile: String::new(),

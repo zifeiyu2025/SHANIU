@@ -3110,12 +3110,14 @@ pub fn run() {
     // 继承，本机实测 `D:\MyWorkspace` 25.6s + `D:\MyWorkspace\SHANIU` 25.4s。这段代价
     // 绝不能挡在第一次 exec 前面，所以放在这里异步跑：启动不等待、命令不阻塞、
     // 失败只降级为「某些祖先前缀探测不到」并在自报里标 `ancestors=needs_admin`。
-    // 只有真的会起容器（workspace-write + AppContainer，或写约束档下仍走容器的
-    // MCP server / 交互终端）才有这件事要做；logical 回退没有容器，不需要祖先 ACE。
+    // 只有真的会起容器（workspace-write + `sandbox.os = "app_container"`）才需要祖先 ACE：
+    // exec、交互终端、MCP server 的默认档都是写约束受限令牌，没有祖先链；
+    // logical 回退同样没有容器。条件必须与这三面的实际分支一一对应，
+    // 否则要么白写 DACL，要么留下「等祖先权限」的窗口。
     {
         let sandbox_config = &app_state.config().sandbox;
         if sandbox_config.mode == config::SandboxMode::WorkspaceWrite
-            && sandbox_config.os != config::OsSandbox::Logical
+            && sandbox_config.os == config::OsSandbox::AppContainer
         {
             sandbox::enable_ancestor_provisioning();
             sandbox::provision_ancestors_in_background(registered_workspace_roots(&app_state));
