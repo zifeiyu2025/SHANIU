@@ -2024,7 +2024,7 @@ fn record_tool_result(
     };
     history.push(HistoryItem::FunctionCallOutput {
         call_id: call_id.to_string(),
-        output: match crate::sandbox::execution_note(name, sandbox) {
+        output: match crate::sandbox::execution_note(name, sandbox, &output_text) {
             Some(note) => format!("{output_text}\n{note}"),
             None => output_text.clone(),
         },

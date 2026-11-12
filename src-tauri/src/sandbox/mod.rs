@@ -130,12 +130,29 @@ pub fn current_enforcement(mode: SandboxMode) -> SandboxEnforcement {
 /// 读写文件类工具的结果里塞这行只是噪声，模型也拿它做不了判断。
 const EXEC_TOOLS: &[&str] = &["unified_exec", "terminal"];
 
+/// 受限令牌档下 libuv 建管道用的是 Win32 默认安全描述符模板（不含 restricting SID），
+/// 所以 `spawnSync` 一类需要管道 stdio 的命令会拿到 EPERM。参考项目 dsh 撞到同一问题后
+/// 登记为已知限制（不修，需要管道时走用户批准的升权）；这里只把失败语义标出来，
+/// 不改变任何执行行为，也不据此放宽令牌/DACL。
+const PIPED_STDIO_DENIED_MARKERS: &[&str] = &["spawnSync", "spawn EPERM", "EPERM: spawn"];
+
+/// 是否属于「写约束档下管道 stdio 被拒」。只认写约束档：同一段 stderr 出现在别的档
+/// 里原因不同（比如全权档的权限问题），标成管道限制会误导模型。
+fn denied_piped_stdio(mode: SandboxMode, output: &str) -> bool {
+    mode == SandboxMode::WorkspaceWrite
+        && PIPED_STDIO_DENIED_MARKERS
+            .iter()
+            .any(|marker| output.contains(marker))
+}
+
 /// 给模型看的沙箱自报（拼在工具结果末尾）。非执行类工具返回 `None`。
 ///
 /// 措辞固定为 `[sandbox] mode=… enforcement=…`：机器可读，不随界面文案漂移。
 /// 祖先 ACE 还在后台补 / 补不上时追加 `ancestors=preparing|needs_admin`——这是
 /// 「这条命令为什么可能看不到某个目录」的唯一线索，别让它只留在日志里。
-pub fn execution_note(tool: &str, mode: SandboxMode) -> Option<String> {
+/// `output` 是本条工具结果的文本（含 stderr）：写约束档下的管道 EPERM 追加
+/// `denied=piped-stdio`，其余字段不动。
+pub fn execution_note(tool: &str, mode: SandboxMode, output: &str) -> Option<String> {
     if !EXEC_TOOLS.contains(&tool) {
         return None;
     }
@@ -151,6 +168,9 @@ pub fn execution_note(tool: &str, mode: SandboxMode) -> Option<String> {
             AncestorState::NeedsAdmin => note.push_str(" ancestors=needs_admin"),
             AncestorState::Idle | AncestorState::Ready => {}
         }
+    }
+    if denied_piped_stdio(mode, output) {
+        note.push_str(" denied=piped-stdio");
     }
     Some(note)
 }
@@ -1803,17 +1823,43 @@ mod tests {
     /// 自报只挂在真的执行了子进程的工具上，且字段名固定。
     #[test]
     fn execution_note_only_for_exec_tools() {
-        assert!(execution_note("read_file", SandboxMode::WorkspaceWrite).is_none());
-        let note = execution_note("unified_exec", SandboxMode::WorkspaceWrite).expect("应有自报");
+        assert!(execution_note("read_file", SandboxMode::WorkspaceWrite, "").is_none());
+        let note = execution_note("unified_exec", SandboxMode::WorkspaceWrite, "")
+            .expect("应有自报");
         assert!(
             note.starts_with("[sandbox] mode=workspace_write enforcement="),
             "实际: {note}"
         );
-        let escalated = execution_note("terminal", SandboxMode::DangerFullAccess).unwrap();
+        let escalated = execution_note("terminal", SandboxMode::DangerFullAccess, "").unwrap();
         assert!(
             escalated.contains("mode=danger_full_access"),
             "实际: {escalated}"
         );
+    }
+
+    /// 管道 stdio 的 EPERM 只在写约束档标语义，且不动自报的其他字段。
+    #[test]
+    fn execution_note_marks_piped_stdio_denied_only_in_write_mode() {
+        // 真机原文形如 `Error: spawnSync C:\WINDOWS\system32\cmd.exe EPERM`。
+        let stderr = "Error: spawnSync C:\\WINDOWS\\system32\\cmd.exe EPERM";
+        let note = execution_note("unified_exec", SandboxMode::WorkspaceWrite, stderr).unwrap();
+        assert!(note.ends_with(" denied=piped-stdio"), "实际: {note}");
+        assert!(
+            note.starts_with("[sandbox] mode=workspace_write enforcement="),
+            "原有字段不该被改动: {note}"
+        );
+
+        // 非写约束档：同一段 stderr 不许被标成管道限制。
+        for mode in [SandboxMode::ReadOnly, SandboxMode::DangerFullAccess] {
+            let note = execution_note("unified_exec", mode, stderr).unwrap();
+            assert!(!note.contains("denied="), "{mode:?} 不该命中: {note}");
+        }
+
+        // 写约束档里的普通失败：不含管道 spawn 特征就不许标。
+        for text in ["[exit code: 1]", "EPERM: operation not permitted", ""] {
+            let note = execution_note("unified_exec", SandboxMode::WorkspaceWrite, text).unwrap();
+            assert!(!note.contains("denied="), "「{text}」不该命中: {note}");
+        }
     }
 
     /// 非法 server id 派生不出容器名：必须**直接失败**，不能悄悄退回受限令牌。
@@ -2538,7 +2584,7 @@ mod tests {
 
         // `Preparing` 期间的自报必须带上状态：这是用户唯一能看到的「为什么看不到某个目录」。
         if ancestor_state() == AncestorState::Preparing {
-            let note = execution_note("unified_exec", SandboxMode::WorkspaceWrite)
+            let note = execution_note("unified_exec", SandboxMode::WorkspaceWrite, "")
                 .expect("执行类工具应有自报");
             eprintln!("[provision] Preparing 期自报：{note}");
             assert!(note.contains("ancestors=preparing"), "实际: {note}");
