@@ -1,0 +1,14 @@
+   Compiling shaniu v0.2.5 (D:\MyWorkspace\SHANIU\src-tauri)
+    Finished `test` profile [unoptimized + debuginfo] target(s) in 23.37s
+     Running tests\sandbox_probe.rs (target\debug\deps\sandbox_probe-6705a124e10e102b.exe)
+
+running 6 tests
+test write_restricted_allows_read_outside_workspace ... ok
+test write_restricted_allows_write_inside_workspace ... ok
+test write_restricted_can_reach_host_loopback ... ok
+test write_restricted_denies_write_outside_workspace ... ok
+test write_restricted_reaches_internet_without_any_grant ... ignored, 需要外网：写约束令牌默认出网的真机验证
+test write_restricted_restricts_node_grandchild ... ok
+
+test result: ok. 5 passed; 0 failed; 1 ignored; 0 measured; 10 filtered out; finished in 0.23s
+

@@ -1,0 +1,29 @@
+   Compiling shaniu v0.2.5 (D:\MyWorkspace\SHANIU\src-tauri)
+warning: unused import: `LUA_TOKEN`
+  --> src\sandbox\windows_impl.rs:40:64
+   |
+40 |     ACL, CREATE_RESTRICTED_TOKEN_FLAGS, DISABLE_MAX_PRIVILEGE, LUA_TOKEN, PSID, WRITE_RESTRICTED,
+   |                                                                ^^^^^^^^^
+   |
+   = note: `#[warn(unused_imports)]` (part of `#[warn(unused)]`) on by default
+
+warning: `shaniu` (lib) generated 1 warning (run `cargo fix --lib -p shaniu` to apply 1 suggestion)
+    Finished `test` profile [unoptimized + debuginfo] target(s) in 24.36s
+     Running tests\sandbox_probe.rs (target\debug\deps\sandbox_probe-6705a124e10e102b.exe)
+
+running 1 test
+[sid-probe] logon=S-1-5-5-0-673530 everyone=S-1-1-0 write=["S-1-4-672279689-600797215", "S-1-4-277320191-34693441-1"]
+
+thread 'write_restricted_reaches_internet_without_any_grant' (10652) panicked at tests\sandbox_probe.rs:894:5:
+curl 应返回 200，实际输出：
+note: run with `RUST_BACKTRACE=1` environment variable to display a backtrace
+test write_restricted_reaches_internet_without_any_grant ... FAILED
+
+failures:
+
+failures:
+    write_restricted_reaches_internet_without_any_grant
+
+test result: FAILED. 0 passed; 1 failed; 0 ignored; 0 measured; 16 filtered out; finished in 0.14s
+
+error: test failed, to rerun pass `--test sandbox_probe`

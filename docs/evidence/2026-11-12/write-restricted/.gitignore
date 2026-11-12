@@ -1,0 +1,12 @@
+# 证据目录只入库「可复查的产物」：
+# - secrets/ 是 DPAPI 加密的凭据存储，属于密钥边界，永不入库；
+# - cache/ 是运行期缓存，无证据价值；
+# - workspace/target/ 是验收用最小 crate 的构建产物。
+data-root/secrets/
+data-root/cache/
+workspace/target/
+
+# 仓库根 `.gitignore` 忽略 `*.log` 与 `logs/`；本目录里的运行日志与验收轨迹就是证据本体，
+# 在这里显式放行（否则 docs/16 §9 引用的 drive.log 在 clone 后不存在）。
+!data-root/logs/
+!*.log

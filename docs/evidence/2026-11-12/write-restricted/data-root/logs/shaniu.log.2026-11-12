@@ -1,0 +1,84 @@
+2026-11-12T11:56:44.518628Z  INFO shaniu_lib: config_root: d:\MyWorkspace\SHANIU\docs\evidence\2026-11-12\write-restricted\data-root
+2026-11-12T11:56:44.523637Z  INFO shaniu_lib: data_root:   d:\MyWorkspace\SHANIU\docs\evidence\2026-11-12\write-restricted\data-root
+2026-11-12T11:56:44.523709Z  INFO shaniu_lib: workspace:   d:\MyWorkspace\SHANIU\docs\evidence\2026-11-12\write-restricted\data-root\Workspace
+2026-11-12T11:56:44.523737Z  INFO shaniu_lib: 数据根判定 data_root_kind="env" record=C:\Users\jun\AppData\Local\SHANIU\data-root\c1138d696c584b01.json decided_now=false
+2026-11-12T11:56:44.527356Z  INFO shaniu_lib::sandbox: 沙箱文件权限后台预置开始（不阻塞命令执行） roots=1 state="preparing"
+2026-11-12T11:56:44.529298Z  INFO shaniu_lib::sandbox::acl: 目录已有容器 SID 的显式 ACE，跳过改写（持久授权命中） dir=C:\Users\jun\.cargo
+2026-11-12T11:56:44.529676Z  INFO shaniu_lib::sandbox::acl: 目录已有容器 SID 的显式 ACE，跳过改写（持久授权命中） dir=C:\Users\jun\.rustup
+2026-11-12T11:56:44.529967Z  INFO shaniu_lib::sandbox::acl: 目录已有容器 SID 的显式 ACE，跳过改写（持久授权命中） dir=C:\Users\jun\AppData\Local\Temp
+2026-11-12T11:56:44.531754Z  INFO shaniu_lib::sandbox::acl: 目录授权审计 action="grant" path=D:\MyWorkspace\SHANIU\docs\evidence\2026-11-12\write-restricted\workspace sid="S-1-15-2-1983691489-4147020651-3927463519-3530369433-875054126-3321602352-1494959735" access="write" result="ok"
+2026-11-12T11:56:44.532339Z  INFO shaniu_lib::sandbox: 沙箱写权限已持久化（不随退出还原，下次启动探测命中即跳过） path=D:\MyWorkspace\SHANIU\docs\evidence\2026-11-12\write-restricted\workspace elapsed_ms=2
+2026-11-12T11:56:44.539006Z  INFO shaniu_lib::sandbox: 祖先 ACE 已写入 `(RA,S)` path=D:\MyWorkspace\SHANIU\docs elapsed_ms=11
+2026-11-12T11:56:44.543053Z  INFO shaniu_lib::sandbox: 祖先 ACE 已写入 `(RA,S)` path=D:\MyWorkspace\SHANIU\docs\evidence elapsed_ms=15
+2026-11-12T11:56:44.546990Z  INFO shaniu_lib::sandbox: 祖先 ACE 已写入 `(RA,S)` path=D:\MyWorkspace\SHANIU\docs\evidence\2026-11-12 elapsed_ms=19
+2026-11-12T11:56:44.550540Z  INFO shaniu_lib::sandbox: 祖先 ACE 已写入 `(RA,S)` path=D:\MyWorkspace\SHANIU\docs\evidence\2026-11-12\write-restricted elapsed_ms=23
+2026-11-12T11:56:44.551020Z  INFO shaniu_lib::sandbox: 沙箱文件权限后台预置结束（工作区根/临时/工具链与祖先 (RA,S) 都持久化，下次启动按真实 DACL 探测，命中即跳过） written=5 present=5 denied=0 failed=0 cancelled=false elapsed_ms=23 state="ready"
+2026-11-12T11:56:44.910251Z  INFO shaniu_lib::gateway: WebSocket gateway 监听 127.0.0.1:53349
+2026-11-12T11:56:47.912047Z  WARN shaniu_lib: 前端未在 3 秒内发出就绪信号，强制显示主窗口
+2026-11-12T11:59:53.521312Z  INFO shaniu_lib: config_root: d:\MyWorkspace\SHANIU\docs\evidence\2026-11-12\write-restricted\data-root
+2026-11-12T11:59:53.525428Z  INFO shaniu_lib: data_root:   d:\MyWorkspace\SHANIU\docs\evidence\2026-11-12\write-restricted\data-root
+2026-11-12T11:59:53.525469Z  INFO shaniu_lib: workspace:   d:\MyWorkspace\SHANIU\docs\evidence\2026-11-12\write-restricted\data-root\Workspace
+2026-11-12T11:59:53.525487Z  INFO shaniu_lib: 数据根判定 data_root_kind="env" record=C:\Users\jun\AppData\Local\SHANIU\data-root\c1138d696c584b01.json decided_now=false
+2026-11-12T11:59:53.528223Z  INFO shaniu_lib::sandbox: 沙箱文件权限后台预置开始（不阻塞命令执行） roots=1 state="preparing"
+2026-11-12T11:59:53.529623Z  INFO shaniu_lib::sandbox::acl: 目录已有容器 SID 的显式 ACE，跳过改写（持久授权命中） dir=C:\Users\jun\.cargo
+2026-11-12T11:59:53.529895Z  INFO shaniu_lib::sandbox::acl: 目录已有容器 SID 的显式 ACE，跳过改写（持久授权命中） dir=C:\Users\jun\.rustup
+2026-11-12T11:59:53.530109Z  INFO shaniu_lib::sandbox::acl: 目录已有容器 SID 的显式 ACE，跳过改写（持久授权命中） dir=C:\Users\jun\AppData\Local\Temp
+2026-11-12T11:59:53.530591Z  INFO shaniu_lib::sandbox::acl: 目录已有容器 SID 的显式 ACE，跳过改写（持久授权命中） dir=D:\MyWorkspace\SHANIU\docs\evidence\2026-11-12\write-restricted\workspace
+2026-11-12T11:59:53.531228Z  INFO shaniu_lib::sandbox: 沙箱文件权限后台预置结束（工作区根/临时/工具链与祖先 (RA,S) 都持久化，下次启动按真实 DACL 探测，命中即跳过） written=0 present=10 denied=0 failed=0 cancelled=false elapsed_ms=3 state="ready"
+2026-11-12T11:59:53.771920Z  INFO shaniu_lib::gateway: WebSocket gateway 监听 127.0.0.1:53116
+2026-11-12T11:59:56.777732Z  WARN shaniu_lib: 前端未在 3 秒内发出就绪信号，强制显示主窗口
+2026-11-12T12:01:25.166780Z  INFO shaniu_lib: config_root: d:\MyWorkspace\SHANIU\docs\evidence\2026-11-12\write-restricted\data-root
+2026-11-12T12:01:25.170647Z  INFO shaniu_lib: data_root:   d:\MyWorkspace\SHANIU\docs\evidence\2026-11-12\write-restricted\data-root
+2026-11-12T12:01:25.170678Z  INFO shaniu_lib: workspace:   d:\MyWorkspace\SHANIU\docs\evidence\2026-11-12\write-restricted\data-root\Workspace
+2026-11-12T12:01:25.170696Z  INFO shaniu_lib: 数据根判定 data_root_kind="env" record=C:\Users\jun\AppData\Local\SHANIU\data-root\c1138d696c584b01.json decided_now=false
+2026-11-12T12:01:25.173581Z  INFO shaniu_lib::sandbox: 沙箱文件权限后台预置开始（不阻塞命令执行） roots=1 state="preparing"
+2026-11-12T12:01:25.174921Z  INFO shaniu_lib::sandbox::acl: 目录已有容器 SID 的显式 ACE，跳过改写（持久授权命中） dir=C:\Users\jun\.cargo
+2026-11-12T12:01:25.175260Z  INFO shaniu_lib::sandbox::acl: 目录已有容器 SID 的显式 ACE，跳过改写（持久授权命中） dir=C:\Users\jun\.rustup
+2026-11-12T12:01:25.175511Z  INFO shaniu_lib::sandbox::acl: 目录已有容器 SID 的显式 ACE，跳过改写（持久授权命中） dir=C:\Users\jun\AppData\Local\Temp
+2026-11-12T12:01:25.175999Z  INFO shaniu_lib::sandbox::acl: 目录已有容器 SID 的显式 ACE，跳过改写（持久授权命中） dir=D:\MyWorkspace\SHANIU\docs\evidence\2026-11-12\write-restricted\workspace
+2026-11-12T12:01:25.176719Z  INFO shaniu_lib::sandbox: 沙箱文件权限后台预置结束（工作区根/临时/工具链与祖先 (RA,S) 都持久化，下次启动按真实 DACL 探测，命中即跳过） written=0 present=10 denied=0 failed=0 cancelled=false elapsed_ms=3 state="ready"
+2026-11-12T12:01:25.421631Z  INFO shaniu_lib::gateway: WebSocket gateway 监听 127.0.0.1:57842
+2026-11-12T12:01:28.429550Z  WARN shaniu_lib: 前端未在 3 秒内发出就绪信号，强制显示主窗口
+2026-11-12T12:01:29.710378Z  INFO shaniu_lib: 前端就绪信号到达，显示主窗口
+2026-11-12T12:01:38.388160Z  WARN shaniu_lib::agent_loop: 模型未声明 context_window：压缩阈值按保守窗口推导，请在模型行补全该字段 configured=500000 fallback_window=128000
+2026-11-12T12:01:38.520276Z  WARN shaniu_lib::agent_loop::prompt: 系统提示超出 token 预算 prompt_version="2026-11-12.2" prompt_tokens=2502 limit=2500
+2026-11-12T12:01:38.520526Z  INFO shaniu_lib::agent_loop::prompt: 系统提示已组装（内容锁） prompt_version="2026-11-12.2" prompt_fingerprint=5b3f3f4032c6090f prompt_tokens=2502 prompt_chars=3615 rules_fingerprint=2ebd5353ac8dda5c rules_sources=1 rules_selection=声明选节：第 3 行，8 个锚点 rules_dropped=文档地图（终态）、1. 允许 / 禁止的工作、2.1 逐路径要求与原因、4. 每次变更的必需证据、4.1 测试密钥（唯一约定）、4.2.1 事故与细则、4.3.1 实例：假绿与假红、4.4 写了要接上（未接线的代码按未完成处理）、5. 验证与验收、6. 依赖规则、7. 例外条款、8. 可追溯清单（每次交付时自检）、9. 工作节奏、10. 方向性约定（2026-11-08 起生效）、11. 缝合原则（全文见 `docs/01` §2.4）、11.1 自研四样、11.2 判断流程 rules_clipped=
+2026-11-12T12:01:38.529927Z  INFO shaniu_lib::sandbox::acl: 目录已有容器 SID 的显式 ACE，跳过改写（持久授权命中） dir=C:\Users\jun\.cargo
+2026-11-12T12:01:38.530214Z  INFO shaniu_lib::sandbox::acl: 目录已有容器 SID 的显式 ACE，跳过改写（持久授权命中） dir=C:\Users\jun\.rustup
+2026-11-12T12:01:38.530445Z  INFO shaniu_lib::sandbox::acl: 目录已有容器 SID 的显式 ACE，跳过改写（持久授权命中） dir=C:\Users\jun\AppData\Local\Temp
+2026-11-12T12:01:38.532189Z  INFO shaniu_lib::sandbox::acl: 目录授权审计 action="grant" path=D:\MyWorkspace\SHANIU\docs\evidence\2026-11-12\write-restricted\workspace sid="S-1-4-678263378-59939818" access="write" result="ok"
+2026-11-12T12:01:38.532623Z  INFO shaniu_lib::sandbox: 写约束沙箱就绪：受限令牌 WRITE_RESTRICTED，读与网络不约束 workspace=D:\MyWorkspace\SHANIU\docs\evidence\2026-11-12\write-restricted\workspace workspace_sid="S-1-4-678263378-59939818" temp_sid="S-1-4-277320191-34693441-1"
+2026-11-12T12:01:38.549238Z  INFO shaniu_lib::sandbox: 写约束沙箱就绪：受限令牌 WRITE_RESTRICTED，读与网络不约束 workspace=D:\MyWorkspace\SHANIU\docs\evidence\2026-11-12\write-restricted\workspace workspace_sid="S-1-4-678263378-59939818" temp_sid="S-1-4-277320191-34693441-1"
+2026-11-12T12:01:38.565204Z  INFO shaniu_lib::sandbox: 写约束沙箱就绪：受限令牌 WRITE_RESTRICTED，读与网络不约束 workspace=D:\MyWorkspace\SHANIU\docs\evidence\2026-11-12\write-restricted\workspace workspace_sid="S-1-4-678263378-59939818" temp_sid="S-1-4-277320191-34693441-1"
+2026-11-12T12:01:38.584086Z  INFO shaniu_lib::sandbox: 写约束沙箱就绪：受限令牌 WRITE_RESTRICTED，读与网络不约束 workspace=D:\MyWorkspace\SHANIU\docs\evidence\2026-11-12\write-restricted\workspace workspace_sid="S-1-4-678263378-59939818" temp_sid="S-1-4-277320191-34693441-1"
+2026-11-12T12:01:38.654230Z  INFO shaniu_lib::sandbox: 写约束沙箱就绪：受限令牌 WRITE_RESTRICTED，读与网络不约束 workspace=D:\MyWorkspace\SHANIU\docs\evidence\2026-11-12\write-restricted\workspace workspace_sid="S-1-4-678263378-59939818" temp_sid="S-1-4-277320191-34693441-1"
+2026-11-12T12:01:38.731969Z  INFO shaniu_lib::sandbox: 写约束沙箱就绪：受限令牌 WRITE_RESTRICTED，读与网络不约束 workspace=D:\MyWorkspace\SHANIU\docs\evidence\2026-11-12\write-restricted\workspace workspace_sid="S-1-4-678263378-59939818" temp_sid="S-1-4-277320191-34693441-1"
+2026-11-12T12:01:39.376141Z  INFO shaniu_lib::sandbox: 写约束沙箱就绪：受限令牌 WRITE_RESTRICTED，读与网络不约束 workspace=D:\MyWorkspace\SHANIU\docs\evidence\2026-11-12\write-restricted\workspace workspace_sid="S-1-4-678263378-59939818" temp_sid="S-1-4-277320191-34693441-1"
+2026-11-12T12:01:53.903573Z  INFO shaniu_lib::gateway: gateway 在线订阅计数 +1 viewers=1
+2026-11-12T12:06:05.507528Z  INFO shaniu_lib: config_root: d:\MyWorkspace\SHANIU\docs\evidence\2026-11-12\write-restricted\data-root
+2026-11-12T12:06:05.512137Z  INFO shaniu_lib: data_root:   d:\MyWorkspace\SHANIU\docs\evidence\2026-11-12\write-restricted\data-root
+2026-11-12T12:06:05.512183Z  INFO shaniu_lib: workspace:   d:\MyWorkspace\SHANIU\docs\evidence\2026-11-12\write-restricted\data-root\Workspace
+2026-11-12T12:06:05.512204Z  INFO shaniu_lib: 数据根判定 data_root_kind="env" record=C:\Users\jun\AppData\Local\SHANIU\data-root\c1138d696c584b01.json decided_now=false
+2026-11-12T12:06:05.515489Z  INFO shaniu_lib::sandbox: 沙箱文件权限后台预置开始（不阻塞命令执行） roots=1 state="preparing"
+2026-11-12T12:06:05.517214Z  INFO shaniu_lib::sandbox::acl: 目录已有容器 SID 的显式 ACE，跳过改写（持久授权命中） dir=C:\Users\jun\.cargo
+2026-11-12T12:06:05.517568Z  INFO shaniu_lib::sandbox::acl: 目录已有容器 SID 的显式 ACE，跳过改写（持久授权命中） dir=C:\Users\jun\.rustup
+2026-11-12T12:06:05.517788Z  INFO shaniu_lib::sandbox::acl: 目录已有容器 SID 的显式 ACE，跳过改写（持久授权命中） dir=C:\Users\jun\AppData\Local\Temp
+2026-11-12T12:06:05.518286Z  INFO shaniu_lib::sandbox::acl: 目录已有容器 SID 的显式 ACE，跳过改写（持久授权命中） dir=D:\MyWorkspace\SHANIU\docs\evidence\2026-11-12\write-restricted\workspace
+2026-11-12T12:06:05.518980Z  INFO shaniu_lib::sandbox: 沙箱文件权限后台预置结束（工作区根/临时/工具链与祖先 (RA,S) 都持久化，下次启动按真实 DACL 探测，命中即跳过） written=0 present=10 denied=0 failed=0 cancelled=false elapsed_ms=3 state="ready"
+2026-11-12T12:06:05.773747Z  INFO shaniu_lib::gateway: WebSocket gateway 监听 127.0.0.1:64430
+2026-11-12T12:06:06.062639Z  INFO shaniu_lib: 前端就绪信号到达，显示主窗口
+2026-11-12T12:06:06.984951Z  INFO shaniu_lib::gateway: gateway 在线订阅计数 +1 viewers=1
+2026-11-12T12:06:16.246395Z  WARN shaniu_lib::agent_loop: 模型未声明 context_window：压缩阈值按保守窗口推导，请在模型行补全该字段 configured=500000 fallback_window=128000
+2026-11-12T12:06:16.505049Z  WARN shaniu_lib::agent_loop::prompt: 系统提示超出 token 预算 prompt_version="2026-11-12.2" prompt_tokens=2502 limit=2500
+2026-11-12T12:06:16.505239Z  INFO shaniu_lib::agent_loop::prompt: 系统提示已组装（内容锁） prompt_version="2026-11-12.2" prompt_fingerprint=5b3f3f4032c6090f prompt_tokens=2502 prompt_chars=3615 rules_fingerprint=2ebd5353ac8dda5c rules_sources=1 rules_selection=声明选节：第 3 行，8 个锚点 rules_dropped=文档地图（终态）、1. 允许 / 禁止的工作、2.1 逐路径要求与原因、4. 每次变更的必需证据、4.1 测试密钥（唯一约定）、4.2.1 事故与细则、4.3.1 实例：假绿与假红、4.4 写了要接上（未接线的代码按未完成处理）、5. 验证与验收、6. 依赖规则、7. 例外条款、8. 可追溯清单（每次交付时自检）、9. 工作节奏、10. 方向性约定（2026-11-08 起生效）、11. 缝合原则（全文见 `docs/01` §2.4）、11.1 自研四样、11.2 判断流程 rules_clipped=
+2026-11-12T12:06:16.512555Z  INFO shaniu_lib::sandbox::acl: 目录已有容器 SID 的显式 ACE，跳过改写（持久授权命中） dir=C:\Users\jun\.cargo
+2026-11-12T12:06:16.512813Z  INFO shaniu_lib::sandbox::acl: 目录已有容器 SID 的显式 ACE，跳过改写（持久授权命中） dir=C:\Users\jun\.rustup
+2026-11-12T12:06:16.513047Z  INFO shaniu_lib::sandbox::acl: 目录已有容器 SID 的显式 ACE，跳过改写（持久授权命中） dir=C:\Users\jun\AppData\Local\Temp
+2026-11-12T12:06:16.513536Z  INFO shaniu_lib::sandbox::acl: 目录已有容器 SID 的显式 ACE，跳过改写（持久授权命中） dir=D:\MyWorkspace\SHANIU\docs\evidence\2026-11-12\write-restricted\workspace
+2026-11-12T12:06:16.513593Z  INFO shaniu_lib::sandbox: 写约束沙箱就绪：受限令牌 WRITE_RESTRICTED，读与网络不约束 workspace=D:\MyWorkspace\SHANIU\docs\evidence\2026-11-12\write-restricted\workspace workspace_sid="S-1-4-678263378-59939818" temp_sid="S-1-4-277320191-34693441-1"
+2026-11-12T12:06:16.528682Z  INFO shaniu_lib::sandbox: 写约束沙箱就绪：受限令牌 WRITE_RESTRICTED，读与网络不约束 workspace=D:\MyWorkspace\SHANIU\docs\evidence\2026-11-12\write-restricted\workspace workspace_sid="S-1-4-678263378-59939818" temp_sid="S-1-4-277320191-34693441-1"
+2026-11-12T12:06:16.543459Z  INFO shaniu_lib::sandbox: 写约束沙箱就绪：受限令牌 WRITE_RESTRICTED，读与网络不约束 workspace=D:\MyWorkspace\SHANIU\docs\evidence\2026-11-12\write-restricted\workspace workspace_sid="S-1-4-678263378-59939818" temp_sid="S-1-4-277320191-34693441-1"
+2026-11-12T12:06:16.557166Z  INFO shaniu_lib::sandbox: 写约束沙箱就绪：受限令牌 WRITE_RESTRICTED，读与网络不约束 workspace=D:\MyWorkspace\SHANIU\docs\evidence\2026-11-12\write-restricted\workspace workspace_sid="S-1-4-678263378-59939818" temp_sid="S-1-4-277320191-34693441-1"
+2026-11-12T12:06:16.618882Z  INFO shaniu_lib::sandbox: 写约束沙箱就绪：受限令牌 WRITE_RESTRICTED，读与网络不约束 workspace=D:\MyWorkspace\SHANIU\docs\evidence\2026-11-12\write-restricted\workspace workspace_sid="S-1-4-678263378-59939818" temp_sid="S-1-4-277320191-34693441-1"
+2026-11-12T12:06:16.683195Z  INFO shaniu_lib::sandbox: 写约束沙箱就绪：受限令牌 WRITE_RESTRICTED，读与网络不约束 workspace=D:\MyWorkspace\SHANIU\docs\evidence\2026-11-12\write-restricted\workspace workspace_sid="S-1-4-678263378-59939818" temp_sid="S-1-4-277320191-34693441-1"
+2026-11-12T12:06:17.290588Z  INFO shaniu_lib::sandbox: 写约束沙箱就绪：受限令牌 WRITE_RESTRICTED，读与网络不约束 workspace=D:\MyWorkspace\SHANIU\docs\evidence\2026-11-12\write-restricted\workspace workspace_sid="S-1-4-678263378-59939818" temp_sid="S-1-4-277320191-34693441-1"

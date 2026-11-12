@@ -1,0 +1,27 @@
+   Compiling shaniu v0.2.5 (D:\MyWorkspace\SHANIU\src-tauri)
+    Finished `test` profile [unoptimized + debuginfo] target(s) in 3.02s
+     Running tests\sandbox_probe.rs (target\debug\deps\sandbox_probe-6705a124e10e102b.exe)
+
+running 1 test
+
+thread 'write_restricted_reaches_internet_without_any_grant' (12400) panicked at tests\sandbox_probe.rs:863:5:
+curl 应返回 200，实际输出：* Host www.baidu.com:443 was resolved.
+* IPv6: 2408:871a:2100:1b23:0:ff:b07a:7ebc, 2408:871a:2100:186c:0:ff:b07e:3fbc
+* IPv4: 110.242.69.21, 110.242.70.57
+*   Trying [2408:871a:2100:1b23:0:ff:b07a:7ebc]:443...
+* schannel: disabled automatic use of client certificate
+* schannel: AcquireCredentialsHandle failed: SEC_E_NO_CREDENTIALS (0x8009030e) - 安全包中没有可用的凭证
+* closing connection #0
+000
+
+note: run with `RUST_BACKTRACE=1` environment variable to display a backtrace
+test write_restricted_reaches_internet_without_any_grant ... FAILED
+
+failures:
+
+failures:
+    write_restricted_reaches_internet_without_any_grant
+
+test result: FAILED. 0 passed; 1 failed; 0 ignored; 0 measured; 15 filtered out; finished in 0.17s
+
+error: test failed, to rerun pass `--test sandbox_probe`

@@ -1,0 +1,8 @@
+    Finished `test` profile [unoptimized + debuginfo] target(s) in 0.32s
+     Running tests\sandbox_probe.rs (target\debug\deps\sandbox_probe-6705a124e10e102b.exe)
+
+running 1 test
+test write_restricted_reaches_internet_without_any_grant ... ok
+
+test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 15 filtered out; finished in 0.40s
+

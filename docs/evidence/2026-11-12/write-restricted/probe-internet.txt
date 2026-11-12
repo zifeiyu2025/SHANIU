@@ -1,0 +1,21 @@
+    Finished `test` profile [unoptimized + debuginfo] target(s) in 0.33s
+     Running tests\sandbox_probe.rs (target\debug\deps\sandbox_probe-6705a124e10e102b.exe)
+
+running 1 test
+
+thread 'write_restricted_reaches_internet_without_any_grant' (1340) panicked at tests\sandbox_probe.rs:861:5:
+assertion `left == right` failed: 写约束令牌不应影响出网（输出：000
+）
+  left: 35
+ right: 0
+note: run with `RUST_BACKTRACE=1` environment variable to display a backtrace
+test write_restricted_reaches_internet_without_any_grant ... FAILED
+
+failures:
+
+failures:
+    write_restricted_reaches_internet_without_any_grant
+
+test result: FAILED. 0 passed; 1 failed; 0 ignored; 0 measured; 15 filtered out; finished in 0.29s
+
+error: test failed, to rerun pass `--test sandbox_probe`

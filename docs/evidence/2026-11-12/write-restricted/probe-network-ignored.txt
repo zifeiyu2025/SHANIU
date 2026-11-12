@@ -1,0 +1,11 @@
+   Compiling shaniu v0.2.5 (D:\MyWorkspace\SHANIU\src-tauri)
+    Finished `test` profile [unoptimized + debuginfo] target(s) in 3.39s
+     Running tests\sandbox_probe.rs (target\debug\deps\sandbox_probe-6705a124e10e102b.exe)
+
+running 3 tests
+test container_reaches_internet_without_any_grant ... ok
+test write_restricted_reaches_internet_without_any_grant ... ok
+test write_restricted_schannel_clients_fail_as_registered_limitation ... ok
+
+test result: ok. 3 passed; 0 failed; 0 ignored; 0 measured; 16 filtered out; finished in 1.06s
+
