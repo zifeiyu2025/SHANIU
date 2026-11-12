@@ -1,0 +1,9 @@
+   Compiling shaniu v0.2.5 (D:\MyWorkspace\SHANIU\src-tauri)
+    Finished `test` profile [unoptimized + debuginfo] target(s) in 21.09s
+     Running unittests src\lib.rs (target\debug\deps\shaniu_lib-0e6a0f0490e338ae.exe)
+
+running 1 test
+test sandbox::acl::tests::revoke_from_ledger_is_precise_idempotent_and_tolerates_missing_paths ... ok
+
+test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 988 filtered out; finished in 0.02s
+

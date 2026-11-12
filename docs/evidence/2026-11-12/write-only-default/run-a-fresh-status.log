@@ -1,0 +1,2 @@
+[status] target: http://localhost:5173/
+[status] sandbox_status: {"mode":"read_only","os":"restricted_token","os_enabled":true,"enforcement":"full","profile":"","ancestor":"idle","note":"受限令牌约束写入（WRITE_RESTRICTED）；读与网络不约束，无需管理员"}

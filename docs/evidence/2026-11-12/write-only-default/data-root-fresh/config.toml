@@ -1,0 +1,101 @@
+workspaces = []
+active_provider = "deepseek"
+provider_revision = 0
+
+[model]
+provider = "openai-responses"
+base_url = ""
+model = ""
+max_turns = 0
+max_retries = 5
+
+[sandbox]
+mode = "read_only"
+os = "restricted_token"
+os_explicit = true
+
+[approval]
+mode = "on_request"
+allow_prefixes = [
+    "cargo build",
+    "cargo check",
+    "cargo clippy",
+    "cargo test",
+    "cargo metadata",
+    "git status",
+    "git diff",
+    "git log",
+    "git show",
+    "git blame",
+    "dir",
+    "type",
+    "findstr",
+]
+
+[workspace]
+root = ""
+title = ""
+hidden = false
+
+[agent]
+token_budget = 500000
+
+[verify]
+enabled = true
+mode = "enforce"
+baseline = "auto"
+timeout_ms = 120000
+commands = []
+
+[session_title]
+enabled = true
+target_words = 5
+target_cjk_characters = 10
+max_input_bytes = 4096
+max_output_tokens = 4096
+timeout_ms = 60000
+
+[[providers]]
+id = "deepseek"
+label = "DeepSeek"
+provider = "openai-chat"
+base_url = "https://api.deepseek.com"
+model = "deepseek-flash"
+reasoning_effort = ""
+secret_ref = "DEEPSEEK_API_KEY"
+
+[providers.headers]
+
+[[providers.models]]
+id = "deepseek-flash"
+name = "DeepSeek-V4.1-Flash"
+context_window = 1048576
+max_tokens = 393216
+input = [
+    "text",
+    "image",
+]
+
+[providers.models.reasoning_efforts]
+high = "high"
+low = "low"
+max = "max"
+
+[providers.models.capabilities]
+
+[[providers.models]]
+id = "deepseek-v4-pro"
+name = "DeepSeek-V4-Pro"
+context_window = 1048576
+max_tokens = 393216
+input = ["text"]
+
+[providers.models.reasoning_efforts]
+high = "high"
+low = "low"
+max = "max"
+
+[providers.models.capabilities]
+
+[mcp]
+servers = []

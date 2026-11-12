@@ -1,0 +1,26 @@
+# 证据目录只入库「可复查的产物」：
+# - secrets/ 是 DPAPI 加密的凭据存储，属于密钥边界，永不入库；
+# - cache/ 是运行期缓存，无证据价值；
+# - workspace/target/ 是验收用最小 crate 的构建产物。
+data-root/secrets/
+data-root/cache/
+data-root-fresh/secrets/
+data-root-fresh/cache/
+legacy-data-root/secrets/
+legacy-data-root/cache/
+appcontainer-data-root/secrets/
+appcontainer-data-root/cache/
+workspace/target/
+
+# 仓库根 `.gitignore` 忽略 `*.log` 与 `logs/`；本目录里的运行日志与验收轨迹就是证据本体，
+# 在这里显式放行（否则 docs/16 §10 引用的 drive-*.log 在 clone 后不存在）。
+# 目录必须先单独放行，否则「父目录被忽略时子文件无法重新包含」。
+!data-root/logs/
+!data-root-fresh/logs/
+!legacy-data-root/logs/
+!appcontainer-data-root/logs/
+!*.log
+
+# vite 开发服务器日志是 PowerShell 重定向出的 UTF-16 二进制，只证明 dev server 起过，
+# 无复核价值；出网/TLS 的证据在 drive-*.log。
+vite.log

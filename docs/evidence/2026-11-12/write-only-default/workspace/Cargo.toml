@@ -1,0 +1,10 @@
+[package]
+name = "shaniu-acceptance-crate"
+version = "0.1.0"
+edition = "2021"
+
+[[bin]]
+name = "shaniu-acceptance-crate"
+path = "src/main.rs"
+
+[dependencies]

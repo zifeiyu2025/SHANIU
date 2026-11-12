@@ -1,0 +1,60 @@
+providers = []
+workspaces = []
+active_provider = ""
+provider_revision = 0
+
+[model]
+provider = "openai-chat"
+base_url = "http://127.0.0.1:18765/v1"
+model = "mock-acceptance"
+max_turns = 0
+max_retries = 0
+
+[sandbox]
+mode = "workspace_write"
+os = "restricted_token"
+os_explicit = true
+
+[approval]
+mode = "never"
+allow_prefixes = [
+    "cargo build",
+    "cargo check",
+    "cargo clippy",
+    "cargo test",
+    "cargo metadata",
+    "git status",
+    "git diff",
+    "git log",
+    "git show",
+    "git blame",
+    "dir",
+    "type",
+    "findstr",
+]
+
+[workspace]
+root = 'D:\MyWorkspace\SHANIU\docs\evidence\2026-11-12\write-only-default\workspace'
+title = ""
+hidden = false
+
+[agent]
+token_budget = 500000
+
+[verify]
+enabled = false
+mode = "enforce"
+baseline = "auto"
+timeout_ms = 120000
+commands = []
+
+[session_title]
+enabled = false
+target_words = 5
+target_cjk_characters = 10
+max_input_bytes = 4096
+max_output_tokens = 4096
+timeout_ms = 60000
+
+[mcp]
+servers = []

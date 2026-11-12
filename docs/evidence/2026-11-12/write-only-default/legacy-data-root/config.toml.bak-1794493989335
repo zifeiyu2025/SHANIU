@@ -1,0 +1,29 @@
+# 真机验收专用配置（指向本机 mock 模型端点，不触达任何外部服务）。
+# 关键点：沙箱档 = workspace_write、审批档 = never（执行不再逐次弹窗），
+# 写后验证与标题生成关闭，避免与本期的验收目标相互干扰。
+
+active_provider = ""
+
+[model]
+provider = "openai-chat"
+base_url = "http://127.0.0.1:18765/v1"
+model = "mock-acceptance"
+max_turns = 0
+max_retries = 0
+
+[sandbox]
+mode = "workspace_write"
+os = "app_container"
+
+[approval]
+mode = "never"
+
+[workspace]
+root = "D:\\MyWorkspace\\SHANIU\\docs\\evidence\\2026-11-12\\write-only-default\\workspace"
+
+[verify]
+enabled = false
+
+[session_title]
+enabled = false
+

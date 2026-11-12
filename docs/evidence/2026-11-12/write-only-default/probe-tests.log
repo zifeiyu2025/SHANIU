@@ -1,0 +1,28 @@
+   Compiling shaniu v0.2.5 (D:\MyWorkspace\SHANIU\src-tauri)
+    Finished `test` profile [unoptimized + debuginfo] target(s) in 22.50s
+     Running tests\sandbox_probe.rs (target\debug\deps\sandbox_probe-6705a124e10e102b.exe)
+
+running 20 tests
+test container_reaches_internet_without_any_grant ... ignored, 需要外网：容器默认出网的真机验证
+test write_restricted_reaches_internet_without_any_grant ... ignored, 需要外网：写约束令牌默认出网的真机验证
+test write_restricted_schannel_clients_fail_as_registered_limitation ... ignored, 需要外网：Schannel 限制的现状断言
+test readonly_mode_refuses_to_spawn ... ok
+test restricted_token_layer_strips_privileges_independently ... ok
+test sandbox_can_write_inside_workspace ... ok
+test sandbox_denies_write_outside_workspace ... ok
+test write_restricted_denies_write_outside_workspace ... ok
+test python_utf8_env_reaches_logical_exec ... ok
+test python_utf8_env_reaches_danger_exec ... ok
+test write_restricted_allows_write_inside_workspace ... ok
+test sandbox_allows_read_outside_workspace_by_default ... ok
+test sandbox_streams_every_output_line ... ok
+test write_restricted_can_reach_host_loopback ... ok
+test write_restricted_allows_read_outside_workspace ... ok
+test concurrent_execs_do_not_inherit_each_others_pipes ... ok
+test appcontainer_denies_read_outside_workspace ... ok
+test write_restricted_restricts_node_grandchild ... ok
+test ancestor_chain_allows_metadata_but_not_listing_or_reads ... ok
+test appcontainer_isolates_host_loopback ... ok
+
+test result: ok. 17 passed; 0 failed; 3 ignored; 0 measured; 0 filtered out; finished in 1.09s
+

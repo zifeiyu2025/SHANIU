@@ -1,0 +1,7 @@
+2026-11-12T14:31:55.289889Z  INFO shaniu_lib: config_root: d:\MyWorkspace\SHANIU\docs\evidence\2026-11-12\write-only-default\data-root-fresh
+2026-11-12T14:31:55.294643Z  INFO shaniu_lib: data_root:   d:\MyWorkspace\SHANIU\docs\evidence\2026-11-12\write-only-default\data-root-fresh
+2026-11-12T14:31:55.294722Z  INFO shaniu_lib: workspace:   d:\MyWorkspace\SHANIU\docs\evidence\2026-11-12\write-only-default\data-root-fresh\Workspace
+2026-11-12T14:31:55.294756Z  INFO shaniu_lib: 数据根判定 data_root_kind="env" record=C:\Users\jun\AppData\Local\SHANIU\data-root\c1138d696c584b01.json decided_now=false
+2026-11-12T14:31:55.545394Z  INFO shaniu_lib::gateway: WebSocket gateway 监听 127.0.0.1:56702
+2026-11-12T14:31:55.672291Z  INFO shaniu_lib: 前端就绪信号到达，显示主窗口
+2026-11-12T14:31:56.942039Z  INFO shaniu_lib::gateway: gateway 在线订阅计数 +1 viewers=1

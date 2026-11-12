@@ -1,0 +1,29 @@
+# 第二期真机验收配置：**不写 `[sandbox] os`**，靠默认值（写约束）。
+# 与「新用户升级到本版本」的配置形态一致：只有业务项，没有机制选择。
+# 指向本机 mock 模型端点，不触达任何外部服务。
+
+active_provider = ""
+
+[model]
+provider = "openai-chat"
+base_url = "http://127.0.0.1:18765/v1"
+model = "mock-acceptance"
+max_turns = 0
+max_retries = 0
+
+[sandbox]
+mode = "workspace_write"
+os = "app_container"
+os_explicit = true
+
+[approval]
+mode = "never"
+
+[workspace]
+root = "D:\\MyWorkspace\\SHANIU\\docs\\evidence\\2026-11-12\\write-only-default\\workspace"
+
+[verify]
+enabled = false
+
+[session_title]
+enabled = false

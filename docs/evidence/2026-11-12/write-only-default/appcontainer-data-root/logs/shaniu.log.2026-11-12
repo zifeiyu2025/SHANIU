@@ -1,0 +1,15 @@
+2026-11-12T14:39:19.819794Z  INFO shaniu_lib: config_root: d:\MyWorkspace\SHANIU\docs\evidence\2026-11-12\write-only-default\appcontainer-data-root
+2026-11-12T14:39:19.823931Z  INFO shaniu_lib: data_root:   d:\MyWorkspace\SHANIU\docs\evidence\2026-11-12\write-only-default\appcontainer-data-root
+2026-11-12T14:39:19.823969Z  INFO shaniu_lib: workspace:   d:\MyWorkspace\SHANIU\docs\evidence\2026-11-12\write-only-default\appcontainer-data-root\Workspace
+2026-11-12T14:39:19.823994Z  INFO shaniu_lib: 数据根判定 data_root_kind="env" record=C:\Users\jun\AppData\Local\SHANIU\data-root\c1138d696c584b01.json decided_now=false
+2026-11-12T14:39:19.826680Z  INFO shaniu_lib::sandbox: 沙箱文件权限后台预置开始（不阻塞命令执行） roots=1 state="preparing"
+2026-11-12T14:39:19.828026Z  INFO shaniu_lib::sandbox::acl: 目录已有容器 SID 的显式 ACE，跳过改写（持久授权命中） dir=C:\Users\jun\.cargo
+2026-11-12T14:39:19.828271Z  INFO shaniu_lib::sandbox::acl: 目录已有容器 SID 的显式 ACE，跳过改写（持久授权命中） dir=C:\Users\jun\.rustup
+2026-11-12T14:39:19.828458Z  INFO shaniu_lib::sandbox::acl: 目录已有容器 SID 的显式 ACE，跳过改写（持久授权命中） dir=C:\Users\jun\AppData\Local\Temp
+2026-11-12T14:39:19.828930Z  INFO shaniu_lib::sandbox::acl: 目录已有容器 SID 的显式 ACE，跳过改写（持久授权命中） dir=D:\MyWorkspace\SHANIU\docs\evidence\2026-11-12\write-only-default\workspace
+2026-11-12T14:39:19.829586Z  INFO shaniu_lib::sandbox: 沙箱文件权限后台预置结束（工作区根/临时/工具链与祖先 (RA,S) 都持久化，下次启动按真实 DACL 探测，命中即跳过） written=0 present=10 denied=0 failed=0 cancelled=false elapsed_ms=2 state="ready"
+2026-11-12T14:39:20.063372Z  INFO shaniu_lib::gateway: WebSocket gateway 监听 127.0.0.1:54447
+2026-11-12T14:39:20.333689Z  INFO shaniu_lib: 前端就绪信号到达，显示主窗口
+2026-11-12T14:39:21.175995Z  INFO shaniu_lib::gateway: gateway 在线订阅计数 +1 viewers=1
+2026-11-12T14:39:27.013770Z  WARN shaniu_lib::agent_loop: 模型未声明 context_window：压缩阈值按保守窗口推导，请在模型行补全该字段 configured=500000 fallback_window=128000
+2026-11-12T14:39:27.249812Z  INFO shaniu_lib::agent_loop::prompt: 系统提示已组装（内容锁） prompt_version="2026-11-12.5" prompt_fingerprint=16b39c7ddb6b4b7f prompt_tokens=2503 prompt_chars=3617 rules_fingerprint=2ebd5353ac8dda5c rules_sources=1 rules_selection=声明选节：第 3 行，8 个锚点 rules_dropped=文档地图（终态）、1. 允许 / 禁止的工作、2.1 逐路径要求与原因、4. 每次变更的必需证据、4.1 测试密钥（唯一约定）、4.2.1 事故与细则、4.3.1 实例：假绿与假红、4.4 写了要接上（未接线的代码按未完成处理）、5. 验证与验收、6. 依赖规则、7. 例外条款、8. 可追溯清单（每次交付时自检）、9. 工作节奏、10. 方向性约定（2026-11-08 起生效）、11. 缝合原则（全文见 `docs/01` §2.4）、11.1 自研四样、11.2 判断流程 rules_clipped=
