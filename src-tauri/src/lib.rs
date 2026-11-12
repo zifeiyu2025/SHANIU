@@ -1881,10 +1881,7 @@ fn new_session_writer(
         session_id: agent_id.clone(),
         agent_id: agent_id.clone(),
         parent_id: None,
-        created_at: std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)
-            .map(|d| d.as_millis() as u64)
-            .unwrap_or_default(),
+        created_at: now_ms(),
         config_snapshot: rollout::ConfigSnapshot {
             provider: cfg.model.provider.clone(),
             base_url: cfg.model.base_url.clone(),
@@ -2011,7 +2008,6 @@ fn build_agent_with(
             model: active.model.clone(),
             headers: active.headers.clone(),
             api_key: api_key.clone(),
-            token_budget_hint: row.max_tokens,
         };
         let data_root = state.data_root().to_path_buf();
         let probing = state.probing.clone();
@@ -2127,7 +2123,6 @@ fn get_settings(app: tauri::AppHandle) -> Result<serde_json::Value, String> {
                             model: m.id.clone(),
                             headers: p.headers.clone(),
                             api_key,
-                            token_budget_hint: m.max_tokens,
                         };
                         let data_root = state.data_root().to_path_buf();
                         let inflight = state.probing.clone();
@@ -3560,10 +3555,7 @@ mod quit_flow_tests {
         let root = std::env::temp_dir().join(format!(
             "shaniu-quit-abort-{}-{}",
             std::process::id(),
-            std::time::SystemTime::now()
-                .duration_since(std::time::UNIX_EPOCH)
-                .expect("时钟早于 Unix 纪元")
-                .as_nanos()
+            crate::clock::now_ms()
         ));
         let dir = root.join(crate::rollout::ROLLOUT_DIR);
         std::fs::create_dir_all(&dir).expect("建临时 rollout 目录");

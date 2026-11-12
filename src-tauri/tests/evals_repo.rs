@@ -28,7 +28,7 @@ use std::io::Write;
 use std::path::{Path, PathBuf};
 use std::process::{id, Command};
 use std::sync::{Arc, Mutex};
-use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
+use std::time::{Duration, Instant};
 
 use serde::Deserialize;
 use serde_json::{json, Value};
@@ -975,10 +975,7 @@ async fn run_one(ctx: RunOneCtx<'_>) -> (TaskOutcome, u128) {
             session_id: session_id.clone(),
             agent_id: session_id.clone(),
             parent_id: None,
-            created_at: SystemTime::now()
-                .duration_since(UNIX_EPOCH)
-                .map(|d| d.as_millis() as u64)
-                .unwrap_or_default(),
+            created_at: now_ms(),
             config_snapshot: shaniu_lib::rollout::ConfigSnapshot {
                 model: "evals".into(),
                 sandbox: "WorkspaceWrite".into(),

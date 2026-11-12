@@ -195,12 +195,6 @@ impl SessionPolicyHandle {
         *self.note.lock().expect("policy note 锁中毒") = note.map(str::to_string);
     }
 
-    /// 运行中切换沙箱档（会话内 `/permission`）。下一 turn 生效，任务启动时由
-    /// `reset_policy` 用**本会话档案里的最后一档**重新装载——切档不跨会话泄漏。
-    pub fn set_sandbox(&self, mode: SandboxMode) {
-        self.inner.write().expect("policy 锁中毒").sandbox = mode;
-    }
-
     pub fn note(&self) -> Option<String> {
         self.note.lock().expect("policy note 锁中毒").clone()
     }

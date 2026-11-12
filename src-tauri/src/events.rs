@@ -6,10 +6,12 @@
 
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
-use std::time::{SystemTime, UNIX_EPOCH};
+use std::time::SystemTime;
 
 use serde::{Deserialize, Serialize};
 use tokio::sync::broadcast;
+
+use crate::clock::now_ms;
 
 /// 后端 → 前端事件流通道。
 pub const EVENT_CHANNEL: &str = "shaniu://event";
@@ -652,7 +654,7 @@ fn emit_agent_event(
     // 编号与发送共用临界区，否则并发生产者可先发出较大的 event_id。
     let mut ids = EVENT_IDS.lock().map_err(|e| format!("事件编号锁不可用: {e}"))?;
     let now = SystemTime::now();
-    let ts_ms = now.duration_since(UNIX_EPOCH).map_err(|e| format!("事件时间不可用: {e}"))?.as_millis() as u64;
+    let ts_ms = now_ms();
     let event_id = ids.generate_from_datetime(now).map_err(|e| format!("事件编号生成失败: {e}"))?;
     publish(&AgentEvent {
         event_id: event_id.to_string(),
@@ -819,7 +821,7 @@ mod envelope_tests {
     #[test]
     fn root_event_keeps_session_payload_and_timestamp() {
         let msg = EventMsg::ReasoningDelta { delta: "推理片段".into() };
-        let before = SystemTime::now().duration_since(UNIX_EPOCH).unwrap().as_millis() as u64;
+        let before = now_ms();
         emit_agent_event("session-a", "root", None, &msg, |event| {
             assert_eq!(event.session_id, "session-a");
             assert_eq!(event.agent_id, "root");

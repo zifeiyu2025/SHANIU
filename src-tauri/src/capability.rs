@@ -703,7 +703,6 @@ pub struct ProbeTarget {
     pub model: String,
     pub headers: BTreeMap<String, String>,
     pub api_key: String,
-    pub token_budget_hint: u32,
 }
 
 impl ProbeTarget {
@@ -1438,7 +1437,6 @@ pub async fn probe_capabilities(
         model: model_row.id.clone(),
         headers: row.headers.clone(),
         api_key,
-        token_budget_hint: model_row.max_tokens,
     };
     let key = target.cache_key();
     let data_root = state.data_root();

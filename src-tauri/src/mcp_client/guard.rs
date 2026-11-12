@@ -157,12 +157,6 @@ pub enum GuardVerdict {
     Suspicious(Vec<InjectionHit>),
 }
 
-impl GuardVerdict {
-    pub fn is_suspicious(&self) -> bool {
-        matches!(self, GuardVerdict::Suspicious(_))
-    }
-}
-
 /// 保守词表。只收**明确的**指令性语句：
 /// - 不含 "system prompt" 之类可能出现在合法文档里的措辞；
 /// - 不含裸 "ignore"，避免 "ignores previous cache entries" 这类正常描述被误杀。
@@ -340,6 +334,8 @@ pub struct Exemption {
     pub dispatch_name: String,
     /// 用户确认放行时命中的首条规则（供审计回溯）。
     pub rule: RuleId,
+    /// 命中片段：随豁免事件序列化给前端台账展示（`src/mcp-trust/McpConnector.tsx`），
+    /// 不是死字段。
     pub hit_fragment: String,
     pub granted_at_ms: u64,
 }

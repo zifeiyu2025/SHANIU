@@ -377,7 +377,7 @@ impl SubagentRegistry {
         let inbox = instance.inbox.clone();
 
         let done = Arc::new(Notify::new());
-        let created_at_ms = wall_clock_ms();
+        let created_at_ms = crate::clock::now_ms();
         let label = lane_label(&task);
         let name = {
             let mut inner = self.lock();
@@ -713,13 +713,6 @@ fn emit(sink: &Arc<dyn EventSink>, msg: EventMsg) {
     if let Err(error) = sink.emit(&msg) {
         tracing::warn!("子代理事件广播失败（执行结果不受影响）: {error}");
     }
-}
-
-fn wall_clock_ms() -> u64 {
-    std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)
-        .map(|elapsed| elapsed.as_millis() as u64)
-        .unwrap_or(0)
 }
 
 /// 泳道展示标签：task 首行，按字符截到 60（上游 catalog v3 的 `label` 是人读标题，

@@ -7,8 +7,8 @@
 //! 见 [`nearest_safe_cut`]。
 
 use std::path::{Path, PathBuf};
-use std::time::{SystemTime, UNIX_EPOCH};
 
+use crate::clock::now_ms;
 use crate::model_client::{HistoryItem, Role};
 use crate::rollout::{self, RolloutError, RolloutItem, RolloutWriter};
 
@@ -30,6 +30,9 @@ pub struct Resumed {
     /// 会话内最后一次权限预设切换（新档案；无则 None = 回落到 `sandbox_mode`/部署默认）。
     pub permission_preset: Option<String>,
     /// 档案里记录过的系统提示词版本（按写入顺序）。旧档案为空 = 未记录。
+    ///
+    /// **仅审计留档**：当前生产无读取方（`tests/wire_field_consumers.rs` 登记为 Gap），
+    /// resume 不使用它、也不影响运行行为；版本漂移检测尚未接生产入口。
     pub prompt_versions: Vec<SystemPromptRecord>,
     /// 末行半截写被丢弃的行数。
     pub torn_tail_lines: usize,
@@ -44,11 +47,14 @@ pub struct Resumed {
 }
 
 /// 档案里的一条系统提示词版本（只读快照，供审计与轨迹回放）。
+///
+/// 注意：整个结构当前只有测试读取，生产链路不消费——填了也不生效，仅审计留档。
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct SystemPromptRecord {
     /// 落盘后的文本（写入时已经过统一脱敏）。
     pub text: String,
     pub sha256: String,
+    /// 写入时刻：仅审计留档，当前无读取方。
     pub at_ms: u64,
     pub turn: u32,
 }
@@ -251,7 +257,7 @@ pub fn fork(src: &Path, dir: &Path, new_agent_id: &str, want_items: usize) -> Re
         session_id: new_agent_id.to_string(),
         agent_id: new_agent_id.to_string(),
         parent_id: Some(parent.0),
-        created_at: SystemTime::now().duration_since(UNIX_EPOCH).map(|d| d.as_millis() as u64).unwrap_or_default(),
+        created_at: now_ms(),
         config_snapshot: parent.1,
     };
     let writer = RolloutWriter::create(dir, &meta)?;

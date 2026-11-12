@@ -107,8 +107,16 @@ struct BatchGrant {
 }
 
 impl ApprovalBroker {
+    /// 生产装配入口。
+    ///
+    /// `SHANIU_EVAL_ABLATE_BATCH=1` 时关闭同 turn 批量确认，供评估基线跑「降噪前」
+    /// 对照组；这是唯一的真实入口，不设代理可调用的开关（见 [`Self::disable_batch`]）。
     pub fn new() -> Self {
-        Self::default()
+        let broker = Self::default();
+        if std::env::var_os("SHANIU_EVAL_ABLATE_BATCH").is_some() {
+            broker.disable_batch();
+        }
+        broker
     }
 
     /// 装配层把 config.toml 里的前缀规则装进来（空 = 全部按风险裁决）。
@@ -116,11 +124,8 @@ impl ApprovalBroker {
         *self.prefix.write().expect("prefix 锁中毒") = rules;
     }
 
-    pub fn prefix_rule_count(&self) -> usize {
-        self.prefix.read().expect("prefix 锁中毒").rule_count()
-    }
-
     /// 关闭批量确认（评估对照用）。只影响 `gate` 的批量短路，不改记忆与风险评估。
+    /// 正常入口是环境变量 `SHANIU_EVAL_ABLATE_BATCH`（见 [`Self::new`]）。
     pub fn disable_batch(&self) {
         self.batch_disabled
             .store(true, std::sync::atomic::Ordering::SeqCst);

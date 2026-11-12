@@ -71,10 +71,6 @@ impl PlanState {
         self.activate_for(None);
     }
 
-    pub fn deactivate(&self) {
-        self.deactivate_for(None);
-    }
-
     fn key(session: Option<&str>) -> &str {
         session.unwrap_or("")
     }

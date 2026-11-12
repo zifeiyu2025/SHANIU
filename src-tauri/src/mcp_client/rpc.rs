@@ -20,8 +20,6 @@ pub const MCP_PROTOCOL_VERSION: &str = "2025-06-18";
 pub const INVALID_REQUEST: i64 = -32600;
 /// 方法不存在或不支持（server→client 请求的默认拒绝码）。
 pub const METHOD_NOT_FOUND: i64 = -32601;
-/// 客户端内部错误。
-pub const INTERNAL_ERROR: i64 = -32603;
 
 /// 请求/响应关联标识：MCP 允许数字或字符串，两种都要能原样回显。
 #[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize, Deserialize)]

@@ -678,10 +678,8 @@ struct Outcome {
 /// 两个 `SHANIU_EVAL_ABLATE_*` 开关只用于 SH-119 的前后对照——关掉它们就复现
 /// "降噪前"的逐次打断。两处用例（任务集 + repair）共用同一套装配，避免漂移。
 fn eval_broker() -> Arc<ApprovalBroker> {
+    // `SHANIU_EVAL_ABLATE_BATCH` 由 `ApprovalBroker::new` 统一处理（关闭同 turn 批量确认）。
     let broker = Arc::new(ApprovalBroker::new());
-    if std::env::var("SHANIU_EVAL_ABLATE_BATCH").is_ok() {
-        broker.disable_batch();
-    }
     if std::env::var("SHANIU_EVAL_ABLATE_PREFIX").is_err() {
         let (rules, _) = policy::PrefixAllowlist::from_config(
             &shaniu_lib::config::default_allow_prefixes(),

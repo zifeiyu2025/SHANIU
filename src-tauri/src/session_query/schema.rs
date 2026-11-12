@@ -9,7 +9,7 @@
 use std::collections::HashSet;
 use std::fs;
 use std::path::{Path, PathBuf};
-use std::time::{Duration, SystemTime, UNIX_EPOCH};
+use std::time::Duration;
 
 use rusqlite::{Connection, Transaction};
 
@@ -221,10 +221,7 @@ pub(crate) const QUARANTINE_KEEP: usize = 3;
 /// 把损坏的索引文件改名保留（含 WAL/SHM/journal 附属），再让调用方新建。
 /// 目标是"不误删"，所以 rename 失败一律报错而不是强行覆盖。
 fn quarantine(path: &Path) -> Result<(), SearchError> {
-    let stamp = SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .map(|d| d.as_millis())
-        .unwrap_or_default();
+    let stamp = crate::clock::now_ms();
     let name = path
         .file_name()
         .map(|n| n.to_string_lossy().into_owned())

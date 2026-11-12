@@ -93,10 +93,7 @@ pub struct Target {
 /// 不参与任何持久化键或安全判定。
 pub fn new_id() -> String {
     static SEQ: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
-    let now = std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)
-        .map(|d| d.as_millis())
-        .unwrap_or(0);
+    let now = crate::clock::now_ms();
     format!(
         "cmp-{now}-{}",
         SEQ.fetch_add(1, std::sync::atomic::Ordering::Relaxed)

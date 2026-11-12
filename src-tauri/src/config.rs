@@ -12,7 +12,7 @@ use std::io;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::AtomicU64;
 use std::sync::{OnceLock, RwLock};
-use std::time::{SystemTime, UNIX_EPOCH};
+use std::time::SystemTime;
 
 use regex::Regex;
 use serde::{Deserialize, Serialize};
@@ -2226,7 +2226,7 @@ fn backup_original(path: &Path) -> Option<PathBuf> {
     if !path.is_file() {
         return None;
     }
-    let ms = SystemTime::now().duration_since(UNIX_EPOCH).ok()?.as_millis();
+    let ms = crate::clock::now_ms();
     for attempt in 0..10 {
         let name = if attempt == 0 {
             format!("{CONFIG_FILE}.bak-{ms}")
@@ -2244,10 +2244,7 @@ fn backup_original(path: &Path) -> Option<PathBuf> {
 
 /// 单调会话 ID（M3 rollout 接入后换正式 ULID/UUID）。
 pub fn new_session_id(seq: u32) -> String {
-    let ms = SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .map(|d| d.as_millis())
-        .unwrap_or_default();
+    let ms = crate::clock::now_ms();
     format!("sess-{ms}-{seq:04}")
 }
 
@@ -2501,10 +2498,7 @@ pub fn write_crash_report(
     thread: &str,
 ) -> Result<PathBuf, String> {
     fs::create_dir_all(crash_dir).map_err(|e| format!("创建 crash 目录失败: {e}"))?;
-    let stamp = SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .map(|d| d.as_millis())
-        .unwrap_or(0);
+    let stamp = crate::clock::now_ms();
     let seq = CRASH_SEQ.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
     let path = crash_dir.join(format!("panic-{stamp}-{}-{seq}.log", std::process::id()));
     let body = format!(

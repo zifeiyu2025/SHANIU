@@ -36,8 +36,6 @@ use super::rpc::{self, ClientRequestVerdict, Incoming, RequestId};
 /// 握手超时。真实 server 首次启动可能要拉起 node 运行时，给宽一点；
 /// 但必须有上限，否则「连接」按钮永远转圈。
 pub const DEFAULT_HANDSHAKE_TIMEOUT: Duration = Duration::from_secs(30);
-/// 普通请求（`tools/list`）超时。
-pub const DEFAULT_REQUEST_TIMEOUT: Duration = Duration::from_secs(15);
 /// 工具调用超时由调用方决定（工具本身可能很慢），这里只给默认值。
 pub const DEFAULT_CALL_TIMEOUT: Duration = Duration::from_secs(120);
 /// `tools/list` 分页上限：恶意 server 可用无限 `nextCursor` 拖死连接。

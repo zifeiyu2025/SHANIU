@@ -125,12 +125,6 @@ impl AgentInstance {
         }
     }
 
-    /// 排空并返回尚未消费的 steering 消息（每轮采样前调用）。
-    pub fn drain_messages(&self) -> Vec<String> {
-        let mut inbox = self.inbox.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
-        std::mem::take(&mut *inbox)
-    }
-
     /// 深度上的 spawn 资格：只有 root 能继续分叉（ADR-101 硬限）。
     pub fn can_spawn(&self) -> bool {
         self.depth < MAX_AGENT_DEPTH

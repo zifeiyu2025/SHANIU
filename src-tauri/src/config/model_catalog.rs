@@ -50,9 +50,11 @@ pub struct Catalog {
 
 /// 一条精确匹配的内置模型条目。
 ///
-/// 扩展位（`audio`/`pdf`/`prompt_caching`/`native_web_search`）现在只留字段位、
-/// 不填值：结构先支持，等真有实测数据再录。`deny_unknown_fields` 保证手写表时
-/// 拼错字段名会直接报错，而不是被 serde 静默忽略成"这一项没声明"。
+/// 扩展位（`audio`/`pdf`/`prompt_caching`/`native_web_search`）**当前没有任何消费方**：
+/// 可以解析，但填了也不会进入能力判定或请求参数，等于静默无效配置。保留字段位是为了
+/// 先固化表结构；接入实测数据时必须同时接上真实读取方，否则不要填。
+/// `deny_unknown_fields` 保证手写表时拼错字段名会直接报错，而不是被 serde 静默忽略成
+/// "这一项没声明"。
 #[derive(Debug, Clone, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct CatalogEntry {
@@ -69,7 +71,7 @@ pub struct CatalogEntry {
     pub reasoning_levels: Option<Vec<String>>,
     pub default_reasoning_level: Option<String>,
     pub builtin_web_search: Option<bool>,
-    // 扩展位：留字段位，暂不填值。
+    // 扩展位：以下四项当前无消费方，填了也不生效（详见结构体注释）。
     pub audio: Option<bool>,
     pub pdf: Option<bool>,
     pub prompt_caching: Option<bool>,

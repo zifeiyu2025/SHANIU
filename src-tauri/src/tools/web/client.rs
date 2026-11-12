@@ -151,11 +151,6 @@ impl WebClient {
         self
     }
 
-    pub fn with_cache_ttl(mut self, ttl: Duration) -> Self {
-        self.cache_ttl = ttl;
-        self
-    }
-
     /// GET 一个 URL，跟随重定向（逐跳校验），返回截断后的正文。
     pub async fn fetch(
         &self,

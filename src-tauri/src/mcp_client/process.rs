@@ -9,7 +9,6 @@
 //! ZCode 由上层进程管理，未做此校验。
 
 use std::path::{Path, PathBuf};
-use std::time::Duration;
 
 use tokio::sync::mpsc;
 
@@ -331,13 +330,10 @@ fn spawn_stdin_writer(stdin: std::fs::File, mut rx: mpsc::Receiver<Vec<u8>>) -> 
     })
 }
 
-/// 等待一条 stdout 事件的便捷包装（超时返回 `None`，调用方据此判定握手超时）。
-pub async fn next_event_within(process: &mut McpProcess, timeout: Duration) -> Option<StdioEvent> {
-    tokio::time::timeout(timeout, process.next_event()).await.ok().flatten()
-}
-
 #[cfg(test)]
 mod tests {
+    use std::time::Duration;
+
     use super::*;
 
     #[test]

@@ -28,10 +28,7 @@ fn required(name: &str) -> String {
 
 /// 隔离数据根：只落 `%TEMP%`（AGENTS §3），每个用例一份，避免互相读到缓存。
 fn temp_root(tag: &str) -> std::path::PathBuf {
-    let stamp = std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)
-        .unwrap()
-        .as_millis();
+    let stamp = shaniu_lib::clock::now_ms();
     let root = std::env::temp_dir().join(format!("shaniu-cap-{tag}-{}-{stamp}", std::process::id()));
     std::fs::create_dir_all(&root).unwrap();
     root
@@ -44,7 +41,6 @@ fn target_of(model: &str) -> ProbeTarget {
         model: model.to_string(),
         headers: BTreeMap::new(),
         api_key: required("SHANIU_TEST_API_KEY"),
-        token_budget_hint: 8_192,
     }
 }
 
@@ -234,7 +230,6 @@ async fn rate_limit_is_unverified_not_unsupported() {
         model: "rate-limited".into(),
         headers: BTreeMap::new(),
         api_key: "local-test-key".into(),
-        token_budget_hint: 0,
     };
     let row = ModelProfile {
         id: "rate-limited".into(),
@@ -394,7 +389,6 @@ fn spawn_reasoning_target(tokens: Vec<u64>) -> (ProbeTarget, Arc<std::sync::atom
         model: "local-reasoning".into(),
         headers: BTreeMap::new(),
         api_key: "local-test-key".into(),
-        token_budget_hint: 0,
     };
     (target, reasoning_requests)
 }
