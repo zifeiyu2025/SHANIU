@@ -13,7 +13,11 @@
 //! 存量已分类的不吵——这是它不变成噪音源的前提。
 //!
 //! 口径：只覆盖 `EventMsg`（事件协议）、`AgentEvent`（信封）、`SessionEntry`（档案投影）
-//! 三个核心 wire 结构。字段从 Rust 源头解析，不在用例里手抄——手抄的清单会和源头漂移。
+//! 三个核心 wire 结构，外加 `Resumed`（resume 的产出，内部结构）。字段从 Rust 源头解析，
+//! 不在用例里手抄——手抄的清单会和源头漂移。
+//!
+//! `Resumed` 不发给前端，所以它的 `Read` 指**生产调用点有消费方**；`Gap` 表示当前无人读，
+//! 按「带出来没人读」登记，待删除或接线；`BackendOnly` 保留给有意只留档的字段。
 
 use std::collections::{BTreeMap, BTreeSet};
 use std::path::Path;
@@ -202,6 +206,19 @@ const RULES: &[Rule] = &[
         fields: "compaction_id ok error",
         overrides: &[("history_tokens_after", Status::Gap("待前端补读：用户最想看压缩后是否真的变短"))],
     },
+    // ── resume 的产出（内部结构，不是前端 wire；Read = 生产调用点有消费方） ──
+    Rule {
+        owner: "Resumed",
+        variant: "Resumed",
+        fields: "parent_id history path workspace_root sandbox_mode permission_preset \
+                 torn_tail_lines damaged_lines dropped_unsafe_tail",
+        overrides: &[
+            ("session_id", Status::Gap("无消费方：身份键实际用 agent_id，首行的 session_id 只被解析")),
+            ("agent_id", Status::Gap("无消费方：调用方自己持有 agent_id 并传给运行器")),
+            ("applied_compactions", Status::Gap("只有测试读；生产入口还没核对压缩锚点数")),
+            ("prompt_versions", Status::Gap("只有测试读；版本漂移检测尚未接生产入口")),
+        ],
+    },
 ];
 
 /// 去掉行尾注释：块内文档注释可能带花括号，会让深度计数错位。
@@ -307,6 +324,7 @@ fn read(relative: &str) -> String {
 fn backend_fields() -> Vec<(String, String, String)> {
     let events = strip_comments(&read("src/events.rs"));
     let lib = strip_comments(&read("src/lib.rs"));
+    let resume = strip_comments(&read("src/rollout/resume.rs"));
 
     let mut out = Vec::new();
     let mut push = |owner: &str, pairs: Vec<(String, Vec<String>)>| {
@@ -324,6 +342,11 @@ fn backend_fields() -> Vec<(String, String, String)> {
     push("AgentEvent", struct_fields(envelope));
     let entry = block_body(&lib, "pub enum SessionEntry").expect("lib.rs 里找不到 SessionEntry");
     push("SessionEntry", enum_fields(entry));
+    // `Resumed` 是内部结构而非前端 wire，但它同样是「读出来给外面用」的载体：
+    // `torn_tail_lines` / `damaged_lines` / `prompt_versions` 这类字段一旦没人读，
+    // 就是「带出来但没人用」，必须有地方强制表态。
+    let resumed = block_body(&resume, "pub struct Resumed").expect("resume.rs 里找不到 Resumed");
+    push("Resumed", struct_fields(resumed));
     out
 }
 
