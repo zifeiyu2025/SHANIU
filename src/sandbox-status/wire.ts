@@ -14,7 +14,7 @@ import { tauriBridge, type HostBridge } from '../transport/tauri'
 export type SandboxModeWire = 'read_only' | 'workspace_write' | 'danger_full_access'
 
 /** OS 级机制（Rust `core::config::OsSandbox` 的字符串形）。 */
-export type OsSandboxWire = 'app_container' | 'logical'
+export type OsSandboxWire = 'restricted_token' | 'app_container' | 'logical'
 
 /** 文件权限后台准备的进度（Rust `sandbox::AncestorState` 的字符串形）。 */
 export type AncestorStateWire = 'idle' | 'preparing' | 'ready' | 'needs_admin'

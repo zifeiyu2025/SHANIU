@@ -65,7 +65,7 @@ export interface ExemptionWire {
 
 /** 一个 server 的沙箱口径（与状态条、日志同源，后端只算一次）。 */
 export interface SandboxSummaryWire {
-  /** `app_container` | `logical` | `unsandboxed` */
+  /** `restricted_token` | `app_container` | `logical` | `unsandboxed` */
   readonly kind: string
   /** 容器 profile 名（仅 app_container 非空）。 */
   readonly profile?: string

@@ -644,7 +644,8 @@ function ReviewPanel({
             <dd>
               <Tag
                 tone={
-                  payload.sandbox.kind === 'app_container'
+                  payload.sandbox.kind === 'app_container' ||
+                  payload.sandbox.kind === 'restricted_token'
                     ? 'success'
                     : payload.sandbox.kind === 'logical'
                       ? 'warning'
@@ -652,11 +653,13 @@ function ReviewPanel({
                 }
               >
                 {t(
-                  payload.sandbox.kind === 'app_container'
-                    ? 'sandbox.appContainer'
-                    : payload.sandbox.kind === 'logical'
-                      ? 'sandbox.logical'
-                      : 'sandbox.unsandboxed',
+                  payload.sandbox.kind === 'restricted_token'
+                    ? 'sandbox.restrictedToken'
+                    : payload.sandbox.kind === 'app_container'
+                      ? 'sandbox.appContainer'
+                      : payload.sandbox.kind === 'logical'
+                        ? 'sandbox.logical'
+                        : 'sandbox.unsandboxed',
                 )}
               </Tag>
               <span className="mcp-connector-note">
