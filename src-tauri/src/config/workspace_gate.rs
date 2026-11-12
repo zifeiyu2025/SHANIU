@@ -14,7 +14,8 @@
 //! **比较口径**：
 //! 1. 规范化到最深已存在祖先（不存在也按字面逐段规范化），展开 junction/符号链接与
 //!    8.3 短名；
-//! 2. 去掉 `\\?\`（`\\?\UNC\` 还原成 `\\`）；
+//! 2. 去掉 `\\?\`（`\\?\UNC\` 还原成 `\\`）；两个原语（剥前缀 / 取最深已存在祖先）
+//!    由 [`crate::config::path_norm`] 提供，本模块不再各留一份；
 //! 3. 统一小写（NTFS 默认大小写不敏感）；
 //! 4. 尾部 `\` 由 `Path` 组件比较天然吸收。
 //!
@@ -116,8 +117,12 @@ pub fn check_against(candidate: &Path, data_root: &Path) -> Verdict {
 /// 也会先按组件消掉 `..`，不会因为 canonicalize 失败而漏判。
 pub fn canon_for_compare(path: &Path) -> PathBuf {
     let normalized = lexical_normalize(path);
-    let resolved = canonicalize_deepest(&normalized);
-    PathBuf::from(strip_verbatim(&resolved).to_lowercase())
+    let resolved = crate::config::path_norm::deepest_existing(&normalized);
+    PathBuf::from(
+        crate::config::path_norm::strip_verbatim(&resolved)
+            .to_string_lossy()
+            .to_lowercase(),
+    )
 }
 
 /// 按组件消掉 `.` / `..`（仅字面，不碰盘）。
@@ -136,40 +141,6 @@ fn lexical_normalize(path: &Path) -> PathBuf {
         }
     }
     out
-}
-
-/// 沿祖先链找**最深的一个能 canonicalize 的目录**，把剩下的尾部原样接回去。
-/// 这样 junction / 8.3 短名 / 大小写只要出现在已存在的部分就一定能展开。
-fn canonicalize_deepest(path: &Path) -> PathBuf {
-    if let Ok(resolved) = path.canonicalize() {
-        return resolved;
-    }
-    let mut tail: Vec<std::ffi::OsString> = Vec::new();
-    let mut cursor = path;
-    while let Some(parent) = cursor.parent() {
-        if let Some(name) = cursor.file_name() {
-            tail.push(name.to_os_string());
-        }
-        cursor = parent;
-        if let Ok(mut resolved) = cursor.canonicalize() {
-            for part in tail.iter().rev() {
-                resolved.push(part);
-            }
-            return resolved;
-        }
-    }
-    std::path::absolute(path).unwrap_or_else(|_| path.to_path_buf())
-}
-
-fn strip_verbatim(path: &Path) -> String {
-    let text = path.to_string_lossy();
-    if let Some(rest) = text.strip_prefix(r"\\?\UNC\") {
-        format!(r"\\{rest}")
-    } else if let Some(rest) = text.strip_prefix(r"\\?\") {
-        rest.to_string()
-    } else {
-        text.into_owned()
-    }
 }
 
 #[cfg(test)]
