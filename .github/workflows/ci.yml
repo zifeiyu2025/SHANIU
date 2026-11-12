@@ -110,9 +110,6 @@ jobs:
       - name: 安装前端依赖
         run: pnpm install --frozen-lockfile
 
-      - name: 前端类型检查
-        run: pnpm typecheck
-
       - name: 前端测试
         run: pnpm test
 
@@ -142,7 +139,9 @@ jobs:
           pnpm align:report --check
 
       # typecheck/test 抓不到 Tailwind/vite 构建期问题，而 tauri.conf.json 的 frontendDist
-      # 指向 dist：构建链断裂不该等到打包阶段才暴露
+      # 指向 dist：构建链断裂不该等到打包阶段才暴露。
+      # `pnpm build` = `pnpm typecheck && vite build && check-dist-assets`，typecheck 已含在内，
+      # 不再单独跑一步（重复跑只会把同一条 tsc 走两遍）。
       - name: 前端构建
         run: pnpm build
 

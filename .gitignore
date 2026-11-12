@@ -3,6 +3,8 @@ node_modules/
 dist/
 dist-ssr/
 dist-portable/
+# 前端构建的临时校验产物（vite build 的副本，用于产物检查）
+dist-verify/
 # 交付产物（MSI / 便携 ZIP）：体积大、可复现，不入库；路径与大小记在 docs/08
 dist-release/
 *.local
@@ -39,6 +41,8 @@ pnpm-debug.log*
 .trae-html-share-packages/
 .workbuddy/
 .zcode/
+# 浏览器验收截图（本机工具产物）
+.screenshots/
 
 # Secrets / env files (禁止入库，见 AGENTS.md §3)
 .env

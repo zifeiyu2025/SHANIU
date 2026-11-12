@@ -25,3 +25,4 @@
 | 批次 | 主题 | 关联文档 |
 | --- | --- | --- |
 | [2026-11-12](2026-11-12/README.md) | 令牌特权 / `AccessCheck` / `GetFileAttributes`·`FindFirstFile`·`CreateFile` 只读探针；祖先 ACE 相关代码行摘录 | `docs/13`、`docs/14`、`docs/02`、`docs/04` |
+| [2026-11-13](2026-11-13/README.md) | 第三期真机：exec / 交互终端 / MCP server 三面统一走 `restricted_token` 默认档 | `docs/16` §11 |
