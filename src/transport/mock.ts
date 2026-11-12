@@ -564,7 +564,8 @@ function startMockSubagentDemo(parentId: string, requestId: string | undefined):
       mode: 'continuable' as const, label: spec.label, name: spec.name,
     }
     pushDemoEvent(journal, 'subagent/catalog', data)
-    catalog.push(catalogEntryOf(data))
+    const entry = catalogEntryOf(data)
+    if (entry !== undefined) catalog.push(entry)
     DEMO_LANES.set(laneIds[i]!, { parentSessionId: parentId, aborted: false })
   })
   DEMO_CATALOG.set(parentId, catalog)

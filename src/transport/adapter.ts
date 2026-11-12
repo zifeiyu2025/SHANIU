@@ -1086,7 +1086,8 @@ export function createAdapter(options: AdapterOptions): { remote: unknown; dispo
     const entries: SubagentCatalogEntry[] = []
     for (const lane of agents.values()) {
       if (lane.parentId !== parentId) continue
-      entries.push(catalogEntryOf(lane.catalog))
+      const entry = catalogEntryOf(lane.catalog)
+      if (entry !== undefined) entries.push(entry)
     }
     return entries.length === 0 ? undefined : entries
   }

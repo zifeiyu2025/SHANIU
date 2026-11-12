@@ -70,8 +70,17 @@ export interface SubagentDescriptorEventData {
  */
 export const laneIdOf = (agentId: string): SessionId => agentId as SessionId
 
-/** catalog 事件 → 投影条目（去 version/childId/childCreatedAt、改名 id/createdAt；上游 catalog.ts 的 fold）。 */
-export function catalogEntryOf(data: SubagentCatalogEventData): SubagentCatalogEntry {
+/**
+ * catalog 事件 → 投影条目（去 version/childId/childCreatedAt、改名 id/createdAt；上游 catalog.ts 的 fold）。
+ *
+ * v3 的 `name` 必须过 {@link isLaneName}：上游 catalog schema 会直接拒绝非法名，
+ * 这里若照单全收，脏名字会绕过校验进入投影。非法条目如实丢弃并记日志，不静默塞进去。
+ */
+export function catalogEntryOf(data: SubagentCatalogEventData): SubagentCatalogEntry | undefined {
+  if (data.version === 3 && !isLaneName(data.name)) {
+    console.warn(`[SHANIU] 子代理 catalog 的 name 不合法，条目丢弃：${data.name}（childId=${data.childId}）`)
+    return undefined
+  }
   const { version: _version, childId, childCreatedAt, ...descriptor } = data
   return { id: childId, createdAt: childCreatedAt, ...descriptor } as SubagentCatalogEntry
 }
