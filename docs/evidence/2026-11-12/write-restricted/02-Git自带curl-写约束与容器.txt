@@ -1,0 +1,42 @@
+    Finished `test` profile [unoptimized + debuginfo] target(s) in 0.35s
+     Running tests\curl_evidence_tmp.rs (target\debug\deps\curl_evidence_tmp-3b764f87cad2f246.exe)
+
+running 1 test
+test evidence_git_curl ... 
+===== 宿主侧 Git curl --version =====
+时间：2026-11-12 20:18:04 +08:00
+命令原文："D:\Programs\Git\ucrt64\bin\curl.exe" --version
+退出码：0
+----- 原始输出开始 -----
+curl 8.23.0 (x86_64-w64-mingw32) libcurl/8.23.0 Schannel zlib/1.3.2 brotli/1.2.1 zstd/1.5.7 libidn2/2.3.8 libpsl/0.21.5 libssh2/1.11.1 WinLDAP
+Release-Date: 2026-10-14
+Protocols: dict file ftp ftps gopher gophers http https imap imaps ipfs ipns ldap ldaps mqtt mqtts pop3 pop3s rtsp scp sftp smtp smtps telnet tftp ws wss
+Features: alt-svc AsynchDNS brotli Debug HSTS HTTPS-proxy IDN IPv6 Kerberos Largefile libz NTLM PSL SPNEGO SSL SSPI threadsafe UnixSockets zstd
+WARNING: this libcurl is Debug-enabled, do not use in production
+
+----- 原始输出结束 -----
+
+
+===== 用例：Git 自带 curl 在写约束档取 https =====
+时间：2026-11-12 20:18:05 +08:00
+档位：写约束（restricted token）
+命令原文："D:\Programs\Git\ucrt64\bin\curl.exe" -sS -o NUL -w %{http_code} --max-time 10 https://example.com/
+
+退出码：35（0x00000023）
+----- 原始输出开始（stdout/stderr 由沙箱读线程合并）-----
+curl: (35) schannel: AcquireCredentialsHandle failed: SEC_E_NO_CREDENTIALS (0x8009030e) - 安全包中没有可用的凭证
+000
+----- 原始输出结束 -----
+
+===== 用例：Git 自带 curl 在容器档取 https =====
+时间：2026-11-12 20:18:06 +08:00
+档位：AppContainer
+命令原文："D:\Programs\Git\ucrt64\bin\curl.exe" -sS -o NUL -w %{http_code} --max-time 10 https://example.com/
+
+退出码：-1073741515（0xC0000135）
+----- 原始输出开始（stdout/stderr 由沙箱读线程合并）-----
+----- 原始输出结束 -----
+ok
+
+test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 2 filtered out; finished in 2.80s
+

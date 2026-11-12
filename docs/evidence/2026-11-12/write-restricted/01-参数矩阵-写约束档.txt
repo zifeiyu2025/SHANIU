@@ -1,0 +1,75 @@
+   Compiling shaniu v0.2.5 (D:\MyWorkspace\SHANIU\src-tauri)
+    Finished `test` profile [unoptimized + debuginfo] target(s) in 23.85s
+     Running tests\curl_evidence_tmp.rs (target\debug\deps\curl_evidence_tmp-3b764f87cad2f246.exe)
+
+running 1 test
+test evidence_param_matrix ... 
+===== 用例：基线 https =====
+时间：2026-11-12 20:17:57 +08:00
+档位：写约束（restricted token）
+命令原文：curl -sS -o NUL -w %{http_code} --max-time 10 https://example.com/
+
+退出码：35（0x00000023）
+----- 原始输出开始（stdout/stderr 由沙箱读线程合并）-----
+curl: (35) schannel: AcquireCredentialsHandle failed: SEC_E_NO_CREDENTIALS (0x8009030e) - 安全包中没有可用的凭证
+000
+----- 原始输出结束 -----
+
+===== 用例：-k =====
+时间：2026-11-12 20:17:59 +08:00
+档位：写约束（restricted token）
+命令原文：curl -sS -o NUL -w %{http_code} --max-time 10 -k https://example.com/
+
+退出码：35（0x00000023）
+----- 原始输出开始（stdout/stderr 由沙箱读线程合并）-----
+curl: (35) schannel: AcquireCredentialsHandle failed: SEC_E_NO_CREDENTIALS (0x8009030e) - 安全包中没有可用的凭证
+000
+----- 原始输出结束 -----
+
+===== 用例：--cacert =====
+时间：2026-11-12 20:18:00 +08:00
+档位：写约束（restricted token）
+命令原文：curl -sS -o NUL -w %{http_code} --max-time 10 --cacert D:\Programs\Git\ucrt64\etc\ssl\certs\ca-bundle.crt https://example.com/
+
+退出码：35（0x00000023）
+----- 原始输出开始（stdout/stderr 由沙箱读线程合并）-----
+curl: (35) schannel: AcquireCredentialsHandle failed: SEC_E_NO_CREDENTIALS (0x8009030e) - 安全包中没有可用的凭证
+000
+----- 原始输出结束 -----
+
+===== 用例：--http1.1 =====
+时间：2026-11-12 20:18:01 +08:00
+档位：写约束（restricted token）
+命令原文：curl -sS -o NUL -w %{http_code} --max-time 10 --http1.1 https://example.com/
+
+退出码：35（0x00000023）
+----- 原始输出开始（stdout/stderr 由沙箱读线程合并）-----
+curl: (35) schannel: AcquireCredentialsHandle failed: SEC_E_NO_CREDENTIALS (0x8009030e) - 安全包中没有可用的凭证
+000
+----- 原始输出结束 -----
+
+===== 用例：-x 死代理 127.0.0.1:9 =====
+时间：2026-11-12 20:18:02 +08:00
+档位：写约束（restricted token）
+命令原文：curl -sS -o NUL -w %{http_code} --max-time 10 -x http://127.0.0.1:9 https://example.com/
+
+退出码：7（0x00000007）
+----- 原始输出开始（stdout/stderr 由沙箱读线程合并）-----
+curl: (7) Failed to connect to example.com:443 over proxy 127.0.0.1 after 0 ms: Could not connect to server
+000
+----- 原始输出结束 -----
+
+===== 用例：HTTPS_PROXY 死代理 =====
+时间：2026-11-12 20:18:03 +08:00
+档位：写约束（restricted token）
+命令原文：cmd /C "set HTTPS_PROXY=http://127.0.0.1:9&& curl -sS -o NUL -w "%{http_code}" --max-time 10 https://example.com/"
+
+退出码：7（0x00000007）
+----- 原始输出开始（stdout/stderr 由沙箱读线程合并）-----
+curl: (7) Failed to connect to example.com:443 over proxy 127.0.0.1 after 0 ms: Could not connect to server
+000
+----- 原始输出结束 -----
+ok
+
+test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 2 filtered out; finished in 6.33s
+
