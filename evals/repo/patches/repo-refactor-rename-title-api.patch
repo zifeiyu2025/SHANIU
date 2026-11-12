@@ -1,0 +1,13 @@
+diff --git a/src-tauri/src/session_title.rs b/src-tauri/src/session_title.rs
+index 5c7b704..2fd0981 100644
+--- a/src-tauri/src/session_title.rs
++++ b/src-tauri/src/session_title.rs
+@@ -98,7 +98,7 @@ fn strip_whole_line_emphasis(line: &str) -> String {
+ 
+ /// 从模型输出取标题：首个非空行（模型把注释写在标题后面时只取标题），归一化后
+ /// 为空即拒绝——空标题会让侧栏行看起来"会话没有内容"。
+-pub fn title_from_output(text: &str) -> Result<String, String> {
++pub fn title_from_reply(text: &str) -> Result<String, String> {
+     let line = text
+         .split(['\r', '\n'])
+         .map(str::trim)

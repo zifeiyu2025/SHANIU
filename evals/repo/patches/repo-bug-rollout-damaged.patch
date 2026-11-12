@@ -1,0 +1,12 @@
+diff --git a/src-tauri/src/rollout/mod.rs b/src-tauri/src/rollout/mod.rs
+index 57658da..a74c340 100644
+--- a/src-tauri/src/rollout/mod.rs
++++ b/src-tauri/src/rollout/mod.rs
+@@ -321,7 +321,6 @@ pub fn read(path: &Path) -> Result<Rollout, RolloutError> {
+                 if parsed.is_empty() {
+                     return Err(RolloutError::Corrupted { line: number, message: e.to_string() });
+                 }
+-                damaged.push(number);
+             }
+         }
+     }

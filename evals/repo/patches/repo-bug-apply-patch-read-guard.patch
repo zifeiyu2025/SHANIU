@@ -1,0 +1,15 @@
+diff --git a/src-tauri/src/tools/apply_patch.rs b/src-tauri/src/tools/apply_patch.rs
+index 66a38e1..fd6e267 100644
+--- a/src-tauri/src/tools/apply_patch.rs
++++ b/src-tauri/src/tools/apply_patch.rs
+@@ -438,9 +438,7 @@ fn verify_read_state(
+     let Some(reads) = &ctx.reads else { return Ok(None) };
+     let key = crate::tool_router::canonical_key(full);
+     let Some(recorded) = reads.get(ctx.session_id.as_deref(), &key) else {
+-        return Err(ToolError::Execution(format!(
+-            "write_file_not_read: 未读取过 {path} 就尝试修改。请先用 read_file 读取当前内容，再基于真实内容生成补丁"
+-        )));
++        return Ok(None);
+     };
+     let meta = std::fs::metadata(full)
+         .map_err(|e| ToolError::Execution(format!("读取失败: {e}")))?;

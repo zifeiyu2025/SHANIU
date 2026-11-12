@@ -1,0 +1,20 @@
+diff --git a/src-tauri/src/model_client/retry.rs b/src-tauri/src/model_client/retry.rs
+index 5a81569..7098ad6 100644
+--- a/src-tauri/src/model_client/retry.rs
++++ b/src-tauri/src/model_client/retry.rs
+@@ -64,14 +64,10 @@ impl RetryPolicy {
+     /// - 否则指数退避 `initial * 2^(retry-1)`，封顶 `max_delay`，再乘对称抖动并二次封顶。
+     ///
+     /// `random01` 由调用方注入（`[0, 1]`），生产用 [`random01`]，测试用固定值。
+-    pub fn delay(&self, retry: u32, provider_retry_after_ms: Option<u64>, random01: f64) -> Option<Duration> {
++    pub fn delay(&self, retry: u32, _provider_retry_after_ms: Option<u64>, random01: f64) -> Option<Duration> {
+         if retry == 0 || retry > self.max_retries {
+             return None;
+         }
+-        if let Some(required) = provider_retry_after_ms {
+-            let required = Duration::from_millis(required);
+-            return (required <= self.max_delay).then_some(required);
+-        }
+         // `2^(retry-1)` 用移位算，先夹住指数防止手写超大次数时溢出。
+         let exponent = retry.saturating_sub(1).min(20);
+         let exponential = self.initial_delay.saturating_mul(1u32 << exponent).min(self.max_delay);

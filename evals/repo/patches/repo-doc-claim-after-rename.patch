@@ -1,0 +1,53 @@
+diff --git a/src-tauri/src/capability.rs b/src-tauri/src/capability.rs
+index 78e921d..e186f3b 100644
+--- a/src-tauri/src/capability.rs
++++ b/src-tauri/src/capability.rs
+@@ -306,7 +306,7 @@ impl EndpointMetadata {
+ ///
+ /// 缺字段或类型不符（例如 `context_length` 是字符串）一律按缺失处理，绝不 panic、
+ /// 也绝不拿模型名去猜。
+-pub fn parse_metadata(item: &serde_json::Value) -> EndpointMetadata {
++pub fn parse_endpoint_metadata(item: &serde_json::Value) -> EndpointMetadata {
+     let context_window = first_number(item, &["context_window", "context_length"])
+         .or_else(|| nested_number(item, &["architecture", "context_length"]));
+     let max_output = first_number(item, &["max_output_tokens", "max_completion_tokens"]);
+@@ -1532,7 +1532,7 @@ async fn fetch_endpoint_metadata(
+     };
+     // 有的端点把单模型信息包一层 `data`，两种形状都试。
+     let item = json.get("data").filter(|v| v.is_object()).unwrap_or(&json);
+-    Ok(parse_metadata(item))
++    Ok(parse_endpoint_metadata(item))
+ }
+ 
+ /// 总超时后的结论：每一项都记「未验证」并写明原因。
+@@ -1912,7 +1912,7 @@ mod tests {
+             "max_output_tokens": 8192,
+             "input_modalities": ["text", "image", "video"],
+         });
+-        let meta = parse_metadata(&list_shape);
++        let meta = parse_endpoint_metadata(&list_shape);
+         assert_eq!(meta.context_window, Some(131_072));
+         assert_eq!(meta.max_output, Some(8_192));
+         assert_eq!(meta.input_modalities.unwrap(), vec!["text", "image", "video"]);
+@@ -1923,7 +1923,7 @@ mod tests {
+             "architecture": { "input_modalities": ["text", "image"] },
+             "supported_parameters": ["max_tokens", "tools", "thinking"],
+         });
+-        let meta = parse_metadata(&single_shape);
++        let meta = parse_endpoint_metadata(&single_shape);
+         // 类型不符（字符串）按缺失处理，不 panic、不猜
+         assert_eq!(meta.context_window, None);
+         assert_eq!(meta.supports_tools, Some(true));
+diff --git a/src-tauri/src/model_discovery.rs b/src-tauri/src/model_discovery.rs
+index b6f248d..334e99a 100644
+--- a/src-tauri/src/model_discovery.rs
++++ b/src-tauri/src/model_discovery.rs
+@@ -100,7 +100,7 @@ pub async fn discover_endpoint_models(
+         let context_window = first_number(item, &["context_window", "context_length"]);
+         let max_tokens = first_number(item, &["max_output_tokens", "max_completion_tokens"]);
+         // 能力线索与能力模块共用同一套防御性解析（两种字段形状、类型不符按缺失）。
+-        let meta = crate::capability::parse_metadata(item);
++        let meta = crate::capability::parse_endpoint_metadata(item);
+         let input_modalities = meta
+             .input_modalities
+             .unwrap_or_else(|| vec!["text".to_string()])

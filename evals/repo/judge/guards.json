@@ -1,0 +1,58 @@
+{
+  "retry-after": [
+    {
+      "mode": "tail_hash",
+      "value": "d871c577daf42586b346a44cecbe1da67e3022603313a0ecb485854cd91ba8a1",
+      "path": "src-tauri/src/model_client/retry.rs"
+    }
+  ],
+  "context-overflow-code": [
+    {
+      "mode": "whole_hash",
+      "value": "704e52a48172a27dc89f68a8b56c7188fcda985fb71e87debcd8b378126a18f6",
+      "path": "src-tauri/tests/repo_feat_context_overflow.rs"
+    }
+  ],
+  "rollout-damaged": [
+    {
+      "mode": "tail_hash",
+      "value": "fca274330a08013983c28a80cd4d188f8d8f94b314ffbae1c3b61e520b1fdae1",
+      "path": "src-tauri/src/rollout/mod.rs"
+    }
+  ],
+  "title-cap": [
+    {
+      "mode": "whole_hash",
+      "value": "7fa2fa0a9917a928e5751dc4e5859369cbdf44e8c6793fa43a7be56fb97a9975",
+      "path": "src-tauri/tests/repo_feat_title_cap.rs"
+    }
+  ],
+  "now-ms-exit": [
+    {
+      "mode": "whole_hash",
+      "value": "99b1e817c25a15f306251a606831141681586115ce820f6f6b3129d50bc60e3a",
+      "path": "src-tauri/tests/now_ms_single_source.rs"
+    }
+  ],
+  "rename-title-api": [
+    {
+      "mode": "assert_min",
+      "value": 24,
+      "path": "src-tauri/src/session_title.rs"
+    }
+  ],
+  "apply-patch-read-guard": [
+    {
+      "mode": "tail_hash",
+      "value": "3c10107ce5395ae45059d63e43bbc712c53c41364300c6da1bda7cb6ee2a2bc0",
+      "path": "src-tauri/src/tools/apply_patch.rs"
+    }
+  ],
+  "compaction-tail": [
+    {
+      "mode": "tail_hash",
+      "value": "3555764f5dbbef414a5c64e2e9e31a701e30749f2aace7b824878f110b7b0479",
+      "path": "src-tauri/src/compaction/mod.rs"
+    }
+  ]
+}

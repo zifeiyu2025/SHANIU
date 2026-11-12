@@ -1,0 +1,13 @@
+diff --git a/src-tauri/src/compaction/mod.rs b/src-tauri/src/compaction/mod.rs
+index 9967710..19f8ab0 100644
+--- a/src-tauri/src/compaction/mod.rs
++++ b/src-tauri/src/compaction/mod.rs
+@@ -149,7 +149,7 @@ fn tail_target(items: &[HistoryItem], keep_allowance: usize) -> Target {
+     for index in (0..items.len()).rev() {
+         let cost = item_tokens(&items[index]);
+         // 不变量①：严格大于——刚好装得下的那条必须留下。
+-        if kept + cost > keep_allowance {
++        if kept + cost >= keep_allowance {
+             split = index + 1;
+             break;
+         }

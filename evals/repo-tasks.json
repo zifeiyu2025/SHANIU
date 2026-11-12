@@ -1,0 +1,143 @@
+{
+  "version": 1,
+  "kind": "repo",
+  "base_commit": "0bee58e",
+  "judge": "evals/repo/judge/run.ps1",
+  "notes": [
+    "基线快照固定为 git archive/read-tree 0bee58e，不跟随 HEAD；补丁失效时按 evals/repo/README.md 重建，不要删题。",
+    "前端任务本轮不做：需要在工作区里准备 node_modules，可写面与依赖获取成本都会破坏「干净树可重复」这条前提，扩题时另行定方案。"
+  ],
+  "tasks": [
+    {
+      "id": "repo-bug-retry-after",
+      "type": "bugfix",
+      "title": "重试策略忽略端点 Retry-After",
+      "prompt": "这是真实仓库快照。`cargo test --lib model_client::retry` 有失败。\n请定位并修复实现，让重试策略在端点给出 Retry-After 时优先采用它、超过上限时放弃重试。\n范围：只改 src-tauri/src 下的实现；不要改测试，不要动 scripts/dev。完成后跑 `cargo test --lib model_client::retry` 确认。",
+      "patch": "evals/repo/patches/repo-bug-retry-after.patch",
+      "fixtures": [],
+      "judge": "retry-after",
+      "timeout_secs": 480,
+      "max_turns": 24,
+      "forbid_paths": ["src-tauri/tests/", "scripts/dev/"]
+    },
+    {
+      "id": "repo-bug-apply-patch-read-guard",
+      "type": "bugfix",
+      "title": "补丁工具在未读文件时不再拒绝修改",
+      "prompt": "这是真实仓库快照。`cargo test --lib tools::apply_patch` 有失败。\n现象：没先读文件就发补丁，工具不再报 write_file_not_read 而是直接改。\n请修复实现，恢复「写前必须先读」的守卫；不要改测试，不要动 scripts/dev。完成后跑 `cargo test --lib tools::apply_patch` 确认。",
+      "patch": "evals/repo/patches/repo-bug-apply-patch-read-guard.patch",
+      "fixtures": [],
+      "judge": "apply-patch-read-guard",
+      "timeout_secs": 600,
+      "max_turns": 24,
+      "forbid_paths": ["src-tauri/tests/", "scripts/dev/"]
+    },
+    {
+      "id": "repo-bug-rollout-damaged",
+      "type": "bugfix",
+      "title": "读档时静默跳过损坏行、不计数",
+      "prompt": "这是真实仓库快照。`cargo test --lib rollout::` 有失败。\n现象：档案中间有坏行时，读回来的结果不再报出坏行行号，等于把可恢复的损坏变成悄悄丢历史。\n请修复实现，让坏行被跳过但必须计数并带行号返回；不要改测试。完成后跑 `cargo test --lib rollout::` 确认。",
+      "patch": "evals/repo/patches/repo-bug-rollout-damaged.patch",
+      "fixtures": [],
+      "judge": "rollout-damaged",
+      "timeout_secs": 600,
+      "max_turns": 24,
+      "forbid_paths": ["src-tauri/tests/", "scripts/dev/"]
+    },
+    {
+      "id": "repo-bug-compaction-tail",
+      "type": "bugfix",
+      "title": "压缩保留边界少留一条",
+      "prompt": "这是真实仓库快照。`cargo test --lib compaction::` 有失败。\n现象：保留额度刚好装得下一条时，这条被压掉了，压得比配置口径更狠。\n请修复实现（只改边界判定，不要改阈值与调用方门槛）；不要改测试。完成后跑 `cargo test --lib compaction::` 确认。",
+      "patch": "evals/repo/patches/repo-bug-compaction-tail.patch",
+      "fixtures": [],
+      "judge": "compaction-tail",
+      "timeout_secs": 480,
+      "max_turns": 24,
+      "forbid_paths": ["src-tauri/tests/", "scripts/dev/"]
+    },
+    {
+      "id": "repo-feat-context-overflow-code",
+      "type": "feature",
+      "title": "新增受控错误码 CONTEXT_OVERFLOW",
+      "prompt": "这是真实仓库快照。新增的验收用例 `src-tauri/tests/repo_feat_context_overflow.rs` 当前失败。\n需求：模型端点因为上下文超限拒绝请求时（HTTP 400/413，错误体含 context length / too many tokens 一类关键词），要归到一个独立的受控错误码 CONTEXT_OVERFLOW，并登记进受控码表，不能落进通用的请求无效。\n范围：只改 src-tauri/src 下的实现；`src-tauri/tests/repo_feat_context_overflow.rs` 是判据，不许改。完成后跑 `cargo test --test repo_feat_context_overflow` 与 `cargo test --lib agent_loop::error_codes` 确认。",
+      "patch": null,
+      "fixtures": [
+        {
+          "from": "evals/repo/fixtures/repo_feat_context_overflow.rs",
+          "to": "src-tauri/tests/repo_feat_context_overflow.rs"
+        }
+      ],
+      "judge": "context-overflow-code",
+      "timeout_secs": 900,
+      "max_turns": 32,
+      "forbid_paths": ["src-tauri/tests/", "scripts/dev/"]
+    },
+    {
+      "id": "repo-feat-title-cap",
+      "type": "feature",
+      "title": "标题归一化增加长度上限",
+      "prompt": "这是真实仓库快照。新增的验收用例 `src-tauri/tests/repo_feat_title_cap.rs` 当前失败。\n需求：标题归一化后超过上限时按字符（不是字节）截断并补省略号，且既有标题用例必须保持通过。\n范围：只改 src-tauri/src 下的实现；`src-tauri/tests/repo_feat_title_cap.rs` 是判据，不许改。完成后跑 `cargo test --test repo_feat_title_cap` 与 `cargo test --lib session_title` 确认。",
+      "patch": null,
+      "fixtures": [
+        {
+          "from": "evals/repo/fixtures/repo_feat_title_cap.rs",
+          "to": "src-tauri/tests/repo_feat_title_cap.rs"
+        }
+      ],
+      "judge": "title-cap",
+      "timeout_secs": 600,
+      "max_turns": 24,
+      "forbid_paths": ["src-tauri/tests/", "scripts/dev/"]
+    },
+    {
+      "id": "repo-refactor-now-ms-exit",
+      "type": "refactor",
+      "title": "时钟收敛到唯一定义",
+      "prompt": "这是真实仓库快照。`cargo test --test now_ms_single_source` 失败。\n现状：会话查询模块里留了一份自己的 now_ms 实现。\n要求：收敛到 clock 模块的单一出口，删掉重复实现并更新调用点；行为不变。不要改测试。完成后跑 `cargo test --test now_ms_single_source` 与 `cargo test --lib clock::` 确认。",
+      "patch": "evals/repo/patches/repo-refactor-now-ms-exit.patch",
+      "fixtures": [],
+      "judge": "now-ms-exit",
+      "timeout_secs": 600,
+      "max_turns": 24,
+      "forbid_paths": ["src-tauri/tests/", "scripts/dev/"]
+    },
+    {
+      "id": "repo-refactor-rename-title-api",
+      "type": "refactor",
+      "title": "跨文件重命名标题生成入口",
+      "prompt": "这是真实仓库快照，当前编译不过：`session_title::title_from_output` 已改名为 `title_from_reply`，但调用点没跟上。\n要求：把全部调用点与相关测试改到新名字，旧名不许残留；测试断言不许删减。不要动 scripts/dev。完成后跑 `cargo test --lib session_title` 确认。",
+      "patch": "evals/repo/patches/repo-refactor-rename-title-api.patch",
+      "fixtures": [],
+      "judge": "rename-title-api",
+      "timeout_secs": 480,
+      "max_turns": 20,
+      "forbid_paths": ["scripts/dev/"],
+      "warmup_compile": false
+    },
+    {
+      "id": "repo-doc-max-turns-drift",
+      "type": "doc-sync",
+      "title": "协议文档的轮数默认值与代码不一致",
+      "prompt": "这是真实仓库快照。`docs/04-协议规范.md` 里 `[model]` 段的 `max_turns` 与代码默认值不一致。\n要求：以代码为准修文档，只改 docs/ 下的文件，不许改代码（改代码规避不算完成）。完成后确认文档里的值与 config 默认值一致。",
+      "patch": "evals/repo/patches/repo-doc-max-turns-drift.patch",
+      "fixtures": [],
+      "judge": "doc-max-turns",
+      "timeout_secs": 300,
+      "max_turns": 12,
+      "forbid_paths": ["src-tauri/", "src/", "scripts/"]
+    },
+    {
+      "id": "repo-doc-claim-after-rename",
+      "type": "doc-sync",
+      "title": "代码改名后文档与断言清单滞后",
+      "prompt": "这是真实仓库快照。代码里 `capability::parse_metadata` 已改名为 `capability::parse_endpoint_metadata`，但文档与断言清单仍写旧名，`pwsh -NoProfile -File scripts/dev/check-doc-claims.ps1` 报 A 类缺口。\n要求：以代码为准同步 docs 与 align/doc-claims.md；不许改代码、不许删除断言行蒙混。完成后重跑该脚本确认退出码 0。",
+      "patch": "evals/repo/patches/repo-doc-claim-after-rename.patch",
+      "fixtures": [],
+      "judge": "doc-claim-rename",
+      "timeout_secs": 480,
+      "max_turns": 16,
+      "forbid_paths": ["src-tauri/src/", "src/", "scripts/dev/"]
+    }
+  ]
+}
