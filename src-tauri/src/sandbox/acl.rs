@@ -854,14 +854,15 @@ fn sid_to_string(sid: PSID) -> Result<String, String> {
 ///
 /// 为什么不能只剥 `\\?\` 前缀：UNC 的 verbatim 拼写是 `\\?\UNC\host\share`，剥掉
 /// `\\?\` 后剩下的 `UNC\host\share` 是**相对路径**，会与 `\\host\share` 收敛不到一起。
-/// `tool_router::shell_usable` 已按 `Prefix::VerbatimDisk / VerbatimUNC` 分派，这里直接复用，
-/// 不维护第二份前缀规则。
+/// 前缀规则只有一份，下沉在 `config::path_norm::strip_verbatim`（`config` 是共享
+/// 基础设施，`sandbox` 依赖它不产生反向依赖）；这里只保留"先 canonicalize、
+/// 失败按字面"这一条本地口径。
 ///
 /// `pub(crate)`：写约束模型的身份派生（`sandbox::write_sid`）必须用同一套规范化，
 /// 否则同一目录的两种拼写会派生出两个写 SID（docs/16 §1.2）。
 pub(crate) fn normalize(path: &Path) -> PathBuf {
     let canonical = std::fs::canonicalize(path).unwrap_or_else(|_| path.to_path_buf());
-    crate::tool_router::shell_usable(&canonical)
+    crate::config::path_norm::strip_verbatim(&canonical)
 }
 
 /// 同一路径？两侧都先规范化（`..`、尾斜杠、`\\?\`、junction 会收敛到同一形态），
@@ -1713,6 +1714,16 @@ mod tests {
             from_plain.text(),
             "同一目录的两种拼写必须派生出同一个写 SID"
         );
+    }
+
+    #[test]
+    fn non_existent_paths_fall_back_to_their_literal_spelling() {
+        // 钉住既有口径：`canonicalize` 失败时按字面返回，不做"最深已存在祖先"展开
+        // （那是 `config::workspace_gate` 的比较口径，不是 ACL 键的口径）。这不是
+        // 要修的行为——一旦改成展开祖先，同一路径在目录创建前后会得到不同的键，
+        // 已授出的 ACE 查不回来。
+        let missing = Path::new(r"shaniu-no-such-dir\child");
+        assert_eq!(normalize(missing), missing.to_path_buf());
     }
 
     #[test]
