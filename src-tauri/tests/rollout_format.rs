@@ -176,10 +176,15 @@ async fn rollout_file_matches_history_after_one_task() {
     assert_eq!(snapshot_lines.next(), Some("## 环境快照"), "快照首行必须是标题：{snapshot_text:?}");
     let facts: Vec<&str> = snapshot_lines.filter(|l| !l.trim().is_empty()).collect();
     assert!(!facts.is_empty(), "快照不能只有标题没有事实：{snapshot_text:?}");
+    // 允许清单 = `environment_note` 实际会写的 5 类事实（探测失败的整行省略）。
+    // **仍然只允许这 5 类**：出现第 6 类说明有人往快照里塞了新类别，必须同步这里，
+    // 并想清楚它是否真的需要逐任务播报（快照进历史，会随会话累积）。
+    const ALLOWED_FACTS: [&str; 5] = ["- 当前时间：", "- Git：", "- Python：", "- Node：", "- npm："];
     for fact in &facts {
         assert!(
-            fact.starts_with("- 当前时间：") || fact.starts_with("- Git："),
-            "快照只允许「当前时间 / Git」两类事实（探测失败的整行省略），收到 {fact:?}"
+            ALLOWED_FACTS.iter().any(|prefix| fact.starts_with(prefix)),
+            "环境快照只允许这 5 类事实（当前时间 / Git / Python / Node / npm，探测失败的整行省略），\
+收到 {fact:?}；新增第 6 类必须同步本用例"
         );
     }
     assert!(
