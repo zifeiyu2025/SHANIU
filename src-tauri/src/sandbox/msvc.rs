@@ -45,6 +45,11 @@ pub fn toolchain_env() -> &'static [(String, String)] {
 /// 写 stdout/stderr，而我们的工具输出一律按 UTF-8 解析——中文会乱码、`json` 输出会解析
 /// 失败。`PYTHONUTF8=1` 同时把文件默认编码切到 UTF-8，`PYTHONIOENCODING` 兜住 stdio。
 /// 这属于工具链环境变量，不是放宽沙箱边界。
+///
+/// **注意（2026-11-12）：本机实测是 no-op，未验证过修复乱码**。本机 Python 3.15.2
+/// 从 PEP 686 起默认 UTF-8 mode：清空宿主变量后 `sys.stdout.encoding` 仍是 `utf-8`、
+/// `sys.flags.utf8_mode` 仍是 1。所以「本机能跑」不能当作「乱码已修」的证据——
+/// 这条补丁只对 ≤3.14 的代码页行为有意义，验证要到装了 3.12/3.13 的机器上做。
 const PYTHON_UTF8_ENV: [(&str, &str); 2] =
     [("PYTHONIOENCODING", "utf-8"), ("PYTHONUTF8", "1")];
 
