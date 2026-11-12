@@ -38,10 +38,33 @@ use crate::config::{OsSandbox, SandboxMode};
 /// 2026-11-12.3：隔离机制行按**实际生效**的机制分支（见 [`write_restricted_active`]）。
 /// 写约束档下读区外是放行的，旧句「路径外一律拒绝」会让模型漏掉这个能力、
 /// 也会把「写被拒」误判成路径越界。
-pub const PROMPT_VERSION: &str = "2026-11-12.3";
+/// 2026-11-12.4：`PROMPT_TOKEN_LIMIT` 2500 → 3000（对标 codex / dsh / ZCode，见常量注释）。
+pub const PROMPT_VERSION: &str = "2026-11-12.4";
 
-/// 全文 token 上限（估算口径见 [`rules::estimate_tokens`]）。
-pub const PROMPT_TOKEN_LIMIT: usize = 2500;
+/// 全文 token 上限（估算口径见 [`rules::estimate_tokens`]：CJK 1 字 1 token，ASCII 4 字符 1 token）。
+///
+/// 3000 的由来（2026-11-12 对标，三家都用同一估算口径折算）：
+/// - codex：`base_instructions/default.md` 21,026 字符 ≈ 5,257 tokens（其快照自报
+///   省略段 ~4,925 tokens，量级一致），这还只是 base，未含 permissions / 环境块；
+/// - dsh：装配后的系统提示快照 3,382–6,596 字符 ≈ 853–1,657 tokens；
+/// - ZCode：`context/` 各 section 字面量 11,507 字符 ≈ 2,888 tokens（未含 AGENTS.md 与工具 schema）。
+///
+/// 我们的 2,499（静态块 ≈1,093 + 项目规则 ≈1,142 + 技能目录 264）落在参照区间内，
+/// 但 2500 只剩 1 token：任何新增常驻条款都得先改旧措辞（2026-11-12 的隔离机制行就撞上了）。
+/// 3000 给 500 token 余量，仍低于 codex 的 base 与 ZCode 的静态部分。
+///
+/// 成本（抬高上限的唯一代价）：+500 tokens × 30 轮 ≈ 1.5 万 tokens/会话；按常见输入价
+/// （$0.03–$0.3 / 百万）约 $0.0005–$0.004，缓存命中后更低。真正值钱的是工具 schema 与
+/// 历史，不是这段前缀。防止日后无节制膨胀见 `prompt_segments_keep_their_share`。
+pub const PROMPT_TOKEN_LIMIT: usize = 3000;
+
+/// 预算判定的唯一口径：**恰好等于上限算通过**，多 1 token 才算超。
+///
+/// 只在测试里用（生产侧超限只记日志、不截断），所以按测试构建裁剪。
+#[cfg(test)]
+fn within_prompt_budget(tokens: usize) -> bool {
+    tokens <= PROMPT_TOKEN_LIMIT
+}
 
 /// 一次组装所需的运行事实。显式传参而不是在函数里到处读全局，
 /// 是为了让快照测试能给出确定的环境（时间、Git 状态）。
@@ -1190,10 +1213,18 @@ mod tests {
         context.plan_mode = true;
         let text = system_instruction(&context);
         assert!(
-            rules::estimate_tokens(&text) <= PROMPT_TOKEN_LIMIT,
+            within_prompt_budget(rules::estimate_tokens(&text)),
             "全文估算 {} > 预算 {PROMPT_TOKEN_LIMIT}",
             rules::estimate_tokens(&text)
         );
+    }
+
+    /// 上限边界：恰好等于上限通过，多 1 token 就超。
+    #[test]
+    fn prompt_budget_boundary_is_inclusive() {
+        assert!(within_prompt_budget(PROMPT_TOKEN_LIMIT), "恰好等于上限必须算通过");
+        assert!(!within_prompt_budget(PROMPT_TOKEN_LIMIT + 1), "多 1 token 必须判超");
+        assert!(within_prompt_budget(0));
     }
 
     /// 真实工作区回归闸：仓库自己的 `AGENTS.md`（约 1000 tokens 规则）+ 一条典型技能摘要。
@@ -1222,7 +1253,7 @@ mod tests {
 
         for (label, text) in [("仅规则", &bare), ("规则+技能", &with_skill)] {
             assert!(
-                rules::estimate_tokens(text) <= PROMPT_TOKEN_LIMIT,
+                within_prompt_budget(rules::estimate_tokens(text)),
                 "真实工作区提示词（{label}）超预算：{} > {PROMPT_TOKEN_LIMIT}；\
 分段账单见 `rules::tests::injected_rules_must_contain_iron_law_and_degradation_redline` 的诊断输出",
                 rules::estimate_tokens(text)
@@ -1231,6 +1262,53 @@ mod tests {
         assert!(
             bare.contains("### 0. 铁律"),
             "真实 AGENTS.md 的铁律必须进上下文（规则段不能整段缺失）"
+        );
+    }
+
+    /// 增长闸：上限从 2500 抬到 3000 后，用分段占比防止某一类内容无节制膨胀。
+    ///
+    /// 分段用「空工作区 / 仅规则 / 规则+技能」三次组装的差值量出来。阈值按 2026-11-12
+    /// 实测（静态 1,093 / 规则 1,142 / 技能 264，上限 3,000）留了余量：
+    /// 静态 ≤ 55%、项目规则 ≤ 45%、技能目录 ≤ 15%。
+    #[test]
+    fn prompt_segments_keep_their_share() {
+        let repo = Path::new(env!("CARGO_MANIFEST_DIR")).parent().expect("src-tauri 的上一级是仓库根");
+        let catalog = vec![format!("- `sample-skill`: {}", "示例技能用途说明，".repeat(20))];
+
+        // 空工作区：没有 AGENTS.md，也没有技能 → 只剩静态块。
+        let empty = std::env::temp_dir().join(format!("shaniu-prompt-empty-{}", std::process::id()));
+        std::fs::create_dir_all(&empty).expect("创建空工作区");
+        let static_only =
+            system_instruction(&ctx(&empty, SandboxMode::WorkspaceWrite, OsSandbox::AppContainer, false));
+        std::fs::remove_dir_all(&empty).ok();
+        assert!(!static_only.contains("### 0. 铁律"), "空工作区不该带出项目规则，否则分段量法失效");
+
+        let with_rules = system_instruction(&ctx(repo, SandboxMode::WorkspaceWrite, OsSandbox::AppContainer, false));
+        let with_skill = system_instruction(&PromptContext {
+            skill_catalog: &catalog,
+            ..ctx(repo, SandboxMode::WorkspaceWrite, OsSandbox::AppContainer, false)
+        });
+
+        let static_tokens = rules::estimate_tokens(&static_only);
+        let rules_tokens = rules::estimate_tokens(&with_rules).saturating_sub(static_tokens);
+        let skill_tokens =
+            rules::estimate_tokens(&with_skill).saturating_sub(rules::estimate_tokens(&with_rules));
+        assert!(rules_tokens > 0, "真实 AGENTS.md 必须计入差值（规则段不能整段缺失）");
+
+        eprintln!(
+            "[prompt] 分段占比：静态 {static_tokens} / 规则 {rules_tokens} / 技能 {skill_tokens}（上限 {PROMPT_TOKEN_LIMIT}）"
+        );
+        assert!(
+            static_tokens * 100 <= PROMPT_TOKEN_LIMIT * 55,
+            "静态块占比超 55%：{static_tokens}/{PROMPT_TOKEN_LIMIT}"
+        );
+        assert!(
+            rules_tokens * 100 <= PROMPT_TOKEN_LIMIT * 45,
+            "项目规则占比超 45%：{rules_tokens}/{PROMPT_TOKEN_LIMIT}"
+        );
+        assert!(
+            skill_tokens * 100 <= PROMPT_TOKEN_LIMIT * 15,
+            "技能目录占比超 15%：{skill_tokens}/{PROMPT_TOKEN_LIMIT}"
         );
     }
 
