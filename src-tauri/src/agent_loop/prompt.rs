@@ -31,7 +31,10 @@ use crate::config::{OsSandbox, SandboxMode};
 /// 2026-11-10.2：时间与 Git 移出「环境」块（前缀稳定化）。这两条不再属于系统提示，
 /// 由 [`environment_note`] 作为尾部 system 消息按任务注入。
 /// 2026-11-12.1：轮数默认不限（0 = 不限），「验证纪律」补常驻条款「问题没解决不得结束回合」。
-pub const PROMPT_VERSION: &str = "2026-11-12.1";
+/// 2026-11-12.2：环境块补一句 Unix 命令口径——`ls`/`grep` 未必有（装了 Git 有时真能跑），
+/// 勿依赖，列目录用 `dir`、找文本用 `findstr`；读文件仍按既有条款用 `read_file`。
+/// 只是提示词，执行入口未变（仍是 `cmd /C`）。
+pub const PROMPT_VERSION: &str = "2026-11-12.2";
 
 /// 全文 token 上限（估算口径见 [`rules::estimate_tokens`]）。
 pub const PROMPT_TOKEN_LIMIT: usize = 2500;
@@ -106,6 +109,10 @@ fn environment_block(ctx: &PromptContext<'_>) -> String {
     text.push_str(
         "- Shell：cmd /C（不是 PowerShell；勿用 PowerShell 专有语法、cmdlet 或 $变量）\n",
     );
+    // 说实话：Git 装了会把 usr/bin 带进 PATH，这些命令**有时真的能跑**。
+    // 所以写「未必有、勿依赖」，不写「一定失败」——否则模型看到能跑时会以为自己在幻觉。
+    // 篇幅受 `PROMPT_TOKEN_LIMIT`（真实工作区规则+技能）约束，这里只用最短句式。
+    text.push_str("- Unix 命令（`ls`/`grep`）未必有，勿依赖；用 `dir`/`findstr`。\n");
     text.push_str(&format!("- 权限档：{}\n", mode_label(ctx.sandbox)));
     text.push_str(&format!("- 隔离机制：{}\n", isolation_label(ctx.os)));
     text.push('\n');

@@ -3,6 +3,7 @@
 ## 环境
 - 操作系统：Windows（x86_64）
 - Shell：cmd /C（不是 PowerShell；勿用 PowerShell 专有语法、cmdlet 或 $变量）
+- Unix 命令（`ls`/`grep`）未必有，勿依赖；用 `dir`/`findstr`。
 - 权限档：工作区写入（文件工具仅当前工作区内可写）
 - 隔离机制：AppContainer（OS 级；文件系统按路径授权，路径外一律拒绝）
 
