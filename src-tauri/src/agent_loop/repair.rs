@@ -125,6 +125,15 @@ pub fn extract_diagnostics(output: &str) -> Vec<Diagnostic> {
 }
 
 /// 失败签名：优先用定位 + 描述，其次用输出末尾几行——用于识别「同一错误重复」。
+///
+/// 验证闸门也用它做基线比对：**判定标准只能有一套**，否则同一条错误会在
+/// 「工具失败」与「验证失败」两条路径上得到两种签名。
+pub(crate) fn signature_of(output: &str) -> String {
+    let diagnostics = extract_diagnostics(output);
+    failure_signature(output, &diagnostics)
+}
+
+/// 失败签名：优先用定位 + 描述，其次用输出末尾几行——用于识别「同一错误重复」。
 fn failure_signature(output: &str, diagnostics: &[Diagnostic]) -> String {
     if !diagnostics.is_empty() {
         return diagnostics
@@ -210,14 +219,33 @@ impl RepairController {
             return None;
         }
         if success {
-            // 命令通过 = 闭环完成（无论之前失败过几次）。
-            // 注意这里**不**清 `watched`/`recovering`：是否靠改测试变绿，
-            // 由 [`Self::check_test_tampering`] 在同一个成功事件上结算并清理。
-            self.attempts = 0;
-            self.last_failure = None;
-            self.given_up = false;
+            self.clear_on_success();
             return None;
         }
+        self.observe_failure(output)
+    }
+
+    /// 观测一次**宿主验证**结果。与工具失败共用同一个 `attempts` 额度：
+    /// 否则模型可以靠「验证失败」额外拿到 2 次自动修复，等于把额度翻倍。
+    pub fn observe_verification(&mut self, success: bool, output: &str) -> Option<RepairAction> {
+        if success {
+            self.clear_on_success();
+            return None;
+        }
+        self.observe_failure(output)
+    }
+
+    fn clear_on_success(&mut self) {
+        // 命令通过 = 闭环完成（无论之前失败过几次）。
+        // 注意这里**不**清 `watched`/`recovering`：是否靠改测试变绿，
+        // 由 [`Self::check_test_tampering`] / [`Self::settle_verification`]
+        // 在同一个成功事件上结算并清理。
+        self.attempts = 0;
+        self.last_failure = None;
+        self.given_up = false;
+    }
+
+    fn observe_failure(&mut self, output: &str) -> Option<RepairAction> {
         if self.given_up {
             // 已明确告知放弃，不再刷屏；由模型/用户决定下一步。
             return None;
@@ -260,6 +288,24 @@ impl RepairController {
         if !is_command_tool(tool) || !self.recovering {
             return None;
         }
+        self.finish_tampering(writes)
+    }
+
+    /// 验证通过时的结算：**验证不是工具调用**，所以没有工具名前置；
+    /// 但保留 `recovering` 前置——闸门不扩大既有作弊判定边界。
+    ///
+    /// 若直接拿 `("verify", writes)` 调 [`Self::check_test_tampering`]，会因为它
+    /// 不认这个工具名而**静默返回 `None`**：看上去结算过了，实际什么都没判。
+    /// 这是本设计最危险的假实现形态，已用测试锁死。
+    pub fn settle_verification(&mut self, writes: &[FileWrite]) -> Option<RepairAction> {
+        if !self.recovering {
+            return None;
+        }
+        self.finish_tampering(writes)
+    }
+
+    /// 共用主体：无论结论如何，调用一次即结束窗口（避免同一次成功被反复判定）。
+    fn finish_tampering(&mut self, writes: &[FileWrite]) -> Option<RepairAction> {
         self.recovering = false;
         let watched = std::mem::take(&mut self.watched);
 
@@ -608,5 +654,39 @@ mod tests {
         let mut controller = RepairController::new(DEFAULT_REPAIR_ATTEMPTS, ws.to_path_buf());
         let writes = vec![write_of(&ws, "tests/check.rs", BROKEN_TEST_FILE, "fn adds() {}\n")];
         assert!(controller.check_test_tampering("unified_exec", &writes).is_none());
+    }
+
+    #[test]
+    fn settle_verification_rejects_test_deletion_inside_recovery() {
+        // 与工具成功路径同一结论：跑红 → 删断言 → 验证绿，必须按失败处理。
+        let (ws, failure) = failing_test_workspace("tests/check.rs", BROKEN_TEST_FILE);
+        let mut controller = RepairController::new(DEFAULT_REPAIR_ATTEMPTS, ws.to_path_buf());
+        assert!(controller.observe("unified_exec", false, &failure).is_some());
+
+        let after = "#[test]\nfn adds() {\n}\n";
+        let writes = vec![write_of(&ws, "tests/check.rs", BROKEN_TEST_FILE, after)];
+        // 关键：验证不是工具调用，旧入口认不出 "verify"，会**静默返回 None**。
+        assert!(
+            controller.check_test_tampering("verify", &writes).is_none(),
+            "旧入口的错误用法必须保持 None —— 这正是下面的新入口存在的理由"
+        );
+        let verdict = controller.settle_verification(&writes);
+        assert!(
+            matches!(verdict, Some(RepairAction::RejectedRepair(_))),
+            "验证绿 + 删断言必须被拒: {verdict:?}"
+        );
+    }
+
+    #[test]
+    fn settle_verification_is_inert_outside_recovery() {
+        let ws = temp_workspace();
+        std::fs::create_dir_all(ws.join("tests")).unwrap();
+        std::fs::write(ws.join("tests/check.rs"), BROKEN_TEST_FILE).unwrap();
+        let mut controller = RepairController::new(DEFAULT_REPAIR_ATTEMPTS, ws.to_path_buf());
+        let writes = vec![write_of(&ws, "tests/check.rs", BROKEN_TEST_FILE, "fn adds() {}\n")];
+        assert!(
+            controller.settle_verification(&writes).is_none(),
+            "没进过修复窗口就不判作弊——闸门不扩大既有边界"
+        );
     }
 }

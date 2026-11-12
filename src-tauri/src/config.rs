@@ -52,6 +52,8 @@ pub struct AppConfig {
     pub approval: ApprovalConfig,
     pub workspace: WorkspaceConfig,
     pub agent: AgentConfig,
+    /// 写后验证闸门（04 §4 `[verify]`，additive）。缺段 = 默认开启 + enforce。
+    pub verify: VerifyConfig,
     /// 会话标题自动生成（04 §4 `[session_title]`）。缺段 = 默认开启。
     pub session_title: SessionTitleConfig,
     /// 可选的服务商列表（04 §4 `[[providers]]`）。**为空就是旧行为**：生效档直接取
@@ -579,7 +581,31 @@ impl AppConfig {
     fn validate_loaded(&self) -> Result<(), String> {
         // 头值也是凭据：装载即登记，任何一次日志都晚于这次调用（审计 M8）
         register_header_secrets(&self.providers);
+        Self::validate_verify(&self.verify)?;
         Self::validate_mcp(&self.mcp)
+    }
+
+    /// `[verify].commands` 的严格校验：空命令、超条数都直接报错。
+    ///
+    /// 静默截断/跳过会让「我明明配了 4 条」与「实际只跑了 3 条」对不上，
+    /// 而验证闸门最不能容忍的就是「看起来配了、实际没跑」。
+    fn validate_verify(verify: &VerifyConfig) -> Result<(), String> {
+        if verify.commands.len() > MAX_VERIFY_COMMANDS {
+            return Err(format!(
+                "[verify].commands 最多 {MAX_VERIFY_COMMANDS} 条（当前 {} 条）",
+                verify.commands.len()
+            ));
+        }
+        for command in &verify.commands {
+            let trimmed = command.trim();
+            if trimmed.is_empty() {
+                return Err("[verify].commands 不允许空命令".to_string());
+            }
+            if trimmed.contains('\0') {
+                return Err("[verify].commands 含 NUL 字符".to_string());
+            }
+        }
+        Ok(())
     }
 
     /// 按 id 找额外工作区；`default-workspace` 不在这里（它来自 [workspace].root）。
@@ -808,6 +834,94 @@ pub struct AgentConfig {
 impl Default for AgentConfig {
     fn default() -> Self {
         Self { token_budget: 500_000 }
+    }
+}
+
+/// 写后验证闸门（04 §4 `[verify]`）。
+///
+/// 默认 `enforce`：脏状态在收尾时验证失败会否决一次。`mode` / `baseline` 都是
+/// **封闭枚举**——未知字面量在解析期报错，不做容错回落。配置写错必须立刻暴露，
+/// 否则「以为开了闸门，其实静默关掉」比没有闸门更危险。
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(default)]
+pub struct VerifyConfig {
+    /// 总开关。`SHANIU_EVAL_ABLATE_VERIFY=1` 是评测消融，优先于本项。
+    pub enabled: bool,
+    pub mode: VerifyMode,
+    pub baseline: BaselineMode,
+    /// 单条命令超时；上限 `MAX_VERIFY_TIMEOUT_MS`。
+    pub timeout_ms: u64,
+    /// 显式命令（最高优先）；为空才按脏文件就近探测。
+    pub commands: Vec<String>,
+}
+
+/// 验证失败时的处置方式。
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum VerifyMode {
+    /// 失败否决一次（默认）。
+    #[default]
+    Enforce,
+    /// 只发事件、不否决——运行期泄压阀，改配置即生效，不回滚代码。
+    Warn,
+}
+
+/// 「任务开始前就已经红」的基线采集策略。
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum BaselineMode {
+    /// 首次置脏前观测到同命令失败，就把它当作既有失败（不清脏、不否决）。
+    #[default]
+    Auto,
+    /// 不做基线判定。
+    Off,
+}
+
+/// 单条验证命令超时上限：再长就不是「验证」，是「跑构建」。
+pub const MAX_VERIFY_TIMEOUT_MS: u64 = 300_000;
+/// 一次验证最多执行的命令条数（确定性：同任务两次验证必须同组同序）。
+pub const MAX_VERIFY_COMMANDS: usize = 3;
+
+impl Default for VerifyConfig {
+    fn default() -> Self {
+        Self {
+            enabled: true,
+            mode: VerifyMode::default(),
+            baseline: BaselineMode::default(),
+            timeout_ms: 120_000,
+            commands: Vec::new(),
+        }
+    }
+}
+
+impl VerifyConfig {
+    /// 生效模式：进程级 `SHANIU_VERIFY_MODE` 覆盖配置（只认 `enforce|warn`，其它值忽略）。
+    pub fn effective_mode(&self) -> VerifyMode {
+        match std::env::var("SHANIU_VERIFY_MODE").ok().as_deref().map(str::trim) {
+            Some("warn") => VerifyMode::Warn,
+            Some("enforce") => VerifyMode::Enforce,
+            _ => self.mode,
+        }
+    }
+
+    /// 归一化后的命令清单：去空白、去重、保序、截断到 [`MAX_VERIFY_COMMANDS`]。
+    pub fn normalized_commands(&self) -> Vec<String> {
+        let mut result: Vec<String> = Vec::new();
+        for command in &self.commands {
+            let command = command.trim();
+            if command.is_empty() || result.iter().any(|kept| kept == command) {
+                continue;
+            }
+            result.push(command.to_string());
+            if result.len() >= MAX_VERIFY_COMMANDS {
+                break;
+            }
+        }
+        result
+    }
+
+    pub fn clamped_timeout_ms(&self) -> u64 {
+        self.timeout_ms.clamp(1_000, MAX_VERIFY_TIMEOUT_MS)
     }
 }
 

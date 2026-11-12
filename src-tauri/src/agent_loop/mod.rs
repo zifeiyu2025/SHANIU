@@ -15,6 +15,7 @@ pub mod instance;
 pub mod prompt;
 pub mod repair;
 pub mod rules;
+pub mod verify;
 
 use std::path::PathBuf;
 use std::sync::Arc;
@@ -122,6 +123,17 @@ impl StopHook for PlanModeStopHook {
     }
 }
 
+/// 结束前否决额度（方案 C）：计划 1 次 + 验证 1 次，硬顶 2。
+///
+/// 为什么不把「防循环」交给被调用的钩子（codex 的 `stop_hook_active` 做法）：
+/// 本闸门是宿主内建逻辑，不是第三方脚本；硬顶写在宿主才不会被一次配置失误
+/// 变成无限续跑。
+#[derive(Default)]
+struct VetoLedger {
+    plan_used: bool,
+    verify_used: bool,
+}
+
 // ============================== 循环本体 ==============================
 
 pub struct AgentLoop {
@@ -157,6 +169,11 @@ pub struct AgentLoop {
     /// 结束前否决点（SH-121②）。`None` = 不否决（测试与纯后端路径的默认）。
     /// 生产装配在 [`AgentLoop::from_config`] 注入 [`PlanModeStopHook`]。
     pub stop_hook: Option<Arc<dyn StopHook>>,
+    /// 写后验证闸门配置（`04 §4 [verify]`）。缺段 = 默认开启 + enforce。
+    ///
+    /// 该配置只影响宿主侧判定，不改变任何权限档：写入是否经过审批、是否被拒绝，
+    /// 与「有没有置脏」是两件事——脏标记只认**真的落盘且内容变了**的写入。
+    pub verify: crate::config::VerifyConfig,
     /// 模型请求重试策略（`04 §4 [model].max_retries`）：只决定“能不能再试、等多久”，
     /// 事件与取消由采样循环负责。测试一律 [`crate::model_client::RetryPolicy::disabled`]，
     /// 保证既有脚本后端的行为不变。
@@ -473,6 +490,16 @@ impl AgentLoop {
             session_id: None,
             jobs: None,
             stop_hook: Some(Arc::new(PlanModeStopHook)),
+            verify: {
+                let mut verify = cfg.verify.clone();
+                if std::env::var("SHANIU_EVAL_ABLATE_VERIFY")
+                    .ok()
+                    .is_some_and(|value| value.trim() == "1")
+                {
+                    verify.enabled = false;
+                }
+                verify
+            },
             // 手写配置把次数调大只会让一次失败拖成几分钟（500ms→8s 累加），封顶 8。
             retry: crate::model_client::RetryPolicy::new(cfg.model.max_retries.min(8)),
         }
@@ -629,8 +656,29 @@ impl AgentLoop {
         // 本 run 已落档的系统提示词指纹。只记一次：提示词在 run 内冻结，多轮重复记录
         // 会让档案体积随轮数线性增长（二十轮无变化 = 二十份同样的几万 token）。
         let mut recorded_prompt: Option<String> = None;
-        // 结束前否决点是否已经用过（SH-121②：每次任务最多一次）。
-        let mut stop_vetoed = false;
+        // 结束前否决点额度（SH-121② + 写后验证）：计划 1 次、验证 1 次，硬顶 2。
+        //
+        // 两个槽位分开记，是为了让「计划态还没退出」与「代码还没验证」各自只消费
+        // 自己的额度：计划态否决之后，验证闸门仍然有票；反过来也成立。
+        let mut veto_ledger = VetoLedger::default();
+        // 写后验证的脏状态：只由「真的落盘且内容变了」的源码写入置脏。
+        // 审批被拒的写入根本到不了写日志（工具不执行、不登记），因此天然不置脏。
+        let mut dirty = verify::DirtyTracker::default();
+        // 交互式终端里「按原样跑过验证命令并通过」的观测：终端写、闸门读。
+        // 命中即可免跑重复命令（一编译几十秒，模型刚跑过就没必要再来一遍）。
+        let verify_passes = Arc::new(crate::tool_router::VerifyPassLog::default());
+        // 脏状态代次：每次「源码内容真的变了」就 +1。验证结果对某一代有效，
+        // 同一代内不再重跑（模型连续两次只用文字收尾时，第二次是重复劳动）；
+        // 模型改过代码 → 代次前进 → 必须重新验证，否则一次失败会把任务钉死在
+        // `unverified`，而实际上它已经修好了。
+        let mut dirty_epoch: u64 = 0;
+        let mut verified_epoch: u64 = 0;
+        // 首次置脏之前观测到的同命令失败 = 既有失败基线，避免「仓库本来就红」被算到本次改动头上。
+        let mut baseline = verify::BaselineCache::default();
+        // 评估消融开关在构造时落到配置里（与 REPAIR 同口径）：设 1 = 关闭写后验证闸门
+        // （不跑、不拦、不发事件）。放在构造期而不是每轮读环境变量，测试才能用
+        // `verify.enabled = false` 复现控制臂，不必并发改进程环境。
+        let verify_enabled = self.verify.enabled;
         let emit = |sink: &Arc<dyn crate::events::EventSink>, msg: EventMsg| {
             let _ = sink.emit(&msg);
         };
@@ -1115,9 +1163,11 @@ impl AgentLoop {
             } else {
                 Some(std::mem::take(&mut reasoning_text))
             };
-            // 结束前否决点（SH-121②）：先算再入历史——`text` 之后会被 move。
-            // 只在「确实要结束」且预算还够再跑一轮时询问；每次任务最多否决一次。
-            let veto = if calls.is_empty() && !stop_vetoed && turn < self.max_turns {
+            // 结束前否决点（SH-121② + 写后验证）：先算再入历史——`text` 之后会被 move。
+            // 只在「确实要结束」且预算还够再跑一轮时询问。计划优先、验证次之，
+            // 两者各最多一次（硬顶 2）；`turn + 1 < max_turns` 保证否决后还有一轮可用。
+            let can_veto = turn + 1 < self.max_turns;
+            let plan_veto = if calls.is_empty() && can_veto && !veto_ledger.plan_used {
                 self.stop_hook.as_ref().and_then(|hook| {
                     hook.before_stop(StopContext {
                         history,
@@ -1129,15 +1179,141 @@ impl AgentLoop {
             } else {
                 None
             };
+            if plan_veto.is_some() {
+                veto_ledger.plan_used = true;
+            }
             if !text.trim().is_empty() || reasoning.is_some() {
                 history.push(HistoryItem::Message { role: Role::Assistant, text, reasoning });
             }
 
             // 4) 无工具调用 → 结束前否决点放行/否决
             if calls.is_empty() {
-                match veto {
+                let mut reminder = plan_veto;
+                // 计划态否决优先：这一轮不跑验证，脏状态留到下一轮。
+                // 否则「计划提醒」会吃掉验证额度，形成饥饿。
+                if reminder.is_none()
+                    && can_veto
+                    && verify_enabled
+                    && dirty.is_dirty()
+                    && dirty_epoch != verified_epoch
+                {
+                    verified_epoch = dirty_epoch;
+                    // 通过计入优先：模型刚在终端里按原样跑过同一条命令并成功，
+                    // 就没有必要再等一遍编译。判定条件全在 `observed_pass` 里。
+                    let observed =
+                        verify::observed_pass(&self.verify, &verify_passes, dirty_epoch);
+                    let outcome = match observed {
+                        Some(commands) => verify::VerifyOutcome {
+                            state: crate::events::VerifyState::Passed,
+                            commands,
+                            duration_ms: 0,
+                            summary: "终端里已按原样跑过同一条验证命令并通过".into(),
+                            diagnostics: Vec::new(),
+                            output: String::new(),
+                        },
+                        None => match verify::select_commands(
+                            &self.verify,
+                            &dirty,
+                            &self.workspace_root,
+                        ) {
+                            Ok(commands) => {
+                                let sandbox = crate::config::SandboxMode::WorkspaceWrite;
+                                verify::run_commands(
+                                    &commands,
+                                    std::time::Duration::from_millis(
+                                        self.verify.clamped_timeout_ms(),
+                                    ),
+                                    &self.workspace_root,
+                                    sandbox,
+                                    cancel,
+                                    verify::baseline_enabled(&self.verify).then_some(&baseline),
+                                )
+                                .await
+                            }
+                            Err(reason) => verify::VerifyOutcome {
+                                state: crate::events::VerifyState::Skipped(reason),
+                                commands: Vec::new(),
+                                duration_ms: 0,
+                                summary: String::new(),
+                                diagnostics: Vec::new(),
+                                output: String::new(),
+                            },
+                        },
+                    };
+                    emit(
+                        &sink,
+                        EventMsg::VerificationResult {
+                            turn,
+                            state: outcome.state,
+                            commands: outcome.commands.clone(),
+                            duration_ms: outcome.duration_ms,
+                            summary: outcome.summary.clone(),
+                            diagnostics: outcome.diagnostics.clone(),
+                        },
+                    );
+                    match outcome.state {
+                        crate::events::VerifyState::Passed => {
+                            if repair_enabled {
+                                // 成功先清自愈状态，再结算「这次绿是不是靠改测试换来的」。
+                                repair.observe_verification(true, "");
+                                match repair.settle_verification(&pending_writes) {
+                                    Some(repair::RepairAction::RejectedRepair(text)) => {
+                                        emit(&sink, EventMsg::Error { message: text.clone() });
+                                        history.push(HistoryItem::Message {
+                                            role: Role::System,
+                                            text,
+                                            reasoning: None,
+                                        });
+                                        reason = TurnEndReasonLocal::Failed;
+                                        break 'outer;
+                                    }
+                                    Some(repair::RepairAction::SuspiciousRepair(text)) => {
+                                        emit(&sink, EventMsg::Error { message: text.clone() });
+                                        history.push(HistoryItem::Message {
+                                            role: Role::System,
+                                            text,
+                                            reasoning: None,
+                                        });
+                                    }
+                                    _ => {}
+                                }
+                            }
+                            dirty.clear();
+                            pending_writes.clear();
+                        }
+                        crate::events::VerifyState::Failed => {
+                            // 运行期泄压阀：warn 只发事件不否决，改配置即生效。
+                            // 额度已用尽时同样只披露：验证照跑、结果照发，但不再拦。
+                            if matches!(
+                                self.verify.effective_mode(),
+                                crate::config::VerifyMode::Enforce
+                            ) && !veto_ledger.verify_used
+                            {
+                                let note = if repair_enabled {
+                                    repair
+                                        .observe_verification(false, &outcome.output)
+                                        .map(|action| match action {
+                                            repair::RepairAction::Nudge(text)
+                                            | repair::RepairAction::GiveUp(text)
+                                            | repair::RepairAction::RejectedRepair(text)
+                                            | repair::RepairAction::SuspiciousRepair(text) => text,
+                                        })
+                                } else {
+                                    None
+                                };
+                                // 这次失败之前的写入属于「修复前」，不能算到下一轮修复头上。
+                                pending_writes.clear();
+                                reminder = Some(verify::reminder_text(&outcome, note.as_deref()));
+                                veto_ledger.verify_used = true;
+                            }
+                        }
+                        // 判不出来/没配置命令：不清脏、不否决，由末轮 `unverified` 披露。
+                        crate::events::VerifyState::Inconclusive(_)
+                        | crate::events::VerifyState::Skipped(_) => {}
+                    }
+                }
+                match reminder {
                     Some(reminder) => {
-                        stop_vetoed = true;
                         // 独立 System 条目：不伪装成工具结果、不冒充用户消息。
                         history.push(HistoryItem::Message {
                             role: Role::System,
@@ -1291,6 +1467,7 @@ impl AgentLoop {
                 .with_reads(read_registry.clone())
                 .with_writes(write_journal.clone())
                 .with_images(image_budget.clone())
+                .with_verify_passes(verify_passes.clone())
                 .with_scope(scope.clone());
                 // 只有 root（depth=0）拿到编排能力；子代理沿用 scope 但无 orchestrator，
                 // 分发层会拒绝它调用编排工具（第二层深度门控）。
@@ -1402,13 +1579,31 @@ impl AgentLoop {
                 }
                 // SH-126：把本次调用的写入搬进本地缓冲。写日志本身是 take 语义，
                 // 不搬走就会被下一次写入覆盖掉一半判定依据。
-                pending_writes.extend(write_journal.take());
+                //
+                // 写后验证的脏标记也只认这里：**审批被拒的写入根本不会进写日志**
+                // （工具未执行、未登记），所以「拒了就置脏、逼模型去编一个命令」
+                // 这条路径天然不存在。
+                let writes = write_journal.take();
+                dirty.mark(&writes);
+                if verify::DirtyTracker::has_source_change(&writes) {
+                    dirty_epoch += 1;
+                    // 旧通过记录随之失效：先绿后改不算已验证。
+                    verify_passes.advance();
+                }
+                pending_writes.extend(writes);
                 // SH-125：命令失败 → 提取「文件:行」→ 下一轮以独立 System 条目提示
                 // 模型读错、修复、重跑；达到上限或同一错误重复则明示放弃（不伪造成功）。
                 let succeeded = match &result {
                     Ok(out) => out.success,
                     Err(_) => false,
                 };
+                // 写后验证的基线：只收「首次置脏之前」的同命令失败。之后再有失败
+                // 就是本次改动造成的，不能拿来当「本来就红」的藉口。
+                if !succeeded && !dirty.is_dirty() && verify::baseline_enabled(&self.verify) {
+                    if let Some(command) = verify::tool_command(name, arguments) {
+                        baseline.note_failure(&command, &output_text);
+                    }
+                }
                 let was_recovering = repair.is_recovering();
                 if let Some(action) = repair_enabled
                     .then(|| repair.observe(name, succeeded, &output_text))
@@ -1512,6 +1707,9 @@ impl AgentLoop {
                 TurnEndReasonLocal::BudgetExhausted => crate::events::TurnEndReason::BudgetExhausted,
             },
             error: turn_error,
+            // 有源码写入、但到结束都没被验证过：如实标记，不假装验证过。
+            // 末轮不可否决时这就是唯一的诚实出口（不做 VerificationResult）。
+            unverified: dirty.is_dirty(),
         });
         TurnSummary { turns: last_turn, reason: reason.into() }
     }
@@ -1809,6 +2007,7 @@ mod tests {
             session_id: None,
             jobs: None,
             stop_hook: None,
+            verify: Default::default(),
             retry: crate::model_client::RetryPolicy::disabled(),
         };
         (agent, store, CancellationToken::new(), broker)
@@ -1914,6 +2113,360 @@ mod tests {
         };
         assert!(PlanModeStopHook.before_stop(ctx(true)).is_some());
         assert!(PlanModeStopHook.before_stop(ctx(false)).is_none());
+    }
+
+    // ---- 写后验证闸门（design.md / spec.md） ----
+
+    /// 假写入工具：按参数写文件并登记写日志（`path` / `body`，缺省 `src/lib.rs`）。
+    ///
+    /// 名字**必须**是 `apply_patch`：未知工具名会被 `permission::risk_of` 判成
+    /// Destructive 而走审批，测试里没有审批人 → 永久挂起。写什么文件由参数决定，
+    /// 因此同一个工具就能演「模型自己修好了」的回合。
+    struct FakeWriter {
+        spec: ToolSpec,
+    }
+
+    impl Default for FakeWriter {
+        fn default() -> Self {
+            Self { spec: ToolSpec::new("apply_patch", "假写入", serde_json::json!({"type":"object"})) }
+        }
+    }
+
+    #[async_trait::async_trait]
+    impl ToolExecutor for FakeWriter {
+        fn spec(&self) -> &ToolSpec {
+            &self.spec
+        }
+        async fn execute(&self, args: Value, ctx: &ToolContext) -> Result<ToolOutput, ToolError> {
+            let rel = args.get("path").and_then(|v| v.as_str()).unwrap_or("src/lib.rs");
+            let body = args.get("body").and_then(|v| v.as_str()).unwrap_or_default();
+            let path = ctx.workspace_root.join(rel);
+            if let Some(parent) = path.parent() {
+                std::fs::create_dir_all(parent).ok();
+            }
+            let before = std::fs::read_to_string(&path).ok();
+            std::fs::write(&path, body).map_err(|e| ToolError::Execution(e.to_string()))?;
+            if let Some(journal) = &ctx.writes {
+                journal.record(&path, before.as_deref(), Some(body));
+            }
+            Ok(ToolOutput::ok("written"))
+        }
+    }
+
+    /// 假终端：把「按原样跑过验证命令并通过」记进共享观测（替身只做这一段）。
+    ///
+    /// 名字用 `read_file` 是为了走 Read 风险（Allow），避免测试里等审批——
+    /// 真实的 `terminal` 走的是同一份 `ctx.verify_passes` 句柄。
+    struct FakePassRecorder {
+        spec: ToolSpec,
+        command: String,
+    }
+
+    #[async_trait::async_trait]
+    impl ToolExecutor for FakePassRecorder {
+        fn spec(&self) -> &ToolSpec {
+            &self.spec
+        }
+        async fn execute(&self, _args: Value, ctx: &ToolContext) -> Result<ToolOutput, ToolError> {
+            if let Some(log) = &ctx.verify_passes {
+                log.record_pass(&self.command);
+            }
+            Ok(ToolOutput::ok("ok"))
+        }
+    }
+
+    fn script_call_with(name: &str, arguments: &str, call_id: &str) -> Vec<ModelStreamEvent> {
+        vec![
+            ModelStreamEvent::OutputItem(ResponseItem::FunctionCall {
+                name: name.into(),
+                arguments: arguments.into(),
+                call_id: call_id.into(),
+            }),
+            usage_ev(),
+        ]
+    }
+
+    fn script_text(text: &str) -> Vec<ModelStreamEvent> {
+        vec![ModelStreamEvent::OutputTextDelta { delta: text.into() }, usage_ev()]
+    }
+
+    fn verify_demo(
+        turns: Vec<Vec<ModelStreamEvent>>,
+        commands: Vec<String>,
+        max_turns: u32,
+        mode: crate::config::VerifyMode,
+    ) -> (
+        AgentLoop,
+        Arc<Mutex<Vec<EventMsg>>>,
+        CancellationToken,
+        crate::test_support::TestTempDir,
+    ) {
+        let (mut agent, store, cancel, _broker) = make_loop(turns);
+        let ws = crate::test_support::TestTempDir::new("verify-gate");
+        let mut router = ToolRouter::new();
+        router.register(Arc::new(FakeWriter::default()));
+        router.register(Arc::new(FakePassRecorder {
+            spec: ToolSpec::new("read_file", "假终端观测", serde_json::json!({"type":"object"})),
+            command: commands.first().cloned().unwrap_or_default(),
+        }));
+        agent.router = Arc::new(router);
+        agent.workspace_root = ws.path().to_path_buf();
+        agent.max_turns = max_turns;
+        agent.verify = crate::config::VerifyConfig {
+            commands,
+            mode,
+            ..Default::default()
+        };
+        (agent, store, cancel, ws)
+    }
+
+    fn verification_states(events: &[EventMsg]) -> Vec<crate::events::VerifyState> {
+        events
+            .iter()
+            .filter_map(|event| match event {
+                EventMsg::VerificationResult { state, .. } => Some(*state),
+                _ => None,
+            })
+            .collect()
+    }
+
+    fn completed_unverified(events: &[EventMsg]) -> bool {
+        events
+            .iter()
+            .find_map(|event| match event {
+                EventMsg::TurnCompleted { unverified, .. } => Some(*unverified),
+                _ => None,
+            })
+            .expect("必须有一条 turn_completed")
+    }
+
+    /// 失败 → 否决一次 → 模型补一步让命令通过 → 放行；全程只否决一次。
+    #[tokio::test]
+    async fn verification_gate_vetoes_once_then_passes() {
+        let (agent, store, cancel, _ws) = verify_demo(
+            vec![
+                script_call_with(
+                    "apply_patch",
+                    r#"{"path":"src/lib.rs","body":"pub fn f() {}"}"#,
+                    "w1",
+                ),
+                script_text("写完了"),
+                script_call_with(
+                    "apply_patch",
+                    r#"{"path":"src/ok.rs","body":"pub fn ok() {}"}"#,
+                    "w2",
+                ),
+                script_text("验证通过"),
+            ],
+            vec![r"if exist src\ok.rs (exit 0) else (exit 1)".into()],
+            6,
+            crate::config::VerifyMode::Enforce,
+        );
+        let summary = agent.run_task("任务", Arc::new(CapturingSink(store.clone())), cancel).await;
+
+        assert_eq!(summary.reason, TurnEndReason::Completed);
+        assert_eq!(summary.turns, 4, "失败否决后应多跑一轮，通过后不再续跑");
+        let events = store.lock().unwrap();
+        assert_eq!(
+            verification_states(&events),
+            vec![
+                crate::events::VerifyState::Failed,
+                crate::events::VerifyState::Passed
+            ]
+        );
+        assert!(!completed_unverified(&events), "验证通过后不得标记未验证");
+    }
+
+    /// 末轮不可否决：预算只够跑完，没有位置再跑一轮 → 只放行 + 标记未验证。
+    #[tokio::test]
+    async fn verification_gate_last_turn_window_is_marked_unverified() {
+        let (agent, store, cancel, _ws) = verify_demo(
+            vec![
+                script_call_with("apply_patch", r#"{"body":"pub fn f() {}"}"#, "w1"),
+                script_text("写完了"),
+            ],
+            vec!["exit 1".into()],
+            2,
+            crate::config::VerifyMode::Enforce,
+        );
+        let summary = agent.run_task("任务", Arc::new(CapturingSink(store.clone())), cancel).await;
+
+        assert_eq!(summary.reason, TurnEndReason::Completed);
+        let events = store.lock().unwrap();
+        assert!(verification_states(&events).is_empty(), "末轮不执行验证");
+        assert!(completed_unverified(&events), "放行但必须如实标记未验证");
+    }
+
+    /// `warn` 是运行期泄压阀：仍发事件，但不否决、不增加轮次。
+    #[tokio::test]
+    async fn verification_gate_warn_mode_reports_without_veto() {
+        let (agent, store, cancel, _ws) = verify_demo(
+            vec![
+                script_call_with("apply_patch", r#"{"body":"pub fn f() {}"}"#, "w1"),
+                script_text("写完了"),
+                script_text("不该跑到"),
+            ],
+            vec!["exit 1".into()],
+            4,
+            crate::config::VerifyMode::Warn,
+        );
+        let summary = agent.run_task("任务", Arc::new(CapturingSink(store.clone())), cancel).await;
+
+        assert_eq!(summary.turns, 2, "warn 不否决，不得多跑一轮");
+        let events = store.lock().unwrap();
+        assert_eq!(verification_states(&events), vec![crate::events::VerifyState::Failed]);
+        assert!(completed_unverified(&events));
+    }
+
+    /// 纯文档写入不置脏：没有可验证的源码产物，不该跑编译。
+    #[tokio::test]
+    async fn verification_gate_ignores_documentation_writes() {
+        let (agent, store, cancel, _ws) = verify_demo(
+            vec![
+                script_call_with("apply_patch", r#"{"path":"notes.md","body":"记录"}"#, "w1"),
+                script_text("写完了"),
+            ],
+            vec!["exit 1".into()],
+            3,
+            crate::config::VerifyMode::Enforce,
+        );
+        let summary = agent.run_task("任务", Arc::new(CapturingSink(store.clone())), cancel).await;
+
+        assert_eq!(summary.turns, 2);
+        let events = store.lock().unwrap();
+        assert!(verification_states(&events).is_empty());
+        assert!(!completed_unverified(&events), "没有源码写入就不算未验证");
+    }
+
+    /// 饥饿序列：计划否决先吃掉自己那一票，验证闸门仍有票；两票各自只用一次。
+    #[tokio::test]
+    async fn verification_gate_does_not_starve_after_plan_veto() {
+        struct OnceVeto {
+            calls: Mutex<u32>,
+        }
+        impl StopHook for OnceVeto {
+            fn before_stop(&self, _ctx: StopContext<'_>) -> Option<String> {
+                *self.calls.lock().unwrap() += 1;
+                Some("宿主提醒：计划态还没退出。".into())
+            }
+        }
+
+        let (mut agent, store, cancel, _ws) = verify_demo(
+            vec![
+                script_call_with("apply_patch", r#"{"body":"pub fn f() {}"}"#, "w1"),
+                script_text("写完了"),
+                script_text("还是没验证"),
+                script_text("结束"),
+            ],
+            vec!["exit 1".into()],
+            6,
+            crate::config::VerifyMode::Enforce,
+        );
+        let hook = Arc::new(OnceVeto { calls: Mutex::new(0) });
+        agent.stop_hook = Some(hook.clone() as Arc<dyn StopHook>);
+        let summary = agent.run_task("任务", Arc::new(CapturingSink(store.clone())), cancel).await;
+
+        // 轮 2 计划否决 → 轮 3 验证否决 → 轮 4 放行。
+        assert_eq!(summary.turns, 4);
+        assert_eq!(*hook.calls.lock().unwrap(), 1, "计划槽位只能消费一次");
+        let events = store.lock().unwrap();
+        assert_eq!(
+            verification_states(&events),
+            vec![crate::events::VerifyState::Failed],
+            "验证闸门在计划否决之后仍必须执行一次，且只执行一次"
+        );
+    }
+
+    #[tokio::test]
+    async fn verification_gate_counts_terminal_pass_without_rerunning() {
+        let (agent, store, cancel, _ws) = verify_demo(
+            vec![
+                script_call_with("apply_patch", r#"{"body":"pub fn f() {}"}"#, "w1"),
+                script_call_with("read_file", "{}", "r1"),
+                script_text("跑过了"),
+            ],
+            vec!["cargo test".into()],
+            6,
+            crate::config::VerifyMode::Enforce,
+        );
+        let summary = agent.run_task("任务", Arc::new(CapturingSink(store.clone())), cancel).await;
+
+        assert_eq!(summary.reason, TurnEndReason::Completed);
+        assert_eq!(summary.turns, 3);
+        let events = store.lock().unwrap();
+        assert_eq!(
+            verification_states(&events),
+            vec![crate::events::VerifyState::Passed]
+        );
+        let (duration_ms, text) = events
+            .iter()
+            .find_map(|event| match event {
+                EventMsg::VerificationResult { duration_ms, summary, .. } => {
+                    Some((*duration_ms, summary.clone()))
+                }
+                _ => None,
+            })
+            .expect("必须发 VerificationResult");
+        assert_eq!(duration_ms, 0, "通过计入不得再跑一遍命令");
+        assert!(text.contains("终端"), "summary 必须说明来源：{text}");
+        assert!(!completed_unverified(&events));
+    }
+
+    /// 回归（挂死）：验证命令永不返回时必须到点收割，不得把回合挂住。
+    ///
+    /// 断言本身带超时：闸门若卡住（等锁/等子进程/否决循环缺终止），用例直接失败。
+    #[tokio::test]
+    async fn verification_gate_times_out_instead_of_hanging() {
+        let (mut agent, store, cancel, _ws) = verify_demo(
+            vec![
+                script_call_with("apply_patch", r#"{"body":"pub fn f() {}"}"#, "w1"),
+                script_text("写完了"),
+            ],
+            // 纯 CPU 忙循环：不依赖网络与控制台，沙箱内也不会立刻退出。
+            vec!["for /L %i in (1,1,2000000000) do @rem".into()],
+            4,
+            crate::config::VerifyMode::Enforce,
+        );
+        // 配置下限就是 1000ms（`clamped_timeout_ms`）；取下限即可证明「到点即收」。
+        agent.verify.timeout_ms = 1_000;
+        // 沙箱运行时在进程内首次启动要 ~15s（AppContainer 初始化），这属于冷启动、
+        // 不是闸门时长。先单独跑一条命令把它拉起来，后面的时限才只量闸门本身。
+        let warmup = tokio::time::timeout(
+            std::time::Duration::from_secs(60),
+            crate::sandbox::capture::run_capture(
+                crate::config::SandboxMode::WorkspaceWrite,
+                &agent.workspace_root,
+                "exit 0",
+                &agent.workspace_root,
+                std::time::Duration::from_secs(1),
+                &cancel,
+            ),
+        )
+        .await;
+        assert!(warmup.is_ok(), "沙箱冷启动超时，无法进入闸门计时");
+        let started = std::time::Instant::now();
+        let summary = tokio::time::timeout(
+            std::time::Duration::from_secs(15),
+            agent.run_task("任务", Arc::new(CapturingSink(store.clone())), cancel),
+        )
+        .await
+        .expect("验证闸门不得挂住回合（15s 未返回即失败）");
+        let elapsed = started.elapsed();
+        assert!(
+            elapsed < std::time::Duration::from_secs(10),
+            "闸门到点后必须很快放行，实际用了 {elapsed:?}"
+        );
+
+        assert_eq!(summary.reason, TurnEndReason::Completed);
+        let events = store.lock().unwrap();
+        assert_eq!(
+            verification_states(&events),
+            vec![crate::events::VerifyState::Inconclusive(
+                crate::events::InconclusiveReason::Timeout
+            )],
+            "不返回的命令必须判为超时；判成 Failed 会误否决"
+        );
+        assert!(completed_unverified(&events), "超时不算验证通过");
     }
 
     #[tokio::test]
@@ -2633,6 +3186,7 @@ mod tests {
             session_id: None,
             jobs: None,
             stop_hook: None,
+            verify: Default::default(),
             retry: crate::model_client::RetryPolicy::disabled(),
         };
         let sink = Arc::new(CapturingSink(store.clone()));
@@ -2782,6 +3336,7 @@ mod tests {
             session_id: None,
             jobs: None,
             stop_hook: None,
+            verify: Default::default(),
             retry: crate::model_client::RetryPolicy::disabled(),
         };
         let sink: Arc<dyn EventSink> = Arc::new(AutoApproveSink { store: store.clone(), broker });
@@ -2876,6 +3431,7 @@ mod tests {
             session_id: None,
             jobs: None,
             stop_hook: None,
+            verify: Default::default(),
             retry: crate::model_client::RetryPolicy::disabled(),
         };
         let sink = Arc::new(CapturingSink(store.clone()));
@@ -3021,6 +3577,7 @@ mod tests {
             session_id: None,
             jobs: None,
             stop_hook: None,
+            verify: Default::default(),
             retry: crate::model_client::RetryPolicy::disabled(),
         };
         (agent, recorded, store)
@@ -3259,6 +3816,7 @@ mod tests {
             session_id: None,
             jobs: None,
             stop_hook: None,
+            verify: Default::default(),
             retry: crate::model_client::RetryPolicy::disabled(),
         };
         let (sink, _store) = CapturingSink::new();

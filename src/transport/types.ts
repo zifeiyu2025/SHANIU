@@ -74,9 +74,25 @@ export type RetryPhase = 'scheduled' | 'started' | 'exhausted';
 /** 压缩触发原因（与 Rust `CompactionTrigger` 同形）。 */
 export type CompactionTrigger = 'pressure' | 'manual';
 
+/** 写后验证「无法判定」的封闭原因（与 Rust `InconclusiveReason` 同形，不设 catch-all）。 */
+export type InconclusiveReason = 'timeout' | 'command_missing' | 'pre_existing_red' | 'env_failure';
+
+/** 写后验证「未执行」的封闭原因（与 Rust `SkipReason` 同形）。 */
+export type SkipReason = 'no_source_write' | 'no_command_configured';
+
+/**
+ * 写后验证四态（与 Rust `VerifyState` 同形，serde 外部标签）：
+ * `'passed'` / `'failed'` 是裸字符串，带原因的两个是单键对象。
+ *
+ * 消费端纪律：遇到**认不出**的形态按 `failed` 展示（fail-closed），
+ * 绝不当成通过——否则后端新增一个原因码就会在前端变成绿色。
+ */
+export type VerifyState = 'passed' | 'failed' | { inconclusive: InconclusiveReason } | { skipped: SkipReason };
+
 export type EventMsg =
   | { type: 'turn_started'; turn: number }
-  | { type: 'turn_completed'; turn: number; reason: TurnEndReason; error?: TurnErrorInfo }
+  | { type: 'turn_completed'; turn: number; reason: TurnEndReason; error?: TurnErrorInfo; unverified?: boolean }
+  | { type: 'verification_result'; turn: number; state: VerifyState; commands: string[]; duration_ms: number; summary: string; diagnostics: string[] }
   | { type: 'agent_message_delta'; delta: string }
   | { type: 'reasoning_delta'; delta: string }
   | { type: 'tool_call_begin'; call_id: string; tool: string; args: JsonValue }

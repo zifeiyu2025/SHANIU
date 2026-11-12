@@ -7,19 +7,16 @@
 //! - 超时/失败以 `ToolOutput::fail` 回填（模型可自我纠正），取消以 `ToolError::Cancelled`；
 //! - 输出总量超限时截断并标注。
 
-use std::io;
-use std::os::windows::process::ExitStatusExt;
 use std::path::Path;
-use std::process::{ExitStatus, Stdio};
+use std::process::Stdio;
 use std::time::Duration;
 
 use async_trait::async_trait;
 use serde_json::Value;
-use tokio::io::{AsyncBufReadExt, AsyncReadExt, BufReader};
 use tokio::sync::mpsc;
 
 use crate::events::EventMsg;
-use crate::sandbox;
+use crate::sandbox::{self, spawn_reader, Waiter};
 use crate::tool_router::{
     resolve_in_workspace, ToolContext, ToolError, ToolExecutor, ToolOutput, ToolSpec,
 };
@@ -27,12 +24,6 @@ use crate::tool_router::{
 const DEFAULT_TIMEOUT_MS: u64 = 120_000;
 const MAX_TIMEOUT_MS: u64 = 600_000;
 const MAX_COLLECTED_BYTES: usize = 128 * 1024;
-/// 单行原始字节上限（`read_until` 本身无界）。
-///
-/// 一条永远不换行的输出（`printf` 几百 MB、`yes` 被截断在半行）会把行缓冲撑到 OOM，
-/// 而总量上限 `MAX_COLLECTED_BYTES` 是**收集之后**才生效，救不了读取阶段。
-/// 超限按一行先发出去、继续读下一段：内容不丢、行序不变，只是超长行会被切成多条。
-const MAX_LINE_BYTES: usize = 64 * 1024;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum IoChannel {
@@ -381,56 +372,6 @@ impl UnifiedExec {
     }
 }
 
-/// 逐行读取子进程管道送入通道；EOF（管道关闭）后任务自然结束。
-///
-/// 按**原始字节**读行再解码：`read_line(&mut String)` 遇到中文 Windows 的 GBK 输出
-/// 会返回 `InvalidData` 并让整行连同其后内容一起丢失（模型只看到 `�\u{73e}...`）。
-/// 编码由 [`crate::text_encoding::StreamDecoder`] 按整条流判定一次，结果回写进
-/// `encodings`，供调用方写进工具输出元数据。
-fn spawn_reader(
-    pipe: Box<dyn tokio::io::AsyncRead + Unpin + Send>,
-    channel: u8,
-    tx: mpsc::Sender<sandbox::ExecLine>,
-    encodings: crate::text_encoding::EncodingLedger,
-) -> tokio::task::JoinHandle<()> {
-    tokio::spawn(async move {
-        let mut reader = BufReader::new(pipe);
-        let mut decoder = crate::text_encoding::StreamDecoder::with_system_oem();
-        let mut raw: Vec<u8> = Vec::new();
-        'read: loop {
-            raw.clear();
-            // 有界读取：`take` 封顶后 `read_until` 到上限即返回（不带换行），下一轮接着读。
-            let read = {
-                let mut limited = (&mut reader).take(MAX_LINE_BYTES as u64);
-                limited.read_until(b'\n', &mut raw).await
-            };
-            match read {
-                Ok(0) | Err(_) => break,
-                Ok(_) => {}
-            }
-            while matches!(raw.last(), Some(b'\n') | Some(b'\r')) {
-                raw.pop();
-            }
-            for decoded in decoder.push_line(&raw) {
-                if tx.send((channel, decoded)).await.is_err() {
-                    break 'read;
-                }
-            }
-            if let Some(encoding) = decoder.decision() {
-                encodings.record(channel, encoding);
-            }
-        }
-        for decoded in decoder.finish() {
-            if tx.send((channel, decoded)).await.is_err() {
-                break;
-            }
-        }
-        if let Some(encoding) = decoder.decision() {
-            encodings.record(channel, encoding);
-        }
-    })
-}
-
 /// 后台作业 worker：脱离工具调用独立运行，输出进注册表环形缓冲，
 /// 由 `job_kill` 的终止信号或超时结束；退出码落定终态。
 fn spawn_background_worker(
@@ -711,37 +652,10 @@ fn to_io_channel(code: u8) -> IoChannel {
     if code == 0 { IoChannel::Stdout } else { IoChannel::Stderr }
 }
 
-/// 子进程等待/终止的统一抽象（Plain=tokio Child / Restricted=spawn_blocking + Job）。
-enum Waiter {
-    Tokio(Box<tokio::process::Child>),
-    Restricted(Box<sandbox::windows_impl::RestrictedChild>),
-}
-
-impl Waiter {
-    async fn status(&mut self) -> io::Result<ExitStatus> {
-        match self {
-            Waiter::Tokio(child) => child.wait().await,
-            Waiter::Restricted(child) => {
-                // 约定：退出码 i32（Windows exit code u32 的有符号视图）
-                let code = child.wait().await?;
-                Ok(ExitStatus::from_raw(code as u32))
-            }
-        }
-    }
-
-    fn kill(&mut self) {
-        match self {
-            Waiter::Tokio(child) => {
-                let _ = child.start_kill();
-            }
-            Waiter::Restricted(child) => child.kill(),
-        }
-    }
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::sandbox::capture::MAX_LINE_BYTES;
     use crate::tool_router::ToolRouter;
     use std::path::Path;
     use std::sync::Arc;

@@ -53,6 +53,8 @@ declare module '@deepseek-ai/dsh-llm' {
     'archive-degraded': { kind: 'archive-degraded'; form: 'notice'; summary: string }
     /** 自动压缩的一次性告知：上下文因为达到预算被有损替换，回答"为什么变短、丢了什么"。 */
     'compaction-notice': { kind: 'compaction-notice'; form: 'notice'; summary: string }
+    /** 写后验证的裁决与「未验证」披露（宿主执行/判定，不参与模型请求）。 */
+    'verification': { kind: 'verification'; form: 'notice'; summary: string }
   }
 }
 

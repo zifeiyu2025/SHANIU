@@ -139,6 +139,7 @@ fn harness_with_rollout(
         jobs: None,
         stop_hook: None,
         retry,
+        verify: Default::default(),
     };
     Harness { agent, sink, backend, cancel: CancellationToken::new(), budget }
 }

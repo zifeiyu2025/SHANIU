@@ -11,14 +11,16 @@
 
 use serde::Serialize;
 use shaniu_lib::events::{
-    AgentEvent, ApprovalDecision, CompactionTrigger, EventMsg, IoChannel, RetryPhase, RiskLevel,
-    SubagentExitStatus, ToolCallResult, TurnEndReason, TurnErrorInfo,
+    AgentEvent, ApprovalDecision, CompactionTrigger, EventMsg, InconclusiveReason, IoChannel,
+    RetryPhase, RiskLevel, SkipReason, SubagentExitStatus, ToolCallResult, TurnEndReason,
+    TurnErrorInfo, VerifyState,
 };
 
 /// 与 src/transport/types.ts 的 type 判别值逐一对应。
-const EXPECTED_TAGS: [&str; 23] = [
+const EXPECTED_TAGS: [&str; 24] = [
     "turn_started",
     "turn_completed",
+    "verification_result",
     "agent_message_delta",
     "reasoning_delta",
     "tool_call_begin",
@@ -45,7 +47,12 @@ const EXPECTED_TAGS: [&str; 23] = [
 fn all_variants() -> Vec<EventMsg> {
     let variants = vec![
         EventMsg::TurnStarted { turn: 1 },
-        EventMsg::TurnCompleted { turn: 1, reason: TurnEndReason::Cancelled, error: None },
+        EventMsg::TurnCompleted {
+            turn: 1,
+            reason: TurnEndReason::Cancelled,
+            error: None,
+            unverified: false,
+        },
         // 审计 A0：失败回合的结构化错误（additive）也要进 round-trip 与序列化覆盖
         EventMsg::TurnCompleted {
             turn: 2,
@@ -59,6 +66,41 @@ fn all_variants() -> Vec<EventMsg> {
                 attempts: Some(5),
                 retry_after_secs: Some(30),
             }),
+            unverified: true,
+        },
+        // 写后验证（additive）：四态各进一次，原因码的序列化形态（裸字符串 vs 单键对象）
+        // 必须被真正验证过，否则前端镜像漂移测不出来。
+        EventMsg::VerificationResult {
+            turn: 1,
+            state: VerifyState::Passed,
+            commands: vec!["cargo test".into()],
+            duration_ms: 1_500,
+            summary: "验证通过".into(),
+            diagnostics: Vec::new(),
+        },
+        EventMsg::VerificationResult {
+            turn: 1,
+            state: VerifyState::Failed,
+            commands: vec!["cargo test".into()],
+            duration_ms: 2_000,
+            summary: "验证未通过".into(),
+            diagnostics: vec!["src/lib.rs:3:1: expected `;`".into()],
+        },
+        EventMsg::VerificationResult {
+            turn: 2,
+            state: VerifyState::Inconclusive(InconclusiveReason::Timeout),
+            commands: vec!["cargo test".into()],
+            duration_ms: 120_000,
+            summary: "命令超时".into(),
+            diagnostics: Vec::new(),
+        },
+        EventMsg::VerificationResult {
+            turn: 2,
+            state: VerifyState::Skipped(SkipReason::NoCommandConfigured),
+            commands: Vec::new(),
+            duration_ms: 0,
+            summary: String::new(),
+            diagnostics: Vec::new(),
         },
         EventMsg::AgentMessageDelta { delta: "你好".into() },
         EventMsg::ReasoningDelta { delta: "先想想".into() },
@@ -192,6 +234,7 @@ fn all_variants() -> Vec<EventMsg> {
         match msg {
             EventMsg::TurnStarted { .. }
             | EventMsg::TurnCompleted { .. }
+            | EventMsg::VerificationResult { .. }
             | EventMsg::AgentMessageDelta { .. }
             | EventMsg::ReasoningDelta { .. }
             | EventMsg::ToolCallBegin { .. }
@@ -485,6 +528,10 @@ fn every_enum_variant_is_mirrored_in_frontend_types() {
     assert_union_covers("SubagentExitStatus", SubagentExitStatus::all_variants());
     assert_union_covers("RetryPhase", RetryPhase::all_variants());
     assert_union_covers("CompactionTrigger", CompactionTrigger::all_variants());
+    // 写后验证的原因码是**封闭枚举**：前后端任一单方增删都必须红，
+    // 否则前端会把一个没见过的原因当成通过。
+    assert_union_covers("InconclusiveReason", InconclusiveReason::all_variants());
+    assert_union_covers("SkipReason", SkipReason::all_variants());
 }
 
 /// SH-079：EventMsg tag 与前端镜像**机械绑定**（此前 EXPECTED_TAGS 与 types.ts 无人校验关联）。

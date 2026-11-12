@@ -164,12 +164,22 @@ struct Session {
     owner: Option<String>,
     buffer: Arc<OutputBuffer>,
     writer: Mutex<Option<std::fs::File>>,
+    /// 最近一次 `write` 的命令原文（去掉尾部换行）。写后验证的「通过计入」靠它
+    /// 与验证命令做**逐字**比对：终端里的命令是模型手输的，不能靠模糊匹配猜。
+    last_command: Mutex<Option<String>>,
     /// `None` = 已被 close 取走（随后立即 Drop → 整树回收）。
     child: Mutex<Option<sandbox::windows_impl::TerminalChild>>,
 }
 
 impl Session {
     fn write(&self, data: &str) -> Result<usize, String> {
+        // 先记原文再写：即使写入失败，也不会把「上一条命令」错当成这一条。
+        // 尾部换行是「按回车」的输入语法，不属于命令本身。
+        *self
+            .last_command
+            .lock()
+            .unwrap_or_else(|p| p.into_inner()) =
+            Some(data.trim_end_matches(['\r', '\n']).to_string());
         let mut guard = self.writer.lock().unwrap_or_else(|p| p.into_inner());
         let writer = guard.as_mut().ok_or_else(|| "终端会话已关闭".to_string())?;
         let payload = normalize_input(data);
@@ -178,6 +188,27 @@ impl Session {
             .map_err(|e| format!("写入终端失败: {e}"))?;
         writer.flush().map_err(|e| format!("刷新终端输入失败: {e}"))?;
         Ok(payload.len())
+    }
+
+    /// 把「这条命令跑过且成功」记进宿主侧的通过观测。
+    ///
+    /// 只认三件事同时成立：会话已关闭（shell 退出，短时间内不会再改代码）、
+    /// 退出码为 0、并且有最近一次命令原文。非 0 一律不记——本期只做「通过计入」。
+    fn observe_pass(&self, ctx: &ToolContext, exit: Option<u32>, closed: bool) {
+        if !closed || exit != Some(0) {
+            return;
+        }
+        let Some(log) = &ctx.verify_passes else {
+            return;
+        };
+        if let Some(command) = self
+            .last_command
+            .lock()
+            .unwrap_or_else(|p| p.into_inner())
+            .as_deref()
+        {
+            log.record_pass(command);
+        }
     }
 
     fn exit_code(&self) -> Option<u32> {
@@ -370,6 +401,7 @@ read（读取**自上次 read 之后**的新输出，可等待）、close（关�
             owner: ctx.session_id.clone(),
             buffer: buffer.clone(),
             writer: Mutex::new(Some(spawned.writer)),
+            last_command: Mutex::new(None),
             child: Mutex::new(Some(spawned.child)),
         });
 
@@ -445,6 +477,7 @@ read（读取**自上次 read 之后**的新输出，可等待）、close（关�
             let closed = session.buffer.lock().closed;
             if !text.is_empty() || closed {
                 let exit = session.exit_code();
+                session.observe_pass(ctx, exit, closed);
                 return Ok(ToolOutput::ok(render_read(
                     &session,
                     &text,
@@ -466,6 +499,7 @@ read（读取**自上次 read 之后**的新输出，可等待）、close（关�
         }
         let exit = session.exit_code();
         let closed = session.buffer.lock().closed;
+        session.observe_pass(ctx, exit, closed);
         Ok(ToolOutput::ok(render_read(
             &session, "", false, 0, exit, closed,
         )))

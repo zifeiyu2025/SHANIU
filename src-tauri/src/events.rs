@@ -190,6 +190,66 @@ impl SubagentExitStatus {
     }
 }
 
+/// 写后验证的四态（docs/04 §1.2）。
+///
+/// `Inconclusive` / `Skipped` 的原因码都是**封闭枚举**：没有 `Other`、没有 catch-all。
+/// 判定侧凡未命中任何具名原因，一律按 `Failed` 处理（fail-closed）——
+/// 「判不出来」不许变成偷偷放过。
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum VerifyState {
+    Passed,
+    Failed,
+    Inconclusive(InconclusiveReason),
+    Skipped(SkipReason),
+}
+
+/// `Inconclusive` 的封闭原因集。新增成员必须同时补 `docs/04` 与判定用例。
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum InconclusiveReason {
+    /// 单命令或总时限内没跑完。
+    Timeout,
+    /// 命令根本不存在（shell 报 `not recognized` / `command not found`）。
+    CommandMissing,
+    /// 命令在首次置脏之前就已经红（基线命中），不是本次改动造成的。
+    PreExistingRed,
+    /// 环境类失败：网络、磁盘、权限、注册表等，重跑也不一定好。
+    EnvFailure,
+}
+
+impl InconclusiveReason {
+    /// FF-2 单一事实源（SH-078）：同 `TurnEndReason::all_variants` 的穷举约定。
+    pub fn all_variants() -> &'static [Self] {
+        match Self::Timeout {
+            Self::Timeout | Self::CommandMissing | Self::PreExistingRed | Self::EnvFailure => {
+                &[Self::Timeout, Self::CommandMissing, Self::PreExistingRed, Self::EnvFailure]
+            }
+        }
+    }
+}
+
+/// `Skipped` 的封闭原因集。
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum SkipReason {
+    /// 本次没有源码类写入（纯文档/资源改动）。
+    NoSourceWrite,
+    /// 配置与探测都没给出命令。
+    NoCommandConfigured,
+}
+
+impl SkipReason {
+    /// FF-2 单一事实源（SH-078）：同 `TurnEndReason::all_variants` 的穷举约定。
+    pub fn all_variants() -> &'static [Self] {
+        match Self::NoSourceWrite {
+            Self::NoSourceWrite | Self::NoCommandConfigured => {
+                &[Self::NoSourceWrite, Self::NoCommandConfigured]
+            }
+        }
+    }
+}
+
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(tag = "type", rename_all = "snake_case")]
 pub enum EventMsg {
@@ -201,6 +261,24 @@ pub enum EventMsg {
         /// 有它，UI 才能说"密钥无效"而不是"回合以 failed 结束"，导出才能对账 401。
         #[serde(default, skip_serializing_if = "Option::is_none")]
         error: Option<TurnErrorInfo>,
+        /// 写后验证闸门（additive）：本回合在「有源码写入但未验证」的情况下结束。
+        /// 末轮不可否决时它会是 `true`，且不会伴随 `VerificationResult`——这是设计
+        /// 明确披露的窗口，不是漏报。旧档案没有该字段，按 `false` 解码。
+        #[serde(default)]
+        unverified: bool,
+    },
+    /// 写后验证闸门（additive，docs/04 §1.2）：宿主执行项目检查命令的结果。
+    ///
+    /// 命令由宿主从配置/探测得到，**不受模型控制**；事件带命令原文是为了让
+    /// 「免审批执行」这件事可审计——不弹窗不等于不留痕。
+    VerificationResult {
+        turn: u32,
+        state: VerifyState,
+        commands: Vec<String>,
+        duration_ms: u64,
+        summary: String,
+        /// 最多 5 条，与自愈诊断同口径。
+        diagnostics: Vec<String>,
     },
     AgentMessageDelta { delta: String },
     /// additive（FF-2，docs/04 §1.2）：思考模型的推理增量。刻意**不复用**正文 delta——

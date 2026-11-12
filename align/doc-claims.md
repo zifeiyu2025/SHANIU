@@ -14,7 +14,7 @@ A（文档有、代码找不到）/ B（不可机械判定）/ 通过数，退�
 **覆盖边界**：本表是**已登记**的断言集，不是从散文自动抽取的。文档新增承诺要人工追加一行
 （ID 续号），删除承诺要人工删行；脚本不会自己发现「新写的句子」。所以：
 
-- 绿 = 已登记的 192 行承诺在**当前 HEAD** 上还站得住；
+- 绿 = 已登记的 200 行承诺在**当前 HEAD** 上还站得住；
 - 绿 ≠ docs 与代码完全一致，也 ≠ 实现正确（见 B 类与下面的盲区）。
 - 「文档位置」列的行号只用于人工回查，文档增删后会漂移；脚本只按**文件**判，不校验行号
   （`docs/10` 已经定过口径：引用不写数字行号，留符号）。
@@ -248,6 +248,13 @@ A（文档有、代码找不到）/ B（不可机械判定）/ 通过数，退�
 | R2-191 | 01:L266 | 派生态 `custom` 不可选 | `CUSTOM` | 符号 | 2026-11-12：两维绑定与派生值 |
 | R2-192 | 01:L266 | 自造扩展档 `workspace-write-auto` 已移除，预设表只剩 DSH 三档 | `removed_extension_preset_is_not_selectable` | 测试 | 2026-11-12 用户裁定「权限档位对齐 dsh 就行，不要搞复杂」：不回退历史，用新提交移除；想不被打断选 `danger-full-access` |
 | R2-193 | 01:L266 | 三档各自的 `(sandbox, approval)` 绑定与 `decide` 结果一致 | `three_presets_decide_as_their_bundles_say` | 测试 | 同上：改错一档的审批值必须同时让这条与 `preset.rs` 的绑定用例变红 |
+| R2-194 | 04:L36 | 写后验证的一次裁决结果（additive）：`verification_result` | `VerificationResult` | 符号 | 2026-11-12 写后验证闸门：事件只在宿主真的跑过/判定过时才发 |
+| R2-195 | 04:L35 | `turn_completed` 的 `unverified` 只披露事实，不改变 `reason` | `unverified` | 符号 | 同上：末轮窗口 / `warn` / 一直失败时置真 |
+| R2-196 | 04:L46 | `[verify]` 缺段 = 默认开启 + enforce（`enabled`/`mode`/`baseline`/`timeout_ms`/`commands`） | `VerifyConfig` | 符号 | 同上：五键与 `config.rs` 的 `VerifyConfig` 一一对应 |
+| R2-197 | 04:L36 | 原因码是**封闭枚举**：`inconclusive` / `skipped` 不得有 catch-all | `InconclusiveReason`、`SkipReason` | 符号 | 同上：`event_schema.rs` 双向镜像这两组变体 |
+| R2-198 | 04:L46 | 运行期泄压阀 `SHANIU_VERIFY_MODE` | `SHANIU_VERIFY_MODE` | 字面量 | 同上：改环境变量即生效，不必改配置 |
+| R2-199 | 04:L46 | 消融开关 `SHANIU_EVAL_ABLATE_VERIFY=1` 关掉闸门 | `SHANIU_EVAL_ABLATE_VERIFY` | 字面量 | 同上：反向对照靠它证明「关掉就红」 |
+| R2-200 | 04:L36 | 模型在终端里按原样跑过命令并通过即计入（`exit 0` + 会话已关闭） | `VerifyPassLog` | 符号 | 同上：终端写、闸门读；此后任何源码写入使旧通过失效 |
 
 ---
 

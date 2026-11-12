@@ -839,6 +839,7 @@ async fn run_one(
         jobs: None,
         stop_hook: None,
         retry: shaniu_lib::model_client::RetryPolicy::disabled(),
+        verify: Default::default(),
     });
     // 多代理场景（SH-073）：只有标了 `multi_agent` 的任务才注入编排器。
     // 其余任务保持原装配（不声明 orchestrate），避免工具面变化污染既有基线。
@@ -1698,6 +1699,7 @@ async fn repair_loop_fixes_broken_rust_project_until_cargo_test_green() {
         jobs: None,
         stop_hook: None,
         retry: shaniu_lib::model_client::RetryPolicy::disabled(),
+        verify: Default::default(),
     };
     let prompt = "这台机器上的 Rust 工程 `cargo test` 不通过。请运行 `cargo test`，读取错误输出，\
                   修复 src/lib.rs 里的问题，直到 `cargo test` 全部通过。不要修改测试断言。";

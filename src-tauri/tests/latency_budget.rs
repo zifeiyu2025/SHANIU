@@ -123,6 +123,7 @@ async fn measure_once(first_byte: Duration) -> (Duration, Duration) {
         jobs: None,
         stop_hook: None,
         retry: shaniu_lib::model_client::RetryPolicy::disabled(),
+        verify: Default::default(),
     };
     let started = Instant::now();
     let _ = agent
@@ -247,6 +248,7 @@ async fn first_delta_latency_within_budget_on_real_endpoint() {
             jobs: None,
             stop_hook: None,
             retry: shaniu_lib::model_client::RetryPolicy::disabled(),
+            verify: Default::default(),
         };
         let started = Instant::now();
         let _ = agent
@@ -351,6 +353,7 @@ async fn cancellation_stops_within_half_second() {
         jobs: None,
         stop_hook: None,
         retry: shaniu_lib::model_client::RetryPolicy::disabled(),
+        verify: Default::default(),
     });
     let sink: Arc<dyn EventSink> = end.clone();
     let token = cancel.clone();

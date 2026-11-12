@@ -362,6 +362,62 @@ impl WriteJournal {
     }
 }
 
+// ============================== 验证通过观测（写后验证闸门） ==============================
+
+/// 交互式终端里「按原样跑过验证命令并成功」的观测。
+///
+/// 为什么放在共享内核：写入侧是 `terminal`（工具），读取侧是 `agent_loop` 的收尾闸门。
+/// 若把句柄定义在 `agent_loop`，`tools → agent_loop` 就成了反向依赖（docs §2.3）。
+///
+/// `epoch` 由宿主在每次源码写入时推进：**早于最近一次写入的通过不算数**——
+/// 改了代码就得重新验证，否则「先绿后改」会被当成已验证。
+#[derive(Debug, Default)]
+pub struct VerifyPassLog {
+    epoch: std::sync::atomic::AtomicU64,
+    passes: std::sync::Mutex<Vec<(u64, String)>>,
+}
+
+impl VerifyPassLog {
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    /// 宿主在每次「源码内容真的变了」时调用，使旧通过记录失效。
+    pub fn advance(&self) {
+        self.epoch
+            .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    }
+
+    pub fn current_epoch(&self) -> u64 {
+        self.epoch.load(std::sync::atomic::Ordering::Relaxed)
+    }
+
+    /// 记一次「命令原文逐字命中 + exit 0 + 会话已关闭」的通过。
+    pub fn record_pass(&self, command: &str) {
+        let command = command.trim();
+        if command.is_empty() {
+            return;
+        }
+        let epoch = self.current_epoch();
+        let mut passes = self.passes.lock().unwrap_or_else(|e| e.into_inner());
+        if let Some(entry) = passes.iter_mut().find(|(_, text)| text == command) {
+            entry.0 = epoch;
+        } else {
+            passes.push((epoch, command.to_string()));
+        }
+    }
+
+    /// 这条命令是否在 `epoch` 之后按原样跑过并通过。
+    pub fn passed_at(&self, epoch: u64, command: &str) -> bool {
+        let command = command.trim();
+        self.passes
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .iter()
+            .any(|(recorded, text)| *recorded >= epoch && text == command)
+    }
+}
+
 // ============================== 执行契约 ==============================
 
 /// 工具执行错误。`Execution` 的文本会回填给模型（风险登记册：失败自动回填）。
@@ -420,6 +476,9 @@ pub struct ToolContext {
     pub writes: Option<Arc<WriteJournal>>,
     /// 会话级图片预算（SH-072）：`view_image` 的张数/字节上限。
     pub images: Option<Arc<std::sync::Mutex<ImageBudget>>>,
+    /// 验证通过观测（写后验证闸门）：`terminal` 在「命令原文命中 + exit 0 + 已关闭」
+    /// 时记一笔，宿主收尾时据此免跑重复命令。None = 不观测（无闸门的测试装配）。
+    pub verify_passes: Option<Arc<VerifyPassLog>>,
 }
 
 impl ToolContext {
@@ -443,7 +502,14 @@ impl ToolContext {
             reads: None,
             writes: None,
             images: None,
+            verify_passes: None,
         }
+    }
+
+    /// 注入验证通过观测（写后验证闸门；每个 run 一份）。
+    pub fn with_verify_passes(mut self, log: Arc<VerifyPassLog>) -> Self {
+        self.verify_passes = Some(log);
+        self
     }
 
     /// 只注入代理身份（子代理路径）：用于深度门控，不提供编排能力。

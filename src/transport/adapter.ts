@@ -36,11 +36,59 @@ import {
   relaySourceOf, settledNoticeOf, timingProjectionOf,
   type SubagentCatalogEntry, type SubagentCatalogEventData, type SubagentTimingState,
 } from './subagent-wire'
-import type { AgentEvent, CompactionTrigger, EventMsg, SessionEntryLike, TurnErrorInfo } from './types'
+import type { AgentEvent, CompactionTrigger, EventMsg, SessionEntryLike, TurnErrorInfo, VerifyState } from './types'
 import { archiveImageToPrompt, imageContentBlocks, type PromptImageRef } from './image-ref'
 import type { HostBridge } from './tauri'
 
 const OK = <T>(value: T) => ({ ok: true as const, value })
+
+/**
+ * 写后验证四态 → 一条宿主通知。
+ *
+ * 四态必须**各说各的话**：`passed` 是证据、`failed` 是结论、`inconclusive` 是
+ * "没判出来"、`skipped` 是"没必要判"。把它们归一成"验证失败"会让用户去修一个
+ * 根本没被验证过的问题。
+ *
+ * 认不出的形态按 `failed` 展示（fail-closed）：后端将来新增原因码时，旧前端
+ * 宁可用红话说"未通过"，也不能把未知当成通过。
+ */
+function verificationNotice(
+  state: VerifyState,
+  commands: readonly string[],
+  durationMs: number,
+  diagnostics: readonly string[],
+): { summary: string; text: string } {
+  const command = commands.length === 0 ? '' : `：${commands.join('；')}`
+  const reasonOf = (reason: string): string => {
+    switch (reason) {
+      case 'timeout': return '命令超时'
+      case 'command_missing': return '命令不存在'
+      case 'pre_existing_red': return '改动前就是红的'
+      case 'env_failure': return '环境故障'
+      case 'no_source_write': return '没有改源码'
+      case 'no_command_configured': return '没有可用命令'
+      default: return `未知原因（${reason}）`
+    }
+  }
+  let title: string
+  if (state === 'passed') {
+    title = `验证通过（${(durationMs / 1000).toFixed(1)}s）${command}`
+  } else if (state === 'failed') {
+    title = `验证未通过${command}`
+  } else if (typeof state === 'object' && 'inconclusive' in state) {
+    title = `无法验证：${reasonOf(state.inconclusive)}${command}`
+  } else if (typeof state === 'object' && 'skipped' in state) {
+    title = `未执行验证：${reasonOf(state.skipped)}`
+  } else {
+    title = `验证未通过（结果无法识别）${command}`
+  }
+  const detail = diagnostics.slice(0, 5)
+  return {
+    summary: title,
+    text: detail.length === 0 ? title : `${title}\n${detail.join('\n')}`,
+  }
+}
+
 const FAIL = (message: string) =>
   ({ ok: false as const, error: new RemoteError('gateway/internal', message, {}) })
 
@@ -1936,6 +1984,25 @@ export function createAdapter(options: AdapterOptions): { remote: unknown; dispo
                 code: msg.error.code,
                 detail: errorDetail(msg.error),
               }
+        // 写后验证的「未验证」窗口（末轮不可否决、warn 模式或一直失败）：必须出声。
+        // 它不改变回合结果（`reason` 仍是 completed），只是在时间线上留下事实；
+        // 悄悄放过等于把「模型说跑过了」当成「跑过了」。
+        if (msg.unverified === true) {
+          pushEvent(journal, 'developer/message', {
+            turn: journal.turn,
+            step: journal.step,
+            message: {
+              id: `shaniu-unverified-${journal.seq + 1}`,
+              role: 'developer',
+              source: {
+                kind: 'verification' as const,
+                form: 'notice' as const,
+                summary: '回合结束：有源码改动但没有验证证据',
+              },
+              content: [{ type: 'text', text: '回合结束：有源码改动但没有验证证据，结果未经检验。' }],
+            },
+          }, { surfaceOp: 'append' })
+        }
         // cancelled 的半截正文是真实发生过的输出：落进档案，但打 interrupted，
         // 不能当成正常答完。
         closeTask(sessionId, journal, msg.reason === 'completed'
@@ -2128,6 +2195,22 @@ export function createAdapter(options: AdapterOptions): { remote: unknown; dispo
           })
         }
         return
+      case 'verification_result': {
+        // 写后验证的裁决结果（additive）：宿主跑过命令才发，与 `turn_completed` 前的
+        // 那一轮提示同属"宿主自己说话"，因此落 developer/message 而不是 assistant。
+        const notice = verificationNotice(msg.state, msg.commands, msg.duration_ms, msg.diagnostics)
+        pushEvent(journal, 'developer/message', {
+          turn: journal.turn,
+          step: journal.step,
+          message: {
+            id: `shaniu-verify-${journal.seq + 1}`,
+            role: 'developer',
+            source: { kind: 'verification' as const, form: 'notice' as const, summary: notice.summary },
+            content: [{ type: 'text', text: notice.text }],
+          },
+        }, { surfaceOp: 'append' })
+        return
+      }
       case 'error':
         // 全局错误不终结回合（回合终结只认 turn_completed）：这里只定稿已有的流，
         // 错误文案由随后的 turn_completed 呈现，避免在此造出一个假回合。

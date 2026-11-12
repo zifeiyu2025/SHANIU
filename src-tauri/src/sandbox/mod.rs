@@ -17,6 +17,7 @@
 
 pub mod acl;
 pub mod appcontainer;
+pub mod capture;
 mod device_acl;
 pub mod msvc;
 pub mod windows_impl;
@@ -33,6 +34,7 @@ use windows::Win32::Security::PSID;
 
 use crate::config::{AllowedRoot, OsSandbox, SandboxMode, WorkspaceAccess};
 
+pub use capture::{spawn_reader, CaptureError, CapturedRun, Waiter};
 pub use windows_impl::{ExecLine, RestrictedStdioChild, StdioEvent};
 
 /// 沙箱错误（文本回填模型/日志；不包含敏感内容）。
