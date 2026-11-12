@@ -818,6 +818,7 @@ mod tests {
             session_id: None,
             jobs: None,
             stop_hook: None,
+            verify: Default::default(),
             retry: crate::model_client::RetryPolicy::disabled(),
         })
     }
@@ -1078,6 +1079,7 @@ mod tests {
             session_id: None,
             jobs: None,
             stop_hook: None,
+            verify: Default::default(),
             retry: crate::model_client::RetryPolicy::disabled(),
         });
         let registry = Arc::new(SubagentRegistry::new(DEFAULT_MAX_CONCURRENT));
