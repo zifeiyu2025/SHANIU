@@ -402,6 +402,10 @@ impl AgentLoop {
             }
         }
         let summary = crate::compaction::extract_summary(&summary).map_err(CompactAbort::Failed)?;
+        // 摘要之外先原样保留用户原文：模型漏抄一条硬约束，接手方就永远看不到。
+        // 仍然是单字符串、单条 `Compacted` 锚点，档案结构不变。
+        let summary =
+            crate::compaction::compose_summary(history.as_slice(), &target, self.token_budget, &summary);
         // 先记账再动历史：区间被 splice 掉之后就再也算不出「丢了哪些、多少 token」。
         let shadowed_items = target.range_end - target.range_start;
         let shadowed_tokens =

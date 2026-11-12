@@ -77,7 +77,10 @@ pub async fn compact_now(
         },
     );
     let summary = match summarize(provider, api_key, &resumed.history, target, cancel).await {
-        Ok(summary) => summary,
+        Ok(summary) => {
+            // 与回合内同一口径：用户原文逐字保留在摘要之前，首条消息无条件保留。
+            compaction::compose_summary(&resumed.history, &target, budget, &summary)
+        }
         Err(error) => {
             // 失败也要发 ended：只回主命令的话，事件流里这条压缩会永远停在「开始」。
             emit_ended(sink, &compaction_id, Err(error.clone()));

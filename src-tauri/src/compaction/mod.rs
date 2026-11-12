@@ -225,6 +225,65 @@ pub fn build_request(items: &[HistoryItem], target: &Target) -> Vec<HistoryItem>
     request
 }
 
+/// 压缩时原样保留的用户原文段落占预算的比例。
+///
+/// 只压不保等于把用户给过的硬约束交给一次摘要请求去保管：摘要漏抄一条，
+/// 接手模型就再也看不到原始要求。取 30% 与保留额度同档，避免反过来挤掉摘要。
+const USER_TEXT_KEEP_PERCENT: usize = 30;
+
+/// 用户原文段落的标题行。单独成段放在摘要**之前**，便于人与模型一眼区分
+/// 「用户原话」与「模型写的交接摘要」。
+const USER_TEXT_HEADER: &str = "## 用户原文（压缩时逐字保留，不得改写）";
+
+/// 压缩前收集区间内的用户原文，拼在摘要之前，作为 `Compacted` 锚点 summary 的前半段。
+///
+/// 仍然只写一条字符串、只改 summary 内容，**不动档案结构**——旧档案里没有这段的
+/// 摘要照常回放，resume 的重放公式也不需要知道这里多了一段。
+///
+/// 取舍规则（按预算从远到近裁）：
+/// 1. **首条用户消息无条件保留**：它承载任务目标与硬约束，丢了等于丢任务本身；
+/// 2. 其余从最新往回装，装不下的直接截断（更旧的同样不装），保证留下的是连续近段；
+/// 3. 输出按时间顺序、每段原样引用，不做任何改写，便于逐字核对。
+pub fn compose_summary(items: &[HistoryItem], target: &Target, budget: usize, summary: &str) -> String {
+    let users: Vec<(usize, &str)> = items[target.range_start..target.range_end]
+        .iter()
+        .enumerate()
+        .filter_map(|(offset, item)| match item {
+            HistoryItem::Message { role: Role::User, text, .. } if !text.trim().is_empty() => {
+                Some((target.range_start + offset, text.as_str()))
+            }
+            _ => None,
+        })
+        .collect();
+    let Some(&(first_index, first_text)) = users.first() else {
+        return summary.to_string();
+    };
+
+    let allowance = budget.saturating_mul(USER_TEXT_KEEP_PERCENT) / 100;
+    let mut picked: Vec<(usize, &str)> = vec![(first_index, first_text)];
+    let mut used = approx_tokens(USER_TEXT_HEADER) + approx_tokens(first_text);
+    for &(index, text) in users.iter().skip(1).rev() {
+        let cost = approx_tokens(text);
+        if used + cost > allowance {
+            break;
+        }
+        used += cost;
+        picked.push((index, text));
+    }
+    picked.sort_by_key(|(index, _)| *index);
+    picked.dedup_by(|(_, later), (_, earlier)| later == earlier);
+
+    let mut composed = String::with_capacity(used * APPROX_BYTES_PER_TOKEN + summary.len());
+    composed.push_str(USER_TEXT_HEADER);
+    for (_, text) in picked {
+        composed.push_str("\n\n");
+        composed.push_str(text);
+    }
+    composed.push_str("\n\n---\n\n");
+    composed.push_str(summary);
+    composed
+}
+
 /// 从总结响应里取摘要。空摘要必须报出来而不是当成成功：
 /// 拿空串写锚点，回放时那段历史就被替换成"什么都没有"，是静默丢上下文。
 pub fn extract_summary(reply_text: &str) -> Result<String, String> {
@@ -466,5 +525,65 @@ mod tests {
     fn manual_plan_needs_at_least_two_items() {
         assert_eq!(plan_manual(&[msg(Role::User, "唯一一条")], 0), None);
         assert_eq!(plan_manual(&[], 0), None);
+    }
+
+    // ============================== 用户原文保真 ==============================
+
+    #[test]
+    fn user_text_is_preserved_verbatim_before_the_summary() {
+        let items = vec![
+            msg(Role::User, "硬约束：不得修改 src/sandbox/mod.rs"),
+            msg(Role::Assistant, "收到"),
+            msg(Role::User, "再补一条：只改测试"),
+            msg(Role::Assistant, "好"),
+            msg(Role::User, "第三条：不要 push"),
+        ];
+        let target = Target { range_start: 0, range_end: 5 };
+        let composed = compose_summary(&items, &target, 500_000, "摘要正文");
+
+        // 首条必须逐字存在——压缩把任务目标交给一次模型总结去保管是不可接受的
+        assert!(composed.contains("硬约束：不得修改 src/sandbox/mod.rs"));
+        assert!(composed.contains("再补一条：只改测试"));
+        assert!(composed.contains("第三条：不要 push"));
+        // 原文段落必须在摘要之前，摘要仍在最后
+        let header = composed.find(USER_TEXT_HEADER).expect("必须有原文段落");
+        let first = composed.find("硬约束").expect("首条必须在");
+        let summary = composed.find("摘要正文").expect("摘要必须在");
+        assert!(header < first && first < summary, "顺序必须是 原文段落 → 摘要");
+        // 原文按时间顺序，不因"从近到远"装填而被倒序
+        assert!(first < composed.find("再补一条").unwrap());
+        assert!(composed.find("再补一条").unwrap() < composed.find("第三条").unwrap());
+    }
+
+    #[test]
+    fn user_text_budget_keeps_first_and_the_nearest_window() {
+        // budget 1_000 → 原文额度 300 token ≈ 1200 字节；首条约 200 字节无条件保留。
+        let first = "首条硬约束：".to_string() + &"a".repeat(180);
+        let old = "旧消息：".to_string() + &"b".repeat(2000);
+        let near = "近消息：".to_string() + &"c".repeat(100);
+        let items = vec![
+            msg(Role::User, &first),
+            msg(Role::User, &old),
+            msg(Role::Assistant, "中间回复"),
+            msg(Role::User, &near),
+        ];
+        let target = Target { range_start: 0, range_end: 4 };
+        let composed = compose_summary(&items, &target, 1_000, "摘要");
+
+        assert!(composed.contains(&first), "首条无条件保留");
+        assert!(composed.contains(&near), "预算内要从近到远装入");
+        assert!(!composed.contains(&old), "超预算时先裁最旧的，近的留下");
+
+        // 预算为 0（显式关压缩）也必须保住首条
+        let zero = compose_summary(&items, &target, 0, "摘要");
+        assert!(zero.contains(&first));
+        assert!(!zero.contains(&near));
+    }
+
+    #[test]
+    fn compose_without_user_messages_leaves_summary_untouched() {
+        let items = vec![msg(Role::Assistant, "只有模型发言")];
+        let target = Target { range_start: 0, range_end: 1 };
+        assert_eq!(compose_summary(&items, &target, 100_000, "摘要正文"), "摘要正文");
     }
 }
