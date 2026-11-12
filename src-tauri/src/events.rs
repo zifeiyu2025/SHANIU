@@ -490,6 +490,32 @@ impl CompactionTrigger {
     }
 }
 
+/// 「此刻有没有人能回执一张审批卡」的三态（照 dsh 的 `unavailable` 语义）。
+///
+/// 判据只有结构性事实，不含任何时间假设：没有超时，也没有「等了多久算没人」。
+/// 依据：`src/dsh/packages/interaction/user-approval/src/index.ts:306-317` ——
+/// 审批请求走 waterfall，默认终点就是 `'unavailable'`（没有应答者 = 立刻 fail closed）。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ResponderState {
+    /// 有存活的 webview，且前端已握手：卡片可能被点击。
+    Ready,
+    /// 一个 webview 都没有（无头运行 / 窗口全销毁）。
+    NoWebview,
+    /// webview 在，但前端从未握手（页面加载失败 / 脚本崩在启动）。
+    FrontendNotReady,
+}
+
+impl ResponderState {
+    /// 落日志用的原因：拒绝必须可定位，不能只剩一句「被拒了」。
+    pub fn reason(self) -> &'static str {
+        match self {
+            Self::Ready => "有可回执的前端",
+            Self::NoWebview => "没有存活的 webview（无头运行或窗口已销毁）",
+            Self::FrontendNotReady => "webview 存在但前端未握手",
+        }
+    }
+}
+
 /// 事件出口抽象：agent_loop 及各模块经此广播（便于测试注入与 M1 复用）。
 pub trait EventSink: Send + Sync {
     fn emit(&self, msg: &EventMsg) -> Result<(), String>;
@@ -501,6 +527,30 @@ pub trait EventSink: Send + Sync {
     fn scoped(&self, _agent_id: &str, _parent_id: Option<&str>) -> Option<Arc<dyn EventSink>> {
         None
     }
+
+    /// 审批卡此刻有没有可能被回执。
+    ///
+    /// 默认 `Ready`：测试替身与无信封出口没有前端概念，维持旧行为（等回执），
+    /// 否则所有既有用例会在「没人能回」上被误判成拒绝。生产出口（TauriEventSink）
+    /// 必须给出真实判定。
+    fn responder(&self) -> ResponderState {
+        ResponderState::Ready
+    }
+}
+
+/// 前端是否已发出就绪信号（由 `frontend_ready` 命令置位，只置不清）。
+///
+/// 放在 events 而不是 lib：审批探测在出口层，不能让叶子模块反向依赖 crate 根。
+static FRONTEND_READY: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+
+/// 前端就绪信号的唯一写入口；返回「是否是第一次」。
+pub fn mark_frontend_ready() -> bool {
+    !FRONTEND_READY.swap(true, Ordering::SeqCst)
+}
+
+/// 前端是否已握手（窗口可能已隐藏到托盘，但页面还在）。
+pub fn frontend_ready() -> bool {
+    FRONTEND_READY.load(Ordering::SeqCst)
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
@@ -556,11 +606,30 @@ impl ViewerCount {
 /// 生产用 `AppHandle`，测试用计数器实现，从而能数出「每条事件实际投递几次」。
 pub trait IpcEmitter: Send + Sync {
     fn emit(&self, event: &AgentEvent) -> Result<(), String>;
+
+    /// 审批卡有没有可能被回执。默认 `Ready` 供测试替身维持旧行为。
+    fn responder(&self) -> ResponderState {
+        ResponderState::Ready
+    }
 }
 
 impl IpcEmitter for tauri::AppHandle {
     fn emit(&self, event: &AgentEvent) -> Result<(), String> {
         tauri::Emitter::emit(self, EVENT_CHANNEL, event).map_err(|e| format!("事件广播失败: {e}"))
+    }
+
+    /// 结构性判据，不问「用户是否在看」：
+    /// - 没有任何 webview → 卡片发出去也没人能点（无头运行 / 窗口全销毁）；
+    /// - 有 webview 但前端从未握手 → 页面没跑起来，监听器不存在；
+    /// - 隐藏到托盘不算不可达：窗口对象仍在，点托盘就能看见卡片。
+    fn responder(&self) -> ResponderState {
+        if tauri::Manager::webview_windows(self).is_empty() {
+            return ResponderState::NoWebview;
+        }
+        if !frontend_ready() {
+            return ResponderState::FrontendNotReady;
+        }
+        ResponderState::Ready
     }
 }
 
@@ -663,6 +732,12 @@ impl EventSink for TauriEventSink {
             broadcast: self.broadcast.clone(),
             viewers: self.viewers.clone(),
         }))
+    }
+
+    /// 子代理与 root 共用同一个 `ipc`，所以回执能力天然一致——ADR-103 只换信封，
+    /// 不换通道。子代理没有独立回执方式，这也是它们不会被本判定漏掉的依据。
+    fn responder(&self) -> ResponderState {
+        self.ipc.responder()
     }
 
     fn emit(&self, msg: &EventMsg) -> Result<(), String> {
@@ -799,6 +874,34 @@ mod envelope_tests {
         sink.emit(&msg).unwrap();
         assert_eq!(ipc.0.load(Ordering::SeqCst), 6, "WS 计数归零后 IPC 必须恢复");
         println!("[M2] 在线计数归零（再发 1 条）→ 累计 IPC 投递 {} 次（增量 1）", ipc.0.load(Ordering::SeqCst));
+    }
+
+    /// 回执能力随 `ipc` 走：`scoped()` 只换信封不换通道，子代理与 root 判定必须一致；
+    /// TauriEventSink 不自己拍脑袋，一律委托注入的 ipc。默认实现保持旧行为（等回执）。
+    #[test]
+    fn responder_state_is_delegated_and_inherited_by_scoped_sink() {
+        struct UnreachableIpc;
+        impl IpcEmitter for UnreachableIpc {
+            fn emit(&self, _: &AgentEvent) -> Result<(), String> {
+                Ok(())
+            }
+
+            fn responder(&self) -> ResponderState {
+                ResponderState::NoWebview
+            }
+        }
+
+        let sink = TauriEventSink::for_test(Arc::new(UnreachableIpc));
+        assert_eq!(sink.responder(), ResponderState::NoWebview, "root 必须用注入的判据");
+        let child = sink.scoped("01CHILD", Some("root")).expect("子代理出口");
+        assert_eq!(
+            child.responder(),
+            ResponderState::NoWebview,
+            "子代理没有独立回执通道，判定必须跟 root 一致"
+        );
+
+        // 默认实现：测试替身 / NullEventSink 维持旧行为，否则既有用例会被误判成拒绝。
+        assert_eq!(NullEventSink.responder(), ResponderState::Ready);
     }
 
     #[test]

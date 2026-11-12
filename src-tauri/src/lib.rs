@@ -80,9 +80,6 @@ fn dev_ping(app: tauri::AppHandle, nonce: String) -> Result<(), String> {
     events::emit_pong(&app, &nonce)
 }
 
-/// 主窗口是否已收到前端的就绪信号（首帧启动页已可显示）。
-static FRONTEND_READY: AtomicBool = AtomicBool::new(false);
-
 /// 本进程内是否已经提示过“图标在托盘区”。只影响第一次点关闭时多出的那一句，
 /// 避免每次关闭都重复同一段位置说明。
 static TRAY_HINT_SHOWN: AtomicBool = AtomicBool::new(false);
@@ -97,7 +94,7 @@ static TRAY_HINT_SHOWN: AtomicBool = AtomicBool::new(false);
 /// 会让那段纯白重新出现（见 docs/01 §9.5.1）。
 #[tauri::command]
 fn frontend_ready(app: tauri::AppHandle) {
-    if !FRONTEND_READY.swap(true, Ordering::SeqCst) {
+    if events::mark_frontend_ready() {
         tracing::info!("前端就绪信号到达，显示主窗口");
     }
     show_main_window(&app);
@@ -3327,7 +3324,7 @@ pub fn run() {
             let handle = app.handle().clone();
             tauri::async_runtime::spawn(async move {
                 tokio::time::sleep(std::time::Duration::from_secs(3)).await;
-                if !FRONTEND_READY.load(Ordering::SeqCst) {
+                if !events::frontend_ready() {
                     tracing::warn!("前端未在 3 秒内发出就绪信号，强制显示主窗口");
                     show_main_window(&handle);
                 }

@@ -14,7 +14,7 @@ use serde_json::Value;
 use tokio_util::sync::CancellationToken;
 
 use crate::config::SandboxMode;
-use crate::events::{ApprovalDecision, EventMsg, EventSink, RiskLevel};
+use crate::events::{ApprovalDecision, EventMsg, EventSink, ResponderState, RiskLevel};
 
 // re-export 便于 use permission::{policy, ...}
 pub use policy::{
@@ -279,6 +279,20 @@ impl ApprovalBroker {
         } else {
             format!("appr-{call_id}")
         };
+        // 照 dsh 的 `unavailable` 语义（dsh `interaction/user-approval/src/index.ts:306-317`：
+        // 审批 waterfall 没有应答者时默认返回 `'unavailable'`，即刻 fail closed）。
+        // 这里问的是「此刻有没有人能回执」，不是「人有没有在看」，所以**不引入超时**：
+        // 用户离开工位是正常场景，超时拒绝会误伤；而没人能回执时等下去没有任何出路。
+        let responder = env.sink.responder();
+        if responder != ResponderState::Ready {
+            tracing::warn!(
+                "审批请求没有可回执的前端（request_id={request_id}，tool={tool}，agent={}，原因={}）：\
+                 无人能批准则不能放行，按 Denied 裁决，不挂起等待回执",
+                subject.agent_id,
+                responder.reason()
+            );
+            return GateOutcome::Denied;
+        }
         let (tx, rx) = tokio::sync::oneshot::channel::<ApprovalDecision>();
         self.pending
             .lock()
@@ -483,7 +497,7 @@ fn prompt_reason(risk: RiskLevel) -> &'static str {
 mod tests {
     use super::*;
     use crate::config::{ApprovalMode, SandboxMode};
-    use crate::events::NullEventSink;
+    use crate::events::{NullEventSink, ResponderState};
     use std::sync::{Arc, Mutex};
 
     fn sink() -> Arc<dyn EventSink> {
@@ -595,6 +609,109 @@ mod tests {
             logged.contains("appr-c-fail") && logged.contains("unified_exec"),
             "日志要能定位到具体请求: {logged}"
         );
+    }
+
+    /// dsh 的 `unavailable` 语义（`user-approval/src/index.ts:306-317`）：没有应答者
+    /// 就立刻 fail closed，不引入超时。SHANIU 的对应事实是「此刻没有能回执的前端」。
+    ///
+    /// 反向对照：把 `request_approval` 顶部的探测删掉，本用例会卡在 200ms 超时上——
+    /// 没有前端时 `rx` 永远不会来，`env.cancel` 也不会自己动。
+    #[tokio::test]
+    async fn approval_is_denied_immediately_when_nobody_can_answer() {
+        struct NoResponderSink;
+        impl EventSink for NoResponderSink {
+            fn emit(&self, _msg: &EventMsg) -> Result<(), String> {
+                Ok(())
+            }
+
+            fn responder(&self) -> ResponderState {
+                ResponderState::NoWebview
+            }
+        }
+
+        let capture = LogCapture::default();
+        let subscriber = tracing_subscriber::fmt()
+            .with_writer(capture.clone())
+            .with_ansi(false)
+            .without_time()
+            .with_max_level(tracing::Level::WARN)
+            .finish();
+        let _guard = tracing::subscriber::set_default(subscriber);
+
+        let broker = ApprovalBroker::new();
+        let cancel = CancellationToken::new();
+        let sink: Arc<dyn EventSink> = Arc::new(NoResponderSink);
+        let started = std::time::Instant::now();
+        let out = tokio::time::timeout(
+            std::time::Duration::from_millis(200),
+            broker.gate(
+                "unified_exec",
+                &args(),
+                "c-nobody",
+                policy::SessionPolicy {
+                    approval: ApprovalMode::OnRequest,
+                    sandbox: SandboxMode::WorkspaceWrite,
+                },
+                GateSubject::root("root"),
+                GateEnv { sink: &sink, cancel: &cancel },
+            ),
+        )
+        .await
+        .expect("没有可回执方时必须立即裁决；挂到用例超时即失败");
+        assert_eq!(out, GateOutcome::Denied, "没人能回执 = 不能批准 = 拒绝");
+        assert!(started.elapsed() < std::time::Duration::from_millis(200));
+        assert!(
+            !broker.has_pending("appr-c-nobody"),
+            "不可达的请求不得留在 pending 表里"
+        );
+
+        let logged = capture.text();
+        assert!(logged.contains("没有可回执的前端"), "日志缺少可定位记录: {logged}");
+        assert!(
+            logged.contains("appr-c-nobody") && logged.contains("unified_exec"),
+            "日志要能定位到具体请求: {logged}"
+        );
+    }
+
+    /// 有人能回执时行为一字不变：照旧等，300ms 后的回执能正常放行（不是「等到超时」）。
+    #[tokio::test]
+    async fn approval_waits_when_responder_is_ready_and_allows_after_delay() {
+        let broker = Arc::new(ApprovalBroker::new());
+        let capture = Arc::new(CaptureSink::default());
+        let sink: Arc<dyn EventSink> = capture.clone();
+        let cancel = CancellationToken::new();
+
+        let b = broker.clone();
+        let s = sink.clone();
+        let c = cancel.clone();
+        let waiting = tokio::spawn(async move {
+            b.gate(
+                "unified_exec",
+                &args(),
+                "c-late",
+                policy::SessionPolicy {
+                    approval: ApprovalMode::OnRequest,
+                    sandbox: SandboxMode::WorkspaceWrite,
+                },
+                GateSubject::root("root"),
+                GateEnv { sink: &s, cancel: &c },
+            )
+            .await
+        });
+        for _ in 0..100 {
+            if broker.has_pending("appr-c-late") {
+                break;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(5)).await;
+        }
+        assert!(broker.has_pending("appr-c-late"), "卡片应已登记，等用户回执");
+        tokio::time::sleep(std::time::Duration::from_millis(300)).await;
+        assert!(broker.resolve("appr-c-late", ApprovalDecision::Allow));
+        let out = tokio::time::timeout(std::time::Duration::from_millis(200), waiting)
+            .await
+            .expect("回执到达后应立刻结束等待")
+            .unwrap();
+        assert_eq!(out, GateOutcome::Allowed, "迟到的回执仍要能放行");
     }
 
     /// SH-120 / ADR-007③④：命中前缀白名单 → 放行 + 审计事件（含规则 id）；
