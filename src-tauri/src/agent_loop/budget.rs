@@ -17,8 +17,10 @@ pub struct TurnBudget {
 }
 
 impl TurnBudget {
+    /// `0` = 不限轮数（配置默认值）：任务没解决就继续跑，由模型自己收口。
+    /// 其余值原样作为硬顶，只有显式配置正整数才会在轮数处停下。
     pub fn new(max_turns: u32) -> Self {
-        Self { max_turns: max_turns.max(1) }
+        Self { max_turns: if max_turns == 0 { u32::MAX } else { max_turns } }
     }
 
     pub fn from_config(cfg: &AppConfig) -> Self {
@@ -214,9 +216,10 @@ mod tests {
     use super::*;
 
     #[test]
-    fn min_one_turn() {
-        assert_eq!(TurnBudget::new(0).max_turns, 1);
+    fn zero_means_unlimited_and_positive_is_a_hard_cap() {
+        assert_eq!(TurnBudget::new(0).max_turns, u32::MAX);
         assert_eq!(TurnBudget::new(7).max_turns, 7);
+        assert_eq!(TurnBudget::from_config(&AppConfig::default()).max_turns, u32::MAX);
     }
 
     #[test]

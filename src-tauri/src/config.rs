@@ -800,7 +800,8 @@ pub struct ModelConfig {
     pub provider: String,
     pub base_url: String,
     pub model: String,
-    /// 每任务最大轮数（风险 R3：无限循环烧 token）。
+    /// 每任务最大轮数。默认 0 = 不限：只要任务没解决就继续，由模型自己收口；
+    /// 只有显式配置正整数时才在上限处停（风险 R3 的兜底从「默认值」改为「用户显式设置」）。
     pub max_turns: u32,
     /// 单个采样步最多重试几次模型请求（0 = 关闭重试）。默认 5，装配时封顶 8。
     /// 只对瞬态失败（限流 / 超时 / 网络 / 5xx / 空响应）生效，且只在首个可见增量前。
@@ -813,7 +814,7 @@ impl Default for ModelConfig {
             provider: "openai-responses".into(),
             base_url: String::new(),
             model: String::new(),
-            max_turns: 32,
+            max_turns: 0,
             max_retries: 5,
         }
     }
@@ -3043,14 +3044,14 @@ mod tests {
         let (cfg, path) = AppConfig::load_or_create(&root).unwrap();
         assert_eq!(cfg.sandbox.mode, SandboxMode::ReadOnly, "默认档必须与 DSH 一致（只读）");
         assert_eq!(cfg.approval.mode, ApprovalMode::OnRequest);
-        assert_eq!(cfg.model.max_turns, 32);
+        assert_eq!(cfg.model.max_turns, 0, "轮数默认不限（0 = 不限）");
 
         // 缺字段 → serde default 兜底（前向兼容旧配置文件）
         let partial = "[model]\nprovider = \"openai-chat\"\n";
         fs::write(&path, partial).unwrap();
         let (cfg2, _) = AppConfig::load_or_create(&root).unwrap();
         assert_eq!(cfg2.model.provider, "openai-chat");
-        assert_eq!(cfg2.model.max_turns, 32);
+        assert_eq!(cfg2.model.max_turns, 0, "旧配置缺字段时也必须落到「不限」");
         assert_eq!(cfg2.sandbox.mode, SandboxMode::ReadOnly);
         assert_eq!(cfg2.sandbox.os, OsSandbox::AppContainer, "OS 沙箱默认必须是 AppContainer");
     }
