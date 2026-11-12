@@ -1363,7 +1363,241 @@ impl AgentLoop {
                     call_id: call_id.clone(),
                 });
             }
-            for (name, arguments, call_id) in &calls {
+            // 连续只读调用并行（第 4 笔）：读类工具互不依赖，串行 await 等于把磁盘与网络
+            // 延迟逐条相加。批次内仍先**按序**过门禁（审批不能被并行绕过），再并发执行，
+            // 最后按原调用顺序回写事件与 tool 输出——协议要求 tool 结果与 tool_calls
+            // 一一对应，前端也按数组顺序消费，顺序不能由完成先后决定。
+            //
+            // 只并行「连续」的只读调用：中间夹一条写入/执行/计划/子代理就断开批次，
+            // 它们会改状态，顺序就是语义。
+            let mut batch_consumed = 0usize;
+            for (index, (name, arguments, call_id)) in calls.iter().enumerate() {
+                if index < batch_consumed {
+                    continue;
+                }
+                if parallel_read_only(&self.router, name) {
+                    let mut batch_end = index + 1;
+                    while batch_end < calls.len()
+                        && parallel_read_only(&self.router, &calls[batch_end].0)
+                    {
+                        batch_end += 1;
+                    }
+                    if batch_end - index >= 2 {
+                        batch_consumed = batch_end;
+                        let batch = &calls[index..batch_end];
+                        // 阶段 1：按序发 Begin 并过门禁；通过的进 pending，被拒的当场回填。
+                        let mut pending: Vec<(usize, serde_json::Value, ToolContext)> = Vec::new();
+                        let mut resolved = vec![false; batch.len()];
+                        let mut cancelled = false;
+                        for (offset, (b_name, b_arguments, b_call_id)) in batch.iter().enumerate() {
+                            emit(&sink, EventMsg::ToolCallBegin {
+                                call_id: b_call_id.clone(),
+                                tool: b_name.clone(),
+                                args: serde_json::from_str(b_arguments)
+                                    .unwrap_or(serde_json::Value::String(b_arguments.clone())),
+                            });
+                            if self.router.get(b_name).is_none() {
+                                emit(&sink, EventMsg::ToolCallEnd {
+                                    call_id: b_call_id.clone(),
+                                    exit_code: None,
+                                    error: Some(format!("未知工具: {b_name}")),
+                                    result: Some(ToolCallResult::Error),
+                                });
+                                history.push(HistoryItem::FunctionCallOutput {
+                                    call_id: b_call_id.clone(),
+                                    output: format!("未知工具: {b_name}"),
+                                });
+                                resolved[offset] = true;
+                                continue;
+                            }
+                            if self.plan_state.is_active_for(session_id.as_deref())
+                                && !policy::plan_mode_allows(b_name)
+                            {
+                                emit(&sink, EventMsg::ToolCallEnd {
+                                    call_id: b_call_id.clone(),
+                                    exit_code: None,
+                                    error: Some("计划模式仅只读工具可用".into()),
+                                    result: Some(ToolCallResult::Error),
+                                });
+                                history.push(HistoryItem::FunctionCallOutput {
+                                    call_id: b_call_id.clone(),
+                                    output: "计划模式仅只读工具可用；请先调用 exit_plan_mode 提交计划"
+                                        .into(),
+                                });
+                                resolved[offset] = true;
+                                continue;
+                            }
+                            let risk_override = self
+                                .router
+                                .get(b_name)
+                                .and_then(|executor| executor.spec().risk);
+                            let call_subject =
+                                crate::permission::GateSubject { risk_override, ..gate_subject };
+                            let args_val = serde_json::from_str(b_arguments)
+                                .unwrap_or(serde_json::Value::String(b_arguments.clone()));
+                            match self
+                                .broker
+                                .gate(
+                                    b_name,
+                                    &args_val,
+                                    b_call_id,
+                                    turn_policy,
+                                    call_subject,
+                                    crate::permission::GateEnv { sink: &sink, cancel },
+                                )
+                                .await
+                            {
+                                crate::permission::GateOutcome::Allowed => {}
+                                crate::permission::GateOutcome::Denied => {
+                                    emit(&sink, EventMsg::ToolCallEnd {
+                                        call_id: b_call_id.clone(),
+                                        exit_code: None,
+                                        error: Some("用户拒绝".into()),
+                                        result: Some(ToolCallResult::Denied),
+                                    });
+                                    history.push(HistoryItem::FunctionCallOutput {
+                                        call_id: b_call_id.clone(),
+                                        output: "用户拒绝了该工具调用".into(),
+                                    });
+                                    resolved[offset] = true;
+                                    continue;
+                                }
+                                crate::permission::GateOutcome::Forbidden => {
+                                    emit(&sink, EventMsg::ToolCallEnd {
+                                        call_id: b_call_id.clone(),
+                                        exit_code: None,
+                                        error: Some("策略拒绝：当前代理无权使用该工具".into()),
+                                        result: Some(ToolCallResult::Denied),
+                                    });
+                                    history.push(HistoryItem::FunctionCallOutput {
+                                        call_id: b_call_id.clone(),
+                                        output: "该工具不在当前代理的有效工具集内（权限只降不升），不会通过审批获得；请改用可用工具或在结果中说明限制".into(),
+                                    });
+                                    resolved[offset] = true;
+                                    continue;
+                                }
+                                crate::permission::GateOutcome::Cancelled => {
+                                    emit(&sink, EventMsg::ToolCallEnd {
+                                        call_id: b_call_id.clone(),
+                                        exit_code: None,
+                                        error: Some("已取消".into()),
+                                        result: Some(ToolCallResult::Cancelled),
+                                    });
+                                    cancelled = true;
+                                    break;
+                                }
+                            }
+                            let tool_ctx = ToolContext::new(
+                                self.workspace_root.clone(),
+                                cancel.clone(),
+                                b_call_id.clone(),
+                                sink.clone(),
+                                turn_policy.sandbox,
+                            )
+                            .with_jobs(session_id.clone(), self.jobs.clone())
+                            .with_reads(read_registry.clone())
+                            .with_writes(write_journal.clone())
+                            .with_images(image_budget.clone())
+                            .with_verify_passes(verify_passes.clone())
+                            .with_scope(scope.clone());
+                            let tool_ctx = match &orchestrator {
+                                Some(orchestrator) => {
+                                    tool_ctx.with_orchestration(scope.clone(), orchestrator.clone())
+                                }
+                                None => tool_ctx,
+                            };
+                            pending.push((offset, args_val, tool_ctx));
+                        }
+                        if cancelled {
+                            reason = TurnEndReasonLocal::Cancelled;
+                            break 'outer;
+                        }
+                        // 阶段 2：并发执行。取消令牌与执行同时竞争——用户按下停止后
+                        // 立即放弃等待，迟到结果不采纳。
+                        let futures = pending.iter().map(|(offset, args_val, ctx)| {
+                            self.router.execute(&batch[*offset].0, args_val.clone(), ctx)
+                        });
+                        let joined = tokio::select! {
+                            _ = cancel.cancelled() => None,
+                            joined = futures::future::join_all(futures) => Some(joined),
+                        };
+                        // 阶段 3：按原调用顺序回写。取消时给尚未回填的调用补一条
+                        // Cancelled，保证每条 FunctionCall 都有对应输出（协议完整）。
+                        let mut results = joined.unwrap_or_default();
+                        let mut done: Vec<Option<Result<crate::tool_router::ToolOutput, crate::tool_router::ToolError>>> =
+                            (0..batch.len()).map(|_| None).collect();
+                        // joined 为 None（取消）时是空表，长度必然对不上非空的 pending；
+                        // 整批都被门禁拒掉时 pending 为空，两边同为 0——不算取消。
+                        let executed = results.len() == pending.len();
+                        if executed {
+                            for ((offset, _, _), result) in pending.iter().zip(results.drain(..)) {
+                                done[*offset] = Some(result);
+                            }
+                        }
+                        let mut cancelled = !executed;
+                        for (offset, (b_name, _, b_call_id)) in batch.iter().enumerate() {
+                            if resolved[offset] {
+                                continue;
+                            }
+                            match done[offset].take() {
+                                Some(result) => {
+                                    match record_tool_result(
+                                        history,
+                                        &sink,
+                                        b_name,
+                                        b_call_id,
+                                        &result,
+                                        turn_policy.sandbox,
+                                    ) {
+                                        Ok(_) => {}
+                                        Err(reason_local) => {
+                                            cancelled = true;
+                                            reason = reason_local;
+                                        }
+                                    }
+                                }
+                                None => {
+                                    emit(&sink, EventMsg::ToolCallEnd {
+                                        call_id: b_call_id.clone(),
+                                        exit_code: None,
+                                        error: Some("已取消".into()),
+                                        result: Some(ToolCallResult::Cancelled),
+                                    });
+                                    history.push(HistoryItem::FunctionCallOutput {
+                                        call_id: b_call_id.clone(),
+                                        output: "已取消".into(),
+                                    });
+                                }
+                            }
+                            if cancelled {
+                                // 取消后剩余调用同样按序补齐，不留没有输出的 tool_call。
+                                for (rest, (_, _, rest_id)) in
+                                    batch.iter().enumerate().skip(offset + 1)
+                                {
+                                    if resolved[rest] {
+                                        continue;
+                                    }
+                                    emit(&sink, EventMsg::ToolCallEnd {
+                                        call_id: rest_id.clone(),
+                                        exit_code: None,
+                                        error: Some("已取消".into()),
+                                        result: Some(ToolCallResult::Cancelled),
+                                    });
+                                    history.push(HistoryItem::FunctionCallOutput {
+                                        call_id: rest_id.clone(),
+                                        output: "已取消".into(),
+                                    });
+                                }
+                                break;
+                            }
+                        }
+                        if cancelled {
+                            reason = TurnEndReasonLocal::Cancelled;
+                            break 'outer;
+                        }
+                        continue;
+                    }
+                }
                 // 未知工具 = 协议违规：不经门禁直接拒绝回填（模型自我纠正），不打扰人工
                 if self.router.get(name).is_none() {
                     emit(&sink, EventMsg::ToolCallBegin {
@@ -1534,62 +1768,20 @@ impl AgentLoop {
                         }
                     }
                 }
-                let output_text = match &result {
-                    Ok(out) => {
-                        emit(&sink, EventMsg::ToolCallEnd {
-                            call_id: call_id.clone(),
-                            exit_code: Some(i32::from(!out.success)),
-                            error: None,
-                            // 成功/失败是两回事：exit_code 只表达是否非零退出，result 才区分语义
-                            result: Some(if out.success {
-                                ToolCallResult::Ok
-                            } else {
-                                ToolCallResult::Error
-                            }),
-                        });
-                        out.output.clone()
-                    }
-                    Err(crate::tool_router::ToolError::Cancelled) => {
-                        emit(&sink, EventMsg::ToolCallEnd {
-                            call_id: call_id.clone(),
-                            exit_code: None,
-                            error: Some("已取消".into()),
-                            result: Some(ToolCallResult::Cancelled),
-                        });
-                        reason = TurnEndReasonLocal::Cancelled;
+                let output_text = match record_tool_result(
+                    history,
+                    &sink,
+                    name,
+                    call_id,
+                    &result,
+                    effective_sandbox,
+                ) {
+                    Ok(output_text) => output_text,
+                    Err(reason_local) => {
+                        reason = reason_local;
                         break 'outer;
                     }
-                    Err(e) => {
-                        emit(&sink, EventMsg::ToolCallEnd {
-                            call_id: call_id.clone(),
-                            exit_code: None,
-                            error: Some(e.to_string()),
-                            result: Some(ToolCallResult::Error),
-                        });
-                        e.to_string()
-                    }
                 };
-                history.push(HistoryItem::FunctionCallOutput {
-                    call_id: call_id.clone(),
-                    output: match crate::sandbox::execution_note(name, effective_sandbox) {
-                        Some(note) => format!("{output_text}\n{note}"),
-                        None => output_text.clone(),
-                    },
-                });
-                // SH-072：view_image 的图片以引用形式回填成一条用户消息——Chat 协议不允许
-                // 图片挂在 tool 消息里，模型只能从用户消息里看到它。字节取自进程内缓存，
-                // 历史里只有 ImageRef（rollout 因此不会变大）。
-                if let Ok(out) = &result {
-                    if out.success {
-                        if let Some(image) = crate::tool_router::attachment(&out.output) {
-                            history.push(HistoryItem::ImageMessage {
-                                role: crate::model_client::Role::User,
-                                text: format!("[view_image] {}", image.path),
-                                images: vec![image],
-                            });
-                        }
-                    }
-                }
                 // SH-126：把本次调用的写入搬进本地缓冲。写日志本身是 take 语义，
                 // 不搬走就会被下一次写入覆盖掉一半判定依据。
                 //
@@ -1761,6 +1953,96 @@ fn declarations_for(
     all.into_iter()
         .filter(|d| policy::plan_mode_allows(&d.name))
         .collect()
+}
+
+/// 可以并行执行的只读工具：复用 `risk_of` 的 Read 档，再排除三类**会改状态**的调用。
+///
+/// 工具自身的 `spec().risk` 优先于 `risk_of`（SH-063/ADR-107 的用户批准覆盖），
+/// 否则动态工具一旦被标成写入档仍会被当成只读并发放行。
+///
+/// 排除名单各自有明确理由，不是保守起见：
+/// - `todo_write` 改会话内任务清单，两次调用谁先落地就是语义；
+/// - `enter_plan_mode` 切换计划态，顺序即状态迁移；
+/// - `wait_agent` 属于子代理面（用户裁定子代理一律串行），并发等待没有收益。
+fn parallel_read_only(router: &ToolRouter, name: &str) -> bool {
+    let risk = router
+        .get(name)
+        .and_then(|executor| executor.spec().risk)
+        .unwrap_or_else(|| policy::risk_of(name));
+    risk == crate::events::RiskLevel::Read
+        && !matches!(name, "todo_write" | "enter_plan_mode" | "wait_agent")
+}
+
+/// 回填一次工具执行结果：`ToolCallEnd` 事件 + 给模型的 tool 输出（附沙箱说明与图片引用）。
+///
+/// 返回 `Err(reason)` 表示这次调用被取消，调用方必须结束整个回合；`Ok` 是写进历史前的
+/// 工具输出原文（baseline/repair 判定要用的、未附沙箱说明的那份）。
+///
+/// 串行与只读批次共用这一份回填：两条路径的结束事件语义必须逐字一致，否则
+/// 「同一工具在批次里报成功、在串行里报失败」这类分叉没有任何测试挡得住。
+fn record_tool_result(
+    history: &mut Vec<HistoryItem>,
+    sink: &Arc<dyn crate::events::EventSink>,
+    name: &str,
+    call_id: &str,
+    result: &Result<crate::tool_router::ToolOutput, crate::tool_router::ToolError>,
+    sandbox: crate::config::SandboxMode,
+) -> Result<String, TurnEndReasonLocal> {
+    let output_text = match result {
+        Ok(out) => {
+            let _ = sink.emit(&EventMsg::ToolCallEnd {
+                call_id: call_id.to_string(),
+                exit_code: Some(i32::from(!out.success)),
+                error: None,
+                // 成功/失败是两回事：exit_code 只表达是否非零退出，result 才区分语义
+                result: Some(if out.success {
+                    ToolCallResult::Ok
+                } else {
+                    ToolCallResult::Error
+                }),
+            });
+            out.output.clone()
+        }
+        Err(crate::tool_router::ToolError::Cancelled) => {
+            let _ = sink.emit(&EventMsg::ToolCallEnd {
+                call_id: call_id.to_string(),
+                exit_code: None,
+                error: Some("已取消".into()),
+                result: Some(ToolCallResult::Cancelled),
+            });
+            return Err(TurnEndReasonLocal::Cancelled);
+        }
+        Err(error) => {
+            let _ = sink.emit(&EventMsg::ToolCallEnd {
+                call_id: call_id.to_string(),
+                exit_code: None,
+                error: Some(error.to_string()),
+                result: Some(ToolCallResult::Error),
+            });
+            error.to_string()
+        }
+    };
+    history.push(HistoryItem::FunctionCallOutput {
+        call_id: call_id.to_string(),
+        output: match crate::sandbox::execution_note(name, sandbox) {
+            Some(note) => format!("{output_text}\n{note}"),
+            None => output_text.clone(),
+        },
+    });
+    // SH-072：view_image 的图片以引用形式回填成一条用户消息——Chat 协议不允许
+    // 图片挂在 tool 消息里，模型只能从用户消息里看到它。
+    if let Ok(out) = result {
+        if out.success {
+            if let Some(image) = crate::tool_router::attachment(&out.output) {
+                history.push(HistoryItem::ImageMessage {
+                    role: crate::model_client::Role::User,
+                    text: format!("[view_image] {}", image.path),
+                    images: vec![image],
+                });
+            }
+        }
+    }
+    Ok(output_text)
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -2641,6 +2923,191 @@ mod tests {
         }));
         agent.router = Arc::new(r);
         (agent, store, cancel, broker)
+    }
+
+    // ---- 只读工具并行（第 4 笔） ----
+
+    /// 慢读工具：并发证据取「同时在飞的调用峰值」，不用墙钟，避免 CI 抖动。
+    struct SlowRead {
+        spec: ToolSpec,
+        started: Arc<std::sync::atomic::AtomicUsize>,
+        finished: Arc<std::sync::atomic::AtomicUsize>,
+        peak: Arc<std::sync::atomic::AtomicUsize>,
+    }
+
+    #[async_trait::async_trait]
+    impl ToolExecutor for SlowRead {
+        fn spec(&self) -> &ToolSpec {
+            &self.spec
+        }
+        async fn execute(&self, _args: Value, _ctx: &ToolContext) -> Result<ToolOutput, ToolError> {
+            // 在飞数量 = 已启动 − 已结束；峰值落在「本次启动之后」，串行实现永远是 1。
+            let now = self
+                .started
+                .fetch_add(1, std::sync::atomic::Ordering::SeqCst)
+                + 1;
+            let finished = self.finished.load(std::sync::atomic::Ordering::SeqCst);
+            self.peak.fetch_max(now - finished, std::sync::atomic::Ordering::SeqCst);
+            tokio::time::sleep(std::time::Duration::from_millis(150)).await;
+            self.finished
+                .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            Ok(ToolOutput::ok("read"))
+        }
+    }
+
+    fn call_ev(name: &str, arguments: &str, call_id: &str) -> ModelStreamEvent {
+        ModelStreamEvent::OutputItem(ResponseItem::FunctionCall {
+            name: name.into(),
+            arguments: arguments.into(),
+            call_id: call_id.into(),
+        })
+    }
+
+    fn slow_router(
+        peak: Arc<std::sync::atomic::AtomicUsize>,
+    ) -> (ToolRouter, Arc<std::sync::atomic::AtomicUsize>) {
+        let started = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let mut router = ToolRouter::new();
+        router.register(Arc::new(SlowRead {
+            spec: ToolSpec::new("read_file", "慢读", serde_json::json!({"type":"object"})),
+            started: started.clone(),
+            finished: Arc::new(std::sync::atomic::AtomicUsize::new(0)),
+            peak,
+        }));
+        (router, started)
+    }
+
+    /// 连续只读调用必须并发在飞，且事件与结果按原调用顺序回写。
+    #[tokio::test]
+    async fn consecutive_read_only_calls_run_in_parallel_and_replay_in_order() {
+        let peak = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let (mut agent, store, cancel, _broker) = make_loop(vec![
+            vec![
+                call_ev("read_file", r#"{"path":"a"}"#, "r1"),
+                call_ev("read_file", r#"{"path":"b"}"#, "r2"),
+                usage_ev(),
+            ],
+            script_text("读完了"),
+        ]);
+        let (router, _started) = slow_router(peak.clone());
+        agent.router = Arc::new(router);
+        let summary = agent.run_task("任务", Arc::new(CapturingSink(store.clone())), cancel).await;
+
+        assert_eq!(summary.reason, TurnEndReason::Completed);
+        assert_eq!(
+            peak.load(std::sync::atomic::Ordering::SeqCst),
+            2,
+            "两条只读调用必须同时在飞（串行实现这里峰值只会是 1）"
+        );
+        let events = store.lock().unwrap();
+        let begins: Vec<&str> = events
+            .iter()
+            .filter_map(|event| match event {
+                EventMsg::ToolCallBegin { call_id, .. } => Some(call_id.as_str()),
+                _ => None,
+            })
+            .collect();
+        let ends: Vec<&str> = events
+            .iter()
+            .filter_map(|event| match event {
+                EventMsg::ToolCallEnd { call_id, .. } => Some(call_id.as_str()),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(begins, ["r1", "r2"], "Begin 必须按原调用顺序发出");
+        assert_eq!(
+            ends,
+            ["r1", "r2"],
+            "结果必须按原调用顺序回写，而不是按完成先后（完成顺序由调度决定）"
+        );
+    }
+
+    /// 写入是分隔符：它不能被并进只读批次，两侧的读各自独立。
+    #[tokio::test]
+    async fn write_between_reads_stays_serial() {
+        let peak = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let (mut agent, store, cancel, _broker) = make_loop(vec![
+            vec![
+                call_ev("read_file", r#"{"path":"a"}"#, "r1"),
+                call_ev("apply_patch", r#"{"path":"src/x.rs","body":"x"}"#, "w1"),
+                call_ev("read_file", r#"{"path":"b"}"#, "r2"),
+                usage_ev(),
+            ],
+            script_text("完成"),
+        ]);
+        let ws = crate::test_support::TestTempDir::new("parallel-order");
+        agent.workspace_root = ws.path().to_path_buf();
+        let (mut router, _started) = slow_router(peak.clone());
+        router.register(Arc::new(FakeWriter::default()));
+        agent.router = Arc::new(router);
+        let summary = agent.run_task("任务", Arc::new(CapturingSink(store.clone())), cancel).await;
+
+        assert_eq!(summary.reason, TurnEndReason::Completed);
+        assert_eq!(
+            peak.load(std::sync::atomic::Ordering::SeqCst),
+            1,
+            "写入两侧的读必须各自串行，不能被并成一批"
+        );
+        let events = store.lock().unwrap();
+        let order: Vec<String> = events
+            .iter()
+            .filter_map(|event| match event {
+                EventMsg::ToolCallBegin { call_id, .. } => Some(format!("begin:{call_id}")),
+                EventMsg::ToolCallEnd { call_id, .. } => Some(format!("end:{call_id}")),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(
+            order,
+            ["begin:r1", "end:r1", "begin:w1", "end:w1", "begin:r2", "end:r2"],
+            "写入必须夹在两段只读之间串行，不能被并行批次吞进去"
+        );
+    }
+
+    /// 取消必须传播到正在并发的读上：不等 150ms×2 跑完，且每条调用都有输出。
+    #[tokio::test]
+    async fn cancelling_a_read_batch_propagates_and_reports_every_call() {
+        let peak = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let (mut agent, store, cancel, _broker) = make_loop(vec![
+            vec![
+                call_ev("read_file", r#"{"path":"a"}"#, "r1"),
+                call_ev("read_file", r#"{"path":"b"}"#, "r2"),
+                usage_ev(),
+            ],
+            script_text("不该跑到"),
+        ]);
+        let (router, _started) = slow_router(peak);
+        agent.router = Arc::new(router);
+        let stopper = cancel.clone();
+        tokio::spawn(async move {
+            tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+            stopper.cancel();
+        });
+        let summary = tokio::time::timeout(
+            std::time::Duration::from_secs(2),
+            agent.run_task("任务", Arc::new(CapturingSink(store.clone())), cancel),
+        )
+        .await
+        .expect("取消必须立即传播，不能等两条读跑完");
+
+        assert_eq!(summary.reason, TurnEndReason::Cancelled);
+        let events = store.lock().unwrap();
+        let cancelled: Vec<&str> = events
+            .iter()
+            .filter_map(|event| match event {
+                EventMsg::ToolCallEnd {
+                    call_id,
+                    result: Some(ToolCallResult::Cancelled),
+                    ..
+                } => Some(call_id.as_str()),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(
+            cancelled,
+            ["r1", "r2"],
+            "取消后每条 FunctionCall 都要有对应输出，协议不能留空洞"
+        );
     }
 
     #[tokio::test]
