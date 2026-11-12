@@ -71,9 +71,19 @@ const RULES: &[Rule] = &[
     Rule {
         owner: "EventMsg",
         variant: "TurnCompleted",
-        fields: "reason error",
+        fields: "reason error unverified",
         // 后端 turn 是采样轮次，前端一律用 journal.turn（同 model_retry/token_usage）。
         overrides: &[("turn", Status::BackendOnly("后端 turn 是采样轮次；前端用 journal.turn"))],
+    },
+    Rule {
+        owner: "EventMsg",
+        variant: "VerificationResult",
+        fields: "state commands duration_ms diagnostics",
+        overrides: &[
+            ("turn", Status::BackendOnly("后端 turn 是采样轮次；前端用 journal.turn")),
+            // 前端按四态自建文案：同一句话两侧各写一遍必然漂移，事件里的 summary 只做审计/导出。
+            ("summary", Status::BackendOnly("前端自建四态文案；summary 留给审计与导出")),
+        ],
     },
     Rule { owner: "EventMsg", variant: "AgentMessageDelta", fields: "delta", overrides: &[] },
     Rule { owner: "EventMsg", variant: "ReasoningDelta", fields: "delta", overrides: &[] },
