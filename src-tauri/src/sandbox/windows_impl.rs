@@ -25,14 +25,21 @@ use std::sync::{Arc, Mutex};
 use tokio::sync::mpsc;
 use windows::core::{PCWSTR, PWSTR};
 use windows::Win32::Foundation::{
-    CloseHandle, HANDLE, HANDLE_FLAGS, HANDLE_FLAG_INHERIT, SetHandleInformation, WAIT_FAILED,
-    WAIT_OBJECT_0,
+    CloseHandle, LocalFree, HANDLE, HANDLE_FLAGS, HANDLE_FLAG_INHERIT, HLOCAL,
+    SetHandleInformation, WAIT_FAILED, WAIT_OBJECT_0,
+};
+use windows::Win32::Security::Authorization::{
+    ConvertStringSidToSidW, SetEntriesInAclW, EXPLICIT_ACCESS_W, GRANT_ACCESS,
+    NO_MULTIPLE_TRUSTEE, TRUSTEE_IS_SID, TRUSTEE_IS_UNKNOWN, TRUSTEE_W,
 };
 use windows::Win32::Security::{
-    CreateRestrictedToken, GetTokenInformation, LookupPrivilegeValueW, LUID_AND_ATTRIBUTES,
-    SECURITY_ATTRIBUTES, SECURITY_CAPABILITIES, SE_PRIVILEGE_REMOVED, SID_AND_ATTRIBUTES,
-    TOKEN_ACCESS_MASK, TokenPrivileges, PSID,
+    CopySid, CreateRestrictedToken, CreateWellKnownSid, GetLengthSid, GetTokenInformation,
+    LookupPrivilegeValueW, SetTokenInformation, LUID_AND_ATTRIBUTES, SECURITY_ATTRIBUTES,
+    SECURITY_CAPABILITIES, SECURITY_MAX_SID_SIZE, SE_PRIVILEGE_REMOVED, SID_AND_ATTRIBUTES,
+    TOKEN_ACCESS_MASK, TOKEN_GROUPS, TokenDefaultDacl, TokenGroups, TokenPrivileges, WinWorldSid,
+    ACL, CREATE_RESTRICTED_TOKEN_FLAGS, DISABLE_MAX_PRIVILEGE, LUA_TOKEN, PSID, WRITE_RESTRICTED,
 };
+use windows::Win32::Storage::FileSystem::READ_CONTROL;
 use windows::Win32::System::Console::{
     ClosePseudoConsole, CreatePseudoConsole, COORD, HPCON,
 };
@@ -169,21 +176,294 @@ unsafe fn privileges_to_remove(token: HANDLE) -> Result<Vec<LUID_AND_ATTRIBUTES>
     Ok(to_remove)
 }
 
-/// 创建「仅留 SeChangeNotifyPrivilege」的受限令牌。
-unsafe fn create_restricted_token() -> Result<HandleGuard, String> {
+/// 创建受限令牌（docs/16 第一期 A：就地补齐，不另起一份实现）。
+///
+/// - `write_sids` **为空**：保持本仓原语义——只删除 `SeChangeNotifyPrivilege` 以外的全部特权，
+///   `flags=0`、无 restricting SID、不设 default DACL。logical 回退、MCP、终端与既有探针
+///   都走这一支，行为必须与改动前逐字节等价（`empty_write_sids_matches_legacy_token` 钉住）。
+/// - `write_sids` **非空**：追加 `DISABLE_MAX_PRIVILEGE | LUA_TOKEN | WRITE_RESTRICTED`，
+///   restricting 列表 `[logon, Everyone, write_sids...]`，并设置 default DACL。
+///
+/// 任何一步失败都返回 Err，由上层 fail-closed（FF-4：不降级为无沙箱执行）。
+unsafe fn create_restricted_token(write_sids: &[PSID]) -> Result<HandleGuard, String> {
     let base = open_current_token()?;
-    let to_remove = privileges_to_remove(base.handle())?;
+    if write_sids.is_empty() {
+        let to_remove = privileges_to_remove(base.handle())?;
+        let mut new_token = HANDLE::default();
+        CreateRestrictedToken(
+            base.handle(),
+            windows::Win32::Security::CREATE_RESTRICTED_TOKEN_FLAGS(0),
+            None,
+            Some(&to_remove),
+            None,
+            &mut new_token,
+        )
+        .map_err(|e| format!("CreateRestrictedToken 失败: {e}"))?;
+        return Ok(HandleGuard::new(new_token));
+    }
+
+    let logon = logon_sid_bytes(base.handle())?;
+    let everyone = everyone_sid()?;
+    let psid_logon = PSID(logon.as_ptr().cast_mut().cast::<core::ffi::c_void>());
+    let psid_everyone = PSID(everyone.as_ptr().cast_mut().cast::<core::ffi::c_void>());
+
+    // 顺序对齐 docs/16 §1.1：logon → Everyone → 写 SID；Attributes 全为 0。
+    let mut entries: Vec<SID_AND_ATTRIBUTES> = Vec::with_capacity(write_sids.len() + 2);
+    entries.push(SID_AND_ATTRIBUTES {
+        Sid: psid_logon,
+        Attributes: 0,
+    });
+    entries.push(SID_AND_ATTRIBUTES {
+        Sid: psid_everyone,
+        Attributes: 0,
+    });
+    for sid in write_sids {
+        entries.push(SID_AND_ATTRIBUTES {
+            Sid: *sid,
+            Attributes: 0,
+        });
+    }
+
     let mut new_token = HANDLE::default();
+    let flags =
+        CREATE_RESTRICTED_TOKEN_FLAGS(DISABLE_MAX_PRIVILEGE.0 | LUA_TOKEN.0 | WRITE_RESTRICTED.0);
     CreateRestrictedToken(
         base.handle(),
-        windows::Win32::Security::CREATE_RESTRICTED_TOKEN_FLAGS(0),
+        flags,
         None,
-        Some(&to_remove),
         None,
+        Some(&entries),
         &mut new_token,
     )
-    .map_err(|e| format!("CreateRestrictedToken 失败: {e}"))?;
-    Ok(HandleGuard::new(new_token))
+    .map_err(|e| format!("CreateRestrictedToken(写约束) 失败: {e}"))?;
+    let guard = HandleGuard::new(new_token);
+    // default DACL 是孙进程新建管道（stdio）的必要条件；失败即弃令牌（fail-closed）。
+    if let Err(error) = set_default_dacl(new_token, psid_logon) {
+        return Err(format!("{error}（写约束令牌初始化失败，拒绝启动子进程）"));
+    }
+    Ok(guard)
+}
+
+// ========================= 写约束令牌（docs/16 第一期 A） =========================
+//
+// 上面的 `create_restricted_token` 同时服务旧路径（空列表）与新路径（写 SID）。
+
+/// 钉住「空列表 = 改动前旧令牌」的等价性（docs/16 第一期 A 的兼容要求）。
+///
+/// 断言的是令牌的**实际内容**，不是我们的入参：
+/// 1) 没有 restricting SID（旧实现 `flags=0`、从不传 restricting 列表）；
+/// 2) 特权只剩 `SeChangeNotifyPrivilege`。
+#[cfg(test)]
+mod token_tests {
+    use super::*;
+
+    /// 读取令牌的 restricting SID 数量（`TokenRestrictedSids` 是 `TOKEN_GROUPS`，首字段即计数）。
+    unsafe fn restricted_sid_count(token: HANDLE) -> u32 {
+        let mut needed = 0u32;
+        let _ = GetTokenInformation(
+            token,
+            windows::Win32::Security::TokenRestrictedSids,
+            None,
+            0,
+            &mut needed,
+        );
+        assert!(needed > 0, "读取 TokenRestrictedSids 长度失败");
+        let mut buffer = vec![0u8; needed as usize];
+        GetTokenInformation(
+            token,
+            windows::Win32::Security::TokenRestrictedSids,
+            Some(buffer.as_mut_ptr().cast()),
+            needed,
+            &mut needed,
+        )
+        .expect("读取 TokenRestrictedSids 失败");
+        std::ptr::read_unaligned(buffer.as_ptr().cast::<u32>())
+    }
+
+    #[test]
+    fn empty_write_sids_matches_legacy_token() {
+        let token = unsafe { create_restricted_token(&[]).expect("旧令牌构造失败") };
+        unsafe {
+            assert_eq!(
+                restricted_sid_count(token.handle()),
+                0,
+                "空写 SID 不应产生 restricting SID（否则旧路径行为已改变）"
+            );
+
+            let mut needed = 0u32;
+            let _ = GetTokenInformation(token.handle(), TokenPrivileges, None, 0, &mut needed);
+            assert!(needed > 0, "读取 TokenPrivileges 长度失败");
+            let mut buffer = vec![0u8; needed as usize];
+            GetTokenInformation(
+                token.handle(),
+                TokenPrivileges,
+                Some(buffer.as_mut_ptr().cast()),
+                needed,
+                &mut needed,
+            )
+            .expect("读取 TokenPrivileges 失败");
+            let count = std::ptr::read_unaligned(buffer.as_ptr().cast::<u32>());
+            assert_eq!(count, 1, "旧令牌只应保留 SeChangeNotifyPrivilege");
+
+            let mut expected = windows::Win32::Foundation::LUID::default();
+            let name = wide("SeChangeNotifyPrivilege");
+            LookupPrivilegeValueW(PCWSTR::null(), PCWSTR(name.as_ptr()), &mut expected)
+                .expect("查询 SeChangeNotifyPrivilege 失败");
+            let item = std::ptr::read_unaligned(
+                buffer
+                    .as_ptr()
+                    .add(std::mem::size_of::<u32>())
+                    .cast::<LUID_AND_ATTRIBUTES>(),
+            );
+            assert_eq!(item.Luid.LowPart, expected.LowPart);
+            assert_eq!(item.Luid.HighPart, expected.HighPart);
+        }
+    }
+
+    /// 非空列表走新语义：restricting 数量 = 2（logon + Everyone）+ 写 SID 数。
+    #[test]
+    fn non_empty_write_sids_adds_restricting_entries() {
+        let everyone = unsafe { everyone_sid().expect("Everyone SID 构造失败") };
+        let write_sid = PSID(everyone.as_ptr().cast_mut().cast::<core::ffi::c_void>());
+        let token =
+            unsafe { create_restricted_token(&[write_sid]).expect("写约束令牌构造失败") };
+        unsafe {
+            assert_eq!(
+                restricted_sid_count(token.handle()),
+                3,
+                "restricting 列表应为 [logon, Everyone, 写 SID]"
+            );
+        }
+    }
+}
+
+// 写约束令牌的调用方必须给非空写 SID 列表；空列表语义是「旧令牌」（见 `create_restricted_token`），
+// 由 `spawn_write_restricted_command` 入口显式拒绝，避免误把写约束路径退化成旧令牌。
+/// `SE_GROUP_LOGON_ID`（winnt.h）：令牌组里 logon 会话 SID 的属性位。
+const SE_GROUP_LOGON_ID: u32 = 0xC000_0000;
+/// `GENERIC_ALL`：受限令牌 default DACL 给 logon SID 的权限（对齐 codex `token.rs:62`）。
+const GENERIC_ALL: u32 = 0x1000_0000;
+
+/// `SetTokenInformation(TokenDefaultDacl)` 的入参形状。
+#[repr(C)]
+struct TokenDefaultDaclInfo {
+    default_dacl: *mut ACL,
+}
+
+/// 令牌里的 logon 会话 SID（`SE_GROUP_LOGON_ID` 属性的那一组）。
+///
+/// 原始缓冲区解析与 `privileges_to_remove` 同口径：`TOKEN_GROUPS::Groups` 的偏移
+/// 由 `offset_of!` 取，不能假设紧跟在 count 后面（有 4 字节对齐填充）。
+unsafe fn logon_sid_bytes(token: HANDLE) -> Result<Vec<u8>, String> {
+    let mut needed = 0u32;
+    let _ = GetTokenInformation(token, TokenGroups, None, 0, &mut needed);
+    if needed == 0 {
+        return Err("GetTokenInformation(TokenGroups) 返回长度为 0".into());
+    }
+    let mut buffer = vec![0u8; needed as usize];
+    GetTokenInformation(
+        token,
+        TokenGroups,
+        Some(buffer.as_mut_ptr().cast()),
+        needed,
+        &mut needed,
+    )
+    .map_err(|e| format!("GetTokenInformation(TokenGroups) 失败: {e}"))?;
+
+    let offset = std::mem::offset_of!(TOKEN_GROUPS, Groups);
+    let stride = std::mem::size_of::<SID_AND_ATTRIBUTES>();
+    if buffer.len() < offset {
+        return Err("令牌组缓冲区被截断（连头部都不完整）".into());
+    }
+    let count = std::ptr::read_unaligned(buffer.as_ptr().cast::<u32>()) as usize;
+    for index in 0..count {
+        let at = offset + index * stride;
+        if at + stride > buffer.len() {
+            return Err(format!("令牌组第 {index} 项越界（缓冲区被截断）"));
+        }
+        let entry =
+            std::ptr::read_unaligned(buffer.as_ptr().add(at).cast::<SID_AND_ATTRIBUTES>());
+        if entry.Sid.0.is_null() || entry.Attributes & SE_GROUP_LOGON_ID != SE_GROUP_LOGON_ID {
+            continue;
+        }
+        let sid_len = GetLengthSid(entry.Sid);
+        if sid_len == 0 {
+            return Err("logon SID 的 GetLengthSid 返回 0".into());
+        }
+        let mut sid = vec![0u8; sid_len as usize];
+        CopySid(sid_len, PSID(sid.as_mut_ptr().cast()), entry.Sid)
+            .map_err(|e| format!("复制 logon SID 失败: {e}"))?;
+        return Ok(sid);
+    }
+    Err("令牌里没有 logon SID：无法建立写约束令牌（拒绝降级）".into())
+}
+
+/// Everyone（`WinWorldSid`）SID 的字节副本。
+unsafe fn everyone_sid() -> Result<Vec<u8>, String> {
+    let mut buffer = vec![0u8; SECURITY_MAX_SID_SIZE as usize];
+    let mut size = buffer.len() as u32;
+    CreateWellKnownSid(
+        WinWorldSid,
+        None,
+        Some(PSID(buffer.as_mut_ptr().cast())),
+        &mut size,
+    )
+    .map_err(|e| format!("CreateWellKnownSid(WinWorldSid) 失败: {e}"))?;
+    buffer.truncate(size as usize);
+    Ok(buffer)
+}
+
+/// 构造 default DACL：logon SID 全权 + OWNER RIGHTS 读控制位。
+///
+/// 为什么必须做：受限令牌会继承用户的 default DACL，而那份 DACL 里没有 restricting
+/// SID；孙进程新建匿名管道（stdio）时 pass-2 检查失败 → `spawn EPERM`，所有派生进程
+/// 全挂。dsh `token.ts:96-145` 与 codex `token.rs:56-112` 都把这一步列为 fail-closed。
+unsafe fn set_default_dacl(token: HANDLE, logon_sid: PSID) -> Result<(), String> {
+    let owner_rights_text = wide("S-1-3-4");
+    let mut owner_rights = PSID(std::ptr::null_mut());
+    ConvertStringSidToSidW(PCWSTR(owner_rights_text.as_ptr()), &mut owner_rights)
+        .map_err(|e| format!("OWNER RIGHTS SID 转换失败: {e}"))?;
+
+    let entries = [
+        explicit_access(logon_sid, GENERIC_ALL),
+        explicit_access(owner_rights, READ_CONTROL.0),
+    ];
+    let mut new_acl: *mut ACL = std::ptr::null_mut();
+    let status = SetEntriesInAclW(Some(&entries), None, &mut new_acl);
+    let _ = LocalFree(Some(HLOCAL(owner_rights.0)));
+    if status != windows::Win32::Foundation::ERROR_SUCCESS {
+        return Err(format!(
+            "构造受限令牌 default DACL 失败（Win32 错误 {}）",
+            status.0
+        ));
+    }
+
+    let info = TokenDefaultDaclInfo {
+        default_dacl: new_acl,
+    };
+    let result = SetTokenInformation(
+        token,
+        TokenDefaultDacl,
+        &info as *const _ as *const core::ffi::c_void,
+        std::mem::size_of::<TokenDefaultDaclInfo>() as u32,
+    );
+    let _ = LocalFree(Some(HLOCAL(new_acl.cast())));
+    result.map_err(|e| format!("SetTokenInformation(TokenDefaultDacl) 失败: {e}"))
+}
+
+fn explicit_access(sid: PSID, mask: u32) -> EXPLICIT_ACCESS_W {
+    EXPLICIT_ACCESS_W {
+        grfAccessPermissions: mask,
+        grfAccessMode: GRANT_ACCESS,
+        grfInheritance: windows::Win32::Security::ACE_FLAGS(0),
+        Trustee: TRUSTEE_W {
+            pMultipleTrustee: std::ptr::null_mut(),
+            MultipleTrusteeOperation: NO_MULTIPLE_TRUSTEE,
+            TrusteeForm: TRUSTEE_IS_SID,
+            TrusteeType: TRUSTEE_IS_UNKNOWN,
+            ptstrName: PWSTR(sid.0.cast::<u16>()),
+        },
+    }
 }
 
 // 实测记录（2026-11-08）：AppContainer 走 `PROC_THREAD_ATTRIBUTE_SECURITY_CAPABILITIES`
@@ -314,16 +594,17 @@ fn wait_for_exit_code(process: &OwnedHandle) -> io::Result<i32> {
     }
 }
 
-/// 以「仅留 SeChangeNotifyPrivilege 的受限令牌 + JobObject」启动子进程。
-/// stdout/stderr 由 std::thread 读线程逐行送入 tx（blocking_send 桥接 tokio）。
+/// 受限启动的公共流程：令牌由调用方给，Job / 句柄白名单 / `CREATE_SUSPENDED → Assign → Resume`
+/// 与旧实现逐字一致。写约束与进程树治理正交，不在这里再分叉一套。
 ///
-/// 句柄继承走 `PROC_THREAD_ATTRIBUTE_HANDLE_LIST` 白名单（见第 5.1 步注释），
-/// 这是 `spawn_appcontainer_command` 之外的独立调用点，两处都必须带这一层。
-pub fn spawn_restricted_command(
+/// `create_process_error` 只影响错误文案（旧路径保留原文案，避免无谓的行为面变化）。
+unsafe fn spawn_with_token(
+    token_guard: HandleGuard,
     program: &str,
     args: &[&str],
     cwd: &Path,
     tx: mpsc::Sender<ExecLine>,
+    create_process_error: &str,
 ) -> Result<RestrictedChild, String> {
     // 程序路径统一走共享的引用规则（含空格路径必须被引起来）；参数保持调用方原文，
     // 见 `shell_command_line` 的说明（SH-064 裁决②：入口不合并，规则共用）。
@@ -331,88 +612,144 @@ pub fn spawn_restricted_command(
     let mut cmdline_wide = wide(&command_line);
     let cwd_wide = wide(cwd.as_os_str());
 
+    // 4) Job 对象：KILL_ON_JOB_CLOSE
+    let job =
+        CreateJobObjectW(None, PCWSTR::null()).map_err(|e| format!("CreateJobObject 失败: {e}"))?;
+    let job_guard = JobGuard(HandleGuard::new(job));
+    let mut limits = JOBOBJECT_EXTENDED_LIMIT_INFORMATION::default();
+    limits.BasicLimitInformation.LimitFlags = JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE;
+    SetInformationJobObject(
+        job_guard.handle(),
+        JobObjectExtendedLimitInformation,
+        &limits as *const _ as *const core::ffi::c_void,
+        std::mem::size_of::<JOBOBJECT_EXTENDED_LIMIT_INFORMATION>() as u32,
+    )
+    .map_err(|e| format!("SetInformationJobObject 失败: {e}"))?;
+
+    // 5) stdio 管道（写端可继承）
+    let (out_read, out_write) = create_inheritable_pipe()?;
+    let (err_read, err_write) = create_inheritable_pipe()?;
+
+    // 5.1) 句柄白名单（M1）：只有列表内的两根写端能进子进程。
+    //
+    // 为什么不能只把读端设成不可继承：`bInheritHandles=true` 的全量继承是按
+    // 「哪个句柄可继承」放的，不是按「这次 spawn 的」放的——同进程里并发的命令 B
+    // 会把命令 A 的管道写端一起继承走。A 退出后 B 还持着 A 的写端，A 的读线程
+    // 永远等不到 EOF，句柄与读线程一起漏（实测 8/8 复现，短命令的输出流挂到超时）。
+    // HANDLE_LIST 是白名单：未列出的可继承句柄一律不进入子进程。
+    // 注意：HANDLE_LIST 要求 bInheritHandles 仍为 TRUE 且列表内句柄本身可继承。
+    let mut attributes = AttrList::new(1)?;
+    attributes.set_handle_list(vec![out_write.handle(), err_write.handle()])?;
+
+    // 6) CREATE_SUSPENDED 启动（EXTENDED_STARTUPINFO_PRESENT 是带属性表的前提）
+    //
+    // 环境块：逻辑回退与写约束两条 exec 路径都用「整块继承 + Python UTF-8 补丁」。
+    // 以前这里是 `lpEnvironment=None`（隐式继承），补丁没有落点；现在显式给块并配
+    // `CREATE_UNICODE_ENVIRONMENT`（块是 UTF-16，缺这个标志系统会按 ANSI 解析）。
+    let environment = build_inherited_environment_block();
+    let mut startup = STARTUPINFOEXW::default();
+    startup.StartupInfo.cb = std::mem::size_of::<STARTUPINFOEXW>() as u32;
+    startup.StartupInfo.dwFlags = STARTF_USESTDHANDLES;
+    startup.StartupInfo.hStdInput = HANDLE::default();
+    startup.StartupInfo.hStdOutput = out_write.handle();
+    startup.StartupInfo.hStdError = err_write.handle();
+    startup.lpAttributeList = attributes.as_mut_ptr();
+
+    let mut pi = PROCESS_INFORMATION::default();
+    CreateProcessAsUserW(
+        Some(token_guard.handle()),
+        PCWSTR::null(),
+        Some(PWSTR(cmdline_wide.as_mut_ptr())),
+        None,
+        None,
+        true,
+        PROCESS_CREATION_FLAGS(
+            CREATE_SUSPENDED.0 | EXTENDED_STARTUPINFO_PRESENT.0 | CREATE_UNICODE_ENVIRONMENT.0,
+        ),
+        Some(environment.as_ptr().cast()),
+        PCWSTR::from_raw(cwd_wide.as_ptr()),
+        &startup.StartupInfo,
+        &mut pi,
+    )
+    .map_err(|e| format!("{create_process_error}: {e}"))?;
+
+    // 7) 入 Job（子进程任何代码执行前）→ 恢复运行
+    AssignProcessToJobObject(job_guard.handle(), pi.hProcess)
+        .map_err(|e| format!("AssignProcessToJobObject 失败: {e}"))?;
+    ResumeThread(pi.hThread);
+
+    // 8) 父侧：关闭继承写端；读端 File 交 std::thread 读线程
+    drop(out_write);
+    drop(err_write);
+    let encodings = crate::text_encoding::EncodingLedger::new();
+    spawn_pipe_reader(out_read, 0, tx.clone(), encodings.clone());
+    spawn_pipe_reader(err_read, 1, tx, encodings.clone());
+
+    // 进程句柄 → OwnedHandle（wait/kill 用）
+    let raw: RawHandle = pi.hProcess.0.cast();
+    let process = OwnedHandle::from_raw_handle(raw);
+    // 线程主句柄立即关闭（线程已 Resume；si 为 Copy 无需 drop）
+    let _ = CloseHandle(pi.hThread);
+    Ok(RestrictedChild {
+        process,
+        _job: job_guard,
+        encodings,
+        exit_rx: None,
+        exit_result: None,
+    })
+}
+
+/// 以「旧受限令牌（仅删特权）+ JobObject」启动子进程。
+/// stdout/stderr 由 std::thread 读线程逐行送入 tx（blocking_send 桥接 tokio）。
+///
+/// 句柄继承走 `PROC_THREAD_ATTRIBUTE_HANDLE_LIST` 白名单（见 `spawn_with_token` 的 5.1 步注释），
+/// 这是 `spawn_appcontainer_command` 之外的独立调用点，两处都必须带这一层。
+pub fn spawn_restricted_command(
+    program: &str,
+    args: &[&str],
+    cwd: &Path,
+    tx: mpsc::Sender<ExecLine>,
+) -> Result<RestrictedChild, String> {
     unsafe {
-        // 1-3) 受限令牌（仅留 SeChangeNotifyPrivilege）
-        let token_guard = create_restricted_token()?;
-
-        // 4) Job 对象：KILL_ON_JOB_CLOSE
-        let job = CreateJobObjectW(None, PCWSTR::null())
-            .map_err(|e| format!("CreateJobObject 失败: {e}"))?;
-        let job_guard = JobGuard(HandleGuard::new(job));
-        let mut limits = JOBOBJECT_EXTENDED_LIMIT_INFORMATION::default();
-        limits.BasicLimitInformation.LimitFlags = JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE;
-        SetInformationJobObject(
-            job_guard.handle(),
-            JobObjectExtendedLimitInformation,
-            &limits as *const _ as *const core::ffi::c_void,
-            std::mem::size_of::<JOBOBJECT_EXTENDED_LIMIT_INFORMATION>() as u32,
+        // 空写 SID = 旧令牌语义，逐字节等价于改动前（docs/16 第一期 A 的兼容要求）。
+        let token_guard = create_restricted_token(&[])?;
+        spawn_with_token(
+            token_guard,
+            program,
+            args,
+            cwd,
+            tx,
+            "CreateProcessAsUserW 失败",
         )
-        .map_err(|e| format!("SetInformationJobObject 失败: {e}"))?;
+    }
+}
 
-        // 5) stdio 管道（写端可继承）
-        let (out_read, out_write) = create_inheritable_pipe()?;
-        let (err_read, err_write) = create_inheritable_pipe()?;
-
-        // 5.1) 句柄白名单（M1）：只有列表内的两根写端能进子进程。
-        //
-        // 为什么不能只把读端设成不可继承：`bInheritHandles=true` 的全量继承是按
-        // 「哪个句柄可继承」放的，不是按「这次 spawn 的」放的——同进程里并发的命令 B
-        // 会把命令 A 的管道写端一起继承走。A 退出后 B 还持着 A 的写端，A 的读线程
-        // 永远等不到 EOF，句柄与读线程一起漏（实测 8/8 复现，短命令的输出流挂到超时）。
-        // HANDLE_LIST 是白名单：未列出的可继承句柄一律不进入子进程。
-        // 注意：HANDLE_LIST 要求 bInheritHandles 仍为 TRUE 且列表内句柄本身可继承。
-        let mut attributes = AttrList::new(1)?;
-        attributes.set_handle_list(vec![out_write.handle(), err_write.handle()])?;
-
-        // 6) CREATE_SUSPENDED 启动（EXTENDED_STARTUPINFO_PRESENT 是带属性表的前提）
-        let mut startup = STARTUPINFOEXW::default();
-        startup.StartupInfo.cb = std::mem::size_of::<STARTUPINFOEXW>() as u32;
-        startup.StartupInfo.dwFlags = STARTF_USESTDHANDLES;
-        startup.StartupInfo.hStdInput = HANDLE::default();
-        startup.StartupInfo.hStdOutput = out_write.handle();
-        startup.StartupInfo.hStdError = err_write.handle();
-        startup.lpAttributeList = attributes.as_mut_ptr();
-
-        let mut pi = PROCESS_INFORMATION::default();
-        CreateProcessAsUserW(
-            Some(token_guard.handle()),
-            PCWSTR::null(),
-            Some(PWSTR(cmdline_wide.as_mut_ptr())),
-            None,
-            None,
-            true,
-            PROCESS_CREATION_FLAGS(CREATE_SUSPENDED.0 | EXTENDED_STARTUPINFO_PRESENT.0),
-            None,
-            PCWSTR::from_raw(cwd_wide.as_ptr()),
-            &startup.StartupInfo,
-            &mut pi,
+/// 以「写约束受限令牌 + JobObject」启动子进程（docs/16 第一期 A）。
+///
+/// 与 `spawn_restricted_command` 的唯一差异是令牌构造时带上 restricting 写 SID；
+/// 其余流程共用 `spawn_with_token`。
+pub fn spawn_write_restricted_command(
+    program: &str,
+    args: &[&str],
+    cwd: &Path,
+    write_sids: &[PSID],
+    tx: mpsc::Sender<ExecLine>,
+) -> Result<RestrictedChild, String> {
+    // 空列表在这里是**安全错误**，不能落到旧令牌分支：否则调用方以为有写约束，
+    // 实际拿到的是不限制写的旧令牌。
+    if write_sids.is_empty() {
+        return Err("写约束启动缺少写 SID（拒绝退化为不限制写的旧令牌）".into());
+    }
+    unsafe {
+        let token_guard = create_restricted_token(write_sids)?;
+        spawn_with_token(
+            token_guard,
+            program,
+            args,
+            cwd,
+            tx,
+            "CreateProcessAsUserW（写约束）失败",
         )
-        .map_err(|e| format!("CreateProcessAsUserW 失败: {e}"))?;
-
-        // 7) 入 Job（子进程任何代码执行前）→ 恢复运行
-        AssignProcessToJobObject(job_guard.handle(), pi.hProcess)
-            .map_err(|e| format!("AssignProcessToJobObject 失败: {e}"))?;
-        ResumeThread(pi.hThread);
-
-        // 8) 父侧：关闭继承写端；读端 File 交 std::thread 读线程
-        drop(out_write);
-        drop(err_write);
-        let encodings = crate::text_encoding::EncodingLedger::new();
-        spawn_pipe_reader(out_read, 0, tx.clone(), encodings.clone());
-        spawn_pipe_reader(err_read, 1, tx, encodings.clone());
-
-        // 进程句柄 → OwnedHandle（wait/kill 用）
-        let raw: RawHandle = pi.hProcess.0.cast();
-        let process = OwnedHandle::from_raw_handle(raw);
-        // 线程主句柄立即关闭（线程已 Resume；si 为 Copy 无需 drop）
-        let _ = CloseHandle(pi.hThread);
-        Ok(RestrictedChild {
-            process,
-            _job: job_guard,
-            encodings,
-            exit_rx: None,
-            exit_result: None,
-        })
     }
 }
 
@@ -475,7 +812,7 @@ pub fn spawn_appcontainer_command(
 
     unsafe {
         // 纵深第 1 层：剥离特权的受限令牌（仅留 SeChangeNotifyPrivilege）
-        let token_guard = create_restricted_token()?;
+        let token_guard = create_restricted_token(&[])?;
 
         // 纵深第 2 层：Job（进程树回收 / 资源边界）
         let job = CreateJobObjectW(None, PCWSTR::null())
@@ -763,14 +1100,16 @@ fn spawn_terminal_impl(
             let env = build_environment(&extra)?;
             Some(build_environment_block(&env))
         }
-        _ => None,
+        // 逻辑 / danger 终端：继承父环境 + Python UTF-8 补丁（以前是 None 隐式继承，
+        // 补丁没有落点）。AppContainer 终端仍走白名单，见上一支。
+        _ => Some(build_inherited_environment_block()),
     };
 
     unsafe {
         // 纵深第 1 层：受限令牌（danger 档不建）
         let token_guard = match &mode {
             TerminalMode::Unsandboxed => None,
-            _ => Some(create_restricted_token()?),
+            _ => Some(create_restricted_token(&[])?),
         };
 
         // 纵深第 2 层：Job（创建时经 JOB_LIST 原子入 Job，无「先跑再入」窗口）
@@ -1328,6 +1667,25 @@ fn build_environment_block(env: &[(String, OsString)]) -> Vec<u16> {
     block
 }
 
+/// 继承型环境块：整块复制父进程环境，再叠加 Python stdio 编码补丁。
+///
+/// 与 [`build_environment`] 的区别：那是 AppContainer/MCP 的**白名单**（容器读不到
+/// 父环境里的路径，整块继承会让 cmd 初始化失败）；这里服务的是**逻辑回退 / 写约束 /
+/// 终端**，它们本来就能读父环境，语义是「继承 + 补丁」，不是收紧。
+///
+/// 键排序用大小写不敏感（`CreateProcess` 要求块内键按此顺序），同名键以补丁值为准。
+fn build_inherited_environment_block() -> Vec<u16> {
+    let mut entries: Vec<(String, OsString)> = std::env::vars_os()
+        .map(|(key, value)| (key.to_string_lossy().into_owned(), value))
+        .collect();
+    for (key, value) in super::msvc::PYTHON_UTF8_ENV {
+        entries.retain(|(existing, _)| !existing.eq_ignore_ascii_case(key));
+        entries.push((key.to_string(), OsString::from(value)));
+    }
+    entries.sort_by_key(|(key, _)| key.to_ascii_uppercase());
+    build_environment_block(&entries)
+}
+
 fn is_script_extension(path: &Path) -> bool {
     path.extension()
         .and_then(|ext| ext.to_str())
@@ -1632,7 +1990,7 @@ fn spawn_stdio(spec: &StdioSpawnSpec<'_>, tx: mpsc::Sender<StdioEvent>) -> Resul
     unsafe {
         let token = match spec.identity {
             StdioIdentity::Unsandboxed => None,
-            _ => Some(create_restricted_token()?),
+            _ => Some(create_restricted_token(&[])?),
         };
 
         // Job：KILL_ON_JOB_CLOSE，随句柄关闭收掉整棵树。

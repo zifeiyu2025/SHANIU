@@ -21,6 +21,7 @@ pub mod capture;
 mod device_acl;
 pub mod msvc;
 pub mod windows_impl;
+pub mod write_sid;
 
 use std::collections::{BTreeMap, HashMap, HashSet};
 use std::path::{Path, PathBuf};
@@ -118,7 +119,31 @@ pub fn enforcement_of(os: OsSandbox, mode: SandboxMode) -> SandboxEnforcement {
 
 /// 当前进程的强制完整度（状态条与工具结果共用同一处判定）。
 pub fn current_enforcement(mode: SandboxMode) -> SandboxEnforcement {
+    // 写约束模型：写入边界由 OS（WRITE_RESTRICTED + restricting SID）强制，
+    // 声明与事实一致 → `full`。这是本期唯一新增的 `full` 来源，默认关闭时不可达。
+    if use_restricted_token() {
+        return SandboxEnforcement::Full;
+    }
     enforcement_of(current_os_mode(), mode)
+}
+
+/// 第一期 A 的机制开关（docs/16 §7）。
+///
+/// `config.rs` 在本期冻结，所以新机制用环境变量门控：`SHANIU_SANDBOX_OS=restricted_token`。
+/// **不设或设成别的值 → 完全走旧机制**，行为与今天一致；`sandbox.os="logical"` 是用户
+/// 显式选择，优先级高于本开关（不会被 env 悄悄改成写约束模式）。
+pub fn restricted_token_enabled() -> bool {
+    static ENABLED: OnceLock<bool> = OnceLock::new();
+    *ENABLED.get_or_init(|| {
+        matches!(
+            std::env::var("SHANIU_SANDBOX_OS").as_deref(),
+            Ok("restricted_token")
+        )
+    })
+}
+
+fn use_restricted_token() -> bool {
+    restricted_token_enabled() && current_os_mode() == OsSandbox::AppContainer
 }
 
 /// 会真正落下执行副作用的工具：只有它们的输出才需要带上沙箱自报。
@@ -139,8 +164,11 @@ pub fn execution_note(tool: &str, mode: SandboxMode) -> Option<String> {
         "[sandbox] mode={name} enforcement={}",
         current_enforcement(mode).as_str()
     );
-    // 只有容器路径才有祖先链这回事；逻辑回退与全权模式加这个后缀只会误导。
-    if mode == SandboxMode::WorkspaceWrite && current_os_mode() == OsSandbox::AppContainer {
+    // 只有容器路径才有祖先链这回事；写约束模式没有祖先链，逻辑回退与全权模式也没有。
+    if mode == SandboxMode::WorkspaceWrite
+        && current_os_mode() == OsSandbox::AppContainer
+        && !restricted_token_enabled()
+    {
         match ancestor_state() {
             AncestorState::Preparing => note.push_str(" ancestors=preparing"),
             AncestorState::NeedsAdmin => note.push_str(" ancestors=needs_admin"),
@@ -197,11 +225,19 @@ pub fn prepare_spawn_with(
         SandboxMode::DangerFullAccess => {
             let mut command = Command::new(request.program);
             command.args(request.args).current_dir(request.cwd);
+            // Python stdio 编码补丁：danger 档同样要，否则 ≤3.14 下中文输出按 GBK 出。
+            for (key, value) in msvc::PYTHON_UTF8_ENV {
+                command.env(key, value);
+            }
             Ok(PreparedSpawn::Plain(command))
         }
         SandboxMode::WorkspaceWrite => {
             #[cfg(windows)]
             {
+                // 第一期 A：门控打开时走「只约束写」的受限令牌；默认关闭，旧分流不变。
+                if request.os == OsSandbox::AppContainer && restricted_token_enabled() {
+                    return prepare_write_restricted(&request, tx);
+                }
                 match request.os {
                     OsSandbox::AppContainer => spawn_in_app_container(&request, tx),
                     OsSandbox::Logical => {
@@ -301,6 +337,63 @@ fn spawn_in_app_container(
         Some(hint) => SandboxError::CreateFailed(format!("{error}（{hint}）")),
         None => SandboxError::CreateFailed(error),
     })?;
+    Ok(PreparedSpawn::Restricted(child))
+}
+
+/// 第一期 A：以「只约束写」的受限令牌启动 `workspace-write` 子进程。
+///
+/// 步骤（docs/16 §1.2–1.4）：
+/// 1. 由规范化路径派生两个写 SID：工作区 SID、temp SID；
+/// 2. 只给 `acl::write_scope` 里的位置补可继承 allow ACE——工作区根用工作区 SID，
+///    其余（TEMP/工具链）用 temp SID（restricting 列表只有四个身份，不新增身份）；
+/// 3. 用 `[logon, Everyone, 工作区 SID, temp SID]` 的 restricting 列表启动子进程。
+///
+/// **fail-closed**：任一目录授不上写权限就拒绝启动，绝不退化成无沙箱执行。
+/// 读与网络不在本机制的约束范围内（用户裁定，对齐 codex/dsh）。
+#[cfg(windows)]
+pub fn prepare_write_restricted(
+    request: &SpawnRequest<'_>,
+    tx: mpsc::Sender<ExecLine>,
+) -> Result<PreparedSpawn, SandboxError> {
+    let workspace_sid = write_sid::workspace_write_sid(request.workspace_root)
+        .map_err(SandboxError::CreateFailed)?;
+    let temp_sid =
+        write_sid::temp_write_sid(&std::env::temp_dir()).map_err(SandboxError::CreateFailed)?;
+
+    let ledger = acl::persistent_ledger_path(&crate::config::resolve_dirs_from_env().data_root);
+    for dir in acl::write_scope(request.workspace_root) {
+        let is_workspace_root = acl::same_path(&dir, request.workspace_root);
+        let sid = if is_workspace_root {
+            workspace_sid.as_psid()
+        } else {
+            temp_sid.as_psid()
+        };
+        match with_acl(|acl| acl.grant_scope_persistent(&dir, sid, is_workspace_root, &ledger))? {
+            acl::ScopeGrant::Written { .. } | acl::ScopeGrant::AlreadyPresent => {}
+            acl::ScopeGrant::Denied(detail) => {
+                return Err(SandboxError::CreateFailed(format!(
+                    "{detail}。写约束沙箱无法给「{}」授写权限，拒绝在沙箱外执行",
+                    dir.display()
+                )))
+            }
+        }
+    }
+
+    tracing::info!(
+        workspace = %request.workspace_root.display(),
+        workspace_sid = workspace_sid.text(),
+        temp_sid = temp_sid.text(),
+        "写约束沙箱就绪：受限令牌 WRITE_RESTRICTED，读与网络不约束"
+    );
+
+    let child = windows_impl::spawn_write_restricted_command(
+        request.program,
+        request.args,
+        request.cwd,
+        &[workspace_sid.as_psid(), temp_sid.as_psid()],
+        tx,
+    )
+    .map_err(SandboxError::CreateFailed)?;
     Ok(PreparedSpawn::Restricted(child))
 }
 
@@ -1098,6 +1191,18 @@ pub struct SandboxStatus {
 }
 
 pub fn status(mode: SandboxMode, os: OsSandbox) -> SandboxStatus {
+    // 写约束模型自报：没有容器、没有祖先链，写边界由令牌强制。
+    if os == OsSandbox::AppContainer && restricted_token_enabled() {
+        return SandboxStatus {
+            mode: mode.as_str(),
+            os: "restricted_token",
+            os_enabled: true,
+            enforcement: SandboxEnforcement::Full.as_str(),
+            profile: String::new(),
+            ancestor: AncestorState::Idle.as_str(),
+            note: "受限令牌约束写入（WRITE_RESTRICTED）；读与网络不约束，无需管理员".to_string(),
+        };
+    }
     let (os_name, os_enabled, note) = match os {
         OsSandbox::AppContainer => (
             "app_container",

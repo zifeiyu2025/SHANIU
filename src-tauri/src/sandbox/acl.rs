@@ -851,7 +851,10 @@ fn sid_to_string(sid: PSID) -> Result<String, String> {
 }
 
 /// `\\?\D:\ws` → `D:\ws`，并尽量取 canonical 形式。
-fn normalize(path: &Path) -> PathBuf {
+///
+/// `pub(crate)`：写约束模型的身份派生（`sandbox::write_sid`）必须用同一套规范化，
+/// 否则同一目录的两种拼写会派生出两个写 SID（docs/16 §1.2）。
+pub(crate) fn normalize(path: &Path) -> PathBuf {
     let canonical = std::fs::canonicalize(path).unwrap_or_else(|_| path.to_path_buf());
     match canonical.to_string_lossy().strip_prefix(r"\\?\") {
         Some(stripped) => PathBuf::from(stripped),

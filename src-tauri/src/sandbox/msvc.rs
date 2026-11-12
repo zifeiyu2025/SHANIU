@@ -50,7 +50,7 @@ pub fn toolchain_env() -> &'static [(String, String)] {
 /// 从 PEP 686 起默认 UTF-8 mode：清空宿主变量后 `sys.stdout.encoding` 仍是 `utf-8`、
 /// `sys.flags.utf8_mode` 仍是 1。所以「本机能跑」不能当作「乱码已修」的证据——
 /// 这条补丁只对 ≤3.14 的代码页行为有意义，验证要到装了 3.12/3.13 的机器上做。
-const PYTHON_UTF8_ENV: [(&str, &str); 2] =
+pub const PYTHON_UTF8_ENV: [(&str, &str); 2] =
     [("PYTHONIOENCODING", "utf-8"), ("PYTHONUTF8", "1")];
 
 /// 一次探测得到的工具链布局。
