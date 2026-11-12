@@ -6,6 +6,17 @@
 //!  - 改安全描述符前先备份原始 DACL；备份失败就不许改（不"先改了再说"）；
 //!  - 卸载/退出按备份还原，避免残留 ACE 指向已删除的容器 SID。
 //!
+//! 第四类：**祖先链**（2026-11-12 补，见 docs/04 §1.5.1）。给每个授权根补
+//! 「盘根 → 父目录」每一级的 `Traverse`（`FILE_GENERIC_EXECUTE`：只路过 + 读属性，
+//! 不含列目录、不含读写内容）。原因：容器里的构建工具逐段 `metadata` 探测路径，
+//! 任何一级拒绝访问都会让整条链断掉。祖先条目**不带继承**，且 DACL 写不进去时降级
+//! （审计 `denied` + warn），不 fail-closed。
+//!
+//! **但运行期不调用它**（2026-11-12 实测后撤回）：写一条不继承 ACE 仍会让系统重算整棵
+//! 子树（`C:\Users\<user>` 62.4s、`AppData` 30.5s、`AppData\Local` 13.4s），单次 spawn
+//! 11.6s → 86.4s（最差 163.6s），且盘根两级非提权写不进、容器仍读不到祖先属性。
+//! 机制保留给安装期一次预置与用例，决策与数字见 docs/13。
+//!
 //! 幂等与范围（2026-11-08 补，见 docs/04 §1.5）：
 //!  - 目录已有容器 SID 的**显式** ACE（掩码覆盖授权掩码）→ 不改写、不写备份；
 //!  - scope 里被父目录严格包含的路径不再单独授权（继承 ACE 已覆盖）；
@@ -19,7 +30,7 @@ use std::ffi::c_void;
 use std::path::{Path, PathBuf};
 
 use windows::core::{PCWSTR, PWSTR};
-use windows::Win32::Foundation::{LocalFree, HLOCAL, ERROR_SUCCESS};
+use windows::Win32::Foundation::{LocalFree, ERROR_SUCCESS, HLOCAL};
 use windows::Win32::Security::Authorization::{
     ConvertSidToStringSidW, GetNamedSecurityInfoW, SetEntriesInAclW, SetNamedSecurityInfoW,
     EXPLICIT_ACCESS_W, GRANT_ACCESS, NO_MULTIPLE_TRUSTEE, REVOKE_ACCESS, SE_FILE_OBJECT,
@@ -27,10 +38,10 @@ use windows::Win32::Security::Authorization::{
 };
 use windows::Win32::Security::{
     AclSizeInformation, EqualSid, GetAce, GetAclInformation, GetSecurityDescriptorDacl,
-    GetSecurityDescriptorLength, ACCESS_ALLOWED_ACE, ACL, ACL_SIZE_INFORMATION,
-    DACL_SECURITY_INFORMATION, INHERITED_ACE, PROTECTED_DACL_SECURITY_INFORMATION, PSID,
-    PSECURITY_DESCRIPTOR,
-    SUB_CONTAINERS_AND_OBJECTS_INHERIT, UNPROTECTED_DACL_SECURITY_INFORMATION,
+    GetSecurityDescriptorLength, ACCESS_ALLOWED_ACE, ACE_FLAGS, ACL, ACL_SIZE_INFORMATION,
+    DACL_SECURITY_INFORMATION, INHERITED_ACE, PROTECTED_DACL_SECURITY_INFORMATION,
+    PSECURITY_DESCRIPTOR, PSID, SUB_CONTAINERS_AND_OBJECTS_INHERIT,
+    UNPROTECTED_DACL_SECURITY_INFORMATION,
 };
 use windows::Win32::Storage::FileSystem::{
     DELETE, FILE_DELETE_CHILD, FILE_GENERIC_EXECUTE, FILE_GENERIC_READ, FILE_GENERIC_WRITE,
@@ -44,7 +55,7 @@ const BACKUP_EXT: &str = "dacl";
 const AUDIT_FILE: &str = "acl-audit.jsonl";
 
 /// 授权档位（2026-11-08 用户定：目录级勾选只有这三种）。
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub enum Access {
     /// 列目录 + 读文件（不给写、不给删）。
     Read,
@@ -94,7 +105,12 @@ pub fn write_scope(workspace_root: &Path) -> Vec<PathBuf> {
     paths.push(std::env::temp_dir());
 
     // 工具链目录：只有显式环境变量或存在的默认目录才纳入，避免给无关目录开口子。
-    for key in ["CARGO_HOME", "RUSTUP_HOME", "PNPM_HOME", "NPM_CONFIG_PREFIX"] {
+    for key in [
+        "CARGO_HOME",
+        "RUSTUP_HOME",
+        "PNPM_HOME",
+        "NPM_CONFIG_PREFIX",
+    ] {
         if let Some(value) = std::env::var_os(key) {
             if !value.is_empty() {
                 paths.push(PathBuf::from(value));
@@ -126,12 +142,50 @@ fn drop_nested(mut paths: Vec<PathBuf>) -> Vec<PathBuf> {
     paths.sort_by_key(|path| path.components().count());
     let mut kept: Vec<PathBuf> = Vec::new();
     for path in paths {
-        if kept.iter().any(|parent| path != *parent && path.starts_with(parent)) {
+        if kept
+            .iter()
+            .any(|parent| path != *parent && path.starts_with(parent))
+        {
             continue;
         }
         kept.push(path);
     }
     kept
+}
+
+/// 「盘根 → 父目录」的完整祖先链，最外层在前，**不含自己**。
+///
+/// 只给这些层级补 `Traverse`：容器里的构建工具会逐段 `metadata` 探测路径，
+/// 任何一级返回「拒绝访问」都会让整条链断掉（`glob` 会静默当成路径不存在）。
+/// 这里不做存在性判断，调用方按需过滤——纯函数便于对 UNC / 盘根做单测。
+pub fn ancestor_chain(dir: &Path) -> Vec<PathBuf> {
+    ancestor_chain_until(dir, None)
+}
+
+/// 同 [`ancestor_chain`]，但止于 `stop_at` 的下一级（**不含** `stop_at` 自身）。
+///
+/// 只给用例用：验证时在 `%TEMP%` 下自造链条，不能让写入一路顶到盘根
+/// （`C:\Users\<user>` 这类目录上一次 DACL 写入要几十秒，且普通用户写不进）。
+/// 生产路径（安装期预置）走 `None`，即整条链。
+fn ancestor_chain_until(dir: &Path, stop_at: Option<&Path>) -> Vec<PathBuf> {
+    let mut chain: Vec<PathBuf> = Vec::new();
+    let mut current = normalize(dir);
+    while let Some(parent) = current.parent() {
+        let parent = normalize(parent);
+        // 盘根/共享根的 `parent()` 可能回到自身；用相等判断兜住，避免死循环。
+        if parent.as_os_str().is_empty() || parent == current {
+            break;
+        }
+        chain.push(parent.clone());
+        current = parent;
+    }
+    chain.reverse();
+    if let Some(stop) = stop_at {
+        if let Some(index) = chain.iter().position(|path| same_path(path, stop)) {
+            return chain.split_off(index + 1);
+        }
+    }
+    chain
 }
 
 impl Access {
@@ -184,11 +238,9 @@ pub fn collapse(entries: Vec<(PathBuf, Access, RootRole)>) -> Vec<(PathBuf, Acce
     merged.sort_by_key(|(path, _, _)| path.components().count());
     let mut kept: Vec<(PathBuf, Access, RootRole)> = Vec::new();
     for (path, access, role) in merged {
-        let covered = kept
-            .iter()
-            .any(|(parent, parent_access, _)| {
-                path != *parent && path.starts_with(parent) && parent_access.covers(access)
-            });
+        let covered = kept.iter().any(|(parent, parent_access, _)| {
+            path != *parent && path.starts_with(parent) && parent_access.covers(access)
+        });
         if !covered {
             kept.push((path, access, role));
         }
@@ -199,8 +251,12 @@ pub fn collapse(entries: Vec<(PathBuf, Access, RootRole)>) -> Vec<(PathBuf, Acce
 pub struct AclManager {
     backup_dir: PathBuf,
     audit_path: PathBuf,
-    /// 已授权项：`(规范化路径, SID 字符串)`，撤销按这个键精确匹配。
-    granted: HashSet<(PathBuf, String)>,
+    /// 已授权项：`(规范化路径, SID 字符串, 档位)`。
+    ///
+    /// **档位必须进键**：祖先链先记 `Traverse`，同一路径随后又作为授权根要 `Write` 时，
+    /// 只按 `(路径, SID)` 命中缓存会把 `Write` 静默跳过——DACL 上只剩一条只路过的 ACE，
+    /// 工作区反而写不进去。命中条件用 `Access::covers`，强档位可以顶替弱档位。
+    granted: HashSet<(PathBuf, String, Access)>,
     recovered_stale: usize,
 }
 
@@ -211,7 +267,12 @@ impl AclManager {
             .parent()
             .map(|parent| parent.join(AUDIT_FILE))
             .unwrap_or_else(|| backup_dir.join(AUDIT_FILE));
-        Self { backup_dir, audit_path, granted: HashSet::new(), recovered_stale: 0 }
+        Self {
+            backup_dir,
+            audit_path,
+            granted: HashSet::new(),
+            recovered_stale: 0,
+        }
     }
 
     /// 上次异常退出留下的备份：先还原，再允许新的授权。
@@ -222,15 +283,39 @@ impl AclManager {
         }
         let mut restored = 0usize;
         let mut failures: Vec<String> = Vec::new();
-        let entries = std::fs::read_dir(&self.backup_dir)
-            .map_err(|e| format!("读取 ACL 备份目录失败（{}）: {e}", self.backup_dir.display()))?;
+        let entries = std::fs::read_dir(&self.backup_dir).map_err(|e| {
+            format!(
+                "读取 ACL 备份目录失败（{}）: {e}",
+                self.backup_dir.display()
+            )
+        })?;
+        // 先全部读出并**按对象层级由浅到深**排序，再逐个还原。
+        //
+        // 顺序不是细节：`SetNamedSecurityInfoW` 写回未保护 DACL 时，系统会按父目录重新
+        // 计算继承。子目录先还原、父目录后还原的话，子目录写回那一刻父目录还带着我们的
+        // 祖先 ACE，继承重算会把那条 ACE 重新灌进来——还原结果比备份多一条授权。
+        let mut pending: Vec<(usize, PathBuf, Vec<u8>)> = Vec::new();
         for entry in entries {
             let entry = entry.map_err(|e| format!("读取 ACL 备份项失败: {e}"))?;
             let path = entry.path();
             if path.extension().and_then(|ext| ext.to_str()) != Some(BACKUP_EXT) {
                 continue;
             }
-            match restore_backup_file(&path) {
+            let blob = match std::fs::read(&path) {
+                Ok(blob) => blob,
+                Err(error) => {
+                    failures.push(format!("{}: 读取备份文件失败（{error}）", path.display()));
+                    continue;
+                }
+            };
+            match parse_backup(&blob) {
+                Ok((object, _)) => pending.push((object.components().count(), path, blob)),
+                Err(error) => failures.push(format!("{}: {error}", path.display())),
+            }
+        }
+        pending.sort_by_key(|(depth, _, _)| *depth);
+        for (_, path, blob) in pending {
+            match restore_backup_blob(&path, &blob) {
                 Ok(()) => restored += 1,
                 Err(error) => failures.push(format!("{}: {error}", path.display())),
             }
@@ -258,7 +343,14 @@ impl AclManager {
         if let Some(reason) = overbroad_root_reason(&normalized) {
             let sid_text = sid_to_string(sid)?;
             // 拒绝必须落进审计：只 warn 一行日志，用户与后来人都看不到它发生过。
-            self.audit("grant", &normalized, &sid_text, access.label(), "refused", Some(&reason));
+            self.audit(
+                "grant",
+                &normalized,
+                &sid_text,
+                access.label(),
+                "refused",
+                Some(&reason),
+            );
             return Err(reason);
         }
         self.grant(dir, sid, access)
@@ -266,14 +358,81 @@ impl AclManager {
 
     /// 给目录加容器 SID 的 ACE。备份失败 → 直接失败，**不改安全描述符**。
     pub fn grant(&mut self, dir: &Path, sid: PSID, access: Access) -> Result<(), String> {
+        self.grant_entry(dir, sid, access, SUB_CONTAINERS_AND_OBJECTS_INHERIT, false)
+            .map(|_| ())
+    }
+
+    /// 给授权根加 ACE，并给「盘根 → 父目录」每一级补 `Traverse`（只路过）。
+    ///
+    /// 祖先条目**不带继承**（`ACE_FLAGS(0)`）：可继承 ACE 会触发整树重传播，
+    /// `C:\Users` 这种大树上是分钟级操作；逐级各加一条只影响那一级。
+    ///
+    /// 祖先 DACL 不可写（`C:\`、`C:\Users`、盘根属 SYSTEM/Administrators，普通用户没有
+    /// `WRITE_DAC`）时**降级**：审计记 `denied` + 一行 warn，继续执行——少一条只路过权限
+    /// 只会更严，不会放宽；fail-closed 会让所有非提权用户的 workspace-write 全部不可用。
+    ///
+    /// **2026-11-12：不在 exec 路径上调用**。实测原因：写一条不继承 ACE 也会让系统重算
+    /// 整棵子树（`C:\Users\<user>` 62.4s、`AppData` 30.5s、`AppData\Local` 13.4s），
+    /// 单次 spawn 从 11.6s 涨到 86.4s（最差 163.6s）；而 `C:\`、`C:\Users` 非提权写不进，
+    /// 容器仍然读不到祖先属性。保留给**安装期一次预置**与用例，决策见 docs/13。
+    pub fn grant_chain(&mut self, dir: &Path, sid: PSID, access: Access) -> Result<(), String> {
+        self.grant(dir, sid, access)?;
+        self.grant_ancestors(dir, sid, None)
+    }
+
+    /// `grant_guarded` 的祖先链版本（用户指定的根：先挡过宽根，再授权 + 补祖先）。
+    pub fn grant_guarded_chain(
+        &mut self,
+        dir: &Path,
+        sid: PSID,
+        access: Access,
+    ) -> Result<(), String> {
+        self.grant_guarded(dir, sid, access)?;
+        self.grant_ancestors(dir, sid, None)
+    }
+
+    /// 逐级补 `Traverse`。`stop_at` 见 [`ancestor_chain_until`]，生产路径传 `None`。
+    fn grant_ancestors(
+        &mut self,
+        dir: &Path,
+        sid: PSID,
+        stop_at: Option<&Path>,
+    ) -> Result<(), String> {
+        for ancestor in ancestor_chain_until(dir, stop_at) {
+            // 祖先按磁盘真实层级构造；并发下被删掉的层级没有可授权的对象，跳过。
+            if !ancestor.is_dir() {
+                continue;
+            }
+            self.grant_entry(&ancestor, sid, Access::Traverse, ACE_FLAGS(0), true)?;
+        }
+        Ok(())
+    }
+
+    /// 授权实现：返回 `true` = 本次真的改了 DACL，`false` = 无需改动（已授权 / 祖先降级）。
+    fn grant_entry(
+        &mut self,
+        dir: &Path,
+        sid: PSID,
+        access: Access,
+        inheritance: ACE_FLAGS,
+        tolerate_denied: bool,
+    ) -> Result<bool, String> {
         let normalized = normalize(dir);
         if !normalized.is_dir() {
-            return Err(format!("不能给非目录路径加沙箱 ACE：{}", normalized.display()));
+            return Err(format!(
+                "不能给非目录路径加沙箱 ACE：{}",
+                normalized.display()
+            ));
         }
         let sid_text = sid_to_string(sid)?;
-        let key = (normalized.clone(), sid_text.clone());
-        if self.granted.contains(&key) {
-            return Ok(());
+        if self
+            .granted
+            .iter()
+            .any(|(path, granted_sid, granted_access)| {
+                *path == normalized && *granted_sid == sid_text && granted_access.covers(access)
+            })
+        {
+            return Ok(false);
         }
         let mask = access.mask();
 
@@ -285,8 +444,8 @@ impl AclManager {
                 dir = %normalized.display(),
                 "目录已有容器 SID 的显式 ACE，跳过改写（幂等，避免触发文件监听器重扫）"
             );
-            self.granted.insert(key);
-            return Ok(());
+            self.granted.insert((normalized, sid_text, access));
+            return Ok(false);
         }
 
         let snapshot = read_dacl_snapshot(&normalized)?;
@@ -297,7 +456,14 @@ impl AclManager {
             false
         } else {
             write_backup_file(&backup_path, &normalized, &snapshot).map_err(|error| {
-                self.audit("grant", &normalized, &sid_text, access.label(), "error", Some(&error));
+                self.audit(
+                    "grant",
+                    &normalized,
+                    &sid_text,
+                    access.label(),
+                    "error",
+                    Some(&error),
+                );
                 format!(
                     "备份原始 DACL 失败（{}）：{error}。按规则不改安全描述符，命令拒绝在沙箱外执行",
                     normalized.display()
@@ -306,13 +472,31 @@ impl AclManager {
             true
         };
 
-        if let Err(error) = apply_grant(
-            &normalized,
-            sid,
-            mask,
-            SUB_CONTAINERS_AND_OBJECTS_INHERIT,
-        ) {
-            // 已经改了一半：立刻按备份还原，再报错。
+        if let Err(error) = apply_grant(&normalized, sid, mask, inheritance) {
+            if should_degrade(tolerate_denied, &error) {
+                // 祖先链专用：权限不足只会「少给」，不会放宽，因此降级而不是 fail-closed。
+                //
+                // 拒绝访问只可能发生在「读 DACL」或「写 DACL」被拒——`SetNamedSecurityInfoW`
+                // 是原子的，被拒就不可能留下半改的 DACL，所以这里**不**回滚（回滚本身也会被
+                // 同样拒掉）。备份一并清掉，避免下次启动重放一份相同快照。
+                let backup_note = backup_rollback_note(wrote_backup, &backup_path);
+                // 降级也必须可观测：审计 + 一行 warn，绝不静默跳过。
+                self.audit(
+                    "grant",
+                    &normalized,
+                    &sid_text,
+                    access.label(),
+                    "denied",
+                    Some(&format!("{}{backup_note}", error.message)),
+                );
+                tracing::warn!(
+                    dir = %normalized.display(),
+                    "祖先目录 DACL 不可写，降级跳过：容器内对该级的路径探测可能返回拒绝访问"
+                );
+                self.granted.insert((normalized, sid_text, access));
+                return Ok(false);
+            }
+            // 已经改了一半的风险：立刻按备份还原，再报错。
             let restore = restore_from_snapshot(&normalized, &snapshot);
             // 备份删不掉 = 下次启动 `recover_pending` 会重放这份「授权前快照」，
             // 把此后对同一目录的合法授权一并抹掉。不能 `let _`：并进错误文案，
@@ -341,8 +525,8 @@ impl AclManager {
         }
 
         self.audit("grant", &normalized, &sid_text, access.label(), "ok", None);
-        self.granted.insert(key);
-        Ok(())
+        self.granted.insert((normalized, sid_text, access));
+        Ok(true)
     }
 
     /// 撤销某个 `(路径, SID)` 的显式 ACE。**只删这一条**，其它 trustee 的 ACE 一个不动。
@@ -359,8 +543,10 @@ impl AclManager {
         // 先记账、再清备份。`granted` 必须反映磁盘现状（ACE 此刻确实已经撤销）：
         // 留着旧条目会让后续同键 `grant` 命中 `contains` 直接返回 Ok，留下一条
         // 「已授权」却没有 ACE 的假记录——那比备份残留更难发现。
-        self.granted.remove(&(normalized.clone(), sid_text.clone()));
-        let other_grants = self.granted.iter().any(|(path, _)| *path == normalized);
+        // 同一路径可能同时记着 `Traverse`（祖先链）与 `Write`（授权根）两条，按路径+SID 全清。
+        self.granted
+            .retain(|(path, granted_sid, _)| !(*path == normalized && *granted_sid == sid_text));
+        let other_grants = self.granted.iter().any(|(path, _, _)| *path == normalized);
         if !other_grants {
             // 该路径上已无其它授权 → 备份文件也删掉，否则下次启动 `recover_pending`
             // 会把它原样重放，把刚撤销的 ACE 又写回去。
@@ -370,7 +556,14 @@ impl AclManager {
             // 用户重试时 `revoke_ace` 返回 false，遗留备份仍必须清掉。
             let backup = self.backup_path(&normalized);
             if let Err(message) = remove_backup(&backup) {
-                self.audit("revoke", &normalized, &sid_text, "-", "error", Some(&message));
+                self.audit(
+                    "revoke",
+                    &normalized,
+                    &sid_text,
+                    "-",
+                    "error",
+                    Some(&message),
+                );
                 return Err(format!(
                     "撤销「{}」的沙箱 ACE 已生效，但{message}；\
                      不删掉备份的话，下次启动会把它还原回来，请关闭占用该文件的程序后重试",
@@ -395,8 +588,10 @@ impl AclManager {
     }
 
     fn backup_path(&self, dir: &Path) -> PathBuf {
-        self.backup_dir
-            .join(format!("{:016x}.{BACKUP_EXT}", hash_path(&dir.to_string_lossy())))
+        self.backup_dir.join(format!(
+            "{:016x}.{BACKUP_EXT}",
+            hash_path(&dir.to_string_lossy())
+        ))
     }
 
     /// 每次授权/撤销写一条审计（JSONL，追加）。写失败只记日志，不阻断安全操作。
@@ -447,8 +642,7 @@ fn sid_to_string(sid: PSID) -> Result<String, String> {
     let mut text = PWSTR::null();
     unsafe { ConvertSidToStringSidW(sid, &mut text) }
         .map_err(|error| format!("SID 转字符串失败: {error}"))?;
-    let value = unsafe { text.to_string() }
-        .map_err(|error| format!("SID 字符串解码失败: {error}"));
+    let value = unsafe { text.to_string() }.map_err(|error| format!("SID 字符串解码失败: {error}"));
     unsafe {
         let _ = LocalFree(Some(HLOCAL(text.0.cast::<c_void>())));
     }
@@ -684,6 +878,15 @@ impl std::fmt::Display for GrantFailure {
     }
 }
 
+/// 祖先链授权失败是否**降级**（继续跑），而不是 fail-closed。
+///
+/// 两个条件同时成立才降级：调用方明确允许降级（只有祖先链这么调），且失败原因是
+/// 「拒绝访问」。其它失败（DACL 结构异常、备份写不进、路径不是目录……）仍然
+/// fail-closed——那些可能留下半改状态，不能当成「少给一条权限」处理。
+fn should_degrade(tolerate_denied: bool, failure: &GrantFailure) -> bool {
+    tolerate_denied && failure.access_denied
+}
+
 /// 授权被拒时补一句「用户能照做什么」。只影响报错文案，不改授权流程：
 /// 失败仍然 fail-closed，也不会为了让命令跑起来而绕过沙箱。
 fn grant_hint(access_denied: bool) -> &'static str {
@@ -723,7 +926,10 @@ pub(crate) fn apply_grant(
         )
     };
     if status != ERROR_SUCCESS {
-        return Err(denied(format!("读取 DACL 失败（Win32 错误 {}）", status.0), status));
+        return Err(denied(
+            format!("读取 DACL 失败（Win32 错误 {}）", status.0),
+            status,
+        ));
     }
 
     let entry = EXPLICIT_ACCESS_W {
@@ -741,14 +947,21 @@ pub(crate) fn apply_grant(
 
     let mut new_acl: *mut ACL = std::ptr::null_mut();
     let status = unsafe {
-        let old = if old_dacl.is_null() { None } else { Some(old_dacl as *const ACL) };
+        let old = if old_dacl.is_null() {
+            None
+        } else {
+            Some(old_dacl as *const ACL)
+        };
         SetEntriesInAclW(Some(std::slice::from_ref(&entry)), old, &mut new_acl)
     };
     if status != ERROR_SUCCESS {
         unsafe {
             let _ = LocalFree(Some(HLOCAL(descriptor.0)));
         }
-        return Err(denied(format!("构造新 DACL 失败（Win32 错误 {}）", status.0), status));
+        return Err(denied(
+            format!("构造新 DACL 失败（Win32 错误 {}）", status.0),
+            status,
+        ));
     }
 
     let status = unsafe {
@@ -768,7 +981,11 @@ pub(crate) fn apply_grant(
     }
     if status != ERROR_SUCCESS {
         return Err(denied(
-            format!("写入「{}」的新 DACL 失败（Win32 错误 {}）", path.display(), status.0),
+            format!(
+                "写入「{}」的新 DACL 失败（Win32 错误 {}）",
+                path.display(),
+                status.0
+            ),
             status,
         ));
     }
@@ -821,7 +1038,11 @@ pub(crate) fn revoke_ace(path: &Path, sid: PSID) -> Result<bool, String> {
 
     let mut new_acl: *mut ACL = std::ptr::null_mut();
     let status = unsafe {
-        let old = if old_dacl.is_null() { None } else { Some(old_dacl as *const ACL) };
+        let old = if old_dacl.is_null() {
+            None
+        } else {
+            Some(old_dacl as *const ACL)
+        };
         SetEntriesInAclW(Some(std::slice::from_ref(&entry)), old, &mut new_acl)
     };
     if status != ERROR_SUCCESS {
@@ -859,7 +1080,9 @@ pub(crate) fn revoke_ace(path: &Path, sid: PSID) -> Result<bool, String> {
     }
 
     // DACL 真的变了才算删掉了东西（SID 本来就没有 ACE 时 SetEntriesInAcl 幂等）。
-    Ok(read_dacl_snapshot(path).map(|after| after != before).unwrap_or(true))
+    Ok(read_dacl_snapshot(path)
+        .map(|after| after != before)
+        .unwrap_or(true))
 }
 
 pub(crate) fn write_backup_file(path: &Path, object: &Path, snapshot: &[u8]) -> Result<(), String> {
@@ -888,7 +1111,10 @@ fn remove_backup(backup: &Path) -> Result<(), String> {
     match std::fs::remove_file(backup) {
         Ok(()) => Ok(()),
         Err(_) if !backup.exists() => Ok(()),
-        Err(error) => Err(format!("删除 DACL 备份失败（{}）：{error}", backup.display())),
+        Err(error) => Err(format!(
+            "删除 DACL 备份失败（{}）：{error}",
+            backup.display()
+        )),
     }
 }
 
@@ -901,24 +1127,24 @@ fn backup_rollback_note(wrote_backup: bool, backup: &Path) -> String {
     }
     match remove_backup(backup) {
         Ok(()) => String::new(),
-        Err(note) => format!(
-            "；且{note}。下次启动会按它还原，可能覆盖此后对同一目录的合法授权，请手工删除"
-        ),
+        Err(note) => {
+            format!("；且{note}。下次启动会按它还原，可能覆盖此后对同一目录的合法授权，请手工删除")
+        }
     }
 }
 
-fn restore_backup_file(path: &Path) -> Result<(), String> {
-    let blob = std::fs::read(path)
-        .map_err(|e| format!("读取备份文件失败（{}）: {e}", path.display()))?;
-    let (object, snapshot) = parse_backup(&blob)?;
+fn restore_backup_blob(path: &Path, blob: &[u8]) -> Result<(), String> {
+    let (object, snapshot) = parse_backup(blob)?;
     if !object.exists() {
         std::fs::remove_file(path).ok();
         return Ok(());
     }
     restore_from_snapshot(&object, snapshot)?;
-    std::fs::remove_file(path)
-        .map_err(|e| format!("还原成功但删除备份文件失败（{}）: {e}", path.display()))?;
-    Ok(())
+    // 删备份与 `remove_backup` 同口径：文件已经被删掉 = 目标达成。
+    // 祖先链让**多个进程/多个工作区**共用同一批备份（`C:\Users\<user>` 等对谁都是祖先），
+    // 并发启动时另一个进程可能已经重放过并删除了同一个文件；此时报错会把
+    // 「已经干净」误判成「未还原」，整个沙箱 fail-closed 起不来。
+    remove_backup(path)
 }
 
 pub(crate) fn parse_backup(blob: &[u8]) -> Result<(PathBuf, &[u8]), String> {
@@ -970,7 +1196,11 @@ pub(crate) fn restore_from_snapshot(path: &Path, snapshot: &[u8]) -> Result<(), 
             DACL_SECURITY_INFORMATION | protection,
             None,
             None,
-            if present.as_bool() { Some(dacl as *const ACL) } else { None },
+            if present.as_bool() {
+                Some(dacl as *const ACL)
+            } else {
+                None
+            },
             None,
         )
     };
@@ -1054,6 +1284,234 @@ mod tests {
         assert_eq!(kept, vec![root, PathBuf::from(r"D:\other")]);
     }
 
+    /// 祖先链是纯函数：盘根 → 父目录，最外层在前、不含自己；盘根/共享根没有上级。
+    #[test]
+    fn ancestor_chain_runs_from_the_root_down_to_the_parent() {
+        assert_eq!(
+            ancestor_chain(Path::new(r"C:\Users\jun\AppData\Local\Temp")),
+            vec![
+                PathBuf::from(r"C:\"),
+                PathBuf::from(r"C:\Users"),
+                PathBuf::from(r"C:\Users\jun"),
+                PathBuf::from(r"C:\Users\jun\AppData"),
+                PathBuf::from(r"C:\Users\jun\AppData\Local"),
+            ]
+        );
+        assert!(ancestor_chain(Path::new(r"D:\")).is_empty(), "盘根没有祖先");
+        assert!(
+            ancestor_chain(Path::new(r"\\server\share")).is_empty(),
+            "共享根没有祖先"
+        );
+        // 用例的上界口径：截到上界的下一级，上界自身与其以上一概不返回。
+        assert_eq!(
+            ancestor_chain_until(
+                Path::new(r"C:\Users\jun\AppData\Local\Temp\l1\l2"),
+                Some(Path::new(r"C:\Users\jun\AppData\Local\Temp"))
+            ),
+            vec![PathBuf::from(r"C:\Users\jun\AppData\Local\Temp\l1")]
+        );
+    }
+
+    /// 降级只对「祖先链 + 拒绝访问」成立；其它组合必须 fail-closed。
+    #[test]
+    fn degrade_only_for_ancestor_chain_and_access_denied() {
+        let denied = GrantFailure {
+            access_denied: true,
+            message: "拒绝访问".into(),
+        };
+        let other = GrantFailure {
+            access_denied: false,
+            message: "不是权限问题".into(),
+        };
+        assert!(should_degrade(true, &denied), "祖先链遇到拒绝访问应降级");
+        assert!(
+            !should_degrade(false, &denied),
+            "非祖先链调用（授权根本身）必须 fail-closed，不得因错少给而放行"
+        );
+        assert!(
+            !should_degrade(true, &other),
+            "非权限错误不得降级：可能留下半改状态"
+        );
+        assert!(!should_degrade(false, &other));
+    }
+
+    /// 断言失败也把 DACL 还原回去：本用例会真实改写目录 DACL，
+    /// panic 时把 ACE 留在临时目录里比测试红更糟。
+    struct RestoreGuard<'a> {
+        manager: &'a mut AclManager,
+        done: bool,
+    }
+
+    impl<'a> RestoreGuard<'a> {
+        fn new(manager: &'a mut AclManager) -> Self {
+            Self {
+                manager,
+                done: false,
+            }
+        }
+
+        /// 正常收尾：由用例断言还原条数，`Drop` 不再重复还原。
+        fn finish(mut self) -> Result<usize, String> {
+            self.done = true;
+            self.manager.restore_all()
+        }
+    }
+
+    impl Drop for RestoreGuard<'_> {
+        fn drop(&mut self) {
+            if !self.done {
+                let _ = self.manager.restore_all();
+            }
+        }
+    }
+
+    /// 祖先链必须真的落到可写层级上：每一级一条 `Traverse`（不含列目录/读内容），
+    /// 退出后按备份逐级还原。
+    ///
+    /// 只在 `%TEMP%` 下**自造链条**（上界钉在临时根），不向盘根写：给 `C:\Users\<user>`
+    /// 这类目录写 DACL 会触发整棵子树的继承重传播（本机实测 62s），而 `C:\`、`C:\Users`
+    /// 在非提权下根本写不进，既危险又验证不了「真的被加上」。
+    ///
+    /// 降级分支（写不进 → 审计 `denied` + 单条 warn）在本机无法于可写层级内自造
+    /// 「`WRITE_DAC` 被拒」的目录——给自己加 Deny 会连恢复也一起锁死，不能留在用例里。
+    /// 该分支由 `should_degrade` 的判定单测覆盖，端到端证据是真机审计记录（见 docs/13）。
+    #[test]
+    fn grant_chain_covers_ancestors_and_restores_them() {
+        let ws = temp_dir("chain");
+        let leaf = ws.join("l1").join("l2").join("l3");
+        std::fs::create_dir_all(&leaf).unwrap();
+        let l1 = ws.join("l1");
+        let l2 = l1.join("l2");
+        let before_l1 = read_dacl_snapshot(&l1).unwrap();
+        let before_l2 = read_dacl_snapshot(&l2).unwrap();
+
+        let sid = super::super::appcontainer::internet_client_capability().unwrap();
+        let mut manager = AclManager::new(ws.join("backups"));
+        // 与 `grant_chain` 同序（先授权根、再逐级补祖先），只是把上界钉在 `ws`：
+        // `%TEMP%` 及以上的层级一条都不写。
+        manager.grant(&leaf, sid.as_psid(), Access::Write).unwrap();
+        manager
+            .grant_ancestors(&leaf, sid.as_psid(), Some(&ws))
+            .unwrap();
+        let guard = RestoreGuard::new(&mut manager);
+
+        // 能写 DACL 的祖先必须真的拿到「只路过」ACE，且没有被升级成可列举/可读。
+        for path in [&l1, &l2] {
+            assert!(
+                has_explicit_grant(path, sid.as_psid(), Access::Traverse.mask()).unwrap(),
+                "祖先 {} 应有容器 SID 的 Traverse ACE",
+                path.display()
+            );
+            assert!(
+                !has_explicit_grant(path, sid.as_psid(), Access::Read.mask()).unwrap(),
+                "祖先只能只路过，不得升级成可列举/可读：{}",
+                path.display()
+            );
+        }
+        assert!(has_explicit_grant(&leaf, sid.as_psid(), Access::Write.mask()).unwrap());
+
+        // 每一级祖先都要有交代：要么落一条 `ok`/`denied` 审计，要么本来就已有该 ACE
+        // （幂等跳过不改 DACL，靠 DACL 状态本身可查）。不许的是「没授权、也没记录」。
+        let audit = std::fs::read_to_string(ws.join("acl-audit.jsonl")).unwrap();
+        let records: Vec<serde_json::Value> = audit
+            .lines()
+            .map(|line| serde_json::from_str(line).unwrap())
+            .collect();
+        for ancestor in ancestor_chain_until(&leaf, Some(&ws)) {
+            let needle = ancestor.display().to_string();
+            let matched: Vec<&serde_json::Value> = records
+                .iter()
+                .filter(|record| {
+                    record["action"] == "grant"
+                        && record["access"] == "traverse"
+                        && record["path"] == needle.as_str()
+                })
+                .collect();
+            if matched.is_empty() {
+                assert!(
+                    has_explicit_grant(&ancestor, sid.as_psid(), Access::Traverse.mask())
+                        .unwrap_or(false),
+                    "祖先既没有授权审计、磁盘上也没有 ACE（静默跳过）：{needle}（审计：{audit}）"
+                );
+                continue;
+            }
+            assert_eq!(
+                matched.len(),
+                1,
+                "每一级祖先应恰好一条审计：{needle}（审计：{audit}）"
+            );
+            let result = matched[0]["result"].as_str().unwrap();
+            assert!(
+                result == "ok" || result == "denied",
+                "祖先授权结果只能是 ok/denied（{needle} → {result}）"
+            );
+        }
+        for record in &records {
+            if record["result"] == "denied" {
+                eprintln!(
+                    "[chain] denied: {} ({})",
+                    record["path"].as_str().unwrap(),
+                    record["access"].as_str().unwrap()
+                );
+            }
+        }
+        let backups = std::fs::read_dir(ws.join("backups")).unwrap().count();
+        eprintln!(
+            "[chain] 审计 {} 条（ok {}），备份文件 {} 个",
+            records.len(),
+            records
+                .iter()
+                .filter(|record| record["result"] == "ok")
+                .count(),
+            backups
+        );
+        for record in &records {
+            eprintln!(
+                "[chain] {} {} {}",
+                record["access"].as_str().unwrap(),
+                record["result"].as_str().unwrap(),
+                record["path"].as_str().unwrap()
+            );
+        }
+
+        let restored = guard.finish().unwrap();
+        eprintln!("[chain] 还原 {restored} 条备份");
+        assert!(
+            restored >= 2,
+            "叶目录与可写祖先都应留有备份，实际还原 {restored} 条"
+        );
+        compare_restored(&before_l1, &read_dacl_snapshot(&l1).unwrap()).unwrap();
+        compare_restored(&before_l2, &read_dacl_snapshot(&l2).unwrap()).unwrap();
+        for path in [&l1, &l2] {
+            assert!(
+                !has_explicit_grant(path, sid.as_psid(), Access::Traverse.mask()).unwrap(),
+                "还原后祖先不应残留容器 SID 的 ACE：{}",
+                path.display()
+            );
+        }
+    }
+
+    /// 缓存键必须带档位：同一路径先记 `Traverse`，随后要 `Write` 时不能被缓存吞掉，
+    /// 否则 DACL 上只留一条只路过 ACE，工作区写不进去。
+    #[test]
+    fn weak_cached_grant_does_not_swallow_a_stronger_grant() {
+        let ws = temp_dir("cache-upgrade");
+        let sid = super::super::appcontainer::internet_client_capability().unwrap();
+
+        let mut manager = AclManager::new(ws.join("backups"));
+        manager.grant(&ws, sid.as_psid(), Access::Traverse).unwrap();
+        assert!(
+            has_explicit_grant(&ws, sid.as_psid(), Access::Traverse.mask()).unwrap(),
+            "前置条件：目录应已有 Traverse ACE"
+        );
+        manager.grant(&ws, sid.as_psid(), Access::Write).unwrap();
+        assert!(
+            has_explicit_grant(&ws, sid.as_psid(), Access::Write.mask()).unwrap(),
+            "同一路径从 Traverse 升级到 Write 时不得被缓存吞掉"
+        );
+        let _ = manager.restore_all();
+    }
+
     /// 收敛规则：父 `Write` 覆盖子 `Read`/`Write`；父 `Read` 不覆盖子 `Write`。
     #[test]
     fn collapse_keeps_only_needed_grants() {
@@ -1127,7 +1585,11 @@ mod tests {
             "已有显式 ACE 时不得改写 DACL"
         );
         assert!(!second_backups.exists(), "幂等跳过时不应写备份");
-        assert_eq!(second.restore_all().unwrap(), 0, "跳过改写时没有可还原的备份");
+        assert_eq!(
+            second.restore_all().unwrap(),
+            0,
+            "跳过改写时没有可还原的备份"
+        );
 
         assert_eq!(first.restore_all().unwrap(), 1);
         assert!(
@@ -1157,7 +1619,10 @@ mod tests {
             )
         }
         .unwrap();
-        Some(unsafe { std::slice::from_raw_parts(dacl as *const u8, info.AclBytesInUse as usize) }.to_vec())
+        Some(
+            unsafe { std::slice::from_raw_parts(dacl as *const u8, info.AclBytesInUse as usize) }
+                .to_vec(),
+        )
     }
 
     fn header_word(snapshot: &[u8], offset: usize) -> u32 {
@@ -1199,7 +1664,9 @@ mod tests {
         for (name, offset) in [("owner", 4usize), ("group", 8usize)] {
             let (old, new) = (header_word(before, offset), header_word(after, offset));
             if old != new && old != 0 && new != 0 {
-                return Err(format!("{name} 偏移差异超出白名单：before={old} after={new}"));
+                return Err(format!(
+                    "{name} 偏移差异超出白名单：before={old} after={new}"
+                ));
             }
         }
         if header_word(before, 12) != header_word(after, 12) {
@@ -1227,7 +1694,9 @@ mod tests {
         let backups = ws.join("backups");
         let mut manager = AclManager::new(backups);
         let sid = super::super::appcontainer::internet_client_capability().unwrap();
-        manager.grant(&target, sid.as_psid(), Access::Write).unwrap();
+        manager
+            .grant(&target, sid.as_psid(), Access::Write)
+            .unwrap();
 
         let after = read_dacl_snapshot(&target).unwrap();
         assert_ne!(before, after, "加 ACE 后 DACL 应发生变化");
@@ -1237,7 +1706,10 @@ mod tests {
         let final_snapshot = read_dacl_snapshot(&target).unwrap();
         compare_restored(&before, &final_snapshot).unwrap();
         // 负向：还原后 DACL 仍在，且容器 SID 的 ACE 确实没了。
-        assert!(dacl_bytes(&final_snapshot).is_some(), "还原后 DACL 不应消失");
+        assert!(
+            dacl_bytes(&final_snapshot).is_some(),
+            "还原后 DACL 不应消失"
+        );
         assert!(
             !has_explicit_grant(&target, sid.as_psid(), Access::Write.mask()).unwrap(),
             "还原后不应残留容器 SID 的 ACE"
@@ -1268,7 +1740,9 @@ mod tests {
 
         let sid = super::super::appcontainer::internet_client_capability().unwrap();
         let mut manager = AclManager::new(ws.join("backups"));
-        manager.grant(&target, sid.as_psid(), Access::Write).unwrap();
+        manager
+            .grant(&target, sid.as_psid(), Access::Write)
+            .unwrap();
         assert_eq!(manager.restore_all().unwrap(), 1);
 
         let final_snapshot = read_dacl_snapshot(&target).unwrap();
@@ -1299,22 +1773,34 @@ mod tests {
         // 拒绝：其它控制位变化。
         let mut other_bit = base.clone();
         other_bit[2..4].copy_from_slice(&(control | 0x1000).to_le_bytes());
-        assert!(compare_restored(&base, &other_bit).is_err(), "其它控制位变化必须失败");
+        assert!(
+            compare_restored(&base, &other_bit).is_err(),
+            "其它控制位变化必须失败"
+        );
 
         // 拒绝：owner 偏移两侧都非零且不相等。
         let mut left = base.clone();
         let mut right = base.clone();
         left[4..8].copy_from_slice(&8u32.to_le_bytes());
         right[4..8].copy_from_slice(&12u32.to_le_bytes());
-        assert!(compare_restored(&left, &right).is_err(), "owner 偏移非零且不同必须失败");
+        assert!(
+            compare_restored(&left, &right).is_err(),
+            "owner 偏移非零且不同必须失败"
+        );
 
         // 拒绝：DACL 本体哪怕差一个字节。
         let mut dacl_flipped = base.clone();
         let dacl_len = dacl_bytes(&base).unwrap().len();
         let last = dacl_offset + dacl_len - 1;
-        assert!(last < dacl_flipped.len(), "DACL 越过描述符边界，前置条件不成立");
+        assert!(
+            last < dacl_flipped.len(),
+            "DACL 越过描述符边界，前置条件不成立"
+        );
         dacl_flipped[last] ^= 0xFF;
-        assert!(compare_restored(&base, &dacl_flipped).is_err(), "DACL 本体差异必须失败");
+        assert!(
+            compare_restored(&base, &dacl_flipped).is_err(),
+            "DACL 本体差异必须失败"
+        );
     }
 
     /// 撤销必须按 `(路径, SID)` 精确删：另一个 SID 的 ACE 一个都不许动。
@@ -1327,8 +1813,12 @@ mod tests {
         let sid_b = super::super::appcontainer::capability_sid("S-1-15-3-2").unwrap();
 
         let mut manager = AclManager::new(ws.join("backups"));
-        manager.grant(&target, sid_a.as_psid(), Access::Write).unwrap();
-        manager.grant(&target, sid_b.as_psid(), Access::Write).unwrap();
+        manager
+            .grant(&target, sid_a.as_psid(), Access::Write)
+            .unwrap();
+        manager
+            .grant(&target, sid_b.as_psid(), Access::Write)
+            .unwrap();
 
         assert!(manager.revoke(&target, sid_a.as_psid()).unwrap());
         assert!(
@@ -1345,10 +1835,20 @@ mod tests {
         );
 
         let audit = std::fs::read_to_string(ws.join("acl-audit.jsonl")).unwrap();
-        assert!(audit.contains("\"action\":\"grant\""), "审计缺少授权记录: {audit}");
-        assert!(audit.contains("\"action\":\"revoke\""), "审计缺少撤销记录: {audit}");
+        assert!(
+            audit.contains("\"action\":\"grant\""),
+            "审计缺少授权记录: {audit}"
+        );
+        assert!(
+            audit.contains("\"action\":\"revoke\""),
+            "审计缺少撤销记录: {audit}"
+        );
 
-        assert_eq!(manager.restore_all().unwrap(), 1, "还剩一份原始 DACL 备份应被还原");
+        assert_eq!(
+            manager.restore_all().unwrap(),
+            1,
+            "还剩一份原始 DACL 备份应被还原"
+        );
         assert!(
             !has_explicit_grant(&target, sid_b.as_psid(), Access::Write.mask()).unwrap(),
             "还原后另一个 SID 的 ACE 也应消失"
@@ -1366,13 +1866,18 @@ mod tests {
         std::fs::create_dir_all(&target).unwrap();
         let sid = super::super::appcontainer::internet_client_capability().unwrap();
         let mut manager = AclManager::new(ws.join("backups"));
-        manager.grant(&target, sid.as_psid(), Access::Write).unwrap();
+        manager
+            .grant(&target, sid.as_psid(), Access::Write)
+            .unwrap();
         let backup = manager.backup_path(&normalize(&target));
         assert!(backup.exists(), "授权后应留下原始 DACL 备份");
 
         // 独占打开（不共享删除）：`remove_file` 必然失败，不需要给产品代码加注入点。
-        let lock =
-            std::fs::OpenOptions::new().read(true).share_mode(0).open(&backup).unwrap();
+        let lock = std::fs::OpenOptions::new()
+            .read(true)
+            .share_mode(0)
+            .open(&backup)
+            .unwrap();
         let error = manager
             .revoke(&target, sid.as_psid())
             .expect_err("备份删不掉时撤销必须报错");
@@ -1386,18 +1891,25 @@ mod tests {
             "ACE 确实已经撤销，报错不能掩盖这个事实"
         );
         let audit = std::fs::read_to_string(ws.join("acl-audit.jsonl")).unwrap();
-        let revoke_lines: Vec<&str> =
-            audit.lines().filter(|line| line.contains("\"action\":\"revoke\"")).collect();
+        let revoke_lines: Vec<&str> = audit
+            .lines()
+            .filter(|line| line.contains("\"action\":\"revoke\""))
+            .collect();
         assert!(!revoke_lines.is_empty(), "撤销必须落审计：{audit}");
         assert!(
-            revoke_lines.iter().all(|line| !line.contains("\"result\":\"ok\"")),
+            revoke_lines
+                .iter()
+                .all(|line| !line.contains("\"result\":\"ok\"")),
             "没删掉备份不能记 ok：{audit}"
         );
 
         drop(lock);
         // 重试：ACE 已不在（`revoke_ace` 返回 false），但遗留备份仍必须被清掉。
         assert!(!manager.revoke(&target, sid.as_psid()).unwrap());
-        assert!(!backup.exists(), "重试必须清掉遗留备份，否则下次启动会把它还原");
+        assert!(
+            !backup.exists(),
+            "重试必须清掉遗留备份，否则下次启动会把它还原"
+        );
         assert_eq!(manager.restore_all().unwrap(), 0, "没有备份可还原");
     }
 
@@ -1412,8 +1924,11 @@ mod tests {
         std::fs::write(&backup, b"stale").unwrap();
         // 独占打开（不共享删除），`remove_file` 必然失败。
         // 只读属性不行：Rust 的 `remove_file` 在 Windows 上会先清掉该属性再删。
-        let lock =
-            std::fs::OpenOptions::new().read(true).share_mode(0).open(&backup).unwrap();
+        let lock = std::fs::OpenOptions::new()
+            .read(true)
+            .share_mode(0)
+            .open(&backup)
+            .unwrap();
 
         let note = backup_rollback_note(true, &backup);
         assert!(note.contains("删除 DACL 备份失败"), "{note}");
@@ -1439,7 +1954,8 @@ mod tests {
         // 尾斜杠
         let trailing = PathBuf::from(format!("{}\\", home.display()));
         assert!(
-            overbroad_root_reason_with(&normalize(&trailing), Some(&home_normalized), &[]).is_some(),
+            overbroad_root_reason_with(&normalize(&trailing), Some(&home_normalized), &[])
+                .is_some(),
             "尾斜杠不能绕过"
         );
         // `..` 绕行
@@ -1451,7 +1967,8 @@ mod tests {
         // `\\?\` 前缀
         let verbatim = PathBuf::from(format!("\\\\?\\{}", home.display()));
         assert!(
-            overbroad_root_reason_with(&normalize(&verbatim), Some(&home_normalized), &[]).is_some(),
+            overbroad_root_reason_with(&normalize(&verbatim), Some(&home_normalized), &[])
+                .is_some(),
             "\\\\?\\ 前缀不能绕过"
         );
         // 盘符根 / UNC 共享根
@@ -1460,7 +1977,8 @@ mod tests {
         // 系统目录
         let system = vec![PathBuf::from(r"C:\Windows")];
         assert!(
-            overbroad_root_reason_with(&normalize(Path::new(r"C:\Windows")), None, &system).is_some()
+            overbroad_root_reason_with(&normalize(Path::new(r"C:\Windows")), None, &system)
+                .is_some()
         );
         // 主目录下的子目录必须放行——否则把所有人都挡在外面。
         assert!(
@@ -1469,6 +1987,8 @@ mod tests {
         );
     }
 
+    // （临时性能分解用例已移除：结论见 docs/13。）
+    // （临时性能分解用例已移除：结论见 docs/13。）
     #[test]
     fn grant_guarded_refuses_home_and_leaves_audit() {
         let ws = temp_dir("refuse");

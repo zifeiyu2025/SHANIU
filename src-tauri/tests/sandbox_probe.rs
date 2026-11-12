@@ -110,6 +110,97 @@ async fn sandbox_denies_write_outside_workspace() {
     std::fs::remove_dir_all(&outside).ok();
 }
 
+/// 祖先链（docs/04 §1.5.1）：容器能**穿过**祖先目录并读它的属性，但不能**列举**它。
+///
+/// 四组断言（用户的验证口径）：
+/// 1) `metadata(祖先)` 成功——构建工具逐段探测路径依赖这一条；
+/// 2) `read_dir(祖先)` 失败——`Traverse` 掩码不含 `FILE_LIST_DIRECTORY`；
+/// 3) 读祖先下**未授权**文件失败——路过不等于可读；
+/// 4) `read_dir(工作区)` 成功——正向对照，否则前三条可能只是「沙箱根本没跑起来」。
+///
+/// 靶点用 `%USERPROFILE%`（本机 `C:\Users\jun`）：它是工作区（`%TEMP%` 下）的祖先。
+/// 盘根 `C:\`/`C:\Users` 在非提权下写不进 DACL，运行期只能降级（见 `acl::grant_chain`）。
+///
+/// 用 `if exist` 而不是 `dir` 探测存在性：AppContainer 下 `cmd /C dir` 实测静默无输出
+/// （`sandbox_streams_every_output_line` 里有记录），会把「能读属性」误判成失败。
+///
+/// **当前必红，因此标 `#[ignore]`**：运行期已不做祖先写入（代价见 docs/13），
+/// 真机实测即便把 `Traverse` 写进 `%USERPROFILE%`，容器仍读不到它的属性——
+/// `C:\`、`C:\Users` 两级在非提权下写不进（审计 `result:"denied"`，err 5），
+/// 路径解析在盘根就断了。本用例是**安装期预置盘根 Traverse（docs/13 方案 A）的验收探针**，
+/// 预置完成后再打开。
+#[tokio::test]
+#[ignore = "需要安装期预置盘根 Traverse（docs/13 方案 A）；非提权环境必红"]
+async fn ancestor_chain_allows_metadata_but_not_listing_or_reads() {
+    let ws = unique_dir("traverse");
+    std::fs::write(ws.join("inside.txt"), "inside").unwrap();
+    let home = std::env::var("USERPROFILE").expect("需要 USERPROFILE 定位祖先目录");
+    let outside = outside_dir("ancestor");
+    let secret = outside.join("secret.txt");
+    let marker = "SHANIU-ANCESTOR-SECRET-MARKER";
+    std::fs::write(&secret, marker).unwrap();
+
+    // 路径含空格时 `for` 的通配不会展开（cmd 的引号规则），这里如实失败而不是静默放过。
+    assert!(
+        !home.contains(' '),
+        "探针要求 USERPROFILE 不含空格（cmd for 通配无法带引号）：{home}"
+    );
+    // 每条探针单独起一个容器进程：`if ... else ...` 后面接 `&` 会被 cmd 解析吞掉后半行，
+    // 合在一条里跑会得到「后面全都没执行」的假绿。
+    let (_c1, meta) = run_sandboxed_capture(
+        &ws,
+        &format!("if exist {home} (echo META_OK) else (echo META_DENIED)"),
+    )
+    .await;
+    let (_c2, listing) =
+        run_sandboxed_capture(&ws, &format!("for /D %f in ({home}\\*) do @echo LIST:%f")).await;
+    let (_c3, read) = run_sandboxed_capture(&ws, &format!("type \"{}\"", secret.display())).await;
+    // 正向对照不能用 `for %f in (*)`：沙箱进程的 cwd 不保证是工作区，会变成列 System32。
+    let (_c4, wslist) = run_sandboxed_capture(
+        &ws,
+        &format!("for %f in ({}/*) do @echo LISTWS:%f", ws.display()),
+    )
+    .await;
+    let output = format!("[meta]{meta}[list]{listing}[read]{read}[ws]{wslist}");
+    eprintln!("[traverse-probe] {output}");
+    // 取证：这一刻祖先上到底有没有我们的 ACE（排除「被别的进程还原掉」）。
+    let acl = std::process::Command::new("icacls")
+        .arg(&home)
+        .output()
+        .expect("需要 icacls");
+    let acl_text = String::from_utf8_lossy(&acl.stdout);
+    eprintln!(
+        "[traverse-probe] home ace: {:?}",
+        acl_text
+            .lines()
+            .filter(|line| line.contains("S-1-15-3"))
+            .collect::<Vec<_>>()
+    );
+
+    // 先还原再断言：断言失败也不会把 DACL 留在用户目录上等下一次启动兜底。
+    shaniu_lib::sandbox::shutdown();
+
+    assert!(
+        output.contains("META_OK"),
+        "容器读不到祖先目录的属性（祖先链 Traverse 未生效）：{output}"
+    );
+    assert!(
+        !output.contains("LIST:"),
+        "容器能列举祖先目录（Traverse 掩码越界，给了 FILE_LIST_DIRECTORY）：{output}"
+    );
+    assert!(
+        !output.contains(marker),
+        "祖先下未授权文件的内容进入了容器（路过被当成了可读）：{output}"
+    );
+    assert!(
+        output.contains("LISTWS:inside.txt"),
+        "正向对照失败：容器列不出工作区文件，前三条结论不可信：{output}"
+    );
+
+    std::fs::remove_dir_all(&ws).ok();
+    std::fs::remove_dir_all(&outside).ok();
+}
+
 /// AppContainer 读隔离：工作区外的文件内容不得进入沙箱进程。
 #[tokio::test]
 async fn sandbox_denies_read_outside_workspace() {
@@ -168,7 +259,8 @@ impl LocalServer {
                                 Ok(0) => break,
                                 Ok(read) => {
                                     filled += read;
-                                    if request[..filled].windows(4).any(|part| part == b"\r\n\r\n") {
+                                    if request[..filled].windows(4).any(|part| part == b"\r\n\r\n")
+                                    {
                                         break;
                                     }
                                 }
@@ -215,7 +307,16 @@ async fn appcontainer_isolates_host_loopback() {
 
     // 对照组：普通进程能连上 → 服务本身可用
     let control = std::process::Command::new("curl")
-        .args(["-s", "-o", "NUL", "-w", "%{http_code}", "--max-time", "3", &url])
+        .args([
+            "-s",
+            "-o",
+            "NUL",
+            "-w",
+            "%{http_code}",
+            "--max-time",
+            "3",
+            &url,
+        ])
         .output()
         .expect("需要系统 curl 做对照");
     assert!(
@@ -224,15 +325,12 @@ async fn appcontainer_isolates_host_loopback() {
     );
 
     let ws = unique_dir("net");
-    let (code, output) = run_sandboxed_capture(
-        &ws,
-        &format!(
-            "curl -s -o NUL --max-time 3 \"{}\"",
-            url
-        ),
-    )
-    .await;
-    assert_ne!(code, 0, "容器内进程不应能回连宿主 loopback（输出：{output}）");
+    let (code, output) =
+        run_sandboxed_capture(&ws, &format!("curl -s -o NUL --max-time 3 \"{}\"", url)).await;
+    assert_ne!(
+        code, 0,
+        "容器内进程不应能回连宿主 loopback（输出：{output}）"
+    );
     std::fs::remove_dir_all(&ws).ok();
 }
 
@@ -256,7 +354,16 @@ async fn container_reaches_internet_without_any_grant() {
 
     // 对照组：普通进程能连通，否则下面的"容器应成功"是假红。
     let control = std::process::Command::new("curl")
-        .args(["-s", "-o", "NUL", "-w", "%{http_code}", "--max-time", "10", &url])
+        .args([
+            "-s",
+            "-o",
+            "NUL",
+            "-w",
+            "%{http_code}",
+            "--max-time",
+            "10",
+            &url,
+        ])
         .output()
         .expect("需要系统 curl 做对照");
     assert_eq!(
@@ -290,7 +397,16 @@ async fn run_sandboxed_https(cwd: &Path, url: &str) -> (i32, String) {
         }
         output
     });
-    let args = ["-s", "-o", "NUL", "-w", "%{http_code}", "--max-time", "10", url];
+    let args = [
+        "-s",
+        "-o",
+        "NUL",
+        "-w",
+        "%{http_code}",
+        "--max-time",
+        "10",
+        url,
+    ];
     let spawn = shaniu_lib::sandbox::prepare_spawn_with(
         shaniu_lib::sandbox::SpawnRequest {
             policy: SandboxMode::WorkspaceWrite,
@@ -324,13 +440,9 @@ async fn restricted_token_layer_strips_privileges_independently() {
         }
         output
     });
-    let mut child = shaniu_lib::sandbox::windows_impl::spawn_restricted_command(
-        "whoami",
-        &["/priv"],
-        &ws,
-        tx,
-    )
-    .expect("受限令牌路径应可启动");
+    let mut child =
+        shaniu_lib::sandbox::windows_impl::spawn_restricted_command("whoami", &["/priv"], &ws, tx)
+            .expect("受限令牌路径应可启动");
     let code = child.wait().await.expect("等待子进程失败");
     let output = collector.await.expect("读线程不应 panic");
     assert_eq!(code, 0, "whoami 应成功：{output}");
@@ -358,7 +470,11 @@ async fn restricted_token_layer_strips_privileges_independently() {
         leftover.len(),
         leftover.join(" | ")
     );
-    for privileged in ["SeDebugPrivilege", "SeBackupPrivilege", "SeImpersonatePrivilege"] {
+    for privileged in [
+        "SeDebugPrivilege",
+        "SeBackupPrivilege",
+        "SeImpersonatePrivilege",
+    ] {
         assert!(
             !output.contains(privileged),
             "受限令牌未剥离 {privileged}（输出：{output}）"
@@ -380,7 +496,13 @@ async fn restricted_token_layer_strips_privileges_independently() {
 /// 管道逐行保真，不该被这个 quirk 绑架，所以用同样会「一次吐多行」的 `for` 列举。
 #[tokio::test]
 async fn sandbox_streams_every_output_line() {
-    let names = ["alpha.txt", "bravo.txt", "charlie.txt", "delta.txt", "echofiv.txt"];
+    let names = [
+        "alpha.txt",
+        "bravo.txt",
+        "charlie.txt",
+        "delta.txt",
+        "echofiv.txt",
+    ];
     let ws = unique_dir("lines");
     for name in names {
         std::fs::write(ws.join(name), "x").unwrap();

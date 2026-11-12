@@ -139,7 +139,6 @@ pub fn execution_note(tool: &str, mode: SandboxMode) -> Option<String> {
     ))
 }
 
-
 /// 按策略准备子进程（Windows 实现）。tx 供受限路径的读线程回传 stdio 行。
 pub fn prepare_spawn(
     policy: SandboxMode,
@@ -168,9 +167,7 @@ pub fn prepare_spawn_with(
 ) -> Result<PreparedSpawn, SandboxError> {
     match request.policy {
         // read-only：纯策略拒绝（fail-closed 双保险）
-        SandboxMode::ReadOnly => Err(SandboxError::PolicyDenied(
-            "只读沙箱禁止命令执行".into(),
-        )),
+        SandboxMode::ReadOnly => Err(SandboxError::PolicyDenied("只读沙箱禁止命令执行".into())),
         // danger-full-access：直接执行
         SandboxMode::DangerFullAccess => {
             let mut command = Command::new(request.program);
@@ -280,6 +277,8 @@ fn spawn_in_app_container(
 
 /// 容器运行时 + 工作区写 ACE 的公共准备步骤。
 /// ACE 只加三类位置：工作区根 / temp / 工具链目录；授权对象是容器 SID。
+/// **不加祖先链**：写一条不继承 ACE 也会让系统重算整棵子树（实测 62s/30s/13s），
+/// 而盘根两级非提权写不进，详见 `app_container_scope` 内注释与 docs/13。
 /// 每个工作区根在进程内只解析一次 scope：重复 exec / 终端不再碰 DACL（docs/04 §1.5）。
 ///
 /// 能力列表恒为 `internetClient`：网络不是策略维度，容器一律可出网（2026-11-10）。
@@ -300,6 +299,12 @@ fn app_container_scope(workspace_root: &Path) -> Result<(PSID, Vec<PSID>), Sandb
         for dir in acl::write_scope(workspace_root) {
             // 工作区根与工具链目录走同一份清单，但只有前者受「过宽根」约束：
             // 工具链本来就可能在 Program Files 下。
+            // 注意：**不在运行期补祖先链**（2026-11-12 实测后撤回）。写 DACL 会让系统重算
+            // 整棵子树：`C:\Users\<user>` ≈62s、`AppData` ≈30s、`AppData\Local` ≈13s，
+            // 每次进程启动的首次 spawn 都要付，把 spawn 从 ~12s 拉到 86s（最差 164s）；
+            // 而 `C:\`、`C:\Users` 这两级非提权写不进，容器仍然读不到祖先属性——
+            // 也就是说代价全花在没用上的层级。祖先 `Traverse` 改为安装期一次预置，
+            // 机制见 `acl::grant_chain`，决策见 `docs/13-祖先遍历权决策材料.md`。
             let is_workspace_root = dir == *workspace_root;
             with_acl(|acl| {
                 if is_workspace_root {
@@ -329,7 +334,10 @@ static ACL_RECOVERED: AtomicUsize = AtomicUsize::new(0);
 
 /// ACL 备份目录（目录 DACL 与 NUL 设备 DACL 共用）。
 fn acl_backup_dir() -> PathBuf {
-    crate::config::resolve_dirs_from_env().data_root.join("sandbox").join("acl")
+    crate::config::resolve_dirs_from_env()
+        .data_root
+        .join("sandbox")
+        .join("acl")
 }
 
 /// 懒初始化：只跑一次 `recover_pending`，失败即 fail-closed 返回错误。
@@ -344,15 +352,17 @@ fn ensure_acl() -> Result<(), SandboxError> {
     let backup_dir = acl_backup_dir();
     let mut manager = acl::AclManager::new(backup_dir.clone());
     // 先还原上次异常退出留下的 DACL，再允许新的授权，避免在被污染的 ACL 上继续。
-    let restored = manager.recover_pending().map_err(SandboxError::CreateFailed)?;
+    let restored = manager
+        .recover_pending()
+        .map_err(SandboxError::CreateFailed)?;
     // 设备对象的备份独立存放（设备路径没有 exists()，不能进目录备份的回收分支）。
     match device_acl::restore_null_device(&backup_dir) {
         Ok(true) => tracing::info!("已还原上次异常退出遗留的 NUL 设备 DACL 备份"),
         Ok(false) => {}
         Err(error) => {
             return Err(SandboxError::CreateFailed(format!(
-                "上次异常退出留下的 NUL 设备 DACL 还原失败（拒绝在未还原的设备 ACL 上继续）：{error}"
-            )))
+            "上次异常退出留下的 NUL 设备 DACL 还原失败（拒绝在未还原的设备 ACL 上继续）：{error}"
+        )))
         }
     }
     ACL_RECOVERED.store(restored, Ordering::Relaxed);
@@ -395,7 +405,9 @@ fn ensure_null_device(sid: PSID) -> bool {
     }
 }
 
-fn with_acl<R>(f: impl FnOnce(&mut acl::AclManager) -> Result<R, String>) -> Result<R, SandboxError> {
+fn with_acl<R>(
+    f: impl FnOnce(&mut acl::AclManager) -> Result<R, String>,
+) -> Result<R, SandboxError> {
     ensure_acl()?;
     let mutex = ACL.get().expect("ACL 已初始化");
     let mut guard = mutex
@@ -422,12 +434,11 @@ fn build_runtime() -> Result<Runtime, SandboxError> {
     ensure_acl()?;
     let recovered = ACL_RECOVERED.load(Ordering::Relaxed);
 
-    let container =
-        appcontainer::AppContainer::ensure().map_err(SandboxError::CreateFailed)?;
+    let container = appcontainer::AppContainer::ensure().map_err(SandboxError::CreateFailed)?;
     // exec 容器的 NUL 授权由退出时的整份设备 DACL 还原兜底，不逐个撤销。
     ensure_null_device(container.sid());
-    let capability_internet = appcontainer::internet_client_capability()
-        .map_err(SandboxError::CreateFailed)?;
+    let capability_internet =
+        appcontainer::internet_client_capability().map_err(SandboxError::CreateFailed)?;
     let owns_profile = container.created() || recovered > 0;
     Ok(Runtime {
         container,
@@ -499,8 +510,7 @@ fn mcp_runtimes() -> &'static Mutex<HashMap<String, McpRuntime>> {
     MCP_RUNTIMES.get_or_init(|| Mutex::new(HashMap::new()))
 }
 
-fn mcp_lock() -> Result<std::sync::MutexGuard<'static, HashMap<String, McpRuntime>>, SandboxError>
-{
+fn mcp_lock() -> Result<std::sync::MutexGuard<'static, HashMap<String, McpRuntime>>, SandboxError> {
     mcp_runtimes()
         .lock()
         .map_err(|_| SandboxError::CreateFailed("MCP 容器锁已中毒".into()))
@@ -529,7 +539,10 @@ fn mcp_reclaim_allowlist(
 /// 白名单里已经包含正在运行的 server，所以在跑的永远不会被当成孤儿；
 /// 而「配置里已信任但当前没连」的 server 也不再被白删白建。
 /// 不在白名单里的 `Shaniu.Mcp.*` 才是上次遗留的孤儿（见 `appcontainer::reclaim_orphans` 的边界）。
-fn ensure_mcp_container(server_id: &str, trusted_server_ids: &[String]) -> Result<(), SandboxError> {
+fn ensure_mcp_container(
+    server_id: &str,
+    trusted_server_ids: &[String],
+) -> Result<(), SandboxError> {
     let profile = appcontainer::mcp_profile_name(server_id).map_err(SandboxError::CreateFailed)?;
     let mut runtimes = mcp_lock()?;
     if runtimes.contains_key(server_id) {
@@ -558,7 +571,12 @@ fn ensure_mcp_container(server_id: &str, trusted_server_ids: &[String]) -> Resul
         appcontainer::internet_client_capability().map_err(SandboxError::CreateFailed)?;
     runtimes.insert(
         server_id.to_string(),
-        McpRuntime { container, capability_internet, granted: Vec::new(), null_granted },
+        McpRuntime {
+            container,
+            capability_internet,
+            granted: Vec::new(),
+            null_granted,
+        },
     );
     Ok(())
 }
@@ -573,14 +591,20 @@ fn grant_mcp_paths(
     })?;
     let sid = runtime.container.sid();
     for (path, access, role) in desired {
-        if runtime.granted.iter().any(|(granted, level)| granted == path && level == access) {
+        if runtime
+            .granted
+            .iter()
+            .any(|(granted, level)| granted == path && level == access)
+        {
             continue;
         }
         with_acl(|acl| match role {
             // 用户指定的根（工作区、cwd、allowed_roots）过宽即拒；程序推导的目录放行。
+            // 同上：运行期不补祖先链（代价与收益见 `app_container_scope` 的注释）。
             acl::RootRole::UserPicked => acl.grant_guarded(path, sid, *access),
             acl::RootRole::Derived => acl.grant(path, sid, *access),
-        }).map_err(|error| {
+        })
+        .map_err(|error| {
             // 常见根因：运行时装在管理员所有的目录（普通用户改不了它的 DACL，
             // 容器也没读到它的权限）。给出能照做的两个出口。
             let detail = match &error {
@@ -611,7 +635,10 @@ pub fn release_mcp_server(server_id: &str) {
         return;
     };
     let Ok(mut runtimes) = mutex.lock() else {
-        tracing::error!(server_id, "释放 MCP 容器：锁已中毒，ACE 与 profile 可能残留");
+        tracing::error!(
+            server_id,
+            "释放 MCP 容器：锁已中毒，ACE 与 profile 可能残留"
+        );
         return;
     };
     let Some(runtime) = runtimes.remove(server_id) else {
@@ -752,16 +779,14 @@ pub fn prepare_stdio(
         SandboxMode::ReadOnly => Err(SandboxError::PolicyDenied(
             "只读沙箱禁止启动 MCP server 进程".into(),
         )),
-        SandboxMode::DangerFullAccess => {
-            windows_impl::spawn_unsandboxed_stdio(
-                request.program,
-                request.args,
-                request.cwd,
-                request.env,
-                tx,
-            )
-            .map_err(SandboxError::CreateFailed)
-        }
+        SandboxMode::DangerFullAccess => windows_impl::spawn_unsandboxed_stdio(
+            request.program,
+            request.args,
+            request.cwd,
+            request.env,
+            tx,
+        )
+        .map_err(SandboxError::CreateFailed),
         SandboxMode::WorkspaceWrite => match current_os_mode() {
             OsSandbox::Logical => {
                 warn_logical_fallback_once();
@@ -792,12 +817,20 @@ fn guarded_mcp_user_roots(
     workspace_access: acl::Access,
 ) -> Result<Vec<(PathBuf, acl::Access, acl::RootRole)>, SandboxError> {
     let candidates = [
-        ("工作区根", request.workspace_root.to_path_buf(), workspace_access),
+        (
+            "工作区根",
+            request.workspace_root.to_path_buf(),
+            workspace_access,
+        ),
         ("cwd", request.cwd.to_path_buf(), workspace_access),
     ]
     .into_iter()
     .chain(request.allowed_roots.iter().map(|root| {
-        ("allowed_roots", PathBuf::from(root.path.trim()), acl_access(root.access))
+        (
+            "allowed_roots",
+            PathBuf::from(root.path.trim()),
+            acl_access(root.access),
+        )
     }));
     let mut roots = Vec::new();
     for (label, path, access) in candidates {
@@ -837,7 +870,11 @@ fn spawn_mcp_in_app_container(
     // 角色决定是否受过宽约束：用户指定的一律判，程序推导的（临时目录、工具链）不判。
     let mut desired = guarded_mcp_user_roots(request, &data_root, workspace_access)?;
     // 临时目录必须可写：TEMP/TMP 会在下面改指到这里。
-    desired.push((server_temp.clone(), acl::Access::Write, acl::RootRole::Derived));
+    desired.push((
+        server_temp.clone(),
+        acl::Access::Write,
+        acl::RootRole::Derived,
+    ));
     for root in toolchain_roots(request.program, request.args) {
         desired.push((root, acl::Access::Read, acl::RootRole::Derived));
     }
@@ -853,14 +890,18 @@ fn spawn_mcp_in_app_container(
     let (sid, internet) = {
         let runtimes = mcp_lock()?;
         let runtime = runtimes.get(request.server_id).ok_or_else(|| {
-            SandboxError::CreateFailed(format!(
-                "MCP server {} 的容器尚未建立",
-                request.server_id
-            ))
+            SandboxError::CreateFailed(format!("MCP server {} 的容器尚未建立", request.server_id))
         })?;
-        (runtime.container.sid(), runtime.capability_internet.as_psid())
+        (
+            runtime.container.sid(),
+            runtime.capability_internet.as_psid(),
+        )
     };
-    let capabilities = if request.allow_network { vec![internet] } else { Vec::new() };
+    let capabilities = if request.allow_network {
+        vec![internet]
+    } else {
+        Vec::new()
+    };
     windows_impl::spawn_appcontainer_stdio(
         request.program,
         request.args,
@@ -1027,11 +1068,16 @@ fn is_os_owned(dir: &Path) -> bool {
     }
     // Windows 路径比较不区分大小写，环境变量与解析出的 exe 路径大小写常不一致。
     let text = dir.to_string_lossy().to_lowercase();
-    ["SystemRoot", "ProgramFiles", "ProgramFiles(x86)", "ProgramData"]
-        .iter()
-        .filter_map(std::env::var_os)
-        .map(|owned| owned.to_string_lossy().to_lowercase())
-        .any(|owned| !owned.is_empty() && text.starts_with(&owned))
+    [
+        "SystemRoot",
+        "ProgramFiles",
+        "ProgramFiles(x86)",
+        "ProgramData",
+    ]
+    .iter()
+    .filter_map(std::env::var_os)
+    .map(|owned| owned.to_string_lossy().to_lowercase())
+    .any(|owned| !owned.is_empty() && text.starts_with(&owned))
 }
 
 fn find_ancestor(start: &Path, marker: &str) -> Option<PathBuf> {
@@ -1078,7 +1124,13 @@ mod tests {
     fn danger_policy_yields_plain_command() {
         let dir = ws();
         let (tx, _rx) = mpsc::channel(4);
-        let spawn = match prepare_spawn(SandboxMode::DangerFullAccess, "cmd", &["/C", "echo"], &dir, tx) {
+        let spawn = match prepare_spawn(
+            SandboxMode::DangerFullAccess,
+            "cmd",
+            &["/C", "echo"],
+            &dir,
+            tx,
+        ) {
             Ok(PreparedSpawn::Plain(command)) => command,
             _ => panic!("danger 应为 Plain"),
         };
@@ -1155,9 +1207,15 @@ mod tests {
     fn execution_note_only_for_exec_tools() {
         assert!(execution_note("read_file", SandboxMode::WorkspaceWrite).is_none());
         let note = execution_note("unified_exec", SandboxMode::WorkspaceWrite).expect("应有自报");
-        assert!(note.starts_with("[sandbox] mode=workspace_write enforcement="), "实际: {note}");
+        assert!(
+            note.starts_with("[sandbox] mode=workspace_write enforcement="),
+            "实际: {note}"
+        );
         let escalated = execution_note("terminal", SandboxMode::DangerFullAccess).unwrap();
-        assert!(escalated.contains("mode=danger_full_access"), "实际: {escalated}");
+        assert!(
+            escalated.contains("mode=danger_full_access"),
+            "实际: {escalated}"
+        );
     }
 
     /// 非法 server id 派生不出容器名：必须**直接失败**，不能悄悄退回受限令牌。
@@ -1188,7 +1246,10 @@ mod tests {
             Ok(_) => panic!("非法 id 必须拒绝启动，而不是回退受限令牌"),
         };
         assert!(matches!(err, SandboxError::CreateFailed(_)), "实际: {err}");
-        assert!(err.to_string().contains("profile"), "错误应指清是容器名派生失败: {err}");
+        assert!(
+            err.to_string().contains("profile"),
+            "错误应指清是容器名派生失败: {err}"
+        );
     }
 
     /// 每个 server 一个容器：建立后可释放，释放时 profile 一并删除。
@@ -1240,7 +1301,10 @@ mod tests {
             !deleted.contains(&running_profile),
             "正在运行的 server profile 永不在回收范围内（实际删除清单：{deleted:?}）"
         );
-        assert!(deleted.contains(&orphan_profile), "非运行、非信任的 profile 应被回收");
+        assert!(
+            deleted.contains(&orphan_profile),
+            "非运行、非信任的 profile 应被回收"
+        );
         assert!(
             appcontainer::list_mcp_profiles().contains(&running_profile),
             "运行中的 profile 必须仍然存在"
@@ -1269,8 +1333,14 @@ mod tests {
         );
         let deleted = appcontainer::reclaim_orphans(&allowlist);
 
-        assert!(!deleted.contains(&trusted_profile), "已信任 server 的 profile 不应被回收");
-        assert!(deleted.contains(&stale_profile), "既不在配置也不在运行的 profile 才是孤儿");
+        assert!(
+            !deleted.contains(&trusted_profile),
+            "已信任 server 的 profile 不应被回收"
+        );
+        assert!(
+            deleted.contains(&stale_profile),
+            "既不在配置也不在运行的 profile 才是孤儿"
+        );
         assert!(appcontainer::list_mcp_profiles().contains(&trusted_profile));
         let _ = trusted_container.delete();
     }
@@ -1293,15 +1363,21 @@ mod tests {
         };
         let profile = appcontainer::mcp_profile_name(&id).unwrap();
 
-        grant_mcp_paths(&id, &[(target.clone(), acl::Access::Read, acl::RootRole::UserPicked)])
-            .expect("授权读");
+        grant_mcp_paths(
+            &id,
+            &[(target.clone(), acl::Access::Read, acl::RootRole::UserPicked)],
+        )
+        .expect("授权读");
         assert!(
             acl::has_explicit_grant(&target, sid, acl::Access::Read.mask()).unwrap(),
             "容器 SID 应有显式读 ACE"
         );
         // 幂等：重复授权不报错，ACE 仍在。
-        grant_mcp_paths(&id, &[(target.clone(), acl::Access::Read, acl::RootRole::UserPicked)])
-            .expect("重复授权应幂等");
+        grant_mcp_paths(
+            &id,
+            &[(target.clone(), acl::Access::Read, acl::RootRole::UserPicked)],
+        )
+        .expect("重复授权应幂等");
         assert!(acl::has_explicit_grant(&target, sid, acl::Access::Read.mask()).unwrap());
 
         release_mcp_server(&id);
@@ -1333,7 +1409,9 @@ mod tests {
             .parent()
             .expect("备份目录应位于 sandbox/ 下")
             .join("acl-audit.jsonl");
-        let before = std::fs::read_to_string(&audit_path).map(|text| text.len()).unwrap_or(0);
+        let before = std::fs::read_to_string(&audit_path)
+            .map(|text| text.len())
+            .unwrap_or(0);
 
         let home = crate::config::home_dir();
         let error = grant_mcp_paths(
@@ -1351,8 +1429,11 @@ mod tests {
         );
 
         // 主目录的子目录放行（临时目录本身就在用户主目录下）。
-        grant_mcp_paths(&id, &[(sub.clone(), acl::Access::Read, acl::RootRole::UserPicked)])
-            .expect("主目录的子目录不应被拦");
+        grant_mcp_paths(
+            &id,
+            &[(sub.clone(), acl::Access::Read, acl::RootRole::UserPicked)],
+        )
+        .expect("主目录的子目录不应被拦");
         release_mcp_server(&id);
     }
 
@@ -1393,27 +1474,49 @@ mod tests {
         // 正常：工作区与数据根之外的目录放行。
         let outside = dir.join("outside");
         std::fs::create_dir_all(&outside).unwrap();
-        let allowed = [AllowedRoot { path: outside.display().to_string(), access: WorkspaceAccess::Read }];
-        let roots = guarded_mcp_user_roots(&make(workspace, workspace, &allowed, &env), &data_root, acl::Access::Read)
-            .expect("数据根之外的用户指定根必须放行");
+        let allowed = [AllowedRoot {
+            path: outside.display().to_string(),
+            access: WorkspaceAccess::Read,
+        }];
+        let roots = guarded_mcp_user_roots(
+            &make(workspace, workspace, &allowed, &env),
+            &data_root,
+            acl::Access::Read,
+        )
+        .expect("数据根之外的用户指定根必须放行");
         assert_eq!(roots.len(), 3, "工作区、cwd、allowed_roots 各一条");
 
         // 拒绝：allowed_roots 指到 data\secrets。
         let secrets = data_root.join("secrets");
-        let allowed = [AllowedRoot { path: secrets.display().to_string(), access: WorkspaceAccess::Write }];
-        let error = guarded_mcp_user_roots(&make(workspace, workspace, &allowed, &env), &data_root, acl::Access::Read)
-            .expect_err("allowed_roots 指向数据根内部必须拒绝");
+        let allowed = [AllowedRoot {
+            path: secrets.display().to_string(),
+            access: WorkspaceAccess::Write,
+        }];
+        let error = guarded_mcp_user_roots(
+            &make(workspace, workspace, &allowed, &env),
+            &data_root,
+            acl::Access::Read,
+        )
+        .expect_err("allowed_roots 指向数据根内部必须拒绝");
         assert!(error.to_string().contains("allowed_roots"), "{error}");
         assert!(error.to_string().contains("secrets"), "{error}");
 
         // 拒绝：cwd 指向数据根本身。
-        let error = guarded_mcp_user_roots(&make(&data_root, workspace, &[], &env), &data_root, acl::Access::Read)
-            .expect_err("cwd 指向数据根必须拒绝");
+        let error = guarded_mcp_user_roots(
+            &make(&data_root, workspace, &[], &env),
+            &data_root,
+            acl::Access::Read,
+        )
+        .expect_err("cwd 指向数据根必须拒绝");
         assert!(error.to_string().contains("cwd"), "{error}");
 
         // 拒绝：数据根的上级目录（祖先）同样拿到的是「能读档案」的授权。
-        let error = guarded_mcp_user_roots(&make(dir.path(), workspace, &[], &env), &data_root, acl::Access::Read)
-            .expect_err("数据根祖先必须拒绝");
+        let error = guarded_mcp_user_roots(
+            &make(dir.path(), workspace, &[], &env),
+            &data_root,
+            acl::Access::Read,
+        )
+        .expect_err("数据根祖先必须拒绝");
         assert!(error.to_string().contains("上级目录"), "{error}");
     }
 
@@ -1471,7 +1574,10 @@ mod tests {
         );
         if !granted {
             // 本机口径：什么都没补，就更不许把设备上原有的共享应用包授权删掉。
-            assert!(shared_present(), "释放不得删除设备 DACL 里原有的共享应用包授权");
+            assert!(
+                shared_present(),
+                "释放不得删除设备 DACL 里原有的共享应用包授权"
+            );
         }
         assert!(
             !appcontainer::list_mcp_profiles().contains(&profile),
@@ -1525,7 +1631,10 @@ mod tests {
                 output.push_str(&line);
             }
         }
-        assert!(output.contains("container-read-ok"), "容器内应能读到工作区文件，实际: {output}");
+        assert!(
+            output.contains("container-read-ok"),
+            "容器内应能读到工作区文件，实际: {output}"
+        );
         release_mcp_server(&id);
     }
 
@@ -1539,8 +1648,13 @@ mod tests {
         // 真实 Win32 沙箱 smoke：受限令牌 + Job + AppContainer 下运行 echo，退出码必须为 0
         let dir = ws();
         let (tx, mut rx) = mpsc::channel(64);
-        let mut child = match prepare_spawn(SandboxMode::WorkspaceWrite, "cmd", &["/C", "echo sb-ok"], &dir, tx)
-        {
+        let mut child = match prepare_spawn(
+            SandboxMode::WorkspaceWrite,
+            "cmd",
+            &["/C", "echo sb-ok"],
+            &dir,
+            tx,
+        ) {
             Ok(PreparedSpawn::Restricted(child)) => child,
             _ => panic!("workspace-write 应为 Restricted"),
         };
@@ -1567,11 +1681,16 @@ mod tests {
         let _serial = appcontainer::PROFILE_TEST_MUTEX.lock().await;
         let dir = ws();
         let (tx, _rx) = mpsc::channel(64);
-        let mut child =
-            match prepare_spawn(SandboxMode::WorkspaceWrite, "cmd", &["/C", "exit 7"], &dir, tx) {
-                Ok(PreparedSpawn::Restricted(child)) => child,
-                _ => panic!("workspace-write 应为 Restricted"),
-            };
+        let mut child = match prepare_spawn(
+            SandboxMode::WorkspaceWrite,
+            "cmd",
+            &["/C", "exit 7"],
+            &dir,
+            tx,
+        ) {
+            Ok(PreparedSpawn::Restricted(child)) => child,
+            _ => panic!("workspace-write 应为 Restricted"),
+        };
         let first = child.wait().await.expect("首次等待应拿到退出码");
         let second = child.wait().await.expect("重复等待必须复用缓存结果");
         let third = child.wait().await.expect("第三次等待同样走缓存");
