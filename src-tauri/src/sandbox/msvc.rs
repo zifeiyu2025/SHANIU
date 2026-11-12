@@ -21,15 +21,32 @@ use std::sync::OnceLock;
 /// 解析结果缓存：进程生命周期内 vswhere/目录结构不会变。
 static CACHE: OnceLock<Vec<(String, String)>> = OnceLock::new();
 
-/// 返回要叠加到容器子进程环境的工具链条目；无 MSVC 时为空。
+/// 返回要叠加到容器子进程环境的条目：MSVC 工具链 + Python stdio 编码补丁。
+///
+/// 编码补丁与 MSVC 无关，**探测不到 VS 也照发**（见 [`PYTHON_UTF8_ENV`]）。
 pub fn toolchain_env() -> &'static [(String, String)] {
     CACHE.get_or_init(|| {
         let old_path = env::var("PATH").unwrap_or_default();
-        resolve()
+        let mut entries = resolve()
             .map(|paths| paths.into_entries_with(&old_path))
-            .unwrap_or_default()
+            .unwrap_or_default();
+        entries.extend(
+            PYTHON_UTF8_ENV
+                .iter()
+                .map(|(key, value)| (key.to_string(), value.to_string())),
+        );
+        entries
     })
 }
+
+/// Python stdio 编码补丁（对齐 ZCode `runtimeCommandEnv.ts` 的 `PYTHON_UTF8_ENV_PATCH`）。
+///
+/// 理由：Windows 上 CPython 未显式指定编码时按**当前代码页**（简体中文机器是 GBK/936）
+/// 写 stdout/stderr，而我们的工具输出一律按 UTF-8 解析——中文会乱码、`json` 输出会解析
+/// 失败。`PYTHONUTF8=1` 同时把文件默认编码切到 UTF-8，`PYTHONIOENCODING` 兜住 stdio。
+/// 这属于工具链环境变量，不是放宽沙箱边界。
+const PYTHON_UTF8_ENV: [(&str, &str); 2] =
+    [("PYTHONIOENCODING", "utf-8"), ("PYTHONUTF8", "1")];
 
 /// 一次探测得到的工具链布局。
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -226,6 +243,22 @@ mod tests {
         let entries = paths.into_entries_with("C:\\old");
         assert_eq!(entries.len(), 2);
         assert!(entries.iter().all(|(key, _)| key != "INCLUDE"));
+    }
+
+    /// Python 编码补丁**无条件**注入：与这台机器是否探测到 MSVC 无关。
+    #[test]
+    fn toolchain_env_always_injects_python_utf8() {
+        let entries = toolchain_env();
+        assert!(
+            entries
+                .iter()
+                .any(|(key, value)| key == "PYTHONIOENCODING" && value == "utf-8"),
+            "缺 PYTHONIOENCODING=utf-8：{entries:?}"
+        );
+        assert!(
+            entries.iter().any(|(key, value)| key == "PYTHONUTF8" && value == "1"),
+            "缺 PYTHONUTF8=1：{entries:?}"
+        );
     }
 
     /// 把 Kits 根的探测拆成可注入参数的形态：根不存在 → None。
