@@ -1,0 +1,41 @@
+# 第三批真机验收配置：exec / 交互终端 / MCP server 三面统一走默认档（写约束受限令牌）。
+# 不写 `[sandbox] os`：默认就是 restricted_token；AppContainer 只作为可选档保留。
+# 模型指向本机 mock 端点，不触达外部服务。
+
+active_provider = ""
+
+[model]
+provider = "openai-chat"
+base_url = "http://127.0.0.1:18765/v1"
+model = "mock-acceptance"
+max_turns = 0
+max_retries = 0
+
+[sandbox]
+mode = "workspace_write"
+
+[approval]
+mode = "never"
+
+[workspace]
+root = "D:\\MyWorkspace\\SHANIU\\docs\\evidence\\2026-11-13\\three-faces-default\\workspace"
+
+[verify]
+enabled = false
+
+[session_title]
+enabled = false
+
+# 真实第三方 MCP server：@modelcontextprotocol/server-filesystem（node 实现）。
+# 刻意把 `C:\Users\jun` 也放进 server 自己的允许目录：这样「区外写被拒」只可能来自
+# SHANIU 的写约束令牌，而不是 server 自身的路径白名单。
+[[mcp.servers]]
+id = "fs"
+command = "node"
+args = [
+  "D:\\AI\\mcp-node-test\\node_modules\\@modelcontextprotocol\\server-filesystem\\dist\\index.js",
+  "D:\\MyWorkspace\\SHANIU\\docs\\evidence\\2026-11-13\\three-faces-default\\workspace",
+  "C:\\Users\\jun",
+]
+cwd = "D:\\MyWorkspace\\SHANIU\\docs\\evidence\\2026-11-13\\three-faces-default\\workspace"
+workspace_access = "write"

@@ -1,0 +1,12 @@
+# 只提交 harness 与结论；运行期产物（数据根、workspace 里的写入、rollout、临时日志）不进仓库。
+# `!dir/` 必须先放行目录本身，否则 `!dir/file` 无法把被 `*` 忽略的目录里的文件捞回来。
+*
+!.gitignore
+!harness/
+!harness/**
+!data-root/
+!data-root/config.toml
+!workspace/
+!workspace/hello.txt
+!*.log
+!*.md
