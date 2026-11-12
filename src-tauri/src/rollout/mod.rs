@@ -32,7 +32,7 @@ pub const ROLLOUT_DIR: &str = "rollouts";
 /// 会话建档时固化的配置快照。字段全是字符串以保证**跨版本可读**：
 /// 枚举改名/拆分不该让历史档案解析失败（resume 依赖它）。
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(rename_all = "snake_case")]
+#[serde(rename_all = "snake_case", default)]
 pub struct ConfigSnapshot {
     pub provider: String,
     pub base_url: String,
@@ -647,6 +647,20 @@ mod tests {
                 ..Default::default()
             },
         }
+    }
+
+    /// 旧档案缺 `config_snapshot` 字段时必须照常读出（空串 = 未记录），不能判整份档案损坏：
+    /// 这个结构的存在意义就是「跨版本可读」，缺字段按 `Default` 补是它成立的唯一方式。
+    #[test]
+    fn config_snapshot_missing_fields_read_as_empty_strings() {
+        let line = r#"{"type":"session_meta","session_id":"s","agent_id":"a","created_at":1,"config_snapshot":{"model":"m"}}"#;
+        let item: RolloutItem = serde_json::from_str(line).expect("旧档案缺字段必须仍可读");
+        let RolloutItem::SessionMeta { config_snapshot, .. } = item else {
+            panic!("首行应是 session_meta");
+        };
+        assert_eq!(config_snapshot.model, "m", "已写入的字段不能被默认值覆盖");
+        assert_eq!(config_snapshot.provider, "");
+        assert_eq!(config_snapshot.workspace_root, "");
     }
 
     #[test]
