@@ -3,9 +3,10 @@
 //! resume 的本质是"把档案重放成运行时的 `history`"，因此它的正确性判据只有一条：
 //! **重放出来的历史必须能直接喂给模型且不违反协议**。SH-082 已经证明，
 //! 一条 `function_call` 后面缺配对的 `function_call_output`，严格端点直接 400——
-//! 所以重放只丢尾部"有 call 无 output"的落单调用，压缩锚点、控制面记录与正常消息
-//! 一条不丢。fork 仍按前缀截断，见 [`nearest_safe_cut`]。
+//! 所以重放会把"有 call 无 output"的落单调用**原位剔除**（不是截断尾巴），压缩锚点、
+//! 控制面记录与正常消息一条不丢。fork 仍按前缀截断，见 [`nearest_safe_cut`]。
 
+use std::collections::HashSet;
 use std::path::{Path, PathBuf};
 
 use crate::clock::now_ms;
@@ -38,12 +39,12 @@ pub struct Resumed {
     pub torn_tail_lines: usize,
     /// 中间坏行（已跳过）的 1-based 行号；空 = 档案完好。重放出来的历史因此可能缺条目。
     pub damaged_lines: Vec<usize>,
-    /// 重放时因工具调用配对不完整而丢弃的**落单 `function_call`** 条数。
+    /// 重放时因工具调用配对不完整而剔除的**落单 `function_call`** 条数。
     ///
     /// 典型成因：崩溃时档案停在 `function_call` 之后、`function_call_output` 之前。
     /// 这些条目留在盘上，但不进模型历史——带着它们续写，第一条请求就会被严格端点
-    /// 400（SH-082）。只数会进历史的 `ResponseItem`：`Compacted` 锚点与控制面/审计
-    /// 记录不参与配对，即使落在切点之后也照常重放，永远不会被这条计数代表。
+    /// 400（SH-082）。只数这个方向（有 call 无 output）：落单输出与 `Compacted` 锚点、
+    /// 控制面/审计记录、正常消息全都保留，不会被这条计数代表。
     pub dropped_unsafe_tail: usize,
 }
 
@@ -75,25 +76,6 @@ pub struct SystemPromptRecord {
 /// 所以当初那条论证真正排除的只有 system，并没有支持 assistant。
 pub fn resume(path: &Path) -> Result<Resumed, RolloutError> {
     let archive = rollout::read(path)?;
-    // 只丢弃尾部落单的 `function_call`（崩溃点，或被中段坏行拆散配对）：这些条目留在
-    // 盘上，但绝不进模型历史——带着它续写，第一条请求就 400（SH-082）。截断不是"修补
-    // 档案"：盘上内容一个字节都不动，只决定这次重放读到哪里。
-    //
-    // 切点只作用于会进历史的 `ResponseItem`：`Compacted` 锚点与控制面/审计记录本来就不
-    // 参与配对，落在切点之后也必须照常处理——锚点通常写在尾部，一刀切会把摘要连同
-    // "压缩成功"本身一起丢掉（SH-032 的验收正是在这里红的）。
-    let cut = nearest_safe_cut(&archive.items, archive.items.len());
-    let dropped_unsafe_tail = archive.items[cut..]
-        .iter()
-        .filter(|item| matches!(item, RolloutItem::ResponseItem { .. }))
-        .count();
-    if dropped_unsafe_tail > 0 {
-        tracing::warn!(
-            path = %path.display(),
-            dropped = dropped_unsafe_tail,
-            "档案尾部工具调用配对不完整：重放跳过落单调用，被丢弃的条目不进模型历史"
-        );
-    }
     let (session_id, agent_id, parent_id, workspace_root) = match &archive.meta {
         RolloutItem::SessionMeta { session_id, agent_id, parent_id, config_snapshot, .. } => {
             (session_id.clone(), agent_id.clone(), parent_id.clone(), config_snapshot.workspace_root.clone())
@@ -114,10 +96,7 @@ pub fn resume(path: &Path) -> Result<Resumed, RolloutError> {
     let mut permission_preset: Option<String> = None;
     // 系统提示词版本不进模型历史（每轮由 SessionPrompt 重新组装），只做审计与回放。
     let mut prompt_versions: Vec<SystemPromptRecord> = Vec::new();
-    for (index, item) in archive.items.iter().enumerate() {
-        if index >= cut && matches!(item, RolloutItem::ResponseItem { .. }) {
-            continue;
-        }
+    for item in &archive.items {
         match item {
             RolloutItem::ResponseItem { item: h, .. } => history.push(h.clone()),
             RolloutItem::SandboxMode { mode, .. } => sandbox_mode = Some(mode.clone()),
@@ -183,6 +162,34 @@ pub fn resume(path: &Path) -> Result<Resumed, RolloutError> {
                 });
             }
         }
+    }
+
+    // 重放不截断：锚点、控制面/审计记录、正常消息一律按档案顺序还原。唯一不安全的是
+    // "有 call 无 output"的落单调用（SH-082：带着它续写，第一条请求就 400），所以在重放
+    // 完成后**原位剔除**它，而不是像 d610652 那样"从它开始把后面全丢掉"——崩溃之后用户
+    // 接着说的话、以及写在其后的压缩锚点都不该陪葬。
+    //
+    // 配对必须按**最终历史**判：锚点可能把调用连同输出一起压掉，也可能只压掉调用、留下
+    // 输出（落单输出是 `chat_messages` 明确容忍的形态，按 call_id 原样发出）。
+    let answered: HashSet<String> = history
+        .iter()
+        .filter_map(|item| match item {
+            HistoryItem::FunctionCallOutput { call_id, .. } => Some(call_id.clone()),
+            _ => None,
+        })
+        .collect();
+    let before = history.len();
+    history.retain(|item| match item {
+        HistoryItem::FunctionCall { call_id, .. } => answered.contains(call_id),
+        _ => true,
+    });
+    let dropped_unsafe_tail = before - history.len();
+    if dropped_unsafe_tail > 0 {
+        tracing::warn!(
+            path = %path.display(),
+            dropped = dropped_unsafe_tail,
+            "档案里存在落单的工具调用：重放已剔除，这些条目不进模型历史（盘上内容未改动）"
+        );
     }
 
     Ok(Resumed {
@@ -342,22 +349,52 @@ mod tests {
     }
 
     #[test]
-    fn replay_truncates_to_the_last_paired_prefix_and_counts_the_loss() {
+    fn replay_drops_only_the_unpaired_call_and_counts_the_loss() {
         let dir = temp_dir("truncate");
         let path = dir.join("a.jsonl");
         let w = RolloutWriter::create(&dir, &meta("a")).unwrap();
         w.append(&msg("任务")).unwrap();
         w.append(&call("c1")).unwrap();
         w.append(&out("c1")).unwrap();
-        // 崩溃点：档案停在 call 之后、output 之前。重放必须停在 c1 的 output 之后就收手。
+        // 崩溃点：档案停在 call 之后、output 之前。重放只能剔除 c2 这一条。
         w.append(&call("c2")).unwrap();
         drop(w);
 
         let r = resume(&path).unwrap();
         assert_eq!(r.history.len(), 3, "落单的 c2 不得进模型历史：{:#?}", r.history);
-        assert_eq!(r.dropped_unsafe_tail, 1, "被截断的条目数必须带出来");
-        // 反向对照：盘上内容原样保留，截断只影响这次重放。
+        assert_eq!(r.dropped_unsafe_tail, 1, "被剔除的条目数必须带出来");
+        // 反向对照：盘上内容原样保留，剔除只影响这次重放。
         assert_eq!(rollout::read(&path).unwrap().items.len(), 4);
+    }
+
+    #[test]
+    fn replay_keeps_messages_that_follow_an_unpaired_call() {
+        let dir = temp_dir("unpaired-mid");
+        let path = dir.join("a.jsonl");
+        let w = RolloutWriter::create(&dir, &meta("a")).unwrap();
+        w.append(&msg("任务")).unwrap();
+        w.append(&call("c1")).unwrap(); // 崩溃/坏行：c1 永远等不到 output
+        w.append(&msg("补一句")).unwrap(); // 崩溃之后用户接着说的话，不许陪葬
+        // 锚点只压第一轮任务，落单的 c1 留给重放剔除——两种机制互不干扰。
+        w.append(&RolloutItem::Compacted { range_start: 0, range_end: 1, summary: "此前：任务".into() })
+            .unwrap();
+        drop(w);
+
+        let r = resume(&path).unwrap();
+        assert_eq!(r.dropped_unsafe_tail, 1, "只该剔除 c1");
+        assert_eq!(r.applied_compactions, 1, "写在落单调用之后的锚点同样要生效");
+        assert_eq!(r.history.len(), 2, "摘要与「补一句」都必须保留：{:#?}", r.history);
+        match &r.history[0] {
+            HistoryItem::Message { role, text, .. } => {
+                assert_eq!(*role, Role::User);
+                assert!(text.contains("此前"), "摘要应回放成 user：{text}");
+            }
+            other => panic!("压缩锚点应回放为 message，收到 {other:?}"),
+        }
+        match &r.history[1] {
+            HistoryItem::Message { text, .. } => assert_eq!(text, "补一句"),
+            other => panic!("落单调用之后的消息必须保留，收到 {other:?}"),
+        }
     }
 
     #[test]
