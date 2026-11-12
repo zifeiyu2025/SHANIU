@@ -736,36 +736,32 @@ mod tests {
         assert!(out.output.contains("[exit code: 7]"));
     }
 
-    /// 真机用例（仅中文 Windows 生效）：cmd 的报错按 OEM 代码页（936/GBK）写管道，
-    /// 旧实现会 `InvalidData` 丢整行。这里要求模型侧拿到**可读中文** + 编码元数据，
-    /// 且不得出现替换字符。
-    #[tokio::test]
-    async fn gbk_error_message_is_readable_on_chinese_windows() {
-        if crate::text_encoding::system_oem_codepage() != 936 {
-            return;
-        }
-        let ws = workspace();
-        let out = UnifiedExec::new()
-            .execute(
-                serde_json::json!({"command": "type __shaniu_missing_file_9f3c__.txt"}),
-                &ctx(&ws),
-            )
-            .await
-            .unwrap();
-        assert!(!out.success, "输出: {}", out.output);
-        assert!(!out.output.contains('\u{FFFD}'), "输出: {}", out.output);
+    /// 自带真实 GBK 字节喂给解码器：要求解出中文，且元数据写明 `oem-936`。
+    ///
+    /// 不再依赖当前控制台代码页——英文系统上 cmd 报错是纯 ASCII，没有 GBK 字节可标记，
+    /// 按注册表判 936 再断言必然红。这里直接给「拒绝访问。」的 GBK 原字节。
+    #[test]
+    fn gbk_error_message_is_readable_with_oem_metadata() {
+        const GBK_ACCESS_DENIED: [u8; 10] = [
+            0xBE, 0xDC, 0xBE, 0xF8, 0xB7, 0xC3, 0xCE, 0xCA, 0xA1, 0xA3,
+        ];
+        let mut decoder = crate::text_encoding::StreamDecoder::new(936);
+        let lines = decoder.push_line(&GBK_ACCESS_DENIED);
+        assert_eq!(lines, vec!["拒绝访问。".to_string()]);
+        assert!(!lines[0].contains('\u{FFFD}'), "不许出现替换字符: {lines:?}");
         assert!(
-            out.output
-                .chars()
-                .any(|c| ('\u{4e00}'..='\u{9fff}').contains(&c)),
-            "应拿到可读中文，实际: {}",
-            out.output
+            lines[0].chars().any(|c| ('\u{4e00}'..='\u{9fff}').contains(&c)),
+            "确实要解出中文，实际: {lines:?}"
         );
-        assert!(
-            out.output.contains("oem-936"),
-            "缺少编码元数据: {}",
-            out.output
+        assert_eq!(
+            decoder.decision(),
+            Some(crate::text_encoding::StreamEncoding::Oem(936))
         );
+
+        let ledger = crate::text_encoding::EncodingLedger::new();
+        ledger.record(1, crate::text_encoding::StreamEncoding::Oem(936));
+        let note = ledger.note().expect("OEM 回退必须写编码元数据");
+        assert!(note.contains("oem-936"), "缺少编码元数据: {note}");
     }
 
     /// 不碰网络、不碰文件系统的「长命令」：超时 / 取消 / 后台终止用例的样本。
