@@ -546,6 +546,51 @@ mod tests {
         assert_eq!(classify(&odd, false), VerifyState::Failed);
     }
 
+    /// 环境问题不是代码失败：沙箱拒绝访问 / 磁盘满 / DNS 故障必须判 `Inconclusive`。
+    ///
+    /// 反向对照：把 `is_env_failure` 的特征串摘空，本条必须变红——否则闸门会拿模型
+    /// 根本修不好的问题去否决，并吃掉唯一一次验证额度。
+    #[test]
+    fn environment_failures_are_inconclusive_not_failed() {
+        for output in [
+            "error: 拒绝访问。 (os error 5)",
+            "error: No space left on device (os error 28)",
+            "error: failed to download: Could not resolve host: crates.io",
+        ] {
+            let run = crate::sandbox::capture::CapturedRun {
+                exit_code: 1,
+                timed_out: false,
+                output: output.into(),
+                duration_ms: 10,
+            };
+            assert_eq!(
+                classify(&run, false),
+                VerifyState::Inconclusive(InconclusiveReason::EnvFailure),
+                "环境故障必须判为 Inconclusive(EnvFailure)：{output}"
+            );
+        }
+    }
+
+    /// `baseline = off` 必须真的关掉基线判定；否则真回归会被当成「事先就红」而不拦。
+    #[test]
+    fn baseline_off_switch_disables_baseline() {
+        let off = VerifyConfig {
+            baseline: BaselineMode::Off,
+            ..Default::default()
+        };
+        assert!(!baseline_enabled(&off), "baseline=off 时不得采集/命中基线");
+        assert!(baseline_enabled(&VerifyConfig::default()), "默认 auto 必须启用基线");
+
+        // 开关关上时，同样的失败只能走 Failed，不许落到 PreExistingRed。
+        let run = crate::sandbox::capture::CapturedRun {
+            exit_code: 2,
+            timed_out: false,
+            output: "something odd happened".into(),
+            duration_ms: 10,
+        };
+        assert_eq!(classify(&run, baseline_enabled(&off)), VerifyState::Failed);
+    }
+
     #[test]
     fn baseline_requires_exact_command_and_same_signature() {
         let mut baseline = BaselineCache::default();

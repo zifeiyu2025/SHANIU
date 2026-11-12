@@ -2414,6 +2414,83 @@ mod tests {
         );
     }
 
+    /// 否决额度是硬顶：被否决一次后，模型再次写坏也只如实披露，不得再否决。
+    ///
+    /// 反向对照：删掉闸门里的 `!veto_ledger.verify_used`，`turns` 会从 4 变 5。
+    #[tokio::test]
+    async fn verification_gate_vetoes_at_most_once_then_discloses() {
+        // 会起沙箱进程，与建/删 profile 的用例串行（同上）。
+        let _serial = crate::sandbox::appcontainer::PROFILE_TEST_MUTEX.lock().await;
+        let (agent, store, cancel, _ws) = verify_demo(
+            vec![
+                script_call_with(
+                    "apply_patch",
+                    r#"{"path":"src/lib.rs","body":"pub fn f() {}"}"#,
+                    "w1",
+                ),
+                script_text("写完了"),
+                script_call_with(
+                    "apply_patch",
+                    r#"{"path":"src/lib2.rs","body":"pub fn g() {}"}"#,
+                    "w2",
+                ),
+                script_text("还是写完了"),
+                // 若第二票仍能否决，这个回合会被消费掉并让 `turns` 变 5。
+                script_text("结束"),
+            ],
+            vec!["exit 1".into()],
+            6,
+            crate::config::VerifyMode::Enforce,
+        );
+        let summary = agent.run_task("任务", Arc::new(CapturingSink(store.clone())), cancel).await;
+
+        assert_eq!(summary.reason, TurnEndReason::Completed);
+        let events = store.lock().unwrap();
+        let states = verification_states(&events);
+        assert_eq!(
+            summary.turns, 4,
+            "第二次失败不得再否决（硬顶每任务一票）；实际裁决序列 {states:?}"
+        );
+        assert_eq!(
+            states,
+            vec![
+                crate::events::VerifyState::Failed,
+                crate::events::VerifyState::Failed
+            ]
+        );
+        assert!(completed_unverified(&events), "第二次失败必须如实标记未验证");
+    }
+
+    /// 环境故障算「判不出来」，不得否决——模型改代码也修不好。
+    ///
+    /// 反向对照：把 `is_env_failure` 的特征串摘空，本条会退化成 `Failed` 并否决。
+    #[tokio::test]
+    async fn verification_gate_does_not_veto_on_environment_failure() {
+        // 会起沙箱进程，与建/删 profile 的用例串行（同上）。
+        let _serial = crate::sandbox::appcontainer::PROFILE_TEST_MUTEX.lock().await;
+        let (agent, store, cancel, _ws) = verify_demo(
+            vec![
+                script_call_with("apply_patch", r#"{"body":"pub fn f() {}"}"#, "w1"),
+                script_text("写完了"),
+                script_text("不该跑到"),
+            ],
+            vec!["echo Could not resolve host: example.invalid & exit /b 1".into()],
+            4,
+            crate::config::VerifyMode::Enforce,
+        );
+        let summary = agent.run_task("任务", Arc::new(CapturingSink(store.clone())), cancel).await;
+
+        let events = store.lock().unwrap();
+        assert_eq!(summary.turns, 2, "环境故障不得否决续跑");
+        assert_eq!(
+            verification_states(&events),
+            vec![crate::events::VerifyState::Inconclusive(
+                crate::events::InconclusiveReason::EnvFailure
+            )]
+        );
+        assert!(completed_unverified(&events), "环境故障也必须如实标记未验证");
+    }
+
     #[tokio::test]
     async fn verification_gate_counts_terminal_pass_without_rerunning() {
         let (agent, store, cancel, _ws) = verify_demo(
