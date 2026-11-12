@@ -32,7 +32,7 @@ DSH 把权限拆成两个独立旋钮，预设只是两个旋钮的一个**捆�
 | id | 中文名 | English | 说明原文 | 捆绑 | 语义 | 可作默认 | 判定 |
 | --- | --- | --- | --- | --- | --- | --- | --- |
 | `read-only` | 仅可查看 | Read Only | 只读查看，不产生任何写入<br>`Read-only access, no writes at all` | `read-only` + `ask` | 文件写入全部拒绝；执行本身不被审批层拦，由沙箱在写入点拒绝 | 仅当部署把它写进预设表 | **我们更严**：我们连命令执行都拒绝，且额外做工作区外读隔离（见 §4.2） |
-| `workspace-write` | 工作区内修改 | Workspace Write | 「仅在工作区内读写」<br>`Read and write inside the workspace only`<br>宿主 catalog：`Write inside the workspace and permitted temporary directories; wider retries require approval.` | `workspace-write` + `ask` | 工作区与允许的临时目录内可写；越界重试需要审批 | 是（出厂默认表） | **当前更严**（区内写入多问一次）；取证支持对齐，见 §4.1；命令执行仍更严 |
+| `workspace-write` | 工作区内修改 | Workspace Write | 「仅在工作区内读写」<br>`Read and write inside the workspace only`<br>宿主 catalog：`Write inside the workspace and permitted temporary directories; wider retries require approval.` | `workspace-write` + `ask` | 工作区与允许的临时目录内可写；越界重试需要审批 | 是（出厂默认表） | **一致**（区内写入不弹，`4573527` 落地，见 §4.1）；命令执行仍更严（我们额外询问） |
 | `danger-full-access` | 完全权限 | Full access | 「不受工作区边界限制」<br>`Not limited by the workspace boundary`<br>宿主 catalog：`Full file access without approval prompts.` | `danger-full-access` + `never` | 绕过文件沙箱；不再弹审批；需要审批的操作在 `never` 下确定性拒绝 | 是（出厂默认表） | **一致**（文件边界/不弹窗/需审批者拒绝）；计划评审放行是本仓扩展 |
 | `auto`（EXP） | 自动审查 | Auto review | 「无沙箱运行；每次原生工具调用和 PTC 内层调用前由同一模型进行实验性审查。」<br>`Run without a sandbox after an experimental same-model review of every native tool call and PTC inner call.` | `danger-full-access` + `ask` + 每次调用同模型审查 | 无沙箱；审查器拒绝后 `ask` 把决定交回用户，子代理被钉成 `never` 时拒绝即终局 | 否（仅当前会话，插件在线才出现） | **缺口**：缺同模型审查器，不提供 |
 | `custom` | Custom（原文即英文） | Custom | `Current sandbox and approval settings do not match a preset.` | 无 | **派生状态**：当前两维组合不匹配任何预设；不是切换目标，不进事件 | 否 | **缺口**：需补派生值，禁止回落成具体档 |
@@ -57,7 +57,7 @@ DSH 把权限拆成两个独立旋钮，预设只是两个旋钮的一个**捆�
 | DSH 档 | 我们的组合 | Read | WriteInWorkspace | Execute | Destructive | PlanReview | 结论 |
 | --- | --- | --- | --- | --- | --- | --- | --- |
 | `read-only` | `read_only` + `on_request` | L | D | **D** | P | P | **我们更严**：写入语义一致，执行与工作区外读隔离都比 DSH 严（§4.2） |
-| `workspace-write` | `workspace_write` + `on_request` | L | **P→L**（§4.1） | P（可记忆） | P | P | **当前更严**：区内写入多问一次，取证后对齐；执行仍比 DSH 严 |
+| `workspace-write` | `workspace_write` + `on_request` | L | L（§4.1） | P（可记忆） | P | P | **更严**：区内写入与 DSH 一致（`4573527` 落地，2026-11-12 用户裁定不回收为 `Prompt`）；执行仍比 DSH 严 |
 | `danger-full-access` | `danger_full_access` + `never` | L | L | L | D | D→**L+审计**（上轮批准的目标） | **一致**（文件边界/不弹窗/需审批者拒绝）；计划评审放行是本仓扩展 |
 | `auto` | `danger_full_access` + `on_request` | L | L | P | P | P | **缺口**：只映射到旋钮，缺「同模型逐调用审查器」，不能声称等价 |
 | `custom` | 任意不匹配组合（如 `workspace_write` + `on_failure`） | — | — | — | — | — | **缺口**：我方计划里会把组合塌缩到某个预设，DSH 明确要求 `custom` |
@@ -80,8 +80,15 @@ DSH 把权限拆成两个独立旋钮，预设只是两个旋钮的一个**捆�
   ——「wider retries」才需要审批，区内写入不在其列。
 - 沙箱边界由文件系统后端执行（`sandbox-windows-acl/src/index.ts`），不是由审批层逐次询问。
 
-**我方现状：更严。** `decide(WriteInWorkspace, OnRequest, WorkspaceWrite) = Prompt`，
-每个 `apply_patch` 都要点一次。
+**我方现状：已对齐（`4573527`）。** `decide(WriteInWorkspace, OnRequest, WorkspaceWrite) = Allow`，
+区内写入不弹审批；`Execute` 仍逐次询问（这一维没有对齐，见 §3 结论列）。
+
+> **2026-11-12 裁决（重要，别改回去）**：曾有一版方案把 `WriteInWorkspace` 在
+> `workspace_write` + `on_request` 下回收成 `Prompt`（理由是「用户分不清改文件工具和
+> 命令行工具」），该方案**已被用户撤回**——「权限档位对齐 dsh 就行，不要搞复杂」。
+> 现在的口径是：**保持 `Allow`，与 DSH 一致**；同时删掉自造的扩展档
+> `workspace-write-auto`（见 §6/§7），无人值守就走 `danger-full-access`（DSH 同款答案）。
+> 谁要再动这一支，先回来改本节和 §3，不要在代码里单方面改。
 
 **能否对齐（改成一致）：可以，前提是下面三条同时成立。**
 
@@ -137,6 +144,15 @@ DSH 把权限拆成两个独立旋钮，预设只是两个旋钮的一个**捆�
   dsh 明确不拦读。
 - 网络：两边都不按策略断网；我们额外拦 loopback（`:211-236`），dsh 连 loopback 也不拦。
 
+**产品口径（2026-11-12，只写文档、不改界面、不改行为）**：`read-only` 只约束**文件写入**，
+不约束联网——`web_search` / `web_fetch` 的风险级是 `read`（`permission/policy.rs` 的
+`risk_of`），只读档下照常可用。这不是放宽，而是 DSH 的 read-only 本来就不按策略断网
+（`sandbox-windows-acl/src/index.ts:26-31`：「writes are restricted; reads, network,
+and process visibility are NOT」）。用户若把「只读」理解成「数据出不去」，缺的是一句
+说明，不是一道禁令；禁掉联网会让只读档连调研都做不了。**因此本条不落界面文案、
+不改策略表**，只在这里留档，防止下一个人把它当成「只读档漏了禁网」。跑一次
+`cargo test --lib permission::` 即可复验 `risk_of` 对两个 web 工具的 `read` 归属。
+
 **能否对齐：本轮不能证明，保留现状。**
 
 - ACL 原语本身有真进程证据：`Access::Read` 的 AppContainer 能读、写同一目录失败
@@ -161,17 +177,17 @@ DSH 把权限拆成两个独立旋钮，预设只是两个旋钮的一个**捆�
    **适用范围只有 `read-only` 沙箱预设**：计划态不能执行命令走的是另一套机制
    （工具白名单），不由此条派生，也不是它的副作用——见 §9 末条。
    计划态能否执行命令**已决定不做**（2026-11-12），理由见 §9 末条。
-4. **`workspace-write` 的工作区内写入更严**：DSH 在 `ask` 下工作区内写入不弹窗，
-   我们每个补丁都问。取证（§4.1）支持对齐：路径校验与 ACL 都成立，补三条测试后
-   把 `WriteInWorkspace` 在 `on_request` 下改为 `Allow`。注意这只解决「写」，
-   `Execute` 在 `on_request` 下仍询问，所以无人值守仍需预授权档（见 §6/§7）。
-   （本条是 2026-11-11 的缺口记录；④-1 已在 `4573527` 落地，当前行为见 §9。）
+4. ~~**`workspace-write` 的工作区内写入更严**~~：**已关闭**。④-1 在 `4573527` 落地
+   （`WriteInWorkspace` 在 `on_request` 下为 `Allow`，与 DSH 一致），2026-11-12 用户
+   再次裁定「对齐 dsh 就行」，**不回收为 `Prompt`**（见 §4.1 的裁决框）。
+   这只解决「写」：`Execute` 在 `on_request` 下仍询问；无人值守的出口是
+   `danger-full-access`（原来那档自造扩展已删，见 §6/§7）。
 
 ## 6. 反向：我们有 / 计划有、DSH 没有
 
 | 本仓档位 | DSH 是否有 | 处理 |
 | --- | --- | --- |
-| `workspace-write-auto`（计划新增：`workspace_write` + `never`） | **没有**。DSH 从不把 `workspace-write` 与 `never` 捆绑；它唯一的无人值守路径是 `danger-full-access`+`never` | **明确标为扩展**：id 保留，文案自拟；**「扩展」只作内部标记（本表/代码注释/`docs/07`），界面不出现该字样**；理由——上一条硬要求禁止把无人值守做成完全访问，DSH 没有「工作区内无人值守」档，这个组合只能由我们补 |
+| ~~`workspace-write-auto`~~（`workspace_write` + `never`） | **没有**。DSH 从不把 `workspace-write` 与 `never` 捆绑；它唯一的无人值守路径是 `danger-full-access` + `never` | **2026-11-11 曾加、2026-11-12 已移除**（用户裁定：「权限档位对齐 dsh 就行，不要搞复杂」）。想不被打断就选 `danger-full-access`。删档后 `workspace_write` + `never` 落到派生值 `custom`，**不回落到 `workspace-write`**（那是静默放宽审批）也不回落到 `danger-full-access`（那是静默放宽沙箱） |
 | `on_failure` / `full_access` | 没有 | 保留在 `config.toml`，**不进预设**；生效时按 DSH 口径显示为 `custom` |
 | `unavailable`（我们已有的前端状态） | 没有 | 已有扩展，`docs/07` 已登记 |
 | `enter_plan_mode` / `exit_plan_mode`（PlanReview） | DSH 的计划模式不走审批策略 | 本仓扩展；按上轮批准：预授权档（`never`/`on_failure`/`full_access`）放行并在时间线留痕，`on_request` 仍询问 |
@@ -183,24 +199,29 @@ DSH 把权限拆成两个独立旋钮，预设只是两个旋钮的一个**捆�
 | 1 | `read-only` | `read_only` + `on_request` | DSH 原文（仅可查看 / Read Only；只读查看，不产生任何写入） | DSH 已知档（本部署配置启用） |
 | 2 | `workspace-write` | `workspace_write` + `on_request` | DSH 原文（工作区内修改 / Workspace Write；仅在工作区内读写） | DSH 出厂档 |
 | 3 | `danger-full-access` | `danger_full_access` + `never` | DSH 原文（完全权限 / Full access；不受工作区边界限制）+ DSH 确认弹窗 | DSH 出厂档 |
-| 4 | `workspace-write-auto` | `workspace_write` + `never` | **自拟**（文案见下；内部标扩展，界面不展示） | 扩展（DSH 无） |
 | — | `custom` | 派生 | DSH 原文（Custom） | 派生状态，不可选 |
 | — | `unavailable` | 派生 | 本仓原文（读取失败 / Unreadable） | 本仓扩展 |
 
-`workspace-write-auto` 文案（已定稿并落地）：
-- 中文名：**工作区内自动**；英文名：**Workspace Write (auto)**
-- 中文说明：**在工作区内读写与执行，不再逐次确认**（破坏性操作仍由 `decide` 拒绝，见 §3 的 `danger-full-access` 行同一套 fail-closed）
-- 英文说明：**Read, write and run inside the workspace without per-action confirmation**
-- 语言覆盖：除 `zh` / `en` 之外的 6 套语言里 **`ja` 已译**；**`es` / `fr` / `de` / `ru` / `pt` 五套走英文原文回落**（与上游 `auto.*` 只译 `ja` 的做法一致）。
-  这是**刻意安排，不是漏翻**——看到半套翻译不要去补；要补就先把 `auto.*` 一起补齐，
-  并同步改 `docs/07` 第 30 行（那里是给同步上游的人看的同一句话）。
+**第 4 档（`workspace-write-auto`）已删除（2026-11-12）**：
+- 曾用中文名「工作区内自动」/ 英文名「Workspace Write (auto)」，说明「在工作区内读写与执行，不再逐次确认」，
+  词典键 `preset.workspaceWriteAuto{,.description}`，并有 8 套语言的 label（`ja` 已译，其余五套走英文回落）。
+- 删除原因：用户裁定「权限档位对齐 dsh 就行，不要搞复杂」。DSH 没有「工作区内无人值守」档，
+  想不被打断就是 `danger-full-access`。
+- 删除范围：`preset.rs` 的表与字段、`permission-presets.ts` 与 spec、vendored `presentation.ts` /
+  `locales.ts` 的 24 条 auto 词条、`docs/04` 的两处 id 列表、本文件、`docs/07` 第 30 行（改为
+  「曾加后移除」的如实记录）。**没有改写历史提交**，用新提交移除。
+- 代价：旧档案里记过 `permission_preset = "workspace-write-auto"` 的会话，恢复时
+  `from_id` 已认不出该 id，会回落到部署默认档（默认 `read-only`），而不是 `workspace-write` 或
+  `danger-full-access`——**宁可退回更严的档，也不静默替用户放宽**。想恢复原来的无人值守，
+  重新选 `danger-full-access` 即可（这是刻意的回落方向，不是 bug）。
 
 ## 8. 这次对齐对上一轮方案的影响
 
 1. 预设 id 保留 `read-only` / `workspace-write` / `danger-full-access`，
    `danger-full-access` 的捆绑正好就是 DSH 出厂值（`never`），无需发明。
-2. `workspace-write-auto` **不是 DSH id**，保留为扩展，但「扩展」只写在本表、
-   代码注释与 `docs/07`，**界面文案不出现该字样**；也不能把它说成 DSH 的 `auto`
+2. ~~`workspace-write-auto` 保留为扩展~~ → **2026-11-12 已删除**：它不是 DSH id，
+   产品也不需要多一档；动态增删档位会让用户对「哪档问、哪档不问」失去稳定预期。
+   想不被打断就用 `danger-full-access`。它也不能被说成 DSH 的 `auto`
    （`auto` = 无沙箱 + 同模型审查，语义完全不同）。
 3. `id_of` 在非规范组合下必须返回 `custom`，不得回落成某个具体预设；
    **用例覆盖 `on_failure`、`full_access` 与任意混搭，且断言 `custom` 不可选**。
@@ -216,7 +237,8 @@ DSH 把权限拆成两个独立旋钮，预设只是两个旋钮的一个**捆�
 
 **落点**
 
-- 预设表：`src-tauri/src/permission/preset.rs`（`PRESETS` 四档 + `CUSTOM` 派生）；
+- 预设表：`src-tauri/src/permission/preset.rs`（`PRESETS` **三档** + `CUSTOM` 派生；
+  2026-11-12 移除第四档 `workspace-write-auto`，见 §6/§7）；
   前端同一张表：`src/transport/permission-presets.ts`（`PRESET_BUNDLES` / `PRESET_TO_SANDBOX`）。
 - 三条单一写入面：设置页 `save_settings { permission_preset? }`、会话 `set_session_permission_preset`、
   任务 `send_task { permission_preset? }`。都不接受「只改沙箱」或「只改审批」。
@@ -230,6 +252,10 @@ DSH 把权限拆成两个独立旋钮，预设只是两个旋钮的一个**捆�
 - ④-1（`workspace-write` 区内写入对齐 DSH）在 `4573527` 落地，三条路径测试（绝对路径、
   已存在软链接、中间层 junction）同笔。
 - ④-2（`read-only` 仍拒绝执行）保留，§2 与 §3 标「我们更严」。
+- **2026-11-12**：按用户裁定移除扩展档 `workspace-write-auto`（提交说明写明「对齐 dsh、
+  不保留扩展档」），档位集合回到 DSH 的三档。同时**撤回**「`workspace-write` 写入改问」
+  的另一版方案——`WriteInWorkspace` 在 `on_request` 下保持 `Allow`（见 §4.1 裁决框）。
+  旧档案里该 id 恢复时回落部署默认档（更严方向），代价记在 §7。
 - **计划态不能执行命令与之无关**（原稿写成「计划态是 Read 档、是 ④-2 的副作用」，错）。
   真实机制是**工具白名单**：`plan_mode_allows` 只放行 Read 档工具与 `exit_plan_mode`
   （`permission/policy.rs:460-465`），执行侧由 `agent_loop/mod.rs:1207` 兜底拒绝、
@@ -238,7 +264,7 @@ DSH 把权限拆成两个独立旋钮，预设只是两个旋钮的一个**捆�
   执行无关——`danger-full-access` 下开计划态同样不能执行命令。
   「计划态能否执行只读命令做调研」**已决定不做**（2026-11-12 裁决，保持现状、不放开白名单），
   **这是决策，不是欠账**，不再挂待议：白名单一旦放开，计划态内的执行会继承会话当前预设——
-  在 `workspace-write-auto` 下等于**规划期就握有完整命令权限**，而规划恰恰是最该克制的阶段。
+  在 `danger-full-access` 下等于**规划期就握有完整命令权限**，而规划恰恰是最该克制的阶段。
   代价与替代口径也一并记下：放开只能改 `plan_mode_allows`，**改 ④-2 无效**
   （那只会放开所有 read-only 会话，与计划态无关）；要做也只能做成「计划态专用的只读命令白名单」，
   那是另立需求，不是本账的遗留项。
