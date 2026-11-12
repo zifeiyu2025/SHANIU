@@ -250,6 +250,11 @@ impl SkipReason {
     }
 }
 
+/// `#[serde(skip_serializing_if)]` 的布尔谓词：只落有信息的键，`false` 走缺省。
+fn is_false(value: &bool) -> bool {
+    !*value
+}
+
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(tag = "type", rename_all = "snake_case")]
 pub enum EventMsg {
@@ -264,7 +269,11 @@ pub enum EventMsg {
         /// 写后验证闸门（additive）：本回合在「有源码写入但未验证」的情况下结束。
         /// 末轮不可否决时它会是 `true`，且不会伴随 `VerificationResult`——这是设计
         /// 明确披露的窗口，不是漏报。旧档案没有该字段，按 `false` 解码。
-        #[serde(default)]
+        ///
+        /// `false` 时不落键：`04 §1.2` 把它写成 `unverified?: bool`（缺省即 false），
+        /// 而 FF-104 要求旧事件载荷的键集合一个都不能多——无条件序列化会让
+        /// `turn_completed` 凭空多出一个键，旧消费端的严格校验直接失败。
+        #[serde(default, skip_serializing_if = "is_false")]
         unverified: bool,
     },
     /// 写后验证闸门（additive，docs/04 §1.2）：宿主执行项目检查命令的结果。
@@ -835,6 +844,38 @@ mod envelope_tests {
             Ok(())
         })
         .unwrap();
+    }
+
+    /// 写后验证闸门给 `turn_completed` 加了 `unverified`：FF-104 要求旧事件的载荷
+    /// 键集合一个都不能多，所以 `false` 必须不落键、`true` 才出现（04 §1.2 写的就是
+    /// `unverified?: bool`，缺省即 false）。两个方向都钉住，别让 skip 被顺手改回去。
+    #[test]
+    fn turn_completed_only_carries_unverified_when_it_is_true() {
+        let keys = |msg: EventMsg| -> std::collections::BTreeSet<String> {
+            serde_json::to_value(msg).unwrap().as_object().unwrap().keys().cloned().collect()
+        };
+        let clean = keys(EventMsg::TurnCompleted {
+            turn: 1,
+            reason: TurnEndReason::Completed,
+            error: None,
+            unverified: false,
+        });
+        assert_eq!(
+            clean,
+            ["type", "turn", "reason"].into_iter().map(str::to_string).collect(),
+            "false 时不得落键：旧消费端的严格键集合校验（FF-104）不能因 additive 字段被打红"
+        );
+
+        let dirty = keys(EventMsg::TurnCompleted {
+            turn: 1,
+            reason: TurnEndReason::Completed,
+            error: None,
+            unverified: true,
+        });
+        assert!(
+            dirty.contains("unverified"),
+            "true 必须落键，否则「改过源码但没验证」的披露窗口丢失：{dirty:?}"
+        );
     }
 
     /// M2 验收：WS 有在线订阅者时，同一条事件不再被第二次投递到 Tauri IPC；
