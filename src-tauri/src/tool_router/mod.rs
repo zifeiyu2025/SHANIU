@@ -761,30 +761,12 @@ fn check_name(name: &str, existing: &[&str]) -> Result<(), RegisterError> {
 /// （SH-085 的真实成因，基线里那条任务就是这么死的）。
 /// 只在**安全校验之后**调用：越界判定仍用 canonical 路径做，还原不改变指向的位置。
 /// 非 verbatim（普通绝对/相对路径）原样返回。
+///
+/// 实现下沉在 [`crate::config::path_norm::strip_verbatim`]：`sandbox` / `mcp_client`
+/// 也要用同一套前缀规则，而它们在本模块之下，不能反向依赖 `tool_router`
+/// （docs/01 §2.3.1）。这里只保留公开名字，供既有调用点与文档引用。
 pub fn shell_usable(path: &Path) -> PathBuf {
-    let mut components = path.components();
-    match components.next() {
-        Some(std::path::Component::Prefix(prefix)) => match prefix.kind() {
-            // drive 是 ASCII 码（u8），必须转成字符；根已在字符串里给出，
-            // 后面的 RootDir 组件必须跳过，否则拼出 "D:\\\x"
-            std::path::Prefix::VerbatimDisk(drive) => {
-                let mut out = PathBuf::from(format!("{}:\\", char::from(drive)));
-                out.extend(components.filter(|c| !matches!(c, std::path::Component::RootDir)));
-                out
-            }
-            std::path::Prefix::VerbatimUNC(host, share) => {
-                // host/share 是 OsStr，不能进 format!；用 push 逐段拼
-                let mut out = PathBuf::from(r"\\");
-                out.push(host);
-                out.push(share);
-                out.extend(components.filter(|c| !matches!(c, std::path::Component::RootDir)));
-                out
-            }
-            // 其它前缀（\\.\、\?\ 设备路径等）不是 canonicalize 的产物，原样交出
-            _ => path.to_path_buf(),
-        },
-        _ => path.to_path_buf(),
-    }
+    crate::config::path_norm::strip_verbatim(path)
 }
 
 /// 解析工作区内路径：绝对路径与相对路径统一，canonicalize 后校验不越界。
