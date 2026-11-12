@@ -4,12 +4,23 @@
 //! 1) 工作区内写入应成功——证明沙箱本身可用（否则"越界被拒"可能是沙箱根本没跑起来）；
 //! 2) 工作区外写入应失败——FF-3 的核心不变量；
 //! 3) 工作区外读取应失败——AppContainer 的读隔离（SH-021）；
+//!    2026-11-12 实测口径收紧：读隔离是**按对象**的，只覆盖 DACL 里没有
+//!    `ALL APPLICATION PACKAGES` / 容器 SID 的位置。用户目录（`%USERPROFILE%`）下的
+//!    越界读取确实被拒（err 5），但系统目录仍可读（容器能 `type` 出
+//!    `C:\Windows\System32\drivers\etc\hosts`）。不要把它写成"整个文件系统都读不到"。
 //! 4) loopback 隔离——容器连不回宿主 127.0.0.1 端口（与网络能力无关的另一条边界）；
 //!    出网本身是默认能力，正向证据见 `container_reaches_internet_without_any_grant`；
-//! 5) 受限令牌层独立生效——逻辑沙箱路径同样剥离特权（纵深两层各自可验证）。
+//! 5) 祖先链 `(RA,S)`——容器能对祖先取属性、但列举与读内容仍被拒（`ancestor_chain_*`）；
+//! 6) 受限令牌层独立生效——逻辑沙箱路径同样剥离特权（纵深两层各自可验证）。
 //!
 //! 允许位置按用户 2026-11-08 的决定：工作区根 / temp / 工具链目录。
 //! 因此"越界"探针的目标**不能放在 temp**——temp 是明确授权的位置。
+//!
+//! **探针工作区位置（2026-11-12 改）**：`%USERPROFILE%\.shaniu-probe\`，不再用 `%TEMP%`。
+//! `%TEMP%` 上留着旧版本写下的**可继承**容器 ACE `(OI)(CI)(M,DC)`（本机已清掉），
+//! 在其下新建的目录会继承它——那样「容器能写工作区」可能只是残留 ACE 的功劳，
+//! 用例的绿不可信。`.shaniu-probe` 不在 `write_scope` 里，父链上也没有我们的 ACE，
+//! 所以这里的绿只可能来自当场显式授权。
 
 #![cfg(windows)]
 
@@ -21,19 +32,41 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use shaniu_lib::config::SandboxMode;
-use shaniu_lib::sandbox::{prepare_spawn, PreparedSpawn};
+use shaniu_lib::sandbox::acl::AncestorGrant;
+use shaniu_lib::sandbox::appcontainer::PROFILE_NAME;
+use shaniu_lib::sandbox::{
+    ensure_ancestor_for, prepare_spawn, revoke_ancestor_for, PreparedSpawn,
+};
 use tokio::sync::mpsc;
 
 static SEQ: AtomicUsize = AtomicUsize::new(0);
 
+/// 探针工作区的父目录（`%USERPROFILE%\.shaniu-probe`）。
+///
+/// 关键是它**不是**任何授权位置：`write_scope` 只含工作区根 / temp / 工具链，
+/// 所以这层不会被运行期顺手写上我们的可继承 ACE。
+const PROBE_BASE: &str = ".shaniu-probe";
+
+fn probe_base() -> PathBuf {
+    let home = std::env::var_os("USERPROFILE").expect("探针需要 USERPROFILE 定位工作区");
+    let base = PathBuf::from(home).join(PROBE_BASE);
+    std::fs::create_dir_all(&base).unwrap();
+    base
+}
+
+/// 探针工作区：`%USERPROFILE%\.shaniu-probe\<tag>-<pid>-<n>`。
+///
+/// 以前建在 `%TEMP%`，那里留着旧版本的可继承容器 ACE `(OI)(CI)(M,DC)`：新建目录会
+/// **继承**它，于是「容器能写工作区」这类断言可能是靠残留 ACE 变绿的。换到一条干净
+/// 父目录后，绿只可能来自 `app_container_scope` 当场显式写的那一条。
 fn unique_dir(tag: &str) -> PathBuf {
     let n = SEQ.fetch_add(1, Ordering::SeqCst);
-    let dir = std::env::temp_dir().join(format!("shaniu-probe-{tag}-{}-{n}", id()));
+    let dir = probe_base().join(format!("{tag}-{}-{n}", id()));
     std::fs::create_dir_all(&dir).unwrap();
     dir
 }
 
-/// 工作区外、且不在 temp / 工具链目录里的位置（用户主目录下）。
+/// 工作区外、且不在 temp / 工具链目录里的位置（用户主目录下，与 `PROBE_BASE` 平级）。
 fn outside_dir(tag: &str) -> PathBuf {
     let n = SEQ.fetch_add(1, Ordering::SeqCst);
     let home = std::env::var_os("USERPROFILE").expect("探针需要 USERPROFILE 定位工作区外目录");
@@ -110,95 +143,113 @@ async fn sandbox_denies_write_outside_workspace() {
     std::fs::remove_dir_all(&outside).ok();
 }
 
-/// 祖先链（docs/04 §1.5.1）：容器能**穿过**祖先目录并读它的属性，但不能**列举**它。
+/// 祖先链 `(RA,S)` 的验收探针（docs/04 §1.5.1、docs/14）。
 ///
-/// 四组断言（用户的验证口径）：
-/// 1) `metadata(祖先)` 成功——构建工具逐段探测路径依赖这一条；
-/// 2) `read_dir(祖先)` 失败——`Traverse` 掩码不含 `FILE_LIST_DIRECTORY`；
-/// 3) 读祖先下**未授权**文件失败——路过不等于可读；
-/// 4) `read_dir(工作区)` 成功——正向对照，否则前三条可能只是「沙箱根本没跑起来」。
+/// **它证明什么，不证明什么**：穿越祖先本来就不需要 ACE（`SeChangeNotifyPrivilege`
+/// 由对象管理器绕过 `FILE_TRAVERSE`），所以这里不断言"能穿过"。断的是「对该对象本身
+/// 能不能取属性 / 能不能列举」：
+/// 1) `metadata(祖先)` 成功——构建工具逐段 `fs::metadata` 依赖这一条；
+/// 2) `read_dir(祖先)` 失败——`(RA,S)` 不含 `FILE_LIST_DIRECTORY`，不暴露条目名；
+/// 3) 读祖先下**未授权兄弟目录**里的文件失败——路过不等于可读；
+/// 4) `read_dir(工作区)` 成功——正向对照，否则前三条可能只是"沙箱根本没跑起来"。
 ///
-/// 靶点用 `%USERPROFILE%`（本机 `C:\Users\jun`）：它是工作区（`%TEMP%` 下）的祖先。
-/// 盘根 `C:\`/`C:\Users` 在非提权下写不进 DACL，运行期只能降级（见 `acl::grant_chain`）。
+/// 靶点用探针自造的 `.shaniu-probe`（`%USERPROFILE%` 下一层）：它是工作区的父目录，
+/// 自己没有任何容器 ACE，所以 `(RA,S)` 的效果不会被别人的继承 ACE 盖住。
+/// `C:\Users` 那一级写不进去（owner=SYSTEM、普通用户没有 `WRITE_DAC`），本用例不碰。
 ///
-/// 用 `if exist` 而不是 `dir` 探测存在性：AppContainer 下 `cmd /C dir` 实测静默无输出
-/// （`sandbox_streams_every_output_line` 里有记录），会把「能读属性」误判成失败。
-///
-/// **当前必红，因此标 `#[ignore]`**：运行期已不做祖先写入（代价见 docs/13），
-/// 真机实测即便把 `Traverse` 写进 `%USERPROFILE%`，容器仍读不到它的属性——
-/// `C:\`、`C:\Users` 两级在非提权下写不进（审计 `result:"denied"`，err 5），
-/// 路径解析在盘根就断了。本用例是**安装期预置盘根 Traverse（docs/13 方案 A）的验收探针**，
-/// 预置完成后再打开。
+/// 收尾按 `existed_before` 决定：只有 `Written{existed_before:false}` 才是我们独创的，
+/// 才撤销；`AlreadyPresent` 说明盘上本来就有（可能是别人的），不删。
 #[tokio::test]
-#[ignore = "需要安装期预置盘根 Traverse（docs/13 方案 A）；非提权环境必红"]
 async fn ancestor_chain_allows_metadata_but_not_listing_or_reads() {
+    let base = probe_base();
     let ws = unique_dir("traverse");
     std::fs::write(ws.join("inside.txt"), "inside").unwrap();
-    let home = std::env::var("USERPROFILE").expect("需要 USERPROFILE 定位祖先目录");
-    let outside = outside_dir("ancestor");
-    let secret = outside.join("secret.txt");
+    // 兄弟目录：在已授权祖先之下、但自身没有任何 ACE——用来证明"路过 ≠ 可读"。
+    let sibling = base.join(format!(
+        "sibling-{}-{}",
+        id(),
+        SEQ.fetch_add(1, Ordering::SeqCst)
+    ));
+    std::fs::create_dir_all(&sibling).unwrap();
+    let secret = sibling.join("secret.txt");
     let marker = "SHANIU-ANCESTOR-SECRET-MARKER";
     std::fs::write(&secret, marker).unwrap();
 
-    // 路径含空格时 `for` 的通配不会展开（cmd 的引号规则），这里如实失败而不是静默放过。
+    let ancestor = base.display().to_string();
+    // 路径含空格时 `for` 的通配不会展开（cmd 的引号规则），如实失败而不是静默放过。
     assert!(
-        !home.contains(' '),
-        "探针要求 USERPROFILE 不含空格（cmd for 通配无法带引号）：{home}"
+        !ancestor.contains(' '),
+        "探针要求祖先路径不含空格（cmd for 通配无法带引号）：{ancestor}"
     );
-    // 每条探针单独起一个容器进程：`if ... else ...` 后面接 `&` 会被 cmd 解析吞掉后半行，
-    // 合在一条里跑会得到「后面全都没执行」的假绿。
+
+    let grant = ensure_ancestor_for(&base, PROFILE_NAME).expect("补祖先 (RA,S) 失败");
+    eprintln!("[ancestor-probe] 祖先 {} → {}", ancestor, grant.as_str());
+
+    // 取属性的**唯一**可信载体是 `GetFileAttributes` 本身。实测（2026-11-12，同一条
+    // `(RA,S)` 下）：`[IO.File]::GetAttributes` → OK，而 cmd 内建 `if exist` / `attrib`
+    // → 拒绝或"找不到路径"。cmd 内建命令是按父目录 `FindFirstFile` 解析的，
+    // 要的是父目录的 `FILE_LIST_DIRECTORY`（容器没有），所以它们**不能**用来验 metadata。
     let (_c1, meta) = run_sandboxed_capture(
         &ws,
-        &format!("if exist {home} (echo META_OK) else (echo META_DENIED)"),
+        &format!(
+            "powershell -NoProfile -NonInteractive -Command \"try{{[IO.File]::GetAttributes('{ancestor}')|Out-Null;'META_OK'}}catch{{'META_DENIED'}}\""
+        ),
     )
     .await;
-    let (_c2, listing) =
-        run_sandboxed_capture(&ws, &format!("for /D %f in ({home}\\*) do @echo LIST:%f")).await;
+    let (_c2, listing) = run_sandboxed_capture(
+        &ws,
+        &format!("for /D %f in ({ancestor}\\*) do @echo LIST:%f"),
+    )
+    .await;
     let (_c3, read) = run_sandboxed_capture(&ws, &format!("type \"{}\"", secret.display())).await;
     // 正向对照不能用 `for %f in (*)`：沙箱进程的 cwd 不保证是工作区，会变成列 System32。
+    // 通配必须用反斜杠：`(<path>/*)` 里的 `/` 会被 cmd 当成选项分隔符，把最后一级目录吃掉，
+    // 于是 `%f` 展开成上一层的同名文件——旧写法就是这样「碰巧」匹配到 `LISTWS:inside.txt`
+    // 的假绿（2026-11-12 复核）。
     let (_c4, wslist) = run_sandboxed_capture(
         &ws,
-        &format!("for %f in ({}/*) do @echo LISTWS:%f", ws.display()),
+        &format!("for %f in ({}\\*) do @echo LISTWS:%f", ws.display()),
     )
     .await;
     let output = format!("[meta]{meta}[list]{listing}[read]{read}[ws]{wslist}");
-    eprintln!("[traverse-probe] {output}");
-    // 取证：这一刻祖先上到底有没有我们的 ACE（排除「被别的进程还原掉」）。
-    let acl = std::process::Command::new("icacls")
-        .arg(&home)
-        .output()
-        .expect("需要 icacls");
-    let acl_text = String::from_utf8_lossy(&acl.stdout);
-    eprintln!(
-        "[traverse-probe] home ace: {:?}",
-        acl_text
-            .lines()
-            .filter(|line| line.contains("S-1-15-3"))
-            .collect::<Vec<_>>()
-    );
+    eprintln!("[ancestor-probe] {output}");
 
-    // 先还原再断言：断言失败也不会把 DACL 留在用户目录上等下一次启动兜底。
-    shaniu_lib::sandbox::shutdown();
+    // 先撤销再断言：断言失败也不会把 ACE 留在用户目录里等下一次兜底。
+    // `existed_before: true` 意味着这条 ACE 不是我们独创的，不动它。
+    let owned = matches!(
+        grant,
+        AncestorGrant::Written {
+            existed_before: false
+        }
+    );
+    if owned {
+        revoke_ancestor_for(&base, PROFILE_NAME).expect("撤销祖先 (RA,S) 失败");
+        eprintln!("[ancestor-probe] 已撤销我们写的那条 (RA,S)");
+    }
 
     assert!(
         output.contains("META_OK"),
-        "容器读不到祖先目录的属性（祖先链 Traverse 未生效）：{output}"
+        "容器读不到祖先目录的属性（`(RA,S)` 未生效）：{output}"
     );
     assert!(
         !output.contains("LIST:"),
-        "容器能列举祖先目录（Traverse 掩码越界，给了 FILE_LIST_DIRECTORY）：{output}"
+        "容器能列举祖先目录（掩码越界，给了 FILE_LIST_DIRECTORY）：{output}"
     );
     assert!(
         !output.contains(marker),
         "祖先下未授权文件的内容进入了容器（路过被当成了可读）：{output}"
     );
     assert!(
-        output.contains("LISTWS:inside.txt"),
+        // 逐行判：`%f` 展开的是完整路径，用 `contains("LISTWS:inside.txt")` 会被
+        // 那个反斜杠通配的旧 bug「碰巧」满足（见上面注释）。
+        output
+            .lines()
+            .any(|line| line.contains("LISTWS:") && line.ends_with("inside.txt")),
         "正向对照失败：容器列不出工作区文件，前三条结论不可信：{output}"
     );
 
     std::fs::remove_dir_all(&ws).ok();
-    std::fs::remove_dir_all(&outside).ok();
+    std::fs::remove_dir_all(&sibling).ok();
 }
 
 /// AppContainer 读隔离：工作区外的文件内容不得进入沙箱进程。
