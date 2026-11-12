@@ -41,9 +41,9 @@ use std::path::{Path, PathBuf};
 use windows::core::{PCWSTR, PWSTR};
 use windows::Win32::Foundation::{LocalFree, ERROR_SUCCESS, HLOCAL};
 use windows::Win32::Security::Authorization::{
-    ConvertSidToStringSidW, GetNamedSecurityInfoW, SetEntriesInAclW, SetNamedSecurityInfoW,
-    EXPLICIT_ACCESS_W, GRANT_ACCESS, NO_MULTIPLE_TRUSTEE, REVOKE_ACCESS, SE_FILE_OBJECT,
-    TRUSTEE_IS_SID, TRUSTEE_IS_UNKNOWN, TRUSTEE_W,
+    ConvertSidToStringSidW, ConvertStringSidToSidW, GetNamedSecurityInfoW, SetEntriesInAclW,
+    SetNamedSecurityInfoW, EXPLICIT_ACCESS_W, GRANT_ACCESS, NO_MULTIPLE_TRUSTEE, REVOKE_ACCESS,
+    SE_FILE_OBJECT, TRUSTEE_IS_SID, TRUSTEE_IS_UNKNOWN, TRUSTEE_W,
 };
 use windows::Win32::Security::{
     AclSizeInformation, EqualSid, GetAce, GetAclInformation, GetSecurityDescriptorDacl,
@@ -1566,6 +1566,120 @@ fn append_ledger(
     Ok(())
 }
 
+/// 账本回放的结果（卸载/撤销时给调用方与日志看）。
+#[derive(Debug, Default, PartialEq, Eq, serde::Serialize)]
+pub struct LedgerRevokeReport {
+    /// 去重后、`existed_before=false` 的条目数（真正要考虑撤销的）。
+    pub considered: usize,
+    /// 真的删掉了 ACE 的条目。
+    pub revoked: usize,
+    /// 目标本来就没有这条 ACE（重复调用 / 已被别处删掉），DACL 无变化。
+    pub unchanged: usize,
+    /// 路径已经不存在：跳过，不当失败（目录可能已被用户删掉）。
+    pub missing: usize,
+    /// 逐条失败原因；单条失败不阻断其余条目。
+    pub failed: Vec<String>,
+}
+
+impl LedgerRevokeReport {
+    pub fn is_clean(&self) -> bool {
+        self.failed.is_empty()
+    }
+}
+
+/// 按账本精确撤销我们加过的授权（卸载/回滚用）。
+///
+/// 口径（对齐 codex，**不做 DACL 快照还原**——快照会把别人在这段时间里新加的
+/// 授权一起抹掉，且跨版本结构不同就无法还原）：
+/// 1. 只处理 `existed_before == false` 的条目：别人本来就有的 ACE 一律不碰；
+/// 2. 按 `(path, sid)` 去重，同一个对象只撤一次；
+/// 3. 用 `REVOKE_ACCESS` 只删该 trustee 的 ACE，其它 trustee 原样保留；
+/// 4. 幂等：目标已没有这条 ACE 时算成功（`unchanged`）；
+/// 5. 路径不存在只计数（`missing`），不当失败。
+///
+/// 账本不存在 = 没有任何我们加的授权，返回全 0 报告。
+pub fn revoke_from_ledger(ledger: &Path) -> LedgerRevokeReport {
+    let mut report = LedgerRevokeReport::default();
+    let body = match std::fs::read_to_string(ledger) {
+        Ok(body) => body,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return report,
+        Err(error) => {
+            report
+                .failed
+                .push(format!("读取 ACE 账本失败（{}）: {error}", ledger.display()));
+            return report;
+        }
+    };
+
+    let mut seen: HashSet<(String, String)> = HashSet::new();
+    for (index, line) in body.lines().enumerate() {
+        let line = line.trim();
+        if line.is_empty() {
+            continue;
+        }
+        let value: serde_json::Value = match serde_json::from_str(line) {
+            Ok(value) => value,
+            Err(error) => {
+                // 我们把路径写坏了也不会因此拒绝撤销别的条目——如实报出来即可。
+                report
+                    .failed
+                    .push(format!("账本第 {} 行不是合法 JSON: {error}", index + 1));
+                continue;
+            }
+        };
+        if value.get("existed_before").and_then(|v| v.as_bool()) != Some(false) {
+            continue;
+        }
+        let (Some(path), Some(sid_text)) = (
+            value.get("path").and_then(|v| v.as_str()),
+            value.get("sid").and_then(|v| v.as_str()),
+        ) else {
+            report
+                .failed
+                .push(format!("账本第 {} 行缺 path/sid", index + 1));
+            continue;
+        };
+        if !seen.insert((path.to_string(), sid_text.to_string())) {
+            continue;
+        }
+        report.considered += 1;
+
+        let target = Path::new(path);
+        if !target.exists() {
+            report.missing += 1;
+            continue;
+        }
+        let raw = match sid_from_text(sid_text) {
+            Ok(raw) => raw,
+            Err(error) => {
+                report.failed.push(error);
+                continue;
+            }
+        };
+        let outcome = revoke_ace(target, raw);
+        unsafe {
+            let _ = LocalFree(Some(HLOCAL(raw.0)));
+        }
+        match outcome {
+            Ok(true) => report.revoked += 1,
+            Ok(false) => report.unchanged += 1,
+            Err(error) => report.failed.push(error),
+        }
+    }
+    report
+}
+
+/// SID 文本 → 二进制 SID。调用方负责 `LocalFree`。
+fn sid_from_text(text: &str) -> Result<PSID, String> {
+    let wide_text = wide(std::ffi::OsStr::new(text));
+    let mut raw = PSID(std::ptr::null_mut());
+    unsafe {
+        ConvertStringSidToSidW(PCWSTR(wide_text.as_ptr()), &mut raw)
+    }
+    .map_err(|error| format!("SID 文本「{text}」转二进制失败: {error}"))?;
+    Ok(raw)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -2519,5 +2633,77 @@ mod tests {
         // 卸载/回滚：只按账本删我们那条，DACL 回到原状。
         assert!(revoke_ace(&dir, sid.as_psid()).unwrap());
         compare_restored(&before, &read_dacl_snapshot(&dir).unwrap()).unwrap();
+    }
+
+    /// 卸载用的账本回放：按 `(path, sid)` 精确撤销、只撤 `existed_before=false`、
+    /// 重复调用幂等、路径已不存在只计数。
+    #[test]
+    fn revoke_from_ledger_is_precise_idempotent_and_tolerates_missing_paths() {
+        let ws = temp_dir("revoke-ledger");
+        let dir = ws.join("workspace");
+        std::fs::create_dir_all(&dir).unwrap();
+        let sid = super::super::write_sid::workspace_write_sid(&dir).unwrap();
+        let ledger = ws.join("ace.jsonl");
+        let mut manager = AclManager::new(ws.join("acl"));
+        let before = read_dacl_snapshot(&dir).unwrap();
+        manager
+            .grant_scope_persistent(&dir, sid.as_psid(), false, &ledger)
+            .unwrap();
+
+        // 账本追加：同一 (path, sid) 的重复行（去重）、别人本来就有的 ACE（跳过）、
+        // 一条指向已删除目录的记录（容错）。用 serde_json 拼，避免手写 Windows 路径时
+        // 反斜杠被当成 JSON 转义（那会变成非法行，测的就不是撤销逻辑了）。
+        let sid_text = sid.text().to_string();
+        let path_text = normalize(&dir).display().to_string();
+        let gone = ws.join("deleted");
+        std::fs::create_dir_all(&gone).unwrap();
+        let gone_sid = super::super::write_sid::workspace_write_sid(&gone).unwrap();
+        let gone_text = normalize(&gone).display().to_string();
+        std::fs::remove_dir_all(&gone).unwrap();
+        let record = |path: &str, sid: &str, existed_before: bool| {
+            serde_json::json!({
+                "kind": LEDGER_KIND_SCOPE,
+                "path": path,
+                "sid": sid,
+                "mask": 1,
+                "inherit": true,
+                "existed_before": existed_before,
+                "added_at_ms": 1,
+            })
+            .to_string()
+        };
+        let extra = format!(
+            "{}\n{}\n{}\n",
+            record(&path_text, &sid_text, false),
+            record(&path_text, "S-1-5-32-545", true),
+            record(&gone_text, gone_sid.text(), false),
+        );
+        let existing = std::fs::read_to_string(&ledger).unwrap();
+        std::fs::write(&ledger, format!("{existing}{extra}")).unwrap();
+
+        let report = revoke_from_ledger(&ledger);
+        assert_eq!(report.considered, 2, "两条 existed_before=false 去重后各算一次");
+        assert_eq!(report.revoked, 1, "只有真实存在的那条会被删");
+        assert_eq!(report.missing, 1, "已删除的目录只计数");
+        assert_eq!(report.unchanged, 0);
+        assert!(report.is_clean(), "缺路径不是失败：{report:?}");
+        assert!(
+            !has_explicit_grant(&dir, sid.as_psid(), Access::Write.mask()).unwrap(),
+            "撤销后不得留下我们那条 ACE"
+        );
+        compare_restored(&before, &read_dacl_snapshot(&dir).unwrap()).unwrap();
+
+        // 幂等：再跑一遍，DACL 不变、也不算失败。
+        let second = revoke_from_ledger(&ledger);
+        assert_eq!(second.considered, 2);
+        assert_eq!(second.revoked, 0);
+        assert_eq!(second.unchanged, 1);
+        assert_eq!(second.missing, 1);
+        assert!(second.is_clean(), "{second:?}");
+        compare_restored(&before, &read_dacl_snapshot(&dir).unwrap()).unwrap();
+
+        // 账本不存在 = 没有我们加的授权。
+        let absent = revoke_from_ledger(&ws.join("no-such-ledger.jsonl"));
+        assert_eq!(absent, LedgerRevokeReport::default());
     }
 }
