@@ -16,6 +16,7 @@
 //! `tests/fixtures/system_prompt.v1.txt` 锁住；漂移必须显式更新版本号并重跑回归。
 
 use std::path::Path;
+use std::sync::OnceLock;
 use std::time::{Duration, Instant};
 
 use sha2::{Digest, Sha256};
@@ -61,6 +62,8 @@ pub struct EnvironmentFacts {
     pub now: Option<String>,
     /// `分支 main，3 个未提交改动`
     pub git: Option<String>,
+    /// `3.12.4（python）`；没探到就是 `None`（整行省略，不写「可能有」）
+    pub python: Option<String>,
 }
 
 impl EnvironmentFacts {
@@ -70,8 +73,94 @@ impl EnvironmentFacts {
             os: format!("Windows（{}）", std::env::consts::ARCH),
             now: local_now(),
             git: git_facts(workspace_root),
+            python: python_facts(),
         }
     }
+}
+
+/// 探测 Python：**真的跑一次解释器**，不信 `where` / 文件是否存在。
+///
+/// 唯一判据是 stdout 里拿到形如 `3.12.4` 的版本号且退出码为 0。商店存根
+/// （`WindowsApps\python.exe` 那个 0 字节 app execution alias）拿不到版本号，
+/// 于是自然被判成不可用——这一步就是用来挡「假可用」的。
+///
+/// 只探**宿主侧**：AppContainer 里还取决于解释器安装目录对容器是否可读，
+/// 这里不假装探测过容器内可用性。
+fn python_facts() -> Option<String> {
+    static CACHE: OnceLock<Option<String>> = OnceLock::new();
+    CACHE.get_or_init(probe_python).clone()
+}
+
+fn probe_python() -> Option<String> {
+    const CODE: &str = "import sys;print(sys.version.split()[0])";
+    // 顺序按 Windows 惯例：`python` 先，再 `py -3`。
+    for (program, prefix) in [("python", &[][..]), ("python3", &[][..]), ("py", &["-3"][..])] {
+        if let Some(version) = probe_interpreter(program, prefix, CODE) {
+            let launcher = if prefix.is_empty() {
+                program.to_string()
+            } else {
+                format!("{program} {}", prefix.join(" "))
+            };
+            return Some(format!("{version}（{launcher}）"));
+        }
+    }
+    None
+}
+
+/// 跑一次 `program [prefix] -c CODE`；3 秒内拿不到版本号就杀掉并判不可用。
+fn probe_interpreter(program: &str, prefix: &[&str], code: &str) -> Option<String> {
+    let mut command = std::process::Command::new(program);
+    command
+        .args(prefix)
+        .arg("-c")
+        .arg(code)
+        .stdin(std::process::Stdio::null())
+        .stdout(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::null());
+    #[cfg(windows)]
+    {
+        use std::os::windows::process::CommandExt;
+        // 探测不能闪一个黑框出来：这是后台事实采集，不是用户动作。
+        const CREATE_NO_WINDOW: u32 = 0x0800_0000;
+        command.creation_flags(CREATE_NO_WINDOW);
+    }
+    let mut child = command.spawn().ok()?;
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(3);
+    loop {
+        match child.try_wait() {
+            Ok(Some(status)) => {
+                if !status.success() {
+                    return None;
+                }
+                let mut raw = String::new();
+                let mut stdout = child.stdout.take()?;
+                std::io::Read::read_to_string(&mut stdout, &mut raw).ok()?;
+                let token = raw.split_whitespace().next()?;
+                return looks_like_version(token).then(|| token.to_string());
+            }
+            Ok(None) if std::time::Instant::now() >= deadline => {
+                let _ = child.kill();
+                let _ = child.wait();
+                return None;
+            }
+            Ok(None) => std::thread::sleep(std::time::Duration::from_millis(20)),
+            Err(_) => {
+                let _ = child.kill();
+                return None;
+            }
+        }
+    }
+}
+
+/// 只认「点分数字」：`3.12.4` / `3.13.0rc1` 算，空串、`Python`、整句都不算。
+fn looks_like_version(token: &str) -> bool {
+    let mut parts = token.split('.');
+    let major = parts.next().unwrap_or_default();
+    let minor = parts.next().unwrap_or_default();
+    let minor_digits = minor.chars().take_while(|c| c.is_ascii_digit()).count();
+    !major.is_empty()
+        && major.chars().all(|c| c.is_ascii_digit())
+        && minor_digits > 0
 }
 
 /// A-R6 条款。默认常驻；仅评估消融实验可通过 `SHANIU_EVAL_ABLATE_AR6=1` 关掉，
@@ -133,6 +222,9 @@ pub fn environment_note(ctx: &PromptContext<'_>) -> Option<String> {
     }
     if let Some(git) = &ctx.env.git {
         lines.push(format!("- Git：{git}"));
+    }
+    if let Some(python) = &ctx.env.python {
+        lines.push(format!("- Python：{python}"));
     }
     if lines.is_empty() {
         return None;
@@ -530,6 +622,7 @@ mod tests {
                 os: "Windows（x86_64）".into(),
                 now: Some("2026-11-08 20:05（UTC+08:00，China Standard Time）".into()),
                 git: Some("分支 main，0 个未提交改动".into()),
+                python: None,
             },
         }
     }
@@ -618,6 +711,42 @@ mod tests {
         let text = system_instruction(&context);
         assert!(!text.contains("- 当前时间："));
         assert!(!text.contains("- Git："));
+    }
+
+    /// Python 这一行只写真实探测结果：探到才写，探不到整行省略（不写「可能有」）。
+    #[test]
+    fn python_line_only_appears_when_probed() {
+        let root = demo();
+        let mut context = ctx(&root, SandboxMode::WorkspaceWrite, OsSandbox::AppContainer, false);
+        context.env.now = None;
+        context.env.git = None;
+        context.env.python = Some("3.12.4（python）".into());
+        let note = environment_note(&context).expect("Python 探到时必须产出快照");
+        assert!(note.contains("- Python：3.12.4（python）"));
+        // 探不到：连行都不出现，而不是写「未检测到」占位（与时间/Git 同一口径）。
+        context.env.python = None;
+        assert!(environment_note(&context).is_none(), "三项全空时不得注入空快照");
+    }
+
+    /// 商店存根挡板：判据是「stdout 里有点分版本号」，不是「文件存在」。
+    #[test]
+    fn version_parser_rejects_store_stub_output() {
+        for ok in ["3.12.4", "3.13.0rc1", "3.8.10"] {
+            assert!(looks_like_version(ok), "{ok} 应判为可用");
+        }
+        for bad in ["", "Python", "3", "3.", "python 3.12.4", "Store"] {
+            assert!(!looks_like_version(bad), "{bad:?} 不该判为可用");
+        }
+    }
+
+    /// 真机证据：本机探测结果必须是「真实版本号 + 启动器」的形态，或明确 None。
+    #[test]
+    fn python_probe_result_is_well_formed() {
+        eprintln!("[prompt] 宿主 Python 探测：{:?}", python_facts());
+        if let Some(python) = python_facts() {
+            let version = python.split('（').next().unwrap_or_default();
+            assert!(looks_like_version(version), "探测结果必须带真实版本号：{python}");
+        }
     }
 
     /// 前缀稳定化的核心断言：时间跳一分钟、Git 状态变了，系统提示**一个字节都不能动**，
