@@ -850,16 +850,18 @@ fn sid_to_string(sid: PSID) -> Result<String, String> {
     value
 }
 
-/// `\\?\D:\ws` → `D:\ws`，并尽量取 canonical 形式。
+/// `\\?\D:\ws` → `D:\ws`、`\\?\UNC\server\share` → `\\server\share`，并尽量取 canonical 形式。
+///
+/// 为什么不能只剥 `\\?\` 前缀：UNC 的 verbatim 拼写是 `\\?\UNC\host\share`，剥掉
+/// `\\?\` 后剩下的 `UNC\host\share` 是**相对路径**，会与 `\\host\share` 收敛不到一起。
+/// `tool_router::shell_usable` 已按 `Prefix::VerbatimDisk / VerbatimUNC` 分派，这里直接复用，
+/// 不维护第二份前缀规则。
 ///
 /// `pub(crate)`：写约束模型的身份派生（`sandbox::write_sid`）必须用同一套规范化，
 /// 否则同一目录的两种拼写会派生出两个写 SID（docs/16 §1.2）。
 pub(crate) fn normalize(path: &Path) -> PathBuf {
     let canonical = std::fs::canonicalize(path).unwrap_or_else(|_| path.to_path_buf());
-    match canonical.to_string_lossy().strip_prefix(r"\\?\") {
-        Some(stripped) => PathBuf::from(stripped),
-        None => canonical,
-    }
+    crate::tool_router::shell_usable(&canonical)
 }
 
 /// 同一路径？两侧都先规范化（`..`、尾斜杠、`\\?\`、junction 会收敛到同一形态），
@@ -1686,6 +1688,31 @@ mod tests {
 
     fn temp_dir(tag: &str) -> crate::test_support::TestTempDir {
         crate::test_support::TestTempDir::new(&format!("acl-{tag}"))
+    }
+
+    /// `\\?\UNC\server\share` 与 `\\server\share` 是同一个目录的两种拼写：归一必须收敛到
+    /// 同一路径，否则 `write_sid::workspace_write_sid` 会派生两个写 SID，等于同一目录
+    /// 被开了两个口子（docs/16 §1.2）。旧实现只剥 `\\?\` 前缀，会把 UNC 主机名留在
+    /// 相对路径 `UNC\server\share\...` 里。
+    #[test]
+    fn verbatim_unc_and_plain_unc_normalize_to_the_same_path() {
+        let verbatim = Path::new(r"\\?\UNC\localhost\shaniu-nonexistent-share\dir\file.txt");
+        let plain = Path::new(r"\\localhost\shaniu-nonexistent-share\dir\file.txt");
+        let normalized = normalize(verbatim);
+        assert_eq!(normalized, normalize(plain), "UNC 两种拼写必须归一到同一路径");
+        assert!(
+            !normalized.to_string_lossy().starts_with("UNC"),
+            "剥前缀不得把 UNC 主机名剥成相对路径：{}",
+            normalized.display()
+        );
+
+        let from_verbatim = super::super::write_sid::workspace_write_sid(verbatim).expect("派生应成功");
+        let from_plain = super::super::write_sid::workspace_write_sid(plain).expect("派生应成功");
+        assert_eq!(
+            from_verbatim.text(),
+            from_plain.text(),
+            "同一目录的两种拼写必须派生出同一个写 SID"
+        );
     }
 
     #[test]

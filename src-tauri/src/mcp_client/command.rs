@@ -98,12 +98,13 @@ fn candidate_extensions(name: &str) -> Vec<String> {
 }
 
 /// 展开 `canonicalize` 在 Windows 上加的 `\\?\` 前缀（指纹与展示都用干净路径）。
+///
+/// UNC 上的 verbatim 拼写是 `\\?\UNC\host\share`：只剥 `\\?\` 会得到相对路径
+/// `UNC\host\share`，与 `\\host\share` 算成两份指纹。复用 `tool_router::shell_usable`
+/// 的 `VerbatimUNC` 分支，两处前缀规则只留一份。
 fn normalize(path: &Path) -> PathBuf {
     let canonical = path.canonicalize().unwrap_or_else(|_| path.to_path_buf());
-    match canonical.to_string_lossy().strip_prefix(r"\\?\") {
-        Some(stripped) => PathBuf::from(stripped),
-        None => canonical,
-    }
+    crate::tool_router::shell_usable(&canonical)
 }
 
 /// 计算文件 SHA-256（小写十六进制）。批准记录、启动前校验、重启前复核共用同一算法。
@@ -136,6 +137,22 @@ mod tests {
         let path = dir.join(name);
         std::fs::write(&path, content).unwrap();
         (dir, path)
+    }
+
+    /// `canonicalize` 在 UNC 上产出 `\\?\UNC\server\share\...`：剥前缀时必须还原成
+    /// `\\server\share\...`，不能留下相对路径 `UNC\server\share\...`（那会让同一个
+    /// 可执行文件算出两个指纹，批准记录与启动前校验对不上）。
+    #[test]
+    fn verbatim_unc_normalizes_like_plain_unc() {
+        let verbatim = Path::new(r"\\?\UNC\localhost\shaniu-nonexistent-share\server.exe");
+        let plain = Path::new(r"\\localhost\shaniu-nonexistent-share\server.exe");
+        let normalized = normalize(verbatim);
+        assert_eq!(normalized, normalize(plain), "UNC 两种拼写必须归一为同一路径");
+        assert!(
+            normalized.is_absolute(),
+            "还原后必须仍是绝对路径（UNC），实际：{}",
+            normalized.display()
+        );
     }
 
     #[test]
