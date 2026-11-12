@@ -2295,8 +2295,12 @@ mod tests {
         let summary = agent.run_task("任务", Arc::new(CapturingSink(store.clone())), cancel).await;
 
         assert_eq!(summary.reason, TurnEndReason::Completed);
-        assert_eq!(summary.turns, 4, "失败否决后应多跑一轮，通过后不再续跑");
         let events = store.lock().unwrap();
+        let states = verification_states(&events);
+        assert_eq!(
+            summary.turns, 4,
+            "失败否决后应多跑一轮，通过后不再续跑；实际裁决序列 {states:?}"
+        );
         assert_eq!(
             verification_states(&events),
             vec![
@@ -2399,9 +2403,10 @@ mod tests {
         let summary = agent.run_task("任务", Arc::new(CapturingSink(store.clone())), cancel).await;
 
         // 轮 2 计划否决 → 轮 3 验证否决 → 轮 4 放行。
-        assert_eq!(summary.turns, 4);
-        assert_eq!(*hook.calls.lock().unwrap(), 1, "计划槽位只能消费一次");
         let events = store.lock().unwrap();
+        let states = verification_states(&events);
+        assert_eq!(summary.turns, 4, "实际裁决序列 {states:?}");
+        assert_eq!(*hook.calls.lock().unwrap(), 1, "计划槽位只能消费一次");
         assert_eq!(
             verification_states(&events),
             vec![crate::events::VerifyState::Failed],
