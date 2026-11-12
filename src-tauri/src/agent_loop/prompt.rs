@@ -308,7 +308,8 @@ fn environment_block(ctx: &PromptContext<'_>) -> String {
 /// 解释器可用"的时机，中途变更时模型自己看得到（它刚写完那些文件，也能用 `git status` 查）。
 ///
 /// 最多 5 行（时间 / Git / Python / Node / npm），每任务一条、不随轮次增长；
-/// 整体约 40–60 tokens，且走尾部消息，不占系统提示前缀预算。
+/// 五行全有值时约 110 tokens（本机样例按 `rules::estimate_tokens` 口径实测 112），
+/// 且走尾部消息，不占系统提示前缀预算。
 /// 探测失败（字段为 `None`）**整行省略**，不填占位符；全部失败则返回 `None`，不注入空消息。
 pub fn environment_note(ctx: &PromptContext<'_>) -> Option<String> {
     let mut lines = Vec::new();
