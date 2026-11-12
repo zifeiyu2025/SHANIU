@@ -7,14 +7,6 @@ export const FULL_ACCESS_PRESET = 'danger-full-access'
 export const AUTO_REVIEW_PRESET = 'auto'
 
 /**
- * Machine value of Shanzhu's extension preset: workspace writes without
- * per-action approval. Not a DSH preset, but internally it is just another
- * bundle — the UI shows the same product copy style, never the word
- * "extension".
- */
-export const WORKSPACE_WRITE_AUTO_PRESET = 'workspace-write-auto'
-
-/**
  * Machine value of the derived state: the current `(sandbox, approval)`
  * combination is not one of the presets. It is never selectable and never
  * collapses into a concrete preset — collapsing would tell the user they are
@@ -39,7 +31,6 @@ export type PermissionPresetLabelKey =
   | 'preset.readOnly'
   | 'preset.workspaceWrite'
   | 'preset.fullAccess'
-  | 'preset.workspaceWriteAuto'
   | 'preset.custom'
   | 'preset.unreadable'
 
@@ -47,7 +38,6 @@ const PRESET_LABEL_KEYS = new Map<string, PermissionPresetLabelKey>([
   ['read-only', 'preset.readOnly'],
   ['workspace-write', 'preset.workspaceWrite'],
   [FULL_ACCESS_PRESET, 'preset.fullAccess'],
-  [WORKSPACE_WRITE_AUTO_PRESET, 'preset.workspaceWriteAuto'],
   [CUSTOM_PRESET, 'preset.custom'],
   [PERMISSION_UNAVAILABLE, 'preset.unreadable'],
 ])
@@ -56,7 +46,6 @@ const DEFAULT_PRESET_LABELS: Record<PermissionPresetLabelKey, string> = {
   'preset.readOnly': en['preset.readOnly'],
   'preset.workspaceWrite': en['preset.workspaceWrite'],
   'preset.fullAccess': en['preset.fullAccess'],
-  'preset.workspaceWriteAuto': en['preset.workspaceWriteAuto'],
   'preset.custom': en['preset.custom'],
   'preset.unreadable': en['preset.unreadable'],
 }
@@ -66,14 +55,12 @@ export type PermissionPresetDescriptionKey =
   | 'preset.readOnly.description'
   | 'preset.workspaceWrite.description'
   | 'preset.fullAccess.description'
-  | 'preset.workspaceWriteAuto.description'
   | 'preset.custom.description'
 
 const PRESET_DESCRIPTION_KEYS = new Map<string, PermissionPresetDescriptionKey>([
   ['read-only', 'preset.readOnly.description'],
   ['workspace-write', 'preset.workspaceWrite.description'],
   [FULL_ACCESS_PRESET, 'preset.fullAccess.description'],
-  [WORKSPACE_WRITE_AUTO_PRESET, 'preset.workspaceWriteAuto.description'],
   [CUSTOM_PRESET, 'preset.custom.description'],
 ])
 
@@ -81,7 +68,6 @@ const DEFAULT_PRESET_DESCRIPTIONS: Record<PermissionPresetDescriptionKey, string
   'preset.readOnly.description': en['preset.readOnly.description'],
   'preset.workspaceWrite.description': en['preset.workspaceWrite.description'],
   'preset.fullAccess.description': en['preset.fullAccess.description'],
-  'preset.workspaceWriteAuto.description': en['preset.workspaceWriteAuto.description'],
   'preset.custom.description': en['preset.custom.description'],
 }
 

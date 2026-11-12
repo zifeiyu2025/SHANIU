@@ -2167,12 +2167,12 @@ describe('权限挡位与底部指标的数据面', () => {
       defaultPreset: string
     }
     expect(catalog.options.map(option => option.value))
-      .toEqual(['read-only', 'workspace-write', 'danger-full-access', 'workspace-write-auto'])
+      .toEqual(['read-only', 'workspace-write', 'danger-full-access'])
     // 说明行是界面文案，只能来自界面词典：宿主目录带 description 就会被下拉 detail
     // 原样渲染成中文（en 界面串语言），所以这里锁住「不下发」。
     expect(catalog.options.every(option => !('description' in option))).toBe(true)
     expect(catalog.defaultOptions.map(option => option.value))
-      .toEqual(['read-only', 'workspace-write', 'danger-full-access', 'workspace-write-auto'])
+      .toEqual(['read-only', 'workspace-write', 'danger-full-access'])
     expect(catalog.defaultPreset).toBe('workspace-write')
 
     // 切挡前的快照基线：没有自己的档位事件 → 跟随部署默认
@@ -2271,7 +2271,7 @@ describe('权限挡位与底部指标的数据面', () => {
     const bridge = scriptedBridge(
       undefined, [], undefined, undefined, undefined, undefined, undefined, undefined, undefined,
       undefined, undefined,
-      () => { throw new Error('未知权限预设 `danger-full-access`，可用：read-only / workspace-write / danger-full-access / workspace-write-auto') },
+      () => { throw new Error('未知权限预设 `danger-full-access`，可用：read-only / workspace-write / danger-full-access') },
     )
     const { remote, dispose } = createAdapter({ bridge })
     const face = faceOf2(remote)
@@ -2822,7 +2822,7 @@ describe('Plan 芯片与客户端排队', () => {
     const unknown = await face.commands.execute('agent-new', '/permission yolo')
     expect(unknown).toMatchObject({
       ok: true,
-      value: { result: { kind: 'error', text: 'unknown preset "yolo" (available: read-only, workspace-write, danger-full-access, workspace-write-auto)' } },
+      value: { result: { kind: 'error', text: 'unknown preset "yolo" (available: read-only, workspace-write, danger-full-access)' } },
     })
     dispose()
   })

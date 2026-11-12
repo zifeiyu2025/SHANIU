@@ -6,11 +6,13 @@
  * 现在每一档都是 `(sandbox, approval)` 的**一组绑定**：设置页、`/permission <preset>`、
  * 会话档案、resume 全部只认 id，两维由这张表一起装载（与 `permission/preset.rs` 同表）。
  *
- * 三档逐字对齐 DSH（`read-only` / `workspace-write` / `danger-full-access`）；
- * `workspace-write-auto` 是本仓库扩展（区内写入不问、越界由沙箱拒），内部就是普通一档，
- * **界面不出现「扩展」字样**。不在表里的组合（`on_failure`、`full_access`、任何混搭）
- * 派生为 {@link CUSTOM_PERMISSION_PRESET}：如实显示「自定义」，**绝不回落成具体档**——
- * 把 `full_access` 显示成 `danger-full-access` 会让用户以为自己在 `never` 档。
+ * 三档逐字对齐 DSH（`read-only` / `workspace-write` / `danger-full-access`），
+ * **没有扩展档**：2026-11-11 曾加过 `workspace-write-auto`（`workspace_write` + `never`），
+ * 2026-11-12 用户裁定「权限档位对齐 dsh 就行，不要搞复杂」后移除——想不被打断就选
+ * `danger-full-access`，那是 DSH 的答案。不在表里的组合（`on_failure`、`full_access`、
+ * 任何混搭，含 `workspace_write` + `never`）派生为 {@link CUSTOM_PERMISSION_PRESET}：
+ * 如实显示「自定义」，**绝不回落成具体档**——把 `full_access` 显示成
+ * `danger-full-access` 会让用户以为自己在 `never` 档。
  */
 
 /**
@@ -44,7 +46,6 @@ export const PRESET_BUNDLES: Readonly<Record<string, PermissionPresetBundle>> = 
   'read-only': { sandbox: 'read_only', approval: 'on_request' },
   'workspace-write': { sandbox: 'workspace_write', approval: 'on_request' },
   'danger-full-access': { sandbox: 'danger_full_access', approval: 'never' },
-  'workspace-write-auto': { sandbox: 'workspace_write', approval: 'never' },
 }
 
 /** DSH 挡位键 → 宿主 `[sandbox] mode` 落盘值（04 §4；由 {@link PRESET_BUNDLES} 派生）。 */
@@ -84,9 +85,9 @@ export const approvalOfPreset = (preset: string): string | undefined => PRESET_B
 /**
  * 两维 → 挡位键：**精确匹配**，不匹配返回 {@link CUSTOM_PERMISSION_PRESET}。
  *
- * 不匹配时不能挑一个"最像的"：`(workspace_write, never)` 确实等于扩展档，
- * 但 `(workspace_write, full_access)` 与它只差审批维，回落过去就等于告诉用户
- * "你在 `never` 档"——而实际是 `full_access`。
+ * 不匹配时不能挑一个"最像的"：`(workspace_write, never)` 与 `workspace-write`、
+ * `danger-full-access` 各差一维，回落过去等于替用户改了一维权限；
+ * `(workspace_write, full_access)` 同理——它只和 `workspace-write` 差审批维。
  */
 export const presetOfBundle = (sandbox: string, approval: string): string => {
   for (const [preset, bundle] of Object.entries(PRESET_BUNDLES)) {

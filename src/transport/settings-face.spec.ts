@@ -762,7 +762,7 @@ describe('权限挡位域（permission 命名空间，SH-105 补修）', () => {
     return described.namespaces.find(ns => ns['ns'] === 'permission')!
   }
 
-  it('describe 暴露 permission 命名空间：defaultPreset 取宿主预设表结果，schema 声明四档', async () => {
+  it('describe 暴露 permission 命名空间：defaultPreset 取宿主预设表结果，schema 声明三档', async () => {
     const host = fakeHost([LONGCAT])
     host.sandboxMode = 'danger_full_access'
     host.approvalMode = 'never'
@@ -776,9 +776,11 @@ describe('权限挡位域（permission 命名空间，SH-105 补修）', () => {
     expect(view['revision']).toBe(0)
     // schema 的枚举必须覆盖全集：界面按它渲染下拉，缺一档就少一个可选项
     const schema = JSON.stringify(view['schema'])
-    for (const preset of ['read-only', 'workspace-write', 'danger-full-access', 'workspace-write-auto']) {
+    for (const preset of ['read-only', 'workspace-write', 'danger-full-access']) {
       expect(schema, preset).toContain(preset)
     }
+    // 自造扩展档已按用户裁定移除：schema 里再出现它就是档位表又长回来了
+    expect(schema).not.toContain('workspace-write-auto')
     // 派生值不进可选目录：它不是"选择"，是"组合不在表里"的观察结果
     expect(schema).not.toContain('custom')
   })
