@@ -60,22 +60,122 @@ pub struct EnvironmentFacts {
     pub os: String,
     /// `2026-11-08 20:05（UTC+08:00，China Standard Time）`
     pub now: Option<String>,
-    /// `分支 main，3 个未提交改动`
+    /// `2.45.1.windows.1（git）；分支 main，3 个未提交改动；可看差异与历史；提交身份已配置（可提交）`
     pub git: Option<String>,
     /// `3.12.4（python）`；没探到就是 `None`（整行省略，不写「可能有」）
     pub python: Option<String>,
+    /// `v22.11.0（node，可运行 JS 脚本与 Node 工具）`
+    pub node: Option<String>,
+    /// `10.9.0（npm，可安装/运行 Node 包与 CLI）`
+    pub npm: Option<String>,
 }
 
 impl EnvironmentFacts {
     /// 探测真实环境。任一探测失败返回 `None`，由组装侧省略整行。
+    ///
+    /// 所有探测**并行**跑（`thread::scope`）：串行时最坏是各候选 3 秒超时累加，
+    /// 会把任务启动拖到十几秒；并行后最坏只等于其中最慢的一组（解释器 3 秒、Git 5 秒）。
     pub fn detect(workspace_root: &Path) -> Self {
+        let (now, git, python, node, npm) = std::thread::scope(|scope| {
+            let now = scope.spawn(local_now);
+            let git = scope.spawn(|| git_facts(workspace_root));
+            let python = scope.spawn(python_facts);
+            let node = scope.spawn(node_facts);
+            let npm = scope.spawn(npm_facts);
+            (
+                now.join().ok().flatten(),
+                git.join().ok().flatten(),
+                python.join().ok().flatten(),
+                node.join().ok().flatten(),
+                npm.join().ok().flatten(),
+            )
+        });
         Self {
             os: format!("Windows（{}）", std::env::consts::ARCH),
-            now: local_now(),
-            git: git_facts(workspace_root),
-            python: python_facts(),
+            now,
+            git,
+            python,
+            node,
+            npm,
         }
     }
+}
+
+/// 单次解释器探测的超时。**不是**每个候选各一份：Python 的三条候选共用这一个预算。
+const PROBE_TIMEOUT: Duration = Duration::from_secs(3);
+
+/// Git 一整组探测（版本 + 仓库判定 + 状态 + 身份）共用的超时。
+const GIT_PROBE_TIMEOUT: Duration = Duration::from_secs(5);
+
+/// 一组探测共用的截止时刻：每次起子进程前用 `remaining()` 取剩余预算。
+#[derive(Clone, Copy)]
+struct Deadline(Instant);
+
+impl Deadline {
+    fn after(budget: Duration) -> Self {
+        Self(Instant::now() + budget)
+    }
+    fn remaining(self) -> Duration {
+        self.0.saturating_duration_since(Instant::now())
+    }
+}
+
+/// 跑一个子进程并读 stdout；超时、非零退出或读取失败都返回 `None`。
+///
+/// 统一在这里挂 `CREATE_NO_WINDOW`：探测是后台事实采集，不是用户动作，不许闪控制台。
+fn run_probe(mut command: std::process::Command, timeout: Duration) -> Option<String> {
+    command
+        .stdin(std::process::Stdio::null())
+        .stdout(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::null());
+    #[cfg(windows)]
+    {
+        use std::os::windows::process::CommandExt;
+        // 0x08000000 = CREATE_NO_WINDOW
+        command.creation_flags(0x0800_0000);
+    }
+    let mut child = command.spawn().ok()?;
+    let deadline = Deadline::after(timeout);
+    loop {
+        match child.try_wait() {
+            Ok(Some(status)) => {
+                if !status.success() {
+                    return None;
+                }
+                let mut raw = String::new();
+                let mut stdout = child.stdout.take()?;
+                std::io::Read::read_to_string(&mut stdout, &mut raw).ok()?;
+                return Some(raw);
+            }
+            Ok(None) if deadline.remaining().is_zero() => {
+                let _ = child.kill();
+                let _ = child.wait();
+                return None;
+            }
+            Ok(None) => std::thread::sleep(Duration::from_millis(20)),
+            Err(_) => {
+                let _ = child.kill();
+                return None;
+            }
+        }
+    }
+}
+
+/// 跑 `<program> <args>`，把 stdout 首个 token 当版本号校验；拿不到版本号就是 `None`。
+fn probe_version(program: &str, args: &[&str], timeout: Duration) -> Option<String> {
+    let mut command = std::process::Command::new(program);
+    command.args(args);
+    let raw = run_probe(command, timeout)?;
+    let token = raw.split_whitespace().next()?;
+    looks_like_version(token).then(|| token.to_string())
+}
+
+/// 每个事实只在进程内探一次（解释器版本不会在进程生命周期内变化）。
+fn cached(
+    cell: &'static OnceLock<Option<String>>,
+    probe: fn() -> Option<String>,
+) -> Option<String> {
+    cell.get_or_init(probe).clone()
 }
 
 /// 探测 Python：**真的跑一次解释器**，不信 `where` / 文件是否存在。
@@ -88,14 +188,22 @@ impl EnvironmentFacts {
 /// 这里不假装探测过容器内可用性。
 fn python_facts() -> Option<String> {
     static CACHE: OnceLock<Option<String>> = OnceLock::new();
-    CACHE.get_or_init(probe_python).clone()
+    cached(&CACHE, probe_python)
 }
 
 fn probe_python() -> Option<String> {
     const CODE: &str = "import sys;print(sys.version.split()[0])";
+    // 三条候选共用一份 3 秒预算：各给 3 秒的话最坏是 9 秒。
+    let deadline = Deadline::after(PROBE_TIMEOUT);
     // 顺序按 Windows 惯例：`python` 先，再 `py -3`。
     for (program, prefix) in [("python", &[][..]), ("python3", &[][..]), ("py", &["-3"][..])] {
-        if let Some(version) = probe_interpreter(program, prefix, CODE) {
+        let remaining = deadline.remaining();
+        if remaining.is_zero() {
+            break;
+        }
+        let mut args: Vec<&str> = prefix.to_vec();
+        args.extend(["-c", CODE]);
+        if let Some(version) = probe_version(program, &args, remaining) {
             let launcher = if prefix.is_empty() {
                 program.to_string()
             } else {
@@ -107,53 +215,38 @@ fn probe_python() -> Option<String> {
     None
 }
 
-/// 跑一次 `program [prefix] -c CODE`；3 秒内拿不到版本号就杀掉并判不可用。
-fn probe_interpreter(program: &str, prefix: &[&str], code: &str) -> Option<String> {
-    let mut command = std::process::Command::new(program);
-    command
-        .args(prefix)
-        .arg("-c")
-        .arg(code)
-        .stdin(std::process::Stdio::null())
-        .stdout(std::process::Stdio::piped())
-        .stderr(std::process::Stdio::null());
-    #[cfg(windows)]
-    {
-        use std::os::windows::process::CommandExt;
-        // 探测不能闪一个黑框出来：这是后台事实采集，不是用户动作。
-        const CREATE_NO_WINDOW: u32 = 0x0800_0000;
-        command.creation_flags(CREATE_NO_WINDOW);
-    }
-    let mut child = command.spawn().ok()?;
-    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(3);
-    loop {
-        match child.try_wait() {
-            Ok(Some(status)) => {
-                if !status.success() {
-                    return None;
-                }
-                let mut raw = String::new();
-                let mut stdout = child.stdout.take()?;
-                std::io::Read::read_to_string(&mut stdout, &mut raw).ok()?;
-                let token = raw.split_whitespace().next()?;
-                return looks_like_version(token).then(|| token.to_string());
-            }
-            Ok(None) if std::time::Instant::now() >= deadline => {
-                let _ = child.kill();
-                let _ = child.wait();
-                return None;
-            }
-            Ok(None) => std::thread::sleep(std::time::Duration::from_millis(20)),
-            Err(_) => {
-                let _ = child.kill();
-                return None;
-            }
-        }
-    }
+/// 探测 Node：`node --version` 输出 `v22.11.0`，判据仍是「点分版本号」。
+fn node_facts() -> Option<String> {
+    static CACHE: OnceLock<Option<String>> = OnceLock::new();
+    cached(&CACHE, probe_node)
 }
 
-/// 只认「点分数字」：`3.12.4` / `3.13.0rc1` 算，空串、`Python`、整句都不算。
+fn probe_node() -> Option<String> {
+    probe_version("node", &["--version"], PROBE_TIMEOUT)
+        .map(|version| format!("{version}（node，可运行 JS 脚本与 Node 工具）"))
+}
+
+/// 探测 npm。Windows 上 npm 落地成 `npm.cmd`：`CreateProcess` 不能直接执行 `.cmd`，
+/// 必须经 `cmd /C`（与本项目固定执行入口一致），否则永远探不到。
+fn npm_facts() -> Option<String> {
+    static CACHE: OnceLock<Option<String>> = OnceLock::new();
+    cached(&CACHE, probe_npm)
+}
+
+fn probe_npm() -> Option<String> {
+    #[cfg(windows)]
+    let version = probe_version("cmd", &["/C", "npm --version"], PROBE_TIMEOUT);
+    #[cfg(not(windows))]
+    let version = probe_version("npm", &["--version"], PROBE_TIMEOUT);
+    version.map(|version| format!("{version}（npm，可安装/运行 Node 包与 CLI）"))
+}
+
+/// 只认「点分数字」：`3.12.4` / `3.13.0rc1` / `v22.11.0` 算，空串、`Python`、整句都不算。
 fn looks_like_version(token: &str) -> bool {
+    let token = token
+        .strip_prefix('v')
+        .or_else(|| token.strip_prefix('V'))
+        .unwrap_or(token);
     let mut parts = token.split('.');
     let major = parts.next().unwrap_or_default();
     let minor = parts.next().unwrap_or_default();
@@ -208,13 +301,15 @@ fn environment_block(ctx: &PromptContext<'_>) -> String {
     text
 }
 
-/// 任务开始时的环境快照（当前时间 + Git 状态）：以尾部 system 消息注入历史。
+/// 任务开始时的环境快照（当前时间 + Git + Python/Node/npm）：以尾部 system 消息注入历史。
 ///
 /// 为什么不做成"变化就发一条"：Git 状态在 agent 自己写文件时每轮都变，逐次播报会往
-/// 历史里灌一串噪声消息，收益为零。任务是唯一需要"现在几点、工作区脏不脏"的时机，
-/// 中途变更时模型自己看得到（它刚写完那些文件，也能用 `git status` 查）。
+/// 历史里灌一串噪声消息，收益为零。任务是唯一需要"现在几点、工作区脏不脏、有哪些
+/// 解释器可用"的时机，中途变更时模型自己看得到（它刚写完那些文件，也能用 `git status` 查）。
 ///
-/// 探测失败（字段为 `None`）**整行省略**，不填占位符；两项都失败则返回 `None`，不注入空消息。
+/// 最多 5 行（时间 / Git / Python / Node / npm），每任务一条、不随轮次增长；
+/// 整体约 40–60 tokens，且走尾部消息，不占系统提示前缀预算。
+/// 探测失败（字段为 `None`）**整行省略**，不填占位符；全部失败则返回 `None`，不注入空消息。
 pub fn environment_note(ctx: &PromptContext<'_>) -> Option<String> {
     let mut lines = Vec::new();
     if let Some(now) = &ctx.env.now {
@@ -225,6 +320,12 @@ pub fn environment_note(ctx: &PromptContext<'_>) -> Option<String> {
     }
     if let Some(python) = &ctx.env.python {
         lines.push(format!("- Python：{python}"));
+    }
+    if let Some(node) = &ctx.env.node {
+        lines.push(format!("- Node：{node}"));
+    }
+    if let Some(npm) = &ctx.env.npm {
+        lines.push(format!("- npm：{npm}"));
     }
     if lines.is_empty() {
         return None;
@@ -265,7 +366,7 @@ pub struct SessionPrompt {
 }
 
 impl SessionPrompt {
-    /// 组装一次。返回 `(冻结实例, 首轮环境快照)`；快照为 `None` 表示两项探测都失败。
+    /// 组装一次。返回 `(冻结实例, 首轮环境快照)`；快照为 `None` 表示全部探测都失败。
     pub fn assemble(ctx: &PromptContext<'_>) -> (Self, Option<String>) {
         (Self { text: system_instruction(ctx), facts: LiveFacts::of(ctx) }, environment_note(ctx))
     }
@@ -494,16 +595,18 @@ todo_write 只用于计划获批后的实施跟踪；规划阶段的计划本体
     text
 }
 
-/// `git status --porcelain=v2 --branch` 的一次探测结果缓存。
+/// Git 事实的一次探测结果缓存。
 ///
-/// 系统提示每轮重算，而轮内可能有多次采样；每次都起进程问 Git 会把延迟叠进首 token。
+/// 系统提示每轮重算，而轮内可能有多次采样；每次都起 Git 进程会把延迟叠进首 token。
 /// 5 秒 TTL 足够让"刚改完文件"的下一轮看到新状态，又不会在工具调用密集时反复起进程。
 static GIT_CACHE: std::sync::Mutex<Option<(std::path::PathBuf, Instant, Option<String>)>> =
     std::sync::Mutex::new(None);
 
 const GIT_CACHE_TTL: Duration = Duration::from_secs(5);
 
-/// 探测 Git 状态；任何失败（不是仓库、没装 git、输出异常）返回 `None` → 整行省略。
+/// 探测 Git 事实；没装 Git / 拿不到版本号都返回 `None` → 整行省略。
+///
+/// 版本、仓库、分支、身份都来自真跑命令，唯一判据是「stdout 里有可解析的版本号」。
 fn git_facts(root: &Path) -> Option<String> {
     if let Ok(cache) = GIT_CACHE.lock() {
         if let Some((cached_root, at, value)) = cache.as_ref() {
@@ -521,19 +624,47 @@ fn git_facts(root: &Path) -> Option<String> {
 }
 
 fn probe_git(root: &Path) -> Option<String> {
-    let mut command = std::process::Command::new("git");
-    command.arg("-C").arg(root).args(["status", "--porcelain=v2", "--branch"]);
-    #[cfg(windows)]
-    {
-        use std::os::windows::process::CommandExt;
-        // 0x08000000 = CREATE_NO_WINDOW：后台探测不弹控制台窗口
-        command.creation_flags(0x0800_0000);
+    // 整组共用一份预算：版本、仓库判定、状态、身份五条命令不能各等一次超时。
+    let deadline = Deadline::after(GIT_PROBE_TIMEOUT);
+    let version = git_version(deadline)?;
+    let inside = run_git(root, &["rev-parse", "--is-inside-work-tree"], deadline)
+        .is_some_and(|text| text.trim() == "true");
+    if !inside {
+        // 不是仓库：分支与提交身份都不写，也不编一个「空仓库」的说法。
+        return Some(compose_git_line(&version, None, None));
     }
-    let output = command.output().ok()?;
-    if !output.status.success() {
+    let parsed = run_git(root, &["status", "--porcelain=v2", "--branch"], deadline)
+        .as_deref()
+        .and_then(parse_git_status);
+    let identity = parsed.as_ref().map(|_| git_identity(root, deadline));
+    Some(compose_git_line(
+        &version,
+        parsed.as_ref().map(|(branch, changed)| (branch.as_str(), *changed)),
+        identity,
+    ))
+}
+
+/// `git --version` 输出是 `git version 2.45.1.windows.1`，取 `version ` 之后的首个 token。
+fn git_version(deadline: Deadline) -> Option<String> {
+    let mut command = std::process::Command::new("git");
+    command.arg("--version");
+    let raw = run_probe(command, deadline.remaining())?;
+    let token = raw.trim().strip_prefix("git version ")?.split_whitespace().next()?;
+    looks_like_version(token).then(|| token.to_string())
+}
+
+fn run_git(root: &Path, args: &[&str], deadline: Deadline) -> Option<String> {
+    let remaining = deadline.remaining();
+    if remaining.is_zero() {
         return None;
     }
-    let text = String::from_utf8_lossy(&output.stdout);
+    let mut command = std::process::Command::new("git");
+    command.arg("-C").arg(root).args(args);
+    run_probe(command, remaining)
+}
+
+/// `status --porcelain=v2 --branch`：取分支名与未提交改动数；解析不出分支返回 `None`。
+fn parse_git_status(text: &str) -> Option<(String, usize)> {
     let mut branch = String::new();
     let mut changed = 0usize;
     for line in text.lines() {
@@ -549,7 +680,36 @@ fn probe_git(root: &Path) -> Option<String> {
     if branch.is_empty() {
         return None;
     }
-    Some(format!("分支 {branch}，{changed} 个未提交改动"))
+    if branch == "(detached)" {
+        branch = "HEAD 分离（无分支）".to_string();
+    }
+    Some((branch, changed))
+}
+
+/// 提交身份：`user.name` / `user.email` 都非空才算已配置。
+/// **只报「已配置 / 未配置」，不把邮箱写进提示**（隐私边界）。
+fn git_identity(root: &Path, deadline: Deadline) -> bool {
+    let configured = |key: &str| {
+        run_git(root, &["config", key], deadline)
+            .is_some_and(|value| !value.trim().is_empty())
+    };
+    configured("user.name") && configured("user.email")
+}
+
+/// 把 Git 事实拼成一行：版本 + 仓库/分支 + 能做什么。不是仓库时只有版本。
+///
+/// 「可提交」只在身份已配置时出现——没配身份时直接提交会失败，提前说清比让它撞一次错好。
+fn compose_git_line(version: &str, status: Option<(&str, usize)>, identity: Option<bool>) -> String {
+    let mut parts = vec![format!("{version}（git）")];
+    if let Some((branch, changed)) = status {
+        parts.push(format!("分支 {branch}，{changed} 个未提交改动"));
+        parts.push("可看差异与历史".to_string());
+        parts.push(match identity {
+            Some(true) => "提交身份已配置（可提交）".to_string(),
+            _ => "提交身份未配置（直接提交会失败，先配 user.name/user.email）".to_string(),
+        });
+    }
+    parts.join("；")
 }
 
 /// 本地时间 + 时区偏移 + 时区名。失败返回 `None`（整行省略）。
@@ -623,6 +783,8 @@ mod tests {
                 now: Some("2026-11-08 20:05（UTC+08:00，China Standard Time）".into()),
                 git: Some("分支 main，0 个未提交改动".into()),
                 python: None,
+                node: None,
+                npm: None,
             },
         }
     }
@@ -700,14 +862,14 @@ mod tests {
         let mut context = ctx(&root, SandboxMode::WorkspaceWrite, OsSandbox::AppContainer, false);
         context.env.now = None;
         context.env.git = None;
-        // 两项都失败：不产出环境快照（而不是一条空标题）。
-        assert!(environment_note(&context).is_none(), "两项探测都失败时不得注入空快照");
+        // 全部探测都失败：不产出环境快照（而不是一条空标题）。
+        assert!(environment_note(&context).is_none(), "全部探测都失败时不得注入空快照");
         // 单项失败只省略那一行：不得用占位符或猜测值补齐。
         context.env.now = Some("2026-11-08 20:05（UTC+08:00）".into());
         let note = environment_note(&context).expect("时间有值时应产出快照");
         assert!(note.contains("- 当前时间："));
         assert!(!note.contains("- Git："), "Git 探测失败必须整行省略");
-        // 系统提示本体无论探测成败都不含这两项，保证前缀稳定。
+        // 系统提示本体无论探测成败都不含这些易变项，保证前缀稳定。
         let text = system_instruction(&context);
         assert!(!text.contains("- 当前时间："));
         assert!(!text.contains("- Git："));
@@ -725,28 +887,88 @@ mod tests {
         assert!(note.contains("- Python：3.12.4（python）"));
         // 探不到：连行都不出现，而不是写「未检测到」占位（与时间/Git 同一口径）。
         context.env.python = None;
-        assert!(environment_note(&context).is_none(), "三项全空时不得注入空快照");
+        assert!(environment_note(&context).is_none(), "全部为空时不得注入空快照");
+    }
+
+    /// Node / npm 与 Python 同一口径：探到才写，探不到整行省略；两者可以单独存在。
+    #[test]
+    fn node_and_npm_lines_only_appear_when_probed() {
+        let root = demo();
+        let mut context = ctx(&root, SandboxMode::WorkspaceWrite, OsSandbox::AppContainer, false);
+        context.env.now = None;
+        context.env.git = None;
+        context.env.node = Some("v22.11.0（node，可运行 JS 脚本与 Node 工具）".into());
+        context.env.npm = Some("10.9.0（npm，可安装/运行 Node 包与 CLI）".into());
+        let note = environment_note(&context).expect("探到 Node/npm 时必须产出快照");
+        assert!(note.contains("- Node：v22.11.0（node，可运行 JS 脚本与 Node 工具）"));
+        assert!(note.contains("- npm：10.9.0（npm，可安装/运行 Node 包与 CLI）"));
+        // 只装了 node、没装 npm 是真实形态：两行互不牵连。
+        context.env.npm = None;
+        let note = environment_note(&context).expect("只有 node 时仍要产出快照");
+        assert!(note.contains("- Node："));
+        assert!(!note.contains("- npm："));
     }
 
     /// 商店存根挡板：判据是「stdout 里有点分版本号」，不是「文件存在」。
     #[test]
     fn version_parser_rejects_store_stub_output() {
-        for ok in ["3.12.4", "3.13.0rc1", "3.8.10"] {
+        for ok in ["3.12.4", "3.13.0rc1", "3.8.10", "v22.11.0", "v20.10.0"] {
             assert!(looks_like_version(ok), "{ok} 应判为可用");
         }
-        for bad in ["", "Python", "3", "3.", "python 3.12.4", "Store"] {
+        for bad in ["", "Python", "3", "3.", "python 3.12.4", "Store", "v", "v."] {
             assert!(!looks_like_version(bad), "{bad:?} 不该判为可用");
         }
     }
 
-    /// 真机证据：本机探测结果必须是「真实版本号 + 启动器」的形态，或明确 None。
+    /// 真机证据：本机探测结果必须是「真实版本号 + 说明」的形态，或明确 None（不伪造）。
     #[test]
-    fn python_probe_result_is_well_formed() {
-        eprintln!("[prompt] 宿主 Python 探测：{:?}", python_facts());
-        if let Some(python) = python_facts() {
-            let version = python.split('（').next().unwrap_or_default();
-            assert!(looks_like_version(version), "探测结果必须带真实版本号：{python}");
+    fn host_probe_results_are_well_formed() {
+        for (label, value) in [
+            ("Python", python_facts()),
+            ("Node", node_facts()),
+            ("npm", npm_facts()),
+        ] {
+            eprintln!("[prompt] 宿主 {label} 探测：{value:?}");
+            if let Some(text) = value {
+                let version = text.split('（').next().unwrap_or_default();
+                assert!(looks_like_version(version), "{label} 探测结果必须带真实版本号：{text}");
+            }
         }
+        let cwd = std::env::current_dir().expect("当前目录可读");
+        eprintln!("[prompt] 宿主 Git 探测：{:?}", git_facts(&cwd));
+    }
+
+    /// Git 行：版本总在；分支/身份只在确认真实仓库时出现，且**绝不输出邮箱原文**。
+    #[test]
+    fn git_line_reports_capabilities_without_leaking_identity() {
+        let inside = compose_git_line("2.45.1.windows.1", Some(("main", 3)), Some(true));
+        assert!(inside.contains("2.45.1.windows.1（git）"));
+        assert!(inside.contains("分支 main，3 个未提交改动"));
+        assert!(inside.contains("可看差异与历史"));
+        assert!(inside.contains("提交身份已配置（可提交）"));
+        assert!(!inside.contains('@'), "不得把邮箱写进提示：{inside}");
+
+        let unconfigured = compose_git_line("2.45.1.windows.1", Some(("main", 0)), Some(false));
+        assert!(unconfigured.contains("提交身份未配置"));
+        assert!(!unconfigured.contains("已配置"));
+
+        // 不是仓库：不写分支、不写提交身份（也不编一个「空仓库」的说法）。
+        let outside = compose_git_line("2.45.1.windows.1", None, None);
+        assert!(!outside.contains("分支"));
+        assert!(!outside.contains("身份"));
+    }
+
+    /// 分支/改动数来自 `status --porcelain=v2 --branch`：解析失败就不写，不猜。
+    #[test]
+    fn git_status_parser_reads_branch_and_counts_changes() {
+        let text = "# branch.oid abc\n# branch.head main\n\
+                    1 .M N... 100644 100644 100644 a b file\n? new.txt\n";
+        assert_eq!(parse_git_status(text), Some(("main".to_string(), 2)));
+        assert_eq!(
+            parse_git_status("# branch.head (detached)\n"),
+            Some(("HEAD 分离（无分支）".to_string(), 0))
+        );
+        assert_eq!(parse_git_status("no header"), None);
     }
 
     /// 前缀稳定化的核心断言：时间跳一分钟、Git 状态变了，系统提示**一个字节都不能动**，
