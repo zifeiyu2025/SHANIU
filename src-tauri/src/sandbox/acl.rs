@@ -6,16 +6,25 @@
 //!  - 改安全描述符前先备份原始 DACL；备份失败就不许改（不"先改了再说"）；
 //!  - 卸载/退出按备份还原，避免残留 ACE 指向已删除的容器 SID。
 //!
-//! 第四类：**祖先链**（2026-11-12 补，见 docs/04 §1.5.1）。给每个授权根补
-//! 「盘根 → 父目录」每一级的 `Traverse`（`FILE_GENERIC_EXECUTE`：只路过 + 读属性，
-//! 不含列目录、不含读写内容）。原因：容器里的构建工具逐段 `metadata` 探测路径，
-//! 任何一级拒绝访问都会让整条链断掉。祖先条目**不带继承**，且 DACL 写不进去时降级
-//! （审计 `denied` + warn），不 fail-closed。
+//! 第四类：**祖先链**（2026-11-12 定案，见 docs/04 §1.5.1、docs/14）。给每个授权根补
+//! 「盘根以下 → 工作区根」每一级的 `(RA,S)` = `FILE_READ_ATTRIBUTES|SYNCHRONIZE`
+//! （`0x100080`：够 `fs::metadata`，**不含** `FILE_LIST_DIRECTORY`，不暴露祖先条目名）。
 //!
-//! **但运行期不调用它**（2026-11-12 实测后撤回）：写一条不继承 ACE 仍会让系统重算整棵
-//! 子树（`C:\Users\<user>` 62.4s、`AppData` 30.5s、`AppData\Local` 13.4s），单次 spawn
-//! 11.6s → 86.4s（最差 163.6s），且盘根两级非提权写不进、容器仍读不到祖先属性。
-//! 机制保留给安装期一次预置与用例，决策与数字见 docs/13。
+//! **判定口径（之前写反过，别再踩）**：容器对某个对象做 `metadata` / `read_dir`，需要
+//! **该对象自身**有一条命名容器 SID 的 ACE；**穿过**祖先不需要 ACE（`SeChangeNotifyPrivilege`
+//! 由对象管理器实现，整条路径的 `FILE_TRAVERSE` 被绕过）。所以「盘根没 ACE」不等于
+//! 「路径在盘根就断了」——断点永远是被访问的那个对象。
+//!
+//! 为什么必须补：容器里的构建工具用 `glob` 逐段 `fs::metadata` 探测路径，
+//! `glob-0.3.4` 对任何一级失败都 `.flatten()` **静默丢弃整条路径**（不报错）。
+//! 实测后果：`tauri-build` 收集不到 `core:*` 权限，冷构建报
+//! `Permission core:window:allow-minimize not found`，全程没有一句「拒绝访问」。
+//!
+//! **持久化、不进备份、不在 exec 路径**：祖先 ACE 一次写入长期有效，绝不随退出还原
+//! （还原等于每次启动重写）。写一条不继承 ACE 仍会让系统重算整棵子树——本机实测
+//! `D:\MyWorkspace` 25.6s / `D:\MyWorkspace\SHANIU` 25.4s（与子树大小关系不大，是整树
+//! 继承重算的固定成本），所以只能**后台预置**（`mod::provision_ancestors_in_background`），
+//! 绝不能在第一次 exec 里现补。下一次启动按真实 DACL 探测命中，1–2ms 跳过。
 //!
 //! 幂等与范围（2026-11-08 补，见 docs/04 §1.5）：
 //!  - 目录已有容器 SID 的**显式** ACE（掩码覆盖授权掩码）→ 不改写、不写备份；
@@ -61,9 +70,19 @@ pub enum Access {
     Read,
     /// 读 + 写 + 删（目录还要能删子项）。
     Write,
-    /// 只给穿过父目录的权限（祖先链补洞用，不给读内容）。
-    Traverse,
+    /// 祖先链补洞：只给「读属性 + 同步」，够 `fs::metadata`，**不给列举、不给读内容**。
+    ///
+    /// 不要用 `FILE_GENERIC_EXECUTE` / `Traverse`：它含 `FILE_LIST_DIRECTORY`，
+    /// 会把祖先目录的条目名暴露给容器。穿越本身不需要 ACE（`SeChangeNotifyPrivilege`
+    /// 绕过），所以这里买的只是「能对祖先对象取属性」这一件事。
+    Ancestor,
 }
+
+/// `Ancestor` 的掩码：`FILE_READ_ATTRIBUTES`(0x80) | `SYNCHRONIZE`(0x100000)。
+///
+/// 逐档实测（容器内 `fs::metadata`）：`FILE_READ_ATTRIBUTES` 单独**不够**、
+/// `READ_CONTROL` 单独**不够**、本条**够用且 `read_dir` 仍被拒**。
+pub const ANCESTOR_ACCESS_MASK: u32 = 0x0000_0080 | 0x0010_0000;
 
 impl Access {
     pub(crate) fn mask(self) -> u32 {
@@ -78,8 +97,8 @@ impl Access {
                     | DELETE.0
                     | FILE_DELETE_CHILD.0
             }
-            // 遍历：只给穿过这一级目录的权限。
-            Access::Traverse => FILE_GENERIC_EXECUTE.0,
+            // 祖先：只买「读属性 + 同步」。
+            Access::Ancestor => ANCESTOR_ACCESS_MASK,
         }
     }
 
@@ -87,7 +106,7 @@ impl Access {
         match self {
             Access::Read => "read",
             Access::Write => "write",
-            Access::Traverse => "traverse",
+            Access::Ancestor => "ancestor",
         }
     }
 }
@@ -153,10 +172,12 @@ fn drop_nested(mut paths: Vec<PathBuf>) -> Vec<PathBuf> {
     kept
 }
 
-/// 「盘根 → 父目录」的完整祖先链，最外层在前，**不含自己**。
+/// 「盘根以下 → 父目录」的完整祖先链，最外层在前，**不含自己、不含盘根**。
 ///
-/// 只给这些层级补 `Traverse`：容器里的构建工具会逐段 `metadata` 探测路径，
-/// 任何一级返回「拒绝访问」都会让整条链断掉（`glob` 会静默当成路径不存在）。
+/// 只给这些层级补 `(RA,S)`：容器里的构建工具会逐段 `fs::metadata` 探测路径，
+/// 任何一级返回「拒绝访问」都会让整条链断掉（`glob-0.3.4` 直接 `.flatten()` 丢掉，
+/// 连错误都不报）。盘根本身不写：`glob` 只 stat 盘根以下每一段，盘根写了没用
+/// （2026-11-12 实测，`C:\`/`D:\` 全裸也能跑通冷构建）。
 /// 这里不做存在性判断，调用方按需过滤——纯函数便于对 UNC / 盘根做单测。
 pub fn ancestor_chain(dir: &Path) -> Vec<PathBuf> {
     ancestor_chain_until(dir, None)
@@ -166,7 +187,7 @@ pub fn ancestor_chain(dir: &Path) -> Vec<PathBuf> {
 ///
 /// 只给用例用：验证时在 `%TEMP%` 下自造链条，不能让写入一路顶到盘根
 /// （`C:\Users\<user>` 这类目录上一次 DACL 写入要几十秒，且普通用户写不进）。
-/// 生产路径（安装期预置）走 `None`，即整条链。
+/// 生产路径（后台预置）走 `None`，即整条链。
 fn ancestor_chain_until(dir: &Path, stop_at: Option<&Path>) -> Vec<PathBuf> {
     let mut chain: Vec<PathBuf> = Vec::new();
     let mut current = normalize(dir);
@@ -174,6 +195,13 @@ fn ancestor_chain_until(dir: &Path, stop_at: Option<&Path>) -> Vec<PathBuf> {
         let parent = normalize(parent);
         // 盘根/共享根的 `parent()` 可能回到自身；用相等判断兜住，避免死循环。
         if parent.as_os_str().is_empty() || parent == current {
+            break;
+        }
+        // 盘根本身不写（`parent()` 为 `None` 即盘根）：真正被 stat 的是盘根以下每一级，
+        // 盘根写了没用（2026-11-12 实测：`C:\`/`D:\` 全裸也能跑通冷构建）；而且盘根
+        // owner 是 TrustedInstaller/SYSTEM、普通用户没有 `WRITE_DAC`，写进去只会把
+        // `ancestors` 状态永久钉在 `needs_admin`。
+        if parent.parent().is_none() {
             break;
         }
         chain.push(parent.clone());
@@ -189,13 +217,13 @@ fn ancestor_chain_until(dir: &Path, stop_at: Option<&Path>) -> Vec<PathBuf> {
 }
 
 impl Access {
-    /// 权限包含关系：`Write ⊇ Read ⊇ Traverse`。
+    /// 权限包含关系：`Write ⊇ Read ⊇ Ancestor`。
     fn covers(self, other: Access) -> bool {
         matches!(
             (self, other),
             (Access::Write, _)
-                | (Access::Read, Access::Read | Access::Traverse)
-                | (Access::Traverse, Access::Traverse)
+                | (Access::Read, Access::Read | Access::Ancestor)
+                | (Access::Ancestor, Access::Ancestor)
         )
     }
 }
@@ -253,10 +281,15 @@ pub struct AclManager {
     audit_path: PathBuf,
     /// 已授权项：`(规范化路径, SID 字符串, 档位)`。
     ///
-    /// **档位必须进键**：祖先链先记 `Traverse`，同一路径随后又作为授权根要 `Write` 时，
+    /// **档位必须进键**：祖先链先记 `Ancestor`，同一路径随后又作为授权根要 `Write` 时，
     /// 只按 `(路径, SID)` 命中缓存会把 `Write` 静默跳过——DACL 上只剩一条只路过的 ACE，
     /// 工作区反而写不进去。命中条件用 `Access::covers`，强档位可以顶替弱档位。
     granted: HashSet<(PathBuf, String, Access)>,
+    /// 本进程见过的**持久**写权限：`(路径, SID 文本)`。
+    ///
+    /// 只给 `restore_all` 收尾复查用：如果某次备份还原把持久 ACE 一并抹掉了，
+    /// 退出日志要能看见（下一次启动会重新补齐，不在退出路径重写 DACL）。
+    persistent: Vec<(PathBuf, String)>,
     recovered_stale: usize,
 }
 
@@ -271,6 +304,7 @@ impl AclManager {
             backup_dir,
             audit_path,
             granted: HashSet::new(),
+            persistent: Vec::new(),
             recovered_stale: 0,
         }
     }
@@ -339,6 +373,19 @@ impl AclManager {
     /// 否则换个配置键就能绕过。工具链目录走 `grant`：`node.exe` 在
     /// `Program Files\nodejs` 是子目录，只有 `Program Files` 本身作为根才拒。
     pub fn grant_guarded(&mut self, dir: &Path, sid: PSID, access: Access) -> Result<(), String> {
+        self.grant_guarded_entry(dir, sid, access).map(|_| ())
+    }
+
+    /// [`grant_guarded`] 的回报版：`true` = 本次真的改了 DACL，`false` = 已在位。
+    ///
+    /// 后台预置要区分「写了」与「本来就有」：前者首条命令才可能变快，
+    /// 后者说明上一次已经写过（持久化生效），两者的日志含义完全不同。
+    pub(crate) fn grant_guarded_entry(
+        &mut self,
+        dir: &Path,
+        sid: PSID,
+        access: Access,
+    ) -> Result<bool, String> {
         let normalized = normalize(dir);
         if let Some(reason) = overbroad_root_reason(&normalized) {
             let sid_text = sid_to_string(sid)?;
@@ -353,7 +400,127 @@ impl AclManager {
             );
             return Err(reason);
         }
-        self.grant(dir, sid, access)
+        self.grant_entry(dir, sid, access, SUB_CONTAINERS_AND_OBJECTS_INHERIT, false)
+    }
+
+    /// 工作区根 / temp / 工具链的**持久**写权限入口（不写备份、不随退出还原）。
+    ///
+    /// 口径与祖先 `(RA,S)` 完全一致：按真实 DACL 探测（命中即跳过，毫秒级）、
+    /// 写成功才追加账本（供卸载按 `existed_before=false` 精确删除）。
+    ///
+    /// 为什么不再备份：这四处每次启动重写一次，本机约 40s（工作区根 24s 占大头），
+    /// 用户看不见但磁盘在抖。dsh 的做法是写一次常驻复用（README:130），我们采用同一口径。
+    /// 备份只保留给**会随会话消失**的授权（MCP 每 server 一个容器 SID）。
+    ///
+    /// `guarded` = 该路径是**用户指定的根**（挡过宽根）；temp / 工具链目录传 `false`。
+    pub(crate) fn grant_scope_persistent(
+        &mut self,
+        dir: &Path,
+        sid: PSID,
+        guarded: bool,
+        ledger: &Path,
+    ) -> Result<ScopeGrant, String> {
+        let normalized = normalize(dir);
+        if !normalized.is_dir() {
+            return Err(format!(
+                "不能给非目录路径加沙箱 ACE：{}",
+                normalized.display()
+            ));
+        }
+        let sid_text = sid_to_string(sid)?;
+        if guarded {
+            if let Some(reason) = overbroad_root_reason(&normalized) {
+                self.audit(
+                    "grant",
+                    &normalized,
+                    &sid_text,
+                    Access::Write.label(),
+                    "refused",
+                    Some(&reason),
+                );
+                return Err(reason);
+            }
+        }
+        // 进程内缓存：同一进程重复 exec 不再问 DACL。
+        if self
+            .granted
+            .iter()
+            .any(|(path, granted_sid, granted_access)| {
+                *path == normalized
+                    && *granted_sid == sid_text
+                    && granted_access.covers(Access::Write)
+            })
+        {
+            return Ok(ScopeGrant::AlreadyPresent);
+        }
+        let mask = Access::Write.mask();
+        if has_explicit_grant(&normalized, sid, mask)? {
+            tracing::info!(
+                dir = %normalized.display(),
+                "目录已有容器 SID 的显式 ACE，跳过改写（持久授权命中）"
+            );
+            self.remember_persistent(&normalized, &sid_text);
+            self.granted.insert((normalized, sid_text, Access::Write));
+            return Ok(ScopeGrant::AlreadyPresent);
+        }
+
+        // 写之前记一次「这个 SID 有没有任何显式 ACE」：卸载只许删 `existed_before=false` 的。
+        let existed_before = has_any_explicit_grant(&normalized, sid)?;
+        match apply_grant(&normalized, sid, mask, SUB_CONTAINERS_AND_OBJECTS_INHERIT) {
+            Ok(()) => {
+                self.audit(
+                    "grant",
+                    &normalized,
+                    &sid_text,
+                    Access::Write.label(),
+                    "ok",
+                    None,
+                );
+                self.remember_persistent(&normalized, &sid_text);
+                self.granted
+                    .insert((normalized.clone(), sid_text, Access::Write));
+                if let Err(error) = append_ledger(
+                    ledger,
+                    LEDGER_KIND_SCOPE,
+                    &normalized,
+                    sid,
+                    mask,
+                    true,
+                    existed_before,
+                ) {
+                    // ACE 已生效；账本丢了只影响卸载能否精确回滚这一处。
+                    tracing::warn!(
+                        path = %normalized.display(),
+                        %error,
+                        "写权限已持久化但账本写入失败（卸载时无法精确回滚这一处）"
+                    );
+                }
+                Ok(ScopeGrant::Written { existed_before })
+            }
+            // 没有 `WRITE_DAC`（系统目录）：交给调用方决定降级还是 fail-closed。
+            Err(failure) if failure.access_denied => {
+                self.audit(
+                    "grant",
+                    &normalized,
+                    &sid_text,
+                    Access::Write.label(),
+                    "denied",
+                    Some(&failure.message),
+                );
+                Ok(ScopeGrant::Denied(failure.message))
+            }
+            Err(failure) => {
+                self.audit(
+                    "grant",
+                    &normalized,
+                    &sid_text,
+                    Access::Write.label(),
+                    "error",
+                    Some(&failure.message),
+                );
+                Err(failure.message)
+            }
+        }
     }
 
     /// 给目录加容器 SID 的 ACE。备份失败 → 直接失败，**不改安全描述符**。
@@ -362,19 +529,19 @@ impl AclManager {
             .map(|_| ())
     }
 
-    /// 给授权根加 ACE，并给「盘根 → 父目录」每一级补 `Traverse`（只路过）。
+    /// 给授权根加 ACE，并给「盘根以下 → 父目录」每一级补 `(RA,S)`。
     ///
-    /// 祖先条目**不带继承**（`ACE_FLAGS(0)`）：可继承 ACE 会触发整树重传播，
-    /// `C:\Users` 这种大树上是分钟级操作；逐级各加一条只影响那一级。
+    /// 祖先条目**不带继承**（`ACE_FLAGS(0)`）——但别指望它能省掉重传播：本机实测
+    /// 不继承 ACE 仍让系统重算整棵子树（`D:\MyWorkspace` 25.6s / `D:\MyWorkspace\SHANIU`
+    /// 25.4s，与子树大小关系不大）。
     ///
-    /// 祖先 DACL 不可写（`C:\`、`C:\Users`、盘根属 SYSTEM/Administrators，普通用户没有
-    /// `WRITE_DAC`）时**降级**：审计记 `denied` + 一行 warn，继续执行——少一条只路过权限
-    /// 只会更严，不会放宽；fail-closed 会让所有非提权用户的 workspace-write 全部不可用。
+    /// 祖先 DACL 不可写（`C:\Users` 属 SYSTEM，普通用户没有 `WRITE_DAC`）时**降级**：
+    /// 审计记 `denied` + 一行 warn，继续执行——少一条只买「读属性」的 ACE 只会更严。
     ///
-    /// **2026-11-12：不在 exec 路径上调用**。实测原因：写一条不继承 ACE 也会让系统重算
-    /// 整棵子树（`C:\Users\<user>` 62.4s、`AppData` 30.5s、`AppData\Local` 13.4s），
-    /// 单次 spawn 从 11.6s 涨到 86.4s（最差 163.6s）；而 `C:\`、`C:\Users` 非提权写不进，
-    /// 容器仍然读不到祖先属性。保留给**安装期一次预置**与用例，决策见 docs/13。
+    /// **2026-11-12：不在 exec 路径上调用**。这条路径会写备份、会随退出还原，
+    /// 天生是「每次启动重写一遍」。生产改走 [`ensure_ancestor_grant`] + 后台预置
+    /// （`mod::provision_ancestors_in_background`），持久化、不写备份。
+    /// 这里保留给用例与显式的一次性授权。
     pub fn grant_chain(&mut self, dir: &Path, sid: PSID, access: Access) -> Result<(), String> {
         self.grant(dir, sid, access)?;
         self.grant_ancestors(dir, sid, None)
@@ -391,7 +558,7 @@ impl AclManager {
         self.grant_ancestors(dir, sid, None)
     }
 
-    /// 逐级补 `Traverse`。`stop_at` 见 [`ancestor_chain_until`]，生产路径传 `None`。
+    /// 逐级补 `(RA,S)`。`stop_at` 见 [`ancestor_chain_until`]，生产路径传 `None`。
     fn grant_ancestors(
         &mut self,
         dir: &Path,
@@ -403,7 +570,7 @@ impl AclManager {
             if !ancestor.is_dir() {
                 continue;
             }
-            self.grant_entry(&ancestor, sid, Access::Traverse, ACE_FLAGS(0), true)?;
+            self.grant_entry(&ancestor, sid, Access::Ancestor, ACE_FLAGS(0), true)?;
         }
         Ok(())
     }
@@ -543,9 +710,12 @@ impl AclManager {
         // 先记账、再清备份。`granted` 必须反映磁盘现状（ACE 此刻确实已经撤销）：
         // 留着旧条目会让后续同键 `grant` 命中 `contains` 直接返回 Ok，留下一条
         // 「已授权」却没有 ACE 的假记录——那比备份残留更难发现。
-        // 同一路径可能同时记着 `Traverse`（祖先链）与 `Write`（授权根）两条，按路径+SID 全清。
+        // 同一路径可能同时记着 `Ancestor`（祖先链）与 `Write`（授权根）两条，按路径+SID 全清。
         self.granted
             .retain(|(path, granted_sid, _)| !(*path == normalized && *granted_sid == sid_text));
+        // 主动撤销的持久授权不再需要退出复查（否则 `restore_all` 会误报「被抹掉」）。
+        self.persistent
+            .retain(|(path, known_sid)| !(*path == normalized && *known_sid == sid_text));
         let other_grants = self.granted.iter().any(|(path, _, _)| *path == normalized);
         if !other_grants {
             // 该路径上已无其它授权 → 备份文件也删掉，否则下次启动 `recover_pending`
@@ -579,7 +749,38 @@ impl AclManager {
 
     /// 按备份还原全部已授权目录。返回还原条数。
     pub fn restore_all(&mut self) -> Result<usize, String> {
-        self.recover_pending()
+        let restored = self.recover_pending()?;
+        // 备份快照可能早于持久写权限（例如 MCP 先授权、exec 后授权），还原会把持久 ACE
+        // 一并抹掉。这里**不重写** DACL——退出路径不能被 25s 的写入卡住——只把事实说清楚，
+        // 下一次启动按真实 DACL 探测时自会补齐。
+        for (path, sid_text) in &self.persistent {
+            let missing = match super::appcontainer::capability_sid(sid_text) {
+                Ok(sid) => {
+                    has_explicit_grant(path, sid.as_psid(), Access::Write.mask()).map(|hit| !hit)
+                }
+                Err(_) => Ok(true),
+            };
+            if matches!(missing, Ok(true)) {
+                tracing::warn!(
+                    path = %path.display(),
+                    "持久写权限被本次备份还原抹掉（下一次启动会重新补齐）"
+                );
+            }
+        }
+        Ok(restored)
+    }
+
+    /// 记下「这一处是本进程见过的持久授权」，供 `restore_all` 收尾复查用。
+    fn remember_persistent(&mut self, path: &Path, sid_text: &str) {
+        if self
+            .persistent
+            .iter()
+            .any(|(known_path, known_sid)| known_path == path && known_sid == sid_text)
+        {
+            return;
+        }
+        self.persistent
+            .push((path.to_path_buf(), sid_text.to_string()));
     }
 
     /// 是否从异常退出中接管了 profile（用于退出时删除陈旧容器）。
@@ -822,6 +1023,15 @@ pub(crate) fn has_explicit_grant(path: &Path, sid: PSID, mask: u32) -> Result<bo
         let _ = LocalFree(Some(HLOCAL(descriptor.0)));
     }
     result
+}
+
+/// 该对象上是否已有容器 SID 的**任何**显式允许 ACE（不看掩码覆盖）。
+///
+/// 只给账本的 `existed_before` 用：掩码不覆盖 ≠ 没有别人的 ACE。只有这里返回
+/// `false` 时，新写的那条才是「我们独创的」，卸载/回滚时才允许删。
+pub(crate) fn has_any_explicit_grant(path: &Path, sid: PSID) -> Result<bool, String> {
+    // 掩码传 0：`Mask & 0 != 0` 恒假，等于「任意掩码都算命中」。
+    has_explicit_grant(path, sid, 0)
 }
 
 unsafe fn scan_acl_for_grant(dacl: *mut ACL, sid: PSID, mask: u32) -> Result<bool, String> {
@@ -1214,6 +1424,145 @@ pub(crate) fn restore_from_snapshot(path: &Path, snapshot: &[u8]) -> Result<(), 
     Ok(())
 }
 
+// ---------------------------------------------------------------------------
+// 祖先链持久预置（docs/14）
+// ---------------------------------------------------------------------------
+
+/// 单级祖先的预置结果。
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum AncestorGrant {
+    /// 本次真的写了 DACL。`existed_before` 记的是**写之前**该对象上有没有容器 SID
+    /// 的任何显式 ACE（哪怕掩码不够）——账本据此区分「我们独创的」与「在别人的基础上加码」。
+    Written { existed_before: bool },
+    /// 磁盘上已有覆盖 `(RA,S)` 的显式 ACE（上次运行写的，或外部授权）——零写入。
+    AlreadyPresent,
+    /// 当前用户对该级没有 `WRITE_DAC`（`C:\Users` 这类系统拥有的层级）：需要一次管理员。
+    Denied(String),
+}
+
+impl AncestorGrant {
+    pub fn as_str(&self) -> &'static str {
+        match self {
+            Self::Written { .. } => "written",
+            Self::AlreadyPresent => "present",
+            Self::Denied(_) => "denied",
+        }
+    }
+}
+
+/// 工作区根 / temp / 工具链的持久写权限结果（与 [`AncestorGrant`] 同构）。
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum ScopeGrant {
+    /// 本次真的写了 DACL；`existed_before` 记写之前该 SID 有没有任何显式 ACE。
+    Written { existed_before: bool },
+    /// 真实 DACL 已覆盖 `Write` 掩码——零写入。
+    AlreadyPresent,
+    /// 当前用户没有该目录的 `WRITE_DAC`：调用方决定降级还是 fail-closed。
+    Denied(String),
+}
+
+impl ScopeGrant {
+    pub fn as_str(&self) -> &'static str {
+        match self {
+            Self::Written { .. } => "written",
+            Self::AlreadyPresent => "present",
+            Self::Denied(_) => "denied",
+        }
+    }
+}
+
+/// 给一级祖先补 `(RA,S)`：**不写备份**（持久化，绝不随退出还原），先按真实 DACL 判缺。
+///
+/// 判定口径：这一级对象上有没有容器 SID 的**显式** ACE 且掩码覆盖 `(RA,S)`。
+/// 有就跳过（实测 1–2ms），没有才写；写不进去只可能因为没有 `WRITE_DAC`，
+/// 按 `Denied` 上报而不是 fail-closed——少一条只买「读属性」的 ACE 只会更严，不会放宽。
+pub fn ensure_ancestor_grant(dir: &Path, sid: PSID) -> Result<AncestorGrant, String> {
+    if !dir.is_dir() {
+        return Err(format!("祖先路径不是目录：{}", dir.display()));
+    }
+    if has_explicit_grant(dir, sid, ANCESTOR_ACCESS_MASK)? {
+        return Ok(AncestorGrant::AlreadyPresent);
+    }
+    // 写之前记一次「有没有别人的 ACE」：掩码不覆盖也算，这样账本不把别人的授权记成我们的。
+    let existed_before = has_any_explicit_grant(dir, sid)?;
+    // 祖先专用 `ACE_FLAGS(0)`：不继承（可继承 ACE 会被转发进整棵子树）。
+    match apply_grant(dir, sid, ANCESTOR_ACCESS_MASK, ACE_FLAGS(0)) {
+        Ok(()) => Ok(AncestorGrant::Written { existed_before }),
+        Err(failure) if failure.access_denied => Ok(AncestorGrant::Denied(failure.message)),
+        Err(failure) => Err(failure.message),
+    }
+}
+
+/// 持久预置账本路径。**故意不放 `acl/` 子目录**：那一层是 DACL 备份台账，
+/// `recover_pending` 会把里面的文件当成备份重放。
+pub fn persistent_ledger_path(data_root: &Path) -> PathBuf {
+    data_root.join("sandbox").join("ancestor-ace.jsonl")
+}
+
+/// 账本里「祖先 `(RA,S)`」与「持久写权限」两类记录用 `kind` 区分。
+///
+/// 老版本写的行没有 `kind` 字段，按祖先处理（见 docs/14 §六 的回滚步骤）。
+pub const LEDGER_KIND_ANCESTOR: &str = "ancestor";
+pub const LEDGER_KIND_SCOPE: &str = "scope";
+
+/// 追加一条账本记录：只记「我们加的、加之前没有」，供卸载/回滚使用。
+///
+/// `existed_before` 必须如实——别人的 ACE 记成我们的，卸载时就会删掉不属于我们的授权。
+/// 运行时**不读**这个账本做判断（判缺一律按真实 DACL 探测）。
+pub fn append_persistent_ledger(
+    ledger: &Path,
+    object: &Path,
+    sid: PSID,
+    existed_before: bool,
+) -> Result<(), String> {
+    append_ledger(
+        ledger,
+        LEDGER_KIND_ANCESTOR,
+        object,
+        sid,
+        ANCESTOR_ACCESS_MASK,
+        false,
+        existed_before,
+    )
+}
+
+/// 账本的唯一写入实现：`kind` / `mask` / `inherit` 都如实落盘，
+/// 卸载时只凭这几个字段就能判断该删哪一条、删之前要不要先确认掩码。
+fn append_ledger(
+    ledger: &Path,
+    kind: &str,
+    object: &Path,
+    sid: PSID,
+    mask: u32,
+    inherit: bool,
+    existed_before: bool,
+) -> Result<(), String> {
+    if let Some(parent) = ledger.parent() {
+        std::fs::create_dir_all(parent)
+            .map_err(|e| format!("创建 ACE 账本目录失败（{}）: {e}", parent.display()))?;
+    }
+    let line = serde_json::json!({
+        "kind": kind,
+        "path": object.to_string_lossy(),
+        "sid": sid_to_string(sid)?,
+        "mask": mask,
+        "inherit": inherit,
+        "existed_before": existed_before,
+        "added_at_ms": now_ms(),
+    });
+    let mut file = std::fs::OpenOptions::new()
+        .create(true)
+        .append(true)
+        .open(ledger)
+        .map_err(|e| format!("打开 ACE 账本失败（{}）: {e}", ledger.display()))?;
+    {
+        use std::io::Write as _;
+        writeln!(file, "{line}")
+            .map_err(|e| format!("写 ACE 账本失败（{}）: {e}", ledger.display()))?;
+    }
+    Ok(())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1290,12 +1639,12 @@ mod tests {
         assert_eq!(
             ancestor_chain(Path::new(r"C:\Users\jun\AppData\Local\Temp")),
             vec![
-                PathBuf::from(r"C:\"),
                 PathBuf::from(r"C:\Users"),
                 PathBuf::from(r"C:\Users\jun"),
                 PathBuf::from(r"C:\Users\jun\AppData"),
                 PathBuf::from(r"C:\Users\jun\AppData\Local"),
-            ]
+            ],
+            "盘根不写：写它既没用（实测 `C:\\` 全裸也能跑通冷构建），普通用户也没有它的 WRITE_DAC"
         );
         assert!(ancestor_chain(Path::new(r"D:\")).is_empty(), "盘根没有祖先");
         assert!(
@@ -1365,7 +1714,7 @@ mod tests {
         }
     }
 
-    /// 祖先链必须真的落到可写层级上：每一级一条 `Traverse`（不含列目录/读内容），
+    /// 祖先链必须真的落到可写层级上：每一级一条 `Ancestor`（不含列目录/读内容），
     /// 退出后按备份逐级还原。
     ///
     /// 只在 `%TEMP%` 下**自造链条**（上界钉在临时根），不向盘根写：给 `C:\Users\<user>`
@@ -1398,8 +1747,8 @@ mod tests {
         // 能写 DACL 的祖先必须真的拿到「只路过」ACE，且没有被升级成可列举/可读。
         for path in [&l1, &l2] {
             assert!(
-                has_explicit_grant(path, sid.as_psid(), Access::Traverse.mask()).unwrap(),
-                "祖先 {} 应有容器 SID 的 Traverse ACE",
+                has_explicit_grant(path, sid.as_psid(), Access::Ancestor.mask()).unwrap(),
+                "祖先 {} 应有容器 SID 的 Ancestor ACE",
                 path.display()
             );
             assert!(
@@ -1423,13 +1772,13 @@ mod tests {
                 .iter()
                 .filter(|record| {
                     record["action"] == "grant"
-                        && record["access"] == "traverse"
+                        && record["access"] == "ancestor"
                         && record["path"] == needle.as_str()
                 })
                 .collect();
             if matched.is_empty() {
                 assert!(
-                    has_explicit_grant(&ancestor, sid.as_psid(), Access::Traverse.mask())
+                    has_explicit_grant(&ancestor, sid.as_psid(), Access::Ancestor.mask())
                         .unwrap_or(false),
                     "祖先既没有授权审计、磁盘上也没有 ACE（静默跳过）：{needle}（审计：{audit}）"
                 );
@@ -1484,14 +1833,14 @@ mod tests {
         compare_restored(&before_l2, &read_dacl_snapshot(&l2).unwrap()).unwrap();
         for path in [&l1, &l2] {
             assert!(
-                !has_explicit_grant(path, sid.as_psid(), Access::Traverse.mask()).unwrap(),
+                !has_explicit_grant(path, sid.as_psid(), Access::Ancestor.mask()).unwrap(),
                 "还原后祖先不应残留容器 SID 的 ACE：{}",
                 path.display()
             );
         }
     }
 
-    /// 缓存键必须带档位：同一路径先记 `Traverse`，随后要 `Write` 时不能被缓存吞掉，
+    /// 缓存键必须带档位：同一路径先记 `Ancestor`，随后要 `Write` 时不能被缓存吞掉，
     /// 否则 DACL 上只留一条只路过 ACE，工作区写不进去。
     #[test]
     fn weak_cached_grant_does_not_swallow_a_stronger_grant() {
@@ -1499,15 +1848,15 @@ mod tests {
         let sid = super::super::appcontainer::internet_client_capability().unwrap();
 
         let mut manager = AclManager::new(ws.join("backups"));
-        manager.grant(&ws, sid.as_psid(), Access::Traverse).unwrap();
+        manager.grant(&ws, sid.as_psid(), Access::Ancestor).unwrap();
         assert!(
-            has_explicit_grant(&ws, sid.as_psid(), Access::Traverse.mask()).unwrap(),
-            "前置条件：目录应已有 Traverse ACE"
+            has_explicit_grant(&ws, sid.as_psid(), Access::Ancestor.mask()).unwrap(),
+            "前置条件：目录应已有 Ancestor ACE"
         );
         manager.grant(&ws, sid.as_psid(), Access::Write).unwrap();
         assert!(
             has_explicit_grant(&ws, sid.as_psid(), Access::Write.mask()).unwrap(),
-            "同一路径从 Traverse 升级到 Write 时不得被缓存吞掉"
+            "同一路径从 Ancestor 升级到 Write 时不得被缓存吞掉"
         );
         let _ = manager.restore_all();
     }
@@ -1988,7 +2337,6 @@ mod tests {
     }
 
     // （临时性能分解用例已移除：结论见 docs/13。）
-    // （临时性能分解用例已移除：结论见 docs/13。）
     #[test]
     fn grant_guarded_refuses_home_and_leaves_audit() {
         let ws = temp_dir("refuse");
@@ -2012,5 +2360,159 @@ mod tests {
             .grant_guarded(&work, sid.as_psid(), Access::Read)
             .expect("主目录的子目录不是过宽根，不应被拦");
         assert!(has_explicit_grant(&work, sid.as_psid(), Access::Read.mask()).unwrap());
+    }
+
+    /// 祖先预置的持久化语义（docs/14）：写一次 → 第二次命中跳过 → 账本如实记
+    /// 「写之前有没有」。**不走备份**：这里只用 `revoke_ace` 收尾，模拟卸载。
+    #[test]
+    fn ancestor_grant_is_persistent_idempotent_and_records_existed_before() {
+        let ws = temp_dir("ancestor-persist");
+        let dir = ws.join("level");
+        std::fs::create_dir_all(&dir).unwrap();
+        let sid = super::super::appcontainer::internet_client_capability().unwrap();
+        let ledger = ws.join("ancestor-ace.jsonl");
+        let before = read_dacl_snapshot(&dir).unwrap();
+
+        // 第一次：真写，且写之前这一级没有容器 SID 的任何显式 ACE。
+        let first = ensure_ancestor_grant(&dir, sid.as_psid()).unwrap();
+        assert_eq!(
+            first,
+            AncestorGrant::Written {
+                existed_before: false
+            },
+            "首写必须如实报告「之前没有」"
+        );
+        assert!(has_explicit_grant(&dir, sid.as_psid(), ANCESTOR_ACCESS_MASK).unwrap());
+
+        // 第二次：按真实 DACL 命中，零写入（DACL 逐字节不变）。
+        let after_first = read_dacl_snapshot(&dir).unwrap();
+        assert_eq!(
+            ensure_ancestor_grant(&dir, sid.as_psid()).unwrap(),
+            AncestorGrant::AlreadyPresent
+        );
+        assert_eq!(
+            read_dacl_snapshot(&dir).unwrap(),
+            after_first,
+            "命中后不得改写 DACL"
+        );
+
+        // 账本：一条记录、掩码是 `(RA,S)`、不继承、`existed_before: false`。
+        append_persistent_ledger(&ledger, &dir, sid.as_psid(), false).unwrap();
+        let records: Vec<serde_json::Value> = std::fs::read_to_string(&ledger)
+            .unwrap()
+            .lines()
+            .map(|line| serde_json::from_str(line).unwrap())
+            .collect();
+        assert_eq!(records.len(), 1);
+        assert_eq!(records[0]["mask"], ANCESTOR_ACCESS_MASK);
+        assert_eq!(records[0]["inherit"], false);
+        assert_eq!(records[0]["existed_before"], false);
+        assert_eq!(
+            records[0]["path"].as_str().unwrap(),
+            dir.display().to_string()
+        );
+
+        // 卸载/回滚就是删掉我们那条（持久化不还原）。
+        assert!(revoke_ace(&dir, sid.as_psid()).unwrap());
+        compare_restored(&before, &read_dacl_snapshot(&dir).unwrap()).unwrap();
+    }
+
+    /// 别人的 ACE 不能被记成我们的：只加「属性」这种弱于 `(RA,S)` 的显式 ACE 时，
+    /// 我们仍要补写，但账本必须写 `existed_before: true`（回滚时不许删掉别人那条）。
+    #[test]
+    fn ancestor_grant_marks_existed_before_when_sid_already_had_an_ace() {
+        let ws = temp_dir("ancestor-existed");
+        let dir = ws.join("level");
+        std::fs::create_dir_all(&dir).unwrap();
+        let sid = super::super::appcontainer::internet_client_capability().unwrap();
+        let before = read_dacl_snapshot(&dir).unwrap();
+
+        // 先只给 `FILE_READ_ATTRIBUTES`（0x80）：够不上 `(RA,S)`，但确实是这个 SID 的 ACE。
+        apply_grant(&dir, sid.as_psid(), 0x0000_0080, ACE_FLAGS(0))
+            .map_err(|failure| failure.message)
+            .unwrap();
+        assert!(
+            !has_explicit_grant(&dir, sid.as_psid(), ANCESTOR_ACCESS_MASK).unwrap(),
+            "弱 ACE 不应被当成已覆盖 (RA,S)"
+        );
+
+        let grant = ensure_ancestor_grant(&dir, sid.as_psid()).unwrap();
+        assert_eq!(
+            grant,
+            AncestorGrant::Written {
+                existed_before: true
+            },
+            "写之前已有该 SID 的 ACE，必须记 existed_before: true"
+        );
+        assert!(has_explicit_grant(&dir, sid.as_psid(), ANCESTOR_ACCESS_MASK).unwrap());
+
+        // 收尾：撤销这个 SID 的全部显式 ACE，回到原状。
+        assert!(revoke_ace(&dir, sid.as_psid()).unwrap());
+        compare_restored(&before, &read_dacl_snapshot(&dir).unwrap()).unwrap();
+    }
+
+    /// 工作区根 / temp / 工具链的持久写权限：首写记 `existed_before`、命中零写入、
+    /// **不产生备份**（否则退出时 `restore_all` 会把它还原掉），账本按 `kind=scope` 记账。
+    #[test]
+    fn scope_grant_is_persistent_idempotent_and_writes_no_backup() {
+        let ws = temp_dir("scope-persist");
+        let dir = ws.join("workspace");
+        std::fs::create_dir_all(&dir).unwrap();
+        let sid = super::super::appcontainer::internet_client_capability().unwrap();
+        let backup_dir = ws.join("acl");
+        let ledger = ws.join("ace.jsonl");
+        let before = read_dacl_snapshot(&dir).unwrap();
+        let mut manager = AclManager::new(backup_dir.clone());
+
+        let first = manager
+            .grant_scope_persistent(&dir, sid.as_psid(), false, &ledger)
+            .unwrap();
+        assert_eq!(
+            first,
+            ScopeGrant::Written {
+                existed_before: false
+            }
+        );
+        assert!(has_explicit_grant(&dir, sid.as_psid(), Access::Write.mask()).unwrap());
+        // 持久化 = 不写备份：备份目录要么不存在，要么是空的。
+        let leftovers = std::fs::read_dir(&backup_dir)
+            .map(|entries| entries.count())
+            .unwrap_or(0);
+        assert_eq!(leftovers, 0, "持久授权不得产生退出时会还原的备份");
+
+        // 换一个 manager（没有进程内缓存）再问一次：必须按真实 DACL 命中、零写入。
+        let after_first = read_dacl_snapshot(&dir).unwrap();
+        let mut fresh = AclManager::new(backup_dir.clone());
+        assert_eq!(
+            fresh
+                .grant_scope_persistent(&dir, sid.as_psid(), false, &ledger)
+                .unwrap(),
+            ScopeGrant::AlreadyPresent
+        );
+        assert_eq!(
+            read_dacl_snapshot(&dir).unwrap(),
+            after_first,
+            "命中后不得改写 DACL"
+        );
+
+        // 账本：一条、`kind=scope`、掩码是 Write、可继承、existed_before=false。
+        let records: Vec<serde_json::Value> = std::fs::read_to_string(&ledger)
+            .unwrap()
+            .lines()
+            .map(|line| serde_json::from_str(line).unwrap())
+            .collect();
+        assert_eq!(records.len(), 1);
+        assert_eq!(records[0]["kind"], LEDGER_KIND_SCOPE);
+        assert_eq!(records[0]["mask"], Access::Write.mask());
+        assert_eq!(records[0]["inherit"], true);
+        assert_eq!(records[0]["existed_before"], false);
+        assert_eq!(
+            records[0]["path"].as_str().unwrap(),
+            dir.display().to_string()
+        );
+
+        // 卸载/回滚：只按账本删我们那条，DACL 回到原状。
+        assert!(revoke_ace(&dir, sid.as_psid()).unwrap());
+        compare_restored(&before, &read_dacl_snapshot(&dir).unwrap()).unwrap();
     }
 }

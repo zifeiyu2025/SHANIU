@@ -165,6 +165,14 @@ impl AppContainer {
     }
 }
 
+/// 只派生容器 SID，**不创建 profile**（后台祖先 ACE 预置用）。
+///
+/// 后台线程不能走 `ensure()`：它会在 `build_runtime` 之前把 profile 建好，
+/// 让运行时的 `created()` 变成 `false`，退出时就把本该由本进程删掉的 profile 留下。
+pub fn derived_sid(name: &str) -> Result<Sid, String> {
+    unsafe { derive_sid(name) }
+}
+
 /// `internetClient` 能力 SID。
 /// exec/终端路径恒带（网络不是策略维度）；MCP 路径按 server 的 `allow_network` 决定。
 pub fn internet_client_capability() -> Result<Sid, String> {

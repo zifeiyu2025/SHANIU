@@ -3106,6 +3106,21 @@ pub fn run() {
         show_native_message(&format!("工作区设置不可用\n\n{message}"));
     }
 
+    // 祖先 `(RA,S)` **后台**预置（docs/14）：给目录写一条 ACE 会让系统重算整棵子树的
+    // 继承，本机实测 `D:\MyWorkspace` 25.6s + `D:\MyWorkspace\SHANIU` 25.4s。这段代价
+    // 绝不能挡在第一次 exec 前面，所以放在这里异步跑：启动不等待、命令不阻塞、
+    // 失败只降级为「某些祖先前缀探测不到」并在自报里标 `ancestors=needs_admin`。
+    // 只有真的会起容器（workspace-write + AppContainer）才有这件事要做。
+    {
+        let sandbox_config = &app_state.config().sandbox;
+        if sandbox_config.mode == config::SandboxMode::WorkspaceWrite
+            && sandbox_config.os == config::OsSandbox::AppContainer
+        {
+            sandbox::enable_ancestor_provisioning();
+            sandbox::provision_ancestors_in_background(registered_workspace_roots(&app_state));
+        }
+    }
+
     tauri::Builder::default()
         .plugin(tauri_plugin_dialog::init())
         .manage(app_state)

@@ -24,7 +24,7 @@ pub mod windows_impl;
 
 use std::collections::{BTreeMap, HashMap, HashSet};
 use std::path::{Path, PathBuf};
-use std::sync::atomic::{AtomicU8, AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU8, AtomicUsize, Ordering};
 use std::sync::{Mutex, OnceLock};
 
 use tokio::process::Command;
@@ -128,15 +128,40 @@ const EXEC_TOOLS: &[&str] = &["unified_exec", "terminal"];
 /// 给模型看的沙箱自报（拼在工具结果末尾）。非执行类工具返回 `None`。
 ///
 /// 措辞固定为 `[sandbox] mode=… enforcement=…`：机器可读，不随界面文案漂移。
+/// 祖先 ACE 还在后台补 / 补不上时追加 `ancestors=preparing|needs_admin`——这是
+/// 「这条命令为什么可能看不到某个目录」的唯一线索，别让它只留在日志里。
 pub fn execution_note(tool: &str, mode: SandboxMode) -> Option<String> {
     if !EXEC_TOOLS.contains(&tool) {
         return None;
     }
     let name = mode.as_str();
-    Some(format!(
+    let mut note = format!(
         "[sandbox] mode={name} enforcement={}",
         current_enforcement(mode).as_str()
-    ))
+    );
+    // 只有容器路径才有祖先链这回事；逻辑回退与全权模式加这个后缀只会误导。
+    if mode == SandboxMode::WorkspaceWrite && current_os_mode() == OsSandbox::AppContainer {
+        match ancestor_state() {
+            AncestorState::Preparing => note.push_str(" ancestors=preparing"),
+            AncestorState::NeedsAdmin => note.push_str(" ancestors=needs_admin"),
+            AncestorState::Idle | AncestorState::Ready => {}
+        }
+    }
+    Some(note)
+}
+
+/// 命令失败时补给人/模型的一句解释（`None` 表示与预置无关）。
+fn ancestor_hint() -> Option<&'static str> {
+    if current_os_mode() != OsSandbox::AppContainer {
+        return None;
+    }
+    match ancestor_state() {
+        AncestorState::Preparing => Some("沙箱正在准备文件权限，稍等重试就好"),
+        AncestorState::NeedsAdmin => Some(
+            "有些目录的文件权限还没准备好（需要以管理员身份运行一次 SHANIU），个别命令可能提示找不到路径",
+        ),
+        AncestorState::Idle | AncestorState::Ready => None,
+    }
 }
 
 /// 按策略准备子进程（Windows 实现）。tx 供受限路径的读线程回传 stdio 行。
@@ -271,14 +296,17 @@ fn spawn_in_app_container(
         msvc::toolchain_env(),
         tx,
     )
-    .map_err(SandboxError::CreateFailed)?;
+    .map_err(|error| match ancestor_hint() {
+        // 起进程就失败、且祖先权限还在准备：把「稍后重试」说清楚，别让人去查策略。
+        Some(hint) => SandboxError::CreateFailed(format!("{error}（{hint}）")),
+        None => SandboxError::CreateFailed(error),
+    })?;
     Ok(PreparedSpawn::Restricted(child))
 }
 
 /// 容器运行时 + 工作区写 ACE 的公共准备步骤。
 /// ACE 只加三类位置：工作区根 / temp / 工具链目录；授权对象是容器 SID。
-/// **不加祖先链**：写一条不继承 ACE 也会让系统重算整棵子树（实测 62s/30s/13s），
-/// 而盘根两级非提权写不进，详见 `app_container_scope` 内注释与 docs/13。
+/// **不加祖先链**：那几级由后台预置负责（见 `provision_ancestors_in_background`）。
 /// 每个工作区根在进程内只解析一次 scope：重复 exec / 终端不再碰 DACL（docs/04 §1.5）。
 ///
 /// 能力列表恒为 `internetClient`：网络不是策略维度，容器一律可出网（2026-11-10）。
@@ -296,31 +324,384 @@ fn app_container_scope(workspace_root: &Path) -> Result<(PSID, Vec<PSID>), Sandb
 
     if !runtime.resolved_roots.contains(workspace_root) {
         let sid = runtime.container.sid();
+        // 账本与后台预置共用一份：写权限也是持久的，卸载要能按账本精确删。
+        let ledger = acl::persistent_ledger_path(&crate::config::resolve_dirs_from_env().data_root);
         for dir in acl::write_scope(workspace_root) {
             // 工作区根与工具链目录走同一份清单，但只有前者受「过宽根」约束：
             // 工具链本来就可能在 Program Files 下。
-            // 注意：**不在运行期补祖先链**（2026-11-12 实测后撤回）。写 DACL 会让系统重算
-            // 整棵子树：`C:\Users\<user>` ≈62s、`AppData` ≈30s、`AppData\Local` ≈13s，
-            // 每次进程启动的首次 spawn 都要付，把 spawn 从 ~12s 拉到 86s（最差 164s）；
-            // 而 `C:\`、`C:\Users` 这两级非提权写不进，容器仍然读不到祖先属性——
-            // 也就是说代价全花在没用上的层级。祖先 `Traverse` 改为安装期一次预置，
-            // 机制见 `acl::grant_chain`，决策见 `docs/13-祖先遍历权决策材料.md`。
+            // 注意：**不在 exec 路径上补祖先链**。写 DACL 会让系统重算整棵子树
+            // （本机 2026-11-12 实测：`D:\MyWorkspace` 25.6s、`D:\MyWorkspace\SHANIU`
+            // 25.4s，与子树大小关系不大），绝不能出现在第一次 exec 里。
+            // 祖先 `(RA,S)` 由 `provision_ancestors_in_background` 在启动后异步补齐。
+            // 这四处写权限同理走**持久**入口：命中即跳过（ms 级），首次才写一次。
             let is_workspace_root = dir == *workspace_root;
-            with_acl(|acl| {
-                if is_workspace_root {
-                    acl.grant_guarded(&dir, sid, acl::Access::Write)
-                } else {
-                    acl.grant(&dir, sid, acl::Access::Write)
+            match with_acl(|acl| {
+                acl.grant_scope_persistent(&dir, sid, is_workspace_root, &ledger)
+            })? {
+                acl::ScopeGrant::Written { .. } | acl::ScopeGrant::AlreadyPresent => {}
+                acl::ScopeGrant::Denied(detail) => {
+                    return Err(SandboxError::CreateFailed(format!(
+                        "{detail}。该目录的权限当前改不了，命令拒绝在沙箱外执行"
+                    )))
                 }
-            })?;
+            }
         }
         runtime.resolved_roots.insert(workspace_root.to_path_buf());
+        // 新根第一次被用到：把它的祖先链交给后台补（非阻塞，本轮命令按当前状态跑）。
+        // 启动时已预置过的根会被台账挡住，这里等于零成本。
+        provision_ancestors_in_background(vec![workspace_root.to_path_buf()]);
     }
 
     Ok((
         runtime.container.sid(),
         vec![runtime.capability_internet.as_psid()],
     ))
+}
+
+// ---------------------------------------------------------------------------
+// 祖先 ACE 后台预置（docs/14）
+// ---------------------------------------------------------------------------
+//
+// 为什么必须后台：给目录写一条 ACE 会让系统重算整棵子树的继承（本机实测
+// `D:\MyWorkspace` 25.6s、`D:\MyWorkspace\SHANIU` 25.4s，与子树大小关系不大）。
+// 放 exec 路径上就是用户第一条命令卡半分钟，所以这里异步补、exec 只按当前状态跑。
+//
+// **持久化是方案本身**：祖先 ACE 写一次长期有效，不写备份、不随退出还原
+// （还原等于每次启动重写一遍，白付 51s）。账本只记「我们加过哪一级、加之前有没有」，
+// 供卸载/回滚使用；运行期判缺一律按真实 DACL 探测，绝不信任状态位或账本。
+
+/// 后台预置状态。**只用于自报与提示**，绝不用来判断「缺不缺」——那必须按真实 DACL
+/// 探测（`acl::ensure_ancestor_grant`）。状态会与磁盘漂移（用户手工改过 DACL、
+/// 别的实例写过），账本同理。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum AncestorState {
+    /// 没触发过（logical 档、只读工作区，或尚未启动）。
+    Idle,
+    /// 后台正在补齐：命令照常执行，可能因某一级还没 ACE 而看不到路径。
+    Preparing,
+    /// 需要的层级都已是 `(RA,S)`（本次写入或上次已写）。
+    Ready,
+    /// 至少一级没补上：缺 `WRITE_DAC`（`C:\Users` 这类系统拥有的层级）或 DACL 读不了。
+    /// **不是 fail-closed**：命令照常按当前状态执行，只是逐段 `fs::metadata` 会断。
+    NeedsAdmin,
+}
+
+impl AncestorState {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Idle => "idle",
+            Self::Preparing => "preparing",
+            Self::Ready => "ready",
+            Self::NeedsAdmin => "needs_admin",
+        }
+    }
+}
+
+/// 正在跑预置线程的个数：`>0` 即 `Preparing`（多个工作区可能先后触发）。
+static ANCESTOR_ACTIVE: AtomicUsize = AtomicUsize::new(0);
+/// 至少跑完过一轮（用来把 `Idle` 与 `Ready` 分开）。
+static ANCESTOR_DONE: AtomicBool = AtomicBool::new(false);
+/// 至少一级被拒或失败。
+static ANCESTOR_DENIED: AtomicBool = AtomicBool::new(false);
+/// 退出期间置位：后台线程在每级之间检查，尽快收手（写 DACL 本身不可中断）。
+static ANCESTOR_CANCEL: AtomicBool = AtomicBool::new(false);
+/// 已交给后台的根：切工作区/重开窗口不重扫同一条链。
+static ANCESTOR_CLAIMED: OnceLock<Mutex<HashSet<PathBuf>>> = OnceLock::new();
+/// 是否允许后台预置。**默认关**：这是应用生命周期行为（`lib.rs::run` 打开），
+/// 不该由沙箱原语替调用方决定。默认关也保证单测/集成测试不会顺手改写真实盘的
+/// 祖先 DACL（`%TEMP%` 的链条一路顶到 `C:\Users\jun`，既慢又不是用例要验的东西）。
+static ANCESTOR_ENABLED: AtomicBool = AtomicBool::new(false);
+
+/// 由应用入口显式打开后台预置（`lib.rs::run`）。
+pub fn enable_ancestor_provisioning() {
+    ANCESTOR_ENABLED.store(true, Ordering::Relaxed);
+}
+
+pub fn ancestor_state() -> AncestorState {
+    if ANCESTOR_ACTIVE.load(Ordering::Relaxed) > 0 {
+        return AncestorState::Preparing;
+    }
+    if ANCESTOR_DENIED.load(Ordering::Relaxed) {
+        return AncestorState::NeedsAdmin;
+    }
+    if ANCESTOR_DONE.load(Ordering::Relaxed) {
+        return AncestorState::Ready;
+    }
+    AncestorState::Idle
+}
+
+/// 把若干工作区根的文件权限准备交给后台。**立即返回**，从不阻塞调用方。
+///
+/// 两件事一起做，顺序固定：
+///  1. exec 路径上的写权限（工作区根 / TEMP / 工具链目录）——`AclManager` 语义，
+///     随退出还原；
+///  2. 祖先链的 `(RA,S)`——持久化、不写备份（见上）。
+///
+/// 先 1 后 2 是有意的：1 决定「第一条命令能不能立刻写文件」，2 决定「构建工具逐段
+/// 取属性会不会断」，前者对用户更靠前。
+///
+/// 可重复调用：同一根只排一次；中途退出由 [`ANCESTOR_CANCEL`] 收手；
+/// 任何一级失败都只记录并置 `NeedsAdmin`，**绝不 panic、绝不 fail-closed**。
+/// 只派生容器 SID、不创建 profile：后台线程不能抢在 `build_runtime` 前建好容器，
+/// 否则 `owns_profile` 会误判成「别人建的」，退出时把 profile 留下。
+pub fn provision_ancestors_in_background(roots: Vec<PathBuf>) {
+    if !ANCESTOR_ENABLED.load(Ordering::Relaxed) || ANCESTOR_CANCEL.load(Ordering::Relaxed) {
+        return;
+    }
+    let pending: Vec<PathBuf> = {
+        let claimed = ANCESTOR_CLAIMED.get_or_init(|| Mutex::new(HashSet::new()));
+        let Ok(mut guard) = claimed.lock() else {
+            tracing::warn!("祖先 ACE 后台预置：根台账锁已中毒，跳过本轮（命令不受影响）");
+            return;
+        };
+        roots
+            .into_iter()
+            .filter(|root| root.is_dir() && guard.insert(root.clone()))
+            .collect()
+    };
+    if pending.is_empty() {
+        return;
+    }
+    let sid = match appcontainer::derived_sid(appcontainer::PROFILE_NAME) {
+        Ok(sid) => sid,
+        Err(error) => {
+            tracing::warn!(
+                %error,
+                "祖先 ACE 后台预置：派生容器 SID 失败，按当前状态继续（命令不阻塞）"
+            );
+            return;
+        }
+    };
+    ANCESTOR_ACTIVE.fetch_add(1, Ordering::Relaxed);
+    let spawned = std::thread::Builder::new()
+        .name("shaniu-ancestor-ace".into())
+        .spawn(move || run_ancestor_provision(pending, sid));
+    if let Err(error) = spawned {
+        // 线程起不来不影响功能，只是祖先链这一轮不补：别让启动因此失败。
+        ANCESTOR_ACTIVE.fetch_sub(1, Ordering::Relaxed);
+        ANCESTOR_DENIED.store(true, Ordering::Relaxed);
+        tracing::warn!(%error, "祖先 ACE 后台预置：线程启动失败，按当前状态继续（命令不阻塞）");
+    }
+}
+
+/// 给一级祖先补 `(RA,S)`（探针/诊断用公开入口，按容器 profile 名定位 SID）。
+///
+/// 生产路径不打这里：`run_ancestor_provision` 直接握着一个 `Sid` 逐级调用，
+/// 不必每级重新派生。给集成测试用是因为它们不能命名 `windows::...::PSID`。
+pub fn ensure_ancestor_for(dir: &Path, profile_name: &str) -> Result<acl::AncestorGrant, String> {
+    let sid = appcontainer::derived_sid(profile_name)?;
+    acl::ensure_ancestor_grant(dir, sid.as_psid())
+}
+
+/// 撤销该容器在某个目录上的**全部**显式 ACE（探针收尾 / 未来卸载工具用）。
+pub fn revoke_ancestor_for(dir: &Path, profile_name: &str) -> Result<bool, String> {
+    let sid = appcontainer::derived_sid(profile_name)?;
+    acl::revoke_ace(dir, sid.as_psid())
+}
+
+/// 一次预置里的单级结果（真机验收/诊断用；界面只用 [`ancestor_state`]）。
+#[derive(Debug, Clone, serde::Serialize)]
+pub struct AncestorStep {
+    pub path: String,
+    /// `written` / `present` / `denied` / `failed`，与 `AncestorGrant::as_str` 同一套口径。
+    pub result: String,
+    pub elapsed_ms: u64,
+}
+
+/// 最近一次预置的汇总。**只用于验收与日志取证**，不参与任何判定。
+#[derive(Debug, Clone, serde::Serialize)]
+pub struct AncestorRun {
+    pub steps: Vec<AncestorStep>,
+    pub total_ms: u64,
+    pub cancelled: bool,
+    pub state: String,
+}
+
+static ANCESTOR_LAST_RUN: OnceLock<Mutex<Option<AncestorRun>>> = OnceLock::new();
+
+/// 取最近一次预置的逐级结果；`None` 表示本进程还没跑过。
+pub fn ancestor_last_run() -> Option<AncestorRun> {
+    ANCESTOR_LAST_RUN
+        .get()
+        .and_then(|slot| slot.lock().ok())
+        .and_then(|guard| guard.clone())
+}
+
+/// 后台线程本体：逐级探测 + 补 `(RA,S)`，写入成功才记账。
+fn run_ancestor_provision(roots: Vec<PathBuf>, sid: appcontainer::Sid) {
+    let started = std::time::Instant::now();
+    let ledger = acl::persistent_ledger_path(&crate::config::resolve_dirs_from_env().data_root);
+    let mut written = 0usize;
+    let mut present = 0usize;
+    let mut denied = 0usize;
+    let mut failed = 0usize;
+    let mut cancelled = false;
+    let mut steps: Vec<AncestorStep> = Vec::new();
+
+    // 开始也记一行：界面那条「正在准备文件权限」对应的就是这个状态，
+    // 没有开始行的话日志里只剩最后一次写入，用户看到的提示在日志里无从对证。
+    tracing::info!(
+        roots = roots.len(),
+        state = ancestor_state().as_str(),
+        "沙箱文件权限后台预置开始（不阻塞命令执行）"
+    );
+
+    // 阶段一：exec 路径上的四处写权限（工作区根 / TEMP / .cargo / .rustup）。
+    //
+    // 2026-11-12 搬到后台：这四处各自要让系统重算整棵子树，实测首条命令要等 5.87s
+    // （冷工作区副本；`%TEMP%`、`.cargo`、`.rustup` 子树大，占大头）。
+    //
+    // 2026-11-12 再改为**持久化**（与祖先 `(RA,S)` 同一套口径，对齐 dsh README:130
+    // 「写一次常驻复用」）：不再写随退出还原的备份，按真实 DACL 探测命中即跳过。
+    // 首次启动写一次（本机约 40s，工作区根 24s 占大头），此后每次启动只探测、零写入。
+    // exec 路径上的同一入口也走持久化，所以兜底不会再把持久 ACE 还原掉。
+    let mut seen: HashSet<PathBuf> = HashSet::new();
+    for root in &roots {
+        for dir in acl::write_scope(root) {
+            if ANCESTOR_CANCEL.load(Ordering::Relaxed) {
+                cancelled = true;
+                break;
+            }
+            // `TEMP` / `TMP` / `temp_dir()` 常常是同一个目录，重复授权没有意义。
+            if !dir.is_dir() || !seen.insert(dir.clone()) {
+                continue;
+            }
+            let step_started = std::time::Instant::now();
+            let guarded = dir == *root;
+            let outcome: &'static str = match with_acl(|acl| {
+                acl.grant_scope_persistent(&dir, sid.as_psid(), guarded, &ledger)
+            }) {
+                Ok(acl::ScopeGrant::Written { .. }) => {
+                    written += 1;
+                    tracing::info!(
+                        path = %dir.display(),
+                        elapsed_ms = step_started.elapsed().as_millis() as u64,
+                        "沙箱写权限已持久化（不随退出还原，下次启动探测命中即跳过）"
+                    );
+                    "written"
+                }
+                Ok(acl::ScopeGrant::AlreadyPresent) => {
+                    present += 1;
+                    "present"
+                }
+                Ok(acl::ScopeGrant::Denied(detail)) => {
+                    denied += 1;
+                    tracing::warn!(
+                        path = %dir.display(),
+                        %detail,
+                        "沙箱写权限未能补齐（该路径内的写入会被拒，其余照常）：需要管理员运行一次才能补齐"
+                    );
+                    "denied"
+                }
+                Err(error) => {
+                    denied += 1;
+                    tracing::warn!(
+                        path = %dir.display(),
+                        %error,
+                        "沙箱写权限未能补齐（该路径内的写入会被拒，其余照常）：需要管理员运行一次才能补齐"
+                    );
+                    "denied"
+                }
+            };
+            steps.push(AncestorStep {
+                path: dir.display().to_string(),
+                result: outcome.to_string(),
+                elapsed_ms: step_started.elapsed().as_millis() as u64,
+            });
+        }
+        if cancelled {
+            break;
+        }
+    }
+
+    // 多根会共用同一段祖先：逐级已有就跳过（实测 1–2ms），重复不会重写。
+    for dir in roots.iter().flat_map(|root| acl::ancestor_chain(root)) {
+        if ANCESTOR_CANCEL.load(Ordering::Relaxed) {
+            cancelled = true;
+            break;
+        }
+        if !dir.is_dir() {
+            continue;
+        }
+        let step_started = std::time::Instant::now();
+        let outcome: &'static str = match acl::ensure_ancestor_grant(&dir, sid.as_psid()) {
+            Ok(acl::AncestorGrant::Written { existed_before }) => {
+                written += 1;
+                // 每写一级就打一行：单级就可能 25s，只报汇总等于长时间没动静。
+                tracing::info!(
+                    path = %dir.display(),
+                    elapsed_ms = started.elapsed().as_millis() as u64,
+                    "祖先 ACE 已写入 `(RA,S)`"
+                );
+                if let Err(error) =
+                    acl::append_persistent_ledger(&ledger, &dir, sid.as_psid(), existed_before)
+                {
+                    // ACE 已生效；账本丢了只影响卸载时能否精确回滚这一级。
+                    tracing::warn!(
+                        path = %dir.display(),
+                        %error,
+                        "祖先 ACE 已生效但账本写入失败（卸载时无法精确回滚这一级）"
+                    );
+                }
+                "written"
+            }
+            Ok(acl::AncestorGrant::AlreadyPresent) => {
+                present += 1;
+                "present"
+            }
+            Ok(acl::AncestorGrant::Denied(detail)) => {
+                denied += 1;
+                tracing::warn!(
+                    path = %dir.display(),
+                    %detail,
+                    "祖先 ACE 未能写入（当前用户没有该级的 WRITE_DAC）：需要管理员运行一次才能补齐"
+                );
+                "denied"
+            }
+            Err(error) => {
+                failed += 1;
+                tracing::warn!(path = %dir.display(), %error, "祖先 ACE 预置失败（命令按当前状态执行）");
+                "failed"
+            }
+        };
+        steps.push(AncestorStep {
+            path: dir.display().to_string(),
+            result: outcome.to_string(),
+            elapsed_ms: step_started.elapsed().as_millis() as u64,
+        });
+    }
+
+    if denied > 0 || failed > 0 {
+        ANCESTOR_DENIED.store(true, Ordering::Relaxed);
+    }
+    // 被取消时**不**置 DONE：这一轮没补完，状态不能自报 `ready`
+    // （下次启动会重新按真实 DACL 探测，台账是进程内的，不跨进程遗留）。
+    if !cancelled {
+        ANCESTOR_DONE.store(true, Ordering::Relaxed);
+    }
+    ANCESTOR_ACTIVE.fetch_sub(1, Ordering::Relaxed);
+    let run = AncestorRun {
+        steps,
+        total_ms: started.elapsed().as_millis() as u64,
+        cancelled,
+        state: ancestor_state().as_str().to_string(),
+    };
+    if let Ok(mut slot) = ANCESTOR_LAST_RUN
+        .get_or_init(|| Mutex::new(None))
+        .lock()
+    {
+        *slot = Some(run.clone());
+    }
+    tracing::info!(
+        written,
+        present,
+        denied,
+        failed,
+        cancelled,
+        elapsed_ms = run.total_ms,
+        state = run.state,
+        "沙箱文件权限后台预置结束（工作区根/临时/工具链与祖先 (RA,S) 都持久化，下次启动按真实 DACL 探测，命中即跳过）"
+    );
 }
 
 /// 进程内唯一的目录 ACL 管理器。
@@ -450,6 +831,12 @@ fn build_runtime() -> Result<Runtime, SandboxError> {
 
 /// 进程退出时调用：先还原 DACL，再删除自己创建的容器 profile。
 pub fn shutdown() {
+    // 后台祖先 ACE 预置先收手：进行中的那一级会写完（DACL 写入不可中断），
+    // 但不再往下级走。**不等它**——退出路径不能被 25s 的 DACL 写入拖住。
+    ANCESTOR_CANCEL.store(true, Ordering::Relaxed);
+    if ANCESTOR_ACTIVE.load(Ordering::Relaxed) > 0 {
+        tracing::info!("沙箱退出：已通知后台祖先 ACE 预置停止（进行中的一级会写完）");
+    }
     release_all_mcp_containers();
     // 不论有没有 exec 运行时，只要动过 DACL 就要还原：MCP 容器也会改目录权限。
     if ACL.get().is_some() {
@@ -702,6 +1089,11 @@ pub struct SandboxStatus {
     pub enforcement: &'static str,
     /// 容器 profile 名（UI 常驻展示"跑的到底是哪个容器"）；logical 模式为空串。
     pub profile: String,
+    /// 文件权限后台准备的进度：`idle` / `preparing` / `ready` / `needs_admin`。
+    ///
+    /// 界面只在 `preparing` 与 `needs_admin` 时显示一行字，其余不占位。
+    /// **它只是自报，不是判定**：要不要重写某条 ACE 一律按真实 DACL 探测。
+    pub ancestor: &'static str,
     pub note: String,
 }
 
@@ -726,6 +1118,11 @@ pub fn status(mode: SandboxMode, os: OsSandbox) -> SandboxStatus {
         profile: match os {
             OsSandbox::AppContainer => appcontainer::PROFILE_NAME.to_string(),
             OsSandbox::Logical => String::new(),
+        },
+        // 只有容器路径才有「准备文件权限」这回事：逻辑回退与只读/全权档都不补，恒为 idle。
+        ancestor: match (os, mode) {
+            (OsSandbox::AppContainer, SandboxMode::WorkspaceWrite) => ancestor_state().as_str(),
+            _ => AncestorState::Idle.as_str(),
         },
         note: note.to_string(),
     }
@@ -1695,5 +2092,131 @@ mod tests {
         let second = child.wait().await.expect("重复等待必须复用缓存结果");
         let third = child.wait().await.expect("第三次等待同样走缓存");
         assert_eq!((first, second, third), (7, 7, 7));
+    }
+
+    /// 后台预置的真机验收（**不跑 CI**）：会写真实盘 DACL，单级可达 25s。
+    ///
+    /// ```text
+    /// $env:SHANIU_ANCESTOR_PROBE='D:\MyWorkspace\SHANIU'
+    /// cargo test --lib ancestor_provision_real_disk -- --ignored --nocapture
+    /// ```
+    /// 连跑两次：第一次应真写并收敛到 `ready`，第二次应毫秒级跳过（零写入）。
+    /// 关键断言是**入队立即返回**——这 51s 绝不能挡在第一次 exec 前面。
+    #[cfg(windows)]
+    #[test]
+    #[ignore = "写真实盘 DACL（单级可达 25s），只在真机验收时手动跑"]
+    fn ancestor_provision_real_disk_acceptance() {
+        use std::time::{Duration, Instant};
+
+        let Some(root) = std::env::var_os("SHANIU_ANCESTOR_PROBE").map(PathBuf::from) else {
+            eprintln!("跳过：未设置 SHANIU_ANCESTOR_PROBE");
+            return;
+        };
+        enable_ancestor_provisioning();
+        let sid = appcontainer::derived_sid(appcontainer::PROFILE_NAME).expect("派生容器 SID");
+        let chain = acl::ancestor_chain(&root);
+        let probe_started = Instant::now();
+        let missing = chain
+            .iter()
+            .filter(|dir| {
+                !acl::has_explicit_grant(dir, sid.as_psid(), acl::ANCESTOR_ACCESS_MASK)
+                    .unwrap_or(false)
+            })
+            .count();
+        let probed = probe_started.elapsed();
+        eprintln!(
+            "[provision] 按真实 DACL 探测 {} 级耗时 {}µs",
+            chain.len(),
+            probed.as_micros()
+        );
+
+        let started = Instant::now();
+        provision_ancestors_in_background(vec![root.clone()]);
+        let enqueued = started.elapsed();
+        eprintln!(
+            "[provision] 入队返回 {}µs（链 {} 级，其中缺 ACE {} 级）：{}",
+            enqueued.as_micros(),
+            chain.len(),
+            missing,
+            root.display()
+        );
+        assert!(
+            enqueued < Duration::from_millis(100),
+            "入队必须立即返回，实际 {enqueued:?}"
+        );
+
+        // `Preparing` 期间的自报必须带上状态：这是用户唯一能看到的「为什么看不到某个目录」。
+        if ancestor_state() == AncestorState::Preparing {
+            let note = execution_note("unified_exec", SandboxMode::WorkspaceWrite)
+                .expect("执行类工具应有自报");
+            eprintln!("[provision] Preparing 期自报：{note}");
+            assert!(note.contains("ancestors=preparing"), "实际: {note}");
+        }
+
+        while ancestor_state() == AncestorState::Preparing {
+            let waited = started.elapsed();
+            assert!(
+                waited < Duration::from_secs(300),
+                "后台预置超时（>300s）"
+            );
+            // 快路径自旋：Windows 的 `Sleep` 取整到 15.6ms，`sleep(1)` 实测也是 15ms+，
+            // 用 sleep 轮询会把「毫秒级收敛」吞成 200ms（旧写法就是这样虚报的）。
+            // 超过 50ms 说明是首写那种长跑，改回 sleep，别为一个 25s 的用例白烧一核。
+            if waited < Duration::from_millis(50) {
+                std::hint::spin_loop();
+            } else {
+                std::thread::sleep(Duration::from_millis(20));
+            }
+        }
+        let total = started.elapsed();
+        eprintln!(
+            "[provision] 结束状态 {}，从入队到收敛 {}µs（{}ms）",
+            ancestor_state().as_str(),
+            total.as_micros(),
+            total.as_millis()
+        );
+
+        // 逐级耗时只能从后台线程自己记的那份拿：外部轮询看不到单级粒度。
+        let run = ancestor_last_run().expect("后台线程应留下最近一次预置记录");
+        eprintln!(
+            "[provision] 线程内自计 total={}ms cancelled={} state={}",
+            run.total_ms, run.cancelled, run.state
+        );
+        eprintln!("[provision] 逐级结果（path | result | elapsed_ms）：");
+        for step in &run.steps {
+            eprintln!(
+                "[provision]   {} | {} | {}",
+                step.path, step.result, step.elapsed_ms
+            );
+        }
+        let written: Vec<&AncestorStep> = run
+            .steps
+            .iter()
+            .filter(|step| step.result == "written")
+            .collect();
+        eprintln!(
+            "[provision] 写入 {} 级、已在位 {} 级、拒绝 {} 级、失败 {} 级",
+            written.len(),
+            run.steps.iter().filter(|s| s.result == "present").count(),
+            run.steps.iter().filter(|s| s.result == "denied").count(),
+            run.steps.iter().filter(|s| s.result == "failed").count()
+        );
+
+        for dir in &chain {
+            let granted =
+                acl::has_explicit_grant(dir, sid.as_psid(), acl::ANCESTOR_ACCESS_MASK).unwrap_or(false);
+            eprintln!(
+                "[provision] {} → {}",
+                dir.display(),
+                if granted { "(RA,S) 在位" } else { "缺 ACE" }
+            );
+        }
+        // 本机验收口径：链上每一级都必须真的拿到 `(RA,S)`；拿不到的层级会被
+        // `ensure_ancestor_grant` 报 `Denied` 并置 `needs_admin`，那是另一条结论。
+        assert_eq!(
+            ancestor_state(),
+            AncestorState::Ready,
+            "有层级没补上（看上面逐级输出与日志里的 WRITE_DAC 提示）"
+        );
     }
 }
