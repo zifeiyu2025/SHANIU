@@ -26,17 +26,19 @@ use std::collections::{BTreeMap, BTreeSet};
 use std::fs::{File, OpenOptions};
 use std::io::Write;
 use std::path::{Path, PathBuf};
-use std::process::{id, Command};
-use std::sync::{Arc, Mutex};
+use std::process::{id, Command, Stdio};
+use std::sync::atomic::{AtomicUsize, Ordering};
+use std::sync::{Arc, Mutex, OnceLock};
 use std::time::{Duration, Instant};
 
-use serde::Deserialize;
+use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
-use shaniu_lib::agent_loop::{AgentLoop, ResponsesBackend};
+use shaniu_lib::agent_loop::{AgentLoop, ModelBackend, ResponsesBackend};
 use shaniu_lib::clock::now_ms;
 use shaniu_lib::config::{ApprovalMode, SandboxMode};
 use shaniu_lib::events::{ApprovalDecision, EventMsg, EventSink};
 use shaniu_lib::model_client::provider::ProviderConfig;
+use shaniu_lib::model_client::{HistoryItem, ModelError, ModelStream, ToolDeclaration};
 use shaniu_lib::permission::{policy, ApprovalBroker};
 use shaniu_lib::tool_router::{PlanState, ToolRouter};
 use shaniu_lib::tools;
@@ -47,6 +49,133 @@ const DEFAULT_REPEATS: usize = 3;
 /// 判据通过标记：退出码 0 之外还要求 stdout 真的说出这句话，
 /// 否则脚本「参数错误但退出码 0」会被读成通过。
 const JUDGE_PASS_MARKER: &str = "REPO-CHECK: PASS";
+/// 评测侧模型请求超时（只包住「拿到响应头」这一步）。超时归因固定写成
+/// 「评测自身/环境」，不把超时算成模型判断错误。
+const DEFAULT_REQUEST_TIMEOUT_SECS: u64 = 180;
+/// 整题硬超时 = 题面 `timeout_secs` + 这段余量（准备快照、判据编译、判据本身）。
+/// 子进程到点直接被强杀，保证一题挂死不会拖住整轮。
+const DEFAULT_TASK_HARD_EXTRA_SECS: u64 = 420;
+
+static RUN_LOG: OnceLock<Mutex<File>> = OnceLock::new();
+
+fn run_log_path() -> PathBuf {
+    std::env::var("SHANIU_EVAL_RUN_LOG").map_or_else(
+        |_| {
+            repo_root()
+                .join("target")
+                .join(format!("evals-repo-run-{}.log", id()))
+        },
+        PathBuf::from,
+    )
+}
+
+fn run_log() -> &'static Mutex<File> {
+    RUN_LOG.get_or_init(|| {
+        let path = run_log_path();
+        if let Some(dir) = path.parent() {
+            std::fs::create_dir_all(dir).ok();
+        }
+        let file = OpenOptions::new()
+            .create(true)
+            .append(true)
+            .open(&path)
+            .unwrap_or_else(|error| {
+                panic!("打开运行日志 {} 失败：{error}", path.display())
+            });
+        Mutex::new(file)
+    })
+}
+
+/// 运行日志：文件 + stdout 双写。父子进程用同一份文件，靠 append 模式共享。
+fn log_line(line: &str) {
+    if let Ok(mut file) = run_log().lock() {
+        let _ = writeln!(file, "[{}] {line}", now_ms());
+        let _ = file.flush();
+    }
+    println!("[repo-eval] {line}");
+}
+
+fn request_timeout() -> Duration {
+    let secs = std::env::var("SHANIU_EVAL_REQUEST_TIMEOUT_SECS")
+        .ok()
+        .and_then(|raw| raw.parse::<u64>().ok())
+        .filter(|secs| *secs > 0)
+        .unwrap_or(DEFAULT_REQUEST_TIMEOUT_SECS);
+    Duration::from_secs(secs)
+}
+
+fn task_hard_extra() -> Duration {
+    let secs = std::env::var("SHANIU_EVAL_TASK_HARD_EXTRA_SECS")
+        .ok()
+        .and_then(|raw| raw.parse::<u64>().ok())
+        .unwrap_or(DEFAULT_TASK_HARD_EXTRA_SECS);
+    Duration::from_secs(secs)
+}
+
+/// 模型后端打点装饰器：每次请求记录开始/结束/超时，并给「拿响应头」套超时。
+///
+/// 为什么加在评测侧而不是被测产品：本轮要回答的是「评测能不能稳定跑完」，
+/// 模型端点若中途不返回，必须能被判定为评测/环境层的超时，而不是被读成
+/// 「模型选错了修改方向」。产品自身的模型超时（connect 15s / 首字节 120s /
+/// 整请求 900s）保持原样，不在这里改。
+struct TimedBackend {
+    inner: Arc<ResponsesBackend>,
+    label: String,
+    seq: AtomicUsize,
+}
+
+#[async_trait::async_trait]
+impl ModelBackend for TimedBackend {
+    async fn stream(
+        &self,
+        history: &[HistoryItem],
+        tools: &[ToolDeclaration],
+        instructions: &str,
+    ) -> Result<ModelStream, ModelError> {
+        let seq = self.seq.fetch_add(1, Ordering::SeqCst) + 1;
+        let limit = request_timeout();
+        log_line(&format!(
+            "[req] task={} seq={seq} start timeout={}s",
+            self.label,
+            limit.as_secs()
+        ));
+        let started = Instant::now();
+        let result = tokio::time::timeout(
+            limit,
+            self.inner.stream(history, tools, instructions),
+        )
+        .await;
+        let ms = started.elapsed().as_millis();
+        match result {
+            Ok(Ok(stream)) => {
+                log_line(&format!(
+                    "[req] task={} seq={seq} end ok ms={ms}",
+                    self.label
+                ));
+                Ok(stream)
+            }
+            Ok(Err(error)) => {
+                log_line(&format!(
+                    "[req] task={} seq={seq} end err ms={ms} kind={:?} code={}",
+                    self.label,
+                    error.kind,
+                    error.code()
+                ));
+                Err(error)
+            }
+            Err(_) => {
+                log_line(&format!(
+                    "[req] task={} seq={seq} end TIMEOUT ms={ms}（超时归因=评测自身/环境，不是模型判断错误）",
+                    self.label
+                ));
+                Err(ModelError::timeout(format!(
+                    "评测侧模型请求超时（{}s 内未返回响应头）；超时归因=评测自身/环境，不是模型判断错误",
+                    limit.as_secs()
+                )))
+            }
+        }
+    }
+}
 
 fn repo_root() -> PathBuf {
     Path::new(env!("CARGO_MANIFEST_DIR"))
@@ -446,7 +575,8 @@ fn eval_broker() -> Arc<ApprovalBroker> {
 
 // ============================== 单题结果 ==============================
 
-#[derive(Clone, Default)]
+#[derive(Clone, Default, Serialize, Deserialize)]
+#[serde(default)]
 struct TaskOutcome {
     id: String,
     kind: String,
@@ -464,12 +594,17 @@ struct TaskOutcome {
     invalid_reason: Option<String>,
     success: bool,
     timeout: bool,
+    /// 超时归因层：`agent`（题内超时，含模型请求/工具未在时限内返回）/
+    /// `eval_hard`（评测侧整题子进程硬超时被强杀）。`None` 表示未超时。
+    /// 两种都属于「评测自身/环境」，不能读成模型判断错误。
+    timeout_layer: Option<String>,
     turns: Option<u32>,
     interruptions: usize,
     prompt_attribution: Vec<String>,
     agent_ms: u128,
     setup_ms: u128,
     check_ms: u128,
+    warmup_ms: u128,
     files_changed: usize,
     forbidden_touched: bool,
     detail: String,
@@ -494,12 +629,14 @@ impl TaskOutcome {
             "invalid_reason": self.invalid_reason,
             "success": self.success,
             "timeout": self.timeout,
+            "timeout_layer": self.timeout_layer,
             "turns": self.turns,
             "interruptions": self.interruptions,
             "prompt_attribution": self.prompt_attribution,
             "agent_ms": self.agent_ms as u64,
             "setup_ms": self.setup_ms as u64,
             "check_ms": self.check_ms as u64,
+            "warmup_ms": self.warmup_ms as u64,
             "files_changed": self.files_changed,
             "forbidden_touched": self.forbidden_touched,
             "detail": self.detail,
@@ -861,7 +998,7 @@ fn changed_files(ws: &Path, task_base: &str) -> Vec<String> {
 // ============================== 单题执行 ==============================
 
 /// 单题执行的输入集合。参数收进结构体而不是堆在签名上：`run_one` 需要
-/// 题目、第几轮、基座、判据、快照、工作区、档案根、模型后端共 8 项，
+/// 题目、第几轮、基座、判据、快照、工作区、档案根共 7 项（模型后端单独传），
 /// 平铺会触发 `clippy::too_many_arguments`，且调用点顺序错了很难看出来。
 struct RunOneCtx<'a> {
     task: &'a RepoTask,
@@ -871,10 +1008,9 @@ struct RunOneCtx<'a> {
     pristine: &'a Path,
     ws: &'a Path,
     rollout_root: &'a Path,
-    backend: Arc<ResponsesBackend>,
 }
 
-async fn run_one(ctx: RunOneCtx<'_>) -> (TaskOutcome, u128) {
+async fn run_one(ctx: RunOneCtx<'_>, backend: Arc<dyn ModelBackend>) -> (TaskOutcome, u128) {
     let RunOneCtx {
         task,
         run,
@@ -883,7 +1019,6 @@ async fn run_one(ctx: RunOneCtx<'_>) -> (TaskOutcome, u128) {
         pristine,
         ws,
         rollout_root,
-        backend,
     } = ctx;
     let mut out = TaskOutcome {
         id: task.id.clone(),
@@ -1019,6 +1154,10 @@ async fn run_one(ctx: RunOneCtx<'_>) -> (TaskOutcome, u128) {
     });
 
     // 任务 prompt 原样使用：不加任何解题提示，工作区事实由生产系统提示给出。
+    log_line(&format!(
+        "[agent] start task={} timeout={}s max_turns={}",
+        task.id, task.timeout_secs, task.max_turns
+    ));
     let started = Instant::now();
     let summary = tokio::time::timeout(
         Duration::from_secs(task.timeout_secs),
@@ -1032,16 +1171,32 @@ async fn run_one(ctx: RunOneCtx<'_>) -> (TaskOutcome, u128) {
             format!("{:?}", summary.reason)
         }
         // 超时被丢弃：真实跑了多少轮**不知道**，记 None 而不是填上限。
+        // 归因层固定为 agent（评测自身/环境），不评价模型判断。
         Err(_) => {
             out.timeout = true;
+            out.timeout_layer = Some("agent".into());
             format!("超时被丢弃（>{}s）", task.timeout_secs)
         }
     };
+    log_line(&format!(
+        "[agent] end task={} ms={} turns={:?} reason={reason}",
+        task.id, out.agent_ms, out.turns
+    ));
 
     // 判据一次定成败。
+    log_line(&format!("[judge] start task={} check={}", task.id, task.judge));
     let check_start = Instant::now();
     let judge = run_judge(judge_script, &task.judge, ws);
     out.check_ms += check_start.elapsed().as_millis();
+    log_line(&format!(
+        "[judge] end task={} ms={} pass={} detail={}",
+        task.id,
+        out.check_ms,
+        judge.as_ref().is_ok_and(|judge| judge.pass),
+        judge
+            .as_ref()
+            .map_or_else(|error| error.clone(), |judge| judge.detail.clone())
+    ));
 
     let files = changed_files(ws, &task_base);
     out.files_changed = files.len();
@@ -1075,6 +1230,249 @@ async fn run_one(ctx: RunOneCtx<'_>) -> (TaskOutcome, u128) {
     out.success =
         judge.as_ref().is_ok_and(|judge| judge.pass) && !out.forbidden_touched && !out.timeout;
     (out, warmup_ms)
+}
+
+// ============================== 子进程隔离（整题硬超时）==============================
+
+/// 父进程传给子进程的最小规格。只传路径与题号，题面仍从任务集读，
+/// 避免两边各存一份题面漂移。
+#[derive(Serialize, Deserialize)]
+struct ChildSpec {
+    task_id: String,
+    run: usize,
+    base_short: String,
+    judge_script: String,
+    pristine: String,
+    ws: String,
+    rollout_root: String,
+    tasks_file: String,
+    outcome: String,
+}
+
+fn provider_from_env() -> ProviderConfig {
+    ProviderConfig {
+        provider: std::env::var("SHANIU_TEST_PROVIDER").unwrap_or_else(|_| "openai-chat".into()),
+        base_url: std::env::var("SHANIU_TEST_BASE_URL")
+            .unwrap_or_else(|_| "https://api.deepseek.com/v1".into()),
+        model: std::env::var("SHANIU_TEST_MODEL").unwrap_or_else(|_| "deepseek-flash".into()),
+        reasoning_effort: None,
+        headers: Default::default(),
+    }
+}
+
+fn base_outcome(task: &RepoTask, base_short: &str) -> TaskOutcome {
+    TaskOutcome {
+        id: task.id.clone(),
+        kind: task.kind.clone(),
+        base_commit: base_short.to_string(),
+        patch_applied: task.patch.is_none(),
+        patch_check: if task.patch.is_none() {
+            "none"
+        } else {
+            "pending"
+        }
+        .to_string(),
+        ..Default::default()
+    }
+}
+
+/// 子进程入口：只跑一题、把 `TaskOutcome` 原子落盘、退出。
+/// 不抢锁、不写报告——锁和报告都归父进程。
+async fn run_child_mode(spec_path: &str) {
+    let raw = std::fs::read_to_string(spec_path).expect("子进程读不到 spec");
+    let spec: ChildSpec = serde_json::from_str(&raw).expect("子进程 spec 解析失败");
+    let api_key = std::env::var("SHANIU_TEST_API_KEY").expect("子进程缺少 SHANIU_TEST_API_KEY");
+    assert_key_sane(&api_key);
+    let tasks_raw = std::fs::read_to_string(repo_root().join(&spec.tasks_file))
+        .expect("子进程读不到任务集");
+    let tasks: RepoTasksFile = serde_json::from_str(&tasks_raw).expect("子进程任务集解析失败");
+    let task = tasks
+        .tasks
+        .into_iter()
+        .find(|task| task.id == spec.task_id)
+        .expect("子进程找不到题目");
+    let backend: Arc<dyn ModelBackend> = Arc::new(TimedBackend {
+        inner: Arc::new(ResponsesBackend {
+            provider: provider_from_env(),
+            api_key,
+        }),
+        label: format!("{}-r{}", spec.task_id, spec.run),
+        seq: AtomicUsize::new(0),
+    });
+    log_line(&format!(
+        "[child] start task={} run={}",
+        spec.task_id, spec.run
+    ));
+    let (mut outcome, warmup_ms) = run_one(
+        RunOneCtx {
+            task: &task,
+            run: spec.run,
+            base_short: &spec.base_short,
+            judge_script: Path::new(&spec.judge_script),
+            pristine: Path::new(&spec.pristine),
+            ws: Path::new(&spec.ws),
+            rollout_root: Path::new(&spec.rollout_root),
+        },
+        backend,
+    )
+    .await;
+    outcome.warmup_ms = warmup_ms;
+    let path = PathBuf::from(&spec.outcome);
+    let tmp = path.with_extension("tmp");
+    std::fs::write(
+        &tmp,
+        serde_json::to_string(&outcome).expect("子进程结果序列化失败"),
+    )
+    .expect("子进程结果写入失败");
+    std::fs::rename(&tmp, &path).expect("子进程结果改名失败");
+    log_line(&format!(
+        "[child] end task={} run={}",
+        spec.task_id, spec.run
+    ));
+}
+
+/// 父进程侧：拉起子进程跑一题，超过 `hard` 直接 taskkill 进程树。
+///
+/// 为什么必须落到子进程：`tokio::time::timeout` 只能中断「有 await 点」的 future，
+/// 一旦被测代码或工具里出现同步阻塞调用，整个运行器就会跟着卡死（上一轮 7060 就是这样
+/// 挂在第 8 题后面，锁一直被占着、报告写不出来）。进程边界是唯一能保证「一题挂住
+/// 不拖住整轮」的边界。
+async fn run_one_isolated(children_dir: &Path, ctx: RunOneCtx<'_>, hard: Duration) -> TaskOutcome {
+    let task = ctx.task;
+    let stem = format!("{}-r{}", task.id, ctx.run);
+    let spec_path = children_dir.join(format!("{stem}.spec.json"));
+    let outcome_path = children_dir.join(format!("{stem}.outcome.json"));
+    let stdout_path = children_dir.join(format!("{stem}.child.log"));
+    let stderr_path = children_dir.join(format!("{stem}.child.err.log"));
+    let rollout_dir = ctx.rollout_root.join(&task.id);
+    let rollout_before = count_jsonl(&rollout_dir);
+
+    let spec = ChildSpec {
+        task_id: task.id.clone(),
+        run: ctx.run,
+        base_short: ctx.base_short.to_string(),
+        judge_script: ctx.judge_script.display().to_string(),
+        pristine: ctx.pristine.display().to_string(),
+        ws: ctx.ws.display().to_string(),
+        rollout_root: ctx.rollout_root.display().to_string(),
+        tasks_file: std::env::var("SHANIU_EVAL_REPO_TASKS")
+            .unwrap_or_else(|_| DEFAULT_TASKS_FILE.to_string()),
+        outcome: outcome_path.display().to_string(),
+    };
+    std::fs::write(&spec_path, serde_json::to_string(&spec).expect("spec 序列化失败"))
+        .unwrap_or_else(|error| panic!("写子进程 spec 失败：{error}"));
+
+    log_line(&format!(
+        "[task] start id={} run={} hard_timeout={}s",
+        task.id,
+        ctx.run,
+        hard.as_secs()
+    ));
+    let exe = std::env::current_exe().expect("取当前测试可执行文件路径失败");
+    let stdout = File::create(&stdout_path).expect("创建子进程 stdout 日志失败");
+    let stderr = File::create(&stderr_path).expect("创建子进程 stderr 日志失败");
+    let mut command = Command::new(exe);
+    command
+        .args(["evals_repo_v0", "--exact", "--ignored", "--nocapture"])
+        .env("SHANIU_EVAL_CHILD_SPEC", &spec_path)
+        .env("SHANIU_EVAL_RUN_LOG", run_log_path())
+        .stdin(Stdio::null())
+        .stdout(Stdio::from(stdout))
+        .stderr(Stdio::from(stderr));
+    let mut child = command.spawn().expect("拉起子进程失败");
+    let child_pid = child.id();
+
+    let started = Instant::now();
+    let mut killed = false;
+    loop {
+        match child.try_wait() {
+            Ok(Some(_)) => break,
+            Ok(None) => {}
+            Err(error) => {
+                log_line(&format!("[task] wait 失败 id={} err={error}", task.id));
+                break;
+            }
+        }
+        if started.elapsed() >= hard {
+            let kill = Command::new("taskkill")
+                .args(["/T", "/F", "/PID", &child_pid.to_string()])
+                .output();
+            if let Err(error) = kill {
+                log_line(&format!(
+                    "[task] taskkill 失败 pid={child_pid} err={error}"
+                ));
+            }
+            let _ = child.wait();
+            killed = true;
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(300)).await;
+    }
+    let elapsed = started.elapsed().as_millis();
+
+    let mut out = std::fs::read_to_string(&outcome_path)
+        .ok()
+        .and_then(|raw| serde_json::from_str::<TaskOutcome>(&raw).ok())
+        .unwrap_or_else(|| base_outcome(task, ctx.base_short));
+    let rollout_grew = count_jsonl(&rollout_dir) > rollout_before;
+    if killed {
+        out.timeout = true;
+        out.timeout_layer = Some("eval_hard".into());
+        out.agent_ms = elapsed;
+        out.success = false;
+        if rollout_grew {
+            // 已有档案 = 前置红已过、agent 真的跑过；只是没能在硬时限内收口。
+            out.precondition_checked = true;
+            out.precondition_red = true;
+            out.detail = clip(
+                &format!(
+                    "评测侧整题硬超时：子进程在 {}s 后被强杀（超时归因=评测自身/环境；无模型判断结论）｜{}",
+                    hard.as_secs(),
+                    out.detail
+                ),
+                400,
+            );
+        } else {
+            out.invalidate(format!(
+                "评测侧整题硬超时：{}s 后在准备/判据阶段被强杀（无模型结论）",
+                hard.as_secs()
+            ));
+            out.detail = clip(
+                &format!(
+                    "{}；子进程日志 {}",
+                    out.invalid_reason.clone().unwrap_or_default(),
+                    stdout_path.display()
+                ),
+                400,
+            );
+        }
+    } else if out.detail.is_empty() {
+        // 子进程没写出结果：崩溃、被外部杀掉或 libtest 提前退出。
+        let err_tail = std::fs::read_to_string(&stderr_path).unwrap_or_default();
+        out.precondition_checked = rollout_grew;
+        out.precondition_red = rollout_grew;
+        out.agent_ms = elapsed;
+        out.invalidate(format!(
+            "子进程未写出结果（stderr 末尾：{}）",
+            tail(&err_tail, 200)
+        ));
+        out.detail = clip(&format!("子进程日志 {}", stdout_path.display()), 400);
+    }
+    log_line(&format!(
+        "[task] end id={} run={} status={} timeout_layer={} ms={}",
+        task.id,
+        ctx.run,
+        if out.invalid {
+            "INVALID"
+        } else if out.success {
+            "PASS"
+        } else {
+            "FAIL"
+        },
+        out.timeout_layer.as_deref().unwrap_or("-"),
+        elapsed
+    ));
+    out
 }
 
 // ============================== 报告 ==============================
@@ -1202,25 +1600,23 @@ async fn evals_repo_pipeline_selfcheck() {
 #[tokio::test]
 #[ignore = "真实仓库端到端评测需要真实端点密钥、本机 Rust 工具链与 pwsh，按里程碑/变更回归手动运行"]
 async fn evals_repo_v0() {
+    // 子进程模式：父进程按题拉起本测试二进制，只跑一题就退出。
+    if let Ok(spec_path) = std::env::var("SHANIU_EVAL_CHILD_SPEC") {
+        run_child_mode(&spec_path).await;
+        return;
+    }
+    // 父子进程共用同一份运行日志；先固定路径，再抢锁。
+    std::env::set_var("SHANIU_EVAL_RUN_LOG", run_log_path());
+
     // 第一件事就是抢锁：没有锁，后面的任何数字都可能是别人的。
     let _lock = EvalRunLock::acquire();
     let epoch = now_ms();
 
-    let api_key = std::env::var("SHANIU_TEST_API_KEY")
+    // 父进程不直接调用模型，但必须先确认密钥形态合法，别等子进程逐个报错。
+    let _api_key = std::env::var("SHANIU_TEST_API_KEY")
         .expect("repo 评测必须配真实端点：设置 SHANIU_TEST_API_KEY（勿把密钥写进仓库）");
-    assert_key_sane(&api_key);
-    let provider = ProviderConfig {
-        provider: std::env::var("SHANIU_TEST_PROVIDER").unwrap_or_else(|_| "openai-chat".into()),
-        base_url: std::env::var("SHANIU_TEST_BASE_URL")
-            .unwrap_or_else(|_| "https://api.deepseek.com/v1".into()),
-        model: std::env::var("SHANIU_TEST_MODEL").unwrap_or_else(|_| "deepseek-flash".into()),
-        reasoning_effort: None,
-        headers: Default::default(),
-    };
-    let backend = Arc::new(ResponsesBackend {
-        provider: provider.clone(),
-        api_key,
-    });
+    assert_key_sane(&_api_key);
+    let provider = provider_from_env();
 
     let tasks_file =
         std::env::var("SHANIU_EVAL_REPO_TASKS").unwrap_or_else(|_| DEFAULT_TASKS_FILE.to_string());
@@ -1340,27 +1736,49 @@ async fn evals_repo_v0() {
     let mut warmup_ms_total: u128 = 0;
     let mut attempted: usize = 0;
 
+    let children_dir = root
+        .join("target")
+        .join(format!("evals-repo-children-{}", id()));
+    std::fs::remove_dir_all(&children_dir).ok();
+    std::fs::create_dir_all(&children_dir).expect("创建子进程工作目录失败");
+    let hard_extra = task_hard_extra();
+    // 压测/演练用：直接钉死整题硬超时（不设则 = 题面 timeout_secs + 余量）。
+    let hard_override = std::env::var("SHANIU_EVAL_TASK_HARD_SECS")
+        .ok()
+        .and_then(|raw| raw.parse::<u64>().ok())
+        .filter(|secs| *secs > 0)
+        .map(Duration::from_secs);
+    if let Some(hard) = hard_override {
+        log_line(&format!(
+            "整题硬超时被 SHANIU_EVAL_TASK_HARD_SECS 钉死为 {}s",
+            hard.as_secs()
+        ));
+    }
+
     for run in 1..=repeats {
         let mut outcomes: Vec<TaskOutcome> = Vec::new();
         for task in &spec.tasks {
-            let (outcome, warmup_ms) = run_one(RunOneCtx {
-                task,
-                run,
-                base_short: &base_short,
-                judge_script: &judge_script,
-                pristine: &pristine,
-                ws: &ws,
-                rollout_root: &rollout_root,
-                backend: backend.clone(),
-            })
+            let outcome = run_one_isolated(
+                &children_dir,
+                RunOneCtx {
+                    task,
+                    run,
+                    base_short: &base_short,
+                    judge_script: &judge_script,
+                    pristine: &pristine,
+                    ws: &ws,
+                    rollout_root: &rollout_root,
+                },
+                hard_override.unwrap_or_else(|| Duration::from_secs(task.timeout_secs) + hard_extra),
+            )
             .await;
-            warmup_ms_total += warmup_ms;
+            warmup_ms_total += outcome.warmup_ms;
             // 「尝试过」= 真的把 agent 跑起来了；准备/前置阶段失败的题没有档案，不能算样本。
             if outcome.precondition_checked {
                 attempted += 1;
             }
-            println!(
-                "[repo-eval] run {run}/{repeats} {:<34} {} turns={} 打断={} 耗时={}ms files={} setup={}ms check={}ms {}｜{}",
+            log_line(&format!(
+                "run {run}/{repeats} {:<34} {} turns={} 打断={} 耗时={}ms files={} setup={}ms check={}ms 超时层={} {}｜{}",
                 outcome.id,
                 if outcome.invalid {
                     "INVALID"
@@ -1377,15 +1795,16 @@ async fn evals_repo_v0() {
                 outcome.files_changed,
                 outcome.setup_ms,
                 outcome.check_ms,
+                outcome.timeout_layer.as_deref().unwrap_or("-"),
                 outcome.detail,
                 task.title,
-            );
+            ));
             outcomes.push(outcome);
         }
         let summary = summarize(&outcomes, max_turns);
         let run_timeouts = outcomes.iter().filter(|task| task.timeout).count();
-        println!(
-            "[repo-eval] run {run}/{repeats} 小计 成功率={}/{}（invalid={}），轮次中位={}，打断合计={}，超时={}",
+        log_line(&format!(
+            "run {run}/{repeats} 小计 成功率={}/{}（invalid={}），轮次中位={}，打断合计={}，超时={}",
             summary["passed"].as_u64().unwrap_or(0),
             summary["n"].as_u64().unwrap_or(0),
             summary["invalid"].as_u64().unwrap_or(0),
@@ -1394,7 +1813,7 @@ async fn evals_repo_v0() {
                 .map_or_else(|| "unknown".to_string(), |value| format!("{value:.2}")),
             summary["interruptions"]["total"].as_u64().unwrap_or(0),
             run_timeouts,
-        );
+        ));
         run_values.push(json!({
             "run": run,
             "summary": summary,

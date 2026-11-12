@@ -73,7 +73,9 @@ for (const task of tasks) {
     `  ${verdict} ${String(task.id).padEnd(34)} ${String(task.type ?? '?').padEnd(9)} ` +
     `turns=${turns.padEnd(7)} 打断=${fmt(task.interruptions)} 耗时=${ms(task.agent_ms)} ` +
     `files=${fmt(task.files_changed)}`;
-  if (task.timeout) line += ' 超时';
+  // 超时必须带归因层：agent=题内超时，eval_hard=评测侧整题子进程被强杀。
+  // 两者都属于「评测自身/环境」，读报告的人不能把它当成模型判断错误。
+  if (task.timeout) line += ` 超时(${task.timeout_layer ?? '未标注'})`;
   if (task.forbidden_touched) line += ' 命中禁止路径';
   // 逐题证据三项：base_commit / 补丁校验 / 前置红。缺一项按 invalid 明示（不计分母）。
   const missing = [];
