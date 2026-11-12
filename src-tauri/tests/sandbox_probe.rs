@@ -31,11 +31,12 @@ use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::Arc;
 use std::time::Duration;
 
-use shaniu_lib::config::SandboxMode;
+use shaniu_lib::config::{OsSandbox, SandboxMode};
 use shaniu_lib::sandbox::acl::AncestorGrant;
 use shaniu_lib::sandbox::appcontainer::PROFILE_NAME;
 use shaniu_lib::sandbox::{
-    ensure_ancestor_for, prepare_spawn, revoke_ancestor_for, PreparedSpawn,
+    ensure_ancestor_for, prepare_spawn, prepare_spawn_with, revoke_ancestor_for, PreparedSpawn,
+    SpawnRequest,
 };
 use tokio::sync::mpsc;
 
@@ -76,7 +77,10 @@ fn outside_dir(tag: &str) -> PathBuf {
 }
 
 /// 在 workspace-write 沙箱内执行 `cmd /C <line>`，返回退出码与合并输出。
-async fn run_sandboxed_capture(cwd: &Path, line: &str) -> (i32, String) {
+///
+/// `os` 逐条指定机制：第二期起默认是 `RestrictedToken`（只约束写），
+/// AppContainer 是可选项。**不要改成读进程全局**——测试并发跑，全局会被互相污染。
+async fn run_capture(os: OsSandbox, cwd: &Path, line: &str) -> (i32, String) {
     let (tx, mut rx) = mpsc::channel::<shaniu_lib::sandbox::ExecLine>(256);
     let collector = tokio::spawn(async move {
         let mut output = String::new();
@@ -86,8 +90,18 @@ async fn run_sandboxed_capture(cwd: &Path, line: &str) -> (i32, String) {
         }
         output
     });
-    let spawn = prepare_spawn(SandboxMode::WorkspaceWrite, "cmd", &["/C", line], cwd, tx)
-        .expect("workspace-write 沙箱应可创建（fail-closed 之外的正常路径）");
+    let spawn = prepare_spawn_with(
+        SpawnRequest {
+            policy: SandboxMode::WorkspaceWrite,
+            workspace_root: cwd,
+            program: "cmd",
+            args: &["/C", line],
+            cwd,
+            os,
+        },
+        tx,
+    )
+    .expect("workspace-write 沙箱应可创建（fail-closed 之外的正常路径）");
     let code = match spawn {
         PreparedSpawn::Restricted(mut child) => child.wait().await.expect("等待子进程失败"),
         PreparedSpawn::Plain(_) => panic!("workspace-write 不得退化为无沙箱执行（FF-4）"),
@@ -96,15 +110,25 @@ async fn run_sandboxed_capture(cwd: &Path, line: &str) -> (i32, String) {
     (code, output)
 }
 
-async fn run_sandboxed(cwd: &Path, line: &str) -> i32 {
-    run_sandboxed_capture(cwd, line).await.0
+/// AppContainer（可选档）内的执行：读/写都受路径约束。
+async fn run_sandboxed_capture(cwd: &Path, line: &str) -> (i32, String) {
+    run_capture(OsSandbox::AppContainer, cwd, line).await
+}
+
+/// **默认机制**（写约束）内的执行：只拒写，读放行。
+async fn run_default_capture(cwd: &Path, line: &str) -> (i32, String) {
+    run_capture(OsSandbox::RestrictedToken, cwd, line).await
+}
+
+async fn run_default_sandboxed(cwd: &Path, line: &str) -> i32 {
+    run_default_capture(cwd, line).await.0
 }
 
 #[tokio::test]
 async fn sandbox_can_write_inside_workspace() {
     let ws = unique_dir("in");
     let target = ws.join("probe.txt");
-    let code = run_sandboxed(&ws, &format!("echo inside> \"{}\"", target.display())).await;
+    let code = run_default_sandboxed(&ws, &format!("echo inside> \"{}\"", target.display())).await;
 
     assert_eq!(code, 0, "工作区内写入的退出码应为 0");
     assert!(target.is_file(), "工作区内写入应真实落盘（证明沙箱可运行）");
@@ -125,19 +149,25 @@ async fn readonly_mode_refuses_to_spawn() {
     std::fs::remove_dir_all(&ws).ok();
 }
 
-/// FF-3 核心不变量：工作区外写入必须失败。
+/// FF-3 核心不变量：工作区外写入必须失败（**默认机制**下）。
 #[tokio::test]
 async fn sandbox_denies_write_outside_workspace() {
     let ws = unique_dir("ws");
     let outside = outside_dir("outside");
     let target = outside.join("escaped.txt");
 
-    let code = run_sandboxed(&ws, &format!("echo escaped> \"{}\"", target.display())).await;
+    let (code, output) =
+        run_default_capture(&ws, &format!("echo escaped> \"{}\"", target.display())).await;
 
     // 无论 cmd 返回码如何，关键断言是：越界文件不得出现
     assert!(
         !target.exists(),
-        "工作区外写入成功（cmd 退出码 {code}）：AppContainer 未提供路径级隔离"
+        "工作区外写入成功（cmd 退出码 {code}）：默认机制的写边界没有生效"
+    );
+    assert_ne!(code, 0, "越界写必须让命令失败，而不是静默放过：{output}");
+    assert!(
+        output.contains("拒绝访问") || output.to_lowercase().contains("access is denied"),
+        "越界写的失败要给可读原因：{output}"
     );
     std::fs::remove_dir_all(&ws).ok();
     std::fs::remove_dir_all(&outside).ok();
@@ -252,9 +282,13 @@ async fn ancestor_chain_allows_metadata_but_not_listing_or_reads() {
     std::fs::remove_dir_all(&sibling).ok();
 }
 
-/// AppContainer 读隔离：工作区外的文件内容不得进入沙箱进程。
+/// AppContainer（可选档）读隔离：工作区外的文件内容不得进入容器进程。
+///
+/// 第二期起这不是默认行为：默认机制只约束写，读区外**应当成功**（见
+/// `sandbox_allows_read_outside_workspace_by_default`）。这条保留为「选 AppContainer 时
+/// 仍有读隔离」的守门用例，不能为了跟默认口径一致而删掉。
 #[tokio::test]
-async fn sandbox_denies_read_outside_workspace() {
+async fn appcontainer_denies_read_outside_workspace() {
     let ws = unique_dir("read-ws");
     let outside = outside_dir("read-outside");
     let secret = outside.join("secret.txt");
@@ -266,7 +300,31 @@ async fn sandbox_denies_read_outside_workspace() {
 
     assert!(
         !output.contains(marker),
-        "工作区外文件内容被读进沙箱（输出：{output}）"
+        "AppContainer 档工作区外文件内容被读进沙箱（输出：{output}）"
+    );
+    std::fs::remove_dir_all(&ws).ok();
+    std::fs::remove_dir_all(&outside).ok();
+}
+
+/// 第二期核心口径：默认机制**不隔离读**——区外读必须成功。
+///
+/// 这条和 `sandbox_denies_write_outside_workspace` 成对：写被拒、读放行，
+/// 才是「只约束写」。只要有一半不成立，默认机制就不是参考实现那套语义。
+#[tokio::test]
+async fn sandbox_allows_read_outside_workspace_by_default() {
+    let ws = unique_dir("read-default-ws");
+    let outside = outside_dir("read-default-outside");
+    let secret = outside.join("secret.txt");
+    let marker = "SHANIU-DEFAULT-READ-ALLOWED-MARKER";
+    std::fs::write(&secret, marker).unwrap();
+
+    let (code, output) =
+        run_default_capture(&ws, &format!("type \"{}\"", secret.display())).await;
+
+    assert_eq!(code, 0, "默认机制读区外必须成功（退出码 {code}）：{output}");
+    assert!(
+        output.contains(marker),
+        "默认机制读不到区外文件，说明它还带着读隔离：{output}"
     );
     std::fs::remove_dir_all(&ws).ok();
     std::fs::remove_dir_all(&outside).ok();
