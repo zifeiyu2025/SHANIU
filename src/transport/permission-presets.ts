@@ -60,27 +60,11 @@ export const PRESET_TO_SANDBOX: Record<string, string> = Object.fromEntries(
 export const PERMISSION_PRESETS: readonly string[] = Object.keys(PRESET_BUNDLES)
 
 /**
- * `permissionPreset` 缺失/非法时的回落档。**不是产品默认档**：产品默认是
- * `config.rs` 里 `SandboxMode::default()` 的 `read_only`。这里只在读不到时兜底，
- * 取权限最小的一档——宁可显示"只读"，也不显示用户从没开过的宽松档。
- */
-export const DEFAULT_PERMISSION_PRESET: string = PERMISSION_PRESETS[0] ?? 'read-only'
-
-/**
  * 挡位选项的静态目录（形状照上游 PermissionCatalog.options；name 给机器值走界面词典）。
  * **不带 `description`**：说明文案是界面文案，只能来自界面词典
  * （`ui-permission-presets` 的 `preset.*.description`）。
  */
 export const PERMISSION_PRESET_OPTIONS = PERMISSION_PRESETS.map(value => ({ value, name: value }))
-
-/**
- * DSH 挡位键 → 宿主沙箱档。
- * @returns 宿主落盘值；未知挡位返回 undefined，由调用方如实拒绝而不是猜一档。
- */
-export const sandboxOfPreset = (preset: string): string | undefined => PRESET_BUNDLES[preset]?.sandbox
-
-/** DSH 挡位键 → 宿主审批档（与沙箱档同表派生，永远成对出现）。 */
-export const approvalOfPreset = (preset: string): string | undefined => PRESET_BUNDLES[preset]?.approval
 
 /**
  * 两维 → 挡位键：**精确匹配**，不匹配返回 {@link CUSTOM_PERMISSION_PRESET}。
