@@ -587,4 +587,46 @@ mod tests {
         assert!(text.contains("src/lib.rs:3:5"));
         assert!(text.contains("不要用 `echo`"));
     }
+
+    /// 到点收割：命令永不返回时，闸门必须在时限附近返回 `timeout`，而不是把回合挂住。
+    ///
+    /// 这里量的是**闸门自己的时限**，所以刻意走 `danger-full-access`（不起沙箱）：
+    /// 沙箱冷启动/建容器的成本随机器与祖先链授权变化，把它算进「闸门时长」就会得到
+    /// 一个随环境漂移的断言。循环级的端到端验证在 `agent_loop::tests` 里，那里只断言
+    /// 「不挂住 + 判 timeout + 不否决」，不掺时间账。
+    #[tokio::test]
+    async fn run_commands_harvests_at_deadline() {
+        let root = std::env::temp_dir();
+        let cancel = CancellationToken::new();
+        let commands = vec![VerifyCommand {
+            // 纯 CPU 忙循环：不依赖网络与控制台，也不会自己退出。
+            display: "for /L %i in (1,1,2000000000) do @rem".into(),
+            cwd: root.clone(),
+        }];
+        let started = Instant::now();
+        let outcome = tokio::time::timeout(
+            Duration::from_secs(30),
+            run_commands(
+                &commands,
+                Duration::from_millis(1_000),
+                &root,
+                crate::config::SandboxMode::DangerFullAccess,
+                &cancel,
+                None,
+            ),
+        )
+        .await
+        .expect("1s 时限的命令不得挂住闸门（30s 未返回即失败）");
+
+        assert_eq!(
+            outcome.state,
+            VerifyState::Inconclusive(InconclusiveReason::Timeout),
+            "不返回的命令必须判为超时；判成 Failed 会误否决"
+        );
+        let elapsed = started.elapsed();
+        assert!(
+            elapsed < Duration::from_secs(10),
+            "1s 时限应在时限附近收割（留足进程创建开销），实际 {elapsed:?}"
+        );
+    }
 }

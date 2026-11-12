@@ -134,6 +134,20 @@ struct VetoLedger {
     verify_used: bool,
 }
 
+/// 评测消融开关（与 `SHANIU_EVAL_ABLATE_AR6` / `SHANIU_EVAL_ABLATE_REPAIR` 同口径）：
+/// `SHANIU_EVAL_ABLATE_VERIFY=1` 关掉写后验证闸门。
+///
+/// 只有一个入口，装配期调用一次：闸门是否生效必须是**构造期常量**，不能每轮去读
+/// 进程环境——同一进程里并发跑两个会话时，环境变量会把两臂的语义搅在一起。
+fn apply_eval_ablation(verify: &mut crate::config::VerifyConfig) {
+    if std::env::var("SHANIU_EVAL_ABLATE_VERIFY")
+        .ok()
+        .is_some_and(|value| value.trim() == "1")
+    {
+        verify.enabled = false;
+    }
+}
+
 // ============================== 循环本体 ==============================
 
 pub struct AgentLoop {
@@ -492,12 +506,7 @@ impl AgentLoop {
             stop_hook: Some(Arc::new(PlanModeStopHook)),
             verify: {
                 let mut verify = cfg.verify.clone();
-                if std::env::var("SHANIU_EVAL_ABLATE_VERIFY")
-                    .ok()
-                    .is_some_and(|value| value.trim() == "1")
-                {
-                    verify.enabled = false;
-                }
+                apply_eval_ablation(&mut verify);
                 verify
             },
             // 手写配置把次数调大只会让一次失败拖成几分钟（500ms→8s 累加），封顶 8。
@@ -2217,6 +2226,9 @@ mod tests {
             mode,
             ..Default::default()
         };
+        // 与 `AgentLoop::from_config` 走同一个消融入口：这条路径若不接，评测对照臂
+        // 就只有集成用例能验，单测里量不出「关掉闸门」的差别。
+        apply_eval_ablation(&mut agent.verify);
         (agent, store, cancel, ws)
     }
 
@@ -2238,6 +2250,21 @@ mod tests {
                 _ => None,
             })
             .expect("必须有一条 turn_completed")
+    }
+
+    /// 不设 `SHANIU_EVAL_ABLATE_VERIFY=1` 时闸门必须是开的（消融是唯一关掉闸门的路径）。
+    ///
+    /// 反向对照（AGENTS §4.2）：`$env:SHANIU_EVAL_ABLATE_VERIFY='1'; cargo test --lib
+    /// eval_ablation_switch` 必须红——红了才证明「关掉闸门」这条对照臂真由这个开关驱动，
+    /// 而不是被别的路径顺手关掉。同一次带上环境变量跑闸门用例也必须红（见 verify_demo）。
+    #[test]
+    fn verify_gate_is_enabled_unless_eval_ablation_switch_is_set() {
+        let mut verify = crate::config::VerifyConfig::default();
+        apply_eval_ablation(&mut verify);
+        assert!(
+            verify.enabled,
+            "未设 SHANIU_EVAL_ABLATE_VERIFY=1 时写后验证闸门必须默认开启"
+        );
     }
 
     /// 失败 → 否决一次 → 模型补一步让命令通过 → 放行；全程只否决一次。
@@ -2412,9 +2439,14 @@ mod tests {
         assert!(!completed_unverified(&events));
     }
 
-    /// 回归（挂死）：验证命令永不返回时必须到点收割，不得把回合挂住。
+    /// 回归（挂死）：验证命令永不返回时，回合必须到点收割，不得被挂住，也不得误否决。
     ///
-    /// 断言本身带超时：闸门若卡住（等锁/等子进程/否决循环缺终止），用例直接失败。
+    /// 时间账分两处量，别混在一起：
+    /// - **闸门自己的时限**（1s 到点收割）由 `verify::tests::run_commands_harvests_at_deadline`
+    ///   钉住——那条不起沙箱，断言才不随机器漂移；
+    /// - **本用例**只管循环级事实：回合返回了、裁决是 `timeout`、没有被当成失败否决。
+    ///   外层时限是「挂死」的兜底，不是性能断言：沙箱起一个进程本身就可能要分钟级
+    ///   （AppContainer 建 profile + 工作区 ACE 链），把它写进断言等于给环境立规矩。
     #[tokio::test]
     async fn verification_gate_times_out_instead_of_hanging() {
         let (mut agent, store, cancel, _ws) = verify_demo(
@@ -2427,37 +2459,23 @@ mod tests {
             4,
             crate::config::VerifyMode::Enforce,
         );
-        // 配置下限就是 1000ms（`clamped_timeout_ms`）；取下限即可证明「到点即收」。
+        // 配置下限就是 1000ms（`clamped_timeout_ms`）：取最短时限，让「到点收割」这条
+        // 断言有东西可测；收割时长本身由 `verify::tests` 按毫秒级钉住。
         agent.verify.timeout_ms = 1_000;
-        // 沙箱运行时在进程内首次启动要 ~15s（AppContainer 初始化），这属于冷启动、
-        // 不是闸门时长。先单独跑一条命令把它拉起来，后面的时限才只量闸门本身。
-        let warmup = tokio::time::timeout(
-            std::time::Duration::from_secs(60),
-            crate::sandbox::capture::run_capture(
-                crate::config::SandboxMode::WorkspaceWrite,
-                &agent.workspace_root,
-                "exit 0",
-                &agent.workspace_root,
-                std::time::Duration::from_secs(1),
-                &cancel,
-            ),
-        )
-        .await;
-        assert!(warmup.is_ok(), "沙箱冷启动超时，无法进入闸门计时");
         let started = std::time::Instant::now();
         let summary = tokio::time::timeout(
-            std::time::Duration::from_secs(15),
+            std::time::Duration::from_secs(300),
             agent.run_task("任务", Arc::new(CapturingSink(store.clone())), cancel),
         )
         .await
-        .expect("验证闸门不得挂住回合（15s 未返回即失败）");
+        .expect("验证闸门挂住了回合（300s 未返回即失败）");
         let elapsed = started.elapsed();
-        assert!(
-            elapsed < std::time::Duration::from_secs(10),
-            "闸门到点后必须很快放行，实际用了 {elapsed:?}"
-        );
 
         assert_eq!(summary.reason, TurnEndReason::Completed);
+        assert_eq!(
+            summary.turns, 2,
+            "超时不算失败，不得多跑一轮（本回合耗时 {elapsed:?}）"
+        );
         let events = store.lock().unwrap();
         assert_eq!(
             verification_states(&events),

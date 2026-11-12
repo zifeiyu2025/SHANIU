@@ -113,6 +113,7 @@ pub struct CapturedRun {
 }
 
 /// 捕获式执行的失败形态（与工具回填的成功/失败分开）。
+#[derive(Debug)]
 pub enum CaptureError {
     /// 进程起不来（命令不存在、shell 缺失）。
     Spawn(String),
