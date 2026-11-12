@@ -100,11 +100,11 @@ fn candidate_extensions(name: &str) -> Vec<String> {
 /// 展开 `canonicalize` 在 Windows 上加的 `\\?\` 前缀（指纹与展示都用干净路径）。
 ///
 /// UNC 上的 verbatim 拼写是 `\\?\UNC\host\share`：只剥 `\\?\` 会得到相对路径
-/// `UNC\host\share`，与 `\\host\share` 算成两份指纹。复用 `tool_router::shell_usable`
-/// 的 `VerbatimUNC` 分支，两处前缀规则只留一份。
+/// `UNC\host\share`，与 `\\host\share` 算成两份指纹。前缀规则只有一份，下沉在
+/// `config::path_norm::strip_verbatim`；这里保留"先 canonicalize、失败按字面"的本地口径。
 fn normalize(path: &Path) -> PathBuf {
     let canonical = path.canonicalize().unwrap_or_else(|_| path.to_path_buf());
-    crate::tool_router::shell_usable(&canonical)
+    crate::config::path_norm::strip_verbatim(&canonical)
 }
 
 /// 计算文件 SHA-256（小写十六进制）。批准记录、启动前校验、重启前复核共用同一算法。
@@ -152,6 +152,18 @@ mod tests {
             normalized.is_absolute(),
             "还原后必须仍是绝对路径（UNC），实际：{}",
             normalized.display()
+        );
+    }
+
+    /// 钉住既有口径：`canonicalize` 失败时保留字面路径，但仍剥 verbatim 前缀
+    /// （指纹必须与批准时一致，不能因为文件临时不可访问就换一把指纹）。
+    #[cfg(windows)]
+    #[test]
+    fn non_existent_path_keeps_literal_spelling_but_still_strips_verbatim() {
+        let missing = Path::new(r"\\?\C:\shaniu-no-such-dir\server.exe");
+        assert_eq!(
+            normalize(missing),
+            PathBuf::from(r"C:\shaniu-no-such-dir\server.exe")
         );
     }
 
