@@ -71,14 +71,40 @@ for (const stream of [child.stdout, child.stderr]) {
   stream?.on('data', (chunk) => appendFileSync(path.join(outDir, 'app.log'), chunk))
 }
 
+// 子进程退出状态：主程序一旦退出，CDP 端口就不可能再出现。记下来是为了两件事——
+// ① 失败时不再空等满 90 秒；② 证据里能直接看到「进程自己退了（code=?）」还是「活着但端口没开」。
+// 只记录与提前判负，不放宽任何成功条件。
+let childExit = null
+child.on('exit', (code, signal) => {
+  childExit = { code, signal, at: new Date().toISOString() }
+})
+child.on('error', (error) => {
+  childExit = { code: null, signal: null, at: new Date().toISOString(), error: String(error) }
+})
+
 const sleep = (ms) => new Promise((resolve) => setTimeout(resolve, ms))
 
 async function waitForTarget(timeoutMs) {
   const deadline = Date.now() + timeoutMs
   let last = null
   while (Date.now() < deadline) {
+    if (childExit) {
+      const detail = [
+        `code=${childExit.code}`,
+        childExit.signal ? `signal=${childExit.signal}` : null,
+        childExit.error ? `error=${childExit.error}` : null,
+      ]
+        .filter(Boolean)
+        .join(' ')
+      throw new Error(`主程序已退出（${detail}），CDP 目标不会出现；最后错误：${JSON.stringify(last)}`)
+    }
     try {
-      const list = await (await fetch(`http://127.0.0.1:${cdpPort}/json/list`)).json()
+      // 单次探测必须有独立上限：连接被挂住（对端收 SYN 不回）时，不设超时会把循环拖过总时限。
+      // 2 秒远小于 90 秒总时限，且 2 秒 + 500ms 间隔仍允许约 30 次探测，不改变「90 秒内出现即通过」。
+      const response = await fetch(`http://127.0.0.1:${cdpPort}/json/list`, {
+        signal: AbortSignal.timeout(2000),
+      })
+      const list = await response.json()
       last = list
       const page = list.find((t) => t.type === 'page' && typeof t.webSocketDebuggerUrl === 'string')
       if (page) return page
@@ -389,7 +415,10 @@ try {
   exitCode = 1
 } finally {
   clearTimeout(watchdog)
-  writeFileSync(path.join(outDir, 'summary.json'), JSON.stringify({ exe, nonce, checks }, null, 2))
+  writeFileSync(
+    path.join(outDir, 'summary.json'),
+    JSON.stringify({ exe, nonce, childExit, checks }, null, 2),
+  )
   await cleanup()
   await sleep(500)
   process.exit(exitCode)

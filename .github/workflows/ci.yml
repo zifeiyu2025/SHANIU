@@ -195,6 +195,65 @@ jobs:
           if (-not (Test-Path $exe)) { throw "release 主程序不存在：$exe" }
           node scripts/smoke/run-smoke.mjs --exe $exe --out smoke-out
 
+      # 只为把抖动当场固定住：进程还活着吗、WebView2 什么版本、系统有没有记录崩溃。
+      # 必须排在「失败时留证据」之前，产物才收得到；continue-on-error 保证它自己出错
+      # 也不改变 job 结论（结论只由冒烟那一步决定，这里不写任何判据）。
+      - name: 失败时抓运行时状态
+        if: failure()
+        continue-on-error: true
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = 'Continue'
+          New-Item -ItemType Directory -Force smoke-out | Out-Null
+          $out = 'smoke-out/runtime-diagnostics.txt'
+          "采集时间: $(Get-Date -Format o)" | Out-File $out -Encoding utf8
+
+          '' | Out-File $out -Append -Encoding utf8
+          '## 主程序进程（shaniu.exe）' | Out-File $out -Append -Encoding utf8
+          $procs = Get-Process shaniu -ErrorAction SilentlyContinue
+          if ($procs) {
+            $procs |
+              Select-Object Id, StartTime, Responding, MainWindowTitle, CPU |
+              Format-List |
+              Out-String | Out-File $out -Append -Encoding utf8
+          } else {
+            '未发现 shaniu 进程：主程序在冒烟结束前已退出（对照 app.log / shaniu.log 定位退出点）' |
+              Out-File $out -Append -Encoding utf8
+          }
+
+          '' | Out-File $out -Append -Encoding utf8
+          '## Edge WebView2 运行时版本' | Out-File $out -Append -Encoding utf8
+          $roots = @(
+            'C:\Program Files (x86)\Microsoft\EdgeWebView\Application',
+            'C:\Program Files\Microsoft\EdgeWebView\Application'
+          )
+          $found = $false
+          foreach ($root in $roots) {
+            if (-not (Test-Path $root)) { continue }
+            foreach ($dir in Get-ChildItem $root -Directory -ErrorAction SilentlyContinue) {
+              $exe = Join-Path $dir.FullName 'msedgewebview2.exe'
+              if (Test-Path $exe) {
+                $found = $true
+                "$($dir.Name) -> $((Get-Item $exe).VersionInfo.FileVersion)" |
+                  Out-File $out -Append -Encoding utf8
+              }
+            }
+          }
+          if (-not $found) { '未找到 WebView2 运行时目录或 msedgewebview2.exe' | Out-File $out -Append -Encoding utf8 }
+
+          '' | Out-File $out -Append -Encoding utf8
+          '## 系统 Application 日志（最近 20 分钟，错误级 = Level 2）' | Out-File $out -Append -Encoding utf8
+          try {
+            Get-WinEvent -FilterHashtable @{ LogName = 'Application'; StartTime = (Get-Date).AddMinutes(-20) } -ErrorAction Stop |
+              Where-Object { $_.Level -eq 2 } |
+              Select-Object -First 30 TimeCreated, Id, ProviderName,
+                @{ n = 'Message'; e = { (($_.Message -split "`r?`n") | Select-Object -First 4) -join ' | ' } } |
+              Format-List |
+              Out-String | Out-File $out -Append -Encoding utf8
+          } catch {
+            "读取 Application 日志失败：$($_.Exception.Message)" | Out-File $out -Append -Encoding utf8
+          }
+
       - name: 失败时留证据
         if: failure()
         uses: actions/upload-artifact@v4
