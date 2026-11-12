@@ -2506,9 +2506,11 @@ mod tests {
         assert_eq!(records[0]["mask"], Access::Write.mask());
         assert_eq!(records[0]["inherit"], true);
         assert_eq!(records[0]["existed_before"], false);
+        // 账本记的是**规范化后**的路径（卸载据此定位对象），不能拿原始 tempdir 直接比：
+        // CI 的 `%TEMP%` 会带 8.3 短名（`RUNNER~1`），canonicalize 之后是长名。
         assert_eq!(
             records[0]["path"].as_str().unwrap(),
-            dir.display().to_string()
+            normalize(&dir).display().to_string()
         );
 
         // 卸载/回滚：只按账本删我们那条，DACL 回到原状。
