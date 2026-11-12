@@ -1,8 +1,9 @@
 /*
  * 沙箱异常提示（宿主插件样式）。
  *
- * 只在 `enforcement = partial` 或状态读取失败时渲染，所以这是一条**异常条**，
- * 不是常驻状态栏：没有档位、没有机制、没有 profile，只有一条要用户知道的事实 + 刷新。
+ * 只在四种情况渲染：`enforcement = partial`、状态读取失败、文件权限准备中 / 没准备好。
+ * 所以这是一条**提示条**，不是常驻状态栏：没有档位、没有机制、没有 profile，
+ * 只有一条要用户知道的事实（读取失败与逻辑沙箱额外给一个刷新）。
  *
  * 只引用真实存在的主题令牌（`src/theme-tokens.spec.ts` 会机检）。
  */
@@ -23,6 +24,16 @@
   background: var(--dsw-alias-bg-base);
   border-top: 1px solid var(--dsw-alias-state-error-primary);
   color: var(--dsw-alias-state-error-primary);
+}
+
+/*
+ * `preparing` 只是「再等一会儿」，不是警告：用中性底色，别让用户以为出了问题。
+ * 只复用真实令牌（底色 + 次级文字），分隔线改透明以保留原高度。
+ */
+.shaniu-sandbox-notice[data-tone='info'] {
+  background: var(--dsw-alias-bg-base);
+  border-top-color: transparent;
+  color: var(--dsw-alias-label-secondary);
 }
 
 .shaniu-sandbox-notice-icon {

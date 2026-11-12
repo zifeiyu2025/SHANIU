@@ -16,6 +16,9 @@ export type SandboxModeWire = 'read_only' | 'workspace_write' | 'danger_full_acc
 /** OS 级机制（Rust `core::config::OsSandbox` 的字符串形）。 */
 export type OsSandboxWire = 'app_container' | 'logical'
 
+/** 文件权限后台准备的进度（Rust `sandbox::AncestorState` 的字符串形）。 */
+export type AncestorStateWire = 'idle' | 'preparing' | 'ready' | 'needs_admin'
+
 /** `sandbox_status` 的返回值（Rust `sandbox::SandboxStatus`）。 */
 export interface SandboxStatusWire {
   readonly mode: SandboxModeWire
@@ -26,6 +29,11 @@ export interface SandboxStatusWire {
   readonly enforcement: 'full' | 'partial'
   /** 容器 profile 名；logical 模式为空串。 */
   readonly profile: string
+  /**
+   * 文件权限后台准备进度。界面只在 `preparing` / `needs_admin` 时说一句话，
+   * `idle` / `ready` 不占位——常态提示只会变成噪声。
+   */
+  readonly ancestor: AncestorStateWire
   readonly note: string
 }
 

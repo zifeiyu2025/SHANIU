@@ -5,14 +5,15 @@
  * 承诺四件事：
  *  1. 插件只占 `shell.bottom`，不再有会话头部网络开关；
  *  2. 强制完整（常态）时**整条不渲染**——档位归输入区的访问模式 chip；
- *  3. 逻辑沙箱（`enforcement = partial`）与读取失败两种异常必须可见；
+ *  3. 逻辑沙箱（`enforcement = partial`）、读取失败、文件权限准备中 / 没准备好这四种
+ *     异常必须可见；文件权限的两种**只给一行字**，不许有进度条、弹窗或拦人动作；
  *  4. 任何状态都不许出现第二套档位词（只读 / 工作区可写 / 完全放开），
  *     也不许把机制 / profile 这类实现细节重新搬回来。
  *
  * 第 4 条是反向对照：只断言"新文案在"不够——旧词留着不会让正向断言变红，
  * 却正是用户看到的「同一档位两套词」。
  */
-import { describe, expect, it } from 'vitest'
+import { describe, expect, it, vi } from 'vitest'
 import type { ReactNode } from 'react'
 import { act, render, screen } from '@testing-library/react'
 import { Context } from '@deepseek-ai/cordis'
@@ -33,6 +34,7 @@ const OS_STATUS: SandboxStatusWire = {
   os_enabled: true,
   enforcement: 'full',
   profile: 'Shaniu.Sandbox.v1',
+  ancestor: 'ready',
   note: 'AppContainer 路径/读隔离；受限令牌与 Job 作为纵深保留',
 }
 
@@ -42,8 +44,15 @@ const LOGICAL_STATUS: SandboxStatusWire = {
   os_enabled: false,
   enforcement: 'partial',
   profile: '',
+  ancestor: 'idle',
   note: '当前未启用 OS 沙箱：仅受限令牌 + Job（逻辑隔离），没有路径级写入边界',
 }
+
+/** 文件权限后台准备中：只该出现一行中性提示。 */
+const PREPARING_STATUS: SandboxStatusWire = { ...OS_STATUS, ancestor: 'preparing' }
+
+/** 文件权限没准备好：一行警示，但**不许**拦人（无弹窗、无禁用、无额外按钮）。 */
+const NEEDS_ADMIN_STATUS: SandboxStatusWire = { ...OS_STATUS, ancestor: 'needs_admin' }
 
 /** 档位词的两种写法都必须绝迹：自造词与 chip 词都不该由本组件输出。 */
 const TIER_WORDS = ['只读', '工作区可写', '完全放开', '仅可查看', '工作区内修改', '完全权限'] as const
@@ -149,6 +158,49 @@ describe('src/sandbox-status：异常才出现的提示条', () => {
         expect(text).not.toContain(stale)
       }
       unmount()
+    }
+  })
+
+  it('文件权限准备中：一行中性提示，无按钮，落到终态自动消失', async () => {
+    vi.useFakeTimers()
+    try {
+      let calls = 0
+      const wire: SandboxWire = {
+        status: async () => (calls++ === 0 ? PREPARING_STATUS : OS_STATUS),
+      }
+      render(barElement(wire))
+      await act(async () => { await Promise.resolve() })
+
+      const notice = screen.getByText(zh['notice.preparing'])
+      expect(notice.closest('.shaniu-sandbox-notice')?.getAttribute('data-tone')).toBe('info')
+      // 只要一行字：不给按钮、不给进度条之类的可交互物。
+      expect(screen.queryAllByRole('button')).toHaveLength(0)
+      expect(screen.queryByRole('progressbar')).toBeNull()
+
+      // 每秒自查一次；状态到 ready 后提示消失并停止轮询。
+      await act(async () => { await vi.advanceTimersByTimeAsync(1000) })
+      expect(screen.queryByText(zh['notice.preparing'])).toBeNull()
+      const afterStop = calls
+      await act(async () => { await vi.advanceTimersByTimeAsync(3000) })
+      expect(calls).toBe(afterStop)
+    } finally {
+      vi.useRealTimers()
+    }
+  })
+
+  it('文件权限没准备好：只警示，不弹窗、不禁用、不给额外入口', async () => {
+    render(barElement(fakeWire(NEEDS_ADMIN_STATUS)))
+    const notice = await screen.findByText(zh['notice.needs_admin'])
+
+    expect(notice.closest('.shaniu-sandbox-notice')?.getAttribute('data-tone')).toBe('warn')
+    // 拦人动作一个都不许有：没有「立即提权」按钮、没有 modal、没有禁用态。
+    expect(screen.queryAllByRole('button')).toHaveLength(0)
+    expect(screen.queryByRole('dialog')).toBeNull()
+    expect(document.querySelector('[disabled]')).toBeNull()
+    // 文案不许出现实现细节（那些词用户看不懂，也会泄漏内部结构）。
+    const text = document.body.textContent ?? ''
+    for (const term of ['目录层级', 'DACL', 'ACE', 'SID', '权限项', 'ACL']) {
+      expect(text).not.toContain(term)
     }
   })
 })
