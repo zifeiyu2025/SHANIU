@@ -594,12 +594,54 @@ fn send_task(
     }
 }
 
+/// 档案降级可见化：坏行被跳过、撕裂行被丢弃、不安全尾部被截断时，**必须让用户看到**。
+///
+/// 跳过坏行是读取策略而不是失败（`rollout::read` 的设计选择 2），但"悄悄少了几条
+/// 历史"等于篡改上下文。复用既有 `EventMsg::RolloutDegraded`——前端已有
+/// `archive-degraded` notice 的渲染路径，不新造事件类型。
+fn notify_rollout_degraded(
+    sink: &dyn events::EventSink,
+    agent_id: &str,
+    torn_tail_lines: usize,
+    damaged_lines: &[usize],
+    dropped_unsafe_tail: usize,
+) {
+    if torn_tail_lines == 0 && damaged_lines.is_empty() && dropped_unsafe_tail == 0 {
+        return;
+    }
+    let mut parts: Vec<String> = Vec::new();
+    if !damaged_lines.is_empty() {
+        parts.push(format!(
+            "跳过 {} 行无法解析的记录（行号 {}）",
+            damaged_lines.len(),
+            damaged_lines.iter().map(usize::to_string).collect::<Vec<_>>().join(",")
+        ));
+    }
+    if torn_tail_lines > 0 {
+        parts.push(format!("丢弃 {torn_tail_lines} 行末行撕裂的写入"));
+    }
+    if dropped_unsafe_tail > 0 {
+        parts.push(format!("重放截断丢弃 {dropped_unsafe_tail} 条工具调用配对不完整的尾部记录"));
+    }
+    tracing::warn!(
+        agent_id,
+        torn_tail_lines,
+        damaged = ?damaged_lines,
+        dropped_unsafe_tail,
+        "会话档案不完整：已跳过坏行/截断不安全尾部，历史可能缺条目"
+    );
+    let _ = sink.emit(&events::EventMsg::RolloutDegraded {
+        message: format!("会话档案不完整：{}；历史可能缺条目", parts.join("，")),
+    });
+}
+
 /// 续写一份既有档案——`resume_session` 与 `send_task(Some(id))` 的共用主体。
 ///
 /// 恢复的三条硬要求都在这里成立：档案按 agent_id 定位、续跑**追加**到同一份档案
 /// （`open_existing`，不重新建档）、已落盘条数作为写入起点（`persisted`，避免把旧历史
-/// 重写一遍）。历史合法性由 `rollout::resume` 的重放规则保证；这里不再"修"历史——
-/// 静默补配对会掩盖档案损坏，而档案损坏必须由上层显式处理。
+/// 重写一遍）。历史合法性由 `rollout::resume` 的重放规则保证：只重放配对完整的前缀，
+/// 不安全的尾部被截断并计数；这里不再"修"历史——静默补配对会掩盖档案损坏，而档案
+/// 损坏必须让人看得见（[`notify_rollout_degraded`]）。
 ///
 /// `task` 必须是**已剥 marker** 的文本（两个入口都先过 `preflight_send`）。
 fn continue_session(
@@ -617,6 +659,10 @@ fn continue_session(
         .join(rollout::ROLLOUT_DIR)
         .join(format!("{agent_id}.jsonl"));
     let resumed = rollout::resume::resume(&path).map_err(|e| format!("恢复会话失败: {e}"))?;
+    // 降级信息在 `history` 被移走前取出：读取侧跳过/截断了多少，必须一路带到事件面。
+    let torn_tail_lines = resumed.torn_tail_lines;
+    let damaged_lines = resumed.damaged_lines.clone();
+    let dropped_unsafe_tail = resumed.dropped_unsafe_tail;
     let persisted = resumed.history.len();
     // first-prompt 资格看**追加前**的历史：档案里从没有过用户消息、又不是分叉，
     // 这条新任务才是"首条合格消息"（崩溃恢复/续跑/分叉都不重新生成标题）。
@@ -699,7 +745,9 @@ fn continue_session(
         Some(Arc::new(writer)),
         session_preset,
     )?;
-    let sink: Arc<dyn events::EventSink> = Arc::new(events::TauriEventSink::root(app.clone(), agent_id).with_journal(Arc::new(event_journal::FileEventJournal::new(app.state::<AppState>().data_root().join(config::SESSIONS_DIR)))).with_broadcast(app.state::<gateway::GatewayHub>().broadcast_sender()).with_viewers(app.state::<gateway::GatewayHub>().viewers()));
+    let sink: Arc<dyn events::EventSink> = Arc::new(events::TauriEventSink::root(app.clone(), agent_id.clone()).with_journal(Arc::new(event_journal::FileEventJournal::new(app.state::<AppState>().data_root().join(config::SESSIONS_DIR)))).with_broadcast(app.state::<gateway::GatewayHub>().broadcast_sender()).with_viewers(app.state::<gateway::GatewayHub>().viewers()));
+    // 档案不完整必须在会话时间线上看得见：重开会话的第一次回执就带上这条降级通知。
+    notify_rollout_degraded(sink.as_ref(), &agent_id, torn_tail_lines, &damaged_lines, dropped_unsafe_tail);
     // spawn 的 future 必须是 'static：借用的 app 只能换成 owned 句柄再 move 进去。
     let app_handle = app.clone();
     let orchestrator = build_orchestrator(agent.clone());
@@ -1176,8 +1224,9 @@ fn apply_compaction(
 
 /// 读回一个会话的历史条目，供前端渲染（SH-033 的"打开会话"）。
 ///
-/// 走 `rollout::read` 的严格口径：档案中间坏行必须报错，绝不能给前端一份"看起来完整、
-/// 实际缺尾"的历史——那正是 SH-030 设计选择 2 要防的事。
+/// 走 `rollout::read`：中间坏行**跳过并计数**（`read` 内已 warn），末行撕裂丢弃，
+/// 都不再判定整份档案失败；读回后经 [`notify_rollout_degraded`] 让用户看见"这份历史
+/// 不完整"。首行坏仍报错——没有 meta 就没有会话可开。
 #[tauri::command]
 fn load_session(app: tauri::AppHandle, agent_id: String) -> Result<Vec<SessionEntry>, String> {
     let state = app.state::<AppState>();
@@ -1186,6 +1235,10 @@ fn load_session(app: tauri::AppHandle, agent_id: String) -> Result<Vec<SessionEn
         .join(rollout::ROLLOUT_DIR)
         .join(format!("{agent_id}.jsonl"));
     let archive = rollout::read(&path).map_err(|e| format!("档案读不回: {e}"))?;
+    // 打开会话没有任务流，但降级通知同样要送到这个会话的时间线上。
+    // `load_session` 不做重放，所以没有"不安全尾部"这一项。
+    let sink: Arc<dyn events::EventSink> = Arc::new(events::TauriEventSink::root(app.clone(), agent_id.clone()).with_journal(Arc::new(event_journal::FileEventJournal::new(state.data_root().join(config::SESSIONS_DIR)))).with_broadcast(app.state::<gateway::GatewayHub>().broadcast_sender()).with_viewers(app.state::<gateway::GatewayHub>().viewers()));
+    notify_rollout_degraded(sink.as_ref(), &agent_id, archive.torn_tail_lines, &archive.damaged_lines, 0);
     project_entries(&archive.items).map_err(|e| format!("档案读不回: {e}"))
 }
 
@@ -2644,6 +2697,15 @@ async fn compact_session(app: tauri::AppHandle, agent_id: String) -> Result<Opti
             )))
             .with_broadcast(app.state::<gateway::GatewayHub>().broadcast_sender())
             .with_viewers(app.state::<gateway::GatewayHub>().viewers()),
+    );
+    // 压缩本身是有损操作；如果档案读回时已经降级，先把这件事放进同一条时间线，
+    // 否则用户只会看到"压缩把历史变短了"，却不知道压缩前就已经缺条目。
+    notify_rollout_degraded(
+        sink.as_ref(),
+        &agent_id,
+        resumed.torn_tail_lines,
+        &resumed.damaged_lines,
+        resumed.dropped_unsafe_tail,
     );
     // state 的借用止于上面最后一次取值（NLL），不跨下面的 await 点。
     session_compact::compact_now(&provider, &api_key, &resumed, budget, sink.as_ref(), &cancel)

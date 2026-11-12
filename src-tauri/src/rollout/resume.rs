@@ -3,7 +3,8 @@
 //! resume 的本质是"把档案重放成运行时的 `history`"，因此它的正确性判据只有一条：
 //! **重放出来的历史必须能直接喂给模型且不违反协议**。SH-082 已经证明，
 //! 一条 `function_call` 后面缺配对的 `function_call_output`，严格端点直接 400——
-//! 所以 fork 的截断点不能随便选，见 [`nearest_safe_cut`]。
+//! 所以重放只取配对完整的前缀（尾部不安全的条目被截断并计数），fork 的截断点同理，
+//! 见 [`nearest_safe_cut`]。
 
 use std::path::{Path, PathBuf};
 use std::time::{SystemTime, UNIX_EPOCH};
@@ -34,6 +35,12 @@ pub struct Resumed {
     pub torn_tail_lines: usize,
     /// 中间坏行（已跳过）的 1-based 行号；空 = 档案完好。重放出来的历史因此可能缺条目。
     pub damaged_lines: Vec<usize>,
+    /// 重放时因工具调用配对不完整而丢弃的尾部条目数（`items.len() - keep`）。
+    ///
+    /// 典型成因：崩溃时档案停在 `function_call` 之后、`function_call_output` 之前；
+    /// 或者中段坏行恰好吃掉了某个 output，使后面整段都不再配对。这些条目留在盘上，
+    /// 但不进模型历史——带着它们续写，第一条请求就会被严格端点 400（SH-082）。
+    pub dropped_unsafe_tail: usize,
 }
 
 /// 档案里的一条系统提示词版本（只读快照，供审计与轨迹回放）。
@@ -61,6 +68,18 @@ pub struct SystemPromptRecord {
 /// 所以当初那条论证真正排除的只有 system，并没有支持 assistant。
 pub fn resume(path: &Path) -> Result<Resumed, RolloutError> {
     let archive = rollout::read(path)?;
+    // 只重放配对完整的前缀：尾部落单的 `function_call`（崩溃点、或被中段坏行拆散
+    // 的配对）留在盘上，但绝不进模型历史——带着它续写，第一条请求就 400（SH-082）。
+    // 截断不是"修补档案"：盘上内容一个字节都不动，只决定这次重放读到哪里。
+    let keep = nearest_safe_cut(&archive.items, archive.items.len());
+    let dropped_unsafe_tail = archive.items.len() - keep;
+    if dropped_unsafe_tail > 0 {
+        tracing::warn!(
+            path = %path.display(),
+            dropped = dropped_unsafe_tail,
+            "档案尾部工具调用配对不完整：重放截断到最近安全点，被丢弃的条目不进模型历史"
+        );
+    }
     let (session_id, agent_id, parent_id, workspace_root) = match &archive.meta {
         RolloutItem::SessionMeta { session_id, agent_id, parent_id, config_snapshot, .. } => {
             (session_id.clone(), agent_id.clone(), parent_id.clone(), config_snapshot.workspace_root.clone())
@@ -81,7 +100,7 @@ pub fn resume(path: &Path) -> Result<Resumed, RolloutError> {
     let mut permission_preset: Option<String> = None;
     // 系统提示词版本不进模型历史（每轮由 SessionPrompt 重新组装），只做审计与回放。
     let mut prompt_versions: Vec<SystemPromptRecord> = Vec::new();
-    for item in &archive.items {
+    for item in &archive.items[..keep] {
         match item {
             RolloutItem::ResponseItem { item: h, .. } => history.push(h.clone()),
             RolloutItem::SandboxMode { mode, .. } => sandbox_mode = Some(mode.clone()),
@@ -162,15 +181,20 @@ pub fn resume(path: &Path) -> Result<Resumed, RolloutError> {
         prompt_versions,
         torn_tail_lines: archive.torn_tail_lines,
         damaged_lines: archive.damaged_lines,
+        dropped_unsafe_tail,
     })
 }
 
-/// 从 `want` 往下找最近一个**安全截断点**：该位置之前的历史里，每个 `function_call`
-/// 都有配对的 `function_call_output`。
+/// 从 `want` 往下找最近一个**安全截断点**：该位置之前的条目里，每个 `function_call`
+/// 都有配对的 `function_call_output`（按 `call_id` 双向集合包含判定，不校验出现顺序，
+/// 也不看待配对条目本身是 message 还是工具记录）。
 ///
 /// 为什么不能直接按用户选的条数切：一轮的工具记录是"先全部 call、再全部 output"，
 /// 从中间截断就会留下有 call 无 output 的尾巴，续写出来的会话第一次请求就 400。
-/// 安全点必然落在某轮工具段开始之前，也就是索引处是 `message`（或干脆到末尾）。
+///
+/// 返回值只承诺一件事：**`[0, k)` 配对完整**。它不保证 `items[k]` 是 message——
+/// `0`（没有任何安全前缀）与末尾（`want` 本身安全）都可能返回，工具段之外也可能
+/// 落在多条消息之间；调用方只能依赖"前缀可喂给模型"这一条契约。
 pub fn nearest_safe_cut(items: &[RolloutItem], want: usize) -> usize {
     let want = want.min(items.len());
     // 从 want 往下逐个试：[0, k) 是否配对完整
@@ -292,6 +316,25 @@ mod tests {
         assert_eq!(nearest_safe_cut(&items, 3), 1, "切在调用段中间一律回退");
         assert_eq!(nearest_safe_cut(&items, 0), 0);
         assert_eq!(nearest_safe_cut(&items, 99), 6, "超出长度按末尾处理");
+    }
+
+    #[test]
+    fn replay_truncates_to_the_last_paired_prefix_and_counts_the_loss() {
+        let dir = temp_dir("truncate");
+        let path = dir.join("a.jsonl");
+        let w = RolloutWriter::create(&dir, &meta("a")).unwrap();
+        w.append(&msg("任务")).unwrap();
+        w.append(&call("c1")).unwrap();
+        w.append(&out("c1")).unwrap();
+        // 崩溃点：档案停在 call 之后、output 之前。重放必须停在 c1 的 output 之后就收手。
+        w.append(&call("c2")).unwrap();
+        drop(w);
+
+        let r = resume(&path).unwrap();
+        assert_eq!(r.history.len(), 3, "落单的 c2 不得进模型历史：{:#?}", r.history);
+        assert_eq!(r.dropped_unsafe_tail, 1, "被截断的条目数必须带出来");
+        // 反向对照：盘上内容原样保留，截断只影响这次重放。
+        assert_eq!(rollout::read(&path).unwrap().items.len(), 4);
     }
 
     #[test]
