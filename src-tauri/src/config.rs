@@ -27,6 +27,8 @@ pub mod builtin_providers;
 pub mod single_instance;
 /// 工作区根唯一判据：等于/祖先/数据根内兄弟目录一律拒绝（任务 7，2026-11-11）。
 pub mod workspace_gate;
+/// Windows 路径规范化原语：剥 verbatim 前缀 / 取最深已存在祖先（FF-1 收敛，2026-11-13）。
+pub mod path_norm;
 
 pub const DATA_DIR_ENV: &str = "SHANIU_DATA_DIR";
 pub const PORTABLE_MARKER: &str = "portable.marker";
