@@ -1,0 +1,21 @@
+# 提交前自证：第一期 A 三笔提交之前的工作区状态（2026-11-12）
+# 只列与本线相关的条目；docs/15、evals/*、*_repro.rs 属于另外一条线，本线未触碰。
+git_head_before_commit=d0298d093463aea1ff3daed30d757630ef0a42d2
+
+$ git status --porcelain
+ M src-tauri/src/sandbox/acl.rs
+ M src-tauri/src/sandbox/mod.rs
+ M src-tauri/src/sandbox/msvc.rs
+ M src-tauri/src/sandbox/windows_impl.rs
+ M src-tauri/tests/sandbox_probe.rs
+?? docs/16-沙箱改为只约束写.md
+?? docs/evidence/2026-11-12/write-restricted/
+?? src-tauri/src/sandbox/write_sid.rs
+# 以下为他线改动（未纳入本线提交）：
+?? docs/15-安装器与权限生命周期.md
+?? evals/repo-tasks.json
+?? evals/repo/
+?? evals/score-repo.mjs
+?? src-tauri/tests/evals_repo.rs
+?? src-tauri/tests/sandbox_container_repro.rs
+?? src-tauri/tests/sandbox_repo_build_repro.rs
