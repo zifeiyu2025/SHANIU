@@ -500,6 +500,29 @@ mod tests {
         assert_eq!(risk_of("wait_agent"), RiskLevel::Read);
     }
 
+    /// 预设表与门禁必须互相钉住：三档各自的 `(sandbox, approval)` 绑定，跑 `decide`
+    /// 得到的结果要和档位语义一致。改错一档的审批值会同时让本用例与
+    /// `preset::tests::three_shipped_presets_match_dsh_bundles` 变红。
+    #[test]
+    fn three_presets_decide_as_their_bundles_say() {
+        use crate::permission::preset::PRESETS;
+        assert_eq!(PRESETS.len(), 3, "档位集合对齐 DSH：只有三档");
+        for preset in PRESETS {
+            let expected = match preset.id {
+                // 只读：写入与执行都被门禁拒绝（ADR-002）
+                "read-only" => (Decision::Deny, Decision::Deny),
+                // 工作区写：区内写入放行（沙箱就是边界），命令执行逐次询问
+                "workspace-write" => (Decision::Allow, Decision::Prompt),
+                // 完全权限：写入与执行都不问
+                "danger-full-access" => (Decision::Allow, Decision::Allow),
+                other => panic!("表里出现了未知预设：{other}"),
+            };
+            let write = decide(RiskLevel::WriteInWorkspace, preset.approval, preset.sandbox, false);
+            let execute = decide(RiskLevel::Execute, preset.approval, preset.sandbox, false);
+            assert_eq!((write, execute), expected, "{} 的 (写入, 执行) 与档位绑定不一致", preset.id);
+        }
+    }
+
     #[test]
     fn execute_is_prompted_rememberable_and_denied_in_readonly() {
         assert_eq!(decide(RiskLevel::Execute, ApprovalMode::OnRequest, SandboxMode::ReadOnly, false), Decision::Deny);

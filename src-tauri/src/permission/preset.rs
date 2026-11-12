@@ -6,11 +6,11 @@
 //! （选了 never 但沙箱仍是只读，工具全部被拒）。预设把两维绑成一组语义，
 //! 设置页、`/permission`、会话档案、resume 全部只认 id。
 //!
-//! 档位语义以 DSH 为准（对照表见 `align/permission-presets.md`）：
-//! - `read-only` / `workspace-write` / `danger-full-access` 逐字采用 DSH 的
-//!   `(sandbox, approval)` 组合；
-//! - `workspace-write-auto` 是本仓库扩展（DSH 无此档）：区内写入不问、越界由
-//!   沙箱拒绝，用于无人值守。**`extension` 只在内部标记，界面不得显示「扩展」字样**。
+//! 档位集合逐字对齐 DSH（对照表见 `align/permission-presets.md`）：
+//! `read-only` / `workspace-write` / `danger-full-access` 三档，`(sandbox, approval)`
+//! 组合与 DSH 相同。**没有扩展档**：2026-11-11 曾加过 `workspace-write-auto`
+//! （`workspace_write` + `never`），2026-11-12 用户裁定「权限档位对齐 dsh 就行，
+//! 不要搞复杂」后移除——想不被打断就选完全权限，那是 DSH 的答案。
 //!
 //! 不在表里的组合（`on_failure`、`full_access`、任何混搭）一律派生为
 //! [`CUSTOM`]：如实显示「自定义」，**不回落成某个具体预设**——把 `full_access`
@@ -29,35 +29,20 @@ pub struct Preset {
     pub id: &'static str,
     pub sandbox: SandboxMode,
     pub approval: ApprovalMode,
-    /// 本仓库扩展档（DSH 没有）。仅内部标记，界面不得展示。
-    pub extension: bool,
 }
 
 /// 预设全集，顺序即界面呈现顺序（权限递增）。
-pub const PRESETS: [Preset; 4] = [
-    Preset {
-        id: "read-only",
-        sandbox: SandboxMode::ReadOnly,
-        approval: ApprovalMode::OnRequest,
-        extension: false,
-    },
+pub const PRESETS: [Preset; 3] = [
+    Preset { id: "read-only", sandbox: SandboxMode::ReadOnly, approval: ApprovalMode::OnRequest },
     Preset {
         id: "workspace-write",
         sandbox: SandboxMode::WorkspaceWrite,
         approval: ApprovalMode::OnRequest,
-        extension: false,
     },
     Preset {
         id: "danger-full-access",
         sandbox: SandboxMode::DangerFullAccess,
         approval: ApprovalMode::Never,
-        extension: false,
-    },
-    Preset {
-        id: "workspace-write-auto",
-        sandbox: SandboxMode::WorkspaceWrite,
-        approval: ApprovalMode::Never,
-        extension: true,
     },
 ];
 
@@ -79,7 +64,7 @@ impl Preset {
     ///
     /// 它不是预设：`id` 恒为 [`CUSTOM`]，`from_id` 永远选不中它，界面显示「自定义」。
     pub fn custom(sandbox: SandboxMode, approval: ApprovalMode) -> Self {
-        Self { id: CUSTOM, sandbox, approval, extension: false }
+        Self { id: CUSTOM, sandbox, approval }
     }
 }
 
@@ -98,11 +83,18 @@ mod tests {
         ids.sort_unstable();
         ids.dedup();
         assert_eq!(ids.len(), PRESETS.len(), "预设 id 重复");
-        assert_eq!(
-            PRESETS.iter().filter(|preset| preset.extension).map(|preset| preset.id).collect::<Vec<_>>(),
-            vec!["workspace-write-auto"],
-            "扩展档只有一档，且仅内部标记"
-        );
+    }
+
+    /// 2026-11-12 用户裁定：档位集合对齐 DSH，自造的 `workspace-write-auto` 移除。
+    /// 任何把它加回表里的改动都必须在这里变红——「扩展档」不是可以悄悄长回来的东西。
+    #[test]
+    fn removed_extension_preset_is_not_selectable() {
+        assert_eq!(PRESETS.len(), 3, "预设只剩 DSH 的三档");
+        assert_eq!(from_id("workspace-write-auto"), None, "扩展档不得重新出现在表里");
+        assert!(PRESETS.iter().all(|preset| preset.id != "workspace-write-auto"));
+        // `(workspace_write, never)` 现在是「自定义」：想不被打断就选 danger-full-access
+        assert_eq!(resolve(SandboxMode::WorkspaceWrite, ApprovalMode::Never), None);
+        assert_eq!(id_of(SandboxMode::WorkspaceWrite, ApprovalMode::Never), CUSTOM);
     }
 
     #[test]
@@ -123,17 +115,19 @@ mod tests {
     }
 
     #[test]
-    fn extension_preset_binds_never_to_workspace_write() {
-        let preset = from_id("workspace-write-auto").expect("扩展档必须在表里");
-        assert_eq!(preset.sandbox, SandboxMode::WorkspaceWrite);
-        assert_eq!(preset.approval, ApprovalMode::Never);
-        assert!(preset.extension);
+    fn three_presets_keep_dsh_order() {
+        assert_eq!(
+            PRESETS.iter().map(|preset| preset.id).collect::<Vec<_>>(),
+            vec!["read-only", "workspace-write", "danger-full-access"],
+            "目录顺序即界面顺序；多一档少一档都必须在这里显形"
+        );
     }
 
     /// 非标准组合一律 `custom`，绝不回落成具体预设。
     #[test]
     fn non_standard_combinations_stay_custom() {
         for (sandbox, approval) in [
+            (SandboxMode::WorkspaceWrite, ApprovalMode::Never),
             (SandboxMode::WorkspaceWrite, ApprovalMode::OnFailure),
             (SandboxMode::WorkspaceWrite, ApprovalMode::FullAccess),
             (SandboxMode::ReadOnly, ApprovalMode::Never),

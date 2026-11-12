@@ -462,11 +462,11 @@ mod tests {
             "部署默认必须是只读，否则「不带档位」本身就是一次隐式提权"
         );
 
-        let auto = *crate::permission::preset::from_id("workspace-write-auto").unwrap();
-        s.reset_policy(Some(auto));
+        let full = *crate::permission::preset::from_id("danger-full-access").unwrap();
+        s.reset_policy(Some(full));
         assert_eq!(
             s.policy.snapshot().sandbox,
-            crate::config::SandboxMode::WorkspaceWrite
+            crate::config::SandboxMode::DangerFullAccess
         );
         assert_eq!(
             s.policy.snapshot().approval,

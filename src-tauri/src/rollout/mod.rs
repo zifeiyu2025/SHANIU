@@ -86,7 +86,7 @@ pub enum RolloutItem {
     ///
     /// 与 [`RolloutItem::SandboxMode`] 的关系：预设绑定 `(sandbox, approval)` 两维，
     /// 新档案只写这一条；`sandbox_mode` 保留为旧档案的读取兼容（`last_permission_preset`
-    /// 在没有预设事件时回落到它）。`preset` 存 id（如 `workspace-write-auto`），
+    /// 在没有预设事件时回落到它）。`preset` 存 id（如 `danger-full-access`），
     /// 不存两维——id 才是用户选的那个东西，两维展开会让「自定义组合」无法表达。
     PermissionPreset { preset: String, at_ms: u64 },
     /// 退出流程里的“强制中止”留痕：取消信号已发，但等待超时后进程仍要退出。
