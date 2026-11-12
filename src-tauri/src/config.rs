@@ -473,11 +473,15 @@ impl AppConfig {
     /// 并由它生效。只在配置文件**不存在**时使用；已有配置（哪怕 providers 为空）
     /// 一个字节都不改——用户删光了服务商是用户的决定，不能被"默认值"复活。
     pub fn fresh_install() -> Self {
-        Self {
+        let mut cfg = Self {
             providers: builtin_providers::default_profiles(),
             active_provider: builtin_providers::default_active_id().to_string(),
             ..Self::default()
-        }
+        };
+        // 全新安装写出的 `os` 就是本版本默认值，不需要再迁移；标成「已定过」，
+        // 这样用户以后手动改回 app_container 不会被迁移逻辑改回去。
+        cfg.sandbox.os_explicit = true;
+        cfg
     }
 
     /// 校验额外工作区清单（SH-099）：id 唯一非空、路径唯一非空且是绝对路径。
@@ -968,16 +972,27 @@ impl Default for SessionTitleConfig {
 #[serde(default)]
 pub struct SandboxConfig {
     pub mode: SandboxMode,
-    /// OS 级沙箱机制（SH-021/022）。默认 AppContainer；回退必须显式选择。
+    /// OS 级沙箱机制（SH-021/022）。默认受限令牌（只约束写）；AppContainer 是
+    /// 可选的更严格机制，回退到 logical 必须显式选择。
     pub os: OsSandbox,
+    /// `os` 这一项是否已经被定过（用户亲手选过，或由旧默认迁移过）。
+    ///
+    /// 存在的唯一原因：旧版本会把默认值一起写进 config.toml，于是「文件里有
+    /// `app_container`」并不等于「用户选过 AppContainer」。本字段缺失（旧文件）
+    /// 时按旧默认处理——见 `load_or_create_diagnosed` 的一次性迁移。
+    /// 想主动留在 AppContainer：同时写 `os = "app_container"` 与 `os_explicit = true`。
+    pub os_explicit: bool,
 }
 
 /// OS 级沙箱机制。
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum OsSandbox {
-    /// AppContainer 打底：路径/读隔离（默认值）。网络不是策略维度，容器一律可出网。
+    /// 写约束（默认）：`WRITE_RESTRICTED` 受限令牌，只约束写，读与网络不约束。
+    /// 对齐 codex / dsh 在 Windows 上的机制（docs/16 §5）。
     #[default]
+    RestrictedToken,
+    /// **可选**的 AppContainer：路径/读隔离。比参考实现更严，只在显式选择时启用。
     AppContainer,
     /// **显式回退**：只有受限令牌 + Job 的逻辑沙箱，没有路径级边界。
     /// 选中后 UI 与日志必须标注「当前未启用 OS 沙箱」，禁止静默降级。
@@ -2020,6 +2035,7 @@ impl AppConfig {
         if let Err(error) = cfg.validate_loaded() {
             return read_only(format!("{error}（文件未被改动：{}）", path.display()));
         }
+        cfg.migrate_legacy_sandbox_os(&path);
 
         let stray = cfg.stray_reasoning_keys();
         if stray.is_empty() {
@@ -2054,6 +2070,37 @@ impl AppConfig {
                 stray.join("；"),
                 path.display()
             )),
+        }
+    }
+
+    /// 一次性迁移：把旧版写死的默认机制换成新默认（写约束）。
+    ///
+    /// 上下文：旧版本启动时会把**默认值**一起序列化进 config.toml，所以老文件里
+    /// 有 `os = "app_container"` 并不代表用户选过 AppContainer。`os_explicit`
+    /// 缺失（旧文件）时按旧默认迁移；用户想留在 AppContainer 就写
+    /// `os_explicit = true`（迁移后写回的文件也带这个标记，不会被反复改）。
+    ///
+    /// 纪律：**先备份再写回**；写不回去只在本进程内按新默认运行并留 warn，
+    /// 下次启动重试（幂等）。绝不静默——日志与状态面都会显示生效机制。
+    fn migrate_legacy_sandbox_os(&mut self, path: &Path) {
+        if self.sandbox.os != OsSandbox::AppContainer || self.sandbox.os_explicit {
+            return;
+        }
+        let backup = backup_original(path);
+        self.sandbox.os = OsSandbox::RestrictedToken;
+        self.sandbox.os_explicit = true;
+        match self.save(path) {
+            Ok(()) => tracing::warn!(
+                config = %path.display(),
+                backup = %backup.as_ref().map(|p| p.display().to_string()).unwrap_or_default(),
+                "沙箱默认机制已迁移：app_container → restricted_token（只约束写；\
+                 要留在 AppContainer 请写 os_explicit = true，原文件已备份）"
+            ),
+            Err(error) => tracing::warn!(
+                config = %path.display(),
+                %error,
+                "沙箱默认机制迁移未能写回：本次按 restricted_token 运行，下次启动重试"
+            ),
         }
     }
 
@@ -3053,14 +3100,19 @@ mod tests {
         assert_eq!(cfg2.model.provider, "openai-chat");
         assert_eq!(cfg2.model.max_turns, 0, "旧配置缺字段时也必须落到「不限」");
         assert_eq!(cfg2.sandbox.mode, SandboxMode::ReadOnly);
-        assert_eq!(cfg2.sandbox.os, OsSandbox::AppContainer, "OS 沙箱默认必须是 AppContainer");
+        assert_eq!(
+            cfg2.sandbox.os,
+            OsSandbox::RestrictedToken,
+            "OS 沙箱默认必须是只约束写的受限令牌（对齐 codex/dsh）"
+        );
     }
 
     #[test]
     fn sandbox_os_must_be_explicit_to_fall_back_to_logical() {
         // 默认值不能是 logical：回退必须由用户写进配置，不能自动发生。
         let default: SandboxConfig = toml::from_str("").unwrap();
-        assert_eq!(default.os, OsSandbox::AppContainer);
+        assert_eq!(default.os, OsSandbox::RestrictedToken);
+        assert!(!default.os_explicit, "字段缺失 = 旧文件，由迁移逻辑处理");
         let logical: SandboxConfig = toml::from_str("os = \"logical\"").unwrap();
         assert_eq!(logical.os, OsSandbox::Logical);
         assert!(
@@ -3430,6 +3482,7 @@ mod provider_tests {
         let legacy = "[sandbox]\n\
 mode = \"workspace_write\"\n\
 os = \"app_container\"\n\
+os_explicit = true\n\
 network = \"restricted\"\n";
         fs::write(&path, legacy).unwrap();
         let before = fs::read(&path).unwrap();
@@ -3445,6 +3498,51 @@ network = \"restricted\"\n";
         assert_eq!(loaded.config.sandbox.mode, SandboxMode::WorkspaceWrite);
         assert_eq!(loaded.config.sandbox.os, OsSandbox::AppContainer);
         assert_eq!(fs::read(&path).unwrap(), before, "加载不得改写配置文件字节");
+    }
+
+    /// 旧版本的默认值也会被写进 config.toml：`app_container` 且没有 `os_explicit`
+    /// 视为「旧默认」，一次性迁移到 `restricted_token`（先备份、只迁一次）。
+    #[test]
+    fn legacy_default_sandbox_os_is_migrated_once_with_backup() {
+        let base = crate::test_support::TestTempDir::new("os-migrate");
+        let path = base.join(CONFIG_FILE);
+        fs::write(&path, "[sandbox]\nmode = \"workspace_write\"\nos = \"app_container\"\n").unwrap();
+
+        let first = AppConfig::load_or_create_diagnosed(&base);
+        assert_eq!(first.outcome, ConfigLoadOutcome::Clean);
+        assert_eq!(first.config.sandbox.os, OsSandbox::RestrictedToken, "旧默认必须迁到写约束");
+        assert!(first.config.sandbox.os_explicit, "迁移后要标记为已定过");
+        let raw = fs::read_to_string(&path).unwrap();
+        assert!(raw.contains("os = \"restricted_token\""), "迁移必须写回文件: {raw}");
+        assert!(raw.contains("os_explicit = true"), "迁移必须落标记，避免反复迁移: {raw}");
+        let backups = fs::read_dir(&base)
+            .unwrap()
+            .filter_map(|e| e.ok())
+            .filter(|e| e.file_name().to_string_lossy().contains(".bak-"))
+            .count();
+        assert_eq!(backups, 1, "迁移前必须先备份原文件");
+
+        let second = AppConfig::load_or_create_diagnosed(&base);
+        assert_eq!(second.config.sandbox.os, OsSandbox::RestrictedToken);
+        let backups2 = fs::read_dir(&base)
+            .unwrap()
+            .filter_map(|e| e.ok())
+            .filter(|e| e.file_name().to_string_lossy().contains(".bak-"))
+            .count();
+        assert_eq!(backups2, 1, "迁移必须幂等：二次启动不再备份");
+    }
+
+    /// 用户显式留在 AppContainer：带 `os_explicit = true` 的文件不许被迁移。
+    #[test]
+    fn explicit_app_container_is_never_migrated() {
+        let base = crate::test_support::TestTempDir::new("os-explicit");
+        let path = base.join(CONFIG_FILE);
+        let raw = "[sandbox]\nmode = \"workspace_write\"\nos = \"app_container\"\nos_explicit = true\n";
+        fs::write(&path, raw).unwrap();
+
+        let loaded = AppConfig::load_or_create_diagnosed(&base);
+        assert_eq!(loaded.config.sandbox.os, OsSandbox::AppContainer);
+        assert_eq!(fs::read_to_string(&path).unwrap(), raw, "显式选择不得被改写");
     }
 
     /// 修不了（解析就失败）必须进只读：原文件一个字节不动，并给出路径。
