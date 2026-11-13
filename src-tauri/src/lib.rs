@@ -637,23 +637,24 @@ fn notify_rollout_degraded(
     });
 }
 
-/// 权限档被钳制必须让用户看见：界面按配置值显示 `full_access`，执行却按更严的档，
+/// 权限档**真正冲突**时必须让用户看见：配置要求完全放开，执行却只能按更严的档跑，
 /// 用户会误以为已经放行（§11.3 退化红线）。
 ///
-/// 与 codex 的差别：codex 遇到「`approval=never` 但沙箱拿不到 danger」直接拒绝启动
-/// （`core/src/config/mod.rs:4407-4410`）；我们选择降级后继续跑，所以要对齐的是
-/// 「不静默」这一条——启动时发一条 `permission_downgraded`，文案同时给出配置值与实际值。
+/// `full_access` 现在是完整的「完全放开」档：沙箱随档提升为 `danger_full_access`，
+/// 常态下不会产生这条说明。与 codex 的差别是 codex 遇到配置自相矛盾时直接拒绝启动
+/// （`core/src/config/mod.rs:4407-4410`）；我们在**环境给不了无沙箱执行**时回落
+/// `on_request` 并播报，文案同时给出配置值、实际值与要改的那一行。
 ///
 /// 同一进程内同一条说明只播一次（[`AppState::announce_policy_note`]）：每个任务启动都会
-/// 重算策略，逐任务播报会把时间线刷成噪音；配置写成功或降级消失后会重置去重记录。
+/// 重算策略，逐任务播报会把时间线刷成噪音；配置写成功或冲突消失后会重置去重记录。
 fn notify_policy_downgraded(state: &AppState, sink: &dyn events::EventSink) {
     let Some(reason) = state.policy.note() else {
-        // 合法组合：清空去重记录，用户之后再改回不合法时必须重新播报。
+        // 合法组合：清空去重记录，用户之后再改回冲突组合时必须重新播报。
         state.announce_policy_note(None);
         return;
     };
     let policy = state.policy.snapshot();
-    // `note()` 目前唯一来源是「`full_access` 前提不满足」（`ApprovalMode::effective`），
+    // `note()` 目前唯一来源是「环境给不了 danger_full_access」（见 policy::normalize），
     // 所以配置值确定为 `full_access`。把沙箱档一并写进消息：配置一变文本就变，
     // 去重键天然跟着变，用户改了档位就能再看到一次。
     let configured = config::ApprovalMode::FullAccess.as_str();
@@ -672,7 +673,7 @@ fn notify_policy_downgraded(state: &AppState, sink: &dyn events::EventSink) {
         configured,
         effective,
         sandbox = policy.sandbox.as_str(),
-        "审批档被钳制：实际按更严的档运行"
+        "权限档冲突：环境给不了完全放开，实际按更严的档运行"
     );
     let _ = sink.emit(&events::EventMsg::PermissionDowngraded {
         configured: configured.to_string(),
@@ -1925,6 +1926,9 @@ fn new_session_writer(
 ) -> Result<(Arc<rollout::RolloutWriter>, String), String> {
     let cfg = state.config();
     let agent_id = explicit_id.unwrap_or_else(|| state.next_session_id());
+    // 档案记**生效**两维：`full_access` 的沙箱已被提升为 danger，记 raw config
+    // 会让回放/审计看到一个运行时并未使用的档。
+    let effective = permission::policy::effective_pair(cfg.sandbox.mode, cfg.approval.mode);
     let meta = rollout::RolloutItem::SessionMeta {
         session_id: agent_id.clone(),
         agent_id: agent_id.clone(),
@@ -1934,8 +1938,8 @@ fn new_session_writer(
             provider: cfg.model.provider.clone(),
             base_url: cfg.model.base_url.clone(),
             model: cfg.model.model.clone(),
-            sandbox: format!("{:?}", cfg.sandbox.mode),
-            approval: format!("{:?}", cfg.approval.mode),
+            sandbox: format!("{:?}", effective.sandbox),
+            approval: format!("{:?}", effective.approval),
             // 会话的工作区在建档时固化（SH-099）：之后 resume/工具沙箱都读这一行
             workspace_root: workspace_root.display().to_string(),
         },
@@ -2218,6 +2222,9 @@ fn get_settings(app: tauri::AppHandle) -> Result<serde_json::Value, String> {
         }));
     }
     let active = cfg.effective_model();
+    // 安全面回显的是**生效**两维：`full_access` 会把沙箱提升为 danger，
+    // 回显 raw config 会让界面显示一个运行时并不使用的沙箱档。
+    let effective = permission::policy::effective_pair(cfg.sandbox.mode, cfg.approval.mode);
     Ok(serde_json::json!({
         "baseUrl": active.base_url,
         "model": active.model,
@@ -2231,11 +2238,11 @@ fn get_settings(app: tauri::AppHandle) -> Result<serde_json::Value, String> {
         "hasApiKey": secret.load_key(&active.secret_name)?.is_some(),
         // 安全面两档的回显。序列化直接走 serde（枚举本身是 snake_case），
         // 不在这里手写字符串——手写就会与 config.toml 里的写法漂移成两套名字。
-        "sandboxMode": serde_json::to_value(cfg.sandbox.mode).map_err(|e| e.to_string())?,
-        "approvalMode": serde_json::to_value(cfg.approval.mode).map_err(|e| e.to_string())?,
+        "sandboxMode": serde_json::to_value(effective.sandbox).map_err(|e| e.to_string())?,
+        "approvalMode": serde_json::to_value(effective.approval).map_err(|e| e.to_string())?,
         // 预设视图（单一读面）：命中预设给 id，非标准组合如实给 `custom`。
         // 两维仍单独下发是给状态条/诊断用的只读信息，**不构成写面**。
-        "permissionPreset": permission::preset::id_of(cfg.sandbox.mode, cfg.approval.mode),
+        "permissionPreset": permission::preset::id_of(effective.sandbox, effective.approval),
         // 生效档的协议族 id 与服务商文档（多服务商口径，04 §4）
         "activeProvider": if cfg.active_provider.is_empty() { active.id.clone() } else { cfg.active_provider.clone() },
         "providerRevision": cfg.provider_revision,
@@ -2304,7 +2311,9 @@ fn delete_api_key(app: tauri::AppHandle, provider: String) -> Result<(), String>
 fn sandbox_status(app: tauri::AppHandle) -> sandbox::SandboxStatus {
     let state = app.state::<AppState>();
     let cfg = state.config();
-    sandbox::status(cfg.sandbox.mode, cfg.sandbox.os)
+    // 与运行同一口径：`full_access` 下 raw config 的沙箱档不是实际在用的档。
+    let effective = permission::policy::effective_pair(cfg.sandbox.mode, cfg.approval.mode);
+    sandbox::status(effective.sandbox, cfg.sandbox.os)
 }
 
 /// 报错时列给用户的合法档位名。它必须与 `config.rs` 的枚举同源——
@@ -3174,7 +3183,24 @@ pub fn run() {
     // SH-021/022：OS 沙箱机制的进程级装配。
     // 回退到 logical 必须是配置里显式写的——这里只负责把它标出来，绝不自动回退。
     sandbox::set_os_mode(app_config.sandbox.os);
-    if app_config.sandbox.mode == config::SandboxMode::WorkspaceWrite
+    // 警告按**生效**沙箱档判断：`full_access` 会把沙箱提升为 danger，
+    // 此时 raw config 里的 workspace_write 并不生效，不该再报「没有写入边界」。
+    let effective = permission::policy::effective_pair(app_config.sandbox.mode, app_config.approval.mode);
+    // `full_access` 是完整档：沙箱被提升时必须留一条启动 warning，写清配置值、
+    // 生效值与原因。它与 `permission_downgraded` 是两回事——后者只留给
+    // 「环境给不了 danger」的真冲突，不能拿兼任这条正常提升提示。
+    if app_config.approval.mode == config::ApprovalMode::FullAccess
+        && app_config.sandbox.mode != config::SandboxMode::DangerFullAccess
+    {
+        tracing::warn!(
+            "[sandbox].mode 配置值 \"{}\" 实际生效 \"{}\"（原因：[approval].mode = \"full_access\" \
+             是完整的「完全放开」档，审批全放行时不能同时套受限沙箱；若要保留受限沙箱，\
+             请把 [approval].mode 改为 on_request）",
+            app_config.sandbox.mode.as_str(),
+            effective.sandbox.as_str(),
+        );
+    }
+    if effective.sandbox == config::SandboxMode::WorkspaceWrite
         && app_config.sandbox.os == config::OsSandbox::Logical
     {
         tracing::warn!(
@@ -4252,6 +4278,7 @@ mod policy_notice_tests {
     use crate::app_state::AppState;
     use crate::config::{AppConfig, ApprovalMode, SandboxMode};
     use crate::events::{EventMsg, EventSink};
+    use crate::permission::SessionPolicy;
     use std::sync::{Arc, Mutex};
 
     struct CapturingSink(Arc<Mutex<Vec<EventMsg>>>);
@@ -4289,17 +4316,39 @@ mod policy_notice_tests {
             .collect()
     }
 
-    /// 配 `full_access` + 非 danger 沙箱：必须有通知，且文案同时给出配置值与实际值。
-    /// 旧代码（`note()` 零调用）下这条断言必红——这正是本用例要证伪的行为。
+    /// `full_access` 是完整档：配任意沙箱都会把沙箱提升为 danger，
+    /// 审批档保持 `full_access`，且**不产生通知**（不再是常态降级）。
     #[test]
-    fn clamped_full_access_is_announced_with_both_values() {
-        let dir = crate::test_support::TestTempDir::new("policy-notice-clamped");
+    fn full_access_upgrades_sandbox_and_stays_silent() {
+        let dir = crate::test_support::TestTempDir::new("policy-notice-upgrade");
         let state = state_with(ApprovalMode::FullAccess, SandboxMode::ReadOnly, &dir);
+        let policy = state.policy.snapshot();
+        assert_eq!(policy.approval, ApprovalMode::FullAccess, "不再降级审批档");
+        assert_eq!(policy.sandbox, SandboxMode::DangerFullAccess, "沙箱随档完全放开");
+        assert!(state.policy.note().is_none(), "这不是冲突");
+
+        let store = Arc::new(Mutex::new(Vec::new()));
+        notify_policy_downgraded(&state, &CapturingSink(store.clone()));
+        assert!(notes(&store).is_empty(), "常态不应再播降级通知");
+    }
+
+    /// 环境给不了无沙箱执行 = 真正的冲突：必须播报，文案同时给出配置值、
+    /// 实际生效值与要改的那一行（`[approval].mode`）。
+    #[test]
+    fn full_access_without_environment_capability_is_announced() {
+        let dir = crate::test_support::TestTempDir::new("policy-notice-conflict");
+        let state = state_with(ApprovalMode::FullAccess, SandboxMode::ReadOnly, &dir);
+        // AppState 构造时用真实能力探测（当前 Windows 恒为 true），这里显式模拟
+        // 「环境给不了」以覆盖冲突分支。
+        state.policy.reset_with_availability(
+            SessionPolicy { approval: ApprovalMode::FullAccess, sandbox: SandboxMode::ReadOnly },
+            false,
+        );
         let store = Arc::new(Mutex::new(Vec::new()));
         notify_policy_downgraded(&state, &CapturingSink(store.clone()));
 
         let notes = notes(&store);
-        assert_eq!(notes.len(), 1, "权限档被钳制必须播报，不能静默");
+        assert_eq!(notes.len(), 1, "真正的冲突必须播报，不能静默");
         assert_eq!(notes[0].0, "full_access", "配置值必须是用户要求的那档");
         assert_eq!(notes[0].1, "on_request", "实际生效值必须是真正在跑的那档");
         assert!(
@@ -4308,17 +4357,20 @@ mod policy_notice_tests {
             notes[0].2
         );
         assert!(
-            notes[0].2.contains("当前沙箱：read_only"),
-            "原因要落在一眼能改的地方：{}",
+            notes[0].2.contains("当前沙箱：read_only") && notes[0].2.contains("[approval].mode"),
+            "文案要落在用户能改的那一行：{}",
             notes[0].2
         );
     }
 
-    /// 合法组合：`on_request` + 任意沙箱、`full_access` + danger 都不该产生通知。
+    /// 合法组合都不该产生通知：`full_access` 配任意沙箱现在都合法
+    /// （沙箱随档提升），`on_request` + 任意沙箱同样合法。
     #[test]
     fn legal_combinations_stay_silent() {
         for (approval, sandbox) in [
             (ApprovalMode::OnRequest, SandboxMode::WorkspaceWrite),
+            (ApprovalMode::FullAccess, SandboxMode::ReadOnly),
+            (ApprovalMode::FullAccess, SandboxMode::WorkspaceWrite),
             (ApprovalMode::FullAccess, SandboxMode::DangerFullAccess),
         ] {
             let dir = crate::test_support::TestTempDir::new("policy-notice-legal");
@@ -4329,11 +4381,13 @@ mod policy_notice_tests {
         }
     }
 
-    /// 同一进程内连续任务只播一次；用户改配置（降级消失再出现）后必须能再播。
+    /// 同一进程内连续任务只播一次；冲突消失再出现后必须能再播。
     #[test]
-    fn same_note_announces_once_until_config_changes() {
+    fn same_note_announces_once_until_conflict_changes() {
         let dir = crate::test_support::TestTempDir::new("policy-notice-dedupe");
         let state = state_with(ApprovalMode::FullAccess, SandboxMode::ReadOnly, &dir);
+        let conflict = SessionPolicy { approval: ApprovalMode::FullAccess, sandbox: SandboxMode::ReadOnly };
+        state.policy.reset_with_availability(conflict, false);
         let store = Arc::new(Mutex::new(Vec::new()));
         let sink = CapturingSink(store.clone());
 
@@ -4341,17 +4395,13 @@ mod policy_notice_tests {
         notify_policy_downgraded(&state, &sink);
         assert_eq!(notes(&store).len(), 1, "同一条说明连续两个任务只播一次");
 
-        // 用户把配置改成合法再改回不合法：期间的「没有降级」必须清掉去重记录。
-        let mut legal = state.config();
-        legal.approval.mode = ApprovalMode::OnRequest;
-        state.update_config(legal).expect("测试配置应可写");
+        // 冲突消失（回到合法组合）必须清掉去重记录；再次出现是新的冲突。
+        state.policy.reset(SessionPolicy { approval: ApprovalMode::OnRequest, sandbox: SandboxMode::ReadOnly });
         notify_policy_downgraded(&state, &sink);
-        let mut back = state.config();
-        back.approval.mode = ApprovalMode::FullAccess;
-        state.update_config(back).expect("测试配置应可写");
+        state.policy.reset_with_availability(conflict, false);
         notify_policy_downgraded(&state, &sink);
 
-        assert_eq!(notes(&store).len(), 2, "配置改回不合法后必须再播一次");
+        assert_eq!(notes(&store).len(), 2, "冲突消失后再出现必须再播一次");
     }
 }
 

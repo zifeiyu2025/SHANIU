@@ -9,7 +9,7 @@
 //! - execute：只读沙箱拒绝（ADR-002：只读禁止命令执行）；`on-request` 下本会话记住过则放行、
 //!   否则询问；其余三档放行（`on-failure` 的提权询问发生在沙箱拒绝之后，不在门禁里）；
 //! - destructive：`on-request` 每次必问（永不记忆）；`never/on-failure` 直接拒绝（fail-closed，
-//!   不询问也不放行）；`full-access` 放行（前提是 danger 沙箱，由 `ApprovalMode::effective` 保证）。
+//!   不询问也不放行）；`full-access` 放行（该档已在归一化时把沙箱提升为 danger 沙箱）。
 //! - plan_review：`on-request` 询问；预授权档放行并在事件流留痕（计划评审是人工会签，
 //!   不是风险分级；无人值守下不能出现「进得去出不来」）。
 
@@ -18,6 +18,7 @@ use std::sync::{Arc, Mutex, RwLock};
 
 use crate::config::{ApprovalMode, SandboxMode};
 use crate::events::RiskLevel;
+use crate::sandbox::danger_full_access_available;
 
 /// 代理级工具白名单（ADR-103「权限只降不升」）。
 ///
@@ -114,8 +115,6 @@ pub fn decide(
     sandbox_mode: SandboxMode,
     remembered_execute: bool,
 ) -> Decision {
-    // 前提校验先做：`full-access` 只在 danger 沙箱下成立，否则按 on-request 裁决。
-    let (approval_mode, _) = approval_mode.effective(sandbox_mode);
     match risk {
         RiskLevel::Read => Decision::Allow,
         RiskLevel::WriteInWorkspace => match sandbox_mode {
@@ -123,8 +122,8 @@ pub fn decide(
             SandboxMode::DangerFullAccess => Decision::Allow,
             SandboxMode::WorkspaceWrite => match approval_mode {
                 // 沙箱就是边界：边界内的写入不再逐次打断（对齐 dsh 的 workspace-write，
-                // 越界由 ACL/路径校验拒绝，而不是靠审批兜底）。`full-access` 在非 danger
-                // 沙箱下已被 `effective` 钳成 `on-request`，两者在这里同为「不再问」。
+                // 越界由 ACL/路径校验拒绝，而不是靠审批兜底）。`full-access` 的沙箱
+                // 已在归一化时提升为 danger，走到这一支同样按「不再问」处理。
                 ApprovalMode::Never
                 | ApprovalMode::OnFailure
                 | ApprovalMode::OnRequest
@@ -170,16 +169,22 @@ pub fn decide(
 #[derive(Debug, Clone)]
 pub struct SessionPolicyHandle {
     inner: Arc<RwLock<SessionPolicy>>,
-    /// 生效档被钳制的说明（目前只有 full-access 前提不满足一种）。
+    /// 生效档与配置冲突的说明（目前只有「环境给不了无沙箱执行」一种）。
     note: Arc<Mutex<Option<String>>>,
 }
 
 impl SessionPolicyHandle {
     pub fn new(policy: SessionPolicy) -> Self {
-        let (approval, note) = normalize(policy);
+        Self::new_with_availability(policy, danger_full_access_available())
+    }
+
+    /// 显式传入环境能力的构造入口（测试用）：生产路径一律走 [`Self::new`]，
+    /// 由 [`danger_full_access_available`] 给出与沙箱实现同源的判据。
+    pub(crate) fn new_with_availability(policy: SessionPolicy, danger_available: bool) -> Self {
+        let (policy, note) = normalize(policy, danger_available);
         Self {
-            inner: Arc::new(RwLock::new(SessionPolicy { approval, ..policy })),
-            note: Arc::new(Mutex::new(note.map(str::to_string))),
+            inner: Arc::new(RwLock::new(policy)),
+            note: Arc::new(Mutex::new(note)),
         }
     }
 
@@ -190,30 +195,66 @@ impl SessionPolicyHandle {
     /// 重置会话策略（任务启动时由装配层调用）：上一任务运行中切换的档位
     /// 不得泄漏到下一任务——那等于把"会话内切换"变成了事实上的全局开关。
     pub fn reset(&self, policy: SessionPolicy) {
-        let (approval, note) = normalize(policy);
-        *self.inner.write().expect("policy 锁中毒") = SessionPolicy { approval, ..policy };
-        *self.note.lock().expect("policy note 锁中毒") = note.map(str::to_string);
+        self.reset_with_availability(policy, danger_full_access_available());
+    }
+
+    pub(crate) fn reset_with_availability(&self, policy: SessionPolicy, danger_available: bool) {
+        let (policy, note) = normalize(policy, danger_available);
+        *self.inner.write().expect("policy 锁中毒") = policy;
+        *self.note.lock().expect("policy note 锁中毒") = note;
     }
 
     pub fn note(&self) -> Option<String> {
         self.note.lock().expect("policy note 锁中毒").clone()
     }
 
-    /// 运行中切换审批档。`full-access` 前提不满足时**返回错误而不是回落**——
-    /// 用户明确点名 full-access 却得到一个更严的档，必须让他知道。
+    /// 运行中切换审批档。切到 `full_access` 会同时把沙箱提升为 danger；
+    /// 环境给不了无沙箱执行时**返回错误而不是静默降档**。
     pub fn set_approval(&self, mode: ApprovalMode) -> Result<(), String> {
-        let sandbox = self.snapshot().sandbox;
-        if let (_, Some(reason)) = mode.effective(sandbox) {
-            return Err(reason.to_string());
+        let requested = SessionPolicy { approval: mode, sandbox: self.snapshot().sandbox };
+        let (next, note) = normalize(requested, danger_full_access_available());
+        if next.approval != mode {
+            return Err(note.unwrap_or_else(|| "当前环境无法提供 full_access".to_string()));
         }
-        self.inner.write().expect("policy 锁中毒").approval = mode;
-        *self.note.lock().expect("policy note 锁中毒") = None;
+        *self.inner.write().expect("policy 锁中毒") = next;
+        *self.note.lock().expect("policy note 锁中毒") = note;
         Ok(())
     }
 }
 
-fn normalize(policy: SessionPolicy) -> (ApprovalMode, Option<&'static str>) {
-    policy.approval.effective(policy.sandbox)
+/// `full_access` 的语义是**完全放开**：审批全放行 + 无沙箱执行。
+///
+/// 因此沙箱维在 `full_access` 下不是独立选择——选它就把沙箱提升到
+/// `danger_full_access`，不再把审批档回落成 `on_request`。旧的回落会让界面
+/// 显示 `full_access`、实际按更严的档跑，用户看到的档与真正生效的档不一致。
+///
+/// 唯一保留的回落是「环境本身给不了无沙箱执行」：这时配置与能力冲突，
+/// 回落 `on_request` 并留下可播报的说明，指出该改哪一行；不静默放宽，
+/// 也不静默按更严档跑。判据由 [`danger_full_access_available`] 提供，
+/// 与沙箱的 `enforcement_of` 同源，不另立一份「大概能」的清单。
+fn normalize(policy: SessionPolicy, danger_available: bool) -> (SessionPolicy, Option<String>) {
+    if policy.approval != ApprovalMode::FullAccess {
+        return (policy, None);
+    }
+    if danger_available {
+        return (SessionPolicy { sandbox: SandboxMode::DangerFullAccess, ..policy }, None);
+    }
+    (
+        SessionPolicy { approval: ApprovalMode::OnRequest, ..policy },
+        Some(
+            "配置要求 full_access（完全放开），但当前环境无法提供 danger_full_access 无沙箱执行；\
+             已回落 on_request。请把 [approval].mode 改为 on_request，或换到支持 danger_full_access 的环境"
+                .to_string(),
+        ),
+    )
+}
+
+/// 配置两维 → 用户可见的生效两维（与运行时同一口径）。
+///
+/// 界面/档案回显必须用它：直接回显 `config.sandbox.mode` 会在
+/// `full_access` 下显示一个运行时并不使用的沙箱档。
+pub fn effective_pair(sandbox: SandboxMode, approval: ApprovalMode) -> SessionPolicy {
+    normalize(SessionPolicy { approval, sandbox }, danger_full_access_available()).0
 }
 
 /// 一条命令前缀白名单规则（ADR-007③）。`id` 就是规则原文——审计与界面共用，
@@ -551,32 +592,37 @@ mod tests {
         assert_eq!(decide(RiskLevel::PlanReview, ApprovalMode::OnFailure, SandboxMode::WorkspaceWrite, false), Decision::Allow);
     }
 
-    /// `full_access`：前提是 danger 沙箱。前提不满足时 `effective` 回落 on_request，
-    /// 即"允许面收敛"——不是静默放宽。
+    /// `full_access` = 完全放开：danger 沙箱下写/执行/破坏性/计划评审全部放行。
+    /// 只读沙箱仍是沙箱层的硬边界（fail-closed），但归一化会先把该档的沙箱
+    /// 提升为 danger——不再出现「显示 full_access、实际按 on_request 跑」。
     #[test]
-    fn full_access_requires_danger_sandbox() {
+    fn full_access_allows_everything_under_danger_sandbox() {
+        for risk in [
+            RiskLevel::WriteInWorkspace,
+            RiskLevel::Execute,
+            RiskLevel::Destructive,
+            RiskLevel::PlanReview,
+        ] {
+            assert_eq!(
+                decide(risk, ApprovalMode::FullAccess, SandboxMode::DangerFullAccess, false),
+                Decision::Allow,
+                "{risk:?} 在 full_access 下必须放行"
+            );
+        }
+        // 只读沙箱是沙箱层的硬边界：门禁即使放行，执行侧 `prepare_spawn` 仍会拒绝。
         assert_eq!(
-            decide(RiskLevel::WriteInWorkspace, ApprovalMode::FullAccess, SandboxMode::DangerFullAccess, false),
-            Decision::Allow
+            decide(RiskLevel::WriteInWorkspace, ApprovalMode::FullAccess, SandboxMode::ReadOnly, false),
+            Decision::Deny
         );
         assert_eq!(
-            decide(RiskLevel::Destructive, ApprovalMode::FullAccess, SandboxMode::DangerFullAccess, false),
-            Decision::Allow
+            decide(RiskLevel::Execute, ApprovalMode::FullAccess, SandboxMode::ReadOnly, false),
+            Decision::Deny
         );
-        // 前提不满足：`effective` 回落 on_request；workspace-write 下两者都不再询问，
-        // 真正的边界是沙箱（`Destructive` 仍由 on_request 询问，见下一条用例）。
-        assert_eq!(
-            decide(RiskLevel::WriteInWorkspace, ApprovalMode::FullAccess, SandboxMode::WorkspaceWrite, false),
-            Decision::Allow
-        );
-        assert_eq!(
-            decide(RiskLevel::Destructive, ApprovalMode::FullAccess, SandboxMode::WorkspaceWrite, false),
-            Decision::Prompt
-        );
-        let (effective, note) = ApprovalMode::FullAccess.effective(SandboxMode::WorkspaceWrite);
-        assert_eq!(effective, ApprovalMode::OnRequest);
-        assert!(note.expect("应给出回落说明").contains("danger_full_access"));
-        assert_eq!(ApprovalMode::FullAccess.effective(SandboxMode::DangerFullAccess).0, ApprovalMode::FullAccess);
+
+        // 归一化：配置 full_access + 非 danger → 沙箱提升为 danger，审批档保持不变。
+        let normalized = effective_pair(SandboxMode::WorkspaceWrite, ApprovalMode::FullAccess);
+        assert_eq!(normalized.approval, ApprovalMode::FullAccess, "不再回落审批档");
+        assert_eq!(normalized.sandbox, SandboxMode::DangerFullAccess, "沙箱随档完全放开");
     }
 
     #[test]
@@ -643,33 +689,47 @@ mod tests {
         }
     }
 
-    /// SH-120：会话策略句柄的重置与切换——运行中切换只改在当前会话，
-    /// `full_access` 前提不满足时**报错**而不是悄悄降档。
+    /// SH-120：会话策略句柄的重置与切换。
+    ///
+    /// `full_access` 是完整的「完全放开」档：沙箱随档提升为 danger，审批档不降；
+    /// 只有环境给不了无沙箱执行时才回落并留下可播报的冲突说明。
     #[test]
-    fn session_policy_handle_switches_and_resets() {
+    fn session_policy_handle_normalizes_full_access_and_reports_real_conflicts() {
         let handle = SessionPolicyHandle::new(SessionPolicy {
             approval: ApprovalMode::FullAccess,
             sandbox: SandboxMode::WorkspaceWrite,
         });
-        // 构造时就钳制：full_access 前提不满足 → on_request + 说明
-        assert_eq!(handle.snapshot().approval, ApprovalMode::OnRequest);
-        assert!(handle.note().expect("应留下回落说明").contains("full_access"));
+        assert_eq!(handle.snapshot().approval, ApprovalMode::FullAccess, "不再降级审批档");
+        assert_eq!(handle.snapshot().sandbox, SandboxMode::DangerFullAccess, "沙箱随档完全放开");
+        assert!(handle.note().is_none(), "full_access 是完整档，不是冲突");
 
-        assert!(handle.set_approval(ApprovalMode::FullAccess).is_err());
-        assert!(handle.set_approval(ApprovalMode::Never).is_ok());
-        assert_eq!(handle.snapshot().approval, ApprovalMode::Never);
-        assert!(handle.note().is_none());
+        // 运行中切换：切到 full_access 同样把沙箱提升为 danger
+        let switched = SessionPolicyHandle::new(SessionPolicy {
+            approval: ApprovalMode::OnRequest,
+            sandbox: SandboxMode::ReadOnly,
+        });
+        switched.set_approval(ApprovalMode::FullAccess).expect("本环境应能提供 danger_full_access");
+        assert_eq!(switched.snapshot().approval, ApprovalMode::FullAccess);
+        assert_eq!(switched.snapshot().sandbox, SandboxMode::DangerFullAccess);
+        assert!(switched.note().is_none());
+
+        // 环境给不了无沙箱执行：真正的冲突 → 回落 on_request + 指向配置的说明
+        let unavailable = SessionPolicyHandle::new_with_availability(
+            SessionPolicy { approval: ApprovalMode::FullAccess, sandbox: SandboxMode::ReadOnly },
+            false,
+        );
+        assert_eq!(unavailable.snapshot().approval, ApprovalMode::OnRequest);
+        let note = unavailable.note().expect("应留下冲突说明");
+        assert!(
+            note.contains("full_access") && note.contains("[approval].mode"),
+            "说明必须指出改哪一行：{note}"
+        );
 
         // reset 把档位拉回配置，不保留上一任务的选择
-        handle.reset(SessionPolicy { approval: ApprovalMode::OnRequest, sandbox: SandboxMode::WorkspaceWrite });
-        assert_eq!(handle.snapshot().approval, ApprovalMode::OnRequest);
-
-        // danger 沙箱下 full_access 才成立
-        let danger = SessionPolicyHandle::new(SessionPolicy {
-            approval: ApprovalMode::FullAccess,
-            sandbox: SandboxMode::DangerFullAccess,
-        });
-        assert_eq!(danger.snapshot().approval, ApprovalMode::FullAccess);
+        unavailable.reset(SessionPolicy { approval: ApprovalMode::OnRequest, sandbox: SandboxMode::WorkspaceWrite });
+        assert_eq!(unavailable.snapshot().approval, ApprovalMode::OnRequest);
+        assert_eq!(unavailable.snapshot().sandbox, SandboxMode::WorkspaceWrite);
+        assert!(unavailable.note().is_none());
     }
 
     /// SH-120 / ADR-007③：前缀白名单的匹配面。重点不是"能匹配"，而是

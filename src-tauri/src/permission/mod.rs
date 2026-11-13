@@ -203,13 +203,13 @@ impl ApprovalBroker {
                 // 计划评审在预授权档被放行时必须留痕：只写 `tracing::warn` 用户事后翻不到。
                 // 复用 `AllowlistHit`（事件流已有、不扩协议），rule_id 明说「预授权」。
                 if risk == RiskLevel::PlanReview {
-                    let (effective, _) = policy.approval.effective(policy.sandbox);
+                    // 快照已归一化（`full_access` 的沙箱是 danger），直接记录生效两维。
                     let _ = env.sink.emit(&EventMsg::AllowlistHit {
                         tool: tool.to_string(),
                         command: format!(
                             "sandbox={} approval={}",
                             policy.sandbox.as_str(),
-                            effective.as_str()
+                            policy.approval.as_str()
                         ),
                         rule_id: "plan-review:pre-authorized".to_string(),
                     });

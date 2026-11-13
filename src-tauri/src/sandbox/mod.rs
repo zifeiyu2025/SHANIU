@@ -126,6 +126,16 @@ pub fn current_enforcement(mode: SandboxMode) -> SandboxEnforcement {
     enforcement_of(current_os_mode(), mode)
 }
 
+/// 当前环境能否真正提供「无沙箱」执行（`danger_full_access`）。
+///
+/// `full_access` 审批档靠这个判据决定「真放开」还是「环境给不了 → 报冲突」。
+/// 判据与 [`enforcement_of`] 同源：danger 档本身没有边界要强制，三种 OS 模式都算
+/// `full`；将来若有后端对 danger 只能做到 `partial`，这里会自动变成 `false`，
+/// 不需要另立一份「大概能」的能力清单。
+pub fn danger_full_access_available() -> bool {
+    current_enforcement(SandboxMode::DangerFullAccess) == SandboxEnforcement::Full
+}
+
 /// 会真正落下执行副作用的工具：只有它们的输出才需要带上沙箱自报。
 /// 读写文件类工具的结果里塞这行只是噪声，模型也拿它做不了判断。
 const EXEC_TOOLS: &[&str] = &["unified_exec", "terminal"];

@@ -1092,8 +1092,9 @@ pub fn default_allow_prefixes() -> Vec<String> {
 /// - `OnFailure`：沙箱允许的写入/执行不问；只有**沙箱拒绝**导致命令失败时才询问一次
 ///   是否以 full-access 重试（提权必须用户点头，不静默降级）。
 /// - `OnRequest`：写入/执行按风险逐次询问（默认档）。
-/// - `FullAccess`：全部放行且不询问。**前提**是沙箱已是 `danger_full_access`；
-///   前提不满足时回落 `OnRequest`（允许面收敛，不是静默放宽）。
+/// - `FullAccess`：**完全放开**——全部放行且不询问，沙箱随档提升为 `danger_full_access`
+///   （见 `permission::policy::normalize`），不再回落成 `on_request`。只有环境本身
+///   提供不了无沙箱执行时才回落并播报冲突说明。
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum ApprovalMode {
@@ -1116,19 +1117,6 @@ impl ApprovalMode {
             Self::OnFailure => "on_failure",
             Self::OnRequest => "on_request",
             Self::FullAccess => "full_access",
-        }
-    }
-
-    /// 生效档：`full_access` 需要 `danger_full_access` 沙箱作为前提，
-    /// 否则回落到 `on_request` 并返回回落说明（调用方负责播报，不静默）。
-    pub fn effective(self, sandbox: SandboxMode) -> (Self, Option<&'static str>) {
-        if self == Self::FullAccess && sandbox != SandboxMode::DangerFullAccess {
-            (
-                Self::OnRequest,
-                Some("full_access 需要 danger_full_access 沙箱，当前沙箱档不满足，已回落 on_request"),
-            )
-        } else {
-            (self, None)
         }
     }
 }

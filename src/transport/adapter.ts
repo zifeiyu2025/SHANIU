@@ -2054,8 +2054,8 @@ export function createAdapter(options: AdapterOptions): { remote: unknown; dispo
         return
       }
       case 'permission_downgraded':
-        // 配置值没成立、实际按更严的档跑：必须让用户看见「配置值 / 实际生效值」两项，
-        // 只写一句"已降级"等于让人继续以为 full_access 生效了。
+        // 权限档真正冲突：配置要求完全放开、环境给不了，实际按更严的档跑。必须让用户
+        // 看见「配置值 / 实际生效值」两项，只写一句"已降级"等于让人继续以为 full_access 生效了。
         pushEvent(journal, 'developer/message', {
           turn: journal.turn,
           step: journal.step,

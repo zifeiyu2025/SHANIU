@@ -50,7 +50,7 @@ DSH 把权限拆成两个独立旋钮，预设只是两个旋钮的一个**捆�
 | `ask` | `on_request` | 近似：都按风险询问；**差异**是我方 execute 批准一次后会记入会话，DSH 无此记忆 |
 | `never` | `never` | 等价：都不询问，需要审批的操作确定性拒绝（fail-closed） |
 | — | `on_failure` | 本仓扩展（沙箱拒绝后问一次提权），DSH 无对应 |
-| — | `full_access` | 本仓扩展（且要求 danger 沙箱），DSH 无对应；按上轮决定**不进预设** |
+| — | `full_access` | 本仓扩展：**完整的「完全放开」档**（审批全放行 + 沙箱随档提升为 `danger_full_access`），DSH 无对应；按上轮决定**不进预设** |
 
 `decide()` 结果（L=Allow 放行，P=Prompt 询问，D=Deny/Forbidden 拒绝）：
 
@@ -270,6 +270,33 @@ and process visibility are NOT」）。用户若把「只读」理解成「数�
   那是另立需求，不是本账的遗留项。
 
 **残余边界**：§4.1 的硬链接与 TOCTOU 两条不因本轮改动消失，仍按原文记录。
+
+## 10. `full_access` 语义修正（2026-11-13）
+
+**问题**：上一版把 `full_access` 当成「需要 danger 沙箱作为前提」的审批档；前提不满足时
+回落 `on_request`，只播一条 `permission_downgraded`。用户看到 `full_access`，实际按更严的档跑。
+
+**现在的语义**：`full_access` 是完整的「完全放开」档，选中即成立：
+
+- `permission::policy::normalize` 把沙箱提升为 `danger_full_access`，审批档保持 `full_access`；
+- 不再存在「配置 full_access、实际 on_request」的常态；
+- 只有**环境本身给不了无沙箱执行**（`sandbox::danger_full_access_available() == false`）时，
+  才回落 `on_request` 并播报 `permission_downgraded`（真正的冲突），文案指出改 `[approval].mode`
+  或换环境；
+- 设置页回显与档案 `config_snapshot` 一律记**生效**两维（`effective_pair`），不记 raw config；
+- 提升发生时另打一条启动 `tracing::warn`，写明 `[sandbox].mode` 配置值、实际生效值与提升原因。
+  该提示**不复用** `permission_downgraded`：后者只留给「环境给不了 danger」的真冲突。
+
+**参考项目取舍**
+
+- codex：`approval_policy = "never"` 与 `sandbox_mode = "danger-full-access"` 必须同时成立，
+  否则拒绝启动并给出改法（`core/src/config/mod.rs:4407-4410`，旧版）；现行 main 把审批档与
+  沙箱档都过 managed requirements 收窄，冲突进 `startup_warnings`（`config/requirements.rs`）。
+  代价是配置里必须写两处；收益是不会显示与实际不一致。
+- dsh：审批与沙箱是两根正交轴，预设只是捆绑；请求更宽能力时只允许「严格更宽」的升级并
+  走审批，拿不到审批通道就抛错（fail-closed），不静默放宽也不静默收窄。
+- 我方选择：把「完全放开」收敛成一个档（少写一处配置，符合本仓 preset 单一写面），
+  同时保留 dsh 的 fail-closed 与 codex 的「指出改法」，不再用降级解释不一致。
 
 **本文件随第二笔入库**：档位语义的唯一事实源只躺在工作区就等于没有——下一个人改档位时
 不会读到它，也就不会知道自己正在违反一条已批准的裁决。
