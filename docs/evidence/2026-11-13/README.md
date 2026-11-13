@@ -1,10 +1,14 @@
 # 证据 2026-11-13：三面统一走默认档（第三期真机）
 
-本目录是 `docs/16` §11「第三期：三面统一走默认档」的**观测产物**。
-本批只有一组证据：`three-faces-default/`（exec / 交互终端 / MCP server 三面都走
-`restricted_token` 写约束，AppContainer 只作可选档）。
+本目录有两组证据：
 
-## 产生时间与基准提交
+1. `three-faces-default/`：`docs/16` §11「第三期：三面统一走默认档」的观测产物（exec / 交互终端 /
+   MCP server 三面都走 `restricted_token` 写约束，AppContainer 只作可选档）。
+2. `pipe-eprem-probe/`：`docs/16` §10.7 的失败对象定位与 default DACL 对照（令牌级探针，不跑 exe），
+   回答「node `spawnSync` EPERM 到底是哪一条 Win32 调用被拒」。
+
+
+## three-faces-default：产生时间与基准提交
 
 - 产生时间：2026-11-13 00:48–00:49（`drive-final.log` 内的环境快照记为 00:49）。
 - 基准：当时 `HEAD = 57bec6d`，工作树另有 **20 个未提交改动**（同一份环境快照）。
@@ -72,3 +76,12 @@ Test-Path 'C:\Users\jun\shaniu-mcp-escaped.txt'   # 期望 False
 | Ctrl+C 注入 | `docs/16` §11.3 | 功能未实现，属未验证项而非绿灯 | 实现后补一条真机用例，判定「按 `\x03` 后 shell 进程退出」 |
 | AppContainer 可选档在真机上仍可用 | `docs/16` §11.4 | 本批只跑默认档，没有容器档真机日志 | 显式 `os = "app_container"` 跑一次 MCP/终端，并保留日志与 `ancestor-ace.jsonl` |
 | `drive-run3.log` 的失败原因可复现 | `docs/16` §11.5 末段 | 中间失败，仅证明 mock 缺 `WORKSPACE` 时链路会红 | 清空 `WORKSPACE` 再跑 `run-mock.ps1`，观察同一条错误 |
+
+## pipe-eprem-probe：产生时间与内容
+
+- 产生时间：2026-11-13 白天，工作树 `HEAD = a3fab7f`，令牌级探针，不依赖 `shaniu.exe`。
+- 主机：Windows 11 26H2 / 10.0.26300.9818，普通用户（Medium IL），未装 Process Monitor。
+- 内容：`README.md`（方法与矩阵）、`probe.py`（探针）、`run-{none,current,cur_write,dsh,cur_owner}.log`
+  （五种 default DACL 形状的原始输出）、`run-pnpm-exe.log`（工具链本体可跑）。
+- 结论归属：唯一被拒的是**命名管道客户端 `CreateFileA` 的写打开**；`CreateNamedPipeA` 与进程创建都成功；
+  令牌 default DACL 的四种形状都改不动它（详见 `pipe-eprem-probe/README.md`）。

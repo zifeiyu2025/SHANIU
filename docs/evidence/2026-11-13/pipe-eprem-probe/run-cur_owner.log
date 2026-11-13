@@ -1,0 +1,44 @@
+{"set_token_owner": false, "win32_error": 1307}
+{"mode": "cur+owner", "write_sid": "S-1-4-711010719-218466395", "workspace": "C:\\Users\\jun\\AppData\\Local\\Temp\\shaniu-pipe-probe\\ws"}
+PROBE {"step": "token restricted_sid_count", "ok": true, "win32_error": 3}
+PROBE {"step": "pipe DACL (server SDDL)", "ok": true, "win32_error": "D:(A;;FA;;;SY)(A;;FA;;;BA)(A;;FA;;;S-1-5-21-3226398052-62638092-3539548929-1001)(A;;FR;;;WD)(A;;FR;;;AN)"}
+PROBE {"step": "CreateFileA(pipe client, GENERIC_RW|ATTRS|WRITE_DAC)", "ok": false, "win32_error": 5}
+PROBE {"step": "anonymous pipe (CreatePipe, NULL SA) DACL", "ok": true, "win32_error": "D:(A;;FA;;;S-1-5-5-0-675595)(A;;RC;;;OW)"}
+PROBE {"step": "CreateFileA(pipe client, read)", "ok": true, "win32_error": 0}
+PROBE {"step": "CreateFileA(pipe client, write)", "ok": false, "win32_error": 5}
+PROBE {"step": "CreateFileA(pipe client, writedac)", "ok": false, "win32_error": 5}
+PROBE {"step": "CreateFileA(pipe client, readattrs)", "ok": true, "win32_error": 0}
+PROBE {"step": "child probe exit_code", "ok": true, "win32_error": 0}
+<ref *1> node:child_process:1065
+    throw err;
+    ^
+
+Error: spawnSync C:\WINDOWS\system32\cmd.exe EPERM
+    at Object.spawnSync (node:internal/child_process:1175:20)
+    at spawnSync (node:child_process:976:24)
+    at Object.execSync (node:child_process:1057:15)
+    at [eval]:1:26
+    at runScriptInThisContext (node:internal/vm:219:10)
+    at node:internal/process/execution:485:12
+    at [eval]-wrapper:6:24
+    at runScriptInContext (node:internal/process/execution:483:60)
+    at evalFunction (node:internal/process/execution:317:30)
+    at evalTypeScript (node:internal/process/execution:329:3) {
+  errno: -4048,
+  code: 'EPERM',
+  syscall: 'spawnSync C:\\WINDOWS\\system32\\cmd.exe',
+  path: 'C:\\WINDOWS\\system32\\cmd.exe',
+  spawnargs: [ '/d', '/s', '/c', '"cmd /c echo hi"' ],
+  error: [Circular *1],
+  status: null,
+  signal: null,
+  output: null,
+  pid: 0,
+  stdout: undefined,
+  stderr: undefined
+}
+
+Node.js v26.13.1
+PROBE {"step": "node execSync(pipe stdio) exit_code", "ok": false, "win32_error": 1}
+hi
+PROBE {"step": "node execSync(stdio=inherit) exit_code", "ok": true, "win32_error": 0}
