@@ -352,6 +352,28 @@ impl WriteJournal {
         }
     }
 
+    /// 登记一次「别处已经写过」的文件（子代理回传的脏文件）。
+    ///
+    /// 没有 before/after 正文可比对，但文件确实被写过——`changed = true` 是保守且
+    /// 正确的选择：宁可多验证一次，也不能因为父级没看见而漏掉一次编译。
+    /// 断言相关字段保持「未观测」：写日志的另一位消费者是自愈闭环，凭空记
+    /// `weakened = true` 会把子代理的正常编辑误判成「靠改测试变绿」。
+    pub fn record_touch(&self, path: &Path) {
+        let entry = FileWrite {
+            path: canonical_key(path),
+            changed: true,
+            assertion_delta: 0,
+            assertions_touched: false,
+            weakened: false,
+        };
+        let mut entries = self.lock();
+        if let Some(existing) = entries.iter_mut().find(|e| e.path == entry.path) {
+            existing.changed = true;
+        } else {
+            entries.push(entry);
+        }
+    }
+
     /// 取走并清空（消费语义：每次命令结果结算一次，不重复判定）。
     pub fn take(&self) -> Vec<FileWrite> {
         std::mem::take(&mut *self.lock())

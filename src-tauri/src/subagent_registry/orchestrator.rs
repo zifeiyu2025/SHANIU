@@ -127,6 +127,7 @@ fn outcome_from_exit(agent_id: &str, exit: ExitSummary) -> AgentOutcome {
             output_tokens: exit.token_usage.output_tokens,
         }),
         turns: Some(exit.turns),
+        dirty_paths: exit.dirty_paths,
     }
 }
 
@@ -138,5 +139,6 @@ fn pending(agent_id: &str, summary: &str) -> AgentOutcome {
         artifacts: Vec::new(),
         token_usage: None,
         turns: None,
+        dirty_paths: Vec::new(),
     }
 }

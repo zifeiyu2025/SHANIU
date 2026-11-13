@@ -68,6 +68,12 @@ pub struct AgentOutcome {
     /// 父代理要能区分「跑满预算」与「两轮就收敛」。
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub turns: Option<u32>,
+    /// 子代理改过的源码（相对工作区；已验证通过的为空）。
+    ///
+    /// 父级据此把这些写入并入自己的脏状态：子代理写的文件同样是「本任务改过」，
+    /// 父级收口时不能因为自己没动手就跳过写后验证。
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub dirty_paths: Vec<String>,
 }
 
 /// 编排能力：由组合根注入到 `ToolContext`（实现见 `subagent_registry`）。

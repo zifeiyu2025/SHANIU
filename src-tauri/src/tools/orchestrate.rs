@@ -186,6 +186,16 @@ impl ToolExecutor for WaitAgent {
         if ctx.cancel.is_cancelled() {
             return Err(ToolError::Cancelled);
         }
+        // 子代理写过的源码必须并回父级的写日志：父级只看自己的工具调用，
+        // 若这里不登记，就会出现「子代理改了源码、root 没动手 → 收口不验证」。
+        // 路径按相对工作区回传；`join` 在绝对路径上会原样保留，两种都成立。
+        if let Some(journal) = &ctx.writes {
+            for outcome in &outcomes {
+                for path in &outcome.dirty_paths {
+                    journal.record_touch(&ctx.workspace_root.join(path));
+                }
+            }
+        }
         Ok(ToolOutput::ok(serde_json::json!({ "results": outcomes }).to_string()))
     }
 }
@@ -328,6 +338,7 @@ mod tests {
     use crate::config::SandboxMode;
     use crate::events::{EventMsg, EventSink};
     use crate::tool_router::orchestration::{AgentOutcome, AgentOutcomeState, AgentOrchestrator};
+    use crate::tool_router::WriteJournal;
 
     struct DiscardSink;
 
@@ -345,6 +356,7 @@ mod tests {
         allowlists: Mutex<Vec<Option<Vec<String>>>>,
         resumed: Mutex<Vec<(String, Option<String>)>>,
         messages: Mutex<Vec<(String, String)>>,
+        child_dirty_paths: Mutex<Vec<String>>,
     }
 
     #[async_trait]
@@ -387,6 +399,7 @@ mod tests {
                     artifacts: Vec::new(),
                     token_usage: None,
                     turns: Some(3),
+                    dirty_paths: self.child_dirty_paths.lock().unwrap().clone(),
                 })
                 .collect()
         }
@@ -482,6 +495,35 @@ mod tests {
         let json: Value = serde_json::from_str(&output.output).expect("输出必须是 JSON");
         assert_eq!(json["results"].as_array().map(Vec::len), Some(2));
         assert_eq!(json["results"][0]["state"], "done");
+    }
+
+    /// A：子代理改了源码、root 自己没写——`wait_agent` 必须把这些路径登记进
+    /// 父级写日志，否则父级 `dirty.mark` 收不到，收口就不会要求验证。
+    /// 旧行为（只序列化 outcomes、不登记）在这里得到空日志。
+    #[tokio::test]
+    async fn wait_agent_merges_child_dirty_paths_into_parent_journal() {
+        let stub = Arc::new(StubOrchestrator::default());
+        *stub.child_dirty_paths.lock().unwrap() =
+            vec!["src/child.rs".into(), "src-tauri/src/lib.rs".into()];
+        let journal = Arc::new(WriteJournal::new());
+        let ctx = context(stub).with_writes(journal.clone());
+        let tool = WaitAgent::new();
+
+        tool.execute(serde_json::json!({ "agent_ids": ["a"] }), &ctx)
+            .await
+            .expect("wait_agent 应成功");
+
+        let writes = journal.take();
+        assert_eq!(writes.len(), 2, "两个脏文件都要登记，不能只带一个");
+        assert!(writes.iter().all(|write| write.changed), "子代理写过就算变更");
+        let paths: Vec<String> = writes
+            .iter()
+            .map(|write| write.path.to_string_lossy().replace('\\', "/"))
+            .collect();
+        assert!(
+            paths.iter().any(|path| path.ends_with("src/child.rs")),
+            "路径必须能被子代理的脏状态对齐：{paths:?}"
+        );
     }
 
     #[tokio::test]

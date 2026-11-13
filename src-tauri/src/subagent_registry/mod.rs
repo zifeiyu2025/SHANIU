@@ -72,6 +72,10 @@ pub struct ExitSummary {
     /// 预算耗尽与正常完成用同一个字段对比，不能靠猜。
     #[serde(default)]
     pub turns: u32,
+    /// 子代理改过、且收口时仍未通过验证的源码（相对工作区）。
+    /// 父代理收取后必须并回自己的脏状态，否则「子代理改了源码」会被漏验证。
+    #[serde(default)]
+    pub dirty_paths: Vec<String>,
 }
 
 impl ExitSummary {
@@ -81,6 +85,7 @@ impl ExitSummary {
         last_text: Option<&str>,
         token_usage: TokenTotals,
         turns: u32,
+        dirty_paths: Vec<String>,
     ) -> Self {
         let (status, fallback) = match reason {
             TurnEndReason::Completed => (ExitStatus::Done, "子代理已完成，但没有产出文本结果。"),
@@ -95,7 +100,7 @@ impl ExitSummary {
             .filter(|text| !text.is_empty())
             .map(str::to_string)
             .unwrap_or_else(|| fallback.to_string());
-        Self { status, summary, artifacts: Vec::new(), token_usage, turns }
+        Self { status, summary, artifacts: Vec::new(), token_usage, turns, dirty_paths }
     }
 
     /// 取消专用的最小摘要（尚未开始运行就被取消）。
@@ -106,6 +111,7 @@ impl ExitSummary {
             artifacts: Vec::new(),
             token_usage: TokenTotals::default(),
             turns: 0,
+            dirty_paths: Vec::new(),
         }
     }
 
@@ -438,6 +444,7 @@ impl SubagentRegistry {
                 instance.last_assistant_text(),
                 instance.usage,
                 summary.turns,
+                summary.dirty_paths,
             );
             // 历史必须在收口前快照：finish 之后等待方可能立即 resume。
             let history = instance.history.clone();
@@ -964,6 +971,7 @@ mod tests {
             artifacts: vec![],
             token_usage: TokenTotals::default(),
             turns: 1,
+            dirty_paths: vec![],
         };
         let capped = exit.capped();
         assert!(serialized_len(&capped) <= EXIT_SUMMARY_MAX_BYTES);
@@ -975,6 +983,7 @@ mod tests {
             artifacts: vec![],
             token_usage: TokenTotals::default(),
             turns: 1,
+            dirty_paths: vec![],
         };
         assert_eq!(short.clone().capped(), short);
     }

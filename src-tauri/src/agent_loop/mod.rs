@@ -1974,7 +1974,19 @@ impl AgentLoop {
             // 这里就是唯一的诚实出口；收口复查失败则 reason 已被改为 failed。
             unverified: dirty.is_dirty(),
         });
-        TurnSummary { turns: last_turn, reason: reason.into() }
+        // 相对路径给父级用：子代理收口后由 `wait_agent` 登记回父级写日志。
+        // 工作区先规范化，避免 Windows 盘符大小写导致 `strip_prefix` 失败。
+        let workspace_key = crate::tool_router::canonical_key(&self.workspace_root);
+        let dirty_paths = dirty
+            .files()
+            .map(|path| {
+                path.strip_prefix(&workspace_key)
+                    .unwrap_or(path)
+                    .to_string_lossy()
+                    .replace('\\', "/")
+            })
+            .collect();
+        TurnSummary { turns: last_turn, reason: reason.into(), dirty_paths }
     }
 }
 
@@ -2122,10 +2134,13 @@ impl From<TurnEndReasonLocal> for crate::events::TurnEndReason {
     }
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub struct TurnSummary {
     pub turns: u32,
     pub reason: crate::events::TurnEndReason,
+    /// 本任务改过、但收口时仍未通过验证的源码（相对工作区）。
+    /// 子代理收口时带回父级，父级再登记进写日志，让脏状态自然传导。
+    pub dirty_paths: Vec<String>,
 }
 
 // ============================== 采样重试 ==============================
@@ -2755,6 +2770,102 @@ mod tests {
             vec![crate::events::VerifyState::Passed]
         );
         assert!(!completed_unverified(&events), "验证通过后不得标记未验证");
+    }
+
+    /// A：子代理改了源码、root 自己没写。`wait_agent` 把子代理的脏路径并回父级
+    /// 写日志后，父级收口必须照样被要求验证。
+    /// 旧行为（`AgentOutcome` 不带路径、也不登记）下父级脏状态为空，这里会以
+    /// `completed` 收口且 0 次 `VerificationResult`。
+    #[tokio::test]
+    async fn child_writes_are_verified_by_parent_gate() {
+        use crate::tool_router::orchestration::{
+            AgentOrchestrator, AgentOutcome, AgentOutcomeState, AgentScope,
+        };
+
+        struct ChildStub;
+
+        #[async_trait::async_trait]
+        impl AgentOrchestrator for ChildStub {
+            async fn spawn_agent(
+                &self,
+                _parent: &AgentScope,
+                _task: &str,
+                _budget_tokens: Option<u64>,
+                _profile: Option<&str>,
+                _allowed_tools: Option<&[String]>,
+            ) -> Result<String, String> {
+                Err("本用例不派生子代理".into())
+            }
+
+            async fn resume_agent(
+                &self,
+                _parent: &AgentScope,
+                _agent_id: &str,
+                _task: Option<&str>,
+            ) -> Result<String, String> {
+                Err("本用例不续跑子代理".into())
+            }
+
+            async fn wait_agents(
+                &self,
+                agent_ids: &[String],
+                _timeout: std::time::Duration,
+            ) -> Vec<AgentOutcome> {
+                agent_ids
+                    .iter()
+                    .map(|agent_id| AgentOutcome {
+                        agent_id: agent_id.clone(),
+                        state: AgentOutcomeState::Done,
+                        summary: "完成".into(),
+                        artifacts: Vec::new(),
+                        token_usage: None,
+                        turns: Some(2),
+                        dirty_paths: vec!["src/child.rs".into()],
+                    })
+                    .collect()
+            }
+
+            fn send_message(&self, _agent_id: &str, _message: &str) -> Result<(), String> {
+                Err("本用例不注入消息".into())
+            }
+        }
+
+        let (mut agent, store, cancel, _broker) = make_loop(vec![
+            script_call_with("wait_agent", r#"{"agent_ids":["a1"]}"#, "wait-1"),
+            // 最后一轮只用文字收工：此刻才走统一收口闸门。
+            script_text("子代理改完了"),
+        ]);
+        let ws = crate::test_support::TestTempDir::new("child-dirty");
+        let mut router = ToolRouter::new();
+        crate::tools::orchestrate::register(&mut router);
+        agent.router = Arc::new(router);
+        agent.workspace_root = ws.path().to_path_buf();
+        agent.max_turns = 2;
+        agent.verify = crate::config::VerifyConfig {
+            commands: vec!["exit 1".into()],
+            mode: crate::config::VerifyMode::Enforce,
+            ..Default::default()
+        };
+        let summary = agent
+            .run_task_with_orchestrator(
+                "任务",
+                Arc::new(CapturingSink(store.clone())),
+                cancel,
+                Some(Arc::new(ChildStub)),
+            )
+            .await;
+
+        assert_eq!(summary.dirty_paths, vec!["src/child.rs".to_string()]);
+        // 父级自己没有写入，脏文件全部来自子代理；不并回写日志就不会有这次裁决。
+        assert_eq!(
+            verification_states(&store.lock().unwrap()),
+            vec![crate::events::VerifyState::Failed],
+            "子代理改了源码，父级收工必须被要求验证"
+        );
+        assert!(
+            completed_unverified(&store.lock().unwrap()),
+            "验证失败必须如实标记未验证，不能当成已完成"
+        );
     }
 
     /// `warn` 是运行期泄压阀：仍发事件，但不否决、不增加轮次。
