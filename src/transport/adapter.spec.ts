@@ -1726,6 +1726,46 @@ describe('适配层的命令面映射', () => {
     dispose()
   })
 
+  // CI 事实：run 43465798164 的前端测试里，测试桥的 `pending_approvals` 回了 `{}`，
+  // 旧实现把它缓存成「最近快照」，注册审批 UI 时的补派发在微任务里抛
+  // `TypeError: snapshot.approvals is not iterable`，两个文件记未捕获异常、整段判红。
+  it('桥返回 {} 这类非快照载荷时不崩，也不把已弹出的卡当成「已撤销」', async () => {
+    let raw: unknown = pendingSnapshot([SNAP_VIEW], 1)
+    let release: (() => void) | undefined
+    const answered = new Promise<string>((resolve) => { release = () => resolve('rejected') })
+    const bridge = approvalBridge(() => raw as PendingApprovalsSnapshotWire)
+    const { remote, dispose } = createAdapter({ bridge, approvalScope: () => ({ sessionId: 'agent-new' }) })
+    const signals: AbortSignal[] = []
+    const listen = (): void => {
+      faceOf(remote).$on('approval/request', (request: Record<string, unknown>) => {
+        const signal = (request as { signal?: AbortSignal }).signal
+        if (signal !== undefined) signals.push(signal)
+        return answered
+      })
+    }
+
+    listen()
+    await vi.waitFor(() => { expect(signals).toHaveLength(1) })
+    expect(signals[0]?.aborted).toBe(false)
+
+    // 查询通道改回空壳：这次查询没有可用结论，既不能覆盖「最近快照」，也不能撤卡。
+    raw = {}
+    listen()
+    await flush()
+    // 再注册一次：这一轮的补派发读的是「最近快照」——必须仍是上一份合法快照。
+    // 旧实现在这里（queueMicrotask）会抛未捕获的 TypeError。
+    listen()
+    await flush()
+    await flush()
+
+    expect(signals).toHaveLength(1)
+    expect(signals[0]?.aborted).toBe(false)
+    // 卡还挂着等用户回执：不能因为一份空壳载荷就补一条「拒绝」。
+    expect(bridge.calls.some(call => call.command === 'approve')).toBe(false)
+    release?.()
+    dispose()
+  })
+
   it('倒序到达的旧快照不覆盖新状态', async () => {
     let release: (() => void) | undefined
     const answered = new Promise<string>((resolve) => { release = () => resolve('rejected') })

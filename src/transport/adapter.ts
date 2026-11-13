@@ -40,7 +40,7 @@ import type { ActiveTaskView, AgentEvent, CompactionTrigger, EventMsg, SessionEn
 import { archiveImageToPrompt, imageContentBlocks, type PromptImageRef } from './image-ref'
 import type { HostBridge } from './tauri'
 import { startApprovalLease } from './approval-lease'
-import { approvalRequestOf, type PendingApprovalsSnapshotWire } from './pending-approval'
+import { approvalRequestOf, usablePendingSnapshot, type PendingApprovalsSnapshotWire } from './pending-approval'
 
 const OK = <T>(value: T) => ({ ok: true as const, value })
 
@@ -1964,11 +1964,13 @@ export function createAdapter(options: AdapterOptions): { remote: unknown; dispo
 
   /** 重新拉一次快照：审批 UI 注册（或重新注册）时补派发刷新期间的待审批。 */
   const refreshPending = (): void => {
-    void bridge.invoke<PendingApprovalsSnapshotWire | undefined>('pending_approvals')
-      .then((snapshot) => {
-        // 旧宿主/测试桥没有这条命令时返回 undefined：没有快照可重建，等事件即可，
-        // 不能把"查不到"当成"没有待审批"去撤销卡片。
-        if (snapshot === undefined || snapshot === null) return
+    void bridge.invoke<unknown>('pending_approvals')
+      .then((raw) => {
+        // 旧宿主/测试桥没有这条命令时返回 undefined，有的实现会回 `{}` 这类空壳。
+        // 形状不成立一律按「这次查询没有可用结论」处理：既不缓存成快照（否则下次
+        // 补派发会抛 TypeError），也不拿它去撤卡。
+        const snapshot = usablePendingSnapshot(raw)
+        if (snapshot === undefined) return
         // 查询结果只补建、不做删除（可能早于正在到达的实时事件）。
         reconcilePending(snapshot, false)
       })

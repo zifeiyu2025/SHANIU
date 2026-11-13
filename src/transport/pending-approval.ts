@@ -46,6 +46,31 @@ export interface PendingApprovalsSnapshotWire {
 }
 
 /**
+ * 运行时形状判据：载荷是否是一份**可用**的待审批快照。
+ *
+ * 类型只在编译期有效。旧宿主、未注册该命令的实现、测试替身都可能回一个 `{}` 或
+ * 形状不全的对象。把它当快照会同时做两件错事：缓存成「最近快照」，下次补派发时
+ * 抛 `TypeError`；以及把空表误读成「全都撤了」，撤掉刚弹出的卡。所以这里只认形状
+ * 完整的载荷，其余一律按「这次查询/事件没有可用结论」处理：不缓存、不增删卡片。
+ *
+ * 单条只要求 `requestId` / `sessionId` 可用（横幅定位与回执都靠它们）；
+ * `revision` 必须是数字，否则「只前进」的倒序保护会因 `NaN` 比较恒假而失效。
+ */
+export function usablePendingSnapshot(raw: unknown): PendingApprovalsSnapshotWire | undefined {
+  if (raw === null || typeof raw !== 'object') return undefined
+  const candidate = raw as Partial<PendingApprovalsSnapshotWire>
+  if (!Array.isArray(candidate.approvals)) return undefined
+  if (typeof candidate.revision !== 'number' || Number.isNaN(candidate.revision)) return undefined
+  for (const entry of candidate.approvals) {
+    if (entry === null || typeof entry !== 'object') return undefined
+    const view = entry as Partial<PendingApprovalWire>
+    if (typeof view.requestId !== 'string' || view.requestId.length === 0) return undefined
+    if (typeof view.sessionId !== 'string' || view.sessionId.length === 0) return undefined
+  }
+  return candidate as PendingApprovalsSnapshotWire
+}
+
+/**
  * 把快照条目还原成事件流里的审批请求。
  *
  * 刷新后的页面没有 `ExecApprovalRequest` 事件可重放，只能由快照合成一条同形消息，
