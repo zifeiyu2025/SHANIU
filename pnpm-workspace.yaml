@@ -23,3 +23,7 @@ allowBuilds:
 overrides:
   katex: ^0.18.10
   fflate: ^0.8.3
+  # SH-103 / docs/10 D1：@lexical/headless 钉 happy-dom ^20.9.0，20.x 有两条 high
+  # （SSRF/解析不受信 HTML）。本仓只经 @lexical/headless 引入、且不 import 其 /dom
+  # 子路径，dist 无引用；按发布闸门 A5 收敛到修复线，跨主版本由 lexical 用例回归兜底。
+  happy-dom: ^21.0.4
