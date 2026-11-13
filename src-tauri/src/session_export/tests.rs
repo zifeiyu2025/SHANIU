@@ -18,6 +18,17 @@ fn text_entry(path: &str, content: &str) -> ExportEntry {
     }
 }
 
+/// 目标旁边是否还留着导出的临时件：`<目标名>.tmp-<pid>-<seq>`。
+fn temp_remnants(dir: &Path, dest_name: &str) -> Vec<String> {
+    let prefix = format!("{dest_name}.tmp-");
+    std::fs::read_dir(dir)
+        .unwrap()
+        .flatten()
+        .map(|entry| entry.file_name().to_string_lossy().into_owned())
+        .filter(|name| name.starts_with(&prefix))
+        .collect()
+}
+
 #[test]
 fn rejects_path_traversal_and_absolute_paths() {
     // 每条都是真实会被解压器利用或产生歧义的形状。
@@ -67,8 +78,8 @@ fn writes_readable_zip_with_deflate() {
     assert_eq!(report.path, dest.to_string_lossy());
     assert_eq!(report.bytes, fs::metadata(&dest).unwrap().len());
     assert!(
-        !dest.with_file_name("session.v4.zip.part").exists(),
-        "成功后不应残留 .part"
+        temp_remnants(&dir, "session.v4.zip").is_empty(),
+        "成功后不应残留临时件"
     );
 
     let mut archive = zip::ZipArchive::new(File::open(&dest).unwrap()).expect("解压");
@@ -150,7 +161,7 @@ fn refuses_bad_entries_before_touching_disk() {
 
     assert!(!dest.exists(), "任何校验/写入失败都不得留下目标文件");
     assert!(
-        !dir.join("out.zip.part").exists(),
+        temp_remnants(&dir, "out.zip").is_empty(),
         "失败必须清理临时文件"
     );
 

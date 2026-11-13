@@ -187,8 +187,6 @@ pub fn write_zip(dest: &Path, entries: &[ExportEntry]) -> Result<ExportReport, S
     }
 
     let tmp = temp_path(dest);
-    // 上一次失败可能留下 .part；先清掉，避免旧内容混进新归档。
-    let _ = fs::remove_file(&tmp);
 
     let written = encode_zip(&tmp, entries);
     let bytes = match written {
@@ -252,13 +250,15 @@ fn encode_zip(tmp: &Path, entries: &[ExportEntry]) -> Result<u64, String> {
     Ok(bytes)
 }
 
-/// `dest` 同目录下的临时文件名（`session.v4.zip` → `session.v4.zip.part`）。
+/// `dest` 同目录下的唯一临时文件名
+/// （`session.v4.zip` → `session.v4.zip.tmp-<pid>-<seq>`）。
 ///
 /// 同目录而非系统临时目录：跨卷 rename 会退化成 copy，失去"原子替换"的意义。
+/// 唯一名而非固定 `.part`：同一目标被并发导出时，两份 `encode_zip` 不能写同一个
+/// 临时文件，否则先完成的那份会把另一份还没写完的内容 rename 成正式产物。
+/// `encode_zip` 用 `File::create` 截断写入，所以不需要预清理旧临时件。
 fn temp_path(dest: &Path) -> PathBuf {
-    let mut name = dest.file_name().map(|n| n.to_os_string()).unwrap_or_default();
-    name.push(".part");
-    dest.with_file_name(name)
+    crate::config::temp_sibling(dest)
 }
 
 #[cfg(test)]

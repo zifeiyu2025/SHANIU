@@ -1311,7 +1311,11 @@ pub(crate) fn write_backup_file(path: &Path, object: &Path, snapshot: &[u8]) -> 
     blob.extend_from_slice(&(snapshot.len() as u32).to_le_bytes());
     blob.extend_from_slice(snapshot);
 
-    let temp = path.with_extension("tmp");
+    // 唯一临时名：两个进程/工作区同时备份同一对象时不能踩同一个 `.tmp`。
+    //
+    // 临时件的扩展名不再是 BACKUP_EXT，`recover_pending` 只扫 `.dacl`，崩溃残留不会被
+    // 当成待还原备份；最终文件名（`<hash>.dacl`）不变，回滚与还原仍按原路径找得到。
+    let temp = crate::config::temp_sibling(path);
     std::fs::write(&temp, &blob)
         .map_err(|e| format!("写入 ACL 备份临时文件失败（{}）: {e}", temp.display()))?;
     std::fs::rename(&temp, path)
