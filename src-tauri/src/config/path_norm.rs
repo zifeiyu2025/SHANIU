@@ -47,6 +47,16 @@ pub fn strip_verbatim(path: &Path) -> PathBuf {
     }
 }
 
+/// `canonicalize` 成功就展开、失败按字面，再剥 verbatim 前缀。
+///
+/// 展示、指纹与 ACL 键共用这一条口径（`sandbox::acl::normalize`、
+/// `mcp_client::command::normalize` 都走它）。比较用的额外口径——小写、去尾分隔符、
+/// 确保目录存在——仍留在调用点，不在本函数里做。
+pub fn canonical_or_literal(path: &Path) -> PathBuf {
+    let canonical = path.canonicalize().unwrap_or_else(|_| path.to_path_buf());
+    strip_verbatim(&canonical)
+}
+
 /// 沿祖先链找**最深的一个能 canonicalize 的路径**，把剩下的尾部按字面接回去。
 ///
 /// 给"目标尚不存在"的比较用（工作区根判据）：不存在的尾部不能因为 canonicalize
@@ -102,6 +112,30 @@ mod tests {
         assert_eq!(
             strip_verbatim(Path::new(r"\\.\COM1")),
             PathBuf::from(r"\\.\COM1")
+        );
+    }
+
+    /// 已存在就展开并剥 verbatim，不存在就按字面返回（指纹与展示依赖这条）。
+    #[cfg(windows)]
+    #[test]
+    fn canonical_or_literal_expands_existing_and_keeps_missing_literal() {
+        let dir = TestTempDir::new("path-norm-canonical");
+        let existing = dir.join("real");
+        std::fs::create_dir_all(&existing).unwrap();
+
+        let resolved = canonical_or_literal(&existing);
+        assert_eq!(resolved, strip_verbatim(&existing.canonicalize().unwrap()));
+        assert!(
+            !resolved.to_string_lossy().starts_with(r"\\?\"),
+            "verbatim 前缀必须剥掉: {}",
+            resolved.display()
+        );
+
+        let missing = dir.join("not-created").join("file.txt");
+        assert_eq!(
+            canonical_or_literal(&missing),
+            missing,
+            "canonicalize 失败必须按字面返回"
         );
     }
 

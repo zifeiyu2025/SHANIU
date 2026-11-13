@@ -852,17 +852,14 @@ fn sid_to_string(sid: PSID) -> Result<String, String> {
 
 /// `\\?\D:\ws` → `D:\ws`、`\\?\UNC\server\share` → `\\server\share`，并尽量取 canonical 形式。
 ///
-/// 为什么不能只剥 `\\?\` 前缀：UNC 的 verbatim 拼写是 `\\?\UNC\host\share`，剥掉
-/// `\\?\` 后剩下的 `UNC\host\share` 是**相对路径**，会与 `\\host\share` 收敛不到一起。
-/// 前缀规则只有一份，下沉在 `config::path_norm::strip_verbatim`（`config` 是共享
-/// 基础设施，`sandbox` 依赖它不产生反向依赖）；这里只保留"先 canonicalize、
-/// 失败按字面"这一条本地口径。
+/// 实现只有一份，在 `config::path_norm::canonical_or_literal`（`config` 是共享基础
+/// 设施，`sandbox` 依赖它不产生反向依赖）。UNC 的 verbatim 拼写不能只剥 `\\?\`：
+/// 剩下的 `UNC\host\share` 是**相对路径**，会与 `\\host\share` 收敛不到一起。
 ///
 /// `pub(crate)`：写约束模型的身份派生（`sandbox::write_sid`）必须用同一套规范化，
 /// 否则同一目录的两种拼写会派生出两个写 SID（docs/16 §1.2）。
 pub(crate) fn normalize(path: &Path) -> PathBuf {
-    let canonical = std::fs::canonicalize(path).unwrap_or_else(|_| path.to_path_buf());
-    crate::config::path_norm::strip_verbatim(&canonical)
+    crate::config::path_norm::canonical_or_literal(path)
 }
 
 /// 同一路径？两侧都先规范化（`..`、尾斜杠、`\\?\`、junction 会收敛到同一形态），
