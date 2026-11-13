@@ -12,6 +12,7 @@ use std::collections::{BTreeSet, HashMap};
 use std::path::{Path, PathBuf};
 use std::time::{Duration, Instant};
 
+use serde::{Deserialize, Serialize};
 use tokio_util::sync::CancellationToken;
 
 use crate::config::{BaselineMode, VerifyConfig};
@@ -125,6 +126,58 @@ pub struct VerifyOutcome {
     pub diagnostics: Vec<String>,
     /// 原始输出（不序列化）：只给 `observe_verification` 提取诊断用。
     pub output: String,
+}
+
+/// 交给结束前否决点（[`crate::agent_loop::StopHook`]）的验证结论快照。
+///
+/// 字段名与 `verification_result` 事件逐字对齐（`turn` / `state` / `commands` /
+/// `summary` / `diagnostics`），再加一个 `vetoed`：不新造第二套术语，钩子侧读到的
+/// 就是前端事件里看到的那一份。
+///
+/// `vetoed` 不在 [`VerifyOutcome`] 里：额度是宿主账本的事实（否决过一次之后钩子
+/// 仍会拿到同一份结论），所以由构造快照时填写。
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct VerifySnapshot {
+    /// 裁决所属轮次；0 = 本任务还没有可验证的源码写入（合成的 `Skipped`）。
+    pub turn: u32,
+    pub state: VerifyState,
+    pub commands: Vec<String>,
+    pub summary: String,
+    pub diagnostics: Vec<String>,
+    /// 是否已因验证失败被否决过（`VetoLedger::verify_used`）。钩子据此避免重复要同一票。
+    pub vetoed: bool,
+}
+
+impl VerifySnapshot {
+    pub fn from_outcome(outcome: &VerifyOutcome, turn: u32) -> Self {
+        Self {
+            turn,
+            state: outcome.state,
+            commands: outcome.commands.clone(),
+            summary: outcome.summary.clone(),
+            diagnostics: outcome.diagnostics.clone(),
+            vetoed: false,
+        }
+    }
+
+    /// 没有任何源码写入时的合成裁决：`Skipped(NoSourceWrite)` 本来就是这个事实，
+    /// 直接给四态里的那一态，别让钩子去猜「没有快照」是什么意思。
+    pub fn no_source_write() -> Self {
+        Self {
+            turn: 0,
+            state: VerifyState::Skipped(SkipReason::NoSourceWrite),
+            commands: Vec::new(),
+            summary: String::new(),
+            diagnostics: Vec::new(),
+            vetoed: false,
+        }
+    }
+
+    /// 同一份结论 + 当前额度状态。额度会随否决推进，快照本身不会变。
+    pub fn with_vetoed(mut self, vetoed: bool) -> Self {
+        self.vetoed = vetoed;
+        self
+    }
 }
 
 /// 选命令。优先级：显式配置 > 按脏文件就近清单 > `Skipped`。
