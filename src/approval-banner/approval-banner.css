@@ -1,0 +1,123 @@
+/*
+ * 全局待审批横幅（宿主插件样式，`shell.overlay`）。
+ *
+ * 落点：overlay 层顶部，横向通栏；高度只由内容决定（`height: auto`），
+ * 未悬停/未覆盖的区域不拦鼠标——overlay 层的其他成员（退出对话框）仍可正常交互。
+ *
+ * 只引用真实存在的主题令牌（`src/theme-tokens.spec.ts` 会机检）。
+ */
+
+.shaniu-approval-banner {
+  position: absolute;
+  top: 0;
+  left: 0;
+  right: 0;
+  display: flex;
+  flex-direction: column;
+  gap: 4px;
+  padding: 6px 12px 8px;
+  font-size: 12px;
+  line-height: 18px;
+  background: var(--dsw-alias-state-warn-tertiary);
+  border-bottom: 1px solid var(--dsw-alias-state-warn-primary);
+  color: var(--dsw-alias-state-warn-label);
+  box-shadow: 0 4px 12px rgb(0 0 0 / 12%);
+  pointer-events: auto;
+  z-index: 1;
+}
+
+/* 心跳中断：这不是"等一下就好"，用错误档提示后果（TTL 到点按拒绝收口）。 */
+.shaniu-approval-banner[data-attended='false'] {
+  background: var(--dsw-alias-bg-base);
+  border-bottom-color: var(--dsw-alias-state-error-primary);
+  color: var(--dsw-alias-state-error-primary);
+}
+
+.shaniu-approval-banner-head {
+  display: flex;
+  align-items: baseline;
+  gap: 8px;
+  min-width: 0;
+}
+
+.shaniu-approval-banner-title {
+  font-weight: 600;
+  flex: none;
+}
+
+.shaniu-approval-banner-hint {
+  color: var(--dsw-alias-label-secondary);
+  min-width: 0;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.shaniu-approval-banner-list {
+  display: flex;
+  flex-direction: column;
+  gap: 2px;
+  margin: 0;
+  padding: 0;
+  list-style: none;
+}
+
+.shaniu-approval-banner-row {
+  display: flex;
+  align-items: baseline;
+  gap: 8px;
+  width: 100%;
+  padding: 2px 6px;
+  border: 0;
+  border-radius: 4px;
+  background: transparent;
+  color: inherit;
+  font: inherit;
+  text-align: left;
+  cursor: pointer;
+}
+
+.shaniu-approval-banner-row:hover,
+.shaniu-approval-banner-row:focus-visible {
+  background: var(--dsw-alias-bg-layer-1);
+  outline: none;
+}
+
+.shaniu-approval-banner-session {
+  flex: none;
+  max-width: 32ch;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+  color: var(--dsw-alias-label-primary);
+  font-weight: 500;
+}
+
+.shaniu-approval-banner-tool {
+  flex: 1;
+  min-width: 0;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+  color: var(--dsw-alias-label-secondary);
+}
+
+.shaniu-approval-banner-action {
+  flex: none;
+  text-decoration: underline;
+}
+
+.shaniu-approval-banner-more {
+  color: var(--dsw-alias-label-secondary);
+  padding-left: 6px;
+}
+
+/*
+ * 点击后给被聚焦的审批卡描一圈：会话刚切过来时用户未必知道"哪张是刚才点的"。
+ * 只加外框，不改卡片自身的任何布局与状态。
+ */
+.shaniu-approval-focus {
+  outline: 2px solid var(--dsw-alias-state-warn-primary);
+  outline-offset: 2px;
+  border-radius: 6px;
+}

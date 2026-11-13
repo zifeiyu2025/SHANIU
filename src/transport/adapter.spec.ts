@@ -13,6 +13,7 @@ import { PRESET_BUNDLES } from './permission-presets'
 import { registerExportTrigger } from './command-triggers'
 import type { HostBridge } from './tauri'
 import type { AgentEvent, EventMsg } from './types'
+import type { PendingApprovalsSnapshotWire } from './pending-approval'
 
 /** 宿主 `get_settings` 的真实形状（04 §1.3）：服务商文档 + 逐家 hasApiKey。 */
 const HOST_SETTINGS = {
@@ -59,6 +60,8 @@ interface ScriptedBridge extends HostBridge {
     listRunning: boolean
   }
   emit(sessionId: string, msg: EventMsg, agentId?: string, tsMs?: number, eventId?: string): void
+  /** 阶段 3：推送一份待审批快照（模拟 `approval/pending-changed`）。 */
+  pushApproval(snapshot: PendingApprovalsSnapshotWire): void
 }
 
 function scriptedBridge(
@@ -85,10 +88,14 @@ function scriptedBridge(
   sandboxHandler?: (args: Record<string, unknown> | undefined) => unknown,
   /** `send_task` 的宿主替身（throw {code,message} = 类型化失败，如视觉门禁）。 */
   sendTaskHandler?: (args: Record<string, unknown> | undefined) => unknown,
+  /** 阶段 3：`pending_approvals` 的宿主替身（缺省空表 = 没有待审批）。 */
+  approvalSnapshot?: () => PendingApprovalsSnapshotWire,
 ): ScriptedBridge {
   const calls: ScriptedBridge['calls'] = []
   const host: ScriptedBridge['host'] = { active: null, failRuntime: false, listRunning: false }
   const handlers = new Set<(event: AgentEvent) => void>()
+  /** 待审批通道的订阅者（模拟 Tauri 事件 `approval/pending-changed`）。 */
+  const approvalHandlers = new Set<(snapshot: PendingApprovalsSnapshotWire) => void>()
   let counter = 0
   // SH-100 的侧车状态（每份桥独立克隆，避免测试间串味）
   const workspaceFlags = { archived: [] as string[], pinned: [] as string[], order: [] as string[] }
@@ -110,6 +117,14 @@ function scriptedBridge(
     async invoke<T>(command: string, args?: Record<string, unknown>): Promise<T> {
       calls.push({ command, args })
       if (command === 'get_settings') return state as T
+      // 阶段 3：待审批快照（缺省空表）。租约三条命令无返回值。
+      if (command === 'pending_approvals') {
+        return (approvalSnapshot?.() ?? {
+          approvals: [], revision: 0, heartbeatMs: 5000, ttlMs: 15000, attended: true,
+        }) as T
+      }
+      if (command === 'approval_attach' || command === 'approval_detach') return undefined as T
+      if (command === 'approval_heartbeat') return true as T
       if (command === 'workspace_path_applications' || command === 'open_workspace_path' || command === 'list_file_references' || command === 'list_session_references') {
         if (openHandler === undefined) return (command === 'open_workspace_path' ? undefined : []) as T
         return openHandler(command, args) as T
@@ -417,6 +432,13 @@ function scriptedBridge(
     listenEvents(handler) {
       handlers.add(handler)
       return () => handlers.delete(handler)
+    },
+    listenApprovalPending(handler) {
+      approvalHandlers.add(handler)
+      return () => approvalHandlers.delete(handler)
+    },
+    pushApproval(snapshot) {
+      for (const handler of approvalHandlers) handler(snapshot)
     },
     emit(sessionId, msg, agentId = 'root', tsMs = 1_700_000_000_000, eventId) {
       counter += 1
@@ -1598,6 +1620,154 @@ describe('适配层的命令面映射', () => {
     await vi.waitFor(() => {
       expect(bridge.calls.find(call => call.command === 'approve')?.args).toEqual({ requestId: 'r1', decision: 'deny' })
     })
+    dispose()
+  })
+
+  /** 阶段 3：只替换待审批查询，其余宿主面用默认替身。 */
+  function approvalBridge(snapshot: () => PendingApprovalsSnapshotWire): ScriptedBridge {
+    return scriptedBridge(
+      undefined, [], undefined, undefined, undefined, undefined,
+      undefined, undefined, undefined, undefined, undefined, undefined, undefined, snapshot,
+    )
+  }
+
+  /** 一条待审批快照（默认只有一条 `appr-snap`，属于 agent-new）。 */
+  function pendingSnapshot(
+    approvals: PendingApprovalsSnapshotWire['approvals'],
+    revision: number,
+  ): PendingApprovalsSnapshotWire {
+    return { approvals, revision, heartbeatMs: 5000, ttlMs: 15000, attended: true }
+  }
+
+  const SNAP_VIEW: PendingApprovalsSnapshotWire['approvals'][number] = {
+    requestId: 'appr-snap',
+    sessionId: 'agent-new',
+    agentId: 'root',
+    tool: 'unified_exec',
+    risk: 'execute',
+    args: { command: 'git status' },
+    reason: '确认只读命令',
+    callId: 'call-9',
+    taskSummary: null,
+    batchScope: null,
+    createdAtMs: 10,
+  }
+
+  // 阶段 3 的核心承诺：刷新/崩溃后事件流里没有 `ExecApprovalRequest`，
+  // 仍要按后端待审批表把卡重建出来；而且审批 UI 没接上时不能先派发（会立刻被拒）。
+  it('刷新后按待审批快照重建审批卡：UI 注册前只缓存，注册后补派发', async () => {
+    const bridge = approvalBridge(() => pendingSnapshot([SNAP_VIEW], 1))
+    const scope = { sessionId: 'agent-new' }
+    const { remote, dispose } = createAdapter({ bridge, approvalScope: () => scope })
+    const seen: { self: unknown; request: Record<string, unknown>; signal?: AbortSignal }[] = []
+
+    // UI 还没注册：只有查询，没有派发，更没有"没人答"的拒绝回执。
+    await flush()
+    expect(bridge.calls.some(call => call.command === 'pending_approvals')).toBe(true)
+    expect(bridge.calls.some(call => call.command === 'approve')).toBe(false)
+
+    faceOf(remote).$on('approval/request', async function (this: unknown, request: Record<string, unknown>) {
+      seen.push({ self: this, request, signal: (request as { signal?: AbortSignal }).signal })
+      return 'allowed-once'
+    })
+    await vi.waitFor(() => { expect(seen).toHaveLength(1) })
+    // 监听器拿到的是 DSH 声明的载荷（toolName/callId），不是裸事件。
+    expect(seen[0]?.request['toolName']).toBe('unified_exec')
+    expect(seen[0]?.request['callId']).toBe('call-9')
+    // 重建的卡与原路径同一套会话作用域：否则卡会落在错误的会话上。
+    expect(seen[0]?.self).toBe(scope)
+    expect(seen[0]?.signal).toBeInstanceOf(AbortSignal)
+    await vi.waitFor(() => {
+      expect(bridge.calls.find(call => call.command === 'approve')?.args)
+        .toEqual({ requestId: 'appr-snap', decision: 'allow' })
+    })
+    dispose()
+  })
+
+  it('实时事件与刷新快照带来同一条请求时只呈现一张卡', async () => {
+    let release: (() => void) | undefined
+    const answered = new Promise<string>((resolve) => { release = () => resolve('rejected') })
+    const bridge = approvalBridge(() => pendingSnapshot([SNAP_VIEW], 1))
+    const { remote, dispose } = createAdapter({ bridge })
+    let cards = 0
+    faceOf(remote).$on('approval/request', () => { cards += 1; return answered })
+    bridge.emit('agent-new', { type: 'exec_approval_request', request_id: 'appr-snap', tool: 'unified_exec', args: {}, risk: 'execute' })
+    // 同一条请求随后从快照里再来一次：不能弹出第二张卡。
+    bridge.pushApproval(pendingSnapshot([SNAP_VIEW], 1))
+    await flush()
+    await flush()
+    expect(cards).toBe(1)
+    release?.()
+    await vi.waitFor(() => { expect(bridge.calls.some(call => call.command === 'approve')).toBe(true) })
+    dispose()
+  })
+
+  it('快照里消失即撤销卡片：请求已被收口时不留下点了没用的卡', async () => {
+    let release: (() => void) | undefined
+    const answered = new Promise<string>((resolve) => { release = () => resolve('rejected') })
+    const bridge = approvalBridge(() => pendingSnapshot([SNAP_VIEW], 1))
+    const { remote, dispose } = createAdapter({ bridge })
+    const signals: AbortSignal[] = []
+    faceOf(remote).$on('approval/request', async (request: Record<string, unknown>) => {
+      const signal = (request as { signal?: AbortSignal }).signal
+      if (signal !== undefined) signals.push(signal)
+      return answered
+    })
+    bridge.pushApproval(pendingSnapshot([SNAP_VIEW], 1))
+    await vi.waitFor(() => { expect(signals).toHaveLength(1) })
+    expect(signals[0]?.aborted).toBe(false)
+
+    // 后端把这条请求收口了（裁决 / TTL）：快照里没了 → 卡自己退场。
+    bridge.pushApproval(pendingSnapshot([], 2))
+    await vi.waitFor(() => { expect(signals[0]?.aborted).toBe(true) })
+    // 撤销不是"用户拒绝"：不能再补一条回执去覆盖后端已经做出的裁决。
+    expect(bridge.calls.some(call => call.command === 'approve')).toBe(false)
+    release?.()
+    dispose()
+  })
+
+  it('倒序到达的旧快照不覆盖新状态', async () => {
+    let release: (() => void) | undefined
+    const answered = new Promise<string>((resolve) => { release = () => resolve('rejected') })
+    const bridge = approvalBridge(() => pendingSnapshot([SNAP_VIEW], 5))
+    const { remote, dispose } = createAdapter({ bridge })
+    const signals: AbortSignal[] = []
+    faceOf(remote).$on('approval/request', async (request: Record<string, unknown>) => {
+      const signal = (request as { signal?: AbortSignal }).signal
+      if (signal !== undefined) signals.push(signal)
+      return answered
+    })
+    bridge.pushApproval(pendingSnapshot([SNAP_VIEW], 5))
+    await vi.waitFor(() => { expect(signals).toHaveLength(1) })
+    // 旧快照（revision 4）晚到：内容虽然"没有这条"，也不能撤销 revision 5 的卡。
+    bridge.pushApproval(pendingSnapshot([], 4))
+    await flush()
+    await flush()
+    expect(signals[0]?.aborted).toBe(false)
+    release?.()
+    dispose()
+  })
+
+  it('补拉到的快照早于实时事件时不撤掉刚弹出的卡', async () => {
+    // 查询是在某一刻拍下的：它可能不包含"查询发起后才插入、但事件已经先到"的请求。
+    // 拿这样的快照做删除，会把用户眼前刚出现的卡抹掉——删除只认 pending-changed。
+    const bridge = approvalBridge(() => pendingSnapshot([], 0))
+    const { remote, dispose } = createAdapter({ bridge })
+    const signals: AbortSignal[] = []
+    const never = new Promise<string>(() => {})
+    faceOf(remote).$on('approval/request', async (request: Record<string, unknown>) => {
+      const signal = (request as { signal?: AbortSignal }).signal
+      if (signal !== undefined) signals.push(signal)
+      return never
+    })
+    bridge.emit('agent-new', { type: 'exec_approval_request', request_id: 'appr-live', tool: 'unified_exec', args: {}, risk: 'execute' })
+    await vi.waitFor(() => { expect(signals).toHaveLength(1) })
+
+    // 再挂一个监听者会触发补拉（后端此刻返回的是空表）。
+    faceOf(remote).$on('approval/request', async () => never)
+    await flush()
+    await flush()
+    expect(signals[0]?.aborted).toBe(false)
     dispose()
   })
 

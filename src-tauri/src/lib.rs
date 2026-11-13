@@ -2163,17 +2163,88 @@ fn cancel_task(app: tauri::AppHandle) -> Result<(), String> {
     Ok(())
 }
 
-/// 审批回执（approval card → broker）。
+/// 审批回执（approval card → broker）。返回是否命中待审批表：
+/// false = 该 ID 已被裁决或已被租约超时收口，前端据此丢弃过期卡片，不当成错误。
 #[tauri::command]
-fn approve(app: tauri::AppHandle, request_id: String, decision: String) -> Result<(), String> {
+fn approve(app: tauri::AppHandle, request_id: String, decision: String) -> Result<bool, String> {
     let decision = match decision.as_str() {
         "allow" => events::ApprovalDecision::Allow,
         "allow_always" => events::ApprovalDecision::AllowAlways,
         "deny" => events::ApprovalDecision::Deny,
         other => return Err(format!("未知裁决: {other}")),
     };
-    app.state::<AppState>().broker.resolve(&request_id, decision);
-    Ok(())
+    Ok(app.state::<AppState>().broker.resolve(&request_id, decision))
+}
+
+/// 审批观察者租约：页面启动时登记，之后每 5s 心跳续约。
+#[tauri::command]
+fn approval_attach(app: tauri::AppHandle, viewer_id: String) {
+    app.state::<AppState>().broker.attach(&viewer_id);
+}
+
+/// 续约；false = 租约已不存在/已退租，调用方应立即重新 attach。
+#[tauri::command]
+fn approval_heartbeat(app: tauri::AppHandle, viewer_id: String) -> bool {
+    app.state::<AppState>().broker.heartbeat(&viewer_id)
+}
+
+/// 优雅退租：只停止续期，TTL 仍是唯一 fail-closed 权威（刷新场景不能被误杀）。
+#[tauri::command]
+fn approval_detach(app: tauri::AppHandle, viewer_id: String) {
+    app.state::<AppState>().broker.detach(&viewer_id);
+}
+
+/// 待审批快照：刷新后的页面按它重建审批卡，横幅按它显示全局待审批。
+#[tauri::command]
+fn pending_approvals(app: tauri::AppHandle) -> permission::PendingApprovalsSnapshot {
+    app.state::<AppState>().broker.pending_snapshot()
+}
+
+/// 待审批表变化事件：查询与事件共用同一载荷；前端按 revision 丢弃倒序旧快照。
+const APPROVAL_PENDING_CHANGED_EVENT: &str = "approval/pending-changed";
+
+/// 装配审批可达性：租约判据、待审批广播、租约看门狗。
+///
+/// 看门狗每秒跑一次与后端用例完全相同的 `sweep_unattended`：没有心跳就按 Deny 收口，
+/// 并给对应会话补一条 `exec_approval_resolved`（手动裁决的 resolved 仍归 SH-025）。
+fn install_approval_reachability(app: &tauri::AppHandle) {
+    let state = app.state::<AppState>();
+    state.broker.enforce_lease();
+    let emit_handle = app.clone();
+    state.broker.set_pending_changed_listener(Arc::new(move || {
+        let snapshot = emit_handle.state::<AppState>().broker.pending_snapshot();
+        if let Err(error) = tauri::Emitter::emit(&emit_handle, APPROVAL_PENDING_CHANGED_EVENT, snapshot)
+        {
+            tracing::warn!("待审批广播失败: {error}");
+        }
+    }));
+
+    let watchdog = app.clone();
+    tauri::async_runtime::spawn(async move {
+        let interval = std::time::Duration::from_millis(
+            permission::APPROVAL_UNATTENDED_SCAN_INTERVAL_MS,
+        );
+        loop {
+            tokio::time::sleep(interval).await;
+            let expired = watchdog
+                .state::<AppState>()
+                .broker
+                .sweep_unattended(std::time::Instant::now());
+            for view in expired {
+                use events::EventSink as _;
+                let sink = events::TauriEventSink::root(watchdog.clone(), view.session_id.clone());
+                if let Err(error) = sink.emit(&events::EventMsg::ExecApprovalResolved {
+                    request_id: view.request_id.clone(),
+                    decision: events::ApprovalDecision::Deny,
+                }) {
+                    tracing::warn!(
+                        request_id = %view.request_id,
+                        "租约超时裁决补发 resolved 失败: {error}"
+                    );
+                }
+            }
+        }
+    });
 }
 
 /// 保存 API Key（DPAPI 加密落盘，docs §9.1 secrets\）。
@@ -3356,6 +3427,10 @@ pub fn run() {
             insert_workspace_before,
             cancel_task,
             approve,
+            approval_attach,
+            approval_heartbeat,
+            approval_detach,
+            pending_approvals,
             set_session_permission_preset,
             session_permission_preset,
             send_subagent_message,
@@ -3529,6 +3604,8 @@ pub fn run() {
                     app: app.handle().clone(),
                 }));
             }
+            // 审批可达性（阶段 3）：租约并入创建判据 + 待审批广播 + 租约看门狗。
+            install_approval_reachability(app.handle());
             // 延迟显示窗口的兜底（tauri.conf.json 的 visible:false）：前端脚本崩溃、
             // 页面加载失败或就绪信号丢失时，3 秒后强制显示，保证不存在"窗口永不出现"。
             //

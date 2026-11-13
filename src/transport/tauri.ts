@@ -6,11 +6,18 @@
  * 桌面运行时用 `tauriBridge()`——两边共用同一份映射代码，不维护第二套逻辑。
  */
 import type { AgentEvent } from './types'
+import type { PendingApprovalsSnapshotWire } from './pending-approval'
 
 export interface HostBridge {
   invoke<T>(command: string, args?: Record<string, unknown>): Promise<T>
   /** 订阅 `shaniu://event`；返回卸载器。 */
   listenEvents(handler: (event: AgentEvent) => void): () => void
+  /**
+   * 可选：订阅待审批表变化（`approval/pending-changed`）。载荷与 `pending_approvals`
+   * 查询同形；适配层据此重建审批卡，全局横幅据此显示待审批总数。
+   * 测试桥与旧 WS 桥可以不实现，调用方按「没有就不订阅」处理。
+   */
+  listenApprovalPending?(handler: (snapshot: PendingApprovalsSnapshotWire) => void): () => void
   /**
    * 可选：告诉事件通道"这个会话正在被观察"（适配层 follow 入口调用）。
    * WS gateway 据此补订阅；Tauri 全局广播与测试桥无需实现。
@@ -46,6 +53,26 @@ export function tauriBridge(): HostBridge {
         if (closed) off()
       }).catch((reason: unknown) => {
         console.error('[SHANIU] 事件通道订阅失败，会话流不会更新', reason)
+      })
+      return () => {
+        closed = true
+        unlisten?.()
+      }
+    },
+    listenApprovalPending(handler: (snapshot: PendingApprovalsSnapshotWire) => void): () => void {
+      let unlisten: (() => void) | undefined
+      let closed = false
+      // 与 listenEvents 同一套"登记前就卸载"的保护：审批快照通道漏拆会让回调
+      // 指向已卸载的适配层，表现为关掉页面后仍在重建卡片。
+      void import('@tauri-apps/api/event').then(({ listen }) =>
+        listen<PendingApprovalsSnapshotWire>('approval/pending-changed', ({ payload }) => {
+          handler(payload)
+        }),
+      ).then((off) => {
+        unlisten = off
+        if (closed) off()
+      }).catch((reason: unknown) => {
+        console.error('[SHANIU] 待审批通道订阅失败，刷新后可能看不到待审批', reason)
       })
       return () => {
         closed = true

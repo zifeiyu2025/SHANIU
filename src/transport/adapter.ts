@@ -39,6 +39,8 @@ import {
 import type { ActiveTaskView, AgentEvent, CompactionTrigger, EventMsg, SessionEntryLike, SessionListRow, TurnErrorInfo, VerifyState } from './types'
 import { archiveImageToPrompt, imageContentBlocks, type PromptImageRef } from './image-ref'
 import type { HostBridge } from './tauri'
+import { startApprovalLease } from './approval-lease'
+import { approvalRequestOf, type PendingApprovalsSnapshotWire } from './pending-approval'
 
 const OK = <T>(value: T) => ({ ok: true as const, value })
 
@@ -1840,6 +1842,7 @@ export function createAdapter(options: AdapterOptions): { remote: unknown; dispo
   /** 审批：把后端的请求交给 DSH 审批卡，裁决回执只认后端签发过的 request_id。 */
   const requestApproval = async (
     sessionId: string, msg: Extract<EventMsg, { type: 'exec_approval_request' }>,
+    signal?: AbortSignal,
   ): Promise<void> => {
     const listener = approvalListeners[0]
     if (listener === undefined) {
@@ -1882,17 +1885,96 @@ export function createAdapter(options: AdapterOptions): { remote: unknown; dispo
         displayReason: { en: title },
         ...(msg.call_id === undefined ? {} : { callId: msg.call_id }),
         ...(description === undefined ? {} : { description }),
+        // 撤销信号交给 DSH 的 PendingApproval：快照里这条请求消失了，卡片要自己退场，
+        // 而不是留一张点了也没用的卡（点下去只会给一个已被收口的 request_id 回执）。
+        ...(signal === undefined ? {} : { signal }),
       }, next)
       // DSH 的 PendingApproval 只回答 allowed-once / rejected；「本会话记住」需要
       // SH-025 把这档语义接进审批卡，这里不自造第三态。
       decision = outcome === 'allowed-once' ? 'allow' : 'deny'
     } catch (reason) {
+      // 卡片被快照撤销（请求已裁决 / 已被租约 TTL 收口）：不是接线错误，
+      // 也不再回执——那条请求已经不在后端的待审批表里了。
+      if (signal?.aborted === true) return
       // 抛错和"用户点了拒绝"必须分开：静默按拒绝收口会让一次接线错误长得像一次正常否决。
       console.error('[SHANIU] 审批界面处理请求时抛错，本次按拒绝收口', reason)
       decision = 'deny'
     }
     await bridge.invoke('approve', { requestId: msg.request_id, decision })
       .catch((reason: unknown) => { console.error('[SHANIU] 审批回执送不出', reason) })
+  }
+
+  /**
+   * 已呈现在界面上的审批（`request_id → 撤销开关`）。
+   *
+   * 它同时是**去重表**：实时事件与刷新后的快照会带来同一条请求，两个来源都只能
+   * 形成一张卡；谁先到谁呈现，后到的直接跳过。请求从后端待审批表里消失时，
+   * 通过 `abort()` 让卡片退场（`PendingApproval` 监听信号）。
+   */
+  const presentedApprovals = new Map<string, AbortController>()
+  /** 已处理过的快照修订号：倒序到达的旧快照不回头覆盖新状态。 */
+  let pendingRevision = -1
+  /** 最近一次快照：审批 UI 注册得比快照晚时，注册那一刻补派发。 */
+  let latestPending: { snapshot: PendingApprovalsSnapshotWire; allowRemoval: boolean } | undefined
+
+  /** 呈现一条审批（同 `request_id` 只呈现一次）。 */
+  const presentApproval = (
+    sessionId: string,
+    msg: Extract<EventMsg, { type: 'exec_approval_request' }>,
+  ): void => {
+    if (presentedApprovals.has(msg.request_id)) return
+    const controller = new AbortController()
+    presentedApprovals.set(msg.request_id, controller)
+    void requestApproval(sessionId, msg, controller.signal).finally(() => {
+      // 只有仍是自己时才删：撤销路径可能已经先删过，后到的快照又会放进新的一条。
+      if (presentedApprovals.get(msg.request_id) === controller) {
+        presentedApprovals.delete(msg.request_id)
+      }
+    })
+  }
+
+  /**
+   * 按快照重建/撤销审批卡。
+   *
+   * 快照是刷新后唯一的真相来源：页面重启时事件流里没有任何 `ExecApprovalRequest`，
+   * 只有后端待审批表还记得哪些请求挂着。三条纪律：
+   *  - 审批 UI 未注册时**只缓存不派发**：此刻派发会被判成"没人能裁决"而立刻拒绝；
+   *  - `revision` 只允许前进：事件与查询是两条通道，到达顺序不保证；
+   *  - **查询结果只增不删**：查询是在某一刻拍下的，可能早于正在到达的实时事件。
+   *    若拿它做删除，一条刚弹出的卡会被"查询时还不存在"的旧快照撤掉。
+   *    删除只认 `approval/pending-changed`（它是变更发生后才发的）。
+   */
+  const reconcilePending = (snapshot: PendingApprovalsSnapshotWire, allowRemoval: boolean): void => {
+    if (snapshot.revision < pendingRevision) return
+    pendingRevision = snapshot.revision
+    latestPending = { snapshot, allowRemoval }
+    if (approvalListeners.length === 0) return
+    if (allowRemoval) {
+      const alive = new Set(snapshot.approvals.map(view => view.requestId))
+      for (const [requestId, controller] of presentedApprovals) {
+        if (alive.has(requestId)) continue
+        presentedApprovals.delete(requestId)
+        controller.abort(new Error(`审批请求 ${requestId} 已不在待审批表中`))
+      }
+    }
+    for (const view of snapshot.approvals) {
+      presentApproval(view.sessionId, approvalRequestOf(view))
+    }
+  }
+
+  /** 重新拉一次快照：审批 UI 注册（或重新注册）时补派发刷新期间的待审批。 */
+  const refreshPending = (): void => {
+    void bridge.invoke<PendingApprovalsSnapshotWire | undefined>('pending_approvals')
+      .then((snapshot) => {
+        // 旧宿主/测试桥没有这条命令时返回 undefined：没有快照可重建，等事件即可，
+        // 不能把"查不到"当成"没有待审批"去撤销卡片。
+        if (snapshot === undefined || snapshot === null) return
+        // 查询结果只补建、不做删除（可能早于正在到达的实时事件）。
+        reconcilePending(snapshot, false)
+      })
+      .catch((reason: unknown) => {
+        console.warn('[SHANIU] 读取待审批快照失败，刷新后可能看不到待审批', reason)
+      })
   }
 
   /**
@@ -2374,7 +2456,9 @@ export function createAdapter(options: AdapterOptions): { remote: unknown; dispo
       case 'exec_approval_request':
         // 泳道的审批请求按泳道会话作用域派发：审批卡落在该泳道的 composer 上，
         // `this` 绑定泳道会话（上游子代理审批的同款作用域语义；冒泡聚合属 SH-054）。
-        void requestApproval(sessionId, msg)
+        // 走 `presentApproval` 而不是直接调：它按 `request_id` 去重，
+        // 同一条请求随后从刷新快照里再来一次时不会出现第二张卡。
+        presentApproval(sessionId, msg)
         return
       default:
         // exec_approval_resolved / plan_delta / turn_diff：后端当前不产生，客户端无需感知。
@@ -4325,6 +4409,14 @@ export function createAdapter(options: AdapterOptions): { remote: unknown; dispo
       if (event === 'approval/request') {
         const next = listener as (this: unknown, request: Record<string, unknown>, next: () => Promise<never>) => Promise<string>
         approvalListeners.push(next)
+        // 审批 UI 现在才接上：把启动期间缓存/查询到的待审批补派发出去。
+        // 放在微任务里，避免插件在 `$on` 里同步派生事件时重入自己的注册流程。
+        queueMicrotask(() => {
+          if (latestPending !== undefined) {
+            reconcilePending(latestPending.snapshot, latestPending.allowRemoval)
+          }
+          refreshPending()
+        })
         return (): void => {
           const index = approvalListeners.indexOf(next)
           if (index >= 0) approvalListeners.splice(index, 1)
@@ -4439,6 +4531,12 @@ export function createAdapter(options: AdapterOptions): { remote: unknown; dispo
   }
 
   const unlisten = bridge.listenEvents(onEvent)
+  // 待审批表变化：刷新重建与卡片撤销都只认这一条通道。先订阅再查询，
+  // 中间新插入的请求不会既不在查询结果里、也收不到事件。
+  const unlistenPending = bridge.listenApprovalPending?.((snapshot) => { reconcilePending(snapshot, true) })
+  refreshPending()
+  // 租约：页面在，后端才允许挂起等待审批；心跳中断 15s 后宿主统一按无人可答收口。
+  const approvalLease = startApprovalLease(bridge)
   void face.refresh()
   // 单一定时器扫描所有打开回合（每会话按 lastFrameAt 判超时），不是每会话一个定时器。
   const silenceTimer = setInterval(() => { void sweepSilentTurns() }, SILENCE_SCAN_INTERVAL_MS)
@@ -4447,7 +4545,14 @@ export function createAdapter(options: AdapterOptions): { remote: unknown; dispo
     remote,
     dispose() {
       unlisten()
+      unlistenPending?.()
+      approvalLease.dispose()
       clearInterval(silenceTimer)
+      // 适配层卸载后不会再有人处理回执：撤销全部审批卡，别留一张点了没反应的卡。
+      for (const controller of presentedApprovals.values()) {
+        controller.abort(new Error('适配层已卸载'))
+      }
+      presentedApprovals.clear()
     },
   }
 }

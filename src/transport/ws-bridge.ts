@@ -520,5 +520,15 @@ export function createWsBridge(base: HostBridge, options: WsBridgeOptions = {}):
     }
   }
 
-  return { invoke, listenEvents, observeEvents, releaseEvents }
+  return {
+    invoke,
+    listenEvents,
+    observeEvents,
+    releaseEvents,
+    // 待审批走 Tauri 事件通道（不经过 gateway 的会话帧）：它不属于任何一条会话订阅，
+    // 而且是刷新重建卡的唯一来源，不能因为某个会话没订阅就收不到。
+    ...(base.listenApprovalPending === undefined
+      ? {}
+      : { listenApprovalPending: base.listenApprovalPending.bind(base) }),
+  }
 }

@@ -566,6 +566,12 @@ pub trait EventSink: Send + Sync {
         None
     }
 
+    /// 事件归属的会话 id；审批待办表按它定位到具体会话。
+    /// 默认空串：测试替身与无信封出口没有会话概念。
+    fn session_id(&self) -> &str {
+        ""
+    }
+
     /// 审批卡此刻有没有可能被回执。
     ///
     /// 默认 `Ready`：测试替身与无信封出口没有前端概念，维持旧行为（等回执），
@@ -760,6 +766,10 @@ impl TauriEventSink {
 }
 
 impl EventSink for TauriEventSink {
+    fn session_id(&self) -> &str {
+        &self.session_id
+    }
+
     fn scoped(&self, agent_id: &str, parent_id: Option<&str>) -> Option<Arc<dyn EventSink>> {
         Some(Arc::new(TauriEventSink {
             ipc: self.ipc.clone(),

@@ -85,6 +85,7 @@ import { apply as defaultDirApply, inject as defaultDirInject } from './default-
 // 附件占用（A0-7）：通用设置页一行只读统计，只让量级可见，不提供清理。
 import { apply as attachmentUsageApply, inject as attachmentUsageInject } from './attachment-usage'
 import { apply as sandboxStatusApply, inject as sandboxStatusInject } from './sandbox-status'
+import { apply as approvalBannerApply, inject as approvalBannerInject } from './approval-banner'
 import { apply as userTerminalSourceApply, inject as userTerminalSourceInject } from './terminal-source'
 import { apply as trayHintApply, inject as trayHintInject } from './tray-hint'
 import { apply as quitGuardApply, inject as quitGuardInject } from './quit-guard'
@@ -392,6 +393,11 @@ export async function bootShaniu(container: HTMLElement, options: BootOptions = 
     { inject: uiSecretMaskInject, apply: uiSecretMaskApply },
     { inject: uiWorkflowRunInject, apply: uiWorkflowRunApply },
     { inject: uiSidebarDocumentPreviewInject, apply: uiSidebarDocumentPreviewApply },
+    // 全局待审批横幅（阶段 3）：只在桌面真实后端挂——mock 没有待审批事实源，
+    // 挂上只会是一块永远空着的占位。需要在 uiWorkspace（会话切换）之后。
+    ...(realData
+      ? [{ inject: approvalBannerInject, apply: approvalBannerApply } as FeaturePlugin]
+      : []),
     { inject: uiApprovalInject, apply: uiApprovalApply },
     { inject: uiToolInject, apply: uiToolApply },
     { inject: uiTrajectoryInject, apply: uiTrajectoryApply },
