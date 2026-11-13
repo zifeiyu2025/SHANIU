@@ -20,7 +20,7 @@ pub mod verify;
 use std::path::PathBuf;
 use std::sync::Arc;
 
-use futures::StreamExt;
+use futures::{FutureExt, StreamExt};
 use tokio_util::sync::CancellationToken;
 
 use crate::clock::now_ms;
@@ -90,32 +90,63 @@ pub struct StopContext<'a> {
     pub turn: u32,
     /// 计划态是否仍然开启（模型可能忘了 `exit_plan_mode`）。
     pub plan_active: bool,
+    /// 计划态那一票是否已经用掉。钩子据此避免用同一个理由每轮反复否决。
+    pub plan_veto_used: bool,
+    /// 工作目录。钩子要跑自己的检查时以它为根（对齐 codex stop hook 的 `cwd` 入参）。
+    pub cwd: &'a std::path::Path,
+    /// 本任务最近一次写后验证裁决（字段与 `verification_result` 事件同名）。
+    ///
+    /// `None` = 闸门关着（`[verify].enabled = false`）或本代还没裁决过；没有源码写入时
+    /// 给的是合成的 `Skipped(NoSourceWrite)`，仍是四态之一，不需要钩子去猜。
+    pub verify: Option<verify::VerifySnapshot>,
+}
+
+/// 结束前否决点的裁决。
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum StopVerdict {
+    /// 放行：宿主按既有规则收工。
+    Allow,
+    /// 阻止收工：理由作为独立 `Role::System` 条目注入历史后继续本回合。
+    Block(String),
+    /// **无裁决**：钩子超时 / panic / 给了空理由。宿主按放行处理并留痕。
+    ///
+    /// 刻意不 fail-closed：钩子是宿主扩展点，写坏一个钩子不该让用户等不到结果。
+    NoVerdict(&'static str),
 }
 
 /// 结束前否决点（对齐 codex `turn.rs:824-842` 的 stop hook 语义）。
 ///
-/// 返回 `Some(提醒)` 表示**先别结束**：提醒作为独立 `Role::System` 条目注入历史后
-/// 再跑一轮；返回 `None` 表示允许结束。
+/// 返回 `Block(提醒)` 表示**先别结束**：提醒作为独立 `Role::System` 条目注入历史后
+/// 再跑一轮；返回 `Allow` 表示允许结束。
 ///
 /// 为什么必须由宿主判定：模型文本里的「已完成」只是文本，不能终止循环
 /// （SH-121① 已保证「只有派发了工具调用才继续」）。否决点是反向的同一个原则——
-/// 「只有宿主说可以停，才停」。每次任务最多否决一次，避免变成无限续跑。
+/// 「只有宿主说可以停，才停」。
+///
+/// **实现契约**：`before_stop` 必须是异步友好的（真实 IO 走 `await`）。宿主只保证
+/// 在 await 点收割超时（[`STOP_HOOK_TIMEOUT`]），同步阻塞的实现会占住 worker 线程——
+/// 这是进程内钩子，没有外部进程可杀，契约写清楚比假装能强杀更诚实。
+#[async_trait::async_trait]
 pub trait StopHook: Send + Sync {
-    fn before_stop(&self, ctx: StopContext<'_>) -> Option<String>;
+    async fn before_stop(&self, ctx: StopContext<'_>) -> StopVerdict;
 }
 
 /// 默认否决点：计划态还开着、模型却只用文字收尾。
 ///
 /// 这时循环继续一轮并提示提交计划——否则用户看到的是「计划态静默悬空」，
 /// 下一轮对话又回到计划态，白烧一次往返。
+///
+/// 计划那一票每任务只有一次（`plan_veto_used` 由宿主置位）：否则计划一直不退出时，
+/// 每一轮收尾都会被同一句话拦下，把回合变成死循环。
 struct PlanModeStopHook;
 
+#[async_trait::async_trait]
 impl StopHook for PlanModeStopHook {
-    fn before_stop(&self, ctx: StopContext<'_>) -> Option<String> {
-        if !ctx.plan_active {
-            return None;
+    async fn before_stop(&self, ctx: StopContext<'_>) -> StopVerdict {
+        if !ctx.plan_active || ctx.plan_veto_used {
+            return StopVerdict::Allow;
         }
-        Some(
+        StopVerdict::Block(
             "宿主检查：计划态仍未退出，而本轮没有调用任何工具。\
              如果计划已成形，请调用 exit_plan_mode 提交；否则继续执行当前步骤，不要只用文字结束。"
                 .to_string(),
@@ -123,7 +154,21 @@ impl StopHook for PlanModeStopHook {
     }
 }
 
-/// 结束前否决额度（方案 C）：计划 1 次 + 验证 1 次，硬顶 2。
+/// 停止钩子连续阻止收工的上限（ZCode 硬顶 3 次；dsh 在 `agent/turn-stopping` 上
+/// 留了 TODO 没做，见 `src/dsh/packages/core/agent-loop/README.md:220`）。
+///
+/// 达到上限后只把钩子的理由披露出去、不再注入历史，避免钩子写错把回合变成死循环。
+/// 上限写死成常量而不是配置项：它是防死循环的安全阀，不是一个可调参数；
+/// 放开成配置等于允许把「一回合」调成无限续跑。
+pub const MAX_CONSECUTIVE_STOP_BLOCKS: u32 = 3;
+
+/// 停止钩子的单次裁决时限。
+///
+/// 超时按「无裁决」放行并留痕：钩子异常不得让用户等不到结果。10 秒足够覆盖一次
+/// 本地判据检查（读文件 / 查状态），又不会让用户盯着转圈。
+const STOP_HOOK_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(10);
+
+/// 结束前否决额度（方案 C）：计划 1 次 + 验证 1 次，硬顶 2；钩子另有连续上限。
 ///
 /// 为什么不把「防循环」交给被调用的钩子（codex 的 `stop_hook_active` 做法）：
 /// 本闸门是宿主内建逻辑，不是第三方脚本；硬顶写在宿主才不会被一次配置失误
@@ -132,6 +177,53 @@ impl StopHook for PlanModeStopHook {
 struct VetoLedger {
     plan_used: bool,
     verify_used: bool,
+    /// 停止钩子连续阻止收工的次数（`Allow` / 无裁决不计数，见 [`MAX_CONSECUTIVE_STOP_BLOCKS`]）。
+    hook_blocks: u32,
+}
+
+/// 问一次停止钩子：超时 / panic / 空理由统一收敛成 [`StopVerdict::NoVerdict`]。
+///
+/// 没有钩子（`None`）时返回 `Allow`——「没有配置钩子」与「钩子放行」对宿主等价，
+/// 因此装配层不注入钩子的路径行为与改动前完全一致。
+async fn ask_stop_hook(
+    hook: Option<&Arc<dyn StopHook>>,
+    ctx: StopContext<'_>,
+    cancel: &CancellationToken,
+) -> StopVerdict {
+    let Some(hook) = hook else { return StopVerdict::Allow };
+    // panic 不能把整棵回合带崩：钩子是外部判定，宿主只采纳它的结论。
+    let call = std::panic::AssertUnwindSafe(hook.before_stop(ctx)).catch_unwind();
+    let verdict = tokio::select! {
+        // 用户已经按停：立刻放行，不要为了等一个钩子再转十秒。
+        biased;
+        _ = cancel.cancelled() => return StopVerdict::NoVerdict("cancelled"),
+        outcome = tokio::time::timeout(STOP_HOOK_TIMEOUT, call) => match outcome {
+            Ok(Ok(verdict)) => verdict,
+            Ok(Err(_panic)) => StopVerdict::NoVerdict("panic"),
+            Err(_elapsed) => StopVerdict::NoVerdict("timeout"),
+        },
+    };
+    match verdict {
+        // 空理由等于没给理由：注入空提醒只会白烧一轮。
+        StopVerdict::Block(reason) if reason.trim().is_empty() => {
+            StopVerdict::NoVerdict("empty_reason")
+        }
+        other => other,
+    }
+}
+
+/// 交给钩子的验证视图：没有裁决但有脏源码时返回 `None`（闸门关着），
+/// 没有脏源码时给合成的 `Skipped(NoSourceWrite)`——那是四态里的具名事实，不是编造。
+fn stop_verify_view(
+    last: Option<&verify::VerifySnapshot>,
+    dirty: bool,
+    vetoed: bool,
+) -> Option<verify::VerifySnapshot> {
+    match last {
+        Some(snapshot) => Some(snapshot.clone().with_vetoed(vetoed)),
+        None if !dirty => Some(verify::VerifySnapshot::no_source_write().with_vetoed(vetoed)),
+        None => None,
+    }
 }
 
 /// 评测消融开关（与 `SHANIU_EVAL_ABLATE_AR6` / `SHANIU_EVAL_ABLATE_REPAIR` 同口径）：
@@ -696,6 +788,9 @@ impl AgentLoop {
         // 两个槽位分开记，是为了让「计划态还没退出」与「代码还没验证」各自只消费
         // 自己的额度：计划态否决之后，验证闸门仍然有票；反过来也成立。
         let mut veto_ledger = VetoLedger::default();
+        // 本任务最近一次验证裁决。停止钩子要看到「本回合的结论」，而结论可能来自
+        // 本轮的②、前一轮的闸门，或末轮收口——都收在这一处，不另算一份。
+        let mut last_verify: Option<verify::VerifySnapshot> = None;
         // 写后验证的脏状态：只由「真的落盘且内容变了」的源码写入置脏。
         // 审批被拒的写入根本到不了写日志（工具不执行、不登记），因此天然不置脏。
         let mut dirty = verify::DirtyTracker::default();
@@ -1225,35 +1320,68 @@ impl AgentLoop {
             } else {
                 Some(std::mem::take(&mut reasoning_text))
             };
-            // 结束前否决点（SH-121② + 写后验证）：先算再入历史——`text` 之后会被 move。
-            // 只在「确实要结束」且预算还够再跑一轮时询问。计划优先、验证次之，
-            // 两者各最多一次（硬顶 2）；`turn + 1 < max_turns` 保证否决后还有一轮可用。
+            // 结束前否决点（SH-121② + 写后验证 + 停止钩子）：先算再入历史——`text` 之后会被 move。
+            // 顺序固定，且只在「确实要结束」且预算还够再跑一轮时询问：
+            //   ① 计划态（既有优先级：这一轮不跑验证，脏状态留到下一轮）
+            //   ② 写后验证闸门（每任务一次额度）
+            //   ③ 停止钩子（拿着②的裁决再问一次，理由并入同一条提醒）
+            // `turn + 1 < max_turns` 保证否决后还有一轮可用。
             let can_veto = turn + 1 < self.max_turns;
-            let plan_veto = if calls.is_empty() && can_veto && !veto_ledger.plan_used {
-                self.stop_hook.as_ref().and_then(|hook| {
-                    hook.before_stop(StopContext {
-                        history,
-                        last_text: &text,
-                        turn,
-                        plan_active: self.plan_state.is_active_for(session_id.as_deref()),
-                    })
-                })
+            let plan_active = self.plan_state.is_active_for(session_id.as_deref());
+            // 收尾文本要量两次（计划态、钩子），`text` 之后 move 进历史，先留一份。
+            // 只有「可能否决」的收尾才复制，普通回合不多花一次分配。
+            let closing_text = if calls.is_empty() && can_veto {
+                text.clone()
             } else {
-                None
+                String::new()
             };
-            if plan_veto.is_some() {
-                veto_ledger.plan_used = true;
+            let mut stop_reminders: Vec<String> = Vec::new();
+            let mut stop_disclosure: Option<String> = None;
+            let mut plan_vetoed = false;
+
+            if calls.is_empty() && can_veto && plan_active && !veto_ledger.plan_used {
+                // ① 计划态否决优先：这一轮不跑验证，脏状态留到下一轮（既有语义）。
+                // 钩子此时拿到的是本任务**已有**的裁决——本轮还没跑，不能编一份新的。
+                match ask_stop_hook(
+                    self.stop_hook.as_ref(),
+                    StopContext {
+                        history,
+                        last_text: &closing_text,
+                        turn,
+                        plan_active,
+                        plan_veto_used: false,
+                        cwd: &self.workspace_root,
+                        verify: stop_verify_view(
+                            last_verify.as_ref(),
+                            dirty.is_dirty(),
+                            veto_ledger.verify_used,
+                        ),
+                    },
+                    cancel,
+                )
+                .await
+                {
+                    StopVerdict::Block(reason) => {
+                        veto_ledger.plan_used = true;
+                        plan_vetoed = true;
+                        stop_reminders.push(reason);
+                    }
+                    StopVerdict::Allow => {}
+                    StopVerdict::NoVerdict(code) => {
+                        tracing::warn!(turn, code, "停止钩子未给出可用裁决，按无裁决放行（不阻断收工）");
+                    }
+                }
             }
+
             if !text.trim().is_empty() || reasoning.is_some() {
                 history.push(HistoryItem::Message { role: Role::Assistant, text, reasoning });
             }
 
             // 4) 无工具调用 → 结束前否决点放行/否决
             if calls.is_empty() {
-                let mut reminder = plan_veto;
-                // 计划态否决优先：这一轮不跑验证，脏状态留到下一轮。
+                // ② 写后验证闸门：计划态否决优先（这一轮不跑验证，脏状态留到下一轮）。
                 // 否则「计划提醒」会吃掉验证额度，形成饥饿。
-                if reminder.is_none()
+                if stop_reminders.is_empty()
                     && can_veto
                     && verify_enabled
                     && dirty.is_dirty()
@@ -1290,6 +1418,8 @@ impl AgentLoop {
                             diagnostics: outcome.diagnostics.clone(),
                         },
                     );
+                    // 本任务最近一次裁决：③ 与后续轮次的钩子读的就是这一份。
+                    last_verify = Some(verify::VerifySnapshot::from_outcome(&outcome, turn));
                     match outcome.state {
                         crate::events::VerifyState::Passed => {
                             if repair_enabled {
@@ -1343,7 +1473,7 @@ impl AgentLoop {
                                 };
                                 // 这次失败之前的写入属于「修复前」，不能算到下一轮修复头上。
                                 pending_writes.clear();
-                                reminder = Some(verify::reminder_text(&outcome, note.as_deref()));
+                                stop_reminders.push(verify::reminder_text(&outcome, note.as_deref()));
                                 veto_ledger.verify_used = true;
                             }
                         }
@@ -1352,18 +1482,75 @@ impl AgentLoop {
                         | crate::events::VerifyState::Skipped(_) => {}
                     }
                 }
-                match reminder {
-                    Some(reminder) => {
-                        // 独立 System 条目：不伪装成工具结果、不冒充用户消息。
-                        history.push(HistoryItem::Message {
-                            role: Role::System,
-                            text: reminder,
-                            reasoning: None,
-                        });
-                        continue;
+                // ③ 停止钩子：带着②刚产出的裁决（或本任务最近一份）再问一次。
+                // 钩子与闸门同时否决时只续跑一轮、两条理由一起注入，不重复烧轮次。
+                // 计划态已经否决过就不再问：同一句话不该在一轮里出现两次。
+                if can_veto && !plan_vetoed {
+                    let verdict = ask_stop_hook(
+                        self.stop_hook.as_ref(),
+                        StopContext {
+                            history,
+                            last_text: &closing_text,
+                            turn,
+                            plan_active,
+                            plan_veto_used: veto_ledger.plan_used,
+                            cwd: &self.workspace_root,
+                            verify: stop_verify_view(
+                                last_verify.as_ref(),
+                                dirty.is_dirty(),
+                                veto_ledger.verify_used,
+                            ),
+                        },
+                        cancel,
+                    )
+                    .await;
+                    match verdict {
+                        StopVerdict::Block(reason) => {
+                            if veto_ledger.hook_blocks < MAX_CONSECUTIVE_STOP_BLOCKS {
+                                veto_ledger.hook_blocks += 1;
+                                stop_reminders.push(reason);
+                            } else {
+                                // 达到硬顶：只披露不阻断。理由留给用户，不再注入历史继续本回合——
+                                // 钩子写错不能把回合变成死循环。
+                                tracing::warn!(
+                                    turn,
+                                    blocks = veto_ledger.hook_blocks,
+                                    "停止钩子连续阻止收工已达硬顶，本轮只披露不阻断"
+                                );
+                                stop_disclosure = Some(format!(
+                                    "停止钩子连续 {MAX_CONSECUTIVE_STOP_BLOCKS} 次阻止收工，已达硬顶；\
+                                     钩子这一票不再续跑（本轮是否继续由宿主闸门决定）。钩子给的理由：{reason}"
+                                ));
+                            }
+                        }
+                        StopVerdict::Allow => {}
+                        StopVerdict::NoVerdict(code) => {
+                            tracing::warn!(
+                                turn,
+                                code,
+                                "停止钩子未给出可用裁决，按无裁决放行（不阻断收工）"
+                            );
+                        }
                     }
-                    None => break,
                 }
+                // 披露也走独立 System 条目：续跑或收工，用户都能看到「为什么没继续」。
+                if let Some(disclosure) = stop_disclosure {
+                    history.push(HistoryItem::Message {
+                        role: Role::System,
+                        text: disclosure,
+                        reasoning: None,
+                    });
+                }
+                if stop_reminders.is_empty() {
+                    break;
+                }
+                // 独立 System 条目：不伪装成工具结果、不冒充用户消息。
+                history.push(HistoryItem::Message {
+                    role: Role::System,
+                    text: stop_reminders.join("\n\n"),
+                    reasoning: None,
+                });
+                continue;
             }
 
             // 5) 本轮已到预算上限：不在这里 break。先让本轮已声明的工具照常执行，
@@ -2505,18 +2692,23 @@ mod tests {
         assert_eq!(tags, ["turn_started", "system_prompt", "delta", "usage", "turn_completed"]);
     }
 
-    /// 结束前否决点：始终否决的钩子也只能再要一轮（每次任务上限一次），
-    /// 且提醒以 `Role::System` 注入——不冒充用户消息，也不伪装成工具结果。
+    /// 停止钩子连续阻止收工有硬顶：ZCode 硬顶 3 次，我们同样写死 3 次
+    /// （[`MAX_CONSECUTIVE_STOP_BLOCKS`]）。第 4 次只披露、不阻断——钩子写错
+    /// 不能把回合变成死循环。
+    ///
+    /// 反向对照：把 `MAX_CONSECUTIVE_STOP_BLOCKS` 调大（或去掉 `hook_blocks` 判断），
+    /// 回合会一路跑到脚本用尽，`turns` 不会是 4。
     #[tokio::test]
-    async fn stop_hook_vetoes_at_most_once_then_allows_completion() {
+    async fn stop_hook_pushes_at_most_three_times_then_discloses_only() {
         struct AlwaysVeto {
             calls: Mutex<u32>,
         }
+        #[async_trait::async_trait]
         impl StopHook for AlwaysVeto {
-            fn before_stop(&self, ctx: StopContext<'_>) -> Option<String> {
+            async fn before_stop(&self, ctx: StopContext<'_>) -> StopVerdict {
                 *self.calls.lock().unwrap() += 1;
                 assert!(ctx.last_text.contains("完成"), "否决点应看到模型收尾文本");
-                Some("宿主提醒：还有未完成的步骤。".into())
+                StopVerdict::Block("宿主提醒：还有未完成的步骤。".into())
             }
         }
 
@@ -2524,15 +2716,40 @@ mod tests {
             vec![ModelStreamEvent::OutputTextDelta { delta: "完成".into() }, usage_ev()],
             vec![ModelStreamEvent::OutputTextDelta { delta: "完成".into() }, usage_ev()],
             vec![ModelStreamEvent::OutputTextDelta { delta: "完成".into() }, usage_ev()],
+            vec![ModelStreamEvent::OutputTextDelta { delta: "完成".into() }, usage_ev()],
+            vec![ModelStreamEvent::OutputTextDelta { delta: "完成".into() }, usage_ev()],
+            vec![ModelStreamEvent::OutputTextDelta { delta: "完成".into() }, usage_ev()],
         ]);
+        agent.max_turns = 10;
         let hook = Arc::new(AlwaysVeto { calls: Mutex::new(0) });
         agent.stop_hook = Some(hook.clone() as Arc<dyn StopHook>);
-        let summary = agent.run_task("任务", Arc::new(CapturingSink(store)), cancel).await;
+        // 披露落在历史里，历史落档案：接一个写入器，从落档内容里读。
+        let dir = std::env::temp_dir().join(format!("shaniu-stop-hook-cap-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let meta = crate::rollout::RolloutItem::SessionMeta {
+            session_id: "session".into(),
+            agent_id: "agent".into(),
+            parent_id: None,
+            created_at: 0,
+            config_snapshot: crate::rollout::ConfigSnapshot::default(),
+        };
+        let writer = Arc::new(crate::rollout::RolloutWriter::create(&dir, &meta).unwrap());
+        agent.rollout = Some(writer.clone());
 
-        // 一次否决 → 再跑一轮；第二次想否决时 `stop_vetoed` 已置位，必须放行。
-        assert_eq!(summary.turns, 2);
-        assert_eq!(summary.reason, TurnEndReason::Completed);
-        assert_eq!(*hook.calls.lock().unwrap(), 1);
+        let summary = agent
+            .run_task("任务", Arc::new(CapturingSink(store.clone())), cancel)
+            .await;
+
+        assert_eq!(summary.turns, 4, "三轮强推 + 第 4 次只披露");
+        assert_eq!(summary.reason, TurnEndReason::Completed, "达到硬顶后必须如实收工");
+        assert_eq!(*hook.calls.lock().unwrap(), 4);
+        let archived = std::fs::read_to_string(writer.path()).unwrap();
+        assert!(
+            archived.contains("已达硬顶"),
+            "达到上限后必须把钩子的理由披露出来：{archived}"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     /// 没有钩子时必须一轮结束——否决点不能让既有「文本即完成」的路径多跑。
@@ -2547,18 +2764,29 @@ mod tests {
         assert_eq!(summary.reason, TurnEndReason::Completed);
     }
 
-    /// 默认钩子只对「计划态悬空」开口：正常收尾不得被拦。
-    #[test]
-    fn plan_mode_stop_hook_only_vetoes_when_plan_is_active() {
+    /// 默认钩子只对「计划态悬空」开口：正常收尾不得被拦；计划那票用掉后也不得再拦。
+    #[tokio::test]
+    async fn plan_mode_stop_hook_only_vetoes_when_plan_is_active() {
         let history: Vec<HistoryItem> = Vec::new();
-        let ctx = |plan_active| StopContext {
+        let ctx = |plan_active, plan_veto_used| StopContext {
             history: &history,
             last_text: "完成",
             turn: 1,
             plan_active,
+            plan_veto_used,
+            cwd: std::path::Path::new("."),
+            verify: None,
         };
-        assert!(PlanModeStopHook.before_stop(ctx(true)).is_some());
-        assert!(PlanModeStopHook.before_stop(ctx(false)).is_none());
+        assert!(matches!(
+            PlanModeStopHook.before_stop(ctx(true, false)).await,
+            StopVerdict::Block(_)
+        ));
+        assert_eq!(PlanModeStopHook.before_stop(ctx(false, false)).await, StopVerdict::Allow);
+        assert_eq!(
+            PlanModeStopHook.before_stop(ctx(true, true)).await,
+            StopVerdict::Allow,
+            "计划槽位用掉之后不得用同一句话再拦"
+        );
     }
 
     // ---- 写后验证闸门（design.md / spec.md） ----
@@ -2570,11 +2798,16 @@ mod tests {
     /// 因此同一个工具就能演「模型自己修好了」的回合。
     struct FakeWriter {
         spec: ToolSpec,
+        /// 写完之后激活计划态：模拟「写到一半切进规划」，用来验计划票与验证票互不饿死。
+        activate_plan: Option<Arc<PlanState>>,
     }
 
     impl Default for FakeWriter {
         fn default() -> Self {
-            Self { spec: ToolSpec::new("apply_patch", "假写入", serde_json::json!({"type":"object"})) }
+            Self {
+                spec: ToolSpec::new("apply_patch", "假写入", serde_json::json!({"type":"object"})),
+                activate_plan: None,
+            }
         }
     }
 
@@ -2594,6 +2827,9 @@ mod tests {
             std::fs::write(&path, body).map_err(|e| ToolError::Execution(e.to_string()))?;
             if let Some(journal) = &ctx.writes {
                 journal.record(&path, before.as_deref(), Some(body));
+            }
+            if let Some(plan) = &self.activate_plan {
+                plan.activate();
             }
             Ok(ToolOutput::ok("written"))
         }
@@ -3040,28 +3276,45 @@ mod tests {
     async fn verification_gate_does_not_starve_after_plan_veto() {
         // 会起沙箱进程，与建/删 profile 的用例串行（同上）。
         let _serial = crate::sandbox::appcontainer::PROFILE_TEST_MUTEX.lock().await;
-        struct OnceVeto {
+        struct PlanOnlyVeto {
             calls: Mutex<u32>,
         }
-        impl StopHook for OnceVeto {
-            fn before_stop(&self, _ctx: StopContext<'_>) -> Option<String> {
+        #[async_trait::async_trait]
+        impl StopHook for PlanOnlyVeto {
+            async fn before_stop(&self, ctx: StopContext<'_>) -> StopVerdict {
                 *self.calls.lock().unwrap() += 1;
-                Some("宿主提醒：计划态还没退出。".into())
+                if ctx.plan_active && !ctx.plan_veto_used {
+                    StopVerdict::Block("宿主提醒：计划态还没退出。".into())
+                } else {
+                    StopVerdict::Allow
+                }
             }
         }
 
-        let (mut agent, store, cancel, _ws) = verify_demo(
-            vec![
-                script_call_with("apply_patch", r#"{"body":"pub fn f() {}"}"#, "w1"),
-                script_text("写完了"),
-                script_text("还是没验证"),
-                script_text("结束"),
-            ],
-            vec!["exit 1".into()],
-            6,
-            crate::config::VerifyMode::Enforce,
-        );
-        let hook = Arc::new(OnceVeto { calls: Mutex::new(0) });
+        // 计划态在写入**之后**才激活：计划态的只读守卫会挡掉写本身，
+        // 先激活就没有脏状态可验证了（那样这条用例测不到饥饿）。
+        let (mut agent, store, cancel, _broker) = make_loop(vec![
+            script_call_with("apply_patch", r#"{"body":"pub fn f() {}"}"#, "w1"),
+            script_text("写完了"),
+            script_text("还是没验证"),
+            script_text("结束"),
+        ]);
+        let ws = crate::test_support::TestTempDir::new("verify-gate-plan-veto");
+        let mut router = ToolRouter::new();
+        router.register(Arc::new(FakeWriter {
+            activate_plan: Some(agent.plan_state.clone()),
+            ..Default::default()
+        }));
+        agent.router = Arc::new(router);
+        agent.workspace_root = ws.path().to_path_buf();
+        agent.max_turns = 6;
+        agent.verify = crate::config::VerifyConfig {
+            commands: vec!["exit 1".into()],
+            mode: crate::config::VerifyMode::Enforce,
+            ..Default::default()
+        };
+        apply_eval_ablation(&mut agent.verify);
+        let hook = Arc::new(PlanOnlyVeto { calls: Mutex::new(0) });
         agent.stop_hook = Some(hook.clone() as Arc<dyn StopHook>);
         let summary = agent.run_task("任务", Arc::new(CapturingSink(store.clone())), cancel).await;
 
@@ -3069,12 +3322,126 @@ mod tests {
         let events = store.lock().unwrap();
         let states = verification_states(&events);
         assert_eq!(summary.turns, 4, "实际裁决序列 {states:?}");
-        assert_eq!(*hook.calls.lock().unwrap(), 1, "计划槽位只能消费一次");
         assert_eq!(
-            verification_states(&events),
+            *hook.calls.lock().unwrap(),
+            3,
+            "计划那一票只问一次（轮 2），轮 3/4 只做非计划态询问"
+        );
+        assert_eq!(
+            states,
             vec![crate::events::VerifyState::Failed],
             "验证闸门在计划否决之后仍必须执行一次，且只执行一次"
         );
+    }
+
+    /// 停止钩子能读到本任务最近一次验证裁决：Warn 档下闸门只发事件不拦，
+    /// 钩子基于 `Failed` 拒绝收工 → 宿主注入理由并继续本回合。
+    ///
+    /// 证伪旧行为：旧 `StopContext` 根本没有 `verify`，钩子拿不到任何裁决；
+    /// 这里必须能读到 `Failed` + 命令原文。
+    #[tokio::test]
+    async fn stop_hook_blocks_on_verification_failure() {
+        // 会起沙箱进程，与建/删 profile 的用例串行（同上）。
+        let _serial = crate::sandbox::appcontainer::PROFILE_TEST_MUTEX.lock().await;
+        struct VerifyVeto {
+            calls: Mutex<u32>,
+            seen: Mutex<Option<verify::VerifySnapshot>>,
+        }
+        #[async_trait::async_trait]
+        impl StopHook for VerifyVeto {
+            async fn before_stop(&self, ctx: StopContext<'_>) -> StopVerdict {
+                *self.calls.lock().unwrap() += 1;
+                let Some(snapshot) = ctx.verify.clone() else {
+                    return StopVerdict::Allow;
+                };
+                if !matches!(snapshot.state, crate::events::VerifyState::Failed) {
+                    return StopVerdict::Allow;
+                }
+                let first = self.seen.lock().unwrap().is_none();
+                *self.seen.lock().unwrap() = Some(snapshot);
+                if first {
+                    StopVerdict::Block("宿主提醒：验证没过，先别收工。".into())
+                } else {
+                    StopVerdict::Allow
+                }
+            }
+        }
+
+        let (mut agent, store, cancel, _ws) = verify_demo(
+            vec![
+                script_call_with("apply_patch", r#"{"body":"pub fn f() {}"}"#, "w1"),
+                script_text("写完了"),
+                script_text("结束"),
+            ],
+            vec!["echo boom & exit /b 1".into()],
+            6,
+            crate::config::VerifyMode::Warn,
+        );
+        let hook = Arc::new(VerifyVeto { calls: Mutex::new(0), seen: Mutex::new(None) });
+        agent.stop_hook = Some(hook.clone() as Arc<dyn StopHook>);
+        let summary = agent.run_task("任务", Arc::new(CapturingSink(store.clone())), cancel).await;
+
+        assert_eq!(summary.turns, 3, "钩子否决一次 → 再跑一轮 → 放行");
+        assert_eq!(*hook.calls.lock().unwrap(), 2);
+        let seen = hook.seen.lock().unwrap().clone().expect("钩子必须看到本任务的裁决");
+        assert_eq!(seen.state, crate::events::VerifyState::Failed);
+        assert_eq!(seen.commands, vec!["echo boom & exit /b 1"]);
+        assert!(seen.summary.contains("boom"), "失败摘要要带输出尾部：{}", seen.summary);
+        assert!(!seen.vetoed, "Warn 档没消耗验证额度，钩子读到的是 false");
+        assert_eq!(
+            verification_states(&store.lock().unwrap()),
+            vec![crate::events::VerifyState::Failed],
+            "闸门只在本代跑一次"
+        );
+    }
+
+    /// 钩子异常不得让回合卡死：panic / 永久挂起 / 空理由都收敛成「无裁决」放行。
+    ///
+    /// 旧行为下 panic 会把整个任务带崩、挂起会一直等到用户手动取消；
+    /// 这里三者都必须在第 1 轮正常收工。
+    #[tokio::test(start_paused = true)]
+    async fn stop_hook_anomalies_never_block_the_turn() {
+        struct PanicHook;
+        #[async_trait::async_trait]
+        impl StopHook for PanicHook {
+            async fn before_stop(&self, _ctx: StopContext<'_>) -> StopVerdict {
+                panic!("钩子自己炸了");
+            }
+        }
+        struct HangHook;
+        #[async_trait::async_trait]
+        impl StopHook for HangHook {
+            async fn before_stop(&self, _ctx: StopContext<'_>) -> StopVerdict {
+                // 虚拟时钟下由宿主的 `STOP_HOOK_TIMEOUT` 收割，不会真等一小时。
+                tokio::time::sleep(std::time::Duration::from_secs(3600)).await;
+                StopVerdict::Allow
+            }
+        }
+        struct EmptyReasonHook;
+        #[async_trait::async_trait]
+        impl StopHook for EmptyReasonHook {
+            async fn before_stop(&self, _ctx: StopContext<'_>) -> StopVerdict {
+                StopVerdict::Block("   ".into())
+            }
+        }
+
+        let hooks: Vec<Arc<dyn StopHook>> = vec![
+            Arc::new(PanicHook),
+            Arc::new(HangHook),
+            Arc::new(EmptyReasonHook),
+        ];
+        for hook in hooks {
+            let (mut agent, store, cancel, _broker) = make_loop(vec![
+                script_text("完成"),
+                script_text("不该跑到"),
+            ]);
+            agent.stop_hook = Some(hook);
+            let summary = agent
+                .run_task("任务", Arc::new(CapturingSink(store.clone())), cancel)
+                .await;
+            assert_eq!(summary.turns, 1, "钩子异常必须按无裁决放行");
+            assert_eq!(summary.reason, TurnEndReason::Completed);
+        }
     }
 
     /// 否决额度是硬顶：被否决一次后，模型再次写坏也只如实披露，不得再否决。
