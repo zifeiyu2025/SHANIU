@@ -434,6 +434,56 @@ pub fn observed_pass(
         .then_some(commands)
 }
 
+/// 一次裁决的输入。收成结构体，是为了让「通过计入 → 显式/探测命令 → Skipped」
+/// 这套顺序只有一个实现：循环内收工与统一收口两处必须用同一套判定标准，
+/// 各拼一遍迟早会把顺序写反（例如先探测再计入，模型刚跑过也会被重跑）。
+pub struct VerifyRequest<'a> {
+    pub cfg: &'a VerifyConfig,
+    pub dirty: &'a DirtyTracker,
+    pub passes: &'a crate::tool_router::VerifyPassLog,
+    pub baseline: Option<&'a BaselineCache>,
+    pub workspace_root: &'a Path,
+    /// 脏状态代次：只有在这一代之后跑过的通过才算数。
+    pub epoch: u64,
+    pub timeout: Duration,
+    pub sandbox: crate::config::SandboxMode,
+}
+
+/// 按现有机制裁决一次：终端通过计入优先，其次显式/就近探测命令，最后 `Skipped`。
+pub async fn evaluate(request: &VerifyRequest<'_>, cancel: &CancellationToken) -> VerifyOutcome {
+    if let Some(commands) = observed_pass(request.cfg, request.passes, request.epoch) {
+        return VerifyOutcome {
+            state: VerifyState::Passed,
+            commands,
+            duration_ms: 0,
+            summary: "终端里已按原样跑过同一条验证命令并通过".into(),
+            diagnostics: Vec::new(),
+            output: String::new(),
+        };
+    }
+    match select_commands(request.cfg, request.dirty, request.workspace_root) {
+        Ok(commands) => {
+            run_commands(
+                &commands,
+                request.timeout,
+                request.workspace_root,
+                request.sandbox,
+                cancel,
+                request.baseline,
+            )
+            .await
+        }
+        Err(reason) => VerifyOutcome {
+            state: VerifyState::Skipped(reason),
+            commands: Vec::new(),
+            duration_ms: 0,
+            summary: String::new(),
+            diagnostics: Vec::new(),
+            output: String::new(),
+        },
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

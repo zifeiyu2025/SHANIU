@@ -1212,47 +1212,24 @@ impl AgentLoop {
                 {
                     verified_epoch = dirty_epoch;
                     // 通过计入优先：模型刚在终端里按原样跑过同一条命令并成功，
-                    // 就没有必要再等一遍编译。判定条件全在 `observed_pass` 里。
-                    let observed =
-                        verify::observed_pass(&self.verify, &verify_passes, dirty_epoch);
-                    let outcome = match observed {
-                        Some(commands) => verify::VerifyOutcome {
-                            state: crate::events::VerifyState::Passed,
-                            commands,
-                            duration_ms: 0,
-                            summary: "终端里已按原样跑过同一条验证命令并通过".into(),
-                            diagnostics: Vec::new(),
-                            output: String::new(),
+                    // 就没有必要再等一遍编译。判定顺序收在 `verify::evaluate` 一处。
+                    let outcome = verify::evaluate(
+                        &verify::VerifyRequest {
+                            cfg: &self.verify,
+                            dirty: &dirty,
+                            passes: &verify_passes,
+                            baseline: verify::baseline_enabled(&self.verify)
+                                .then_some(&baseline),
+                            workspace_root: &self.workspace_root,
+                            epoch: dirty_epoch,
+                            timeout: std::time::Duration::from_millis(
+                                self.verify.clamped_timeout_ms(),
+                            ),
+                            sandbox: crate::config::SandboxMode::WorkspaceWrite,
                         },
-                        None => match verify::select_commands(
-                            &self.verify,
-                            &dirty,
-                            &self.workspace_root,
-                        ) {
-                            Ok(commands) => {
-                                let sandbox = crate::config::SandboxMode::WorkspaceWrite;
-                                verify::run_commands(
-                                    &commands,
-                                    std::time::Duration::from_millis(
-                                        self.verify.clamped_timeout_ms(),
-                                    ),
-                                    &self.workspace_root,
-                                    sandbox,
-                                    cancel,
-                                    verify::baseline_enabled(&self.verify).then_some(&baseline),
-                                )
-                                .await
-                            }
-                            Err(reason) => verify::VerifyOutcome {
-                                state: crate::events::VerifyState::Skipped(reason),
-                                commands: Vec::new(),
-                                duration_ms: 0,
-                                summary: String::new(),
-                                diagnostics: Vec::new(),
-                                output: String::new(),
-                            },
-                        },
-                    };
+                        cancel,
+                    )
+                    .await;
                     emit(
                         &sink,
                         EventMsg::VerificationResult {
@@ -1874,6 +1851,86 @@ impl AgentLoop {
             }
         }
 
+        // 统一收口：所有 break 路径共用一次「写后验证」复查。
+        //
+        // 循环内的闸门只在模型主动收工（本轮没有工具调用）时才跑，而且要求
+        // `turn + 1 < max_turns`（否决后还得有一轮去修）。于是「把预算全花在读写上、
+        // 最后一轮仍在请求工具」的路径会在 `turn == max_turns` 处直接 break：
+        // 一次宿主裁决都没有，只剩 `unverified` 这个披露位——判据碰巧通过时，
+        // 过程就是「写完就收工、根本没验证」。
+        //
+        // 这里补的仍然是同一个闸门（`verify::evaluate`），不新造判定：
+        // - 只对 root：子代理与父共享工作区，各自跑编译会互相踩；
+        // - 只对「源码写入且这一代没有裁决」：纯问答、只读任务、只写文档都不会置脏，
+        //   计划态下写工具本来就被挡住，因此不会被逼着跑编译；
+        // - 取消/已失败不收口：用户主动停下时再起一个编译进程是错的。
+        if verify_enabled
+            && scope.depth == 0
+            && dirty.is_dirty()
+            && dirty_epoch != verified_epoch
+            && !cancel.is_cancelled()
+            && !matches!(
+                reason,
+                TurnEndReasonLocal::Cancelled | TurnEndReasonLocal::Failed
+            )
+        {
+            let outcome = verify::evaluate(
+                &verify::VerifyRequest {
+                    cfg: &self.verify,
+                    dirty: &dirty,
+                    passes: &verify_passes,
+                    baseline: verify::baseline_enabled(&self.verify).then_some(&baseline),
+                    workspace_root: &self.workspace_root,
+                    epoch: dirty_epoch,
+                    timeout: std::time::Duration::from_millis(
+                        self.verify.clamped_timeout_ms(),
+                    ),
+                    sandbox: crate::config::SandboxMode::WorkspaceWrite,
+                },
+                cancel,
+            )
+            .await;
+            emit(
+                &sink,
+                EventMsg::VerificationResult {
+                    turn: last_turn,
+                    state: outcome.state,
+                    commands: outcome.commands.clone(),
+                    duration_ms: outcome.duration_ms,
+                    summary: outcome.summary.clone(),
+                    diagnostics: outcome.diagnostics.clone(),
+                },
+            );
+            match outcome.state {
+                crate::events::VerifyState::Passed => {
+                    dirty.clear();
+                    pending_writes.clear();
+                }
+                crate::events::VerifyState::Failed => {
+                    // 没有剩余轮次可以否决：不再假装这是「已完成但未验证」。
+                    // 宿主真的跑过、真的失败，收口就是 `failed`，命令与诊断放进
+                    // 历史与 `error` 事件，用户在下一轮/续跑时能照着跑。
+                    if matches!(
+                        self.verify.effective_mode(),
+                        crate::config::VerifyMode::Enforce
+                    ) && !cancel.is_cancelled()
+                    {
+                        let text = verify::reminder_text(&outcome, None);
+                        emit(&sink, EventMsg::Error { message: text.clone() });
+                        history.push(HistoryItem::Message {
+                            role: Role::System,
+                            text,
+                            reasoning: None,
+                        });
+                        reason = TurnEndReasonLocal::Failed;
+                    }
+                }
+                // 判不出来/没配置命令：不清脏、不改收口原因，仍由 `unverified` 披露。
+                crate::events::VerifyState::Inconclusive(_)
+                | crate::events::VerifyState::Skipped(_) => {}
+            }
+        }
+
         // 覆盖所有 break 路径（取消/失败/预算耗尽）——它们都从这里收口
         if let Err(message) = self.flush_history(rollout, history, recorded) {
             degrade_rollout(&sink, message);
@@ -1912,8 +1969,9 @@ impl AgentLoop {
                 TurnEndReasonLocal::BudgetExhausted => crate::events::TurnEndReason::BudgetExhausted,
             },
             error: turn_error,
-            // 有源码写入、但到结束都没被验证过：如实标记，不假装验证过。
-            // 末轮不可否决时这就是唯一的诚实出口（不做 VerificationResult）。
+            // 有源码写入、但到结束都没拿到「通过」裁决：如实标记，不假装验证过。
+            // 收口复查已跑过但仍被判不出来（Skipped/Inconclusive）或 warn 模式时，
+            // 这里就是唯一的诚实出口；收口复查失败则 reason 已被改为 failed。
             unverified: dirty.is_dirty(),
         });
         TurnSummary { turns: last_turn, reason: reason.into() }
@@ -2597,9 +2655,11 @@ mod tests {
         assert!(!completed_unverified(&events), "验证通过后不得标记未验证");
     }
 
-    /// 末轮不可否决：预算只够跑完，没有位置再跑一轮 → 只放行 + 标记未验证。
+    /// 旧行为：末轮不可否决就整块跳过闸门，一次 `VerificationResult` 都不发，
+    /// 只靠 `unverified` 披露；判据碰巧通过时，过程就是「写完就收工、根本没验证」。
+    /// 新行为：末轮仍要拿到真实裁决；没有下一轮可修时，失败即如实收口为 `failed`。
     #[tokio::test]
-    async fn verification_gate_last_turn_window_is_marked_unverified() {
+    async fn verification_gate_last_turn_still_runs_and_fails_the_turn() {
         let (agent, store, cancel, _ws) = verify_demo(
             vec![
                 script_call_with("apply_patch", r#"{"body":"pub fn f() {}"}"#, "w1"),
@@ -2611,10 +2671,90 @@ mod tests {
         );
         let summary = agent.run_task("任务", Arc::new(CapturingSink(store.clone())), cancel).await;
 
-        assert_eq!(summary.reason, TurnEndReason::Completed);
+        assert_eq!(summary.reason, TurnEndReason::Failed, "无剩余轮次时不得伪装成完成");
         let events = store.lock().unwrap();
-        assert!(verification_states(&events).is_empty(), "末轮不执行验证");
-        assert!(completed_unverified(&events), "放行但必须如实标记未验证");
+        assert_eq!(
+            verification_states(&events),
+            vec![crate::events::VerifyState::Failed],
+            "末轮也必须向宿主拿一次裁决"
+        );
+        assert!(completed_unverified(&events), "失败后仍标记未验证");
+        assert!(
+            events.iter().any(|event| matches!(
+                event,
+                EventMsg::Error { message } if message.contains("exit 1")
+            )),
+            "必须把可执行的下一步（命令）交给用户"
+        );
+    }
+
+    /// 复现 `repo-feat-context-overflow-code`：32 轮全在读写，最后一轮仍在请求工具，
+    /// 循环在轮次上限直接 break。旧行为这里 0 次裁决、收口 `budget_exhausted`。
+    /// 新行为在统一收口补一次宿主裁决：失败即 `failed`，不再把「没验证」当完成。
+    #[tokio::test]
+    async fn verification_gate_runs_when_budget_exhausts_with_tool_calls() {
+        let (agent, store, cancel, _ws) = verify_demo(
+            vec![
+                script_call_with("apply_patch", r#"{"body":"pub fn f() {}"}"#, "w1"),
+                // 同内容写入：工具调用照常发生，但不推进脏代次。
+                script_call_with("apply_patch", r#"{"body":"pub fn f() {}"}"#, "w2"),
+            ],
+            vec!["exit 1".into()],
+            2,
+            crate::config::VerifyMode::Enforce,
+        );
+        let summary = agent.run_task("任务", Arc::new(CapturingSink(store.clone())), cancel).await;
+
+        assert_eq!(summary.turns, 2);
+        assert_eq!(summary.reason, TurnEndReason::Failed);
+        let events = store.lock().unwrap();
+        assert_eq!(
+            verification_states(&events),
+            vec![crate::events::VerifyState::Failed],
+            "预算耗尽的收口口也必须接闸门"
+        );
+        assert!(completed_unverified(&events));
+        assert!(events.iter().any(|event| matches!(
+            event,
+            EventMsg::Error { message } if message.contains("exit 1")
+        )));
+    }
+
+    /// 同一收口口上「跑过验证」的对照组：观察到终端通过就放行，不重复跑、不改收口。
+    #[tokio::test]
+    async fn verification_gate_exit_pass_clears_unverified() {
+        // 写入与验证放在同一轮：写入先执行并推进脏代次，随后的终端调用记录本代通过。
+        // 末轮只有文本（不可否决），逼出统一收口口，验证它认这份证据并放行。
+        let (agent, store, cancel, _ws) = verify_demo(
+            vec![
+                vec![
+                    ModelStreamEvent::OutputItem(ResponseItem::FunctionCall {
+                        name: "apply_patch".into(),
+                        arguments: r#"{"body":"pub fn f() {}"}"#.into(),
+                        call_id: "w1".into(),
+                    }),
+                    ModelStreamEvent::OutputItem(ResponseItem::FunctionCall {
+                        name: "read_file".into(),
+                        arguments: "{}".into(),
+                        call_id: "r1".into(),
+                    }),
+                    usage_ev(),
+                ],
+                script_text("写完了"),
+            ],
+            vec!["cargo test".into()],
+            2,
+            crate::config::VerifyMode::Enforce,
+        );
+        let summary = agent.run_task("任务", Arc::new(CapturingSink(store.clone())), cancel).await;
+
+        assert_eq!(summary.reason, TurnEndReason::Completed, "验证通过不改收口原因");
+        let events = store.lock().unwrap();
+        assert_eq!(
+            verification_states(&events),
+            vec![crate::events::VerifyState::Passed]
+        );
+        assert!(!completed_unverified(&events), "验证通过后不得标记未验证");
     }
 
     /// `warn` 是运行期泄压阀：仍发事件，但不否决、不增加轮次。
