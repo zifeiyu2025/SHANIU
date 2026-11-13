@@ -41,6 +41,47 @@ enum PatchOp {
     Delete { path: String },
 }
 
+/// 解析出的单个段，附带补丁文本里的行号，失败时能指到具体哪一段的哪一行。
+#[derive(Debug, Clone)]
+struct PatchSection {
+    /// 1 起算的段号。
+    index: usize,
+    /// 段头（`*** Xxx File: ...`）在补丁文本里的行号（1 起算）。
+    start_line: usize,
+    /// 段内最后一行的行号（1 起算）。
+    end_line: usize,
+    op: PatchOp,
+}
+
+impl PatchSection {
+    fn path(&self) -> &str {
+        match &self.op {
+            PatchOp::Add { path, .. } | PatchOp::Update { path, .. } | PatchOp::Delete { path } => path,
+        }
+    }
+
+    fn kind(&self) -> &'static str {
+        match self.op {
+            PatchOp::Add { .. } => "Add File",
+            PatchOp::Update { .. } => "Update File",
+            PatchOp::Delete { .. } => "Delete File",
+        }
+    }
+
+    fn label(&self) -> String {
+        let span = if self.start_line == self.end_line {
+            format!("补丁第 {} 行", self.start_line)
+        } else {
+            format!("补丁第 {}–{} 行", self.start_line, self.end_line)
+        };
+        format!("第 {} 段（{}: {}，{span}）", self.index, self.kind(), self.path())
+    }
+}
+
+fn section_head(index: usize, kind: &str, path: &str, start_line: usize) -> String {
+    format!("第 {index} 段（{kind}: {path}，从补丁第 {start_line} 行开始）")
+}
+
 pub struct ApplyPatch {
     spec: ToolSpec,
 }
@@ -74,82 +115,142 @@ impl ApplyPatch {
 
 // ============================== 解析（纯函数） ==============================
 
-fn parse_patch(patch: &str) -> Result<Vec<PatchOp>, ToolError> {
-    let trimmed = patch.trim_start();
-    if !trimmed.starts_with(BEGIN) {
-        return Err(ToolError::InvalidArgs(
-            "补丁必须以 *** Begin Patch 开头".into(),
-        ));
+fn parse_patch(patch: &str) -> Result<Vec<PatchSection>, ToolError> {
+    let lines: Vec<&str> = patch.lines().collect();
+    let begin = lines
+        .iter()
+        .position(|line| line.trim_start().starts_with(BEGIN));
+    let Some(begin_idx) = begin else {
+        let first = lines.first().copied().unwrap_or("");
+        return Err(ToolError::InvalidArgs(format!(
+            "补丁格式错误：补丁第 1 行必须是 `*** Begin Patch`，实际是 {first:?}。\
+             期望形状：第 1 行 `*** Begin Patch`，随后是 `*** Add File: <路径>` / \
+             `*** Update File: <路径>` / `*** Delete File: <路径>` 段，最后一行 `*** End Patch`"
+        )));
+    };
+    if lines[..begin_idx].iter().any(|line| !line.trim().is_empty()) {
+        let first = lines.first().copied().unwrap_or("");
+        return Err(ToolError::InvalidArgs(format!(
+            "补丁格式错误：`*** Begin Patch` 之前不能有非空内容，补丁第 1 行是 {first:?}。\
+             期望形状：补丁第 1 行直接写 `*** Begin Patch`"
+        )));
     }
-    let body = &trimmed[BEGIN.len()..];
-    let body = body.strip_prefix('\n').unwrap_or(body);
-    let lines: Vec<&str> = body.lines().collect();
 
-    let mut ops: Vec<PatchOp> = Vec::new();
-    let mut i = 0usize;
+    let mut sections: Vec<PatchSection> = Vec::new();
+    let mut i = begin_idx + 1;
+    let mut saw_end = false;
     while i < lines.len() {
         let line = lines[i];
         if line.trim() == END {
+            saw_end = true;
             break;
         }
+        let index = sections.len() + 1;
         if let Some(path) = line.strip_prefix("*** Add File: ") {
+            let path = path.trim().to_string();
+            let start_line = i + 1;
             i += 1;
             let mut content = Vec::new();
-            while i < lines.len() {
-                let l = lines[i];
-                if l.starts_with("*** ") {
-                    break;
-                }
-                let Some(rest) = l.strip_prefix('+') else {
+            while i < lines.len() && !lines[i].starts_with("*** ") {
+                let raw = lines[i];
+                let Some(rest) = raw.strip_prefix('+') else {
                     return Err(ToolError::InvalidArgs(format!(
-                        "Add File 段的行必须以 + 开头: {l:?}"
+                        "补丁格式错误：{} 的补丁第 {} 行必须以 `+` 开头，实际是 {raw:?}。\
+                         期望形状：`+<新增内容>`；下一段以 `*** ` 开头",
+                        section_head(index, "Add File", &path, start_line),
+                        i + 1
                     )));
                 };
                 content.push(rest.to_string());
                 i += 1;
             }
-            ops.push(PatchOp::Add { path: path.trim().to_string(), lines: content });
+            sections.push(PatchSection {
+                index,
+                start_line,
+                end_line: i.max(start_line),
+                op: PatchOp::Add { path, lines: content },
+            });
         } else if let Some(path) = line.strip_prefix("*** Update File: ") {
+            let path = path.trim().to_string();
+            let start_line = i + 1;
             i += 1;
             let mut seq: Vec<HunkLine> = Vec::new();
             while i < lines.len() && !lines[i].starts_with("*** ") {
-                let l = lines[i];
-                if l == "@@" {
+                let raw = lines[i];
+                if raw == "@@" {
                     i += 1;
                     continue; // 分组标记在连续匹配语义下不改变序列
                 }
-                if let Some(rest) = l.strip_prefix(' ') {
+                if let Some(rest) = raw.strip_prefix(' ') {
                     seq.push(HunkLine::Keep(rest.to_string()));
-                } else if let Some(rest) = l.strip_prefix('-') {
+                } else if let Some(rest) = raw.strip_prefix('-') {
                     seq.push(HunkLine::Remove(rest.to_string()));
-                } else if let Some(rest) = l.strip_prefix('+') {
+                } else if let Some(rest) = raw.strip_prefix('+') {
                     seq.push(HunkLine::Add(rest.to_string()));
-                } else if l.is_empty() {
+                } else if raw.is_empty() {
                     seq.push(HunkLine::Keep(String::new()));
                 } else {
                     return Err(ToolError::InvalidArgs(format!(
-                        "Update File 段的行必须以空格/-/+ 开头: {l:?}"
+                        "补丁格式错误：{} 的补丁第 {} 行无法识别，原文是 {raw:?}。\
+                         期望形状：上下文行以空格开头（` 原内容`）、删除行以 `-` 开头、新增行以 `+` 开头；\
+                         整行留空视为空上下文行",
+                        section_head(index, "Update File", &path, start_line),
+                        i + 1
                     )));
                 }
                 i += 1;
             }
             if seq.iter().all(|h| matches!(h, HunkLine::Keep(_))) {
-                return Err(ToolError::InvalidArgs(
-                    "Update File 需要至少一行删除(+前缀为-)或新增内容".into(),
-                ));
+                return Err(ToolError::InvalidArgs(format!(
+                    "补丁格式错误：{} 只有上下文行，没有任何 `-` 删除行或 `+` 新增行。\
+                     期望形状：至少一行以 `-` 或 `+` 开头",
+                    section_head(index, "Update File", &path, start_line)
+                )));
             }
-            ops.push(PatchOp::Update { path: path.trim().to_string(), seq });
+            sections.push(PatchSection {
+                index,
+                start_line,
+                end_line: i.max(start_line),
+                op: PatchOp::Update { path, seq },
+            });
         } else if let Some(path) = line.strip_prefix("*** Delete File: ") {
-            ops.push(PatchOp::Delete { path: path.trim().to_string() });
+            let start_line = i + 1;
+            sections.push(PatchSection {
+                index,
+                start_line,
+                end_line: start_line,
+                op: PatchOp::Delete { path: path.trim().to_string() },
+            });
             i += 1;
         } else {
-            return Err(ToolError::InvalidArgs(format!("无法识别的补丁行: {line:?}")));
+            return Err(ToolError::InvalidArgs(format!(
+                "补丁格式错误：补丁第 {} 行无法识别，原文是 {line:?}。\
+                 期望形状：`*** Add File: <路径>`、`*** Update File: <路径>`、\
+                 `*** Delete File: <路径>` 或 `*** End Patch`",
+                i + 1
+            )));
         }
     }
-    if ops.is_empty() {
-        return Err(ToolError::InvalidArgs("补丁为空".into()));
+    if !saw_end {
+        let last = sections
+            .last()
+            .map(PatchSection::label)
+            .unwrap_or_else(|| "（没有识别到任何段）".to_string());
+        return Err(ToolError::InvalidArgs(format!(
+            "补丁不完整：补丁共 {} 行，到第 {} 行结束仍未出现 `*** End Patch`。\
+             最后一个段是 {last}。期望形状：最后一行写 `*** End Patch`",
+            lines.len(),
+            lines.len()
+        )));
     }
-    Ok(ops)
+    if sections.is_empty() {
+        return Err(ToolError::InvalidArgs(
+            "补丁为空：`*** Begin Patch` 与 `*** End Patch` 之间没有任何段。\
+             期望形状：至少一个 `*** Add File:` / `*** Update File:` / `*** Delete File:` 段"
+                .to_string(),
+        ));
+    }
+    Ok(sections)
 }
 
 /// 匹配级别（照 ZCode `tool/edit-matchers.ts` 8 级思路 + codex `seek_sequence` 递减严格度）。
@@ -270,6 +371,96 @@ fn anchor_similarity(block: &[String], expected: &[String]) -> f64 {
     total / count as f64
 }
 
+const MISMATCH_EXCERPT_LINES: usize = 8;
+const MISMATCH_LINE_CHARS: usize = 160;
+
+fn truncate_for_display(line: &str) -> String {
+    let trimmed = line.trim_end();
+    if trimmed.chars().count() <= MISMATCH_LINE_CHARS {
+        return trimmed.to_string();
+    }
+    let mut out: String = trimmed.chars().take(MISMATCH_LINE_CHARS).collect();
+    out.push('…');
+    out
+}
+
+/// 在文件里找与期望块最相似的位置（按整块平均相似度，缺失行记 0 分）。
+/// 找不到精确匹配时用来回答「模型以为文件在这里，实际最像的是哪里」。
+fn nearest_block(file: &[String], expected: &[String]) -> Option<(usize, f64)> {
+    if file.is_empty() || expected.is_empty() {
+        return None;
+    }
+    let width = expected.len();
+    let mut best: Option<(usize, f64)> = None;
+    for start in 0..file.len() {
+        let available = (file.len() - start).min(width);
+        let total: f64 = (0..available)
+            .map(|offset| {
+                line_similarity(expected[offset].trim(), file[start + offset].trim())
+            })
+            .sum();
+        let score = total / width as f64;
+        if best.is_none_or(|(_, current)| score > current) {
+            best = Some((start, score));
+        }
+    }
+    best
+}
+
+/// 上下文不匹配时的「可照着改」对比：期望块原文、文件最近似位置、首个差异行。
+fn mismatch_detail(file: &[String], expected: &[String]) -> String {
+    let width = expected.len();
+    let shown = width.min(MISMATCH_EXCERPT_LINES);
+    let mut out = format!("\n期望匹配的 {width} 行（块内序号）：");
+    for (offset, line) in expected.iter().take(shown).enumerate() {
+        out.push_str(&format!("\n  块内 {}| {}", offset + 1, truncate_for_display(line)));
+    }
+    if shown < width {
+        out.push_str(&format!("\n  …（期望块共 {width} 行，只显示前 {shown} 行）"));
+    }
+    match nearest_block(file, expected) {
+        Some((start, score)) => {
+            let available = (file.len() - start).min(width);
+            let shown_actual = available.min(MISMATCH_EXCERPT_LINES);
+            out.push_str(&format!(
+                "\n文件中最接近的位置：第 {} 行起（整块相似度 {:.0}%，文件共 {} 行）：",
+                start + 1,
+                score * 100.0,
+                file.len()
+            ));
+            for offset in 0..shown_actual {
+                out.push_str(&format!(
+                    "\n  文件第 {}| {}",
+                    start + offset + 1,
+                    truncate_for_display(&file[start + offset])
+                ));
+            }
+            if shown_actual < available {
+                out.push_str("\n  …");
+            }
+            if let Some(offset) =
+                (0..available).find(|&offset| expected[offset].trim() != file[start + offset].trim())
+            {
+                out.push_str(&format!(
+                    "\n首个不一致：块内第 {} 行 vs 文件第 {} 行；期望 `{}`，实际读到 `{}`",
+                    offset + 1,
+                    start + offset + 1,
+                    truncate_for_display(expected[offset].trim()),
+                    truncate_for_display(file[start + offset].trim())
+                ));
+            }
+            if available < width {
+                out.push_str(&format!(
+                    "\n边界：文件从第 {} 行起只剩 {available} 行，补丁期望 {width} 行，无法完整比对",
+                    start + 1
+                ));
+            }
+        }
+        None => out.push_str("\n文件为空，没有可比对的位置"),
+    }
+    out
+}
+
 /// Update 段：keep+remove 序列在文件中按递减严格度定位，替换为 keep+add。
 ///
 /// Keep 行一律取**文件原文**（保留原缩进/空白），只有 Add 行用补丁文本。
@@ -290,8 +481,9 @@ fn apply_hunk_seq(
     let width = expected.len();
     if file_lines.len() < width {
         return Err(format!(
-            "上下文不匹配：文件仅 {} 行，补丁期望 {width} 行",
-            file_lines.len()
+            "上下文不匹配：补丁期望 {width} 行上下文，文件只有 {} 行，无法完整匹配。{}",
+            file_lines.len(),
+            mismatch_detail(file_lines, &expected)
         ));
     }
 
@@ -342,7 +534,8 @@ fn apply_hunk_seq(
 
     let Some((start, level)) = found else {
         return Err(format!(
-            "上下文不匹配：未找到补丁期望的 {width} 行序列（已尝试：{}）。请先读取文件当前内容再重试",
+            "上下文不匹配：未找到补丁期望的 {width} 行序列（已尝试：{}）。{}\n\
+             请按上面「文件中最接近的位置」的真实内容重建补丁，不要原样重试",
             [
                 MatchLevel::Exact,
                 MatchLevel::LineNumberStripped,
@@ -353,7 +546,8 @@ fn apply_hunk_seq(
             .iter()
             .map(|l| l.label())
             .collect::<Vec<_>>()
-            .join("、")
+            .join("、"),
+            mismatch_detail(file_lines, &expected)
         ));
     };
 
@@ -494,6 +688,17 @@ fn rollback(snapshot: &HashMap<String, Option<Vec<u8>>>) -> RollbackReport {
     report
 }
 
+/// 给错误加上「第几段 / 补丁第几行」。
+fn with_section(error: ToolError, section: &PatchSection) -> ToolError {
+    let label = section.label();
+    match error {
+        ToolError::InvalidArgs(message) => ToolError::InvalidArgs(format!("{label}：{message}")),
+        ToolError::Execution(message) => ToolError::Execution(format!("{label}：{message}")),
+        ToolError::SandboxDenied(message) => ToolError::SandboxDenied(format!("{label}：{message}")),
+        other => other,
+    }
+}
+
 /// 把回滚结果附在原始错误后面。
 ///
 /// 全部改回成功 → 原样返回：正常失败路径（回滚成功）的文案仍是「写入失败: x」一句话，
@@ -535,29 +740,32 @@ impl ToolExecutor for ApplyPatch {
             .get("patch")
             .and_then(|v| v.as_str())
             .ok_or_else(|| ToolError::InvalidArgs("缺少 patch".into()))?;
-        let ops = parse_patch(patch)?;
+        let sections = parse_patch(patch)?;
 
         // dry-run：全部路径先过边界校验
-        for op in &ops {
-            let path = match op {
-                PatchOp::Add { path, .. }
-                | PatchOp::Update { path, .. }
-                | PatchOp::Delete { path } => path,
-            };
-            resolve_for_write(&ctx.workspace_root, path)?;
+        for section in &sections {
+            resolve_for_write(&ctx.workspace_root, section.path())
+                .map_err(|error| with_section(error, section))?;
         }
 
         // 应用 + 回滚快照：path → 原（None=原不存在，回滚=删除）
         let mut snapshot: HashMap<String, Option<Vec<u8>>> = HashMap::new();
         let mut summary: Vec<String> = Vec::new();
 
-        for op in &ops {
-            match op {
+        for section in &sections {
+            match &section.op {
                 PatchOp::Add { path, lines } => {
-                    let full = resolve_for_write(&ctx.workspace_root, path)?;
+                    let full = resolve_for_write(&ctx.workspace_root, path)
+                        .map_err(|error| with_section(error, section))?;
                     if full.exists() {
                         return Err(with_rollback(
-                            ToolError::Execution(format!("Add File 目标已存在: {path}")),
+                            with_section(
+                                ToolError::Execution(format!(
+                                    "Add File 目标已存在: {path}。如要修改请改用 `*** Update File: {path}`，\
+                                     如要重建先 `*** Delete File: {path}`"
+                                )),
+                                section,
+                            ),
                             rollback(&snapshot),
                         ));
                     }
@@ -570,7 +778,10 @@ impl ToolExecutor for ApplyPatch {
                     }
                     if std::fs::write(&full, &content).is_err() {
                         return Err(with_rollback(
-                            ToolError::Execution(format!("写入失败: {path}")),
+                            with_section(
+                                ToolError::Execution(format!("写入失败: {path}")),
+                                section,
+                            ),
                             rollback(&snapshot),
                         ));
                     }
@@ -584,16 +795,40 @@ impl ToolExecutor for ApplyPatch {
                     summary.push(format!("+ {path}"));
                 }
                 PatchOp::Update { path, seq } => {
-                    let full = resolve_for_write(&ctx.workspace_root, path)?;
-                    let original =
-                        std::fs::read(&full).map_err(|e| ToolError::Execution(format!("读取失败: {e}")))?;
+                    let full = resolve_for_write(&ctx.workspace_root, path)
+                        .map_err(|error| with_section(error, section))?;
+                    let original = match std::fs::read(&full) {
+                        Ok(bytes) => bytes,
+                        Err(error) => {
+                            let message = if full.exists() {
+                                format!("读取失败: {error}")
+                            } else {
+                                format!(
+                                    "Update File 目标不存在: {path}。新建文件请用 `*** Add File: {path}`"
+                                )
+                            };
+                            return Err(with_rollback(
+                                with_section(ToolError::Execution(message), section),
+                                rollback(&snapshot),
+                            ));
+                        }
+                    };
                     // SH-124：先读过、且内容未被外部改动，才允许修改
                     let read_key = match verify_read_state(ctx, path, &full, &original) {
                         Ok(key) => key,
-                        Err(error) => return Err(with_rollback(error, rollback(&snapshot))),
+                        Err(error) => {
+                            return Err(with_rollback(
+                                with_section(error, section),
+                                rollback(&snapshot),
+                            ))
+                        }
                     };
-                    let text = String::from_utf8(original.clone())
-                        .map_err(|_| ToolError::Execution(format!("非 UTF-8 文本文件: {path}")))?;
+                    let text = String::from_utf8(original.clone()).map_err(|_| {
+                        with_section(
+                            ToolError::Execution(format!("非 UTF-8 文本文件: {path}")),
+                            section,
+                        )
+                    })?;
                     let had_trailing_newline = text.ends_with('\n');
                     let (new_lines, level) = apply_hunk_seq(
                         &text.lines().map(String::from).collect::<Vec<_>>(),
@@ -601,7 +836,7 @@ impl ToolExecutor for ApplyPatch {
                     )
                     .map_err(|e| {
                         with_rollback(
-                            ToolError::Execution(format!("{path}: {e}")),
+                            with_section(ToolError::Execution(e), section),
                             rollback(&snapshot),
                         )
                     })?;
@@ -611,7 +846,10 @@ impl ToolExecutor for ApplyPatch {
                     }
                     if std::fs::write(&full, &new_text).is_err() {
                         return Err(with_rollback(
-                            ToolError::Execution(format!("写入失败: {path}")),
+                            with_section(
+                                ToolError::Execution(format!("写入失败: {path}")),
+                                section,
+                            ),
                             rollback(&snapshot),
                         ));
                     }
@@ -625,24 +863,36 @@ impl ToolExecutor for ApplyPatch {
                     });
                 }
                 PatchOp::Delete { path } => {
-                    let full = resolve_for_write(&ctx.workspace_root, path)?;
+                    let full = resolve_for_write(&ctx.workspace_root, path)
+                        .map_err(|error| with_section(error, section))?;
                     let original = match std::fs::read(&full) {
                         Ok(bytes) => bytes,
                         Err(_) => {
                             return Err(with_rollback(
-                                ToolError::Execution(format!("Delete File 目标不存在: {path}")),
+                                with_section(
+                                    ToolError::Execution(format!("Delete File 目标不存在: {path}")),
+                                    section,
+                                ),
                                 rollback(&snapshot),
                             ));
                         }
                     };
                     let read_key = match verify_read_state(ctx, path, &full, &original) {
                         Ok(key) => key,
-                        Err(error) => return Err(with_rollback(error, rollback(&snapshot))),
+                        Err(error) => {
+                            return Err(with_rollback(
+                                with_section(error, section),
+                                rollback(&snapshot),
+                            ))
+                        }
                     };
                     record_write(ctx, &full, Some(&String::from_utf8_lossy(&original)), None);
                     if std::fs::remove_file(&full).is_err() {
                         return Err(with_rollback(
-                            ToolError::Execution(format!("删除失败: {path}")),
+                            with_section(
+                                ToolError::Execution(format!("删除失败: {path}")),
+                                section,
+                            ),
                             rollback(&snapshot),
                         ));
                     }
@@ -807,6 +1057,85 @@ mod tests {
             .await
             .unwrap_err();
         assert!(matches!(err, ToolError::InvalidArgs(_)));
+    }
+
+    /// 证伪旧文案「行必须以 + 开头」：必须给出补丁行号、该行原文、期望形状与段号。
+    #[test]
+    fn malformed_add_line_reports_patch_line_and_shape() {
+        let patch = "*** Begin Patch\n*** Add File: new.txt\n+ok\noops\n*** End Patch";
+        let err = parse_patch(patch).unwrap_err();
+        let message = err.to_string();
+        assert!(message.contains("补丁第 4 行"), "{message}");
+        assert!(message.contains("oops"), "必须回显出错行原文: {message}");
+        assert!(message.contains("`+`"), "{message}");
+        assert!(message.contains("第 1 段"), "{message}");
+        assert!(message.contains("Add File: new.txt"), "{message}");
+    }
+
+    /// Update 段的非法行同样要指到补丁行号与期望形状。
+    #[test]
+    fn malformed_update_line_reports_patch_line_and_shape() {
+        let patch = "*** Begin Patch\n*** Update File: a.txt\n line1\nbad line\n*** End Patch";
+        let err = parse_patch(patch).unwrap_err();
+        let message = err.to_string();
+        assert!(message.contains("补丁第 4 行"), "{message}");
+        assert!(message.contains("bad line"), "{message}");
+        assert!(message.contains("空格开头"), "{message}");
+        assert!(message.contains("`-`"), "{message}");
+        assert!(message.contains("`+`"), "{message}");
+        assert!(message.contains("第 1 段"), "{message}");
+    }
+
+    /// 缺 `*** End Patch` 不能被当成完整补丁静默写入。
+    #[tokio::test]
+    async fn missing_end_patch_is_rejected_without_writing() {
+        let ws = workspace();
+        let patch = "*** Begin Patch\n*** Add File: half.txt\n+x";
+        let err = ApplyPatch::new()
+            .execute(serde_json::json!({"patch": patch}), &ctx(&ws))
+            .await
+            .unwrap_err();
+        let message = err.to_string();
+        assert!(matches!(err, ToolError::InvalidArgs(_)));
+        assert!(message.contains("不完整"), "{message}");
+        assert!(message.contains("`*** End Patch`"), "{message}");
+        assert!(message.contains("第 1 段"), "{message}");
+        assert!(!ws.join("half.txt").exists(), "不完整补丁不得落盘");
+    }
+
+    /// 上下文不匹配必须给出「最接近的位置」与首个差异行，而不是只报一句不匹配。
+    #[tokio::test]
+    async fn context_mismatch_reports_nearest_location_and_diff() {
+        let ws = workspace();
+        std::fs::write(ws.join("a.txt"), "alpha\nbravo\ncharlie\n").unwrap();
+        let patch =
+            "*** Begin Patch\n*** Update File: a.txt\n alpha\n-zulu\n+zulu2\n charlie\n*** End Patch";
+        let err = ApplyPatch::new()
+            .execute(serde_json::json!({"patch": patch}), &ctx(&ws))
+            .await
+            .unwrap_err();
+        let message = err.to_string();
+        assert!(message.contains("最接近的位置"), "{message}");
+        assert!(message.contains("文件第 2 行"), "{message}");
+        assert!(message.contains("期望 `zulu`"), "{message}");
+        assert!(message.contains("实际读到 `bravo`"), "{message}");
+    }
+
+    /// 补丁比文件长时要明确说出「无法完整比对」的边界。
+    #[test]
+    fn mismatch_wider_than_file_states_boundary() {
+        let file: Vec<String> = ["a", "b", "c"].iter().map(|s| s.to_string()).collect();
+        let seq = vec![
+            HunkLine::Keep("a".into()),
+            HunkLine::Keep("b".into()),
+            HunkLine::Keep("c".into()),
+            HunkLine::Remove("d".into()),
+            HunkLine::Remove("e".into()),
+        ];
+        let message = apply_hunk_seq(&file, &seq).unwrap_err();
+        assert!(message.contains("文件只有 3 行"), "{message}");
+        assert!(message.contains("边界"), "{message}");
+        assert!(message.contains("无法完整比对"), "{message}");
     }
 
     // ---------- SH-123 匹配级别：8 类样本 ----------
