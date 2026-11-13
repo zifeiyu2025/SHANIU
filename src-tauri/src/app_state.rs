@@ -333,13 +333,19 @@ impl AppState {
         self.active_subagents.lock().expect("active_subagents 锁中毒").clone()
     }
 
-    /// 正在跑任务的会话 id（None = 空闲）。
-    pub fn active_agent(&self) -> Option<String> {
+    /// 当前活动任务与会话 id（None = 空闲）。运行态的**唯一**查询口径：
+    /// `list_sessions` / `session_runtime` 都走这里，界面不再拿本地 journal 推断。
+    pub fn active_task(&self) -> Option<(String, TaskKind)> {
         self.active_task
             .lock()
             .expect("active_task 锁中毒")
             .as_ref()
-            .map(|(id, _, _)| id.clone())
+            .map(|(id, kind, _)| (id.clone(), *kind))
+    }
+
+    /// 正在跑任务的会话 id（None = 空闲）。
+    pub fn active_agent(&self) -> Option<String> {
+        self.active_task().map(|(id, _)| id)
     }
 
     /// 任务槽被占用时给发起方看的说明：**必须能定位到是谁**。
@@ -388,6 +394,17 @@ pub enum TaskKind {
     Turn,
     /// 手动压缩（`compact_session`）：应用级独占，期间任何会话都起不了新回合。
     Compaction,
+}
+
+impl TaskKind {
+    /// 出到前端的稳定取值（`SessionRow.active_task` / `ActiveTaskView.kind`）。
+    /// 前端只认这两个字符串，别在别处另拼一份。
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            TaskKind::Turn => "turn",
+            TaskKind::Compaction => "compaction",
+        }
+    }
 }
 
 /// 任务槽 Drop 守卫：无论任务 future 正常结束、被取消（abort/drop）还是 **panic**，

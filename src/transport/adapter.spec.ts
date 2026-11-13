@@ -52,6 +52,12 @@ const HOST_SETTINGS = {
 
 interface ScriptedBridge extends HostBridge {
   readonly calls: { command: string; args: Record<string, unknown> | undefined }[]
+  /** 运行态宿主替身：`session_runtime` 与 `list_sessions.running` 都从这里出。 */
+  readonly host: {
+    active: { sessionId: string; kind: 'turn' | 'compaction' } | null
+    failRuntime: boolean
+    listRunning: boolean
+  }
   emit(sessionId: string, msg: EventMsg, agentId?: string, tsMs?: number): void
 }
 
@@ -81,6 +87,7 @@ function scriptedBridge(
   sendTaskHandler?: (args: Record<string, unknown> | undefined) => unknown,
 ): ScriptedBridge {
   const calls: ScriptedBridge['calls'] = []
+  const host: ScriptedBridge['host'] = { active: null, failRuntime: false, listRunning: false }
   const handlers = new Set<(event: AgentEvent) => void>()
   let counter = 0
   // SH-100 的侧车状态（每份桥独立克隆，避免测试间串味）
@@ -99,6 +106,7 @@ function scriptedBridge(
   const sessionPreset = new Map<string, string>()
   return {
     calls,
+    host,
     async invoke<T>(command: string, args?: Record<string, unknown>): Promise<T> {
       calls.push({ command, args })
       if (command === 'get_settings') return state as T
@@ -259,8 +267,20 @@ function scriptedBridge(
         if (searchHandler === undefined) return { items: [], hasMore: false } as T
         return searchHandler(args) as T
       }
+      if (command === 'session_runtime') {
+        if (host.failRuntime) throw { code: 'IPC_FAILED', message: '运行态查询失败' }
+        return host.active as T
+      }
       if (command === 'list_sessions') {
-        return [{ agentId: 'agent-new', updatedAt: 1, title: '首条任务', workspaceRoot: 'W' }] as T
+        return [{
+          agentId: 'agent-new',
+          updatedAt: 1,
+          title: '首条任务',
+          workspaceRoot: 'W',
+          blank: true,
+          running: host.listRunning,
+          activeTask: host.listRunning ? 'turn' : null,
+        }] as T
       }
       if (command === 'fork_session') return 'agent-fork' as T
       if (command === 'rename_session') {
@@ -1329,20 +1349,19 @@ describe('适配层的命令面映射', () => {
     dispose()
   })
 
-  it('list 返回带 sessionId 的 wire 形状，running 反映真实在跑的回合', async () => {
+  it('list 的 running 以宿主为准：本地 journal 开着也不算在跑', async () => {
     const bridge = scriptedBridge()
     const { remote, dispose } = createAdapter({ bridge })
     const session = faceOf(remote).session
     const idle = (await session.list())['value'] as { items: Record<string, unknown>[] }
     expect(idle.items[0]).toMatchObject({ sessionId: 'agent-new', cwd: 'W', running: false, formatStatus: 'current' })
 
+    // 本地已发 prompt（journal.taskOpen=true），但宿主仍说空闲 → 必须显示空闲。
     await session.prompt({ sessionId: 'agent-new', requestId: 'rpc-3', content: [{ type: 'text', text: '在跑' }] })
-    const busy = (await session.list())['value'] as { items: { running: boolean }[] }
-    expect(busy.items[0]?.running).toBe(true)
+    expect(((await session.list())['value'] as { items: { running: boolean }[] }).items[0]?.running).toBe(false)
 
-    bridge.emit('agent-new', { type: 'turn_completed', turn: 1, reason: 'completed' })
-    const done = (await session.list())['value'] as { items: { running: boolean }[] }
-    expect(done.items[0]?.running).toBe(false)
+    bridge.host.listRunning = true
+    expect(((await session.list())['value'] as { items: { running: boolean }[] }).items[0]?.running).toBe(true)
     dispose()
   })
 
@@ -1980,7 +1999,7 @@ describe('适配层的命令面映射', () => {
     expect(detailOf(zeroEvents)).not.toContain('重试')
   })
 
-  it('旧档案没有结局行 → 回放收口为 unknown，不冒充成功', async () => {
+  it('旧档案没有结局行 → 宿主确认空闲后收口为 interrupted，不冒充成功', async () => {
     const archive = [
       { kind: 'message', role: 'user', text: '问' },
       { kind: 'message', role: 'assistant', text: '答' },
@@ -1994,7 +2013,39 @@ describe('适配层的命令面映射', () => {
     const reason = (events.find(event => event['type'] === 'turn/end')?.['data'] as {
       reason: { kind: string }
     }).reason
-    expect(reason.kind).toBe('unknown')
+    expect(reason.kind).toBe('interrupted')
+  })
+
+  it('宿主说本会话还在跑 → 重建不补 turn_end，实时帧继续落在同一回合', async () => {
+    const archive = [
+      { kind: 'message', role: 'user', text: '问' },
+      { kind: 'message', role: 'assistant', text: '答到一半' },
+    ]
+    const bridge = scriptedBridge(undefined, archive)
+    bridge.host.active = { sessionId: 'agent-old', kind: 'turn' }
+    const reopened = createAdapter({ bridge })
+    const iterator = faceOf(reopened.remote).session.follow({ address: { kind: 'session', sessionId: 'agent-old' } })
+    const events = eventsOf((await iterator.next()).value as Record<string, unknown>)
+    await iterator.return?.(undefined)
+    reopened.dispose()
+
+    expect(events.find(event => event['type'] === 'turn/end')).toBeUndefined()
+  })
+
+  it('宿主运行态查询失败 → 不写 turn_end，按未知处理', async () => {
+    const archive = [
+      { kind: 'message', role: 'user', text: '问' },
+      { kind: 'message', role: 'assistant', text: '答到一半' },
+    ]
+    const bridge = scriptedBridge(undefined, archive)
+    bridge.host.failRuntime = true
+    const reopened = createAdapter({ bridge })
+    const iterator = faceOf(reopened.remote).session.follow({ address: { kind: 'session', sessionId: 'agent-old' } })
+    const events = eventsOf((await iterator.next()).value as Record<string, unknown>)
+    await iterator.return?.(undefined)
+    reopened.dispose()
+
+    expect(events.find(event => event['type'] === 'turn/end')).toBeUndefined()
   })
 
   it('重开档案按条目 at_ms 还原时间：不再把整段历史压成打开会话那一刻', async () => {

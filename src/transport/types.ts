@@ -10,6 +10,29 @@ export type SubagentExitStatus = 'done' | 'failed' | 'cancelled';
 export type JsonValue = null | boolean | number | string | JsonValue[] | { [key: string]: JsonValue };
 
 /**
+ * 宿主 `list_sessions` 的一行（与 `src-tauri/src/lib.rs` 的 `SessionRow` 同形）。
+ *
+ * **唯一一份声明**：会话列表、空白复用、标题回填、fork 四处共用。`running` 是宿主
+ * 判定，界面不得再用本地 `journal.taskOpen` 推断——那只是本进程的观察状态。
+ */
+export interface SessionListRow {
+  readonly agentId: string
+  readonly updatedAt: number
+  readonly title: string
+  readonly workspaceRoot: string
+  readonly blank: boolean
+  readonly running: boolean
+  /** 在跑的任务种类；宿主空闲时为 null。 */
+  readonly activeTask: 'turn' | 'compaction' | null
+}
+
+/** 宿主 `session_runtime` 的返回值（与 Rust `ActiveTaskView` 同形）；null = 空闲。 */
+export interface ActiveTaskView {
+  readonly sessionId: string
+  readonly kind: 'turn' | 'compaction'
+}
+
+/**
  * 宿主 `load_session` 返回的一条档案条目（与 `src-tauri/src/lib.rs` 的 `SessionEntry` 同形）。
  *
  * **唯一一份声明**：它有两个消费面——实时 journal 回放（`adapter.ts`）与导出/复制

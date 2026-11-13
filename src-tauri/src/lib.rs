@@ -831,14 +831,65 @@ fn resume_session(
         .map_err(SendTaskError::Plain)
 }
 
+/// 会话列表的一行：档案摘要 + **宿主**的运行态。
+///
+/// 运行态是瞬态的，不进 `rollout::SessionSummary`——那是档案/搜索/导出共用的磁盘模型，
+/// 加字段会让别的路径序列化出假的 `running: false`。这里用 flatten 只做出口装饰。
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize)]
+#[serde(rename_all = "camelCase")]
+struct SessionRow {
+    #[serde(flatten)]
+    summary: rollout::SessionSummary,
+    /// 宿主判定该会话此刻是否真的有任务在跑。界面唯一事实源。
+    running: bool,
+    /// 在跑的任务种类（`turn` / `compaction`）；空闲为 None。
+    active_task: Option<&'static str>,
+}
+
+/// 当前活动任务的宿主视图（`session_runtime` 的返回值）。
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize)]
+#[serde(rename_all = "camelCase")]
+struct ActiveTaskView {
+    session_id: String,
+    kind: &'static str,
+}
+
+/// 把宿主运行态贴到摘要上：只装饰已有行，**不**为活动会话凭空造行
+/// （活动会话可能还没建档，列表不该多出一份虚构摘要）。
+fn decorate_session_rows(
+    summaries: Vec<rollout::SessionSummary>,
+    active: Option<(String, app_state::TaskKind)>,
+) -> Vec<SessionRow> {
+    let (active_id, active_kind) = match active {
+        Some((id, kind)) => (Some(id), Some(kind.as_str())),
+        None => (None, None),
+    };
+    summaries
+        .into_iter()
+        .map(|summary| {
+            let running = active_id.as_deref() == Some(summary.agent_id.as_str());
+            SessionRow { summary, running, active_task: if running { active_kind } else { None } }
+        })
+        .collect()
+}
+
 /// 会话列表（SH-033）：档案目录里的摘要，按更新时间倒序。
 ///
 /// 返回空列表而不是错误：档案目录不存在是**首次运行的正常状态**，
 /// 把它当错误会让前端在干净安装上必须写一条特判分支，而那条分支什么也修不了。
 #[tauri::command]
-fn list_sessions(app: tauri::AppHandle) -> Vec<rollout::SessionSummary> {
+fn list_sessions(app: tauri::AppHandle) -> Vec<SessionRow> {
     let state = app.state::<AppState>();
-    rollout::list(&state.data_root().join(rollout::ROLLOUT_DIR))
+    let summaries = rollout::list(&state.data_root().join(rollout::ROLLOUT_DIR));
+    decorate_session_rows(summaries, state.active_task())
+}
+
+/// 宿主当前在跑什么（None = 空闲）。前端重建档案前必须问这一句：
+/// 只有宿主确认「本会话没有任务」才允许补写 `turn_end`。
+#[tauri::command]
+fn session_runtime(app: tauri::AppHandle) -> Option<ActiveTaskView> {
+    let state = app.state::<AppState>();
+    state.active_task().map(|(session_id, kind)| ActiveTaskView { session_id, kind: kind.as_str() })
 }
 
 /// 会话内切档（`/permission` 的宿主面，对齐 DSH 的 `sandbox/mode` 会话事件）。
@@ -3287,6 +3338,7 @@ pub fn run() {
             create_session,
             resume_session,
             list_sessions,
+            session_runtime,
             load_session,
             search_sessions,
             retry_session_index,
@@ -3559,6 +3611,64 @@ pub fn run() {
         })
         .run(tauri::generate_context!())
         .expect("SHANIU 启动失败");
+}
+
+#[cfg(test)]
+mod session_rows_tests {
+    use super::{decorate_session_rows, SessionRow};
+    use crate::app_state::TaskKind;
+    use crate::rollout::SessionSummary;
+
+    fn summary(id: &str) -> SessionSummary {
+        SessionSummary {
+            agent_id: id.to_string(),
+            parent_id: None,
+            created_at: 0,
+            updated_at: 0,
+            model: String::new(),
+            workspace_root: String::new(),
+            title: String::new(),
+            item_count: 0,
+            blank: true,
+        }
+    }
+
+    fn running_of(rows: &[SessionRow], id: &str) -> Option<bool> {
+        rows.iter().find(|row| row.summary.agent_id == id).map(|row| row.running)
+    }
+
+    /// 反向对照：把 `running` 改成恒 false，第一条断言必红。
+    #[test]
+    fn active_session_is_marked_running() {
+        let rows = decorate_session_rows(
+            vec![summary("sess-a"), summary("sess-b")],
+            Some((String::from("sess-b"), TaskKind::Turn)),
+        );
+        assert_eq!(running_of(&rows, "sess-a"), Some(false));
+        assert_eq!(running_of(&rows, "sess-b"), Some(true));
+        assert_eq!(rows[1].active_task, Some("turn"));
+        assert_eq!(rows[0].active_task, None);
+    }
+
+    #[test]
+    fn idle_marks_every_row_not_running() {
+        let rows = decorate_session_rows(vec![summary("sess-a"), summary("sess-b")], None);
+        assert_eq!(running_of(&rows, "sess-a"), Some(false));
+        assert_eq!(running_of(&rows, "sess-b"), Some(false));
+        assert!(rows.iter().all(|row| row.active_task.is_none()));
+    }
+
+    /// 活动会话还没建档时不能凭空多出一行摘要——那是编造出来的会话。
+    #[test]
+    fn active_session_outside_list_does_not_add_row() {
+        let rows = decorate_session_rows(
+            vec![summary("sess-a")],
+            Some((String::from("sess-new"), TaskKind::Compaction)),
+        );
+        assert_eq!(rows.len(), 1);
+        assert_eq!(running_of(&rows, "sess-a"), Some(false));
+        assert!(rows[0].active_task.is_none());
+    }
 }
 
 #[cfg(test)]

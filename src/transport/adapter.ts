@@ -36,7 +36,7 @@ import {
   relaySourceOf, settledNoticeOf, timingProjectionOf,
   type SubagentCatalogEntry, type SubagentCatalogEventData, type SubagentTimingState,
 } from './subagent-wire'
-import type { AgentEvent, CompactionTrigger, EventMsg, SessionEntryLike, TurnErrorInfo, VerifyState } from './types'
+import type { ActiveTaskView, AgentEvent, CompactionTrigger, EventMsg, SessionEntryLike, SessionListRow, TurnErrorInfo, VerifyState } from './types'
 import { archiveImageToPrompt, imageContentBlocks, type PromptImageRef } from './image-ref'
 import type { HostBridge } from './tauri'
 
@@ -358,6 +358,11 @@ interface Journal {
   turn: number
   step: number
   taskOpen: boolean
+  /**
+   * 重建档案时宿主运行态查询失败（IPC 异常）。它只用于避免把用户消息压进
+   * 「等 turn 收口才冲刷」的队列；**不落盘、不进 wire 契约**。
+   */
+  hostRuntimeUnknown: boolean
   text: string
   reasoning: string
   chunkIndex: number
@@ -644,7 +649,10 @@ function archiveTurnReason(reason: string, error?: TurnErrorInfo): Record<string
     case 'budget_exhausted':
       return { kind: 'error', error: { code: 'BUDGET_EXHAUSTED', message: '本轮已达到轮次上限' } }
     default:
-      return { kind: 'unknown' }
+      // 档案没记录可信结局（旧档缺 turn_end 行、进程中途退出）。上游 `turn/end`
+      // 没有 `unknown` 这个 reason，语义对应的就是 `interrupted`：
+      // 「崩溃/缺结尾的回合事后被补上收口」。界面据此常开，不折叠成正常完成。
+      return { kind: 'interrupted' }
   }
 }
 
@@ -653,7 +661,7 @@ function newJournal(createdAt: number): Journal {
   return {
     serial: journalSerial,
     seq: -1, revision: 0, log: new FrameLog(), createdAt,
-    turn: 0, step: 0, taskOpen: false, text: '', reasoning: '', chunkIndex: 0,
+    turn: 0, step: 0, taskOpen: false, hostRuntimeUnknown: false, text: '', reasoning: '', chunkIndex: 0,
     attemptOpen: false, attemptSeq: -1, attemptId: '',
     attemptStream: [], attemptTurn: 0, attemptStep: 0, attemptStartedAfterSeq: -1,
     usage: undefined, outputs: new Map(),
@@ -1518,6 +1526,8 @@ export function createAdapter(options: AdapterOptions): { remote: unknown; dispo
     journal.turn += 1
     journal.step = 0
     journal.taskOpen = true
+    // 真实回合已经开始，重建时那次「宿主运行态查询失败」不再成立。
+    journal.hostRuntimeUnknown = false
   }
 
   const closeTask = (sessionId: string, journal: Journal, reason: Record<string, unknown>, interrupted: boolean): void => {
@@ -1544,7 +1554,10 @@ export function createAdapter(options: AdapterOptions): { remote: unknown; dispo
    * - 终态：档案里的工具输出**已经**带着后端写的 `[exit code: N]` 尾标记，这里只
    *   读它、不再追加一次。
    */
-  const replayArchive = (entries: readonly SessionEntryLike[]): Journal => {
+  const replayArchive = (
+    entries: readonly SessionEntryLike[],
+    close: { closeOpenTurn: boolean; runtimeUnknown: boolean },
+  ): Journal => {
     const journal = newJournal(now())
     let stepOpen = false
     /**
@@ -1565,7 +1578,9 @@ export function createAdapter(options: AdapterOptions): { remote: unknown; dispo
       closeStepMetrics(journal)
       stepOpen = false
     }
-    const closeTurn = (reason: Record<string, unknown> = { kind: 'unknown' }): void => {
+    // 默认收口只用于「回合没有可信结局」：上游对应 `interrupted`（事后补收口），
+    // 不用 `unknown`——它不在 turn/end 的合法 reason 里。
+    const closeTurn = (reason: Record<string, unknown> = { kind: 'interrupted' }): void => {
       closeStep()
       if (!journal.taskOpen) return
       pushEvent(journal, 'turn/end', { turn: journal.turn, reason })
@@ -1588,7 +1603,7 @@ export function createAdapter(options: AdapterOptions): { remote: unknown; dispo
         // 每条档案条目带自己的落档时刻：本条事件取它，不再取打开会话那一刻。
         replayClock = 'at_ms' in entry && (entry.at_ms ?? 0) > 0 ? entry.at_ms : 0
         if (entry.kind === 'turn_end') {
-          // 结局行：新档案才有；旧档案走到末尾时 closeTurn() 会落 unknown。
+          // 结局行：新档案才有；旧档案走到末尾时由宿主确认空闲后补 `interrupted`。
           if (entry.turn === journal.turn) closeTurn(archiveTurnReason(entry.reason, entry.error))
           journal.entryToSeq[index] = journal.seq
           return
@@ -1696,8 +1711,11 @@ export function createAdapter(options: AdapterOptions): { remote: unknown; dispo
         }
         journal.entryToSeq[index] = journal.seq
       })
-      // 末尾收口：取最后一条条目的时刻；旧档案没有 at_ms → 0（读侧显示「记录时刻不可用」）。
-      closeTurn()
+      // 末尾收口只在宿主**确认**本会话没有任务时执行（运行态以宿主为准）：
+      // 任务真在跑还补一条 turn_end，后续实时帧会挂到已收口的回合上。
+      // 查询失败同样不写——那是「不知道」，不是「空闲」。
+      if (close.closeOpenTurn) closeTurn()
+      else journal.hostRuntimeUnknown = close.runtimeUnknown
     } finally {
       replayClock = undefined
     }
@@ -2299,11 +2317,23 @@ export function createAdapter(options: AdapterOptions): { remote: unknown; dispo
   const rebuildFromArchive = async (sessionId: string): Promise<Journal | undefined> => {
     const entries = await bridge.invoke<SessionEntryLike[]>('load_session', { agentId: sessionId })
     if (entries.length === 0) return undefined
-    const replayed = replayArchive(entries)
+    // 运行态只问宿主：只有它确认「本会话没有任务」才允许把未收口的回合并掉。
+    // 查询失败如实按未知处理——不写 turn_end，也不冒充空闲。
+    const host = await bridge.invoke<ActiveTaskView | null>('session_runtime')
+      .then(view => ({ known: true as const, view }))
+      .catch((reason: unknown) => {
+        console.warn('[SHANIU] 宿主运行态查询失败，档案重建按未知处理', reason)
+        return { known: false as const, view: null }
+      })
+    const runningHere = host.known && host.view?.sessionId === sessionId
+    const replayed = replayArchive(entries, {
+      closeOpenTurn: host.known && !runningHere,
+      runtimeUnknown: !host.known,
+    })
     journals.set(sessionId, replayed)
     if (!titles.has(sessionId)) {
-      const rows = await bridge.invoke<{ agentId: string; title: string }[]>('list_sessions')
-        .catch((): { agentId: string; title: string }[] => [])
+      const rows = await bridge.invoke<SessionListRow[]>('list_sessions')
+        .catch((): SessionListRow[] => [])
       const hostTitle = rows.find(row => row.agentId === sessionId)?.title ?? ''
       if (hostTitle !== '') {
         pushTitle(sessionId, hostTitle)
@@ -2426,8 +2456,7 @@ export function createAdapter(options: AdapterOptions): { remote: unknown; dispo
 
   const sessionNamespace = {
     list: async () => {
-      const rows = await bridge
-        .invoke<{ agentId: string; updatedAt: number; title: string; workspaceRoot: string; blank: boolean }[]>('list_sessions')
+      const rows = await bridge.invoke<SessionListRow[]>('list_sessions')
       return OK({
         items: rows.map(row => {
           const title = titles.get(row.agentId) ?? row.title
@@ -2435,7 +2464,9 @@ export function createAdapter(options: AdapterOptions): { remote: unknown; dispo
             agentAvailable: true,
             sessionId: row.agentId,
             cwd: row.workspaceRoot,
-            running: journals.get(row.agentId)?.taskOpen === true,
+            // 运行态以宿主为准：本地 journal 只说明「本进程观察过什么」，
+            // 从未打开过的会话它根本不知道。
+            running: row.running === true,
             // blank 的权威判定在宿主（折叠前缀无 turn，SH-100 探索报告 list.ts:51）：
             // 后端按 item_count==0 给出，face 不用 title 猜——title 为空但已有
             // turn 的会话（如被截断的 fork）不是 blank。
@@ -2474,13 +2505,13 @@ export function createAdapter(options: AdapterOptions): { remote: unknown; dispo
       const [flags, rows] = await Promise.all([
         readWorkspaceFlags(),
         bridge
-          .invoke<{ agentId: string; workspaceRoot: string; updatedAt: number; blank: boolean }[]>('list_sessions')
-          .catch((): { agentId: string; workspaceRoot: string; updatedAt: number; blank: boolean }[] => []),
+          .invoke<SessionListRow[]>('list_sessions')
+          .catch((): SessionListRow[] => []),
       ])
       const reusableBlank = rows.find(row =>
         row.blank && row.workspaceRoot === cwd
           && !flags.archivedSessionIds.includes(row.agentId)
-          && journals.get(row.agentId)?.taskOpen !== true,
+          && row.running !== true,
       )?.agentId
       const agentId = await bridge.invoke<string>('create_session', {
         ...(cwd === face.workspaceRoot() ? {} : { workspacePath: cwd }),
@@ -2503,7 +2534,7 @@ export function createAdapter(options: AdapterOptions): { remote: unknown; dispo
         sessionId: agentId,
         cwd: reused?.workspaceRoot ?? cwd,
         updatedAt: Date.now(),
-        running: journals.get(agentId)?.taskOpen === true,
+        running: reused?.running === true,
         blank: reused?.blank ?? true,
         formatStatus: 'current',
       })
@@ -2549,8 +2580,8 @@ export function createAdapter(options: AdapterOptions): { remote: unknown; dispo
       // fork 会话继承源会话的工作区（可能在任意一家）：逐家重推受影响的视图
       const flags = await readWorkspaceFlags()
       const rows = await bridge
-        .invoke<{ agentId: string; workspaceRoot: string; updatedAt: number }[]>('list_sessions')
-        .catch((): { agentId: string; workspaceRoot: string; updatedAt: number }[] => [])
+        .invoke<SessionListRow[]>('list_sessions')
+        .catch((): SessionListRow[] => [])
       for (const ws of registeredWorkspaces()) {
         workspaceLog.append({ type: 'upsert', workspace: await workspaceViewFor(ws, rows, flags) })
       }
@@ -2565,7 +2596,7 @@ export function createAdapter(options: AdapterOptions): { remote: unknown; dispo
       // 自动补发。跨会话撞全局单任务闸仍走原路报错（队列只管本会话的收口补发）。
       if (request.sessionId !== undefined) {
         const busy = journals.get(request.sessionId)
-        if (busy?.taskOpen === true && request.requestId !== undefined) {
+        if (busy?.taskOpen === true && busy.hostRuntimeUnknown !== true && request.requestId !== undefined) {
           queueSeq += 1
           busy.queue = [...busy.queue, {
             id: `shaniu-queued-${queueSeq}`,
