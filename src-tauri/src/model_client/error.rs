@@ -96,11 +96,21 @@ impl ModelError {
     /// HTTP 状态 + 错误体 → 结构化错误。
     ///
     /// 分类顺序：先看错误体里的额度关键词（有些端点用 400/403 报余额不足），
-    /// 再看状态码。这样“余额不足”不会被误报成“密钥无效”。
+    /// 再看 400/422 能否从错误体里判出更具体的原因（上下文超长/内容过滤），
+    /// 最后才按状态码兜底。这样“余额不足”不会被误报成“密钥无效”，
+    /// 真实端点用 HTTP 400 + `context_length_exceeded` 报超长时也能走到反应式压缩。
     pub fn from_status(status: u16, body: &str) -> Self {
         let (provider_code, provider_message) = provider_fields(body);
         let kind = if quota_hit(provider_code.as_deref(), provider_message.as_deref()) {
             ModelErrorKind::Quota
+        } else if matches!(status, 400 | 422) {
+            // 只接受错误体**明确**判出的超长/内容过滤；参数错误、纯文本错误体、
+            // 判不出来的一律保持 BAD_REQUEST。宁可漏判，也不能错判成超长——
+            // 错判会触发一次无意义的摘要与重放，白烧额度。
+            match body_kind(provider_code.as_deref(), provider_message.as_deref()) {
+                kind @ (ModelErrorKind::ContextTooLong | ModelErrorKind::ContentFiltered) => kind,
+                _ => ModelErrorKind::BadRequest,
+            }
         } else {
             match status {
                 401 | 403 => ModelErrorKind::Auth,
@@ -285,10 +295,12 @@ fn quota_hit(code: Option<&str>, message: Option<&str>) -> bool {
     .any(|needle| haystack.contains(needle))
 }
 
-/// 流内错误体 → 大类（P0-3）。
+/// 流内错误体 → 大类（P0-3）。`from_status` 对 400/422 也复用它，避免两套关键词。
 ///
-/// 顺序固定：额度 → 上下文 → 内容过滤 → 限流 → 鉴权 → 超时 → 网络 → 服务端 → 请求格式。
-/// 先判具体原因再看兜底，避免 "context_length_exceeded" 被当成普通 400。
+/// 顺序固定：额度 → 内容过滤 → 上下文 → 限流 → 鉴权 → 超时 → 网络 → 服务端 → 请求格式。
+/// 内容过滤必须排在上下文之前：内容策略是确定性拒绝，摘要与重放救不了，
+/// 让 "content_filter" + 超长措辞的错误体落到上下文超长只会白烧一次压缩。
+/// 之后先判具体原因再看兜底，避免 "context_length_exceeded" 被当成普通 400。
 fn body_kind(code: Option<&str>, message: Option<&str>) -> ModelErrorKind {
     let code = code.unwrap_or_default().to_ascii_lowercase();
     let message = message.unwrap_or_default().to_ascii_lowercase();
@@ -297,6 +309,16 @@ fn body_kind(code: Option<&str>, message: Option<&str>) -> ModelErrorKind {
 
     if quota_hit(Some(&code), Some(&message)) {
         return ModelErrorKind::Quota;
+    }
+    if hit(&[
+        "content_filter",
+        "content_policy_violation",
+        "content policy",
+        "safety system",
+        "内容过滤",
+        "安全策略",
+    ]) {
+        return ModelErrorKind::ContentFiltered;
     }
     if hit(&[
         "context_length_exceeded",
@@ -309,16 +331,6 @@ fn body_kind(code: Option<&str>, message: Option<&str>) -> ModelErrorKind {
         "超出上下文",
     ]) {
         return ModelErrorKind::ContextTooLong;
-    }
-    if hit(&[
-        "content_filter",
-        "content_policy_violation",
-        "content policy",
-        "safety system",
-        "内容过滤",
-        "安全策略",
-    ]) {
-        return ModelErrorKind::ContentFiltered;
     }
     if hit(&["rate_limit", "rate limit", "too many requests"]) {
         return ModelErrorKind::RateLimited;
@@ -478,6 +490,54 @@ mod tests {
         assert_eq!(error.human, "余额不足");
         assert_eq!(error.http_status, Some(403));
         assert_eq!(error.provider_code.as_deref(), Some("insufficient_quota"));
+    }
+
+    /// 真实端点最常见的形态：HTTP 400 + 错误体点名上下文超长。
+    /// 判据见 `evals/repo/fixtures/repo_feat_context_overflow.rs` 与失败面题
+    /// `fail-context-overflow-http400`：必须落到独立分类，才能走反应式压缩。
+    #[test]
+    fn http_400_context_overflow_body_maps_to_context_too_long() {
+        let body = r#"{"error":{"code":"context_length_exceeded","message":"This model's maximum context length is 8192 tokens."}}"#;
+        let error = ModelError::from_status(400, body);
+        assert_eq!(error.kind, ModelErrorKind::ContextTooLong);
+        assert_eq!(error.code(), "CONTEXT_TOO_LONG");
+        assert_eq!(error.http_status, Some(400));
+        assert_eq!(error.provider_code.as_deref(), Some("context_length_exceeded"));
+        assert!(!error.human.is_empty());
+    }
+
+    /// 普通坏请求（参数、模型名等）不得被错误体关键词带偏——宁可漏判，
+    /// 也不能判成超长去压缩重放。
+    #[test]
+    fn http_400_plain_bad_request_stays_bad_request() {
+        for body in [
+            r#"{"error":{"code":"invalid_request_error","message":"model not found"}}"#,
+            // 错误体能判成限流，但 400 不是限流形态：只接受超长/内容过滤，其余保持原语义。
+            r#"{"error":{"code":"rate_limit_exceeded","message":"slow down"}}"#,
+            "<html>bad request</html>",
+        ] {
+            let error = ModelError::from_status(400, body);
+            assert_eq!(error.kind, ModelErrorKind::BadRequest, "错误体: {body}");
+            assert_eq!(error.code(), "BAD_REQUEST");
+        }
+    }
+
+    /// 422 与 400 同一类语义（请求本身被拒），错误体点名超长时同样要识别。
+    #[test]
+    fn http_422_context_overflow_body_maps_to_context_too_long() {
+        let body = r#"{"error":{"message":"prompt is too long: 300000 tokens > 128000 maximum"}}"#;
+        assert_eq!(kind(422, body), ModelErrorKind::ContextTooLong);
+    }
+
+    /// 内容过滤优先于超长：内容策略是确定性拒绝，压缩救不了。
+    /// 错误体同时带策略词与超长措辞时，必须判内容过滤，不得触发压缩。
+    #[test]
+    fn content_filter_wins_over_context_overflow() {
+        let body =
+            r#"{"error":{"code":"content_filter","message":"blocked by content policy; prompt is too long"}}"#;
+        let error = ModelError::from_status(400, body);
+        assert_eq!(error.kind, ModelErrorKind::ContentFiltered);
+        assert_ne!(error.kind, ModelErrorKind::ContextTooLong);
     }
 
     #[test]
