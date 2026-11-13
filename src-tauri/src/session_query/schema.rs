@@ -71,7 +71,7 @@ pub fn open_index(path: &Path) -> Result<Connection, SearchError> {
         Existing::Ready(conn) => conn,
         Existing::Rejected(reason) => return Err(SearchError::IndexFailed(reason)),
         Existing::Corrupt(reason) => {
-            tracing::debug!("派生索引 {} 将安全重建：{reason}", path.display());
+            tracing::info!("派生索引 {} 将安全重建：{reason}", path.display());
             if path.exists() {
                 // 保守重建：损坏件改名保留，绝不 unlink 一个可能是别人的数据。
                 quarantine(path)?;
@@ -322,7 +322,7 @@ fn prune_quarantined(newest: &Path, name: &str) {
         if keep.contains(old) {
             continue;
         }
-        tracing::debug!(path = %old.display(), "清理过旧的损坏索引保留件");
+        tracing::info!(path = %old.display(), "清理过旧的损坏索引保留件");
         for suffix in ["", "-wal", "-shm", "-journal"] {
             let mut candidate = old.as_os_str().to_os_string();
             candidate.push(suffix);

@@ -2581,6 +2581,41 @@ impl<'a> MakeWriter<'a> for RedactingMaker {
 pub const LOG_RETENTION_DAYS: u64 = 14;
 pub const LOG_FILE_PREFIX: &str = "shaniu.log";
 
+/// 默认日志级别：INFO。
+///
+/// `tracing::debug!` 的调用默认不落盘，但必须**可达**——排查时用
+/// `SHANIU_LOG_LEVEL=debug`（也接受 trace/warn/error）打开，非法值回落 INFO。
+/// 不把 debug 统一提成 info：那些是每个事件、每个回合都写的开发细节，常态落盘
+/// 只会把真正的告警淹掉。
+fn log_level() -> tracing::Level {
+    parse_log_level(std::env::var("SHANIU_LOG_LEVEL").unwrap_or_default().as_str())
+}
+
+/// 环境变量值 → 级别（大小写不敏感，非法值回落 INFO）。
+fn parse_log_level(raw: &str) -> tracing::Level {
+    raw.trim()
+        .parse::<tracing::Level>()
+        .unwrap_or(tracing::Level::INFO)
+}
+
+#[cfg(test)]
+mod log_level_tests {
+    use super::*;
+
+    #[test]
+    fn debug_can_be_reached_via_env_value() {
+        assert_eq!(parse_log_level("debug"), tracing::Level::DEBUG);
+        assert_eq!(parse_log_level(" DEBUG "), tracing::Level::DEBUG);
+        assert_eq!(parse_log_level("warn"), tracing::Level::WARN);
+    }
+
+    #[test]
+    fn unset_or_invalid_falls_back_to_info() {
+        assert_eq!(parse_log_level(""), tracing::Level::INFO);
+        assert_eq!(parse_log_level("verbose"), tracing::Level::INFO);
+    }
+}
+
 /// 组装订阅器（与全局注册拆开：集成测试用 `with_default` 挂线程级订阅，
 /// 只有生产入口走 set_global_default——全局订阅器一个进程只能设一次）。
 pub fn build_logging(
@@ -2593,7 +2628,7 @@ pub fn build_logging(
     let (non_blocking, guard) =
         tracing_appender::non_blocking(tracing_appender::rolling::daily(&dir, LOG_FILE_PREFIX));
     let subscriber = tracing_subscriber::fmt()
-        .with_max_level(tracing::Level::INFO)
+        .with_max_level(log_level())
         .with_ansi(false)
         .with_writer(RedactingMaker(non_blocking))
         .finish();
