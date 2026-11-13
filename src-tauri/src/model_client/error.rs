@@ -26,12 +26,12 @@ pub enum ModelErrorKind {
     Server,
     /// 404/405：该地址没有这个接口（常见于把 base_url 指到只支持 chat 的端点）。
     EndpointUnsupported,
-    /// 400/422：请求本身被拒。
+    /// 400/413/422：请求本身被拒（413 为请求体过大）。
     BadRequest,
     /// 流正常结束，但没有任何增量、没有工具调用、也没有 usage。
     EmptyResponse,
     /// 上下文超出模型窗口（确定性失败，不重试）。
-    ContextTooLong,
+    ContextOverflow,
     /// 请求/回答被内容安全策略拦截（确定性失败，不重试）。
     ContentFiltered,
     /// 端点明确表示回答未完成（`response.incomplete`，如达到 max_tokens / 内容过滤）。
@@ -86,7 +86,7 @@ impl ModelError {
             ModelErrorKind::EndpointUnsupported => "ENDPOINT_UNSUPPORTED",
             ModelErrorKind::BadRequest => "BAD_REQUEST",
             ModelErrorKind::EmptyResponse => "EMPTY_RESPONSE",
-            ModelErrorKind::ContextTooLong => "CONTEXT_TOO_LONG",
+            ModelErrorKind::ContextOverflow => "CONTEXT_OVERFLOW",
             ModelErrorKind::ContentFiltered => "CONTENT_FILTERED",
             ModelErrorKind::Incomplete => "INCOMPLETE",
             ModelErrorKind::Unknown => "UNKNOWN",
@@ -96,19 +96,21 @@ impl ModelError {
     /// HTTP 状态 + 错误体 → 结构化错误。
     ///
     /// 分类顺序：先看错误体里的额度关键词（有些端点用 400/403 报余额不足），
-    /// 再看 400/422 能否从错误体里判出更具体的原因（上下文超长/内容过滤），
+    /// 再看 400/413/422 能否从错误体里判出更具体的原因（上下文超长/内容过滤），
     /// 最后才按状态码兜底。这样“余额不足”不会被误报成“密钥无效”，
     /// 真实端点用 HTTP 400 + `context_length_exceeded` 报超长时也能走到反应式压缩。
     pub fn from_status(status: u16, body: &str) -> Self {
         let (provider_code, provider_message) = provider_fields(body);
         let kind = if quota_hit(provider_code.as_deref(), provider_message.as_deref()) {
             ModelErrorKind::Quota
-        } else if matches!(status, 400 | 422) {
-            // 只接受错误体**明确**判出的超长/内容过滤；参数错误、纯文本错误体、
-            // 判不出来的一律保持 BAD_REQUEST。宁可漏判，也不能错判成超长——
-            // 错判会触发一次无意义的摘要与重放，白烧额度。
+        } else if matches!(status, 400 | 413 | 422) {
+            // 只接受错误体**明确**判出的原因；参数错误、纯文本错误体、判不出来的
+            // 一律保持 BAD_REQUEST。宁可漏判，也不能错判成超长——错判会触发一次
+            // 无意义的摘要与重放，白烧额度。413（Payload Too Large）只认超长：
+            // 内容过滤的措辞出现在 413 里，不足以说明是上下文问题。
             match body_kind(provider_code.as_deref(), provider_message.as_deref()) {
-                kind @ (ModelErrorKind::ContextTooLong | ModelErrorKind::ContentFiltered) => kind,
+                ModelErrorKind::ContextOverflow => ModelErrorKind::ContextOverflow,
+                ModelErrorKind::ContentFiltered if status != 413 => ModelErrorKind::ContentFiltered,
                 _ => ModelErrorKind::BadRequest,
             }
         } else {
@@ -118,7 +120,6 @@ impl ModelError {
                 404 | 405 => ModelErrorKind::EndpointUnsupported,
                 429 => ModelErrorKind::RateLimited,
                 500..=599 => ModelErrorKind::Server,
-                400 | 422 => ModelErrorKind::BadRequest,
                 _ => ModelErrorKind::Unknown,
             }
         };
@@ -132,7 +133,7 @@ impl ModelError {
             ModelErrorKind::EndpointUnsupported => format!("该地址不支持此接口（HTTP {status}）"),
             ModelErrorKind::BadRequest => format!("请求被拒绝（HTTP {status}）"),
             ModelErrorKind::EmptyResponse => "模型返回了空响应".to_string(),
-            ModelErrorKind::ContextTooLong => "上下文超出模型窗口限制".to_string(),
+            ModelErrorKind::ContextOverflow => "上下文超出模型窗口限制".to_string(),
             ModelErrorKind::ContentFiltered => "请求被内容安全策略拒绝".to_string(),
             ModelErrorKind::Incomplete => "回答未完成".to_string(),
             ModelErrorKind::Unknown => format!("未知错误（HTTP {status}）"),
@@ -149,7 +150,7 @@ impl ModelError {
         let kind = body_kind(provider_code.as_deref(), provider_message.as_deref());
         let human = match kind {
             ModelErrorKind::Quota => "余额不足".to_string(),
-            ModelErrorKind::ContextTooLong => "上下文超出模型窗口限制".to_string(),
+            ModelErrorKind::ContextOverflow => "上下文超出模型窗口限制".to_string(),
             ModelErrorKind::ContentFiltered => "请求被内容安全策略拒绝".to_string(),
             ModelErrorKind::Auth => "密钥无效".to_string(),
             ModelErrorKind::RateLimited => "请求过于频繁，已被限流".to_string(),
@@ -330,7 +331,7 @@ fn body_kind(code: Option<&str>, message: Option<&str>) -> ModelErrorKind {
         "上下文超",
         "超出上下文",
     ]) {
-        return ModelErrorKind::ContextTooLong;
+        return ModelErrorKind::ContextOverflow;
     }
     if hit(&["rate_limit", "rate limit", "too many requests"]) {
         return ModelErrorKind::RateLimited;
@@ -496,11 +497,11 @@ mod tests {
     /// 判据见 `evals/repo/fixtures/repo_feat_context_overflow.rs` 与失败面题
     /// `fail-context-overflow-http400`：必须落到独立分类，才能走反应式压缩。
     #[test]
-    fn http_400_context_overflow_body_maps_to_context_too_long() {
+    fn http_400_context_overflow_body_maps_to_context_overflow() {
         let body = r#"{"error":{"code":"context_length_exceeded","message":"This model's maximum context length is 8192 tokens."}}"#;
         let error = ModelError::from_status(400, body);
-        assert_eq!(error.kind, ModelErrorKind::ContextTooLong);
-        assert_eq!(error.code(), "CONTEXT_TOO_LONG");
+        assert_eq!(error.kind, ModelErrorKind::ContextOverflow);
+        assert_eq!(error.code(), "CONTEXT_OVERFLOW");
         assert_eq!(error.http_status, Some(400));
         assert_eq!(error.provider_code.as_deref(), Some("context_length_exceeded"));
         assert!(!error.human.is_empty());
@@ -524,9 +525,22 @@ mod tests {
 
     /// 422 与 400 同一类语义（请求本身被拒），错误体点名超长时同样要识别。
     #[test]
-    fn http_422_context_overflow_body_maps_to_context_too_long() {
+    fn http_422_context_overflow_body_maps_to_context_overflow() {
         let body = r#"{"error":{"message":"prompt is too long: 300000 tokens > 128000 maximum"}}"#;
-        assert_eq!(kind(422, body), ModelErrorKind::ContextTooLong);
+        assert_eq!(kind(422, body), ModelErrorKind::ContextOverflow);
+    }
+
+    /// 413 只认错误体明确指向超长的形态；其余（含仅有内容过滤措辞）保持坏请求。
+    #[test]
+    fn http_413_only_explicit_overflow_body_maps_to_context_overflow() {
+        let overflow = r#"{"error":{"message":"too many tokens in request"}}"#;
+        assert_eq!(kind(413, overflow), ModelErrorKind::ContextOverflow);
+
+        let plain = r#"{"error":{"message":"payload too large"}}"#;
+        assert_eq!(kind(413, plain), ModelErrorKind::BadRequest);
+
+        let filtered = r#"{"error":{"code":"content_filter","message":"blocked by policy"}}"#;
+        assert_eq!(kind(413, filtered), ModelErrorKind::BadRequest);
     }
 
     /// 内容过滤优先于超长：内容策略是确定性拒绝，压缩救不了。
@@ -537,7 +551,7 @@ mod tests {
             r#"{"error":{"code":"content_filter","message":"blocked by content policy; prompt is too long"}}"#;
         let error = ModelError::from_status(400, body);
         assert_eq!(error.kind, ModelErrorKind::ContentFiltered);
-        assert_ne!(error.kind, ModelErrorKind::ContextTooLong);
+        assert_ne!(error.kind, ModelErrorKind::ContextOverflow);
     }
 
     #[test]
@@ -580,7 +594,7 @@ mod tests {
             ),
             (
                 r#"{"error":{"code":"context_length_exceeded","message":"This model's maximum context length is 128000 tokens"}}"#,
-                ModelErrorKind::ContextTooLong,
+                ModelErrorKind::ContextOverflow,
             ),
             (
                 r#"{"error":{"type":"server_error","message":"upstream exploded"}}"#,

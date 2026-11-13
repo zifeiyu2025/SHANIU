@@ -570,7 +570,7 @@ async fn c15_retryable_stream_error_after_visible_output_is_terminal() {
 /// C16：上下文超长不进通用重试白名单（`retry.rs`），只允许一次反应式压缩；
 /// 压缩失败时立刻以**原始**错误终局——重试一万次也不会变。
 #[tokio::test]
-async fn c16_context_too_long_is_classified_and_not_retried() {
+async fn c16_context_overflow_is_classified_and_not_retried() {
     let body = serde_json::json!({
         "error": {"code": "context_length_exceeded", "message": "maximum context length is 128000 tokens"}
     });
@@ -597,7 +597,7 @@ async fn c16_context_too_long_is_classified_and_not_retried() {
         "补救压缩只允许一次"
     );
     let info = turn_error(&events);
-    assert_eq!(info.code, "CONTEXT_TOO_LONG");
+    assert_eq!(info.code, "CONTEXT_OVERFLOW");
     assert!(info.message.contains("上下文"), "{}", info.message);
 }
 

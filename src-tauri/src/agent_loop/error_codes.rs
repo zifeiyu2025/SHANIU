@@ -19,7 +19,7 @@ pub mod model {
     pub const BAD_REQUEST: &str = "BAD_REQUEST";
     pub const EMPTY_RESPONSE: &str = "EMPTY_RESPONSE";
     /// 上下文超出模型窗口（确定性失败）。
-    pub const CONTEXT_TOO_LONG: &str = "CONTEXT_TOO_LONG";
+    pub const CONTEXT_OVERFLOW: &str = "CONTEXT_OVERFLOW";
     /// 请求/回答被内容安全策略拦截（确定性失败）。
     pub const CONTENT_FILTERED: &str = "CONTENT_FILTERED";
     /// 端点明确表示回答未完成（`response.incomplete`）。
@@ -62,7 +62,7 @@ pub const ALL: &[&str] = &[
     model::ENDPOINT_UNSUPPORTED,
     model::BAD_REQUEST,
     model::EMPTY_RESPONSE,
-    model::CONTEXT_TOO_LONG,
+    model::CONTEXT_OVERFLOW,
     model::CONTENT_FILTERED,
     model::INCOMPLETE,
     model::UNKNOWN,

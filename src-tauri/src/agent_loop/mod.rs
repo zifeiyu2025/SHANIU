@@ -583,7 +583,7 @@ impl AgentLoop {
     /// 与轮首预算压缩的差别只有两条：
     /// 1. 不看阈值——端点已经明确拒绝，`plan_manual` 只回答「压哪一段」；
     /// 2. 结局直接决定能不能重放：没压成 / 没变小都返回 [`OverflowOutcome::GiveUp`]，
-    ///    由调用方抛出**原始** `ContextTooLong`，不拿压缩错误顶替它。
+    ///    由调用方抛出**原始** `ContextOverflow`，不拿压缩错误顶替它。
     ///
     /// 压缩事件仍走 `compaction_started / summarized / ended`，触发原因用
     /// [`crate::events::CompactionTrigger::ContextOverflow`]：用户要能分清这次不是预算触发的。
@@ -678,7 +678,7 @@ impl AgentLoop {
                     // 压缩失败不顶替原始错误：用户要看的是「上下文超出窗口」，
                     // 「总结请求也失败」只是补救没成功，不能当成终局原因。
                     CompactAbort::Failed(message) => {
-                        tracing::warn!(turn, error = %message, "溢出补救失败，保留原始 ContextTooLong");
+                        tracing::warn!(turn, error = %message, "溢出补救失败，保留原始 ContextOverflow");
                         OverflowOutcome::GiveUp
                     }
                     CompactAbort::ArchiveUnavailable(message) => {
@@ -694,7 +694,7 @@ impl AgentLoop {
 /// 溢出补救的结论。
 ///
 /// 只有「确实缩小了历史」才允许重放本步：压缩请求成功但摘要没变小、压缩失败、
-/// 没有可压区间，三者对用户是同一件事——原始 `ContextTooLong` 必须原样报出。
+/// 没有可压区间，三者对用户是同一件事——原始 `ContextOverflow` 必须原样报出。
 enum OverflowOutcome {
     Retry,
     GiveUp,
@@ -1389,7 +1389,7 @@ impl AgentLoop {
                 // 例外：服务端报「上下文超出窗口」时先做一次反应式压缩再重放本步。
                 // 为什么不塞进 `retry.rs`：这是压缩不是重试，请求内容已经变了；
                 // 进通用退避白名单只会让所有不压缩的场景反复打同一份超长上下文。
-                let overflow_rescue = error.kind == crate::model_client::ModelErrorKind::ContextTooLong
+                let overflow_rescue = error.kind == crate::model_client::ModelErrorKind::ContextOverflow
                     && !overflow_compaction_used
                     && !emitted_delta
                     && usage.is_none()
@@ -1420,7 +1420,7 @@ impl AgentLoop {
                             reason = TurnEndReasonLocal::Cancelled;
                             break 'outer;
                         }
-                        // 压缩没发生 / 失败 / 没变小：原始 `ContextTooLong` 原样终局。
+                        // 压缩没发生 / 失败 / 没变小：原始 `ContextOverflow` 原样终局。
                         OverflowOutcome::GiveUp => give_up_without_retry_after(&error),
                     }
                 } else if emitted_delta || usage.is_some() || !calls.is_empty() {
@@ -2738,7 +2738,7 @@ mod tests {
 
     /// 可脚本化「建流阶段失败」的后端：按队列依次返回 `Err` 或一段事件流。
     ///
-    /// 溢出补救的入口正是 `stream()` 返回 `Err(ContextTooLong)`（端点在建流前就拒绝），
+    /// 溢出补救的入口正是 `stream()` 返回 `Err(ContextOverflow)`（端点在建流前就拒绝），
     /// [`ScriptedBackend`] 只会返回事件流，覆盖不到这条路径。队列被问空 = 代码多试了一次，
     /// 直接 panic：无限重放必须让用例红，而不是把测试挂住。
     struct ScriptedResultBackend(
@@ -4187,9 +4187,9 @@ mod tests {
         );
     }
 
-    fn context_too_long_error() -> crate::model_client::ModelError {
+    fn context_overflow_error() -> crate::model_client::ModelError {
         crate::model_client::ModelError::new(
-            crate::model_client::ModelErrorKind::ContextTooLong,
+            crate::model_client::ModelErrorKind::ContextOverflow,
             Some(400),
             Some("context_length_exceeded".into()),
             None,
@@ -4221,12 +4221,12 @@ mod tests {
         Arc::new(ScriptedResultBackend(Mutex::new(scripts.into())))
     }
 
-    /// 溢出补救的主路径：第 1 次请求被端点以 `ContextTooLong` 拒绝 → 强制压缩一次 →
+    /// 溢出补救的主路径：第 1 次请求被端点以 `ContextOverflow` 拒绝 → 强制压缩一次 →
     /// 第 2 次请求成功，回合正常完成。旧代码下这一轮直接失败（白名单里没有它）。
     #[tokio::test]
-    async fn context_too_long_compacts_once_and_replays_the_step() {
+    async fn context_overflow_compacts_once_and_replays_the_step() {
         let mut agent = make_loop_with_backend(result_backend(vec![
-            Err(context_too_long_error()),
+            Err(context_overflow_error()),
             // 压缩请求：只回摘要正文
             Ok(vec![
                 ModelStreamEvent::OutputTextDelta { delta: "压缩摘要".into() },
@@ -4265,17 +4265,17 @@ mod tests {
         assert_eq!(*budget_tokens, 10, "用的是强制压缩预算");
     }
 
-    /// 压缩后仍然超长：只重放一次，最终报**原始** `ContextTooLong`，不无限循环。
+    /// 压缩后仍然超长：只重放一次，最终报**原始** `ContextOverflow`，不无限循环。
     /// 脚本队列只有三格，多问一次会 panic——这条用例同时守住「不得重放两次」。
     #[tokio::test]
     async fn still_too_long_after_compaction_reports_the_original_error() {
         let mut agent = make_loop_with_backend(result_backend(vec![
-            Err(context_too_long_error()),
+            Err(context_overflow_error()),
             Ok(vec![
                 ModelStreamEvent::OutputTextDelta { delta: "压缩摘要".into() },
                 usage_ev(),
             ]),
-            Err(context_too_long_error()),
+            Err(context_overflow_error()),
         ]))
         .0;
         agent.manual_token_budget = 10;
@@ -4292,16 +4292,16 @@ mod tests {
                 e,
                 EventMsg::Error { message } if message == "上下文超出模型窗口限制"
             )),
-            "终局错误必须是原始的 ContextTooLong：{events:?}"
+            "终局错误必须是原始的 ContextOverflow：{events:?}"
         );
     }
 
-    /// 压缩本身失败：不重放，报原始 `ContextTooLong`；历史仍保留原内容，
+    /// 压缩本身失败：不重放，报原始 `ContextOverflow`；历史仍保留原内容，
     /// 不能被半截摘要替换（否则用户既失败又丢了上下文）。
     #[tokio::test]
     async fn failed_compaction_keeps_original_error_and_history() {
         let mut agent = make_loop_with_backend(result_backend(vec![
-            Err(context_too_long_error()),
+            Err(context_overflow_error()),
             Ok(vec![ModelStreamEvent::Incomplete { reason: "max_tokens".into() }]),
         ]))
         .0;
@@ -4336,7 +4336,7 @@ mod tests {
                 e,
                 EventMsg::Error { message } if message == "上下文超出模型窗口限制"
             )),
-            "终局错误必须是原始的 ContextTooLong：{events:?}"
+            "终局错误必须是原始的 ContextOverflow：{events:?}"
         );
         assert!(
             !events.iter().any(|e| matches!(e, EventMsg::CompactionEnded { ok: true, .. })),

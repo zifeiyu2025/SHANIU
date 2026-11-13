@@ -49,19 +49,23 @@ cargo run --manifest-path evals/failure/runner/Cargo.toml --offline -- --only fa
 | `fail-quota-exhausted` | 429 + `insufficient_quota` | 一次终局 `QUOTA`，零重试，provider 字段保留 | `model_client/error.rs#L96-L114`、`retry.rs#L50-L59` |
 | `fail-incomplete-max-output` | `response.incomplete` / `max_output_tokens` | 终局 `INCOMPLETE`，零重试，文案点明最大输出长度 | `model_client/mod.rs#L163-L171`、`error.rs#L214-L222`、`agent_loop/mod.rs#L1345-L1351` |
 | `fail-context-overflow-stream-replay` | 流内 `response.failed` + `context_length_exceeded` | 压缩一次、重放变小且含摘要、收口 | `agent_loop/mod.rs#L1389-L1425`、`#L580-L665` |
-| `fail-context-overflow-http400` | HTTP 400 + 同一错误体 | 同流内判据；**当前 HEAD 预期红**（缺口见下） | `model_client/error.rs#L100-L114`、`evals/repo/fixtures/repo_feat_context_overflow.rs#L9-L22` |
+| `fail-context-overflow-http400` | HTTP 400 + 同一错误体 | 同流内判据；已修复（见下） | `model_client/error.rs#L96-L125`、`evals/repo/fixtures/repo_feat_context_overflow.rs#L9-L22` |
 | `fail-long-session-compaction-anchor` | 预置超预算历史 + 小预算 | 锚点顺序正确；resume 重放首条为摘要；重放请求不含被遮蔽标记 | `agent_loop/mod.rs#L2263`、`rollout/resume.rs#L64-L145` |
 
-## 已知缺口（`fail-context-overflow-http400` 为什么预期红）
+## 已修复（`fail-context-overflow-http400`）
 
-真实端点通常用 **HTTP 400** 报上下文超长。当前 `ModelError::from_status` 对 400/422 一律归
+真实端点通常用 **HTTP 400** 报上下文超长。修复前 `ModelError::from_status` 对 400/422 一律归
 `BadRequest`，只有**流内** `from_body` 才会识别上下文关键词，所以 HTTP 400 形态走不到
-`ContextOverflow` 补救压缩。仓库自己的
-[`repo_feat_context_overflow.rs`](../repo/fixtures/repo_feat_context_overflow.rs) 已经把
-「400 上下文超长要有独立码」登记为要求。该题保留为**缺口探测**：判据不放宽，红必须作为产品
-缺口上报；只有实现补齐后才会变绿。
+`ContextOverflow` 补救压缩。
 
-## 本轮实测（2026-11-13，commit `c5afab0`，工作树除本套件新增文件外干净）
+修复后 `from_status` 对 **400 / 413 / 422** 复用 `body_kind` 的错误体分类：错误体明确判出超长
+才落到 `CONTEXT_OVERFLOW`；413 只认超长，400/422 另外接受内容过滤；判不出来（参数错误、纯文本
+错误体）保持 `BAD_REQUEST`，宁可漏判也不错判成超长去白烧一次摘要与重放。受控词表
+（`agent_loop/error_codes.rs`）中的码名同步为 `CONTEXT_OVERFLOW`。
+
+该题判据未改动，`expect` 由 `gap` 更新为 `pass`（状态更新，不是放宽）。
+
+## 修复前实测（2026-11-13，commit `c5afab0`，工作树除本套件新增文件外干净）
 
 `run_id=1794570544938-15180`，观测见 `evals/results/1794570544938-15180-failure.json`。
 
@@ -79,6 +83,14 @@ cargo run --manifest-path evals/failure/runner/Cargo.toml --offline -- --only fa
 缺口证据：HTTP 400 的错误体已经带了 `context_length_exceeded`，但宿主只按状态码把它归成
 `BAD_REQUEST`，所以压缩一次都没发生（上表请求数 1、压缩触发 0）。这不是判据放宽与否的问题，
 是 `from_status` 没有消费错误体的直接结果。
+
+## 修复后复测（2026-11-13）
+
+`run_id=1794571110020-22108`，**8/8 PASS**（该题 `expect` 已由 `gap` 更新为 `pass`）。
+`fail-context-overflow-http400` 实测：请求 3 次（主请求 996 字符 → 摘要请求 1209 字符 →
+重放 237 字符），压缩 1 次（`trigger=context_overflow`），重放请求已不含 `SEED_OVERFLOW_SHADOW`
+且含 `【交接摘要】`，回合 `completed`，`turn_error=null`。修复前同一题的观测是请求 1 次、
+压缩 0 次、回合 `failed/BAD_REQUEST`。
 
 ## 判据纪律
 

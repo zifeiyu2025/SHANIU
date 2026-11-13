@@ -43,7 +43,7 @@ impl TurnEndReason {
 ///
 /// `code` 是稳定分类码。模型侧：`AUTH` / `QUOTA` / `RATE_LIMIT` / `TIMEOUT` / `NETWORK` /
 /// `SERVER` / `ENDPOINT_UNSUPPORTED` / `BAD_REQUEST` / `EMPTY_RESPONSE` /
-/// `CONTEXT_TOO_LONG` / `CONTENT_FILTERED` / `INCOMPLETE` / `UNKNOWN`；
+/// `CONTEXT_OVERFLOW` / `CONTENT_FILTERED` / `INCOMPLETE` / `UNKNOWN`；
 /// 本地侧：`COMPACTION_FAILED` / `CONTEXT_EXPAND_FAILED` / `TEST_TAMPERING` /
 /// `VERIFY_FAILED`。前端按它本地化，`message` 始终是可读的一句话（不得为空）。
 /// `provider_code` / `provider_message` 是端点原始值（已脱敏），用于展开与对账。
@@ -511,7 +511,7 @@ pub enum CompactionTrigger {
     Pressure,
     /// 用户主动 `/compact`（回合外）。
     Manual,
-    /// 服务端报 `ContextTooLong` 后的补救压缩（对齐 dsh 的 `context-overflow`）。
+    /// 服务端报 `ContextOverflow` 后的补救压缩（对齐 dsh 的 `context-overflow`）。
     ContextOverflow,
 }
 

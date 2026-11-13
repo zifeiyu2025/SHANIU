@@ -226,8 +226,8 @@
     {
       "id": "fail-context-overflow-http400",
       "type": "failure-surface",
-      "title": "HTTP 400 报上下文超长：应与流内报错同一条补救路径（当前缺口）",
-      "description": "第一个主请求直接返回 HTTP 400 + context_length_exceeded 错误体（真实端点最常见的形态）。判据与流内题相同：压缩一次、重放本步、收口。当前 HEAD 把 400 一律归 BadRequest，走不到压缩，故预期红；红必须作为产品缺口上报，不得放宽判据。",
+      "title": "HTTP 400 报上下文超长：应与流内报错同一条补救路径",
+      "description": "第一个主请求直接返回 HTTP 400 + context_length_exceeded 错误体（真实端点最常见的形态）。判据与流内题相同：压缩一次、重放本步、收口。400/413/422 由 from_status 按错误体分类后走同一条补救路径。",
       "task": "请继续处理这个任务并给出结论。",
       "setup": {
         "history": "overflow_seed",
@@ -261,9 +261,9 @@
       "probes": ["SEED_OVERFLOW_SHADOW", "【交接摘要】", "压缩后重放成功"],
       "judge": {
         "key": "context-overflow-http400",
-        "expect": "gap",
+        "expect": "pass",
         "sources": [
-          "src-tauri/src/model_client/error.rs#L100-L114",
+          "src-tauri/src/model_client/error.rs#L96-L125",
           "evals/repo/fixtures/repo_feat_context_overflow.rs#L9-L22",
           "src-tauri/src/agent_loop/mod.rs#L1389-L1425"
         ]
