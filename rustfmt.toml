@@ -1,0 +1,13 @@
+# 对模块根（src/lib.rs、src/config.rs 这类含 `mod x;` 的文件）跑 rustfmt 时，
+# 默认会顺着声明把整棵模块树一起重排。并行开发时这会把别人正在改的子模块
+# 也卷进同一份 diff，看不出谁改了什么。
+#
+# skip_children = true：只格式化命令行点名的那个文件，子模块各自按需单独格式化。
+#
+# 注意（2026-11-13 实测）：本仓库工具链是 stable（rustfmt 1.11.0），`skip_children`
+# 属于 nightly-only 选项，stable 下会被忽略并在每次调用时打印
+# `Warning: can't set skip_children = true`。`rustfmt --print-config current` 仍显示
+# `skip_children = false`。这条配置因此**当前不产生实际拦截效果**，是给未来切到
+# nightly（或 rustfmt 把它转正）时直接生效用的；stable 下真正的保护是
+# 「只对单个文件跑 rustfmt」这条约定。
+skip_children = true
