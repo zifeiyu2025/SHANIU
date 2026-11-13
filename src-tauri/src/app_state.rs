@@ -72,11 +72,13 @@ impl AppState {
             .parent()
             .map(PathBuf::from)
             .unwrap_or_else(std::env::temp_dir);
-        let policy = Arc::new(crate::permission::SessionPolicyHandle::new(
+        // 环境能力由装配层探测后注入：`permission` 不允许反向依赖 `sandbox`（FF-1）。
+        let policy = Arc::new(crate::permission::SessionPolicyHandle::new_with_availability(
             crate::permission::SessionPolicy {
                 approval: config.approval.mode,
                 sandbox: config.sandbox.mode,
             },
+            crate::sandbox::danger_full_access_available(),
         ));
         let broker = Arc::new(ApprovalBroker::new());
         // 回落根在构造时就算好并保持不可变：请求线程不碰配置锁（SH-135 D17）。

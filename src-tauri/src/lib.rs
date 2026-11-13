@@ -1928,7 +1928,11 @@ fn new_session_writer(
     let agent_id = explicit_id.unwrap_or_else(|| state.next_session_id());
     // 档案记**生效**两维：`full_access` 的沙箱已被提升为 danger，记 raw config
     // 会让回放/审计看到一个运行时并未使用的档。
-    let effective = permission::policy::effective_pair(cfg.sandbox.mode, cfg.approval.mode);
+    let effective = permission::policy::effective_pair(
+        cfg.sandbox.mode,
+        cfg.approval.mode,
+        sandbox::danger_full_access_available(),
+    );
     let meta = rollout::RolloutItem::SessionMeta {
         session_id: agent_id.clone(),
         agent_id: agent_id.clone(),
@@ -2224,7 +2228,11 @@ fn get_settings(app: tauri::AppHandle) -> Result<serde_json::Value, String> {
     let active = cfg.effective_model();
     // 安全面回显的是**生效**两维：`full_access` 会把沙箱提升为 danger，
     // 回显 raw config 会让界面显示一个运行时并不使用的沙箱档。
-    let effective = permission::policy::effective_pair(cfg.sandbox.mode, cfg.approval.mode);
+    let effective = permission::policy::effective_pair(
+        cfg.sandbox.mode,
+        cfg.approval.mode,
+        sandbox::danger_full_access_available(),
+    );
     Ok(serde_json::json!({
         "baseUrl": active.base_url,
         "model": active.model,
@@ -2312,7 +2320,11 @@ fn sandbox_status(app: tauri::AppHandle) -> sandbox::SandboxStatus {
     let state = app.state::<AppState>();
     let cfg = state.config();
     // 与运行同一口径：`full_access` 下 raw config 的沙箱档不是实际在用的档。
-    let effective = permission::policy::effective_pair(cfg.sandbox.mode, cfg.approval.mode);
+    let effective = permission::policy::effective_pair(
+        cfg.sandbox.mode,
+        cfg.approval.mode,
+        sandbox::danger_full_access_available(),
+    );
     sandbox::status(effective.sandbox, cfg.sandbox.os)
 }
 
@@ -3185,7 +3197,11 @@ pub fn run() {
     sandbox::set_os_mode(app_config.sandbox.os);
     // 警告按**生效**沙箱档判断：`full_access` 会把沙箱提升为 danger，
     // 此时 raw config 里的 workspace_write 并不生效，不该再报「没有写入边界」。
-    let effective = permission::policy::effective_pair(app_config.sandbox.mode, app_config.approval.mode);
+    let effective = permission::policy::effective_pair(
+        app_config.sandbox.mode,
+        app_config.approval.mode,
+        sandbox::danger_full_access_available(),
+    );
     // `full_access` 是完整档：沙箱被提升时必须留一条启动 warning，写清配置值、
     // 生效值与原因。它与 `permission_downgraded` 是两回事——后者只留给
     // 「环境给不了 danger」的真冲突，不能拿兼任这条正常提升提示。

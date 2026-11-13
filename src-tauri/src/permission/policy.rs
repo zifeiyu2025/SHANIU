@@ -18,7 +18,6 @@ use std::sync::{Arc, Mutex, RwLock};
 
 use crate::config::{ApprovalMode, SandboxMode};
 use crate::events::RiskLevel;
-use crate::sandbox::danger_full_access_available;
 
 /// 代理级工具白名单（ADR-103「权限只降不升」）。
 ///
@@ -171,20 +170,26 @@ pub struct SessionPolicyHandle {
     inner: Arc<RwLock<SessionPolicy>>,
     /// 生效档与配置冲突的说明（目前只有「环境给不了无沙箱执行」一种）。
     note: Arc<Mutex<Option<String>>>,
+    /// 本环境能否提供无沙箱执行。由装配层注入：`permission` 不允许反向依赖
+    /// `sandbox`（FF-1 零出边），能力探测只能发生在组合根/装配层。
+    danger_available: bool,
 }
 
 impl SessionPolicyHandle {
+    /// 默认按「当前 Windows 实现恒能提供 danger」构造；需要如实探测环境的装配点
+    /// 用 [`Self::new_with_availability`]（`AppState` 走的就是那条）。
     pub fn new(policy: SessionPolicy) -> Self {
-        Self::new_with_availability(policy, danger_full_access_available())
+        Self::new_with_availability(policy, true)
     }
 
-    /// 显式传入环境能力的构造入口（测试用）：生产路径一律走 [`Self::new`]，
-    /// 由 [`danger_full_access_available`] 给出与沙箱实现同源的判据。
+    /// 显式传入环境能力的构造入口：由装配层调用 `sandbox::danger_full_access_available()`
+    /// 注入，避免策略层自己猜环境。
     pub(crate) fn new_with_availability(policy: SessionPolicy, danger_available: bool) -> Self {
         let (policy, note) = normalize(policy, danger_available);
         Self {
             inner: Arc::new(RwLock::new(policy)),
             note: Arc::new(Mutex::new(note)),
+            danger_available,
         }
     }
 
@@ -195,7 +200,7 @@ impl SessionPolicyHandle {
     /// 重置会话策略（任务启动时由装配层调用）：上一任务运行中切换的档位
     /// 不得泄漏到下一任务——那等于把"会话内切换"变成了事实上的全局开关。
     pub fn reset(&self, policy: SessionPolicy) {
-        self.reset_with_availability(policy, danger_full_access_available());
+        self.reset_with_availability(policy, self.danger_available);
     }
 
     pub(crate) fn reset_with_availability(&self, policy: SessionPolicy, danger_available: bool) {
@@ -212,7 +217,7 @@ impl SessionPolicyHandle {
     /// 环境给不了无沙箱执行时**返回错误而不是静默降档**。
     pub fn set_approval(&self, mode: ApprovalMode) -> Result<(), String> {
         let requested = SessionPolicy { approval: mode, sandbox: self.snapshot().sandbox };
-        let (next, note) = normalize(requested, danger_full_access_available());
+        let (next, note) = normalize(requested, self.danger_available);
         if next.approval != mode {
             return Err(note.unwrap_or_else(|| "当前环境无法提供 full_access".to_string()));
         }
@@ -230,8 +235,8 @@ impl SessionPolicyHandle {
 ///
 /// 唯一保留的回落是「环境本身给不了无沙箱执行」：这时配置与能力冲突，
 /// 回落 `on_request` 并留下可播报的说明，指出该改哪一行；不静默放宽，
-/// 也不静默按更严档跑。判据由 [`danger_full_access_available`] 提供，
-/// 与沙箱的 `enforcement_of` 同源，不另立一份「大概能」的清单。
+/// 也不静默按更严档跑。判据由装配层注入（`sandbox::danger_full_access_available()`，
+/// 与沙箱的 `enforcement_of` 同源），策略层不反向依赖 `sandbox`，也不另立清单。
 fn normalize(policy: SessionPolicy, danger_available: bool) -> (SessionPolicy, Option<String>) {
     if policy.approval != ApprovalMode::FullAccess {
         return (policy, None);
@@ -253,8 +258,8 @@ fn normalize(policy: SessionPolicy, danger_available: bool) -> (SessionPolicy, O
 ///
 /// 界面/档案回显必须用它：直接回显 `config.sandbox.mode` 会在
 /// `full_access` 下显示一个运行时并不使用的沙箱档。
-pub fn effective_pair(sandbox: SandboxMode, approval: ApprovalMode) -> SessionPolicy {
-    normalize(SessionPolicy { approval, sandbox }, danger_full_access_available()).0
+pub fn effective_pair(sandbox: SandboxMode, approval: ApprovalMode, danger_available: bool) -> SessionPolicy {
+    normalize(SessionPolicy { approval, sandbox }, danger_available).0
 }
 
 /// 一条命令前缀白名单规则（ADR-007③）。`id` 就是规则原文——审计与界面共用，
@@ -620,7 +625,7 @@ mod tests {
         );
 
         // 归一化：配置 full_access + 非 danger → 沙箱提升为 danger，审批档保持不变。
-        let normalized = effective_pair(SandboxMode::WorkspaceWrite, ApprovalMode::FullAccess);
+        let normalized = effective_pair(SandboxMode::WorkspaceWrite, ApprovalMode::FullAccess, true);
         assert_eq!(normalized.approval, ApprovalMode::FullAccess, "不再回落审批档");
         assert_eq!(normalized.sandbox, SandboxMode::DangerFullAccess, "沙箱随档完全放开");
     }
