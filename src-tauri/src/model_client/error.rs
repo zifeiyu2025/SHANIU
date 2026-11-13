@@ -30,6 +30,12 @@ pub enum ModelErrorKind {
     BadRequest,
     /// 流正常结束，但没有任何增量、没有工具调用、也没有 usage。
     EmptyResponse,
+    /// 上下文超出模型窗口（确定性失败，不重试）。
+    ContextTooLong,
+    /// 请求/回答被内容安全策略拦截（确定性失败，不重试）。
+    ContentFiltered,
+    /// 端点明确表示回答未完成（`response.incomplete`，如达到 max_tokens / 内容过滤）。
+    Incomplete,
     /// 其它。
     Unknown,
 }
@@ -80,6 +86,9 @@ impl ModelError {
             ModelErrorKind::EndpointUnsupported => "ENDPOINT_UNSUPPORTED",
             ModelErrorKind::BadRequest => "BAD_REQUEST",
             ModelErrorKind::EmptyResponse => "EMPTY_RESPONSE",
+            ModelErrorKind::ContextTooLong => "CONTEXT_TOO_LONG",
+            ModelErrorKind::ContentFiltered => "CONTENT_FILTERED",
+            ModelErrorKind::Incomplete => "INCOMPLETE",
             ModelErrorKind::Unknown => "UNKNOWN",
         }
     }
@@ -113,6 +122,9 @@ impl ModelError {
             ModelErrorKind::EndpointUnsupported => format!("该地址不支持此接口（HTTP {status}）"),
             ModelErrorKind::BadRequest => format!("请求被拒绝（HTTP {status}）"),
             ModelErrorKind::EmptyResponse => "模型返回了空响应".to_string(),
+            ModelErrorKind::ContextTooLong => "上下文超出模型窗口限制".to_string(),
+            ModelErrorKind::ContentFiltered => "请求被内容安全策略拒绝".to_string(),
+            ModelErrorKind::Incomplete => "回答未完成".to_string(),
             ModelErrorKind::Unknown => format!("未知错误（HTTP {status}）"),
         };
         Self::new(kind, Some(status), provider_code, provider_message, human)
@@ -120,18 +132,28 @@ impl ModelError {
 
     /// 流内错误体（SSE 的 `error` / `response.failed` 事件）→ 结构化错误。
     ///
-    /// 这类事件没有 HTTP 状态码，只能按错误体里的关键词分类；取不到就不猜。
-    /// 用户可见的一句话优先用端点原文（已脱敏），它比"未知错误"更有信息量。
+    /// 这类事件没有 HTTP 状态码。分类只能靠错误体里的 `code` / `type` / `message`；
+    /// 数字型 `code`（如 `"503"`）按状态码语义处理。取不到可判定信息就不猜。
     pub fn from_body(value: Option<&serde_json::Value>) -> Self {
         let (provider_code, provider_message) = value.map(provider_fields_value).unwrap_or((None, None));
-        let kind = if quota_hit(provider_code.as_deref(), provider_message.as_deref()) {
-            ModelErrorKind::Quota
-        } else {
-            ModelErrorKind::Unknown
-        };
+        let kind = body_kind(provider_code.as_deref(), provider_message.as_deref());
         let human = match kind {
             ModelErrorKind::Quota => "余额不足".to_string(),
-            _ => provider_message.clone().unwrap_or_else(|| "模型服务返回错误".to_string()),
+            ModelErrorKind::ContextTooLong => "上下文超出模型窗口限制".to_string(),
+            ModelErrorKind::ContentFiltered => "请求被内容安全策略拒绝".to_string(),
+            ModelErrorKind::Auth => "密钥无效".to_string(),
+            ModelErrorKind::RateLimited => "请求过于频繁，已被限流".to_string(),
+            ModelErrorKind::Timeout => "网络超时".to_string(),
+            ModelErrorKind::Network => "模型连接中断".to_string(),
+            ModelErrorKind::Server => "模型服务端错误".to_string(),
+            ModelErrorKind::BadRequest => "请求被拒绝".to_string(),
+            ModelErrorKind::EmptyResponse => "模型返回了空响应".to_string(),
+            ModelErrorKind::Incomplete => "回答未完成".to_string(),
+            ModelErrorKind::EndpointUnsupported => "该地址不支持此接口".to_string(),
+            // 真的判不出来时才退回端点原文：它比"未知错误"更有信息量。
+            ModelErrorKind::Unknown => provider_message
+                .clone()
+                .unwrap_or_else(|| "模型服务返回错误".to_string()),
         };
         Self::new(kind, None, provider_code, provider_message, human)
     }
@@ -172,6 +194,38 @@ impl ModelError {
             None,
             Some(sanitize(&message.into())),
             "模型连接中断".to_string(),
+        )
+    }
+
+    /// 流在终态标记（`response.completed` / `finish_reason`）之前结束。
+    ///
+    /// 与 [`Self::empty_response`] 区分：这里已经有内容，只是没有收到"说完"的信号。
+    pub fn stream_truncated() -> Self {
+        Self::new(
+            ModelErrorKind::Network,
+            None,
+            None,
+            Some("流在完成标记前结束".to_string()),
+            "模型连接中断（回答未收到完成标记）".to_string(),
+        )
+    }
+
+    /// 端点明确表示回答未完成（`response.incomplete`）→ 带出可判定的原因。
+    pub fn incomplete(reason: &str) -> Self {
+        let lowered = reason.to_ascii_lowercase();
+        let human = if (lowered.contains("max") && lowered.contains("token")) || lowered == "length" {
+            format!("达到最大输出长度，回答被截断（{reason}）")
+        } else if lowered.contains("content") && lowered.contains("filter") {
+            format!("回答被内容安全策略过滤（{reason}）")
+        } else {
+            format!("回答未完成（{reason}）")
+        };
+        Self::new(
+            ModelErrorKind::Incomplete,
+            None,
+            Some(sanitize(reason)),
+            Some(sanitize(reason)),
+            human,
         )
     }
 
@@ -229,6 +283,113 @@ fn quota_hit(code: Option<&str>, message: Option<&str>) -> bool {
     ]
     .iter()
     .any(|needle| haystack.contains(needle))
+}
+
+/// 流内错误体 → 大类（P0-3）。
+///
+/// 顺序固定：额度 → 上下文 → 内容过滤 → 限流 → 鉴权 → 超时 → 网络 → 服务端 → 请求格式。
+/// 先判具体原因再看兜底，避免 "context_length_exceeded" 被当成普通 400。
+fn body_kind(code: Option<&str>, message: Option<&str>) -> ModelErrorKind {
+    let code = code.unwrap_or_default().to_ascii_lowercase();
+    let message = message.unwrap_or_default().to_ascii_lowercase();
+    let haystack = format!("{code} {message}");
+    let hit = |needles: &[&str]| needles.iter().any(|needle| haystack.contains(needle));
+
+    if quota_hit(Some(&code), Some(&message)) {
+        return ModelErrorKind::Quota;
+    }
+    if hit(&[
+        "context_length_exceeded",
+        "maximum context length",
+        "context window",
+        "too many tokens",
+        "prompt is too long",
+        "token limit",
+        "上下文超",
+        "超出上下文",
+    ]) {
+        return ModelErrorKind::ContextTooLong;
+    }
+    if hit(&[
+        "content_filter",
+        "content_policy_violation",
+        "content policy",
+        "safety system",
+        "内容过滤",
+        "安全策略",
+    ]) {
+        return ModelErrorKind::ContentFiltered;
+    }
+    if hit(&["rate_limit", "rate limit", "too many requests"]) {
+        return ModelErrorKind::RateLimited;
+    }
+    if hit(&[
+        "invalid_api_key",
+        "authentication_error",
+        "unauthorized",
+        "invalid api key",
+        "permission_error",
+        "invalid token",
+        "密钥无效",
+    ]) {
+        return ModelErrorKind::Auth;
+    }
+    if hit(&["timeout", "timed out", "etimedout", "deadline exceeded", "超时"]) {
+        return ModelErrorKind::Timeout;
+    }
+    if hit(&[
+        "econnreset",
+        "econnrefused",
+        "epipe",
+        "connection reset",
+        "connection closed",
+        "connection error",
+        "network error",
+        "broken pipe",
+        "stream error",
+        "disconnected",
+        "连接中断",
+        "连接重置",
+    ]) {
+        return ModelErrorKind::Network;
+    }
+    if hit(&[
+        "server_error",
+        "internal_error",
+        "internal server error",
+        "overloaded",
+        "service_unavailable",
+        "temporarily unavailable",
+        "bad gateway",
+        "gateway timeout",
+        "upstream error",
+    ]) {
+        return ModelErrorKind::Server;
+    }
+    if hit(&[
+        "invalid_request",
+        "bad_request",
+        "invalid request",
+        "bad request",
+        "unsupported",
+        "invalid model",
+        "unknown parameter",
+    ]) {
+        return ModelErrorKind::BadRequest;
+    }
+    // 数字型 code 按状态码语义兜底（"401" / "429" / "503" 等）。
+    if let Ok(status) = code.parse::<u16>() {
+        return match status {
+            401 | 403 => ModelErrorKind::Auth,
+            402 => ModelErrorKind::Quota,
+            404 | 405 => ModelErrorKind::EndpointUnsupported,
+            429 => ModelErrorKind::RateLimited,
+            500..=599 => ModelErrorKind::Server,
+            400 | 422 => ModelErrorKind::BadRequest,
+            _ => ModelErrorKind::Unknown,
+        };
+    }
+    ModelErrorKind::Unknown
 }
 
 impl From<&ModelError> for crate::events::TurnErrorInfo {
@@ -345,5 +506,67 @@ mod tests {
         let message = error.provider_message.expect("应提取 message");
         assert!(!message.contains(secret), "错误体回显了凭据: {message}");
         assert!(message.contains(crate::config::REDACTED));
+    }
+
+    /// P0-3：流内错误体没有 HTTP 状态码，必须按 `code` / `message` 里的可判定信息分类。
+    ///
+    /// 反向对照：旧实现除余额外一律 `Unknown`，下面每一条都会红在 `kind` 上。
+    #[test]
+    fn stream_error_body_is_classified_by_actionable_fields() {
+        let cases: &[(&str, ModelErrorKind)] = &[
+            (
+                r#"{"error":{"code":"rate_limit_exceeded","message":"slow down"}}"#,
+                ModelErrorKind::RateLimited,
+            ),
+            (
+                r#"{"error":{"code":"context_length_exceeded","message":"This model's maximum context length is 128000 tokens"}}"#,
+                ModelErrorKind::ContextTooLong,
+            ),
+            (
+                r#"{"error":{"type":"server_error","message":"upstream exploded"}}"#,
+                ModelErrorKind::Server,
+            ),
+            (
+                r#"{"error":{"code":"overloaded_error","message":"Overloaded"}}"#,
+                ModelErrorKind::Server,
+            ),
+            (r#"{"message":"upstream request timeout"}"#, ModelErrorKind::Timeout),
+            (r#"{"message":"connection reset by peer"}"#, ModelErrorKind::Network),
+            (
+                r#"{"error":{"code":"invalid_api_key","message":"bad key"}}"#,
+                ModelErrorKind::Auth,
+            ),
+            (
+                r#"{"error":{"code":"invalid_request_error","message":"bad model"}}"#,
+                ModelErrorKind::BadRequest,
+            ),
+            (
+                r#"{"error":{"code":"content_filter","message":"blocked by policy"}}"#,
+                ModelErrorKind::ContentFiltered,
+            ),
+            (r#"{"error":{"code":"503","message":"oops"}}"#, ModelErrorKind::Server),
+            (r#"{"message":"完全看不懂的一次失败"}"#, ModelErrorKind::Unknown),
+        ];
+        for (body, expected) in cases {
+            let value: serde_json::Value = serde_json::from_str(body).unwrap();
+            let error = ModelError::from_body(Some(&value));
+            assert_eq!(error.kind, *expected, "错误体分类错误：{body} → {error:?}");
+        }
+    }
+
+    /// P0-1：`response.incomplete` 的原因要变成用户能看懂的分类，而不是"未知错误"。
+    #[test]
+    fn incomplete_reason_maps_to_actionable_human() {
+        let max_tokens = ModelError::incomplete("max_output_tokens");
+        assert_eq!(max_tokens.kind, ModelErrorKind::Incomplete);
+        assert_eq!(max_tokens.code(), "INCOMPLETE");
+        assert!(max_tokens.human.contains("长度"), "{}", max_tokens.human);
+        assert_eq!(max_tokens.provider_code.as_deref(), Some("max_output_tokens"));
+
+        let filtered = ModelError::incomplete("content_filter");
+        assert!(filtered.human.contains("内容安全策略"), "{}", filtered.human);
+
+        let other = ModelError::incomplete("server_shutdown");
+        assert!(other.human.contains("server_shutdown"), "{}", other.human);
     }
 }

@@ -248,6 +248,9 @@ fn from_model_error(error: ModelError) -> KeyCheck {
             "empty_response",
             "端点返回了空响应，无法据此判断密钥".to_string(),
         ),
+        ModelErrorKind::ContextTooLong
+        | ModelErrorKind::ContentFiltered
+        | ModelErrorKind::Incomplete => (KeyCheckState::Unknown, "other", error.human.clone()),
         ModelErrorKind::Unknown => (KeyCheckState::Unknown, "unknown", error.human.clone()),
     };
     KeyCheck {
