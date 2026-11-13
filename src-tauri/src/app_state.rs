@@ -60,6 +60,10 @@ pub struct AppState {
     /// 配置里的工作区根被唯一判据拒绝时的说明（配置变更时刷新）。
     /// Some = 本次回落到默认根，UI 必须显式提示；**不写回配置文件**，等用户重选。
     workspace_rejection: RwLock<Option<String>>,
+    /// 最近一次已经播报过的权限降级说明（进程内去重）。
+    /// 每个任务启动都会重算一次策略，逐任务播报会把时间线刷成噪音；
+    /// 说明文本变化（或配置写成功）才允许再播——见 [`AppState::announce_policy_note`]。
+    policy_note_announced: Mutex<Option<String>>,
 }
 
 impl AppState {
@@ -97,6 +101,7 @@ impl AppState {
             media_roots: RwLock::new(Vec::new()),
             fallback_root,
             workspace_rejection: RwLock::new(workspace_rejection),
+            policy_note_announced: Mutex::new(None),
         };
         state.refresh_derived_policy(None);
         state.refresh_media_roots();
@@ -224,6 +229,9 @@ impl AppState {
             *guard = next;
         }
         self.refresh_derived_policy(None);
+        // 配置写成功 = 用户改过档：降级说明必须允许再播，哪怕文本恰好与上次相同
+        // （例如先改合法再改回不合法，中间没跑任务）。
+        self.policy_note_announced.lock().expect("policy note 锁中毒").take();
         self.refresh_media_roots();
         self.refresh_workspace_rejection();
         Ok(())
@@ -234,6 +242,25 @@ impl AppState {
     /// 没有会话预设 = 跟随 config 部署默认；运行中切换过的档位不跨任务、不跨会话泄漏。
     pub fn reset_policy(&self, preset: Option<crate::permission::preset::Preset>) {
         self.refresh_derived_policy(preset);
+    }
+
+    /// 权限降级说明的进程内去重：返回 `true` = 这条说明本次需要播报。
+    ///
+    /// `None`（合法组合）会清空记录：降级消失之后再一次出现，对用户是新事件，
+    /// 不能因为"上次已经说过"就吞掉。同一个说明连续出现则只播一次。
+    pub fn announce_policy_note(&self, note: Option<&str>) -> bool {
+        let mut last = self.policy_note_announced.lock().expect("policy note 锁中毒");
+        match note {
+            None => {
+                *last = None;
+                false
+            }
+            Some(text) if last.as_deref() == Some(text) => false,
+            Some(text) => {
+                *last = Some(text.to_string());
+                true
+            }
+        }
     }
 
     /// 记下"还没建档的会话"选的预设；首条任务落盘时由调用方取走并写进档案。

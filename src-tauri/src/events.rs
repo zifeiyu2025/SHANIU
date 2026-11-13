@@ -416,6 +416,23 @@ pub enum EventMsg {
     /// 失败；但也必须让用户知道「这轮轨迹可能不完整」，并留一条可被后续诊断读到
     /// 的状态（本事件随 journal 落盘，日志侧另有 `tracing::warn!`）。
     RolloutDegraded { message: String },
+    /// 权限档被钳制（additive）：配置值无法成立，实际按更严的档运行。
+    ///
+    /// 为什么必须用户可见：界面按配置值显示 `full_access`，执行却按 `on_request`，
+    /// 用户会以为已经放行、实际每次被问或被拒——这就是「静默降级」。
+    /// 对齐 codex「`approval=never` 但沙箱拿不到 danger 时不静默」的意图；
+    /// 我们选择降级后继续跑，所以重点在「告知」而不是「拒绝启动」。
+    ///
+    /// 载荷刻意拆出 `configured / effective` 两项：前端文案必须能同时给出
+    /// 「配置值」与「实际生效值」，不能只留一句笼统的"已降级"。
+    PermissionDowngraded {
+        /// 用户配置的档（当前唯一来源是 `full_access`）。
+        configured: String,
+        /// 实际生效的档。
+        effective: String,
+        /// 完整说明（含原因与当前沙箱档）。
+        message: String,
+    },
     /// 系统提示词版本（additive，A0 之后的「提示词入轨迹」）。
     ///
     /// 只在**实际下发的那条路径**上、内容指纹变化时发出：同一 run 的多轮不重复。

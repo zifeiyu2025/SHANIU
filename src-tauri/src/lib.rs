@@ -581,6 +581,8 @@ fn send_task(
             // 注册表在任务启动时挂到 AppState：UI 的 steering/中断命令面要摸到活体注册表。
             let orchestrator = build_orchestrator(agent.clone());
             app.state::<AppState>().set_subagents(Some(orchestrator.registry().clone()));
+            // 新会话的第一条任务也要告知「配置档没生效」——不是只有续写才播报。
+            notify_policy_downgraded(&state, sink.as_ref());
             tauri::async_runtime::spawn(async move {
                 // Drop 守卫：正常结束、取消、panic 三条路径都释放任务槽（审计 H2）。
                 let _task_slot =
@@ -632,6 +634,50 @@ fn notify_rollout_degraded(
     );
     let _ = sink.emit(&events::EventMsg::RolloutDegraded {
         message: format!("会话档案不完整：{}；历史可能缺条目", parts.join("，")),
+    });
+}
+
+/// 权限档被钳制必须让用户看见：界面按配置值显示 `full_access`，执行却按更严的档，
+/// 用户会误以为已经放行（§11.3 退化红线）。
+///
+/// 与 codex 的差别：codex 遇到「`approval=never` 但沙箱拿不到 danger」直接拒绝启动
+/// （`core/src/config/mod.rs:4407-4410`）；我们选择降级后继续跑，所以要对齐的是
+/// 「不静默」这一条——启动时发一条 `permission_downgraded`，文案同时给出配置值与实际值。
+///
+/// 同一进程内同一条说明只播一次（[`AppState::announce_policy_note`]）：每个任务启动都会
+/// 重算策略，逐任务播报会把时间线刷成噪音；配置写成功或降级消失后会重置去重记录。
+fn notify_policy_downgraded(state: &AppState, sink: &dyn events::EventSink) {
+    let Some(reason) = state.policy.note() else {
+        // 合法组合：清空去重记录，用户之后再改回不合法时必须重新播报。
+        state.announce_policy_note(None);
+        return;
+    };
+    let policy = state.policy.snapshot();
+    // `note()` 目前唯一来源是「`full_access` 前提不满足」（`ApprovalMode::effective`），
+    // 所以配置值确定为 `full_access`。把沙箱档一并写进消息：配置一变文本就变，
+    // 去重键天然跟着变，用户改了档位就能再看到一次。
+    let configured = config::ApprovalMode::FullAccess.as_str();
+    let effective = policy.approval.as_str();
+    let message = format!(
+        "权限档已降级：{}（配置值：{}；实际生效：{}；当前沙箱：{}）",
+        reason.trim_end_matches('。'),
+        configured,
+        effective,
+        policy.sandbox.as_str(),
+    );
+    if !state.announce_policy_note(Some(&message)) {
+        return;
+    }
+    tracing::warn!(
+        configured,
+        effective,
+        sandbox = policy.sandbox.as_str(),
+        "审批档被钳制：实际按更严的档运行"
+    );
+    let _ = sink.emit(&events::EventMsg::PermissionDowngraded {
+        configured: configured.to_string(),
+        effective: effective.to_string(),
+        message,
     });
 }
 
@@ -748,6 +794,8 @@ fn continue_session(
     let sink: Arc<dyn events::EventSink> = Arc::new(events::TauriEventSink::root(app.clone(), agent_id.clone()).with_journal(Arc::new(event_journal::FileEventJournal::new(app.state::<AppState>().data_root().join(config::SESSIONS_DIR)))).with_broadcast(app.state::<gateway::GatewayHub>().broadcast_sender()).with_viewers(app.state::<gateway::GatewayHub>().viewers()));
     // 档案不完整必须在会话时间线上看得见：重开会话的第一次回执就带上这条降级通知。
     notify_rollout_degraded(sink.as_ref(), &agent_id, torn_tail_lines, &damaged_lines, dropped_unsafe_tail);
+    // 权限档被钳制也要在同一时刻告知：它是「本任务实际按什么档跑」的前提。
+    notify_policy_downgraded(state, sink.as_ref());
     // spawn 的 future 必须是 'static：借用的 app 只能换成 owned 句柄再 move 进去。
     let app_handle = app.clone();
     let orchestrator = build_orchestrator(agent.clone());
@@ -4195,6 +4243,115 @@ mod workspace_scope_tests {
         )
         .unwrap_err();
         assert!(err.contains("不在目录中"), "任意 exe 路径必须被拒: {err}");
+    }
+}
+
+#[cfg(test)]
+mod policy_notice_tests {
+    use super::notify_policy_downgraded;
+    use crate::app_state::AppState;
+    use crate::config::{AppConfig, ApprovalMode, SandboxMode};
+    use crate::events::{EventMsg, EventSink};
+    use std::sync::{Arc, Mutex};
+
+    struct CapturingSink(Arc<Mutex<Vec<EventMsg>>>);
+
+    impl EventSink for CapturingSink {
+        fn emit(&self, msg: &EventMsg) -> Result<(), String> {
+            self.0.lock().unwrap().push(msg.clone());
+            Ok(())
+        }
+    }
+
+    fn state_with(
+        approval: ApprovalMode,
+        sandbox: SandboxMode,
+        dir: &crate::test_support::TestTempDir,
+    ) -> AppState {
+        let mut config = AppConfig::default();
+        config.approval.mode = approval;
+        config.sandbox.mode = sandbox;
+        AppState::new(config, dir.join("config.toml"), dir.join("data"))
+    }
+
+    /// 取出的三元组就是前端必须拿到的两项（配置值 / 实际生效值）+ 完整文案。
+    fn notes(store: &Arc<Mutex<Vec<EventMsg>>>) -> Vec<(String, String, String)> {
+        store
+            .lock()
+            .unwrap()
+            .iter()
+            .filter_map(|event| match event {
+                EventMsg::PermissionDowngraded { configured, effective, message } => {
+                    Some((configured.clone(), effective.clone(), message.clone()))
+                }
+                _ => None,
+            })
+            .collect()
+    }
+
+    /// 配 `full_access` + 非 danger 沙箱：必须有通知，且文案同时给出配置值与实际值。
+    /// 旧代码（`note()` 零调用）下这条断言必红——这正是本用例要证伪的行为。
+    #[test]
+    fn clamped_full_access_is_announced_with_both_values() {
+        let dir = crate::test_support::TestTempDir::new("policy-notice-clamped");
+        let state = state_with(ApprovalMode::FullAccess, SandboxMode::ReadOnly, &dir);
+        let store = Arc::new(Mutex::new(Vec::new()));
+        notify_policy_downgraded(&state, &CapturingSink(store.clone()));
+
+        let notes = notes(&store);
+        assert_eq!(notes.len(), 1, "权限档被钳制必须播报，不能静默");
+        assert_eq!(notes[0].0, "full_access", "配置值必须是用户要求的那档");
+        assert_eq!(notes[0].1, "on_request", "实际生效值必须是真正在跑的那档");
+        assert!(
+            notes[0].2.contains("配置值：full_access") && notes[0].2.contains("实际生效：on_request"),
+            "文案必须同时给出两项：{}",
+            notes[0].2
+        );
+        assert!(
+            notes[0].2.contains("当前沙箱：read_only"),
+            "原因要落在一眼能改的地方：{}",
+            notes[0].2
+        );
+    }
+
+    /// 合法组合：`on_request` + 任意沙箱、`full_access` + danger 都不该产生通知。
+    #[test]
+    fn legal_combinations_stay_silent() {
+        for (approval, sandbox) in [
+            (ApprovalMode::OnRequest, SandboxMode::WorkspaceWrite),
+            (ApprovalMode::FullAccess, SandboxMode::DangerFullAccess),
+        ] {
+            let dir = crate::test_support::TestTempDir::new("policy-notice-legal");
+            let state = state_with(approval, sandbox, &dir);
+            let store = Arc::new(Mutex::new(Vec::new()));
+            notify_policy_downgraded(&state, &CapturingSink(store.clone()));
+            assert!(notes(&store).is_empty(), "{approval:?} + {sandbox:?} 是合法组合");
+        }
+    }
+
+    /// 同一进程内连续任务只播一次；用户改配置（降级消失再出现）后必须能再播。
+    #[test]
+    fn same_note_announces_once_until_config_changes() {
+        let dir = crate::test_support::TestTempDir::new("policy-notice-dedupe");
+        let state = state_with(ApprovalMode::FullAccess, SandboxMode::ReadOnly, &dir);
+        let store = Arc::new(Mutex::new(Vec::new()));
+        let sink = CapturingSink(store.clone());
+
+        notify_policy_downgraded(&state, &sink);
+        notify_policy_downgraded(&state, &sink);
+        assert_eq!(notes(&store).len(), 1, "同一条说明连续两个任务只播一次");
+
+        // 用户把配置改成合法再改回不合法：期间的「没有降级」必须清掉去重记录。
+        let mut legal = state.config();
+        legal.approval.mode = ApprovalMode::OnRequest;
+        state.update_config(legal).expect("测试配置应可写");
+        notify_policy_downgraded(&state, &sink);
+        let mut back = state.config();
+        back.approval.mode = ApprovalMode::FullAccess;
+        state.update_config(back).expect("测试配置应可写");
+        notify_policy_downgraded(&state, &sink);
+
+        assert_eq!(notes(&store).len(), 2, "配置改回不合法后必须再播一次");
     }
 }
 

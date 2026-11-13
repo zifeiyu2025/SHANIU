@@ -2053,6 +2053,20 @@ export function createAdapter(options: AdapterOptions): { remote: unknown; dispo
         }, { surfaceOp: 'append' })
         return
       }
+      case 'permission_downgraded':
+        // 配置值没成立、实际按更严的档跑：必须让用户看见「配置值 / 实际生效值」两项，
+        // 只写一句"已降级"等于让人继续以为 full_access 生效了。
+        pushEvent(journal, 'developer/message', {
+          turn: journal.turn,
+          step: journal.step,
+          message: {
+            id: `shaniu-permission-${journal.seq + 1}`,
+            role: 'developer',
+            source: { kind: 'permission-notice' as const, form: 'notice' as const, summary: msg.message },
+            content: [{ type: 'text', text: msg.message }],
+          },
+        }, { surfaceOp: 'append' })
+        return
       case 'rollout_degraded':
         // 观测失败不冒充失败：对话照常收口，这里只插一条宿主通知（form: 'notice'，
         // 与上游 ContextForm 的一次性告知同义），不参与模型请求。

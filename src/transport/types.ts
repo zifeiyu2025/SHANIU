@@ -110,6 +110,7 @@ export type EventMsg =
   | { type: 'subagent_exited'; child_id: string; status: SubagentExitStatus; summary: string }
   | { type: 'subagent_message'; child_id: string; sender_id: string; text: string; rpc_id?: string | null }
   | { type: 'rollout_degraded'; message: string }
+  | { type: 'permission_downgraded'; configured: string; effective: string; message: string }
   | { type: 'system_prompt'; text: string; sha256: string; at_ms: number; turn: number; step: number }
   | { type: 'compaction_started'; compaction_id: string; trigger: CompactionTrigger; range_start: number; range_end: number; estimated_tokens: number; budget_tokens: number; turn: number | null }
   | { type: 'compaction_summarized'; compaction_id: string; trigger: CompactionTrigger; range_start: number; range_end: number; shadowed_items: number; shadowed_tokens: number; summary: string }

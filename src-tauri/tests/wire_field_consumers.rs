@@ -170,6 +170,15 @@ const RULES: &[Rule] = &[
     Rule { owner: "EventMsg", variant: "RolloutDegraded", fields: "message", overrides: &[] },
     Rule {
         owner: "EventMsg",
+        variant: "PermissionDowngraded",
+        fields: "message",
+        overrides: &[
+            ("configured", Status::BackendOnly("与 message 冗余；前端目前只用 message 的完整文案")),
+            ("effective", Status::BackendOnly("与 message 冗余；前端目前只用 message 的完整文案")),
+        ],
+    },
+    Rule {
+        owner: "EventMsg",
         variant: "SystemPrompt",
         fields: "text",
         overrides: &[

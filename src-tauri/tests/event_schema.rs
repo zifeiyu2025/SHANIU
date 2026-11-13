@@ -17,7 +17,7 @@ use shaniu_lib::events::{
 };
 
 /// 与 src/transport/types.ts 的 type 判别值逐一对应。
-const EXPECTED_TAGS: [&str; 24] = [
+const EXPECTED_TAGS: [&str; 25] = [
     "turn_started",
     "turn_completed",
     "verification_result",
@@ -38,6 +38,7 @@ const EXPECTED_TAGS: [&str; 24] = [
     "subagent_exited",
     "subagent_message",
     "rollout_degraded",
+    "permission_downgraded",
     "system_prompt",
     "compaction_started",
     "compaction_summarized",
@@ -187,6 +188,12 @@ fn all_variants() -> Vec<EventMsg> {
         EventMsg::SubagentMessage { child_id: "01JCHILD".into(), sender_id: "root".into(), text: "请改看 transport".into(), rpc_id: Some("rpc-9".into()) },
         // 档案降级：对话继续，但轨迹可能不完整
         EventMsg::RolloutDegraded { message: "本轮轨迹可能不完整：磁盘已满".into() },
+        // 权限降级（additive）：配置值与实际生效值必须同时在载荷里，前端才有得显示
+        EventMsg::PermissionDowngraded {
+            configured: "full_access".into(),
+            effective: "on_request".into(),
+            message: "权限档已降级：full_access 需要 danger_full_access 沙箱（配置值：full_access；实际生效：on_request）".into(),
+        },
         // 提示词入轨迹（additive）：载荷原样 round-trip
         EventMsg::SystemPrompt {
             text: "你是 SHANIU。\n## 工作区\nD:\\ws".into(),
@@ -252,6 +259,7 @@ fn all_variants() -> Vec<EventMsg> {
             | EventMsg::SubagentExited { .. }
             | EventMsg::SubagentMessage { .. }
             | EventMsg::RolloutDegraded { .. }
+            | EventMsg::PermissionDowngraded { .. }
             | EventMsg::SystemPrompt { .. }
             | EventMsg::CompactionStarted { .. }
             | EventMsg::CompactionSummarized { .. }
