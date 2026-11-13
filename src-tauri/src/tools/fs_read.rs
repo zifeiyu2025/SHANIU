@@ -468,9 +468,28 @@ impl ToolExecutor for ListDir {
             return Err(ToolError::Cancelled);
         }
         let path = args.get("path").and_then(|v| v.as_str()).unwrap_or(".");
-        let full = resolve_in_workspace(&ctx.workspace_root, path)?;
+        let full = match resolve_in_workspace(&ctx.workspace_root, path) {
+            Ok(full) => full,
+            Err(ToolError::InvalidArgs(_)) => {
+                return Err(ToolError::InvalidArgs(format!(
+                    "目录不存在: {path}（路径须位于工作区内）"
+                )))
+            }
+            Err(other) => return Err(other),
+        };
+        if full.is_file() {
+            // 超出参考实现（dsh 只报 `not a regular file`，ZCode 抛裸 EISDIR）：
+            // 模型把文件当目录传过来后，下一步必然是读这个文件，直接给出大小并指路能省一次往返。
+            let size = std::fs::metadata(&full).map(|meta| meta.len()).unwrap_or(0);
+            return Err(ToolError::InvalidArgs(format!(
+                "不是目录：{path} 是一个文件（{}）。读内容请用 read_file",
+                human_bytes(size)
+            )));
+        }
         if !full.is_dir() {
-            return Err(ToolError::InvalidArgs(format!("不是目录: {path}")));
+            return Err(ToolError::InvalidArgs(format!(
+                "不是目录: {path}（既不是文件也不是目录）"
+            )));
         }
         let mut entries = std::fs::read_dir(&full)
             .map_err(|e| ToolError::Execution(format!("读取目录失败: {e}")))?
@@ -489,6 +508,9 @@ impl ToolExecutor for ListDir {
                 _ => name,
             };
             lines.push(line);
+        }
+        if lines.is_empty() {
+            return Ok(ToolOutput::ok(format!("目录 {path} 是空目录（0 项）")));
         }
         let hidden_note = if entries.len() > MAX_LIST_ENTRIES {
             format!("\n[其余 {} 项未显示]", entries.len() - MAX_LIST_ENTRIES)
@@ -546,6 +568,11 @@ impl ToolExecutor for Search {
             .get("query")
             .and_then(|v| v.as_str())
             .ok_or_else(|| ToolError::InvalidArgs("缺少 query".into()))?;
+        if query.is_empty() {
+            return Err(ToolError::InvalidArgs(
+                "query 不能为空：空字符串会匹配每一行。请给出要查找的符号或文本".to_string(),
+            ));
+        }
         let path = args.get("path").and_then(|v| v.as_str()).unwrap_or(".");
         let is_regex = args.get("is_regex").and_then(|v| v.as_bool()).unwrap_or(false);
         let max_results = args
@@ -561,10 +588,20 @@ impl ToolExecutor for Search {
         };
         let re = regex::Regex::new(&pattern)
             .map_err(|e| ToolError::InvalidArgs(format!("正则非法: {e}")))?;
-        let root = resolve_in_workspace(&ctx.workspace_root, path)?;
+        let root = match resolve_in_workspace(&ctx.workspace_root, path) {
+            Ok(root) => root,
+            Err(ToolError::InvalidArgs(_)) => {
+                return Err(ToolError::InvalidArgs(format!(
+                    "搜索路径不存在: {path}（路径须位于工作区内）"
+                )))
+            }
+            Err(other) => return Err(other),
+        };
 
         let mut results = Vec::new();
         let mut total_matches = 0usize;
+        let mut scanned_files = 0usize;
+        let mut skipped_large = 0usize;
         for entry in WalkBuilder::new(&root).build() {
             if ctx.cancel.is_cancelled() {
                 return Err(ToolError::Cancelled);
@@ -578,12 +615,14 @@ impl ToolExecutor for Search {
                 Err(_) => continue,
             };
             if meta.len() > MAX_SEARCH_FILE_BYTES {
+                skipped_large += 1;
                 continue; // 大文件跳过（二进制/日志防御）
             }
             let content = match std::fs::read(entry.path()) {
                 Ok(bytes) => bytes,
                 Err(_) => continue,
             };
+            scanned_files += 1;
             let text = String::from_utf8_lossy(&content);
             let display_path = entry
                 .path()
@@ -607,7 +646,22 @@ impl ToolExecutor for Search {
             }
         }
         if results.is_empty() {
-            return Ok(ToolOutput::ok(format!("无匹配: {query}")));
+            // 超出参考实现（dsh / ZCode 只回 `No matches found`）：评测里模型拿到空结果后
+            // 会换词反复重试，扫描数能区分「搜错范围」和「符号确实不存在」，值得多说一句。
+            let scope = if root.is_file() {
+                format!("文件 {path}")
+            } else {
+                format!("{path}（工作区内）")
+            };
+            let skipped = if skipped_large > 0 {
+                format!("；另有 {skipped_large} 个超过 1 MiB 的文件未扫描")
+            } else {
+                String::new()
+            };
+            return Ok(ToolOutput::ok(format!(
+                "未命中：在 {scope} 中没有出现 {query:?}（已扫描 {scanned_files} 个文件{skipped}）。\
+                 这是搜索而非报错：该符号在当前范围内确实不存在，换更上层目录或核对拼写后再试"
+            )));
         }
         let more = if total_matches > results.len() {
             format!("\n[共约 {total_matches} 处命中，仅显示前 {} 条]", results.len())
@@ -957,7 +1011,58 @@ mod tests {
             .execute(serde_json::json!({"query": "不存在的字符串xyz"}), &ctx(&ws))
             .await
             .unwrap();
-        assert!(none.output.contains("无匹配"), "{}", none.output);
+        assert!(none.output.contains("未命中"), "{}", none.output);
+        assert!(none.output.contains("已扫描"), "未命中要给出扫描范围: {}", none.output);
+        assert!(none.output.contains("不存在的字符串xyz"), "{}", none.output);
+    }
+
+    /// 搜索路径不存在要明确，不要退化成「未命中」。
+    #[tokio::test]
+    async fn search_missing_path_is_explicit() {
+        let ws = workspace();
+        let err = Search::new()
+            .execute(serde_json::json!({"query": "x", "path": "no-such-dir"}), &ctx(&ws))
+            .await
+            .unwrap_err();
+        assert!(err.to_string().contains("搜索路径不存在: no-such-dir"), "{err}");
+    }
+
+    /// 空 query 会匹配每一行，必须拒绝而不是返回噪声。
+    #[tokio::test]
+    async fn search_rejects_empty_query() {
+        let ws = workspace();
+        let err = Search::new()
+            .execute(serde_json::json!({"query": ""}), &ctx(&ws))
+            .await
+            .unwrap_err();
+        assert!(matches!(err, ToolError::InvalidArgs(_)));
+        assert!(err.to_string().contains("不能为空"), "{err}");
+    }
+
+    /// 把文件当目录传给 list_dir 时要说明这是文件并指向 read_file。
+    #[tokio::test]
+    async fn list_dir_on_file_is_explicit() {
+        let ws = workspace();
+        let err = ListDir::new()
+            .execute(serde_json::json!({"path": "README.md"}), &ctx(&ws))
+            .await
+            .unwrap_err();
+        let message = err.to_string();
+        assert!(message.contains("是一个文件"), "{message}");
+        assert!(message.contains("read_file"), "{message}");
+    }
+
+    /// 空目录要明确说明，而不是返回空串。
+    #[tokio::test]
+    async fn list_dir_empty_directory_is_explicit() {
+        let ws = workspace();
+        std::fs::create_dir_all(ws.join("empty")).unwrap();
+        let out = ListDir::new()
+            .execute(serde_json::json!({"path": "empty"}), &ctx(&ws))
+            .await
+            .unwrap();
+        assert!(out.output.contains("空目录"), "{}", out.output);
+        assert!(out.output.contains("0 项"), "{}", out.output);
     }
 
     #[tokio::test]
