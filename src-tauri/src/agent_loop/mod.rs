@@ -2733,6 +2733,33 @@ mod tests {
         }
     }
 
+    /// 等审批请求真正进入 pending 表：由 broker 的变化通知唤醒，不按固定次数 sleep 轮询。
+    ///
+    /// 返回 false 表示上限内没等到——调用方必须显式断言失败，不能当成「什么事都没发生」
+    /// 继续往下跑（那样 `run.await` 会永久挂住，CI 上只看到 job 超时，看不到原因）。
+    ///
+    /// 先注册通知再查一次：覆盖「请求在注册之前就已入表」的窗口；`notify_one` 的 permit
+    /// 又覆盖「注册之后、检查之前」的窗口。
+    async fn await_approval_pending(broker: &Arc<ApprovalBroker>, request_id: &str) -> bool {
+        let signal = Arc::new(tokio::sync::Notify::new());
+        let wake = signal.clone();
+        let listener: Arc<dyn Fn() + Send + Sync> = Arc::new(move || wake.notify_one());
+        broker.set_pending_changed_listener(listener);
+        if broker.has_pending(request_id) {
+            return true;
+        }
+        tokio::time::timeout(std::time::Duration::from_secs(5), async {
+            loop {
+                signal.notified().await;
+                if broker.has_pending(request_id) {
+                    return;
+                }
+            }
+        })
+        .await
+        .is_ok()
+    }
+
     struct ScriptedBackend(Mutex<VecDeque<Vec<ModelStreamEvent>>>);
 
     impl ScriptedBackend {
@@ -4972,15 +4999,20 @@ mod tests {
         ]);
         let sink = Arc::new(CapturingSink(store.clone()));
         let run = tokio::spawn(async move { agent.run_task("任务", sink, cancel).await });
-        // 等待审批请求出现后回执「拒绝」
-        for _ in 0..300 {
-            if broker.has_pending("appr-c7") {
-                assert!(broker.resolve("appr-c7", crate::events::ApprovalDecision::Deny));
-                break;
-            }
-            tokio::time::sleep(std::time::Duration::from_millis(10)).await;
-        }
-        let summary = run.await.unwrap();
+        // 等审批真正进入 pending 再回执「拒绝」：不按固定次数 sleep 攒上限。
+        let ready = await_approval_pending(&broker, "appr-c7").await;
+        assert!(
+            ready,
+            "5s 内没有等到审批请求 appr-c7 进入 pending：同步点未成立，显式失败"
+        );
+        assert!(
+            broker.resolve("appr-c7", crate::events::ApprovalDecision::Deny),
+            "appr-c7 应在 pending 表中等待回执"
+        );
+        let summary = tokio::time::timeout(std::time::Duration::from_secs(5), run)
+            .await
+            .expect("审批回执后任务仍未收口（5s 超时）")
+            .expect("任务线程不应 panic");
         assert_eq!(summary.reason, TurnEndReason::Completed);
         let events = store.lock().unwrap();
         assert!(events.iter().any(|e| matches!(
@@ -5093,14 +5125,20 @@ mod tests {
         let run = tokio::spawn(async move {
             agent.run_task("修好它", sink, CancellationToken::new()).await
         });
-        for _ in 0..300 {
-            if broker.has_pending("appr-c1") {
-                assert!(broker.resolve("appr-c1", crate::events::ApprovalDecision::AllowAlways));
-                break;
-            }
-            tokio::time::sleep(std::time::Duration::from_millis(10)).await;
-        }
-        let summary = run.await.unwrap();
+        // 等审批真正进入 pending 再放行：不按固定次数 sleep 攒上限。
+        let ready = await_approval_pending(&broker, "appr-c1").await;
+        assert!(
+            ready,
+            "5s 内没有等到审批请求 appr-c1 进入 pending：同步点未成立，显式失败"
+        );
+        assert!(
+            broker.resolve("appr-c1", crate::events::ApprovalDecision::AllowAlways),
+            "appr-c1 应在 pending 表中等待回执"
+        );
+        let summary = tokio::time::timeout(std::time::Duration::from_secs(5), run)
+            .await
+            .expect("审批回执后任务仍未收口（5s 超时）")
+            .expect("任务线程不应 panic");
         assert_eq!(summary.reason, TurnEndReason::Completed);
 
         let captured = seen.lock().unwrap();
