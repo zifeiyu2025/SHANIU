@@ -90,6 +90,7 @@ fn engine(live: Arc<AtomicUsize>) -> Arc<AgentLoop> {
         workspace_root: std::env::temp_dir(),
         max_turns: 8,
         token_budget: 0,
+        manual_token_budget: 0,
         tree_budget: Default::default(),
         policy: Arc::new(policy::SessionPolicyHandle::new(policy::SessionPolicy {
             approval: ApprovalMode::OnRequest,

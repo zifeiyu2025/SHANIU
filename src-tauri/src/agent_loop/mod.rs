@@ -252,6 +252,10 @@ pub struct AgentLoop {
     /// 单会话 token 预算（04 §4 `[agent].token_budget`）：每轮采样前据此判定是否压缩。
     /// 0 = 不启用压缩（`compaction::plan_if_needed` 对 0 直接返回 None）。
     pub token_budget: usize,
+    /// 强制压缩（手动 `/compact` 与溢出补救）的目标预算：口径见
+    /// [`crate::compaction::manual_token_budget`]——`token_budget == 0`（用户关掉自动压缩）时
+    /// 仍按窗口推导，而不是把历史一路压到只剩最后一条。
+    pub manual_token_budget: usize,
     /// 树级预算账本（SH-055，02 ADR-103）：root 实例直接用这本账，派生出的子代理
     /// 克隆同一句柄，于是「任一代理触顶 → 全树不再发起新模型请求」由同一个账本保证。
     /// 默认 `unlimited()`：本单元只做共账接线，配置面与 `spawn_agent.budget_tokens`
@@ -547,6 +551,154 @@ impl AgentLoop {
             history_tokens_after: u32::try_from(history_tokens_after).unwrap_or(u32::MAX),
         })
     }
+
+    /// 依据当前历史构造**本步请求副本**：会话引用展开（SH-090）＋ `/name` 技能注入（SH-091）。
+    ///
+    /// 只作用于副本，档案与展示历史不动。抽成方法是为了让「溢出后强制压缩 → 重放本步」
+    /// 能用压缩后的历史重建同一份请求：展开本身只读，重复调用没有副作用。
+    fn build_request_history(
+        &self,
+        history: &[HistoryItem],
+        rollout: &Option<Arc<crate::rollout::RolloutWriter>>,
+    ) -> Result<Vec<HistoryItem>, String> {
+        let expanded = match rollout.as_ref() {
+            Some(writer) => {
+                let dir = writer.path().parent().map(std::path::Path::to_path_buf);
+                let id = writer.path().file_stem().map(|stem| stem.to_string_lossy().into_owned());
+                match (dir, id) {
+                    (Some(dir), Some(id)) => crate::session_reference::prepare_request(history, &dir, &id),
+                    _ => Ok(None),
+                }
+            }
+            None => Ok(None),
+        }?;
+        let mut request = expanded.unwrap_or_else(|| history.to_vec());
+        request.extend(crate::skills::injections(history, &self.workspace_root));
+        Ok(request)
+    }
+
+    /// 服务端报「上下文超出窗口」后的反应式压缩（对齐 dsh `compaction-basic/src/index.ts:213-256`
+    /// 的 `maxOverflowRetries = 1`）：**每个 model step 最多压一次**，压完才由调用方决定是否重放。
+    ///
+    /// 与轮首预算压缩的差别只有两条：
+    /// 1. 不看阈值——端点已经明确拒绝，`plan_manual` 只回答「压哪一段」；
+    /// 2. 结局直接决定能不能重放：没压成 / 没变小都返回 [`OverflowOutcome::GiveUp`]，
+    ///    由调用方抛出**原始** `ContextTooLong`，不拿压缩错误顶替它。
+    ///
+    /// 压缩事件仍走 `compaction_started / summarized / ended`，触发原因用
+    /// [`crate::events::CompactionTrigger::ContextOverflow`]：用户要能分清这次不是预算触发的。
+    // 参数多是因为要同时接住「历史可变借用 + 事件通道 + 取消 + 回合号」；
+    // 与 `compact_in_place` 保持同构比再包一层上下文结构体更重要。
+    #[allow(clippy::too_many_arguments)]
+    async fn compact_after_overflow(
+        &self,
+        rollout: &Option<Arc<crate::rollout::RolloutWriter>>,
+        history: &mut Vec<HistoryItem>,
+        recorded: &mut usize,
+        sink: &Arc<dyn crate::events::EventSink>,
+        instructions: &str,
+        cancel: &tokio_util::sync::CancellationToken,
+        turn: u32,
+    ) -> OverflowOutcome {
+        // 压缩锚点必须排在它遮蔽的条目**之后**（顺序约束见 `compact_in_place`）。
+        // 轮首的预算压缩靠「每轮末尾都 flush」满足；溢出补救可能发生在第 1 步，
+        // 此时当前用户消息还没落盘——不先 flush 就会写出一个指向未来条目的锚点。
+        if let Err(message) = self.flush_history(rollout, history, recorded) {
+            tracing::warn!(turn, error = %message, "溢出补救放弃：档案不可写，锚点已失去顺序前提");
+            return OverflowOutcome::GiveUp;
+        }
+        let Some(target) = crate::compaction::plan_manual(history, self.manual_token_budget) else {
+            // 没有可压缩的区间（历史不足两条）：重放多少次都是同一个结局。
+            return OverflowOutcome::GiveUp;
+        };
+        let compaction_id = crate::compaction::new_id();
+        let before = crate::compaction::history_tokens(history);
+        let trigger = crate::events::CompactionTrigger::ContextOverflow;
+        let emit = |msg: EventMsg| {
+            let _ = sink.emit(&msg);
+        };
+        let range_start = u32::try_from(target.range_start).unwrap_or(u32::MAX);
+        let range_end = u32::try_from(target.range_end).unwrap_or(u32::MAX);
+        emit(
+            EventMsg::CompactionStarted {
+                compaction_id: compaction_id.clone(),
+                trigger,
+                range_start,
+                range_end,
+                estimated_tokens: u32::try_from(before).unwrap_or(u32::MAX),
+                budget_tokens: u32::try_from(self.manual_token_budget).unwrap_or(u32::MAX),
+                turn: Some(turn),
+            },
+        );
+        match self
+            .compact_in_place(rollout, history, recorded, target, instructions, cancel)
+            .await
+        {
+            Ok(stats) => {
+                emit(
+                    EventMsg::CompactionSummarized {
+                        compaction_id: compaction_id.clone(),
+                        trigger,
+                        range_start,
+                        range_end,
+                        shadowed_items: stats.shadowed_items,
+                        shadowed_tokens: stats.shadowed_tokens,
+                        summary: stats.summary,
+                    },
+                );
+                emit(
+                    EventMsg::CompactionEnded {
+                        compaction_id,
+                        ok: true,
+                        error: None,
+                        history_tokens_after: Some(stats.history_tokens_after),
+                    },
+                );
+                // 「压缩成功」不等于「对话面变小」：摘要比被压区间还长时（极端但可能），
+                // 重放只是把同一份超长上下文再发一次。判据只看真实 token 数。
+                let after = usize::try_from(stats.history_tokens_after).unwrap_or(usize::MAX);
+                if after < before {
+                    OverflowOutcome::Retry
+                } else {
+                    tracing::warn!(turn, before, after, "溢出补救放弃：压缩没有缩小历史");
+                    OverflowOutcome::GiveUp
+                }
+            }
+            Err(abort) => {
+                emit(
+                    EventMsg::CompactionEnded {
+                        compaction_id,
+                        ok: false,
+                        error: Some(abort.message()),
+                        history_tokens_after: None,
+                    },
+                );
+                match abort {
+                    CompactAbort::Cancelled => OverflowOutcome::Cancelled,
+                    // 压缩失败不顶替原始错误：用户要看的是「上下文超出窗口」，
+                    // 「总结请求也失败」只是补救没成功，不能当成终局原因。
+                    CompactAbort::Failed(message) => {
+                        tracing::warn!(turn, error = %message, "溢出补救失败，保留原始 ContextTooLong");
+                        OverflowOutcome::GiveUp
+                    }
+                    CompactAbort::ArchiveUnavailable(message) => {
+                        tracing::warn!(turn, error = %message, "溢出补救放弃：档案不可写");
+                        OverflowOutcome::GiveUp
+                    }
+                }
+            }
+        }
+    }
+}
+
+/// 溢出补救的结论。
+///
+/// 只有「确实缩小了历史」才允许重放本步：压缩请求成功但摘要没变小、压缩失败、
+/// 没有可压区间，三者对用户是同一件事——原始 `ContextTooLong` 必须原样报出。
+enum OverflowOutcome {
+    Retry,
+    GiveUp,
+    Cancelled,
 }
 
 /// 一次成功压缩的产出：用来填 `compaction_summarized / ended` 的载荷。
@@ -590,6 +742,14 @@ impl AgentLoop {
         workspace_root: PathBuf,
         rollout: Option<Arc<crate::rollout::RolloutWriter>>,
     ) -> Self {
+        let window = cfg.effective_model().context_window as usize;
+        if window == 0 && cfg.agent.token_budget != 0 {
+            tracing::warn!(
+                configured = cfg.agent.token_budget,
+                fallback_window = crate::compaction::FALLBACK_CONTEXT_WINDOW,
+                "模型未声明 context_window：压缩阈值按保守窗口推导，请在模型行补全该字段"
+            );
+        }
         Self {
             backend,
             router,
@@ -601,17 +761,13 @@ impl AgentLoop {
             // 固定预算吃到底——128K 窗口配 500K 预算等于永远不压缩，等端点溢出才报错。
             // 窗口未知时同样不能退化成「50 万才压」：过去 `window == 0` 直接返回配置预算，
             // 配置里 context_window 缺省即 0，压缩于是永不触发（2026-11-10 修复）。
-            token_budget: {
-                let window = cfg.effective_model().context_window as usize;
-                if window == 0 && cfg.agent.token_budget != 0 {
-                    tracing::warn!(
-                        configured = cfg.agent.token_budget,
-                        fallback_window = crate::compaction::FALLBACK_CONTEXT_WINDOW,
-                        "模型未声明 context_window：压缩阈值按保守窗口推导，请在模型行补全该字段"
-                    );
-                }
-                crate::compaction::compact_token_budget(cfg.agent.token_budget, window)
-            },
+            token_budget: crate::compaction::compact_token_budget(cfg.agent.token_budget, window),
+            // 溢出补救与手动压缩共用同一口径：服务端已经报溢出时不能再拿「自动阈值」
+            // 当借口拒绝压缩，也不能在自动压缩被关掉时把历史压到只剩最后一条。
+            manual_token_budget: crate::compaction::manual_token_budget(
+                cfg.agent.token_budget,
+                window,
+            ),
             tree_budget: TreeBudget::unlimited(),
             policy: Arc::new(policy::SessionPolicyHandle::new(policy::SessionPolicy {
                 approval: cfg.approval.mode,
@@ -844,6 +1000,9 @@ impl AgentLoop {
         'outer: for turn in 1..=self.max_turns {
             last_turn = turn;
             turn_error = None;
+            // 溢出补救额度：每个 model step 只允许一次（dsh `maxOverflowRetries = 1`）。
+            // flag 必须在每步起点重置——做成全局一次的话，第二轮再溢出就永远没有补救机会。
+            let mut overflow_compaction_used = false;
             // SH-120：策略快照按 turn 取。运行中切换审批档只影响后续 turn，
             // 不回改正在执行的这一轮——一轮之内裁决依据必须自洽。
             let turn_policy = self.policy.snapshot();
@@ -1092,21 +1251,11 @@ impl AgentLoop {
                 }
             }
 
-            // 2.7) 会话引用展开（SH-090 批 2）：只作用于本步请求副本，档案与展示历史不动。
-            // 轮次内的后续采样末尾不是 user 消息，不会重复展开。
-            let expanded = match rollout.as_ref() {
-                Some(writer) => {
-                    let dir = writer.path().parent().map(std::path::Path::to_path_buf);
-                    let id = writer.path().file_stem().map(|stem| stem.to_string_lossy().into_owned());
-                    match (dir, id) {
-                        (Some(dir), Some(id)) => crate::session_reference::prepare_request(history, &dir, &id),
-                        _ => Ok(None),
-                    }
-                }
-                None => Ok(None),
-            };
-            let expanded = match expanded {
-                Ok(value) => value,
+            // 2.7) 会话引用展开（SH-090 批 2）＋ 2.8) 用户 `/name` 技能触发（SH-091）：
+            // 都只作用于本步请求副本，档案与展示历史不动。轮次内的后续采样末尾不是
+            // user 消息，不会重复展开；技能正文最后追加，离模型回答最近。
+            let mut request_history = match self.build_request_history(history, rollout) {
+                Ok(request) => request,
                 Err(message) => {
                     turn_error = Some(local_turn_error("CONTEXT_EXPAND_FAILED", message.clone()));
                     emit(&sink, EventMsg::Error { message });
@@ -1114,15 +1263,6 @@ impl AgentLoop {
                     break 'outer;
                 }
             };
-            // 2.8) 用户 `/name` 技能触发（SH-091）：只扫描原始历史末尾的用户消息，
-            // 避免把会话引用展开注入的上下文当成用户手势。技能正文最后追加，
-            // 离模型回答最近（与上游“背景在前、要执行的物料在后”一致）。
-            let skill_injections = crate::skills::injections(history, &self.workspace_root);
-            let mut request_history: Vec<HistoryItem> =
-                expanded.unwrap_or_else(|| history.clone());
-            if !skill_injections.is_empty() {
-                request_history.extend(skill_injections);
-            }
             // 2) 一次采样 = 建流 + 消费流，失败统一收敛成 `Option<ModelError>`。
             //    重试只发生在首个可见增量之前（见 `emitted_delta`）：已吐出的正文/思考
             //    不能重来，否则用户会看到两遍。
@@ -1245,7 +1385,45 @@ impl AgentLoop {
                 // - 已经收集到工具调用：前端已经看到工具卡片，重试会重复执行工具。
                 //
                 // 三者任一命中就直接终局，不再走 `await_retry`。
-                let outcome = if emitted_delta || usage.is_some() || !calls.is_empty() {
+                //
+                // 例外：服务端报「上下文超出窗口」时先做一次反应式压缩再重放本步。
+                // 为什么不塞进 `retry.rs`：这是压缩不是重试，请求内容已经变了；
+                // 进通用退避白名单只会让所有不压缩的场景反复打同一份超长上下文。
+                let overflow_rescue = error.kind == crate::model_client::ModelErrorKind::ContextTooLong
+                    && !overflow_compaction_used
+                    && !emitted_delta
+                    && usage.is_none()
+                    && calls.is_empty();
+                let outcome = if overflow_rescue {
+                    overflow_compaction_used = true;
+                    match self
+                        .compact_after_overflow(rollout, history, recorded, &sink, &instructions, cancel, turn)
+                        .await
+                    {
+                        OverflowOutcome::Retry => {
+                            // 请求副本必须按压缩后的历史重建：会话引用展开与技能注入
+                            // 只作用于副本，原样重发旧副本等于把压缩结果又盖回去。
+                            request_history = match self.build_request_history(history, rollout) {
+                                Ok(request) => request,
+                                Err(message) => {
+                                    turn_error =
+                                        Some(local_turn_error("CONTEXT_EXPAND_FAILED", message.clone()));
+                                    emit(&sink, EventMsg::Error { message });
+                                    reason = TurnEndReasonLocal::Failed;
+                                    break 'outer;
+                                }
+                            };
+                            tracing::info!(turn, "上下文超长，已压缩并重放本步");
+                            continue 'sample;
+                        }
+                        OverflowOutcome::Cancelled => {
+                            reason = TurnEndReasonLocal::Cancelled;
+                            break 'outer;
+                        }
+                        // 压缩没发生 / 失败 / 没变小：原始 `ContextTooLong` 原样终局。
+                        OverflowOutcome::GiveUp => give_up_without_retry_after(&error),
+                    }
+                } else if emitted_delta || usage.is_some() || !calls.is_empty() {
                     give_up_without_retry_after(&error)
                 } else {
                     await_retry(&self.retry, &sink, cancel, turn, retries, &mut retry_chain, &error).await
@@ -2558,6 +2736,32 @@ mod tests {
         }
     }
 
+    /// 可脚本化「建流阶段失败」的后端：按队列依次返回 `Err` 或一段事件流。
+    ///
+    /// 溢出补救的入口正是 `stream()` 返回 `Err(ContextTooLong)`（端点在建流前就拒绝），
+    /// [`ScriptedBackend`] 只会返回事件流，覆盖不到这条路径。队列被问空 = 代码多试了一次，
+    /// 直接 panic：无限重放必须让用例红，而不是把测试挂住。
+    struct ScriptedResultBackend(
+        Mutex<std::collections::VecDeque<Result<Vec<ModelStreamEvent>, crate::model_client::ModelError>>>,
+    );
+
+    #[async_trait::async_trait]
+    impl ModelBackend for ScriptedResultBackend {
+        async fn stream(
+            &self,
+            _history: &[HistoryItem],
+            _tools: &[ToolDeclaration],
+            _instructions: &str,
+        ) -> Result<ModelStream, crate::model_client::ModelError> {
+            let mut q = self.0.lock().unwrap();
+            match q.pop_front() {
+                Some(Ok(script)) => Ok(Box::pin(futures::stream::iter(script))),
+                Some(Err(error)) => Err(error),
+                None => panic!("脚本后端被多问了一次：溢出补救只允许重放一次"),
+            }
+        }
+    }
+
     /// 与 [`ScriptedBackend`] 的"空脚本"不同：这里连**流都不会建立**——
     /// 用于验证取消能在 `stream().await` 阶段生效（审计 H1）。
     struct HangingBackend;
@@ -2630,6 +2834,7 @@ mod tests {
             // 既有循环用例一律不启用压缩：它们断言的是轮次与工具回填行为，
             // 混进压缩会让"为什么这轮历史变短"变成隐性变量。
             token_budget: 0,
+            manual_token_budget: 0,
             tree_budget: TreeBudget::unlimited(),
             policy: Arc::new(policy::SessionPolicyHandle::new(policy::SessionPolicy {
                 approval: crate::config::ApprovalMode::OnRequest,
@@ -3982,6 +4187,163 @@ mod tests {
         );
     }
 
+    fn context_too_long_error() -> crate::model_client::ModelError {
+        crate::model_client::ModelError::new(
+            crate::model_client::ModelErrorKind::ContextTooLong,
+            Some(400),
+            Some("context_length_exceeded".into()),
+            None,
+            "上下文超出模型窗口限制".to_string(),
+        )
+    }
+
+    /// 溢出补救的入参历史：一条很长的旧消息 + 一条助手回复 + 本次用户消息。
+    /// 旧消息必须远大于摘要，否则用例会把「压了但没缩小」误判成补救失败。
+    fn overflow_history() -> Vec<HistoryItem> {
+        vec![
+            HistoryItem::Message {
+                role: Role::User,
+                text: "旧上下文".repeat(2_000),
+                reasoning: None,
+            },
+            HistoryItem::Message {
+                role: Role::Assistant,
+                text: "已了解".into(),
+                reasoning: None,
+            },
+            HistoryItem::Message { role: Role::User, text: "继续".into(), reasoning: None },
+        ]
+    }
+
+    fn result_backend(
+        scripts: Vec<Result<Vec<ModelStreamEvent>, crate::model_client::ModelError>>,
+    ) -> Arc<dyn ModelBackend> {
+        Arc::new(ScriptedResultBackend(Mutex::new(scripts.into())))
+    }
+
+    /// 溢出补救的主路径：第 1 次请求被端点以 `ContextTooLong` 拒绝 → 强制压缩一次 →
+    /// 第 2 次请求成功，回合正常完成。旧代码下这一轮直接失败（白名单里没有它）。
+    #[tokio::test]
+    async fn context_too_long_compacts_once_and_replays_the_step() {
+        let mut agent = make_loop_with_backend(result_backend(vec![
+            Err(context_too_long_error()),
+            // 压缩请求：只回摘要正文
+            Ok(vec![
+                ModelStreamEvent::OutputTextDelta { delta: "压缩摘要".into() },
+                usage_ev(),
+            ]),
+            // 压缩后的重放请求：正常回答
+            Ok(vec![
+                ModelStreamEvent::OutputTextDelta { delta: "完成".into() },
+                usage_ev(),
+            ]),
+        ]))
+        .0;
+        // 手动口径的小预算：保证 plan_manual 一定选出可压缩区间（只看窗口口径，不看阈值）。
+        agent.manual_token_budget = 10;
+        let store = Arc::new(Mutex::new(Vec::new()));
+        let mut instance = AgentInstance::root(overflow_history(), 0, CancellationToken::new());
+        let summary = agent
+            .run_instance(&mut instance, Arc::new(CapturingSink(store.clone())))
+            .await;
+
+        assert_eq!(summary.reason, TurnEndReason::Completed, "压缩后重放应当成功");
+        let events = store.lock().unwrap();
+        let started: Vec<&EventMsg> = events
+            .iter()
+            .filter(|e| matches!(e, EventMsg::CompactionStarted { .. }))
+            .collect();
+        assert_eq!(started.len(), 1, "每个 model step 只允许补救一次：{events:?}");
+        let EventMsg::CompactionStarted { trigger, budget_tokens, .. } = started[0] else {
+            unreachable!()
+        };
+        assert_eq!(
+            *trigger,
+            crate::events::CompactionTrigger::ContextOverflow,
+            "触发原因必须与服务端溢出对应，不能冒充预算压力"
+        );
+        assert_eq!(*budget_tokens, 10, "用的是强制压缩预算");
+    }
+
+    /// 压缩后仍然超长：只重放一次，最终报**原始** `ContextTooLong`，不无限循环。
+    /// 脚本队列只有三格，多问一次会 panic——这条用例同时守住「不得重放两次」。
+    #[tokio::test]
+    async fn still_too_long_after_compaction_reports_the_original_error() {
+        let mut agent = make_loop_with_backend(result_backend(vec![
+            Err(context_too_long_error()),
+            Ok(vec![
+                ModelStreamEvent::OutputTextDelta { delta: "压缩摘要".into() },
+                usage_ev(),
+            ]),
+            Err(context_too_long_error()),
+        ]))
+        .0;
+        agent.manual_token_budget = 10;
+        let store = Arc::new(Mutex::new(Vec::new()));
+        let mut instance = AgentInstance::root(overflow_history(), 0, CancellationToken::new());
+        let summary = agent
+            .run_instance(&mut instance, Arc::new(CapturingSink(store.clone())))
+            .await;
+
+        assert_eq!(summary.reason, TurnEndReason::Failed);
+        let events = store.lock().unwrap();
+        assert!(
+            events.iter().any(|e| matches!(
+                e,
+                EventMsg::Error { message } if message == "上下文超出模型窗口限制"
+            )),
+            "终局错误必须是原始的 ContextTooLong：{events:?}"
+        );
+    }
+
+    /// 压缩本身失败：不重放，报原始 `ContextTooLong`；历史仍保留原内容，
+    /// 不能被半截摘要替换（否则用户既失败又丢了上下文）。
+    #[tokio::test]
+    async fn failed_compaction_keeps_original_error_and_history() {
+        let mut agent = make_loop_with_backend(result_backend(vec![
+            Err(context_too_long_error()),
+            Ok(vec![ModelStreamEvent::Incomplete { reason: "max_tokens".into() }]),
+        ]))
+        .0;
+        agent.manual_token_budget = 10;
+        let store = Arc::new(Mutex::new(Vec::new()));
+        let mut instance = AgentInstance::root(overflow_history(), 0, CancellationToken::new());
+        let before: Vec<HistoryItem> = instance.history.clone();
+        let summary = agent
+            .run_instance(&mut instance, Arc::new(CapturingSink(store.clone())))
+            .await;
+
+        assert_eq!(summary.reason, TurnEndReason::Failed);
+        // 常规流程会追加系统提示这类条目，不能按整段相等断言；要守的是
+        // 「原历史还在、没有被半截摘要替换」。
+        assert!(
+            matches!(
+                instance.history.first(),
+                Some(HistoryItem::Message { role: Role::User, text, .. }) if text.starts_with("旧上下文")
+            ),
+            "压缩失败后原历史必须还在：{:?}",
+            instance.history
+        );
+        assert!(
+            instance.history.len() >= before.len(),
+            "压缩失败不允许历史变短：{} < {}",
+            instance.history.len(),
+            before.len()
+        );
+        let events = store.lock().unwrap();
+        assert!(
+            events.iter().any(|e| matches!(
+                e,
+                EventMsg::Error { message } if message == "上下文超出模型窗口限制"
+            )),
+            "终局错误必须是原始的 ContextTooLong：{events:?}"
+        );
+        assert!(
+            !events.iter().any(|e| matches!(e, EventMsg::CompactionEnded { ok: true, .. })),
+            "压缩失败不能报成功：{events:?}"
+        );
+    }
+
     /// 压缩期间按停止（含"端点还没回响应头"这一段）：必须收口为**取消**，不是失败。
     ///
     /// 反向对照：把 `CompactAbort::Cancelled` 改回按失败处理，本用例立刻变红
@@ -4668,6 +5030,7 @@ mod tests {
             workspace_root: std::env::temp_dir(),
             max_turns: 3,
             token_budget: 0,
+            manual_token_budget: 0,
             tree_budget: TreeBudget::unlimited(),
             policy: Arc::new(policy::SessionPolicyHandle::new(policy::SessionPolicy {
                 approval: crate::config::ApprovalMode::OnRequest,
@@ -4818,6 +5181,7 @@ mod tests {
             workspace_root: ws.to_path_buf(),
             max_turns: 5,
             token_budget: 0,
+            manual_token_budget: 0,
             tree_budget: TreeBudget::unlimited(),
             policy: Arc::new(policy::SessionPolicyHandle::new(policy::SessionPolicy {
                 approval: crate::config::ApprovalMode::OnRequest,
@@ -4922,6 +5286,7 @@ mod tests {
             workspace_root: std::env::temp_dir(),
             max_turns: 6,
             token_budget: 0,
+            manual_token_budget: 0,
             tree_budget: TreeBudget::unlimited(),
             policy: Arc::new(policy::SessionPolicyHandle::new(policy::SessionPolicy {
                 approval: crate::config::ApprovalMode::OnRequest,
@@ -5068,6 +5433,7 @@ mod tests {
             workspace_root: workspace,
             max_turns: 2,
             token_budget: 0,
+            manual_token_budget: 0,
             tree_budget: TreeBudget::unlimited(),
             policy: Arc::new(policy::SessionPolicyHandle::new(policy::SessionPolicy {
                 approval: crate::config::ApprovalMode::OnRequest,
@@ -5307,6 +5673,7 @@ mod tests {
             workspace_root: std::env::temp_dir(),
             max_turns: 1,
             token_budget: 0,
+            manual_token_budget: 0,
             tree_budget: TreeBudget::unlimited(),
             policy: Arc::new(policy::SessionPolicyHandle::new(policy::SessionPolicy {
                 approval: crate::config::ApprovalMode::OnRequest,

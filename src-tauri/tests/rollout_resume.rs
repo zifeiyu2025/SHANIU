@@ -120,6 +120,7 @@ fn loop_with(agent_ws: &Path, backend: Arc<Scripted>, writer: Arc<RolloutWriter>
         workspace_root: agent_ws.to_path_buf(),
         max_turns: 3,
         token_budget: 0,
+        manual_token_budget: 0,
         tree_budget: Default::default(),
         policy: Arc::new(policy::SessionPolicyHandle::new(policy::SessionPolicy { approval: ApprovalMode::OnRequest, sandbox: SandboxMode::WorkspaceWrite })),
         rollout: Some(writer),
@@ -333,6 +334,7 @@ async fn resume_continues_real_work_on_a_real_endpoint() {
             workspace_root: dir.to_path_buf(),
             max_turns: 8,
             token_budget: 0,
+            manual_token_budget: 0,
         tree_budget: Default::default(),
             policy: Arc::new(policy::SessionPolicyHandle::new(policy::SessionPolicy {
                 approval: ApprovalMode::OnRequest,

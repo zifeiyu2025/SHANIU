@@ -1139,6 +1139,10 @@ async fn run_one(ctx: RunOneCtx<'_>, backend: Arc<dyn ModelBackend>) -> (TaskOut
             .ok()
             .and_then(|v| v.parse().ok())
             .unwrap_or(0),
+        manual_token_budget: std::env::var("SHANIU_EVAL_TOKEN_BUDGET")
+            .ok()
+            .and_then(|v| v.parse().ok())
+            .unwrap_or(0),
         tree_budget: Default::default(),
         policy: Arc::new(policy::SessionPolicyHandle::new(policy::SessionPolicy {
             approval: ApprovalMode::OnRequest,

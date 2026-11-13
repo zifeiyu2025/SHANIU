@@ -826,6 +826,10 @@ async fn run_one(
             .ok()
             .and_then(|v| v.parse().ok())
             .unwrap_or(0),
+        manual_token_budget: std::env::var("SHANIU_EVAL_TOKEN_BUDGET")
+            .ok()
+            .and_then(|v| v.parse().ok())
+            .unwrap_or(0),
         tree_budget: Default::default(),
         policy: Arc::new(policy::SessionPolicyHandle::new(policy::SessionPolicy {
             approval: ApprovalMode::OnRequest,
@@ -1686,6 +1690,7 @@ async fn repair_loop_fixes_broken_rust_project_until_cargo_test_green() {
         workspace_root: ws.clone(),
         max_turns: 8,
         token_budget: 0,
+        manual_token_budget: 0,
         tree_budget: Default::default(),
         policy: Arc::new(policy::SessionPolicyHandle::new(policy::SessionPolicy {
             approval: ApprovalMode::OnRequest,

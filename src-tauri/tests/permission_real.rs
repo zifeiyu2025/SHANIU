@@ -120,6 +120,7 @@ async fn real_model_is_blocked_when_it_reaches_outside_the_narrowed_allowlist() 
         workspace_root: workspace.to_path_buf(),
         max_turns: 6,
         token_budget: 0,
+        manual_token_budget: 0,
         tree_budget: Default::default(),
         policy: Arc::new(policy::SessionPolicyHandle::new(policy::SessionPolicy {
             approval: ApprovalMode::OnRequest,

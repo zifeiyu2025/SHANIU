@@ -98,6 +98,7 @@ async fn rollout_file_matches_history_after_one_task() {
         workspace_root: data_root.to_path_buf(),
         max_turns: 2,
         token_budget: 0,
+        manual_token_budget: 0,
         tree_budget: Default::default(),
         policy: Arc::new(policy::SessionPolicyHandle::new(policy::SessionPolicy { approval: ApprovalMode::OnRequest, sandbox: SandboxMode::WorkspaceWrite })),
         rollout: Some(writer.clone()),

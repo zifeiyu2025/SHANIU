@@ -151,6 +151,7 @@ fn loop_with(
         workspace_root: ws.to_path_buf(),
         max_turns,
         token_budget: 0,
+        manual_token_budget: 0,
         tree_budget: Default::default(),
         policy: Arc::new(policy::SessionPolicyHandle::new(policy::SessionPolicy {
             approval: ApprovalMode::OnRequest,

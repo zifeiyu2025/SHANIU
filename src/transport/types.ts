@@ -72,7 +72,7 @@ export interface TurnErrorInfo {
 export type RetryPhase = 'scheduled' | 'started' | 'exhausted';
 
 /** 压缩触发原因（与 Rust `CompactionTrigger` 同形）。 */
-export type CompactionTrigger = 'pressure' | 'manual';
+export type CompactionTrigger = 'pressure' | 'manual' | 'context_overflow';
 
 /** 写后验证「无法判定」的封闭原因（与 Rust `InconclusiveReason` 同形，不设 catch-all）。 */
 export type InconclusiveReason = 'timeout' | 'command_missing' | 'pre_existing_red' | 'env_failure';

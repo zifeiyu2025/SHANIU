@@ -484,8 +484,9 @@ pub enum EventMsg {
 
 /// 压缩触发原因（additive）。
 ///
-/// 刻意不预留「上下文溢出」：本仓库只有预算压力与手动两条路径，多一个永不产出的
-/// 变体就是「写了没接上」（AGENTS §4.4）。真接入溢出触发时再连同消费方一起加。
+/// 三条路径各有明确的生产者：预算压力、用户主动 `/compact`、以及服务端报
+/// 「上下文超出窗口」后的反应式补救。三者的消费方是同一组 `compaction_*` 事件，
+/// 靠这个字段区分——用户在时间线上要能看出「这次不是我按的，也不是预算到了」。
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum CompactionTrigger {
@@ -493,13 +494,19 @@ pub enum CompactionTrigger {
     Pressure,
     /// 用户主动 `/compact`（回合外）。
     Manual,
+    /// 服务端报 `ContextTooLong` 后的补救压缩（对齐 dsh 的 `context-overflow`）。
+    ContextOverflow,
 }
 
 impl CompactionTrigger {
     /// FF-2 单一事实源（SH-078）：同 `TurnEndReason::all_variants` 的穷举约定。
     pub fn all_variants() -> &'static [Self] {
         match Self::Pressure {
-            Self::Pressure | Self::Manual => &[Self::Pressure, Self::Manual],
+            Self::Pressure | Self::Manual | Self::ContextOverflow => &[
+                Self::Pressure,
+                Self::Manual,
+                Self::ContextOverflow,
+            ],
         }
     }
 }

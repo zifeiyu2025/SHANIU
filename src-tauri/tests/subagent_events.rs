@@ -94,6 +94,7 @@ fn engine(turns: Vec<Vec<ModelStreamEvent>>) -> Arc<AgentLoop> {
         workspace_root: std::env::temp_dir(),
         max_turns: 4,
         token_budget: 0,
+        manual_token_budget: 0,
         tree_budget: Default::default(),
         policy: Arc::new(policy::SessionPolicyHandle::new(policy::SessionPolicy { approval: ApprovalMode::OnRequest, sandbox: SandboxMode::WorkspaceWrite })),
         rollout: None,

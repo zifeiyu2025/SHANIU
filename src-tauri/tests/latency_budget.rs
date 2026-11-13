@@ -112,6 +112,7 @@ async fn measure_once(first_byte: Duration) -> (Duration, Duration) {
         workspace_root: std::env::temp_dir(),
         max_turns: 1,
         token_budget: 0,
+        manual_token_budget: 0,
         tree_budget: Default::default(),
         policy: Arc::new(policy::SessionPolicyHandle::new(policy::SessionPolicy {
             approval: ApprovalMode::OnRequest,
@@ -237,6 +238,7 @@ async fn first_delta_latency_within_budget_on_real_endpoint() {
             workspace_root: std::env::temp_dir(),
             max_turns: 1,
             token_budget: 0,
+            manual_token_budget: 0,
         tree_budget: Default::default(),
             policy: Arc::new(policy::SessionPolicyHandle::new(policy::SessionPolicy {
                 approval: ApprovalMode::OnRequest,
@@ -345,6 +347,7 @@ async fn cancellation_stops_within_half_second() {
         workspace_root: std::env::temp_dir(),
         max_turns: 8,
         token_budget: 0,
+        manual_token_budget: 0,
         tree_budget: Default::default(),
         policy: Arc::new(policy::SessionPolicyHandle::new(policy::SessionPolicy { approval: ApprovalMode::OnRequest, sandbox: SandboxMode::WorkspaceWrite })),
         rollout: None,

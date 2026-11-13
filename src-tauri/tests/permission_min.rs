@@ -120,6 +120,7 @@ fn engine(router: ToolRouter, backend: Arc<dyn ModelBackend>) -> AgentLoop {
         workspace_root: std::env::temp_dir(),
         max_turns: 3,
         token_budget: 0,
+        manual_token_budget: 0,
         tree_budget: Default::default(),
         policy: Arc::new(policy::SessionPolicyHandle::new(policy::SessionPolicy {
             approval: ApprovalMode::OnRequest,

@@ -128,6 +128,7 @@ fn harness_with_rollout(
         workspace_root: std::env::temp_dir(),
         max_turns: 3,
         token_budget: 0,
+        manual_token_budget: 0,
         tree_budget: budget.clone(),
         policy: Arc::new(policy::SessionPolicyHandle::new(policy::SessionPolicy {
             approval: ApprovalMode::OnRequest,
@@ -566,7 +567,8 @@ async fn c15_retryable_stream_error_after_visible_output_is_terminal() {
     assert_eq!(turn_error(&events).code, "RATE_LIMIT");
 }
 
-/// C16：上下文超长是确定性失败——分类要能区分，且不重试。
+/// C16：上下文超长不进通用重试白名单（`retry.rs`），只允许一次反应式压缩；
+/// 压缩失败时立刻以**原始**错误终局——重试一万次也不会变。
 #[tokio::test]
 async fn c16_context_too_long_is_classified_and_not_retried() {
     let body = serde_json::json!({
@@ -578,7 +580,8 @@ async fn c16_context_too_long_is_classified_and_not_retried() {
                 message: "context too long".into(),
                 error: Some(ModelError::from_body(body.get("error"))),
             }]),
-            Step::Events(answered()),
+            // 唯一允许的那次补救压缩也失败：此后不得再重放本步。
+            Step::Events(vec![ModelStreamEvent::Incomplete { reason: "max_tokens".into() }]),
         ],
         fast_policy(),
     )
@@ -586,8 +589,13 @@ async fn c16_context_too_long_is_classified_and_not_retried() {
     .await;
 
     assert_eq!(reason, TurnEndReason::Failed);
-    assert_eq!(calls, 1, "上下文超长重试一万次也不会变");
+    assert_eq!(calls, 2, "一次原请求 + 一次压缩请求；压缩失败后不得重放");
     assert_eq!(count(&events, |event| matches!(event, EventMsg::ModelRetry { .. })), 0);
+    assert_eq!(
+        count(&events, |event| matches!(event, EventMsg::CompactionStarted { .. })),
+        1,
+        "补救压缩只允许一次"
+    );
     let info = turn_error(&events);
     assert_eq!(info.code, "CONTEXT_TOO_LONG");
     assert!(info.message.contains("上下文"), "{}", info.message);

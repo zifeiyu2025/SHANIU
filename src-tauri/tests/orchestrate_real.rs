@@ -69,6 +69,7 @@ async fn root_spawns_two_real_children_and_collects_their_answers() {
         workspace_root: std::env::temp_dir(),
         max_turns: 10,
         token_budget: 0,
+        manual_token_budget: 0,
         tree_budget: Default::default(),
         // spawn_agent 属写入档，无人值守的测试进程无法应答审批弹窗；这里用完全信任沙箱，
         // 验证目标在于编排链路本身，权限门控另有 FF-102 覆盖。
