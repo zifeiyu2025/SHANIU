@@ -68,13 +68,19 @@ impl ModelBackend for ScriptedBackend {
             .iter()
             .any(|h| matches!(h, HistoryItem::FunctionCallOutput { .. }));
         let events = if tool_already_ran {
-            vec![ModelStreamEvent::OutputTextDelta { delta: "完成".into() }]
+            vec![
+                ModelStreamEvent::OutputTextDelta { delta: "完成".into() },
+                ModelStreamEvent::Finished,
+            ]
         } else {
-            vec![ModelStreamEvent::OutputItem(ResponseItem::FunctionCall {
-                name: self.tool.clone(),
-                arguments: "{}".into(),
-                call_id: "c1".into(),
-            })]
+            vec![
+                ModelStreamEvent::OutputItem(ResponseItem::FunctionCall {
+                    name: self.tool.clone(),
+                    arguments: "{}".into(),
+                    call_id: "c1".into(),
+                }),
+                ModelStreamEvent::Finished,
+            ]
         };
         Ok(Box::pin(futures::stream::iter(events)))
     }
@@ -98,9 +104,13 @@ impl ModelBackend for MultiCallBackend {
             .iter()
             .any(|h| matches!(h, HistoryItem::FunctionCallOutput { .. }));
         let events = if tool_already_ran {
-            vec![ModelStreamEvent::OutputTextDelta { delta: "完成".into() }]
+            vec![
+                ModelStreamEvent::OutputTextDelta { delta: "完成".into() },
+                ModelStreamEvent::Finished,
+            ]
         } else {
-            self.calls
+            let mut events: Vec<ModelStreamEvent> = self
+                .calls
                 .iter()
                 .map(|(call_id, arguments)| {
                     ModelStreamEvent::OutputItem(ResponseItem::FunctionCall {
@@ -109,7 +119,9 @@ impl ModelBackend for MultiCallBackend {
                         call_id: call_id.clone(),
                     })
                 })
-                .collect()
+                .collect();
+            events.push(ModelStreamEvent::Finished);
+            events
         };
         Ok(Box::pin(futures::stream::iter(events)))
     }
@@ -134,13 +146,19 @@ impl ModelBackend for SequentialBackend {
             .filter(|h| matches!(h, HistoryItem::FunctionCallOutput { .. }))
             .count();
         let events = if outputs >= 2 {
-            vec![ModelStreamEvent::OutputTextDelta { delta: "完成".into() }]
+            vec![
+                ModelStreamEvent::OutputTextDelta { delta: "完成".into() },
+                ModelStreamEvent::Finished,
+            ]
         } else {
-            vec![ModelStreamEvent::OutputItem(ResponseItem::FunctionCall {
-                name: self.tool.clone(),
-                arguments: r#"{"command":"git status"}"#.into(),
-                call_id: format!("c{}", self.emitted.fetch_add(1, Ordering::SeqCst) + 1),
-            })]
+            vec![
+                ModelStreamEvent::OutputItem(ResponseItem::FunctionCall {
+                    name: self.tool.clone(),
+                    arguments: r#"{"command":"git status"}"#.into(),
+                    call_id: format!("c{}", self.emitted.fetch_add(1, Ordering::SeqCst) + 1),
+                }),
+                ModelStreamEvent::Finished,
+            ]
         };
         Ok(Box::pin(futures::stream::iter(events)))
     }

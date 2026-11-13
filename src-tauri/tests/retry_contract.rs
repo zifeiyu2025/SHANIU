@@ -512,3 +512,114 @@ async fn c13_exhausted_attempts_are_persisted_in_rollout() {
     assert_eq!(info.attempts, Some(5), "重开应用后必须能从档案看出这轮重试过 5 次");
     assert_eq!(info.code, "SERVER");
 }
+
+/// C14：流内错误体（无 HTTP 状态码）按可判定信息分类后，零输出前照样重试。
+///
+/// 反向对照：旧实现 `from_body` 除余额外一律 `Unknown`，不在重试白名单 →
+/// `calls` 只有 1，本条红在「必须重试一次」上。
+#[tokio::test]
+async fn c14_retryable_stream_error_before_output_is_retried() {
+    let body = serde_json::json!({"error":{"code":"rate_limit_exceeded","message":"slow down"}});
+    let (reason, events, calls) = harness(
+        vec![
+            Step::Events(vec![ModelStreamEvent::Failed {
+                message: "slow down".into(),
+                error: Some(ModelError::from_body(body.get("error"))),
+            }]),
+            Step::Events(answered()),
+        ],
+        fast_policy(),
+    )
+    .run()
+    .await;
+
+    assert_eq!(reason, TurnEndReason::Completed);
+    assert_eq!(calls, 2, "可判定为限流的流内错误应重试");
+    assert_eq!(phases(&events), vec![RetryPhase::Scheduled, RetryPhase::Started]);
+}
+
+/// C15：硬约束——流内错误即使可重试，一旦已经吐过可见内容就绝不重试。
+///
+/// 重试会让用户看到两遍正文，且同一次生成可能被重复计费。
+#[tokio::test]
+async fn c15_retryable_stream_error_after_visible_output_is_terminal() {
+    let body = serde_json::json!({"error":{"code":"rate_limit_exceeded","message":"slow down"}});
+    let (reason, events, calls) = harness(
+        vec![
+            Step::Events(vec![
+                ModelStreamEvent::OutputTextDelta { delta: "半句".into() },
+                ModelStreamEvent::Failed {
+                    message: "slow down".into(),
+                    error: Some(ModelError::from_body(body.get("error"))),
+                },
+            ]),
+            Step::Events(answered()),
+        ],
+        fast_policy(),
+    )
+    .run()
+    .await;
+
+    assert_eq!(reason, TurnEndReason::Failed);
+    assert_eq!(calls, 1, "已交付内容后不得重试（重复内容 + 重复计费）");
+    assert_eq!(count(&events, |event| matches!(event, EventMsg::ModelRetry { .. })), 0);
+    assert_eq!(turn_error(&events).code, "RATE_LIMIT");
+}
+
+/// C16：上下文超长是确定性失败——分类要能区分，且不重试。
+#[tokio::test]
+async fn c16_context_too_long_is_classified_and_not_retried() {
+    let body = serde_json::json!({
+        "error": {"code": "context_length_exceeded", "message": "maximum context length is 128000 tokens"}
+    });
+    let (reason, events, calls) = harness(
+        vec![
+            Step::Events(vec![ModelStreamEvent::Failed {
+                message: "context too long".into(),
+                error: Some(ModelError::from_body(body.get("error"))),
+            }]),
+            Step::Events(answered()),
+        ],
+        fast_policy(),
+    )
+    .run()
+    .await;
+
+    assert_eq!(reason, TurnEndReason::Failed);
+    assert_eq!(calls, 1, "上下文超长重试一万次也不会变");
+    assert_eq!(count(&events, |event| matches!(event, EventMsg::ModelRetry { .. })), 0);
+    let info = turn_error(&events);
+    assert_eq!(info.code, "CONTEXT_TOO_LONG");
+    assert!(info.message.contains("上下文"), "{}", info.message);
+}
+
+/// C17：已产出工具调用也视为“已交付”——可重试错误不得重发，否则工具会重复执行。
+#[tokio::test]
+async fn c17_retryable_stream_error_after_tool_call_is_not_retried() {
+    let body = serde_json::json!({"error":{"code":"rate_limit_exceeded","message":"slow down"}});
+    let (reason, events, calls) = harness(
+        vec![
+            Step::Events(vec![
+                ModelStreamEvent::OutputItem(ResponseItem::FunctionCall {
+                    name: "echo".into(),
+                    arguments: r#"{"text":"hi"}"#.into(),
+                    call_id: "call-1".into(),
+                }),
+                ModelStreamEvent::Failed {
+                    message: "slow down".into(),
+                    error: Some(ModelError::from_body(body.get("error"))),
+                },
+            ]),
+            Step::Events(answered()),
+        ],
+        fast_policy(),
+    )
+    .run()
+    .await;
+
+    assert_eq!(reason, TurnEndReason::Failed);
+    assert_eq!(calls, 1, "工具调用已产出：重试会重复执行工具");
+    assert_eq!(count(&events, |event| matches!(event, EventMsg::ModelRetry { .. })), 0);
+    assert_eq!(count(&events, |event| matches!(event, EventMsg::ToolCallBegin { .. })), 0);
+    assert_eq!(turn_error(&events).code, "RATE_LIMIT");
+}

@@ -39,7 +39,10 @@ impl ModelBackend for Scripted {
         let mut queue = self.0.lock().unwrap();
         // 脚本用尽后只出文本：保证任何续跑都必然收口，不会把测试挂在无限循环上
         let script = if queue.is_empty() {
-            vec![ModelStreamEvent::OutputTextDelta { delta: "收尾".into() }]
+            vec![
+                ModelStreamEvent::OutputTextDelta { delta: "收尾".into() },
+                ModelStreamEvent::Finished,
+            ]
         } else {
             queue.remove(0)
         };
@@ -202,9 +205,10 @@ async fn restart_then_resume_continues_the_same_archive() {
 
     // ── 第二次进程生命周期：追加到同一份档案，不重新建档 ──
     let writer = Arc::new(RolloutWriter::open_existing(&path).unwrap());
-    let backend = Arc::new(Scripted(Mutex::new(vec![vec![ModelStreamEvent::OutputTextDelta {
-        delta: "第二轮接着做".into(),
-    }]])));
+    let backend = Arc::new(Scripted(Mutex::new(vec![vec![
+        ModelStreamEvent::OutputTextDelta { delta: "第二轮接着做".into() },
+        ModelStreamEvent::Finished,
+    ]])));
     let agent = loop_with(&dir, backend, writer);
     let sink: Arc<dyn EventSink> = Arc::new(NullSink);
     agent
@@ -269,9 +273,10 @@ async fn fork_creates_child_archive_linked_to_parent_without_touching_source() {
     // 子会话续跑写自己的档案，父档案保持不动
     let child_before = std::fs::read_to_string(&forked.path).unwrap();
     let writer = Arc::new(RolloutWriter::open_existing(&forked.path).unwrap());
-    let backend = Arc::new(Scripted(Mutex::new(vec![vec![ModelStreamEvent::OutputTextDelta {
-        delta: "子会话继续".into(),
-    }]])));
+    let backend = Arc::new(Scripted(Mutex::new(vec![vec![
+        ModelStreamEvent::OutputTextDelta { delta: "子会话继续".into() },
+        ModelStreamEvent::Finished,
+    ]])));
     let agent = loop_with(&dir, backend, writer);
     agent
         .run_with_history(child.history.clone(), child.history.len(), Arc::new(NullSink), CancellationToken::new())

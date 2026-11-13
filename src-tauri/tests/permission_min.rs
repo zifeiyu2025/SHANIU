@@ -69,11 +69,14 @@ impl ModelBackend for ScriptedBackend {
                 usage: Usage { input_tokens: 1, cached_input_tokens: None, output_tokens: 1 },
             }]
         } else {
-            vec![ModelStreamEvent::OutputItem(ResponseItem::FunctionCall {
-                name: self.tool.clone(),
-                arguments: "{}".into(),
-                call_id: "c1".into(),
-            })]
+            vec![
+                ModelStreamEvent::OutputItem(ResponseItem::FunctionCall {
+                    name: self.tool.clone(),
+                    arguments: "{}".into(),
+                    call_id: "c1".into(),
+                }),
+                ModelStreamEvent::Finished,
+            ]
         };
         Ok(Box::pin(futures::stream::iter(events)))
     }

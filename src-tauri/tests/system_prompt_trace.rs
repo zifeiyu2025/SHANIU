@@ -51,7 +51,10 @@ impl ModelBackend for Capturing {
         self.instructions.lock().unwrap().push(instructions.to_string());
         let mut queue = self.scripts.lock().unwrap();
         let script = if queue.is_empty() {
-            vec![ModelStreamEvent::OutputTextDelta { delta: "收尾".into() }]
+            vec![
+                ModelStreamEvent::OutputTextDelta { delta: "收尾".into() },
+                ModelStreamEvent::Finished,
+            ]
         } else {
             queue.remove(0)
         };
@@ -201,7 +204,10 @@ async fn one_record_per_run_from_the_actual_instructions() {
                 usage: Usage { input_tokens: 3, cached_input_tokens: None, output_tokens: 1 },
             },
         ],
-        vec![ModelStreamEvent::OutputTextDelta { delta: "做完了".into() }],
+        vec![
+            ModelStreamEvent::OutputTextDelta { delta: "做完了".into() },
+            ModelStreamEvent::Finished,
+        ],
     ]));
     let writer = Arc::new(RolloutWriter::create(&rollout_dir, &meta("a1", &dir)).unwrap());
     {
@@ -232,9 +238,10 @@ async fn one_record_per_run_from_the_actual_instructions() {
 
     // 续跑：新 run 重新组装 → 新记录（同一会话内第二次下发）。
     let writer = Arc::new(RolloutWriter::open_existing(&path).unwrap());
-    let backend2 = Arc::new(Capturing::new(vec![vec![ModelStreamEvent::OutputTextDelta {
-        delta: "继续".into(),
-    }]]));
+    let backend2 = Arc::new(Capturing::new(vec![vec![
+        ModelStreamEvent::OutputTextDelta { delta: "继续".into() },
+        ModelStreamEvent::Finished,
+    ]]));
     let (agent, broker) = loop_with(&dir, backend2, writer, SandboxMode::WorkspaceWrite, 5);
     agent
         .run_task("第二轮任务", Arc::new(Recording::new(broker)), CancellationToken::new())
@@ -256,11 +263,14 @@ async fn twenty_unchanged_turns_do_not_grow_the_archive_linearly() {
     // 每轮都派一个工具调用，强制跑满 20 轮。
     let scripts: Vec<Vec<ModelStreamEvent>> = (0..20)
         .map(|i| {
-            vec![ModelStreamEvent::OutputItem(ResponseItem::FunctionCall {
-                name: "read_file".into(),
-                arguments: format!("{{\"i\":{i}}}"),
-                call_id: format!("c{i}"),
-            })]
+            vec![
+                ModelStreamEvent::OutputItem(ResponseItem::FunctionCall {
+                    name: "read_file".into(),
+                    arguments: format!("{{\"i\":{i}}}"),
+                    call_id: format!("c{i}"),
+                }),
+                ModelStreamEvent::Finished,
+            ]
         })
         .collect();
     let backend = Arc::new(Capturing::new(scripts));
@@ -287,9 +297,10 @@ async fn changed_prompt_produces_a_second_version() {
     let path = rollout_dir.join("ver.jsonl");
 
     // 第一次：WorkspaceWrite
-    let backend = Arc::new(Capturing::new(vec![vec![ModelStreamEvent::OutputTextDelta {
-        delta: "一".into(),
-    }]]));
+    let backend = Arc::new(Capturing::new(vec![vec![
+        ModelStreamEvent::OutputTextDelta { delta: "一".into() },
+        ModelStreamEvent::Finished,
+    ]]));
     let writer = Arc::new(RolloutWriter::create(&rollout_dir, &meta("ver", &dir)).unwrap());
     let (agent, broker) = loop_with(&dir, backend, writer, SandboxMode::WorkspaceWrite, 3);
     agent
@@ -298,9 +309,10 @@ async fn changed_prompt_produces_a_second_version() {
 
     // 第二次：ReadOnly（换档位 → 组装出的提示词不同）
     let writer = Arc::new(RolloutWriter::open_existing(&path).unwrap());
-    let backend = Arc::new(Capturing::new(vec![vec![ModelStreamEvent::OutputTextDelta {
-        delta: "二".into(),
-    }]]));
+    let backend = Arc::new(Capturing::new(vec![vec![
+        ModelStreamEvent::OutputTextDelta { delta: "二".into() },
+        ModelStreamEvent::Finished,
+    ]]));
     let (agent, broker) = loop_with(&dir, backend, writer, SandboxMode::ReadOnly, 3);
     let sink = Arc::new(Recording::new(broker));
     agent.run_task("第二轮", sink, CancellationToken::new()).await;
@@ -336,9 +348,10 @@ async fn archive_write_failure_degrades_instead_of_failing_the_turn() {
         .unwrap();
     lock.lock().expect("无法锁定档案文件");
 
-    let backend = Arc::new(Capturing::new(vec![vec![ModelStreamEvent::OutputTextDelta {
-        delta: "档案写不进去也要把话说完".into(),
-    }]]));
+    let backend = Arc::new(Capturing::new(vec![vec![
+        ModelStreamEvent::OutputTextDelta { delta: "档案写不进去也要把话说完".into() },
+        ModelStreamEvent::Finished,
+    ]]));
     let (agent, broker) = loop_with(&dir, backend, writer, SandboxMode::WorkspaceWrite, 3);
     let sink = Arc::new(Recording::new(broker));
     let summary = agent.run_task("任务", sink.clone(), CancellationToken::new()).await;
@@ -373,9 +386,10 @@ async fn archive_write_failure_degrades_instead_of_failing_the_turn() {
 
     // 释放锁后，下一轮应能自然补齐（游标停在失败条目上，不在失败时丢历史）。
     drop(lock);
-    let backend = Arc::new(Capturing::new(vec![vec![ModelStreamEvent::OutputTextDelta {
-        delta: "恢复".into(),
-    }]]));
+    let backend = Arc::new(Capturing::new(vec![vec![
+        ModelStreamEvent::OutputTextDelta { delta: "恢复".into() },
+        ModelStreamEvent::Finished,
+    ]]));
     let writer = Arc::new(RolloutWriter::open_existing(&path).unwrap());
     let (agent, broker) = loop_with(&dir, backend, writer, SandboxMode::WorkspaceWrite, 3);
     agent
