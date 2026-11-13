@@ -1,0 +1,313 @@
+{
+  "version": 1,
+  "kind": "failure",
+  "judge": "evals/failure/judge/run.ps1",
+  "notes": [
+    "这批题的被测对象是宿主（agent_loop + model_client + compaction + rollout），不是模型能力。模型端点由 runner 内置的本地 mock 提供，剧本写死在每题 inject.steps 里；没有 inject 块的题一律拒绝执行。",
+    "注入只存在于 evals/failure/runner 的 mock 端点里，正常题集（tasks.json / repo-tasks.json）与产品运行路径都不引用它，默认关闭。",
+    "失败面判据必须落到可观测的宿主行为：请求次数与顺序、model_retry 事件、turn_completed.reason/error、rollout 落盘顺序、resume 重放结果。不得用「任务看起来完成了」代替。",
+    "expect=gap 表示：判据来自仓库既有要求，但当前 HEAD 的实现未满足，预期红；红是测量结论，不是套件故障。",
+    "所有判据来源均指向 src-tauri 实现或 evals/repo 的既有要求；没有来源的判据不得入题。"
+  ],
+  "tasks": [
+    {
+      "id": "fail-stream-truncated-before-delta",
+      "type": "failure-surface",
+      "title": "模型流在首个增量前断开：必须重试且只交付一份正文",
+      "description": "mock 端点对第一次请求只发 response.created 就关闭连接（没有 response.completed），第二次请求正常作答。宿主应把 EOF 判成流被截断（可重试），按退避重试一次并成功收口；正文只允许出现一份。",
+      "task": "请直接回复一句完成确认。",
+      "setup": {
+        "history": "none",
+        "token_budget": 0,
+        "manual_token_budget": 0,
+        "rollout": false
+      },
+      "inject": {
+        "max_retries": 2,
+        "initial_delay_ms": 50,
+        "max_delay_ms": 5000,
+        "jitter_ratio": 0.0,
+        "steps": [
+          { "action": "truncate_before_delta" },
+          {
+            "action": "text",
+            "text": "已恢复：这是重试后的正式回答。",
+            "usage": { "input_tokens": 12, "output_tokens": 3 }
+          }
+        ]
+      },
+      "probes": ["已恢复"],
+      "judge": {
+        "key": "truncate-before-delta",
+        "expect": "pass",
+        "sources": [
+          "src-tauri/src/agent_loop/mod.rs#L1367-L1375",
+          "src-tauri/src/agent_loop/mod.rs#L1426-L1430",
+          "src-tauri/src/model_client/retry.rs#L50-L59"
+        ]
+      }
+    },
+    {
+      "id": "fail-stream-truncated-after-delta",
+      "type": "failure-surface",
+      "title": "模型流在首个增量后断开：禁止重试，半截内容不得落历史",
+      "description": "mock 端点先发一段 output_text.delta，再直接关闭连接（没有终态标记）。宿主必须终局失败（NETWORK），不得重试、不得把半截正文当助手消息落 rollout、不得执行任何工具。",
+      "task": "请直接回复一句完成确认。",
+      "setup": {
+        "history": "none",
+        "token_budget": 0,
+        "manual_token_budget": 0,
+        "rollout": true
+      },
+      "inject": {
+        "max_retries": 2,
+        "initial_delay_ms": 50,
+        "max_delay_ms": 5000,
+        "jitter_ratio": 0.0,
+        "steps": [
+          { "action": "truncate_after_delta", "text": "我已经开始处理：半句" }
+        ]
+      },
+      "probes": ["半句"],
+      "judge": {
+        "key": "truncate-after-delta",
+        "expect": "pass",
+        "sources": [
+          "src-tauri/src/agent_loop/mod.rs#L1318-L1322",
+          "src-tauri/src/agent_loop/mod.rs#L1371-L1375",
+          "src-tauri/src/agent_loop/mod.rs#L1426-L1427"
+        ]
+      }
+    },
+    {
+      "id": "fail-rate-limit-retry-after",
+      "type": "failure-surface",
+      "title": "429 且带 Retry-After：必须按端点要求等待后重试",
+      "description": "mock 端点对第一次请求返回 429 + Retry-After: 1，第二次正常作答。宿主必须发 model_retry(scheduled/started)，实际等待接近 1 秒（不得忽略 Retry-After 走自己的 50ms 退避），且正文只交付重试后那一份。",
+      "task": "请直接回复一句完成确认。",
+      "setup": {
+        "history": "none",
+        "token_budget": 0,
+        "manual_token_budget": 0,
+        "rollout": false
+      },
+      "inject": {
+        "max_retries": 2,
+        "initial_delay_ms": 50,
+        "max_delay_ms": 5000,
+        "jitter_ratio": 0.0,
+        "steps": [
+          { "action": "rate_limit", "retry_after_secs": 1 },
+          {
+            "action": "text",
+            "text": "限流后成功：任务完成。",
+            "usage": { "input_tokens": 20, "output_tokens": 4 }
+          }
+        ]
+      },
+      "probes": ["限流后成功"],
+      "judge": {
+        "key": "rate-limit-retry-after",
+        "expect": "pass",
+        "sources": [
+          "src-tauri/src/model_client/mod.rs#L703-L717",
+          "src-tauri/src/model_client/retry.rs#L67-L74"
+        ]
+      }
+    },
+    {
+      "id": "fail-quota-exhausted",
+      "type": "failure-surface",
+      "title": "配额打满：一次终局，不得把 429 当限流重试",
+      "description": "mock 端点始终返回 429，错误体点名 insufficient_quota。宿主必须先按错误体判成 QUOTA（而不是按状态码判成限流），一次都不重试，并把 provider_code / http_status 原样带进 turn_completed.error。",
+      "task": "请直接回复一句完成确认。",
+      "setup": {
+        "history": "none",
+        "token_budget": 0,
+        "manual_token_budget": 0,
+        "rollout": false
+      },
+      "inject": {
+        "max_retries": 3,
+        "initial_delay_ms": 10,
+        "max_delay_ms": 1000,
+        "jitter_ratio": 0.0,
+        "steps": [
+          { "action": "quota" }
+        ]
+      },
+      "probes": [],
+      "judge": {
+        "key": "quota-exhausted",
+        "expect": "pass",
+        "sources": [
+          "src-tauri/src/model_client/error.rs#L96-L114",
+          "src-tauri/src/model_client/retry.rs#L50-L59"
+        ]
+      }
+    },
+    {
+      "id": "fail-incomplete-max-output",
+      "type": "failure-surface",
+      "title": "响应不完整（达到最大输出长度）：终局失败，不得重试或当成功",
+      "description": "mock 端点发一段增量后返回 response.incomplete，reason=max_output_tokens。宿主必须终局失败 INCOMPLETE，文案点明达到最大输出长度，不得重试，半截正文不得落历史。",
+      "task": "请直接回复一句完成确认。",
+      "setup": {
+        "history": "none",
+        "token_budget": 0,
+        "manual_token_budget": 0,
+        "rollout": true
+      },
+      "inject": {
+        "max_retries": 2,
+        "initial_delay_ms": 50,
+        "max_delay_ms": 5000,
+        "jitter_ratio": 0.0,
+        "steps": [
+          { "action": "incomplete", "text": "写到一半", "reason": "max_output_tokens" }
+        ]
+      },
+      "probes": [],
+      "judge": {
+        "key": "incomplete-max-output",
+        "expect": "pass",
+        "sources": [
+          "src-tauri/src/model_client/mod.rs#L163-L171",
+          "src-tauri/src/model_client/error.rs#L214-L222",
+          "src-tauri/src/agent_loop/mod.rs#L1345-L1351"
+        ]
+      }
+    },
+    {
+      "id": "fail-context-overflow-stream-replay",
+      "type": "failure-surface",
+      "title": "流内报上下文超长：强制压缩一次并重放本步",
+      "description": "第一个主请求在流内返回 response.failed + context_length_exceeded（此时还没有任何增量）。宿主必须先摘要、再按压缩后的历史重放本步并收口；重放请求必须比原请求小且包含摘要。",
+      "task": "请继续处理这个任务并给出结论。",
+      "setup": {
+        "history": "overflow_seed",
+        "token_budget": 0,
+        "manual_token_budget": 200,
+        "rollout": true
+      },
+      "inject": {
+        "max_retries": 2,
+        "initial_delay_ms": 20,
+        "max_delay_ms": 2000,
+        "jitter_ratio": 0.0,
+        "steps": [
+          {
+            "action": "overflow_stream",
+            "code": "context_length_exceeded",
+            "message": "Your input exceeds the context window of this model."
+          },
+          {
+            "action": "summary",
+            "text": "【交接摘要】1. 任务目标：继续处理溢出的长任务。2. 已完成事项：已读取背景。3. 关键文件与改动：无。4. 未解决问题：上下文超长。5. 下一步：直接作答。"
+          },
+          {
+            "action": "text",
+            "text": "压缩后重放成功：任务完成。",
+            "usage": { "input_tokens": 40, "output_tokens": 5 }
+          }
+        ]
+      },
+      "probes": ["SEED_OVERFLOW_SHADOW", "【交接摘要】", "压缩后重放成功"],
+      "judge": {
+        "key": "context-overflow-stream-replay",
+        "expect": "pass",
+        "sources": [
+          "src-tauri/src/agent_loop/mod.rs#L1389-L1425",
+          "src-tauri/src/agent_loop/mod.rs#L580-L665",
+          "src-tauri/src/events.rs#L509-L516"
+        ]
+      }
+    },
+    {
+      "id": "fail-context-overflow-http400",
+      "type": "failure-surface",
+      "title": "HTTP 400 报上下文超长：应与流内报错同一条补救路径（当前缺口）",
+      "description": "第一个主请求直接返回 HTTP 400 + context_length_exceeded 错误体（真实端点最常见的形态）。判据与流内题相同：压缩一次、重放本步、收口。当前 HEAD 把 400 一律归 BadRequest，走不到压缩，故预期红；红必须作为产品缺口上报，不得放宽判据。",
+      "task": "请继续处理这个任务并给出结论。",
+      "setup": {
+        "history": "overflow_seed",
+        "token_budget": 0,
+        "manual_token_budget": 200,
+        "rollout": true
+      },
+      "inject": {
+        "max_retries": 2,
+        "initial_delay_ms": 20,
+        "max_delay_ms": 2000,
+        "jitter_ratio": 0.0,
+        "steps": [
+          {
+            "action": "overflow_http",
+            "status": 400,
+            "code": "context_length_exceeded",
+            "message": "Your input exceeds the context window of this model."
+          },
+          {
+            "action": "summary",
+            "text": "【交接摘要】1. 任务目标：继续处理溢出的长任务。2. 已完成事项：已读取背景。3. 关键文件与改动：无。4. 未解决问题：上下文超长。5. 下一步：直接作答。"
+          },
+          {
+            "action": "text",
+            "text": "压缩后重放成功：任务完成。",
+            "usage": { "input_tokens": 40, "output_tokens": 5 }
+          }
+        ]
+      },
+      "probes": ["SEED_OVERFLOW_SHADOW", "【交接摘要】", "压缩后重放成功"],
+      "judge": {
+        "key": "context-overflow-http400",
+        "expect": "gap",
+        "sources": [
+          "src-tauri/src/model_client/error.rs#L100-L114",
+          "evals/repo/fixtures/repo_feat_context_overflow.rs#L9-L22",
+          "src-tauri/src/agent_loop/mod.rs#L1389-L1425"
+        ]
+      }
+    },
+    {
+      "id": "fail-long-session-compaction-anchor",
+      "type": "failure-surface",
+      "title": "长会话预算压缩：锚点顺序与 resume 重放必须一致",
+      "description": "预置一段超预算的历史并从小预算启动。宿主应在回合开始压缩：先摘要，再把压缩后的历史用于主请求；Compacted 锚点必须排在被遮蔽条目之后、后续回复之前；resume(path) 必须能重放出「摘要替换区间」后的历史，且主请求里不得再出现被遮蔽区间的唯一标记。",
+      "task": "请继续这个长会话并给出结论。",
+      "setup": {
+        "history": "long_session",
+        "token_budget": 400,
+        "manual_token_budget": 400,
+        "rollout": true
+      },
+      "inject": {
+        "max_retries": 1,
+        "initial_delay_ms": 10,
+        "max_delay_ms": 1000,
+        "jitter_ratio": 0.0,
+        "steps": [
+          {
+            "action": "summary",
+            "text": "【交接摘要】1. 任务目标：长会话继续。2. 已完成事项：历史已读。3. 关键文件与改动：无。4. 未解决问题：无。5. 下一步：直接作答。"
+          },
+          {
+            "action": "text",
+            "text": "长会话压缩后继续：完成。",
+            "usage": { "input_tokens": 60, "output_tokens": 6 }
+          }
+        ]
+      },
+      "probes": ["SEED_LONG_SHADOW", "【交接摘要】", "长会话压缩后继续"],
+      "judge": {
+        "key": "long-session-compaction-anchor",
+        "expect": "pass",
+        "sources": [
+          "src-tauri/src/agent_loop/mod.rs#L2263",
+          "src-tauri/src/rollout/resume.rs#L64-L145",
+          "src-tauri/src/compaction/mod.rs#L199-L209"
+        ]
+      }
+    }
+  ]
+}

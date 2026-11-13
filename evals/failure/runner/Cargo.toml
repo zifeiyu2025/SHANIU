@@ -1,0 +1,18 @@
+[package]
+name = "shaniu-failure-eval"
+version = "0.1.0"
+edition = "2021"
+publish = false
+
+[[bin]]
+name = "failure-suite"
+path = "src/main.rs"
+
+# 只用于失败面题集：path 依赖产品库，不引入任何前端/可执行壳。
+# 编译请使用独立 target 目录（见 evals/failure/README.md），避免占用主 target 锁。
+[dependencies]
+shaniu_lib = { package = "shaniu", path = "../../../src-tauri" }
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+tokio = { version = "1", features = ["macros", "rt-multi-thread", "net", "io-util", "time", "sync"] }
+tokio-util = "0.7"
