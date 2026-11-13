@@ -1316,12 +1316,10 @@ impl AgentLoop {
                 }
             }
 
-            // 5) 本轮已到预算上限且仍需工具 → 预算耗尽
-            if turn == self.max_turns {
-                emit(&sink, EventMsg::Error { message: format!("已达最大轮数上限（{turn}）") });
-                reason = TurnEndReasonLocal::BudgetExhausted;
-                break;
-            }
+            // 5) 本轮已到预算上限：不在这里 break。先让本轮已声明的工具照常执行，
+            //    保证历史里的 FunctionCall / FunctionCallOutput 成对；执行完再收口。
+            //    旧行为在这一步直接丢弃整批调用，模型最后一刻想跑的验证命令会消失，
+            //    只留下一个没有输出的 FunctionCall 意图。
 
             // 6) 工具调用入历史 → 执行 → 输出回填
             // SH-122：先按派发顺序过一遍空转检测（同一工具 + 规范化参数连续第 4 次），
@@ -1848,6 +1846,15 @@ impl AgentLoop {
             // 游标停在失败条目上，磁盘恢复后下一轮会补齐；本轮继续跑完。
             if let Err(message) = self.flush_history(rollout, history, recorded) {
                 degrade_rollout(&sink, message);
+            }
+
+            // 5) 本轮工具批次已执行完、调用与输出已成对：此刻才收口预算耗尽。
+            //    这样「最后一轮仍在请求工具」不会再静默丢调用，也无需额外的
+            //    「未执行工具」说明——它们确实执行了，历史是完整的。
+            if turn == self.max_turns {
+                emit(&sink, EventMsg::Error { message: format!("已达最大轮数上限（{turn}）") });
+                reason = TurnEndReasonLocal::BudgetExhausted;
+                break;
             }
         }
 
@@ -2866,6 +2873,45 @@ mod tests {
             completed_unverified(&store.lock().unwrap()),
             "验证失败必须如实标记未验证，不能当成已完成"
         );
+    }
+
+    /// B：最后一轮仍在请求工具。
+    /// 旧行为在工具批次执行前就 `break`，历史里连 `FunctionCall` 都没有（更不会有
+    /// 输出）；新行为先把本轮批次执行完，再以预算耗尽收口，保证调用/输出成对。
+    #[tokio::test]
+    async fn last_turn_tool_calls_execute_before_budget_exhaustion() {
+        let (mut agent, store, cancel, _broker) = make_loop(vec![script_call_with(
+            "read_file",
+            "{}",
+            "last-call",
+        )]);
+        agent.max_turns = 1;
+        let mut instance =
+            crate::agent_loop::instance::AgentInstance::root(Vec::new(), 0, cancel);
+        let summary = agent
+            .run_instance(&mut instance, Arc::new(CapturingSink(store)))
+            .await;
+
+        assert_eq!(summary.turns, 1);
+        assert_eq!(summary.reason, TurnEndReason::BudgetExhausted, "收口原因仍是预算耗尽");
+        let calls: Vec<&str> = instance
+            .history
+            .iter()
+            .filter_map(|item| match item {
+                HistoryItem::FunctionCall { call_id, .. } => Some(call_id.as_str()),
+                _ => None,
+            })
+            .collect();
+        let outputs: Vec<&str> = instance
+            .history
+            .iter()
+            .filter_map(|item| match item {
+                HistoryItem::FunctionCallOutput { call_id, .. } => Some(call_id.as_str()),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(calls, vec!["last-call"], "最后一轮声明的调用必须入历史并执行");
+        assert_eq!(outputs, calls, "每个 FunctionCall 都必须有配对的 Output");
     }
 
     /// `warn` 是运行期泄压阀：仍发事件，但不否决、不增加轮次。
