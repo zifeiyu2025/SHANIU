@@ -47,18 +47,14 @@ pub async fn discover_endpoint_models(
     if !(base.starts_with("http://") || base.starts_with("https://")) {
         return Err(format!("端点地址必须以 http(s):// 开头：{base}"));
     }
-    let url = format!("{base}/models");
-    let client = reqwest::Client::builder()
-        .timeout(std::time::Duration::from_secs(DISCOVERY_TIMEOUT_SECS))
-        .build()
-        .map_err(|e| format!("HTTP 客户端不可用: {e}"))?;
-    // 部署头先放，认证头后到（与模型请求同口径：authorization 冲突时认证头获胜）
-    let mut request = client.get(&url).header("accept", "application/json");
-    for (name, value) in headers {
-        request = request.header(name.as_str(), value.as_str());
-    }
+    let (url, request) = crate::model_client::models_probe_request(
+        base,
+        headers,
+        api_key,
+        std::time::Duration::from_secs(DISCOVERY_TIMEOUT_SECS),
+    )
+    .map_err(|e| format!("HTTP 客户端不可用: {e}"))?;
     let response = request
-        .bearer_auth(api_key)
         .send()
         .await
         .map_err(|e| format!("无法访问 {url}: {e}"))?;

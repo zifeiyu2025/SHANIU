@@ -14,6 +14,7 @@ pub use retry::{random01, RetryPolicy};
 use eventsource_stream::{Event, Eventsource};
 use futures::{Stream, StreamExt};
 use serde::{Deserialize, Serialize};
+use std::collections::BTreeMap;
 use std::time::Duration;
 
 use crate::images::{image_store, ImageRef};
@@ -613,6 +614,29 @@ pub fn translate_chat_data(data: &str, acc: &mut ChatStreamAccumulator) -> Vec<M
 }
 
 // ============================== 网络流（薄 IO 壳） ==============================
+
+/// `/models` 探测请求的共同构造（URL、`accept`、部署头、认证头）。
+///
+/// 调用者只有两处：密钥三态校验（`key_check`）与设置页"拉取模型"
+/// （`model_discovery`）。两者的超时、响应上限与结论映射不同，但请求本身必须同口径
+/// ——尤其是自定义头先放、`bearer_auth` 后到（authorization 冲突时认证头获胜），
+/// 否则同一个端点会被两家探测问出两种结果。
+///
+/// 返回拼好的 URL（错误消息要用）与尚未发送的请求；超时由调用者决定。
+pub(crate) fn models_probe_request(
+    base_url: &str,
+    headers: &BTreeMap<String, String>,
+    api_key: &str,
+    timeout: Duration,
+) -> Result<(String, reqwest::RequestBuilder), reqwest::Error> {
+    let url = format!("{}/models", base_url.trim().trim_end_matches('/'));
+    let client = reqwest::Client::builder().timeout(timeout).build()?;
+    let mut request = client.get(&url).header("accept", "application/json");
+    for (name, value) in headers {
+        request = request.header(name.as_str(), value.as_str());
+    }
+    Ok((url, request.bearer_auth(api_key)))
+}
 
 /// 模型流别名（agent_loop 消费；Pin<Box> 保证 Unpin 语义简单）。
 pub type ModelStream = std::pin::Pin<Box<dyn Stream<Item = ModelStreamEvent> + Send>>;

@@ -140,12 +140,13 @@ async fn check_endpoint_key_inner(
             "端点地址必须以 http:// 或 https:// 开头，暂时无法校验",
         );
     }
-    let url = format!("{base}/models");
-    let client = match reqwest::Client::builder()
-        .timeout(Duration::from_secs(CHECK_TIMEOUT_SECS))
-        .build()
-    {
-        Ok(client) => client,
+    let (_, request) = match crate::model_client::models_probe_request(
+        base,
+        headers,
+        api_key,
+        Duration::from_secs(CHECK_TIMEOUT_SECS),
+    ) {
+        Ok(pair) => pair,
         Err(error) => {
             return KeyCheck::new(
                 KeyCheckState::Unknown,
@@ -156,11 +157,7 @@ async fn check_endpoint_key_inner(
     };
 
     let started = Instant::now();
-    let mut request = client.get(&url).header("accept", "application/json");
-    for (name, value) in headers {
-        request = request.header(name.as_str(), value.as_str());
-    }
-    let response = match request.bearer_auth(api_key).send().await {
+    let response = match request.send().await {
         Ok(response) => response,
         Err(error) => {
             return from_model_error(ModelError::from_reqwest(&error))
