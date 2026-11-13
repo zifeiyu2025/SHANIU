@@ -62,6 +62,12 @@ pub enum ModelStreamEvent {
     ReasoningDelta { delta: String },
     OutputItem(ResponseItem),
     Completed { usage: Usage },
+    /// 终态标记，但不带 usage（ChatCompletions 的 `finish_reason`）。
+    ///
+    /// 没有它，「流在完成标记前结束」与「正常说完但没有 usage」无法区分。
+    Finished,
+    /// 端点明确表示回答未完成（Responses 的 `response.incomplete`）。
+    Incomplete { reason: String },
     /// 流内失败。`message` 保留原文（旧消费端/日志），`error` 是分类后的结构化描述，
     /// 供 UI 展开与导出对账；流内错误拿不到 HTTP 状态，故 `error` 可能缺状态码。
     Failed {
@@ -134,18 +140,35 @@ pub fn translate_sse_event(event: &Event) -> Option<ModelStreamEvent> {
             Some(ModelStreamEvent::OutputItem(parse_item(item)?))
         }
         "response.completed" => {
-            let usage = data.pointer("/response/usage")?;
+            // usage 可选：少数网关的 completed 事件不带 usage，但终态标记本身不能丢，
+            // 否则会被误判成"流在完成标记前结束"。
+            let usage = data.pointer("/response/usage");
             Some(ModelStreamEvent::Completed {
                 usage: Usage {
-                    input_tokens: usage.get("input_tokens").and_then(|v| v.as_u64()).unwrap_or(0) as u32,
+                    input_tokens: usage
+                        .and_then(|u| u.get("input_tokens"))
+                        .and_then(|v| v.as_u64())
+                        .unwrap_or(0) as u32,
                     cached_input_tokens: usage
-                        .pointer("/input_tokens_details/cached_tokens")
+                        .and_then(|u| u.pointer("/input_tokens_details/cached_tokens"))
                         .and_then(|v| v.as_u64())
                         .map(|v| v as u32),
-                    output_tokens: usage.get("output_tokens").and_then(|v| v.as_u64()).unwrap_or(0) as u32,
+                    output_tokens: usage
+                        .and_then(|u| u.get("output_tokens"))
+                        .and_then(|v| v.as_u64())
+                        .unwrap_or(0) as u32,
                 },
             })
         }
+        // 端点明确表示回答未完成（达到 max_output_tokens / 内容过滤等）。
+        // 必须单独成事件，不能落进 `error` 的"未知错误"分支：原因要能给用户看。
+        "response.incomplete" => Some(ModelStreamEvent::Incomplete {
+            reason: data
+                .pointer("/response/incomplete_details/reason")
+                .and_then(|v| v.as_str())
+                .unwrap_or("incomplete")
+                .to_string(),
+        }),
         "response.failed" => Some(ModelStreamEvent::Failed {
             message: data
                 .pointer("/response/error/message")
@@ -504,12 +527,34 @@ impl ChatStreamAccumulator {
                     }
                 }
                 let finish = choice.get("finish_reason").and_then(|f| f.as_str());
-                if finish == Some("tool_calls") && !self.finished {
-                    self.finished = true;
-                    for (id, name, arguments) in self.tool_calls.drain(..) {
-                        events.push(ModelStreamEvent::OutputItem(ResponseItem::FunctionCall {
-                            name, arguments, call_id: id,
-                        }));
+                if !self.finished {
+                    match finish {
+                        // 工具调用：先把装配好的调用交出去，再补终态标记。
+                        Some("tool_calls") => {
+                            self.finished = true;
+                            for (id, name, arguments) in self.tool_calls.drain(..) {
+                                events.push(ModelStreamEvent::OutputItem(ResponseItem::FunctionCall {
+                                    name, arguments, call_id: id,
+                                }));
+                            }
+                            events.push(ModelStreamEvent::Finished);
+                        }
+                        // 达到长度上限 / 被内容过滤：不是正常说完，必须带出原因。
+                        Some("length") => {
+                            self.finished = true;
+                            events.push(ModelStreamEvent::Incomplete { reason: "length".to_string() });
+                        }
+                        Some("content_filter") => {
+                            self.finished = true;
+                            events
+                                .push(ModelStreamEvent::Incomplete { reason: "content_filter".to_string() });
+                        }
+                        // 其余非空 finish_reason（stop / function_call 等）都算正常终态。
+                        Some(_) => {
+                            self.finished = true;
+                            events.push(ModelStreamEvent::Finished);
+                        }
+                        None => {}
                     }
                 }
             }
@@ -920,6 +965,58 @@ mod tests {
     }
 
     #[test]
+    fn completed_without_usage_still_marks_terminal() {
+        // 少数网关的 completed 不带 usage；丢掉终态会把它误判成断流。
+        assert_eq!(
+            translate_sse_event(&event("response.completed", r#"{"response":{}}"#)),
+            Some(ModelStreamEvent::Completed { usage: Usage::default() })
+        );
+    }
+
+    #[test]
+    fn response_incomplete_carries_reason() {
+        // 反向对照：旧实现没有这个分支，返回 None，事件被静默忽略。
+        assert_eq!(
+            translate_sse_event(&event(
+                "response.incomplete",
+                r#"{"response":{"incomplete_details":{"reason":"max_output_tokens"}}}"#,
+            )),
+            Some(ModelStreamEvent::Incomplete { reason: "max_output_tokens".into() })
+        );
+        assert_eq!(
+            translate_sse_event(&event(
+                "response.incomplete",
+                r#"{"response":{"incomplete_details":{"reason":"content_filter"}}}"#,
+            )),
+            Some(ModelStreamEvent::Incomplete { reason: "content_filter".into() })
+        );
+    }
+
+    #[test]
+    fn chat_finish_reason_marks_terminal_or_incomplete() {
+        let mut acc = ChatStreamAccumulator::default();
+        assert_eq!(
+            translate_chat_data(r#"{"choices":[{"delta":{},"finish_reason":"stop"}]}"#, &mut acc),
+            vec![ModelStreamEvent::Finished]
+        );
+
+        let mut acc = ChatStreamAccumulator::default();
+        assert_eq!(
+            translate_chat_data(r#"{"choices":[{"delta":{},"finish_reason":"length"}]}"#, &mut acc),
+            vec![ModelStreamEvent::Incomplete { reason: "length".into() }]
+        );
+
+        let mut acc = ChatStreamAccumulator::default();
+        assert_eq!(
+            translate_chat_data(
+                r#"{"choices":[{"delta":{},"finish_reason":"content_filter"}]}"#,
+                &mut acc
+            ),
+            vec![ModelStreamEvent::Incomplete { reason: "content_filter".into() }]
+        );
+    }
+
+    #[test]
     fn request_body_carries_model_stream_history_tools() {
         let p = ProviderConfig {
             provider: "openai-responses".into(),
@@ -1177,11 +1274,14 @@ mod chat_tests {
         );
         assert_eq!(
             evs,
-            vec![ModelStreamEvent::OutputItem(ResponseItem::FunctionCall {
-                name: "apply_patch".into(),
-                arguments: r#"{"p":1}"#.into(),
-                call_id: "c9".into(),
-            })]
+            vec![
+                ModelStreamEvent::OutputItem(ResponseItem::FunctionCall {
+                    name: "apply_patch".into(),
+                    arguments: r#"{"p":1}"#.into(),
+                    call_id: "c9".into(),
+                }),
+                ModelStreamEvent::Finished,
+            ]
         );
         // usage（完成块可同带 usage）
         let evs = translate_chat_data(

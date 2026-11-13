@@ -18,7 +18,25 @@ pub mod model {
     pub const ENDPOINT_UNSUPPORTED: &str = "ENDPOINT_UNSUPPORTED";
     pub const BAD_REQUEST: &str = "BAD_REQUEST";
     pub const EMPTY_RESPONSE: &str = "EMPTY_RESPONSE";
+    /// 上下文超出模型窗口（确定性失败）。
+    pub const CONTEXT_TOO_LONG: &str = "CONTEXT_TOO_LONG";
+    /// 请求/回答被内容安全策略拦截（确定性失败）。
+    pub const CONTENT_FILTERED: &str = "CONTENT_FILTERED";
+    /// 端点明确表示回答未完成（`response.incomplete`）。
+    pub const INCOMPLETE: &str = "INCOMPLETE";
     pub const UNKNOWN: &str = "UNKNOWN";
+}
+
+/// 本地失败（不来自模型响应，`agent_loop` 直接判定）。
+pub mod local {
+    /// 上下文压缩流失败；原历史保持不变。
+    pub const COMPACTION_FAILED: &str = "COMPACTION_FAILED";
+    /// 会话引用展开失败（读取被引用会话）。
+    pub const CONTEXT_EXPAND_FAILED: &str = "CONTEXT_EXPAND_FAILED";
+    /// 自愈过程改动了测试断言，修复被拒绝。
+    pub const TEST_TAMPERING: &str = "TEST_TAMPERING";
+    /// 收口验证未通过且已无重试轮次。
+    pub const VERIFY_FAILED: &str = "VERIFY_FAILED";
 }
 
 /// 工作区文件读取失败（`workspace_files.rs`）。
@@ -44,7 +62,14 @@ pub const ALL: &[&str] = &[
     model::ENDPOINT_UNSUPPORTED,
     model::BAD_REQUEST,
     model::EMPTY_RESPONSE,
+    model::CONTEXT_TOO_LONG,
+    model::CONTENT_FILTERED,
+    model::INCOMPLETE,
     model::UNKNOWN,
+    local::COMPACTION_FAILED,
+    local::CONTEXT_EXPAND_FAILED,
+    local::TEST_TAMPERING,
+    local::VERIFY_FAILED,
     workspace_file::TOO_LARGE,
     workspace_file::NOT_REGULAR_FILE,
     workspace_file::NOT_DIRECTORY,

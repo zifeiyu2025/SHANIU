@@ -41,8 +41,11 @@ impl TurnEndReason {
 
 /// 回合失败的结构化描述（审计 A0，additive）。
 ///
-/// `code` 是稳定分类码（`AUTH` / `QUOTA` / `RATE_LIMIT` / `TIMEOUT` / `NETWORK` /
-/// `SERVER` / `ENDPOINT_UNSUPPORTED` / `BAD_REQUEST` / `UNKNOWN`），前端按它本地化；
+/// `code` 是稳定分类码。模型侧：`AUTH` / `QUOTA` / `RATE_LIMIT` / `TIMEOUT` / `NETWORK` /
+/// `SERVER` / `ENDPOINT_UNSUPPORTED` / `BAD_REQUEST` / `EMPTY_RESPONSE` /
+/// `CONTEXT_TOO_LONG` / `CONTENT_FILTERED` / `INCOMPLETE` / `UNKNOWN`；
+/// 本地侧：`COMPACTION_FAILED` / `CONTEXT_EXPAND_FAILED` / `TEST_TAMPERING` /
+/// `VERIFY_FAILED`。前端按它本地化，`message` 始终是可读的一句话（不得为空）。
 /// `provider_code` / `provider_message` 是端点原始值（已脱敏），用于展开与对账。
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, Default)]
 pub struct TurnErrorInfo {

@@ -388,6 +388,9 @@ impl AgentLoop {
                 .map_err(|e| CompactAbort::Failed(format!("压缩请求发起失败，本轮中止：{e}")))?,
         };
         let mut summary = String::new();
+        // P0-2：压缩流也必须收到终态标记才算成功；中途 `Failed`/`Incomplete`/静默 EOF
+        // 都不得拿半截摘要去替换历史。
+        let mut finished = false;
         loop {
             let mut stream_pin = stream.as_mut();
             let next_item = stream_pin.next();
@@ -396,10 +399,29 @@ impl AgentLoop {
                 item = next_item => match item {
                     None => break,
                     Some(ModelStreamEvent::OutputTextDelta { delta }) => summary.push_str(&delta),
+                    Some(ModelStreamEvent::Completed { .. }) | Some(ModelStreamEvent::Finished) => {
+                        finished = true;
+                    }
+                    Some(ModelStreamEvent::Incomplete { reason }) => {
+                        return Err(CompactAbort::Failed(
+                            crate::model_client::ModelError::incomplete(&reason).human,
+                        ));
+                    }
+                    Some(ModelStreamEvent::Failed { message, error }) => {
+                        return Err(CompactAbort::Failed(
+                            error.map(|error| error.human).unwrap_or(message),
+                        ));
+                    }
                     // 压缩请求不该产出工具调用；真产出了也只能忽略——它不是本轮的答案
-                    Some(_) => {}
+                    Some(ModelStreamEvent::ReasoningDelta { .. })
+                    | Some(ModelStreamEvent::OutputItem(_)) => {}
                 }
             }
+        }
+        if !finished {
+            return Err(CompactAbort::Failed(
+                "压缩流在完成标记前结束，已放弃本次压缩".to_string(),
+            ));
         }
         let summary = crate::compaction::extract_summary(&summary).map_err(CompactAbort::Failed)?;
         // 摘要之外先原样保留用户原文：模型漏抄一条硬约束，接手方就永远看不到。
@@ -957,6 +979,8 @@ impl AgentLoop {
                                 break 'outer;
                             }
                             CompactAbort::Failed(_) => {
+                                // P0-2：本地失败也要写明分类，前端才能显示「为什么失败」。
+                                turn_error = Some(local_turn_error("COMPACTION_FAILED", message.clone()));
                                 emit(&sink, EventMsg::Error { message });
                                 reason = TurnEndReasonLocal::Failed;
                                 break 'outer;
@@ -989,6 +1013,7 @@ impl AgentLoop {
             let expanded = match expanded {
                 Ok(value) => value,
                 Err(message) => {
+                    turn_error = Some(local_turn_error("CONTEXT_EXPAND_FAILED", message.clone()));
                     emit(&sink, EventMsg::Error { message });
                     reason = TurnEndReasonLocal::Failed;
                     break 'outer;
@@ -1027,6 +1052,9 @@ impl AgentLoop {
                     opened = self.backend.stream(&request_history, &declarations, &instructions) => opened,
                 };
 
+                // 是否收到终态标记：`Completed`（带 usage）或 `Finished`（仅 finish_reason）。
+                // P0-1：没有终态标记就 EOF，说明回答只到一半，不能当成功收口。
+                let mut finished = false;
                 let failure = match opened {
                     Err(error) => Some(error),
                     Ok(mut stream) => {
@@ -1074,6 +1102,17 @@ impl AgentLoop {
                                     }
                                     Some(ModelStreamEvent::Completed { usage: u }) => {
                                         usage = Some(u);
+                                        finished = true;
+                                    }
+                                    Some(ModelStreamEvent::Finished) => {
+                                        finished = true;
+                                    }
+                                    // 端点明确表示没说完（max_tokens / 内容过滤）：终局失败，
+                                    // 原因走分类而不是"未知错误"。
+                                    Some(ModelStreamEvent::Incomplete { reason }) => {
+                                        finished = true;
+                                        failure = Some(crate::model_client::ModelError::incomplete(&reason));
+                                        break;
                                     }
                                     Some(ModelStreamEvent::Failed { message, error }) => {
                                         // 没有结构化错误时也要留下痕迹：结局不得被当成"正常结束"。
@@ -1094,14 +1133,24 @@ impl AgentLoop {
                     (calls.is_empty() && !emitted_delta && full_message.is_none() && usage.is_none())
                         .then(crate::model_client::ModelError::empty_response)
                 });
+                // P0-1：EOF 前没有收到终态标记（`response.completed` / `finish_reason`），
+                // 说明流被截断；已经吐出的半截内容只能丢弃，不能作为助手消息落历史。
+                let failure = failure.or_else(|| {
+                    (!finished).then(crate::model_client::ModelError::stream_truncated)
+                });
 
                 let Some(error) = failure else {
                     break 'sample (assistant_text, reasoning_text, full_message, calls, usage);
                 };
 
-                // 硬约束① 的第二半：已经 emit 过可见增量、或已经拿到 usage，就不允许再试。
-                // 前者会让正文/思考出现两遍；后者说明这次采样已按端点口径结算，重试会重复计账。
-                let outcome = if emitted_delta || usage.is_some() {
+                // 重试的硬约束：只在**尚未向用户交付任何内容**时重试。
+                //
+                // - 正文/推理增量已经 emit 过：重试会让用户看到重复内容；
+                // - 已经拿到 usage：这次采样已按端点口径结算，重试会重复计费；
+                // - 已经收集到工具调用：前端已经看到工具卡片，重试会重复执行工具。
+                //
+                // 三者任一命中就直接终局，不再走 `await_retry`。
+                let outcome = if emitted_delta || usage.is_some() || !calls.is_empty() {
                     give_up_without_retry_after(&error)
                 } else {
                     await_retry(&self.retry, &sink, cancel, turn, retries, &mut retry_chain, &error).await
@@ -1248,6 +1297,7 @@ impl AgentLoop {
                                 repair.observe_verification(true, "");
                                 match repair.settle_verification(&pending_writes) {
                                     Some(repair::RepairAction::RejectedRepair(text)) => {
+                                        turn_error = Some(local_turn_error("TEST_TAMPERING", text.clone()));
                                         emit(&sink, EventMsg::Error { message: text.clone() });
                                         history.push(HistoryItem::Message {
                                             role: Role::System,
@@ -1811,6 +1861,7 @@ impl AgentLoop {
                 if repair_enabled && succeeded && repair::is_command_tool(name) {
                     match repair.check_test_tampering(name, &pending_writes) {
                         Some(repair::RepairAction::RejectedRepair(text)) => {
+                            turn_error = Some(local_turn_error("TEST_TAMPERING", text.clone()));
                             emit(&sink, EventMsg::Error { message: text.clone() });
                             history.push(HistoryItem::Message {
                                 role: Role::System,
@@ -1923,6 +1974,7 @@ impl AgentLoop {
                     ) && !cancel.is_cancelled()
                     {
                         let text = verify::reminder_text(&outcome, None);
+                        turn_error = Some(local_turn_error("VERIFY_FAILED", text.clone()));
                         emit(&sink, EventMsg::Error { message: text.clone() });
                         history.push(HistoryItem::Message {
                             role: Role::System,
@@ -2168,6 +2220,22 @@ fn give_up_without_retry_after(error: &crate::model_client::ModelError) -> Retry
     let mut error = error.clone();
     error.retry_after_ms = None;
     RetryOutcome::GiveUp(error)
+}
+
+/// 本地失败（压缩/引用展开/自愈拒绝/收口验证）也要带结构化 `turn_error`。
+///
+/// 这些失败没有模型错误分类可用；只发 `Error` 事件的话，前端只能落进 UNKNOWN 兜底，
+/// 用户看不到"为什么失败"。`code` 用稳定的本地错误码，`message` 必须是可读的一句话。
+fn local_turn_error(code: &str, message: impl Into<String>) -> crate::events::TurnErrorInfo {
+    crate::events::TurnErrorInfo {
+        code: code.to_string(),
+        message: message.into(),
+        http_status: None,
+        provider_code: None,
+        provider_message: None,
+        attempts: None,
+        retry_after_secs: None,
+    }
 }
 
 /// 决定这次采样失败是否重试；重试则发 `scheduled` → 可取消等待 → 发 `started`。
@@ -2708,6 +2776,15 @@ mod tests {
             )),
             "必须把可执行的下一步（命令）交给用户"
         );
+        // P0-2：末轮验证失败也要落 `turn_error`，不能只靠 `Error` 事件。
+        let info = events
+            .iter()
+            .find_map(|event| match event {
+                EventMsg::TurnCompleted { error: Some(info), .. } => Some(info),
+                _ => None,
+            })
+            .expect("验证失败必须带结构化原因");
+        assert_eq!(info.code, "VERIFY_FAILED");
     }
 
     /// 复现 `repo-feat-context-overflow-code`：32 轮全在读写，最后一轮仍在请求工具，
@@ -3888,6 +3965,176 @@ mod tests {
         )));
     }
 
+    /// P0-1：流在完成标记之前安静结束，不得当成正常完成。
+    ///
+    /// 反向对照：旧逻辑把 `None`（EOF）直接 `break` 并按成功收口，这条会红在
+    /// `TurnEndReason::Completed` 上——半截回答还会被写进历史。
+    #[tokio::test]
+    async fn eof_without_terminal_marker_fails_and_keeps_half_answer_out_of_history() {
+        let dir = std::env::temp_dir().join(format!("shaniu-eof-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let meta = crate::rollout::RolloutItem::SessionMeta {
+            session_id: "session".into(),
+            agent_id: "agent".into(),
+            parent_id: None,
+            created_at: 0,
+            config_snapshot: crate::rollout::ConfigSnapshot::default(),
+        };
+        let writer = Arc::new(crate::rollout::RolloutWriter::create(&dir, &meta).unwrap());
+        let (mut agent, store, cancel, _broker) = make_loop(vec![vec![
+            ModelStreamEvent::OutputTextDelta { delta: "半截回答".into() },
+        ]]);
+        agent.rollout = Some(writer.clone());
+
+        let summary = agent.run_task("任务", Arc::new(CapturingSink(store.clone())), cancel).await;
+
+        assert_eq!(summary.reason, TurnEndReason::Failed, "没有终态标记的 EOF 不是成功");
+        let events = store.lock().unwrap();
+        assert!(events.iter().any(|e| matches!(
+            e,
+            EventMsg::AgentMessageDelta { delta } if delta == "半截回答"
+        )));
+        let info = events
+            .iter()
+            .find_map(|event| match event {
+                EventMsg::TurnCompleted { reason: TurnEndReason::Failed, error: Some(info), .. } => {
+                    Some(info)
+                }
+                _ => None,
+            })
+            .expect("断流必须带结构化失败原因");
+        assert_eq!(info.code, "NETWORK", "断流应归类为连接中断，而不是 UNKNOWN");
+        drop(events);
+
+        let archive = crate::rollout::read(writer.path()).unwrap();
+        assert!(
+            !archive.items.iter().any(|item| matches!(
+                item,
+                crate::rollout::RolloutItem::ResponseItem {
+                    item: HistoryItem::Message { role: Role::Assistant, .. },
+                    ..
+                }
+            )),
+            "半截助手消息不得落进历史"
+        );
+        assert!(
+            archive.items.iter().any(|item| matches!(
+                item,
+                crate::rollout::RolloutItem::TurnEnd { .. }
+            )),
+            "档案结局必须写成 failed"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// P0-2：压缩流中途报错时，半截摘要不得替换历史。
+    ///
+    /// 反向对照：旧循环把 `Failed` 丢进 `Some(_) => {}`，摘要非空就照常提交压缩锚点，
+    /// 这条会红在 `TurnEndReason::Failed` 与「不得产出摘要」两条断言上。
+    #[tokio::test]
+    async fn failed_compaction_stream_keeps_history_and_reports_reason() {
+        let dir = std::env::temp_dir().join(format!("shaniu-compact-fail-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let meta = crate::rollout::RolloutItem::SessionMeta {
+            session_id: "session".into(),
+            agent_id: "agent".into(),
+            parent_id: None,
+            created_at: 0,
+            config_snapshot: crate::rollout::ConfigSnapshot::default(),
+        };
+        let writer = Arc::new(crate::rollout::RolloutWriter::create(&dir, &meta).unwrap());
+        let (mut agent, store, cancel, _broker) = make_loop(vec![
+            vec![fn_call_ev(), big_usage_ev()],
+            // 压缩流：先吐了半截摘要，然后断流
+            vec![
+                ModelStreamEvent::OutputTextDelta { delta: "半截摘要".into() },
+                ModelStreamEvent::Failed {
+                    message: "压缩断流".into(),
+                    error: Some(crate::model_client::ModelError::stream_broken("压缩断流")),
+                },
+            ],
+            // 旧实现会继续采样；给一段正常答案，让旧行为能收口（而不是挂住）
+            vec![ModelStreamEvent::OutputTextDelta { delta: "完成".into() }, usage_ev()],
+        ]);
+        agent.token_budget = 100;
+        agent.rollout = Some(writer.clone());
+
+        let summary = agent.run_task("任务", Arc::new(CapturingSink(store.clone())), cancel).await;
+
+        assert_eq!(summary.reason, TurnEndReason::Failed, "压缩失败应让回合失败");
+        let events = store.lock().unwrap();
+        assert!(
+            !events.iter().any(|e| matches!(e, EventMsg::CompactionSummarized { .. })),
+            "中途失败的压缩不得产出摘要"
+        );
+        assert!(events.iter().any(|e| matches!(e, EventMsg::CompactionEnded { ok: false, .. })));
+        let info = events
+            .iter()
+            .find_map(|event| match event {
+                EventMsg::TurnCompleted { error: Some(info), .. } => Some(info),
+                _ => None,
+            })
+            .expect("压缩失败必须带结构化原因");
+        assert_eq!(info.code, "COMPACTION_FAILED");
+        drop(events);
+
+        let archive = crate::rollout::read(writer.path()).unwrap();
+        assert!(
+            !archive
+                .items
+                .iter()
+                .any(|item| matches!(item, crate::rollout::RolloutItem::Compacted { .. })),
+            "压缩锚点不得写入，原历史必须保持可用"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// P0-2：会话引用展开失败原先只发 `Error`，界面只能落到 UNKNOWN。
+    #[tokio::test]
+    async fn session_reference_expansion_failure_reports_turn_error() {
+        let dir = std::env::temp_dir().join(format!("shaniu-sref-fail-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let meta = crate::rollout::RolloutItem::SessionMeta {
+            session_id: "self".into(),
+            agent_id: "self".into(),
+            parent_id: None,
+            created_at: 0,
+            config_snapshot: crate::rollout::ConfigSnapshot::default(),
+        };
+        let writer = Arc::new(crate::rollout::RolloutWriter::create(&dir, &meta).unwrap());
+        let (mut agent, store, cancel, _broker) = make_loop(vec![]);
+        agent.rollout = Some(writer);
+
+        let task = format!(
+            "请参考 @[缺失会话]({}) 回答",
+            crate::session_reference::encode_uri("missing-session")
+        );
+        let summary = agent
+            .run_with_history(
+                vec![HistoryItem::Message { role: Role::User, text: task, reasoning: None }],
+                0,
+                Arc::new(CapturingSink(store.clone())),
+                cancel,
+            )
+            .await;
+
+        assert_eq!(summary.reason, TurnEndReason::Failed);
+        let events = store.lock().unwrap();
+        let info = events
+            .iter()
+            .find_map(|event| match event {
+                EventMsg::TurnCompleted { error: Some(info), .. } => Some(info),
+                _ => None,
+            })
+            .expect("展开失败必须带结构化原因");
+        assert_eq!(info.code, "CONTEXT_EXPAND_FAILED");
+        assert!(!info.message.is_empty(), "原因文案不得为空");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
     /// 审计 A0：401 必须带着分类码与原始 code/message 进入 `TurnCompleted`，
     /// 否则 UI 只能显示"回合以 failed 结束"、导出也无法对账。
     #[tokio::test]
@@ -4233,6 +4480,15 @@ mod tests {
             })
             .expect("必须产出可见的拒绝提示，不能静默通过");
         assert!(rejection.contains("tests/check.rs"), "{rejection}");
+        // P0-2：拒绝原因必须进 `turn_error`，否则前端只能显示 UNKNOWN。
+        let info = events
+            .iter()
+            .find_map(|event| match event {
+                EventMsg::TurnCompleted { error: Some(info), .. } => Some(info),
+                _ => None,
+            })
+            .expect("拒绝修复必须带结构化原因");
+        assert_eq!(info.code, "TEST_TAMPERING");
         // 文件确实被改了（说明判定不是靠「没发生写入」侥幸通过）
         assert_eq!(std::fs::read_to_string(&test_file).unwrap(), WEAKENED);
     }
