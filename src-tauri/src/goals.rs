@@ -129,7 +129,7 @@ fn save(path: &Path, store: &GoalStore) -> Result<(), GoalOpError> {
     })?;
     let bytes = serde_json::to_vec_pretty(store)
         .map_err(|e| GoalOpError::new("GOAL_INVALID_STATE", format!("目标状态序列化失败：{e}")))?;
-    let tmp = path.with_extension("json.tmp");
+    let tmp = crate::config::temp_sibling(path);
     std::fs::write(&tmp, bytes).map_err(|e| {
         GoalOpError::new("GOAL_INVALID_STATE", format!("目标状态写入失败（{}）：{e}", tmp.display()))
     })?;

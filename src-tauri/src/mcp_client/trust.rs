@@ -521,7 +521,7 @@ impl TrustStore {
             std::fs::create_dir_all(parent)
                 .map_err(|error| TrustError::Persist(error.to_string()))?;
         }
-        let tmp = self.path.with_extension("json.tmp");
+        let tmp = crate::config::temp_sibling(&self.path);
         std::fs::write(&tmp, raw).map_err(|error| TrustError::Persist(error.to_string()))?;
         replace_file(&tmp, &self.path).map_err(|error| TrustError::Persist(error.to_string()))
     }
