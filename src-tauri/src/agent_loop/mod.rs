@@ -2034,7 +2034,10 @@ impl AgentLoop {
             unverified: dirty.is_dirty(),
         });
         // 相对路径给父级用：子代理收口后由 `wait_agent` 登记回父级写日志。
-        // 工作区先规范化，避免 Windows 盘符大小写导致 `strip_prefix` 失败。
+        // 两边都过同一个 `canonical_key`（长名 + 去 verbatim + 盘符一致），否则
+        // Windows 的 8.3 短名（`RUNNER~1`）会让 `strip_prefix` 剥不掉，脏路径
+        // 留成绝对路径。工作区本身都取不到长名时（已被删除/无权限）退回原路径：
+        // 此时没有可信的公共前缀，保留绝对路径至少不丢信息，且脏判定仍按后缀生效。
         let workspace_key = crate::tool_router::canonical_key(&self.workspace_root);
         let dirty_paths = dirty
             .files()

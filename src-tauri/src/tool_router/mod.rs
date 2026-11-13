@@ -141,8 +141,35 @@ pub fn content_matches(recorded: &FileStamp, current: &[u8], meta: &std::fs::Met
 ///
 /// `resolve_in_workspace` 已经过 `shell_usable`，而写工具手里的路径是原样 join 的，
 /// 两边必须归一化到同一把键，否则「读过的文件」在写侧永远查不到。
+///
+/// 目标可能还没落盘（写工具在落盘前登记），`canonicalize` 会失败。这时直接返回
+/// 原路径会让同一文件因**形式不同**各成一条键：Windows 上 `temp_dir()` 可能是 8.3
+/// 短名（`RUNNER~1`），而 `canonicalize` 返回长名（`runneradmin`），
+/// `strip_prefix(工作区)` 也就永远剥不掉（CI 就红在这里）。所以逐级上溯到第一个
+/// 存在的祖先并 canonicalize，再把不存在的尾段原样拼回：已落盘与未落盘的路径
+/// 都收敛到「长名 + 无 verbatim」这一种形态。
 pub fn canonical_key(path: &Path) -> PathBuf {
-    shell_usable(&path.canonicalize().unwrap_or_else(|_| path.to_path_buf()))
+    let mut existing = path;
+    let mut tail: Vec<&std::ffi::OsStr> = Vec::new();
+    loop {
+        if let Ok(real) = existing.canonicalize() {
+            let mut key = shell_usable(&real);
+            for part in tail.iter().rev() {
+                key.push(*part);
+            }
+            return key;
+        }
+        match (existing.parent(), existing.file_name()) {
+            (Some(parent), Some(name)) if parent != existing => {
+                tail.push(name);
+                existing = parent;
+            }
+            // 连已存在的祖先都找不到（路径被删/无权限）：退回原路径。
+            // 此时按后缀判源码仍然成立，只是短名与长名可能各成一条——观测不到真实
+            // 路径时不编造长名，这是唯一诚实的退路。
+            _ => return path.to_path_buf(),
+        }
+    }
 }
 
 /// 读状态登记表（会话 + 路径）——写工具在落盘前查询，防止「没读就改」与覆盖外部改动。
@@ -1288,6 +1315,65 @@ mod tests {
         assert_eq!(
             shell_usable(Path::new(r"C:\Users\jun\a")),
             PathBuf::from(r"C:\Users\jun\a")
+        );
+    }
+
+    /// CI 回归：工作区来自 `temp_dir()`（Windows 上可能是 8.3 短名 `RUNNER~1`），
+    /// 而 `canonicalize` 返回长名（`runneradmin`）——两边字符串对不上，
+    /// `strip_prefix(工作区)` 就永远剥不掉，脏路径会留成绝对路径。
+    ///
+    /// 这里显式把「短名形态」与「长名形态」作为两个输入交给同一个函数：
+    /// 没有 8.3 的卷上两者本就相同（断言仍成立），CI 的短名临时目录上则是真实失败形态。
+    /// 尾段故意不存在，覆盖「写工具落盘前登记」的路径。
+    #[test]
+    fn canonical_key_converges_short_and_long_forms_even_when_target_is_missing() {
+        let temp = std::env::temp_dir();
+        let long = std::fs::canonicalize(&temp).expect("临时目录必须可 canonicalize");
+        assert_eq!(canonical_key(&temp), canonical_key(&long));
+
+        let missing = Path::new("shaniu-canonical-key-missing")
+            .join("src")
+            .join("child.rs");
+        assert_eq!(
+            canonical_key(&temp.join(&missing)),
+            canonical_key(&long.join(&missing)),
+            "未落盘路径也必须收敛到同一形态"
+        );
+    }
+
+    /// 真实 8.3 短名：让系统给出短名（而不是靠假设临时目录一定是短名）。
+    /// 卷上禁用 8.3 时返回值就是长名，此时断言退化为恒等；CI 的 `RUNNER~1` 临时目录
+    /// 会真正走到短名展开分支。
+    #[cfg(windows)]
+    #[test]
+    fn canonical_key_expands_real_8_3_short_names() {
+        use std::os::windows::ffi::{OsStrExt, OsStringExt};
+        use windows::core::PCWSTR;
+        use windows::Win32::Storage::FileSystem::GetShortPathNameW;
+
+        let ws = temp_workspace();
+        let long_dir = ws.join("shaniu-short-name-probe");
+        std::fs::create_dir_all(&long_dir).unwrap();
+
+        let wide: Vec<u16> = long_dir
+            .as_os_str()
+            .encode_wide()
+            .chain(std::iter::once(0))
+            .collect();
+        let mut buffer = vec![0u16; 512];
+        let len = unsafe { GetShortPathNameW(PCWSTR(wide.as_ptr()), Some(&mut buffer)) };
+        assert!(len > 0, "GetShortPathNameW 必须成功");
+        buffer.truncate(len as usize);
+        let short = PathBuf::from(std::ffi::OsString::from_wide(&buffer));
+
+        if short == long_dir {
+            eprintln!("本卷未启用 8.3 短名，仅做恒等比对；CI 的 RUNNER~1 会走短名展开");
+        }
+        assert_eq!(canonical_key(&short), canonical_key(&long_dir));
+        assert_eq!(
+            canonical_key(&short.join("src").join("child.rs")),
+            canonical_key(&long_dir.join("src").join("child.rs")),
+            "短名父目录 + 未落盘尾段必须与长名一致"
         );
     }
 
