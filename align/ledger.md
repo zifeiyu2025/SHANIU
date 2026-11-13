@@ -7,8 +7,8 @@
 ## 统计
 
 - 条目总数：3314
-- same：2680
-- drift：75
+- same：2679
+- drift：76
 - missing：0
 - not-applicable：559
 - 待复核（needs-review）：0
@@ -619,6 +619,7 @@
 | `packages/client/ui-shortcuts/tsconfig.json` | not-applicable | 已登记 | 整包未 vendor（本项目未接线该能力） | 接入该能力时整包 vendor，并按 docs/07 登记改动 |
 | `packages/client/ui-shortcuts/tsdown.config.ts` | not-applicable | 已登记 | 整包未 vendor（本项目未接线该能力） | 接入该能力时整包 vendor，并按 docs/07 登记改动 |
 | `packages/client/ui-sidebar-browser/src/client/view/BrowserBody.tsx` | drift | 已登记 | 类型级修复（docs/07 #9） | 同第 9 行类型批 |
+| `packages/client/ui-sidebar-documentpreview/package.json` | drift | 已登记 | npm 依赖安全升级：fast-xml-parser 5.11.1 → 5.12.0（GHSA-474x-hrwr-fgx4 / CVE-2026-126066，docs/07 #31） | 该包不是 workspace 成员，安装解析走根 package.json；两处声明必须同版本，且锁文件里也只有这一份 |
 | `packages/client/ui-sidebar-documentpreview/src/client/image/ImageBody.tsx` | drift | 已登记 | 类型级修复（docs/07 #9） | 同第 9 行类型批 |
 | `packages/client/ui-sidebar-documentpreview/src/client/pdf/pdf.tsx` | drift | 已登记 | 类型级修复（docs/07 #9） | 同第 9 行类型批 |
 | `packages/client/ui-sidebar-documentpreview/src/client/zoom/ZoomViewport.tsx` | drift | 已登记 | 类型级修复（docs/07 #9） | 同第 9 行类型批 |

@@ -389,6 +389,10 @@
       "reason": "类型级修复（docs/07 #9）",
       "guard": "同第 9 行类型批"
     },
+    "ui-sidebar-documentpreview/package.json": {
+      "reason": "npm 依赖安全升级：fast-xml-parser 5.11.1 → 5.12.0（GHSA-474x-hrwr-fgx4 / CVE-2026-126066，docs/07 #31）",
+      "guard": "该包不是 workspace 成员，安装解析走根 package.json；两处声明必须同版本，且锁文件里也只有这一份"
+    },
     "ui-sidebar-documentpreview/src/client/image/ImageBody.tsx": {
       "reason": "类型级修复（docs/07 #9）",
       "guard": "同第 9 行类型批"
