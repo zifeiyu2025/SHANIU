@@ -40,7 +40,10 @@ use crate::config::{OsSandbox, SandboxMode};
 /// 也会把「写被拒」误判成路径越界。
 /// 2026-11-12.4：`PROMPT_TOKEN_LIMIT` 2500 → 3000（对标 codex / dsh / ZCode，见常量注释）。
 /// 2026-11-12.5：写约束成为**默认机制**，隔离机制行不再依赖环境变量开关。
-pub const PROMPT_VERSION: &str = "2026-11-12.5";
+/// 2026-11-13.1：工具使用规则补 `read_file` 口径——`offset` 是 1 起算**行号**、`limit` 是行数，
+/// 并明确不要用 shell（`type` / `findstr` / `more`）读文件。评测里模型把 offset 当字节偏移、
+/// 读错区段后逃逸到 shell，浪费大量轮次（`evals/repo/RESULTS-2026-11-13.md`）。
+pub const PROMPT_VERSION: &str = "2026-11-13.1";
 
 /// 全文 token 上限（估算口径见 [`rules::estimate_tokens`]：CJK 1 字 1 token，ASCII 4 字符 1 token）。
 ///
@@ -569,6 +572,7 @@ pub fn system_instruction(ctx: &PromptContext<'_>) -> String {
 ## 工具使用规则\n\
 - 动手前先用只读工具了解现状，不要凭猜测改文件。\n\
 - 改文件统一用 apply_patch，不要用命令重定向写文件。\n\
+- 读文件用 read_file，不要用 shell（type / findstr / more）绕过去；offset 是 1 起算的**行号**、limit 是最多行数，每行带「行号: 内容」前缀，结尾括号给总行数与续读 offset。\n\
 - 一次性构建/测试/git 用 unified_exec，跑完即弃；需保留状态（cd、环境变量）、持续输出或 stdin 用 terminal，用完必须 close。\n\
 - 只读工具可并行；写入与执行工具一次只做一件。\n\
 - 工具报错先读错误信息再决定，不要重复同样的失败调用。\n\n",

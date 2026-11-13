@@ -3,7 +3,8 @@
 //! 边界：所有路径经 `resolve_in_workspace` 逻辑边界校验（M2 沙箱接管强制力）；
 //! 遍历用 `ignore` crate（ripgrep 引擎），自动尊重 .gitignore 与隐藏文件规则。
 
-use std::io::{Read, Seek, SeekFrom};
+use std::io::{BufRead, BufReader, Read, Seek, SeekFrom};
+use std::path::Path;
 
 use async_trait::async_trait;
 use ignore::WalkBuilder;
@@ -19,7 +20,7 @@ const MAX_READ_BYTES: u64 = 1_048_576;
 ///
 /// 为什么按 token 而不是只看字节：1MB 英文约 25–30 万 token，一个文件就能撞穿 128K 窗口，
 /// 而字节数看不出这个量级（CJK 与英文的 token/字节比差 3 倍）。超限按行边界截断，并给出
-/// 续读偏移，模型才知道"没读完"，而不是拿着半截内容以为读完了。
+/// 续读行号，模型才知道"没读完"，而不是拿着半截内容以为读完了。
 const MAX_READ_TOKENS: usize = 25_000;
 const MAX_LIST_ENTRIES: usize = 500;
 const MAX_SEARCH_RESULTS: usize = 50;
@@ -43,6 +44,211 @@ fn token_cut_index(text: &str, limit: usize) -> Option<usize> {
     None
 }
 
+fn estimate_tokens(text: &str) -> usize {
+    let mut wide = 0usize;
+    let mut narrow = 0usize;
+    for ch in text.chars() {
+        if ch.is_ascii() {
+            narrow += 1;
+        } else {
+            wide += 1;
+        }
+    }
+    wide + narrow.div_ceil(4)
+}
+
+fn truncate_to_tokens(text: &str, limit: usize) -> String {
+    match token_cut_index(text, limit) {
+        Some(cut) => text[..cut].to_string(),
+        None => text.to_string(),
+    }
+}
+
+fn human_bytes(bytes: u64) -> String {
+    const KB: f64 = 1024.0;
+    const MB: f64 = 1024.0 * 1024.0;
+    let value = bytes as f64;
+    if value >= MB {
+        format!("{:.1} MB", value / MB)
+    } else if value >= KB {
+        format!("{:.1} KB", value / KB)
+    } else {
+        format!("{bytes} B")
+    }
+}
+
+/// 统计总行数（1 起算的行数，末行无换行也算一行），并给出第 `start_line` 行的起始字节偏移。
+///
+/// 只顺序扫字节、不整文件驻留内存：越界报总行数需要真实全量行数，
+/// 但一个几 MB 的文件不能为了读 20 行就整份塞进内存。
+fn count_lines_and_locate(path: &Path, start_line: usize) -> std::io::Result<(usize, u64, Option<u64>)> {
+    let mut file = std::fs::File::open(path)?;
+    let mut buffer = [0u8; 64 * 1024];
+    let mut total_lines = 0usize;
+    let mut current_line = 1usize;
+    let mut position = 0u64;
+    let mut start = if start_line == 1 { Some(0u64) } else { None };
+    let mut last_byte = None;
+    loop {
+        let read = file.read(&mut buffer)?;
+        if read == 0 {
+            break;
+        }
+        for &byte in &buffer[..read] {
+            if byte == b'\n' {
+                total_lines += 1;
+                current_line += 1;
+                if start.is_none() && current_line == start_line {
+                    start = Some(position + 1);
+                }
+            }
+            position += 1;
+            last_byte = Some(byte);
+        }
+    }
+    if position > 0 && last_byte != Some(b'\n') {
+        total_lines += 1;
+    }
+    Ok((total_lines, position, start))
+}
+
+fn strip_line_ending(raw: &[u8]) -> &[u8] {
+    let raw = raw.strip_suffix(b"\n").unwrap_or(raw);
+    raw.strip_suffix(b"\r").unwrap_or(raw)
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum WindowCut {
+    /// 已读满调用方指定的行数。
+    LineCount,
+    /// 达到 max_bytes 上限。
+    Bytes,
+    /// 达到单次结果的 token 上限。
+    Tokens,
+}
+
+struct WindowLine {
+    number: usize,
+    text: String,
+}
+
+struct LineWindow {
+    lines: Vec<WindowLine>,
+    /// 本次实际读出的原始字节（用于读状态登记；可能与显示内容不等长）。
+    consumed: Vec<u8>,
+    /// 文件在本次窗口之后还有内容。
+    more_below: bool,
+    cut: Option<WindowCut>,
+    /// 首行本身超限，只显示了开头部分（无法按行续读）。
+    partial_line: bool,
+}
+
+/// 从 `start_byte`（必须是行首）按行读取，最多 `max_lines` 行 / `max_bytes` 字节 / token 上限。
+fn read_line_window(
+    path: &Path,
+    start_byte: u64,
+    start_line: usize,
+    max_lines: Option<usize>,
+    max_bytes: u64,
+    file_len: u64,
+) -> std::io::Result<LineWindow> {
+    let mut file = std::fs::File::open(path)?;
+    file.seek(SeekFrom::Start(start_byte))?;
+    let mut reader = BufReader::new(file.take(max_bytes));
+    let mut lines: Vec<WindowLine> = Vec::new();
+    let mut consumed: Vec<u8> = Vec::new();
+    let mut tokens = 0usize;
+    let mut cut = None;
+    let mut partial_line = false;
+    let mut line_no = start_line;
+    loop {
+        if max_lines.is_some_and(|limit| lines.len() >= limit) {
+            cut = Some(WindowCut::LineCount);
+            break;
+        }
+        let mut raw = Vec::new();
+        let read = reader.read_until(b'\n', &mut raw)?;
+        if read == 0 {
+            break;
+        }
+        let ended_with_newline = raw.last() == Some(&b'\n');
+        let more_file = start_byte + (consumed.len() as u64) + (read as u64) < file_len;
+        if !ended_with_newline && more_file {
+            // max_bytes 把当前行切断了：只剩半行时不把半行内容喂给模型，
+            // 但首行例外——否则 max_bytes 太小会返回空结果。
+            if lines.is_empty() {
+                let text = String::from_utf8_lossy(strip_line_ending(&raw)).to_string();
+                let prefix = format!("{line_no}: ");
+                let budget = MAX_READ_TOKENS.saturating_sub(estimate_tokens(&prefix));
+                lines.push(WindowLine {
+                    number: line_no,
+                    text: truncate_to_tokens(&text, budget),
+                });
+                consumed.extend_from_slice(&raw);
+                partial_line = true;
+            }
+            cut = Some(WindowCut::Bytes);
+            break;
+        }
+        let text = String::from_utf8_lossy(strip_line_ending(&raw)).to_string();
+        let prefix = format!("{line_no}: ");
+        let cost = estimate_tokens(&prefix) + estimate_tokens(&text);
+        if tokens + cost > MAX_READ_TOKENS {
+            if lines.is_empty() {
+                let budget = MAX_READ_TOKENS.saturating_sub(estimate_tokens(&prefix));
+                lines.push(WindowLine {
+                    number: line_no,
+                    text: truncate_to_tokens(&text, budget),
+                });
+                consumed.extend_from_slice(&raw);
+                partial_line = true;
+            }
+            cut = Some(WindowCut::Tokens);
+            break;
+        }
+        tokens += cost;
+        consumed.extend_from_slice(&raw);
+        lines.push(WindowLine { number: line_no, text });
+        line_no += 1;
+    }
+    let more_below = start_byte + (consumed.len() as u64) < file_len;
+    Ok(LineWindow { lines, consumed, more_below, cut, partial_line })
+}
+
+/// 目录预览（read_file 误传目录时给出可行动的事实）。
+fn dir_preview(path: &Path) -> String {
+    let Ok(entries) = std::fs::read_dir(path) else {
+        return "（无法读取目录）".to_string();
+    };
+    let mut names: Vec<String> = entries
+        .filter_map(|entry| entry.ok())
+        .map(|entry| {
+            let name = entry.file_name().to_string_lossy().to_string();
+            if entry.file_type().map(|kind| kind.is_dir()).unwrap_or(false) {
+                format!("{name}/")
+            } else {
+                name
+            }
+        })
+        .collect();
+    names.sort();
+    if names.is_empty() {
+        return "（空目录）".to_string();
+    }
+    names.truncate(5);
+    names.join("、")
+}
+
+fn positive_int_arg(args: &Value, name: &str) -> Result<Option<u64>, ToolError> {
+    match args.get(name) {
+        None | Some(Value::Null) => Ok(None),
+        Some(value) => value
+            .as_u64()
+            .map(Some)
+            .ok_or_else(|| ToolError::InvalidArgs(format!("{name} 必须是正整数，实际收到 {value}"))),
+    }
+}
+
 // ============================== read_file ==============================
 
 pub struct ReadFile {
@@ -60,13 +266,16 @@ impl ReadFile {
         Self {
             spec: ToolSpec::new(
                 "read_file",
-                "读取工作区内文本文件的内容。超长文件会按 token 上限截断，并给出续读 offset。",
+                "按行读取工作区内文本文件，返回内容带行号前缀（如 `12: 内容`）。\
+                 offset 是 1 起算的行号（不是字节偏移），limit 是最多读多少行。\
+                 结尾括号给出总行数与下一次的 offset；越界会报出文件总行数与大小。",
                 serde_json::json!({
                     "type": "object",
                     "properties": {
                         "path": { "type": "string", "description": "工作区相对路径（或绝对路径）" },
-                        "max_bytes": { "type": "integer", "description": "最大读取字节数，默认 65536，上限 1048576" },
-                        "offset": { "type": "integer", "description": "从第几个字节开始读，默认 0；续读时填上次截断标注里的 offset" }
+                        "offset": { "type": "integer", "description": "从第几行开始读，1 起算的行号（不是字节偏移），默认 1" },
+                        "limit": { "type": "integer", "description": "最多读多少行；省略则读到文件末尾（受 max_bytes 与 token 上限约束）" },
+                        "max_bytes": { "type": "integer", "description": "本次最多读取的字节数，默认 65536，上限 1048576" }
                     },
                     "required": ["path"]
                 }),
@@ -89,77 +298,133 @@ impl ToolExecutor for ReadFile {
             .get("path")
             .and_then(|v| v.as_str())
             .ok_or_else(|| ToolError::InvalidArgs("缺少 path".into()))?;
+        // 语义变更说明：offset 曾经是字节偏移，模型普遍当行号用。现在它就是 1 起算的行号，
+        // 不再有「拒绝 offset」的兼容分支——旧用法本来就不成立，改名只会违背模型先验。
+        let offset = positive_int_arg(&args, "offset")?.unwrap_or(1);
+        if offset == 0 {
+            return Err(ToolError::InvalidArgs(
+                "offset 从 1 起算（第 1 行 = 1），不是字节偏移".to_string(),
+            ));
+        }
+        let limit = positive_int_arg(&args, "limit")?;
+        if limit == Some(0) {
+            return Err(ToolError::InvalidArgs(
+                "limit 至少为 1；要读到文件末尾请省略该参数".to_string(),
+            ));
+        }
+        let start_line = offset;
+        let max_lines: Option<usize> = limit
+            .map(|count| usize::try_from(count).unwrap_or(usize::MAX));
         let max_bytes = args
             .get("max_bytes")
             .and_then(|v| v.as_u64())
             .unwrap_or(DEFAULT_READ_BYTES)
             .clamp(1, MAX_READ_BYTES);
-        let offset = args.get("offset").and_then(|v| v.as_u64()).unwrap_or(0);
-        let full = resolve_in_workspace(&ctx.workspace_root, path)?;
+
+        let full = match resolve_in_workspace(&ctx.workspace_root, path) {
+            Ok(full) => full,
+            Err(ToolError::InvalidArgs(_)) => {
+                return Err(ToolError::InvalidArgs(format!(
+                    "文件不存在: {path}（路径须位于工作区内；要列目录请用 list_dir）"
+                )))
+            }
+            Err(other) => return Err(other),
+        };
         let meta = std::fs::metadata(&full).map_err(|e| ToolError::Execution(format!("读取失败: {e}")))?;
-        if !meta.is_file() {
-            return Err(ToolError::InvalidArgs(format!("不是文件: {path}")));
-        }
-        if offset >= meta.len() && offset > 0 {
-            return Ok(ToolOutput::ok(format!(
-                "[已到文件末尾：文件共 {} 字节，offset={offset} 之后无内容]",
-                meta.len()
+        if meta.is_dir() {
+            return Err(ToolError::InvalidArgs(format!(
+                "read_file 只能读文件：{path} 是目录。请改用 list_dir 查看，前 5 项：{}",
+                dir_preview(&full)
             )));
         }
-        let limit = max_bytes.min(meta.len() - offset) as usize;
-        let mut file = std::fs::File::open(&full).map_err(|e| ToolError::Execution(format!("读取失败: {e}")))?;
-        if offset > 0 {
-            file.seek(SeekFrom::Start(offset))
-                .map_err(|e| ToolError::Execution(format!("读取失败: {e}")))?;
+        if !meta.is_file() {
+            return Err(ToolError::InvalidArgs(format!(
+                "不是普通文件: {path}（既不是文件也不是目录）"
+            )));
         }
-        let mut buffer = Vec::with_capacity(limit);
-        file.take(limit as u64)
-            .read_to_end(&mut buffer)
+
+        let start_line_usize = usize::try_from(start_line).unwrap_or(usize::MAX);
+        let (total_lines, file_len, start_byte) = count_lines_and_locate(&full, start_line_usize)
             .map_err(|e| ToolError::Execution(format!("读取失败: {e}")))?;
-        let mut text = String::from_utf8_lossy(&buffer).to_string();
-        // SH-124①：记录读状态（会话 + 路径），写工具落盘前据此判定「没读就改」。
-        if let Some(reads) = &ctx.reads {
-            reads.record(
-                ctx.session_id.as_deref(),
-                &full,
-                crate::tool_router::FileStamp::of_read(&buffer, &meta),
-            );
-        }
-        // 原始字节与解码后字节只有在合法 UTF-8 时才一一对应；非法序列会被替换成 U+FFFD，
-        // 此时不给续读偏移（宁可让模型用 max_bytes 分段，也不给一个错位的 offset）。
-        let exact_utf8 = std::str::from_utf8(&buffer).is_ok();
-        let mut consumed = buffer.len();
-        let mut token_capped = false;
-        if let Some(cut) = token_cut_index(&text, MAX_READ_TOKENS) {
-            // 按行边界收口（不切半行）；单行本身超限时只能按字符切。
-            let cut = text[..cut].rfind('\n').map(|i| i + 1).unwrap_or(cut);
-            consumed = if exact_utf8 { cut } else { buffer.len() };
-            text.truncate(cut);
-            token_capped = true;
-        }
-        let next = offset + consumed as u64;
-        let note = if token_capped && exact_utf8 {
-            format!(
-                "\n\n[已截断：文件共 {} 字节，本次显示第 {offset}–{next} 字节（≤{MAX_READ_TOKENS} tokens）。\
-                 继续读：read_file path=\"{path}\" offset={next}]",
-                meta.len()
-            )
-        } else if token_capped {
-            format!(
-                "\n\n[已截断：文件共 {} 字节；文件含非法 UTF-8 字节，无法给出可靠续读偏移，\
-                 请用 max_bytes 分段读取]",
-                meta.len()
-            )
-        } else if next < meta.len() {
-            format!(
-                "\n\n[已截断：文件共 {} 字节，本次显示第 {offset}–{next} 字节。\
-                 继续读：read_file path=\"{path}\" offset={next}]",
-                meta.len()
-            )
-        } else {
-            String::new()
+        // 空文件 + offset=1 是正常 EOF（对齐 dsh：total 0 不算越界），只有从这里往后才算越界。
+        let Some(start_byte) = start_byte else {
+            return Err(ToolError::Execution(format!(
+                "读取越界：{path} 共 {total_lines} 行（{}），请求 offset={offset}（第 {offset} 行起），超出文件末尾",
+                human_bytes(file_len)
+            )));
         };
-        Ok(ToolOutput::ok(format!("{text}{note}")))
+
+        let window = read_line_window(
+            &full,
+            start_byte,
+            start_line_usize,
+            max_lines,
+            max_bytes,
+            file_len,
+        )
+        .map_err(|e| ToolError::Execution(format!("读取失败: {e}")))?;
+
+        // SH-124①：记录读状态（会话 + 路径），写工具落盘前据此判定「没读就改」。
+        // 只有从文件开头读、且没有截断在行中间时，读到的字节才是文件字节前缀；
+        // 从中间行读或半行截断时改为登记整文件哈希，否则后续 apply_patch 会被误判为「未读先改」。
+        if let Some(reads) = &ctx.reads {
+            let stamp = if start_byte == 0 && !window.partial_line {
+                crate::tool_router::FileStamp::of_read(&window.consumed, &meta)
+            } else {
+                crate::tool_router::FileStamp::of_full_file(&full).unwrap_or_else(|_| {
+                    crate::tool_router::FileStamp::of_read(&window.consumed, &meta)
+                })
+            };
+            reads.record(ctx.session_id.as_deref(), &full, stamp);
+        }
+
+        let last_line = window
+            .lines
+            .last()
+            .map(|line| line.number)
+            .unwrap_or(start_line_usize);
+        let body = window
+            .lines
+            .iter()
+            .map(|line| format!("{}: {}", line.number, line.text))
+            .collect::<Vec<_>>()
+            .join("\n");
+        // 结尾括号是模型据以续读的唯一锚点（对齐 dsh read-render 的三态 footer）：
+        // 读完给总行数，未完给区间 + 可直接照抄的 offset，单行超限则明说不能按行续读。
+        let footer = if window.partial_line {
+            let reason = match window.cut {
+                Some(WindowCut::Bytes) => format!("max_bytes={max_bytes}"),
+                _ => format!("单次 {MAX_READ_TOKENS} token 上限"),
+            };
+            format!(
+                "（已截断：第 {last_line} 行单行内容超出本次上限（{reason}），只显示了开头；\
+                 剩余内容不能按行续读，请先用 search 定位更具体的片段）"
+            )
+        } else if window.more_below {
+            let next = last_line + 1;
+            match window.cut {
+                Some(WindowCut::LineCount) => format!(
+                    "（已显示第 {start_line}–{last_line} 行，共 {total_lines} 行。继续读：offset={next}）"
+                ),
+                reason => {
+                    let reason = match reason {
+                        Some(WindowCut::Bytes) => format!("达到 max_bytes={max_bytes} 上限"),
+                        _ => format!("达到单次 {MAX_READ_TOKENS} token 上限"),
+                    };
+                    format!(
+                        "（已截断：显示第 {start_line}–{last_line} 行，共 {total_lines} 行，{reason}。继续读：offset={next}）"
+                    )
+                }
+            }
+        } else {
+            format!("（文件结束：共 {total_lines} 行）")
+        };
+        let output = if body.is_empty() {
+            footer
+        } else {
+            format!("{body}\n\n{footer}")
+        };
+        Ok(ToolOutput::ok(output))
     }
 }
 
@@ -388,7 +653,151 @@ mod tests {
             .execute(serde_json::json!({"path": "README.md"}), &ctx(&ws))
             .await
             .unwrap();
-        assert!(out.output.starts_with("hello shaniu"));
+        assert!(
+            out.output.starts_with("1: hello shaniu\n2: second line"),
+            "读取结果必须带行号前缀，实际: {}",
+            out.output
+        );
+        assert!(
+            out.output.contains("（文件结束：共 2 行）"),
+            "读完要给总行数 footer，实际: {}",
+            out.output
+        );
+    }
+
+    /// 证伪旧的字节偏移语义：offset=3 必须落在第 3 行上（不是第 3 个字节）。
+    #[tokio::test]
+    async fn read_file_offset_points_at_requested_line() {
+        let ws = workspace();
+        std::fs::write(ws.join("three.txt"), "alpha\nbravo\ncharlie\n").unwrap();
+        let out = ReadFile::new()
+            .execute(
+                serde_json::json!({"path": "three.txt", "offset": 3, "limit": 1}),
+                &ctx(&ws),
+            )
+            .await
+            .unwrap();
+        assert_eq!(
+            out.output.lines().next().unwrap_or(""),
+            "3: charlie",
+            "offset=3 必须是第 3 行，实际: {}",
+            out.output
+        );
+        assert!(
+            out.output.contains("（文件结束：共 3 行）"),
+            "第 3 行就是末行，footer 必须这样说，实际: {}",
+            out.output
+        );
+    }
+
+    /// 空文件 offset=1 是正常 EOF（对齐 dsh），不能报错。
+    #[tokio::test]
+    async fn read_file_empty_file_is_normal_eof() {
+        let ws = workspace();
+        std::fs::write(ws.join("empty.txt"), "").unwrap();
+        let out = ReadFile::new()
+            .execute(serde_json::json!({"path": "empty.txt"}), &ctx(&ws))
+            .await
+            .unwrap();
+        assert_eq!(out.output, "（文件结束：共 0 行）");
+        // offset 超过空文件的行数仍要报越界，并说明文件有几行。
+        let err = ReadFile::new()
+            .execute(serde_json::json!({"path": "empty.txt", "offset": 2}), &ctx(&ws))
+            .await
+            .unwrap_err();
+        assert!(err.to_string().contains("共 0 行"), "{err}");
+        assert!(err.to_string().contains("请求 offset=2"), "{err}");
+    }
+
+    /// 越界必须报总行数与文件大小，而不是空结果或原样回显。
+    #[tokio::test]
+    async fn read_file_out_of_range_reports_total_lines() {
+        let ws = workspace();
+        std::fs::write(ws.join("three.txt"), "a\nb\nc\n").unwrap();
+        let err = ReadFile::new()
+            .execute(serde_json::json!({"path": "three.txt", "offset": 120}), &ctx(&ws))
+            .await
+            .unwrap_err();
+        let message = err.to_string();
+        assert!(message.contains("共 3 行"), "{message}");
+        assert!(message.contains("请求 offset=120"), "{message}");
+        assert!(message.contains("6 B"), "{message}");
+    }
+
+    /// 请求范围部分越界时，footer 给真实总行数（不再单开一条「注意」）。
+    #[tokio::test]
+    async fn read_file_partial_overrun_states_actual_range() {
+        let ws = workspace();
+        std::fs::write(ws.join("three.txt"), "a\nb\nc\n").unwrap();
+        let out = ReadFile::new()
+            .execute(
+                serde_json::json!({"path": "three.txt", "offset": 2, "limit": 10}),
+                &ctx(&ws),
+            )
+            .await
+            .unwrap();
+        assert!(out.output.contains("2: b"), "{}", out.output);
+        assert!(out.output.contains("3: c"), "{}", out.output);
+        assert!(out.output.contains("共 3 行"), "{}", out.output);
+        assert!(out.output.contains("文件结束"), "{}", out.output);
+    }
+
+    /// offset=0 不是合法行号，必须明确拒绝（不能猜成第 1 行）。
+    #[tokio::test]
+    async fn read_file_rejects_offset_zero() {
+        let ws = workspace();
+        let err = ReadFile::new()
+            .execute(
+                serde_json::json!({"path": "README.md", "offset": 0}),
+                &ctx(&ws),
+            )
+            .await
+            .unwrap_err();
+        assert!(matches!(err, ToolError::InvalidArgs(_)));
+        assert!(err.to_string().contains("1 起算"), "{err}");
+    }
+
+    /// 目录误传给 read_file 时要说明并给出前几项，而不是一句「不是文件」。
+    #[tokio::test]
+    async fn read_file_on_directory_lists_preview() {
+        let ws = workspace();
+        let err = ReadFile::new()
+            .execute(serde_json::json!({"path": "src"}), &ctx(&ws))
+            .await
+            .unwrap_err();
+        let message = err.to_string();
+        assert!(message.contains("是目录"), "{message}");
+        assert!(message.contains("main.rs"), "{message}");
+    }
+
+    /// 文件不存在必须明确说，而不是含混的「路径不存在」。
+    #[tokio::test]
+    async fn read_file_missing_file_is_explicit() {
+        let ws = workspace();
+        let err = ReadFile::new()
+            .execute(serde_json::json!({"path": "nope.txt"}), &ctx(&ws))
+            .await
+            .unwrap_err();
+        assert!(err.to_string().contains("文件不存在: nope.txt"), "{err}");
+    }
+
+    /// 从中间行读取后，登记的是整文件哈希；否则后续 apply_patch 会被误判「没读就改」。
+    #[tokio::test]
+    async fn read_file_from_middle_registers_whole_file_stamp() {
+        let ws = workspace();
+        let reads = std::sync::Arc::new(crate::tool_router::ReadRegistry::new());
+        ReadFile::new()
+            .execute(
+                serde_json::json!({"path": "README.md", "offset": 2}),
+                &ctx(&ws).with_reads(reads.clone()),
+            )
+            .await
+            .unwrap();
+        let canonical = crate::tool_router::canonical_key(&ws.join("README.md"));
+        let stamp = reads.get(None, &canonical).expect("必须登记读状态");
+        let file_len = std::fs::metadata(ws.join("README.md")).unwrap().len();
+        assert_eq!(stamp.len, file_len);
+        assert_eq!(stamp.hashed_len, file_len);
     }
 
     #[tokio::test]
@@ -414,12 +823,17 @@ mod tests {
             .execute(serde_json::json!({"path": "big.txt", "max_bytes": 1000}), &ctx(&ws))
             .await
             .unwrap();
-        assert!(out.output.contains("[已截断"));
+        assert!(out.output.contains("已截断"));
         assert!(out.output.len() < 2000);
+        assert!(
+            out.output.contains("不能按行续读"),
+            "单行被字节上限切断时要说明无法按行续读: {}",
+            out.output
+        );
     }
 
     /// 只按字节截断挡不住窗口：1MB 英文 ≈ 25–30 万 token。30k 个 CJK 字符（≈30k token）
-    /// 在 1MB 字节上限内，必须被 token 上限截断并给出续读偏移。
+    /// 在 1MB 字节上限内，必须被 token 上限截断。
     #[tokio::test]
     async fn read_file_caps_result_by_tokens() {
         let ws = workspace();
@@ -431,8 +845,12 @@ mod tests {
             )
             .await
             .unwrap();
-        assert!(out.output.contains("[已截断"), "30k token 必须被截断");
-        assert!(out.output.contains("offset="), "截断必须给出续读偏移");
+        assert!(out.output.contains("已截断"), "30k token 必须被截断");
+        assert!(
+            out.output.contains("token 上限"),
+            "截断原因必须是 token 上限: {}",
+            out.output
+        );
         assert!(
             out.output.chars().count() < 26_000,
             "截断后（含标注）必须回到 token 上限附近，实际 {} 字符",
@@ -440,38 +858,48 @@ mod tests {
         );
     }
 
-    /// 续读必须从精确偏移接上：既不能重复上一段，也不能跳过中间内容。
+    /// 续读必须从下一行接上：既不能重复上一段，也不能跳过中间内容。
     #[tokio::test]
     async fn read_file_offset_resumes_without_gap() {
         let ws = workspace();
-        let content: String = ('a'..='z').cycle().take(200_000).collect();
+        let content: String = (1..=5_000).map(|n| format!("line{n}\n")).collect();
         std::fs::write(ws.join("long.txt"), &content).unwrap();
         let first = ReadFile::new()
             .execute(
-                serde_json::json!({"path": "long.txt", "max_bytes": 65_536}),
+                serde_json::json!({"path": "long.txt", "max_bytes": 2000}),
                 &ctx(&ws),
             )
             .await
             .unwrap();
-        let offset: usize = first
+        let next: usize = first
             .output
             .rsplit("offset=")
             .next()
             .unwrap()
-            .trim_end_matches(']')
+            .trim_end_matches('）')
             .parse()
-            .expect("截断标注里必须能解析出 offset");
-        assert_eq!(offset, 65_536);
+            .expect("截断标注里必须能解析出下一次 offset");
+        let last_no: usize = first
+            .output
+            .lines()
+            .rfind(|line| line.contains(": line"))
+            .and_then(|line| line.split(':').next())
+            .and_then(|number| number.parse().ok())
+            .expect("首段必须带行号");
+        assert_eq!(next, last_no + 1, "续读行号必须紧接上一段末行");
 
         let rest = ReadFile::new()
-            .execute(serde_json::json!({"path": "long.txt", "offset": offset}), &ctx(&ws))
+            .execute(
+                serde_json::json!({"path": "long.txt", "offset": next}),
+                &ctx(&ws),
+            )
             .await
             .unwrap();
         assert!(
-            rest.output.starts_with(&content[offset..offset + 16]),
-            "续读内容必须从 offset 处接上"
+            rest.output.starts_with(&format!("{next}: line{next}\n")),
+            "续读第一行必须是第 {next} 行，实际: {}",
+            rest.output.lines().next().unwrap_or("")
         );
-        assert!(rest.output.contains("[已截断"), "剩余内容仍超默认字节上限，应继续标注");
     }
 
     #[tokio::test]
@@ -529,7 +957,7 @@ mod tests {
             .execute(serde_json::json!({"query": "不存在的字符串xyz"}), &ctx(&ws))
             .await
             .unwrap();
-        assert!(none.output.contains("无匹配"));
+        assert!(none.output.contains("无匹配"), "{}", none.output);
     }
 
     #[tokio::test]
