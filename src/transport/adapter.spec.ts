@@ -58,7 +58,7 @@ interface ScriptedBridge extends HostBridge {
     failRuntime: boolean
     listRunning: boolean
   }
-  emit(sessionId: string, msg: EventMsg, agentId?: string, tsMs?: number): void
+  emit(sessionId: string, msg: EventMsg, agentId?: string, tsMs?: number, eventId?: string): void
 }
 
 function scriptedBridge(
@@ -241,6 +241,11 @@ function scriptedBridge(
         }
         return archive as T
       }
+      if (command === 'latest_session_event_id') {
+        // 事件日志尾：有 event 档案就取该会话最后一条；没有就如实回 null。
+        const rows = journal?.filter(row => row.session_id === String(args?.['sessionId'] ?? '')) ?? []
+        return (rows.at(-1)?.event_id ?? null) as T
+      }
       // SH-056 批 2：子代理归属反查（宿主 owner_session_of_agent 的替身）。
       if (command === 'session_of_agent') {
         if (journal === undefined) return null as T
@@ -413,10 +418,10 @@ function scriptedBridge(
       handlers.add(handler)
       return () => handlers.delete(handler)
     },
-    emit(sessionId, msg, agentId = 'root', tsMs = 1_700_000_000_000) {
+    emit(sessionId, msg, agentId = 'root', tsMs = 1_700_000_000_000, eventId) {
       counter += 1
       const event: AgentEvent = {
-        event_id: `01J00000000000000000000${String(counter).padStart(2, '0')}`,
+        event_id: eventId ?? `01J00000000000000000000${String(counter).padStart(2, '0')}`,
         session_id: sessionId,
         agent_id: agentId,
         parent_id: agentId === 'root' ? null : 'root',
@@ -4238,5 +4243,109 @@ describe('用户可见错误文案不带内部编号', () => {
     expect((error as Error).message).toBe('当前版本不监视文件变更')
     expect((error as Error).message).not.toMatch(NO_CARD)
     dispose()
+  })
+})
+
+describe('续播幂等与无帧兜底（阶段 2）', () => {
+  it('同一批事件重复到达：面板只多一份，不靠渲染去重', async () => {
+    const bridge = scriptedBridge()
+    const { remote, dispose } = createAdapter({ bridge })
+    const session = faceOf(remote).session
+    await session.prompt({ sessionId: 'agent-dup', requestId: 'rpc-dup', content: [{ type: 'text', text: '你好' }] })
+
+    // 同一组事件用**相同 event_id** 连发两遍（模拟续播与 live 交叠）。
+    const batch: { msg: EventMsg; id: string }[] = [
+      { msg: { type: 'turn_started', turn: 1 }, id: 'dup-1' },
+      { msg: { type: 'agent_message_delta', delta: '好' }, id: 'dup-2' },
+      { msg: { type: 'turn_completed', turn: 1, reason: 'completed' }, id: 'dup-3' },
+    ]
+    for (let pass = 0; pass < 2; pass += 1) {
+      for (const item of batch) bridge.emit('agent-dup', item.msg, 'root', 1_700_000_000_000, item.id)
+    }
+
+    const iterator = session.follow({ address: { kind: 'session', sessionId: 'agent-dup' } })
+    const snapshot = (await iterator.next()).value as Record<string, unknown>
+    const events = eventsOf(snapshot)
+    const assistants = events.filter(event => event['type'] === 'assistant/message')
+    expect(assistants).toHaveLength(1)
+    const message = (assistants[0]!['data'] as { message: { content: unknown[] } }).message
+    expect(message.content).toEqual([{ type: 'text', text: '好' }])
+    expect(events.filter(event => event['type'] === 'turn/end')).toHaveLength(1)
+    await iterator.return?.(undefined)
+    dispose()
+  })
+
+  it('60s 无帧但宿主说同会话在跑：续期，不误杀长时间编译', async () => {
+    vi.useFakeTimers()
+    const bridge = scriptedBridge()
+    const { remote, dispose } = createAdapter({ bridge })
+    try {
+      const session = faceOf(remote).session
+      await session.prompt({ sessionId: 'agent-busy', requestId: 'rpc-busy', content: [{ type: 'text', text: '编译' }] })
+      bridge.host.active = { sessionId: 'agent-busy', kind: 'turn' }
+
+      await vi.advanceTimersByTimeAsync(61_000)
+
+      // 续期后仍能正常收下后续帧并走正常收口（不是"被误杀后再补一条"）。
+      bridge.emit('agent-busy', { type: 'agent_message_delta', delta: '完成' })
+      bridge.emit('agent-busy', { type: 'turn_completed', turn: 1, reason: 'completed' })
+      const iterator = session.follow({ address: { kind: 'session', sessionId: 'agent-busy' } })
+      const snapshot = (await iterator.next()).value as Record<string, unknown>
+      const events = eventsOf(snapshot)
+      const ends = events.filter(event => event['type'] === 'turn/end')
+      expect(ends).toHaveLength(1)
+      expect((ends[0]!['data'] as { reason: unknown }).reason).toEqual({ kind: 'completed' })
+      const assistant = events.find(event => event['type'] === 'assistant/message')
+      expect((assistant?.['data'] as { message: { content: unknown[] } }).message.content)
+        .toEqual([{ type: 'text', text: '完成' }])
+      await iterator.return?.(undefined)
+    } finally {
+      dispose()
+      vi.useRealTimers()
+    }
+  })
+
+  it('60s 无帧且宿主确认空闲：前端 fail-closed 收口为 interrupted', async () => {
+    vi.useFakeTimers()
+    const bridge = scriptedBridge()
+    const { remote, dispose } = createAdapter({ bridge })
+    try {
+      const session = faceOf(remote).session
+      await session.prompt({ sessionId: 'agent-dead', requestId: 'rpc-dead', content: [{ type: 'text', text: '跑一下' }] })
+      bridge.host.active = null
+
+      await vi.advanceTimersByTimeAsync(61_000)
+
+      const iterator = session.follow({ address: { kind: 'session', sessionId: 'agent-dead' } })
+      const snapshot = (await iterator.next()).value as Record<string, unknown>
+      const ends = eventsOf(snapshot).filter(event => event['type'] === 'turn/end')
+      expect(ends).toHaveLength(1)
+      expect((ends[0]!['data'] as { reason: unknown }).reason).toEqual({ kind: 'interrupted' })
+      await iterator.return?.(undefined)
+    } finally {
+      dispose()
+      vi.useRealTimers()
+    }
+  })
+
+  it('60s 无帧但运行态查询失败：保持现状，不把"问不到"当空闲', async () => {
+    vi.useFakeTimers()
+    const bridge = scriptedBridge()
+    bridge.host.failRuntime = true
+    const { remote, dispose } = createAdapter({ bridge })
+    try {
+      const session = faceOf(remote).session
+      await session.prompt({ sessionId: 'agent-unknown', requestId: 'rpc-unknown', content: [{ type: 'text', text: '跑一下' }] })
+
+      await vi.advanceTimersByTimeAsync(61_000)
+
+      const iterator = session.follow({ address: { kind: 'session', sessionId: 'agent-unknown' } })
+      const snapshot = (await iterator.next()).value as Record<string, unknown>
+      expect(eventsOf(snapshot).filter(event => event['type'] === 'turn/end')).toHaveLength(0)
+      await iterator.return?.(undefined)
+    } finally {
+      dispose()
+      vi.useRealTimers()
+    }
   })
 })

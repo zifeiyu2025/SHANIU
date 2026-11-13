@@ -363,6 +363,15 @@ interface Journal {
    * 「等 turn 收口才冲刷」的队列；**不落盘、不进 wire 契约**。
    */
   hostRuntimeUnknown: boolean
+  /**
+   * 续播游标三态（follow 进入时交给 `observeEvents`）：
+   * - `undefined`：本进程新建会话，还没有任何位置 → 传 `''` 显式全量补播；
+   * - `null`：读过档案但拿不到事件日志尾 → 传 `null` 只接 live（不假装接上了）；
+   * - `string`：已消费到该 event_id → 传该 id 续播。
+   */
+  lastEventId: string | null | undefined
+  /** 最近一次被接受事件的时刻；60s 无帧扫描用（阈值见 SILENCE_TIMEOUT_MS）。 */
+  lastFrameAt: number
   text: string
   reasoning: string
   chunkIndex: number
@@ -608,6 +617,24 @@ export interface AdapterOptions {
 let journalSerial = 0
 
 /**
+ * `event_id` 去重窗口（有界，防长会话无限涨内存）。
+ *
+ * 每会话只记最近 2048 条：重连补播/全量补播的交叠段远小于这个窗口，更早的 id
+ * 不再有重复到达的可能（服务端只从 `last_id` 之后补）。FIFO 淘汰最旧 id。
+ */
+const EVENT_DEDUP_PER_SESSION = 2048
+/**
+ * 同时跟踪的会话数上限（LRU：命中即触碰，超出淘汰最久未用）。
+ * 64 × 2048 ≈ 13 万条短字符串，量级固定；被淘汰的会话若再收到重复帧，
+ * 退化为「按事件处理一次」，不会崩——去重是优化，不是正确性唯一依赖。
+ */
+const EVENT_DEDUP_MAX_SESSIONS = 64
+/** 无帧扫描周期（前端）。 */
+const SILENCE_SCAN_INTERVAL_MS = 5_000
+/** 回合内连续无帧多久才怀疑失联；只触发「问宿主」，不直接收口。 */
+const SILENCE_TIMEOUT_MS = 60_000
+
+/**
  * 失败回合的原始诊断（供 UI 展开与复制，审计 A0）。
  * 文案只在展开区出现，不参与"一句人话"的展示；后端已做过脱敏。
  */
@@ -661,7 +688,7 @@ function newJournal(createdAt: number): Journal {
   return {
     serial: journalSerial,
     seq: -1, revision: 0, log: new FrameLog(), createdAt,
-    turn: 0, step: 0, taskOpen: false, hostRuntimeUnknown: false, text: '', reasoning: '', chunkIndex: 0,
+    turn: 0, step: 0, taskOpen: false, hostRuntimeUnknown: false, lastEventId: undefined, lastFrameAt: createdAt, text: '', reasoning: '', chunkIndex: 0,
     attemptOpen: false, attemptSeq: -1, attemptId: '',
     attemptStream: [], attemptTurn: 0, attemptStep: 0, attemptStartedAfterSeq: -1,
     usage: undefined, outputs: new Map(),
@@ -693,6 +720,11 @@ export function createAdapter(options: AdapterOptions): { remote: unknown; dispo
   let replayClock: number | undefined
   const now = options.now ?? ((): number => replayClock ?? Date.now())
   const journals = new Map<string, Journal>()
+  /**
+   * `event_id` 去重表：键是信封 `session_id`（泳道按父会话分区，id 全局唯一）。
+   * 有界策略见 `EVENT_DEDUP_*` 常量；重复帧直接丢弃，不推进任何计数。
+   */
+  const seenEventIds = new Map<string, { ids: Set<string>; order: string[] }>()
   const titles = new Map<string, string>()
   /**
    * compactionId → 本次压缩的取证（触发原因 + 规模 + 实际被替换的区间）。
@@ -796,6 +828,48 @@ export function createAdapter(options: AdapterOptions): { remote: unknown; dispo
 
   /** 设置页 / 凭据 / 模型目录三张面：事实来源是宿主的 `[[providers]]` 文档。 */
   const face = createSettingsFace(bridge, { emit: dispatch })
+
+  /**
+   * 记下一条已接受的 event_id；返回 false = 重复帧，调用方必须原样丢弃。
+   *
+   * `eventId === ''` 不参与去重：无法识别身份时宁可让事件走一次正常处理，
+   * 也不整批丢弃（那会把"没有 id 的旧事件"变成静默丢失）。
+   */
+  const acceptEventId = (sessionId: string, eventId: string): boolean => {
+    if (eventId === '') return true
+    let entry = seenEventIds.get(sessionId)
+    if (entry === undefined) {
+      entry = { ids: new Set(), order: [] }
+      seenEventIds.set(sessionId, entry)
+      // 会话数超限：LRU 淘汰最久未用（Map 的插入序即使用序，命中时会重新插入）。
+      while (seenEventIds.size > EVENT_DEDUP_MAX_SESSIONS) {
+        const oldest = seenEventIds.keys().next().value as string | undefined
+        if (oldest === undefined || oldest === sessionId) break
+        seenEventIds.delete(oldest)
+      }
+    } else {
+      seenEventIds.delete(sessionId)
+      seenEventIds.set(sessionId, entry)
+    }
+    if (entry.ids.has(eventId)) return false
+    entry.ids.add(eventId)
+    entry.order.push(eventId)
+    while (entry.order.length > EVENT_DEDUP_PER_SESSION) {
+      const gone = entry.order.shift()
+      if (gone !== undefined) entry.ids.delete(gone)
+    }
+    return true
+  }
+
+  /**
+   * 丢弃某会话的去重记忆：从档案整树重建泳道前必须调用。
+   *
+   * 泳道 journal 是**重建出来**的，若沿用旧去重表，档案里那些"本进程以前见过"的
+   * 事件会被当成重复帧丢掉，泳道变成空壳。重建是重新落一遍账，不是接续投递。
+   */
+  const forgetEventIds = (sessionId: string): void => {
+    seenEventIds.delete(sessionId)
+  }
 
   const journalOf = (sessionId: string): Journal => {
     let journal = journals.get(sessionId)
@@ -1540,6 +1614,47 @@ export function createAdapter(options: AdapterOptions): { remote: unknown; dispo
     pushMetricsFrame(sessionId, journal)
   }
 
+  /** 正在向宿主确认运行态的会话：防止上一次查询没回来时又发一次。 */
+  const silenceChecking = new Set<string>()
+
+  /**
+   * 60s 无帧兜底（docs/04 §1.4）。
+   *
+   * 只负责**发现问题并请求事实**，收口的唯一依据是宿主 `session_runtime`：
+   * - 宿主说同一个会话还在跑（turn 或 compaction）→ 续期，回合保持打开。长时间
+   *   编译/命令执行这类「安静但活着」的回合不会被误杀。
+   * - 宿主确认空闲 → 前端 fail-closed 收口（`turn/end{kind:'interrupted'}`），
+   *   并收回运行态、补发排队消息。
+   * - 查询失败 → 不动（未知），下一轮再问；绝不把「问不到」当成「空闲」。
+   *
+   * 泳道没有独立的宿主任务，按它的父会话判运行态（`agents` 的 `parentId`）。
+   */
+  const sweepSilentTurns = async (): Promise<void> => {
+    const at = now()
+    for (const [sessionId, journal] of [...journals]) {
+      if (!journal.taskOpen || silenceChecking.has(sessionId)) continue
+      if (at - journal.lastFrameAt < SILENCE_TIMEOUT_MS) continue
+      silenceChecking.add(sessionId)
+      try {
+        const view = await bridge.invoke<ActiveTaskView | null>('session_runtime')
+        // 查询期间 journal 可能已被重建、回合可能已收口：以最新状态为准，不重复收口。
+        if (journals.get(sessionId) !== journal || !journal.taskOpen) continue
+        const runtimeId = agents.get(sessionId)?.parentId ?? sessionId
+        if (view !== null && view !== undefined && view.sessionId === runtimeId) {
+          journal.lastFrameAt = now()
+          continue
+        }
+        closeTask(sessionId, journal, { kind: 'interrupted' }, true)
+        dispatch('api-session/status', sessionId, false)
+        void drainQueues()
+      } catch (reason: unknown) {
+        console.warn(`[SHANIU] 会话 ${sessionId} 无帧兜底：宿主运行态查询失败，保持现状`, reason)
+      } finally {
+        silenceChecking.delete(sessionId)
+      }
+    }
+  }
+
   /**
    * 档案历史 → journal 事件重建（SH-033 的"打开旧会话"）。
    *
@@ -1816,6 +1931,9 @@ export function createAdapter(options: AdapterOptions): { remote: unknown; dispo
   }
 
   const onEvent = (event: AgentEvent): void => {
+    // 续播/全量补播/重连补帧都可能把同一封事件重复交来：按 event_id 去重，
+    // 重复帧不落任何一步（否则同一段正文会被拼两次、同一回合会收口两次）。
+    if (!acceptEventId(event.session_id, event.event_id)) return
     const msg = event.msg
     // 子代理事件（agent_id ≠ 'root'）路由进该 agent 的泳道 journal（懒建，SH-109）；
     // session_id 仍是宿主侧任务会话（泳道的父）。根事件走原路径。
@@ -1835,6 +1953,9 @@ export function createAdapter(options: AdapterOptions): { remote: unknown; dispo
       foldLaneTiming(laneId, 'advance')
     }
     const journal = journalOf(sessionId)
+    // 游标与无帧计时都在「已接受」之后推进：重复帧不能把它往前推。
+    if (event.event_id !== '') journal.lastEventId = event.event_id
+    journal.lastFrameAt = now()
     switch (msg.type) {
       case 'turn_started': {
         // 首条用户消息在本层落地时就开了回合（照 mock 的既定顺序：turn/start →
@@ -2278,6 +2399,9 @@ export function createAdapter(options: AdapterOptions): { remote: unknown; dispo
    * rollout 档案重建，失败原因留在控制台，避免把可用的主视图一起罚掉。
    */
   const replayLanes = async (sessionId: string): Promise<void> => {
+    // 泳道 journal 是从档案**重新落账**出来的，不能让旧去重表把"本进程见过"的
+    // 档案事件当成重复帧丢掉（否则泳道重建为空壳）。重复只在实时投递时有意义。
+    forgetEventIds(sessionId)
     let after: string | undefined
     for (;;) {
       const page = await bridge.invoke<{ events: AgentEvent[]; has_more: boolean }>('read_session_events', {
@@ -2305,16 +2429,31 @@ export function createAdapter(options: AdapterOptions): { remote: unknown; dispo
   }
 
   /**
+   * 读事件日志尾（订阅游标）。必须在读 rollout 档案**之前**调用：
+   * 先档后尾会漏掉「已进日志、还没进档案」的帧；先尾后档最多重复一段，
+   * 重复由 `event_id` 去重吸收。读不到如实返回 null（调用方按 live-only 订阅）。
+   */
+  const readEventTail = async (sessionId: string): Promise<string | null> =>
+    bridge.invoke<string | null>('latest_session_event_id', { sessionId })
+      .then(value => (typeof value === 'string' && value !== '' ? value : null))
+      .catch((reason: unknown) => {
+        console.warn('[SHANIU] 读事件日志尾失败，本会话按 live-only 订阅', reason)
+        return null
+      })
+
+  /**
    * 从 rollout 档案重建一个会话的 journal（SH-033；SH-056 批 2 从 `follow` 抽出）。
    *
    * 两条入口共用同一套口径：跟随父会话（重启后重开旧会话）与跟随泳道（子代理
    * 没有自己的 rollout，先反查父会话再整树回放）。返回 `undefined` = 档案为空，
    * 调用方决定交空快照还是继续尝试别的来源。
    *
+   * `tail` 由调用方传入时复用同一次读到的日志尾，避免重复 IPC。
    * 标题回填同样只在这里做一次：宿主 `list_sessions` 的 title 已合并自定义标题，
    * 本地再从档案派生会把它盖掉（重启后用户改过的名字就丢了）。
    */
-  const rebuildFromArchive = async (sessionId: string): Promise<Journal | undefined> => {
+  const rebuildFromArchive = async (sessionId: string, tail?: string | null): Promise<Journal | undefined> => {
+    const cursor = tail === undefined ? await readEventTail(sessionId) : tail
     const entries = await bridge.invoke<SessionEntryLike[]>('load_session', { agentId: sessionId })
     if (entries.length === 0) return undefined
     // 运行态只问宿主：只有它确认「本会话没有任务」才允许把未收口的回合并掉。
@@ -2330,6 +2469,7 @@ export function createAdapter(options: AdapterOptions): { remote: unknown; dispo
       closeOpenTurn: host.known && !runningHere,
       runtimeUnknown: !host.known,
     })
+    replayed.lastEventId = cursor
     journals.set(sessionId, replayed)
     if (!titles.has(sessionId)) {
       const rows = await bridge.invoke<SessionListRow[]>('list_sessions')
@@ -2638,26 +2778,30 @@ export function createAdapter(options: AdapterOptions): { remote: unknown; dispo
       // return、消费方 .return() 关闭生成器、抛错——都在 finally 里释放，否则 gateway
       // 的订阅表只增不减（页面切换后仍在为看不见的会话推帧）。
       const held: string[] = []
-      const hold = (id: string): void => {
+      const hold = (id: string, cursor?: string | null): void => {
         if (id === '' || held.includes(id)) return
         held.push(id)
-        bridge.observeEvents?.(id)
+        bridge.observeEvents?.(id, cursor)
       }
       try {
-        hold(sessionId)
         let journal = journals.get(sessionId)
+        // 没在当前进程里观察过：先从事件日志尾拿续播位置，再读档案重建。
+        // 顺序反了会漏「已进日志、还没进档案」的帧；先尾后档最多重复，由去重吸收。
+        let archiveTail: string | null | undefined
         if (journal === undefined) {
+          archiveTail = await readEventTail(sessionId)
           // 没在当前进程里观察过：能从档案重建就重建（SH-033 的"打开旧会话"）。
           // 宿主对"档案不存在"是**抛错**而不是空表（load_session 的诚实失败），
           // 子代理正好走这一支——先记下错误，反查不到归属再把原始错误抛回去。
           let replayed: Journal | undefined
           let failure: unknown
           try {
-            replayed = await rebuildFromArchive(sessionId)
+            replayed = await rebuildFromArchive(sessionId, archiveTail)
           } catch (error: unknown) {
             failure = error
           }
           if (replayed !== undefined) {
+            hold(sessionId, replayed.lastEventId === undefined ? '' : replayed.lastEventId)
             yield* followReplayed(sessionId, replayed, signal)
             return
           }
@@ -2668,10 +2812,13 @@ export function createAdapter(options: AdapterOptions): { remote: unknown; dispo
           // 中途"的泳道）。
           const ownerId = await ownerSessionOf(sessionId)
           if (ownerId !== null && ownerId !== sessionId) {
+            if (!journals.has(ownerId)) await rebuildFromArchive(ownerId)
             // 子代理事件经父会话频道广播（gateway 按信封 `session_id` 分发）：只订阅
             // 泳道 id 收不到任何帧，这里把父会话一并补订阅。
-            hold(ownerId)
-            if (!journals.has(ownerId)) await rebuildFromArchive(ownerId)
+            const ownerJournal = journals.get(ownerId)
+            hold(ownerId, ownerJournal === undefined
+              ? undefined
+              : ownerJournal.lastEventId === undefined ? '' : ownerJournal.lastEventId)
             // 父 rollout 为空也必须回放：泳道的持久事实在事件档案里，不在 rollout 里。
             if (!journals.has(sessionId)) await replayLanes(ownerId)
             journal = journals.get(sessionId)
@@ -2679,11 +2826,18 @@ export function createAdapter(options: AdapterOptions): { remote: unknown; dispo
           if (journal === undefined) {
             // 真实会话的档案读失败仍是硬错误：不静默交空态让用户以为会话没了。
             if (failure !== undefined) throw failure
+            // 空档案也可能已有事件日志（新会话尚未落 rollout）：有尾就续播；
+            // 连尾都没有时交 `undefined`，让传输层按自己的会话规则决定
+            // （新会话全量补播 / 既有会话 live-only），不在这里替它拍板。
+            hold(sessionId, archiveTail ?? undefined)
             traceFollow(sessionId, 'end-empty')
             yield emptySnapshot(sessionId, now())
             return
           }
         }
+        // 订阅游标三态见 Journal.lastEventId：新会话传 '' 全量补播，档案重建传尾，
+        // 取不到尾传 null（live-only），绝不拿 '' 冒充"没看过任何东西"。
+        hold(sessionId, journal.lastEventId === undefined ? '' : journal.lastEventId)
         // 下标在同步块里一次捕获：cursor / revision / records 必须描述同一时刻，
         // 之后产生的帧由 tail(from) 按位置补齐，不存在"注册太晚丢帧"的窗口。
         const from = journal.log.length
@@ -4286,11 +4440,14 @@ export function createAdapter(options: AdapterOptions): { remote: unknown; dispo
 
   const unlisten = bridge.listenEvents(onEvent)
   void face.refresh()
+  // 单一定时器扫描所有打开回合（每会话按 lastFrameAt 判超时），不是每会话一个定时器。
+  const silenceTimer = setInterval(() => { void sweepSilentTurns() }, SILENCE_SCAN_INTERVAL_MS)
 
   return {
     remote,
     dispose() {
       unlisten()
+      clearInterval(silenceTimer)
     },
   }
 }

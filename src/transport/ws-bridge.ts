@@ -241,15 +241,23 @@ export function createWsBridge(base: HostBridge, options: WsBridgeOptions = {}):
     openSubscription(sessionId, resumable ? reviveCursor(sessionId) : initialCursor, 0)
   }
 
-  /** 观察者进场（引用 +1）：follow 入口调用；同会话多视图共享一条订阅。 */
-  const observeEvents = (sessionId: string): void => {
+  /**
+   * 观察者进场（引用 +1）：follow 入口调用；同会话多视图共享一条订阅。
+   *
+   * `cursor` 只在**新建订阅**时生效：休眠/被淘汰的条目仍优先用保留的游标——
+   * 那是本进程亲眼收到的位置，比调用方手上的档案尾更准。未传时沿用旧规则。
+   */
+  const observeEvents = (sessionId: string, cursor?: string | null): void => {
     if (sessionId === '') return
     const active = subscriptions.get(sessionId)
     if (active !== undefined) {
       active.refs += 1
       return
     }
-    openSubscription(sessionId, reviveCursor(sessionId), 1)
+    const resumable = dormant.has(sessionId) || lostCursor.has(sessionId)
+    openSubscription(sessionId, resumable
+      ? reviveCursor(sessionId)
+      : cursor !== undefined ? cursor : reviveCursor(sessionId), 1)
   }
 
   /**

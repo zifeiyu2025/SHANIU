@@ -239,6 +239,40 @@ describe('ws-bridge（SH-094 批 3）', () => {
     }
   })
 
+  it('observeEvents：显式游标优先，从档案最后一条之后续播', async () => {
+    const h = harness()
+    try {
+      await tick()
+      const ws = h.sockets[0]!
+      ws.open()
+      ws.message({ type: 'ready' })
+
+      h.bridge.observeEvents?.('resumed', '01JTAIL')
+      const frames = subscribeFrames(h.log)
+      expect(frames).toHaveLength(1)
+      expect(frames[0]).toMatchObject({ session_id: 'resumed', after_event_id: '01JTAIL' })
+    } finally {
+      h.dispose()
+    }
+  })
+
+  it('observeEvents：游标取不到时传 null 走 live-only，不冒充全量', async () => {
+    const h = harness()
+    try {
+      await tick()
+      const ws = h.sockets[0]!
+      ws.open()
+      ws.message({ type: 'ready' })
+
+      h.bridge.observeEvents?.('unknown-tail', null)
+      const frames = subscribeFrames(h.log)
+      expect(frames).toHaveLength(1)
+      expect(frames[0]).not.toHaveProperty('after_event_id')
+    } finally {
+      h.dispose()
+    }
+  })
+
   it('打开事件流前先等连接就绪：send_task 不会早于 subscribe 帧发出', async () => {
     const h = harness()
     try {
