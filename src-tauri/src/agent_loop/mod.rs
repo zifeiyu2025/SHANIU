@@ -2711,6 +2711,28 @@ mod tests {
         }
     }
 
+    /// 转发 sink，并在第一条 `ToolCallBegin` 通过时唤醒等待者。
+    ///
+    /// 给「取消必须发生在工具真在飞之后」这类用例一个事件驱动的时间点，替代
+    /// 「睡固定毫秒再取消」——后者在慢一个量级的 CI runner 上会落在模型采样阶段，
+    /// 那时工具还没开始，用例就变成在测「什么都没发生」。
+    struct FirstBeginNotify {
+        inner: Arc<dyn EventSink>,
+        first_begin: Arc<tokio::sync::Notify>,
+    }
+
+    impl EventSink for FirstBeginNotify {
+        fn emit(&self, msg: &EventMsg) -> Result<(), String> {
+            let is_begin = matches!(msg, EventMsg::ToolCallBegin { .. });
+            let outcome = self.inner.emit(msg);
+            if is_begin {
+                // notify_one 在没有等待者时会保存一个 permit，等待者还没被调度到也不丢信号。
+                self.first_begin.notify_one();
+            }
+            outcome
+        }
+    }
+
     struct ScriptedBackend(Mutex<VecDeque<Vec<ModelStreamEvent>>>);
 
     impl ScriptedBackend {
@@ -4014,6 +4036,10 @@ mod tests {
     }
 
     /// 取消必须传播到正在并发的读上：不等 150ms×2 跑完，且每条调用都有输出。
+    ///
+    /// 取消时机等第一条 `ToolCallBegin` 真正出现，而不是睡固定毫秒：CI runner 比本地
+    /// 慢约一个量级，固定窗口会落在模型采样阶段（工具还没开始）。等待本身有上限，
+    /// 超时是**失败**而不是静默跳过。
     #[tokio::test]
     async fn cancelling_a_read_batch_propagates_and_reports_every_call() {
         let peak = Arc::new(std::sync::atomic::AtomicUsize::new(0));
@@ -4027,18 +4053,37 @@ mod tests {
         ]);
         let (router, _started) = slow_router(peak);
         agent.router = Arc::new(router);
+
+        let first_begin = Arc::new(tokio::sync::Notify::new());
+        let sink: Arc<dyn EventSink> = Arc::new(FirstBeginNotify {
+            inner: Arc::new(CapturingSink(store.clone())),
+            first_begin: first_begin.clone(),
+        });
         let stopper = cancel.clone();
-        tokio::spawn(async move {
-            tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+        let watcher = tokio::spawn(async move {
+            let began = tokio::time::timeout(
+                std::time::Duration::from_secs(1),
+                first_begin.notified(),
+            )
+            .await
+            .is_ok();
+            // 即使超时也要取消：否则 run_task 会一直跑到自然结束，报错信息会被
+            // 上层的 timeout 误导成「取消没传播」。
             stopper.cancel();
+            began
         });
         let summary = tokio::time::timeout(
-            std::time::Duration::from_secs(2),
-            agent.run_task("任务", Arc::new(CapturingSink(store.clone())), cancel),
+            std::time::Duration::from_secs(3),
+            agent.run_task("任务", sink, cancel),
         )
         .await
         .expect("取消必须立即传播，不能等两条读跑完");
 
+        let saw_begin = watcher.await.expect("等待 ToolCallBegin 的任务不应 panic");
+        assert!(
+            saw_begin,
+            "1s 上限内没有等到第一条 ToolCallBegin：用例前置条件不成立，显式失败"
+        );
         assert_eq!(summary.reason, TurnEndReason::Cancelled);
         let events = store.lock().unwrap();
         let cancelled: Vec<&str> = events
