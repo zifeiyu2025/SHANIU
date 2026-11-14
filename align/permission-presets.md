@@ -339,3 +339,29 @@ and process visibility are NOT」）。用户若把「只读」理解成「数�
 **代价**：默认档从「不可能造成写盘」变成「可在工作区内写盘」。边界由工作区根判据 +
 OS 写沙箱承担；用户仍可在设置页选 `read-only` 回到严格档。
 
+## 12. 写后验证的三条边界（2026-11-14）
+
+**1）源码后缀白名单窄 → 补。** 原 `is_source_extension` 只认
+`rs|ts|tsx|js|jsx|json|toml`，改 `.py/.go/.css` 不置脏，收工直接 `Skipped(NoSourceWrite)`。
+参考端都没有后缀白名单：codex 的 `TurnDiffTracker` 记录所有 apply_patch 路径，
+dsh 只按沙箱路径边界判写。现在扩到 `rs|ts|tsx|js|jsx|mjs|cjs|json|toml|py|go|css|scss|html|sql|sh|ps1`，
+并且**按扩展名定生态再找清单**：`.py` 只认 `pyproject.toml`/`setup.py`/`requirements.txt`
+（`python -m compileall -q .`），`.go` 只认 `go.mod`（`go build ./...`）；没有对应验证器的
+后缀（css/scss/html/sql/sh/ps1、toml）计脏但不贡献命令，最终落
+`Skipped(NoCommandConfigured)`。绝不拿 `cargo check` 冒充 Python 的「已验证」。
+
+**2）只有 `apply_patch` 计写 → 留。** codex 的内置 `TurnDiffTracker` 同样只记 apply_patch
+变更，不明文跟踪 shell 重定向（`codex-rs/core/src/turn_diff_tracker.rs` 文件头注释）；
+官方 Stop hook 可以自己跑 `git status`，但那是用户配置的钩子，不是内置写日志。dsh 没有
+内置写后验证。保留理由：shell 重定向语义不可靠（`> out.log`、`2>nul`、`>/dev/null` 都是正常
+用法），计成源码写入只会制造假脏；需要覆盖 shell 写盘时，正解是后续接 Stop hook，
+不是猜重定向。回归用例：`shell_writes_are_not_registered_as_file_writes`
+（`tools/unified_exec.rs`）。
+
+**3）否决额度 1 次 → 留。** codex 的收尾钩子不是「每任务 N 次」，而是一次性续跑标志：
+首次 block 后置 `stop_hook_active = true`（`core/src/session/turn.rs:527、812-846`），下一次
+Stop 请求把标志传给钩子（`hooks/src/events/stop.rs:35、147`）；守约钩子的净效果就是一次续跑。
+dsh 没有内置收尾验证/回合预算（`core/agent-loop/README.md:220`）。我们的闸门是宿主内建，
+把同一条纪律写死就是 1 次；抬高额度只会推高最坏回合数，参考端没有给出需要多轮的证据。
+既有硬顶用例 `verification_gate_vetoes_at_most_once_then_discloses` 与四态判据一条不放宽。
+

@@ -1027,6 +1027,26 @@ mod tests {
         assert_eq!(shell_writer_program("echo hi"), None);
     }
 
+    /// 写日志的边界：shell 重定向 / `Set-Content` 都不产生 `FileWrite`。
+    ///
+    /// 这是有意保留的（对齐 codex：内置 `TurnDiffTracker` 只记 apply_patch 提交的变更，
+    /// shell 写盘交给收尾钩子自己跑 `git status`）。把重定向计成源码写入会制造大量假脏，
+    /// 而且 `cargo test > out.log` 之类正常用法会被误判。
+    #[tokio::test]
+    async fn shell_writes_are_not_registered_as_file_writes() {
+        let ws = workspace();
+        let journal = std::sync::Arc::new(crate::tool_router::WriteJournal::new());
+        let context = ctx(&ws).with_writes(journal.clone());
+        let exec = UnifiedExec::new();
+        for command in ["echo hello > out.txt", "Set-Content -Path b.txt -Value x"] {
+            let _ = exec.execute(serde_json::json!({"command": command}), &context).await;
+        }
+        assert!(
+            journal.take().is_empty(),
+            "shell 写盘不计入写日志：内置闸门只认 apply_patch 的 FileWrite"
+        );
+    }
+
     /// 提示只加文本、不改 success，且同一会话只出现一次。
     #[test]
     fn shell_write_hint_fires_once_per_session_and_keeps_success() {

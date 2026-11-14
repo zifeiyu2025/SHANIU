@@ -25,15 +25,46 @@ const TOTAL_BUDGET: Duration = Duration::from_secs(180);
 /// 回填给模型的输出尾部长度。
 const SUMMARY_BYTES: usize = 800;
 
-/// 源码类扩展名：只有这些改动才值得触发编译/类型检查。
+/// 文件所属的验证生态：决定向上找哪份清单，**绝不跨生态顶替**。
+///
+/// 参考项目没有「后缀白名单」这个概念（codex 的 `TurnDiffTracker` 记录所有
+/// apply_patch 路径，dsh 只按沙箱路径边界判写），所以「写过」必须覆盖 py/go/css；
+/// 但验证命令仍是分语言的——拿 `cargo check` 去验一次 Python 改动等于谎报通过，
+/// 因此没有对应验证器的后缀只计脏、不贡献命令。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Ecosystem {
+    Rust,
+    Node,
+    Python,
+    Go,
+    /// 源码类，但当前没有通用验证器（css/scss/html/sql/sh/ps1 等）。
+    Unverified,
+    /// 非源码（文档、二进制等），不计脏。
+    NotSource,
+}
+
+fn ecosystem_of(path: &Path) -> Ecosystem {
+    match path
+        .extension()
+        .and_then(|ext| ext.to_str())
+        .map(|ext| ext.to_ascii_lowercase())
+        .as_deref()
+    {
+        Some("rs") => Ecosystem::Rust,
+        Some("ts" | "tsx" | "js" | "jsx" | "mjs" | "cjs" | "json") => Ecosystem::Node,
+        Some("py") => Ecosystem::Python,
+        Some("go") => Ecosystem::Go,
+        Some("toml" | "css" | "scss" | "html" | "sql" | "sh" | "ps1") => Ecosystem::Unverified,
+        _ => Ecosystem::NotSource,
+    }
+}
+
+/// 源码类扩展名：只有这些改动才值得触发验证。
+///
+/// 名单比 2026-11 之前宽：`.py` / `.go` / `.css` 等同样是源码写入，漏掉它们等于
+/// 允许模型改完直接收工而闸门完全不知情（现网就是 `Skipped(NoSourceWrite)`）。
 fn is_source_extension(path: &Path) -> bool {
-    matches!(
-        path.extension()
-            .and_then(|ext| ext.to_str())
-            .map(|ext| ext.to_ascii_lowercase())
-            .as_deref(),
-        Some("rs" | "ts" | "tsx" | "js" | "jsx" | "json" | "toml")
-    )
+    !matches!(ecosystem_of(path), Ecosystem::NotSource)
 }
 
 /// 一次「脏」判定：有源码写入且内容真的变了。
@@ -221,24 +252,64 @@ pub fn select_commands(
 }
 
 /// 从脏文件向上找最近的清单；找不到归属清单就跳过该文件（**不回落到仓库根**）。
+///
+/// 生态由扩展名决定：`.py` 只认 Python 清单，`.go` 只认 `go.mod`，绝不会因为
+/// 上层恰好有 `Cargo.toml` 就把 Python 改动交给 `cargo check` 去「验证通过」。
 fn nearest_command(file: &Path, workspace_root: &Path) -> Option<VerifyCommand> {
+    match ecosystem_of(file) {
+        Ecosystem::Rust => walk_up(file, workspace_root, |dir| {
+            dir.join("Cargo.toml").is_file().then(|| {
+                let workspace = std::fs::read_to_string(dir.join("Cargo.toml"))
+                    .map(|text| text.contains("[workspace]"))
+                    .unwrap_or(false);
+                let display = if workspace {
+                    "cargo check --workspace --all-targets".to_string()
+                } else {
+                    "cargo check --all-targets".to_string()
+                };
+                VerifyCommand { display, cwd: dir.to_path_buf() }
+            })
+        }),
+        Ecosystem::Node => walk_up(file, workspace_root, |dir| {
+            dir.join("package.json")
+                .is_file()
+                .then(|| package_command(dir))
+                .flatten()
+                .map(|display| VerifyCommand { display, cwd: dir.to_path_buf() })
+        }),
+        Ecosystem::Python => walk_up(file, workspace_root, |dir| {
+            PYTHON_MARKERS
+                .iter()
+                .any(|marker| dir.join(marker).is_file())
+                .then(|| VerifyCommand {
+                    display: "python -m compileall -q .".to_string(),
+                    cwd: dir.to_path_buf(),
+                })
+        }),
+        Ecosystem::Go => walk_up(file, workspace_root, |dir| {
+            dir.join("go.mod").is_file().then(|| VerifyCommand {
+                display: "go build ./...".to_string(),
+                cwd: dir.to_path_buf(),
+            })
+        }),
+        // 计脏但不猜命令：没有验证器时如实落 `Skipped(NoCommandConfigured)`，
+        // 不能拿别的语言的编译器冒充「已验证」。
+        Ecosystem::Unverified | Ecosystem::NotSource => None,
+    }
+}
+
+/// Python 项目的就近清单：任一份存在即认为该目录是验证根。
+const PYTHON_MARKERS: &[&str] = &["pyproject.toml", "setup.py", "requirements.txt"];
+
+/// 从 `file` 的父目录逐级向上探测，命中即返回；到工作区根为止，不越界。
+fn walk_up<F>(file: &Path, workspace_root: &Path, mut probe: F) -> Option<VerifyCommand>
+where
+    F: FnMut(&Path) -> Option<VerifyCommand>,
+{
     let mut dir = file.parent()?;
     loop {
-        if dir.join("Cargo.toml").is_file() {
-            let workspace = std::fs::read_to_string(dir.join("Cargo.toml"))
-                .map(|text| text.contains("[workspace]"))
-                .unwrap_or(false);
-            let display = if workspace {
-                "cargo check --workspace --all-targets".to_string()
-            } else {
-                "cargo check --all-targets".to_string()
-            };
-            return Some(VerifyCommand { display, cwd: dir.to_path_buf() });
-        }
-        if dir.join("package.json").is_file() {
-            if let Some(display) = package_command(dir) {
-                return Some(VerifyCommand { display, cwd: dir.to_path_buf() });
-            }
+        if let Some(command) = probe(dir) {
+            return Some(command);
         }
         if dir == workspace_root || !dir.starts_with(workspace_root) {
             return None;
@@ -591,6 +662,68 @@ mod tests {
         let mut other = DirtyTracker::default();
         assert!(!other.mark(&[write("a.rs", false)]));
         assert!(!other.is_dirty());
+    }
+
+    #[test]
+    fn python_go_and_unverifiable_source_writes_mark_dirty() {
+        let mut dirty = DirtyTracker::default();
+        // 参考项目没有后缀白名单：这些同样是「写过」，必须进闸门。
+        assert!(dirty.mark(&[write("pkg/main.py", true)]));
+        assert!(dirty.mark(&[write("cmd/main.go", true)]));
+        assert!(dirty.mark(&[write("web/site.css", true)]));
+        assert_eq!(dirty.files().count(), 3);
+        // 文档仍不计脏（既有判据不放宽）。
+        assert!(!DirtyTracker::has_source_change(&[write("README.md", true)]));
+    }
+
+    /// 同一仓库里同时有 Cargo.toml 与 pyproject.toml 时，Python 改动只能用 Python
+    /// 验证器验；拿 `cargo check` 顶替等于把「没验」说成「验过了」。
+    #[test]
+    fn python_write_selects_python_not_cargo() {
+        let base = crate::test_support::TestTempDir::new("verify-py");
+        let root = base.join("repo");
+        std::fs::create_dir_all(root.join("pkg")).unwrap();
+        std::fs::write(root.join("Cargo.toml"), "[package]\nname = \"x\"\n").unwrap();
+        std::fs::write(root.join("pyproject.toml"), "[project]\nname = \"x\"\n").unwrap();
+        std::fs::write(root.join("pkg/main.py"), "print(1)\n").unwrap();
+
+        let mut dirty = DirtyTracker::default();
+        dirty.mark(&[write(&root.join("pkg/main.py").to_string_lossy(), true)]);
+        let commands = select_commands(&VerifyConfig::default(), &dirty, &root).unwrap();
+        assert_eq!(commands.len(), 1);
+        assert_eq!(commands[0].display, "python -m compileall -q .");
+        assert_eq!(commands[0].cwd, root);
+    }
+
+    #[test]
+    fn go_write_selects_go_build() {
+        let base = crate::test_support::TestTempDir::new("verify-go");
+        let root = base.join("repo");
+        std::fs::create_dir_all(root.join("cmd")).unwrap();
+        std::fs::write(root.join("go.mod"), "module example.com/x\n").unwrap();
+        std::fs::write(root.join("cmd/main.go"), "package main\n").unwrap();
+
+        let mut dirty = DirtyTracker::default();
+        dirty.mark(&[write(&root.join("cmd/main.go").to_string_lossy(), true)]);
+        let commands = select_commands(&VerifyConfig::default(), &dirty, &root).unwrap();
+        assert_eq!(commands.len(), 1);
+        assert_eq!(commands[0].display, "go build ./...");
+        assert_eq!(commands[0].cwd, root);
+    }
+
+    /// 没有对应验证器的源码后缀：计脏，但只能落 `Skipped(NoCommandConfigured)`，
+    /// 不许借上层 `Cargo.toml` 的 `cargo check` 冒充通过。
+    #[test]
+    fn unverifiable_source_write_is_skipped_not_passed() {
+        let base = crate::test_support::TestTempDir::new("verify-css");
+        let root = base.join("repo");
+        std::fs::create_dir_all(&root).unwrap();
+        std::fs::write(root.join("Cargo.toml"), "[package]\nname = \"x\"\n").unwrap();
+
+        let mut dirty = DirtyTracker::default();
+        assert!(dirty.mark(&[write(&root.join("site.css").to_string_lossy(), true)]));
+        let result = select_commands(&VerifyConfig::default(), &dirty, &root);
+        assert_eq!(result, Err(SkipReason::NoCommandConfigured));
     }
 
     #[test]
