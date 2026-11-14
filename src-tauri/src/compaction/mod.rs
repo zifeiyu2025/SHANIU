@@ -248,25 +248,6 @@ fn has_real_content(items: &[HistoryItem], target: &Target) -> bool {
         })
 }
 
-/// 区间里是否有任何可总结的非系统条目（旧摘要算）。
-///
-/// 手动 `/compact` 与溢出补救**允许**重新总结一条旧摘要——摘要本身过大时，那是
-/// 唯一的收缩手段；它们只跳过「只有系统注入」的区间。自动路径的判据更严，
-/// 见 [`has_real_content`]。
-fn has_any_content(items: &[HistoryItem], target: &Target) -> bool {
-    items[target.range_start..target.range_end]
-        .iter()
-        .any(|item| match item {
-            HistoryItem::Message { role: Role::System, .. }
-            | HistoryItem::ImageMessage { role: Role::System, .. } => false,
-            HistoryItem::Message { text, .. } => !text.trim().is_empty(),
-            HistoryItem::ImageMessage { text, images, .. } => {
-                !text.trim().is_empty() || !images.is_empty()
-            }
-            HistoryItem::FunctionCall { .. } | HistoryItem::FunctionCallOutput { .. } => true,
-        })
-}
-
 /// 是否需要压缩，以及压哪一段。
 ///
 /// `observed_tokens` 是上一次采样端点报回的真实用量（含推理 token 与工具声明开销，
@@ -317,13 +298,7 @@ pub fn plan_manual(items: &[HistoryItem], budget: usize) -> Option<Target> {
     } else {
         budget.saturating_mul(KEEP_RATIO_PERCENT) / 100
     };
-    let target = tail_target(items, keep_allowance);
-    if !has_any_content(items, &target) {
-        // 只有系统注入（如环境快照）：压掉它得到的只是「本轮未收到具体用户任务」，
-        // 与自动路径同一条空集摘要来源。旧摘要仍允许重压，见 [`has_any_content`]。
-        return None;
-    }
-    Some(target)
+    Some(tail_target(items, keep_allowance))
 }
 
 /// 构造总结请求：被压区间的全部条目 + 末尾一条总结指令。
@@ -987,13 +962,27 @@ mod tests {
         );
     }
 
-    /// 手动 `/compact` 与溢出补救：允许重压旧摘要（那是唯一收缩手段），
-    /// 但只有系统注入的区间仍然不压——它同样是空集摘要的来源。
+    /// 手动 `/compact` 与溢出补救**不挂**「无真实内容不压」的闸门。
+    ///
+    /// 溢出补救是强制补救：端点已经报了超长，「区间里没内容」这个前提不成立，
+    /// 跳过等于放任失败（真机契约 `retry_contract::c16` 要求原请求 + 一次补救压缩）。
+    /// 只有系统注入时压出来的摘要带标题与分隔线、原文段为空，下一轮不会被当成
+    /// 用户原文继承（见 [`compose_without_user_messages_marks_an_empty_user_section`]），
+    /// 所以放开它不会把 N9 重新打开。
     #[test]
-    fn manual_planning_recompacts_summaries_but_skips_system_only_ranges() {
+    fn manual_planning_compacts_even_a_system_only_range_without_inheriting_it() {
         let items = vec![msg(Role::System, "## 环境快照"), msg(Role::Assistant, "最新一条")];
-        assert_eq!(plan_manual(&items, 5_000), None);
+        let target = plan_manual(&items, 5_000).expect("强制补救必须尝试压缩");
+        assert_eq!(target, Target { range_start: 0, range_end: 1 });
 
+        let composed = compose_summary(&items, &target, 5_000, "压缩对象为空集");
+        assert_eq!(
+            carried_user_text(&composed),
+            Some(""),
+            "空集摘要不得留下可继承的用户原文段"
+        );
+
+        // 旧摘要同样允许重压：摘要过大时那是唯一收缩手段。
         let generated = compose_summary(
             &[msg(Role::User, "任务目标")],
             &Target { range_start: 0, range_end: 1 },
@@ -1003,8 +992,7 @@ mod tests {
         let items = vec![msg(Role::User, &generated), msg(Role::Assistant, "最新一条")];
         assert_eq!(
             plan_manual(&items, 5_000),
-            Some(Target { range_start: 0, range_end: 1 }),
-            "摘要过大时重压是手动路径的正当用途"
+            Some(Target { range_start: 0, range_end: 1 })
         );
     }
 
