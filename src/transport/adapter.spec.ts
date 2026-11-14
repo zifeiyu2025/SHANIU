@@ -96,6 +96,8 @@ function scriptedBridge(
   sendTaskHandler?: (args: Record<string, unknown> | undefined) => unknown,
   /** 阶段 3：`pending_approvals` 的宿主替身（缺省空表 = 没有待审批）。 */
   approvalSnapshot?: () => PendingApprovalsSnapshotWire,
+  /** 状态源收敛 Phase 3：`reconcile_session` 的宿主替身；缺省 = 档案里没有可对账的回合。 */
+  reconcileHandler?: (args: Record<string, unknown> | undefined) => unknown,
 ): ScriptedBridge {
   const calls: ScriptedBridge['calls'] = []
   const host: ScriptedBridge['host'] = { active: null, failRuntime: false, listRunning: false }
@@ -292,6 +294,9 @@ function scriptedBridge(
       if (command === 'search_sessions') {
         if (searchHandler === undefined) return { items: [], hasMore: false } as T
         return searchHandler(args) as T
+      }
+      if (command === 'reconcile_session') {
+        return (reconcileHandler?.(args) ?? { status: 'no_archive' }) as T
       }
       if (command === 'session_runtime') {
         if (host.failRuntime) throw { code: 'IPC_FAILED', message: '运行态查询失败' }
@@ -4833,9 +4838,14 @@ describe('续播幂等与无帧兜底（阶段 2）', () => {
     }
   })
 
-  it('60s 无帧且宿主确认空闲：只观测、不收口（不再自动补 interrupted）', async () => {
+  it('60s 无帧且宿主确认空闲、对账没有结论时保持打开（前端不补 interrupted）', async () => {
     vi.useFakeTimers()
-    const bridge = scriptedBridge()
+    // 显式写出「档案里没有可对账的回合」：默认值同此，写出来是为了让意图可读。
+    const bridge = scriptedBridge(
+      undefined, [], undefined, undefined, undefined, undefined, undefined,
+      undefined, undefined, undefined, undefined, undefined, undefined, undefined,
+      () => ({ status: 'no_archive' }),
+    )
     const { remote, dispose } = createAdapter({ bridge })
     try {
       const session = faceOf(remote).session
@@ -4901,6 +4911,99 @@ describe('续播幂等与无帧兜底（阶段 2）', () => {
         .filter(event => event['type'] === 'turn/end')
       expect(ends).toHaveLength(0)
       await after.return?.(undefined)
+    } finally {
+      dispose()
+      vi.useRealTimers()
+    }
+  })
+})
+
+describe('宿主恢复对账（阶段 3）', () => {
+  it('重开重建：宿主空闲且档案无结局 → 调用对账并按结论收口', async () => {
+    const archive = [
+      { kind: 'message', role: 'user', text: '跑一下', at_ms: 1 },
+      { kind: 'message', role: 'assistant', text: '跑到一半', at_ms: 2 },
+    ]
+    const bridge = scriptedBridge(
+      undefined, archive, undefined, undefined, undefined, undefined, undefined,
+      undefined, undefined, undefined, undefined, undefined, undefined, undefined,
+      () => ({
+        status: 'appended',
+        entry: { kind: 'turn_end', turn: 1, task_id: 'agent#1', reason: 'indeterminate', at_ms: 3 },
+      }),
+    )
+    bridge.host.active = null
+    const { remote, dispose } = createAdapter({ bridge })
+    const session = faceOf(remote).session
+    const iterator = session.follow({ address: { kind: 'session', sessionId: 'agent-reconcile' } })
+    const events = eventsOf((await iterator.next()).value as Record<string, unknown>)
+    await iterator.return?.(undefined)
+    dispose()
+
+    const ends = events.filter(event => event['type'] === 'turn/end')
+    // 反向对照：去掉对账调用，末尾兜底补的也是 indeterminate，但时刻会退回最后一条
+    // 档案条目的 at_ms（2）——这里必须是结论行自己的 3，才能证明结局来自档案而不是本地兜底。
+    expect(ends).toHaveLength(1)
+    expect((ends[0]!['data'] as { reason: unknown }).reason).toEqual({ kind: 'indeterminate' })
+    expect(ends[0]!['time']).toBe(3)
+    expect(events.filter(event => event['type'] === 'turn/start')).toHaveLength(1)
+    expect(bridge.calls.some(call => call.command === 'reconcile_session'
+      && call.args?.['sessionId'] === 'agent-reconcile')).toBe(true)
+  })
+
+  it('重开重建：对账带回旧档结论 → 按档案 reason 收口，不覆盖成未知', async () => {
+    // 档案尾部故意不含 turn_end：结论只在对账回复里（并发对账在读到档案之后才落行）。
+    const archive = [
+      { kind: 'message', role: 'user', text: '问', at_ms: 1 },
+      { kind: 'message', role: 'assistant', text: '答', at_ms: 2 },
+    ]
+    const bridge = scriptedBridge(
+      undefined, archive, undefined, undefined, undefined, undefined, undefined,
+      undefined, undefined, undefined, undefined, undefined, undefined, undefined,
+      () => ({
+        status: 'already_concluded',
+        entry: { kind: 'turn_end', turn: 1, reason: 'completed', at_ms: 4 },
+      }),
+    )
+    bridge.host.active = null
+    const { remote, dispose } = createAdapter({ bridge })
+    const session = faceOf(remote).session
+    const iterator = session.follow({ address: { kind: 'session', sessionId: 'agent-already' } })
+    const events = eventsOf((await iterator.next()).value as Record<string, unknown>)
+    await iterator.return?.(undefined)
+    dispose()
+
+    const ends = events.filter(event => event['type'] === 'turn/end')
+    expect(ends).toHaveLength(1)
+    // 反向对照：把对账结论丢掉、只走本地兜底，这里会变成 indeterminate。
+    expect((ends[0]!['data'] as { reason: unknown }).reason).toEqual({ kind: 'completed' })
+  })
+
+  it('60s 无帧且宿主空闲、对账有结论 → 按结论收口并收回运行态', async () => {
+    vi.useFakeTimers()
+    const bridge = scriptedBridge(
+      undefined, [], undefined, undefined, undefined, undefined, undefined,
+      undefined, undefined, undefined, undefined, undefined, undefined, undefined,
+      () => ({
+        status: 'appended',
+        entry: { kind: 'turn_end', turn: 1, reason: 'indeterminate', at_ms: 5 },
+      }),
+    )
+    const { remote, dispose } = createAdapter({ bridge })
+    try {
+      const session = faceOf(remote).session
+      await session.prompt({ sessionId: 'agent-reconciled', requestId: 'rpc-reconciled', content: [{ type: 'text', text: '跑一下' }] })
+      bridge.host.active = null
+
+      await vi.advanceTimersByTimeAsync(61_000)
+
+      const iterator = session.follow({ address: { kind: 'session', sessionId: 'agent-reconciled' } })
+      const snapshot = (await iterator.next()).value as Record<string, unknown>
+      const ends = eventsOf(snapshot).filter(event => event['type'] === 'turn/end')
+      // 反向对照：退回「空闲只留痕」，这里会变成 0 条。
+      expect(ends).toHaveLength(1)
+      expect((ends[0]!['data'] as { reason: unknown }).reason).toEqual({ kind: 'indeterminate' })
+      await iterator.return?.(undefined)
     } finally {
       dispose()
       vi.useRealTimers()

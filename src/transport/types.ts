@@ -100,6 +100,26 @@ export type SessionEntryLike =
   }
 
 /**
+ * 宿主恢复对账的结论码（与 Rust `ReconcileStatus::as_str()` 的五个值一一对应）。
+ *
+ * `appended` = 刚补写的「结束原因未知」（`reason === 'indeterminate'`）；
+ * `already_concluded` = 档案里已有的结论；其余三个表示没有可收口的回合。
+ */
+export type ReconcileStatus =
+  | 'appended' | 'already_concluded' | 'running' | 'no_archive' | 'nothing_to_conclude'
+
+/**
+ * 宿主 `reconcile_session` 的返回值（与 Rust `ReconcileReply` 同形）。
+ *
+ * `entry` 只用于收口：前端照它写 `turn/end`，不做 task_id 归属——档案里的
+ * `task_id` 是审计字段，旧档还缺这一项，拿它判断归属会在旧会话上误判。
+ */
+export interface ReconcileReply {
+  readonly status: ReconcileStatus
+  readonly entry?: SessionEntryLike
+}
+
+/**
  * 回合失败的结构化原因（与 Rust `TurnErrorInfo` 同形，审计 A0）。
  * `code` 是稳定分类码，`provider_code`/`provider_message` 是端点原始值（已脱敏）。
  */

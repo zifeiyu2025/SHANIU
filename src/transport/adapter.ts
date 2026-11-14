@@ -36,7 +36,7 @@ import {
   relaySourceOf, settledNoticeOf, timingProjectionOf,
   type SubagentCatalogEntry, type SubagentCatalogEventData, type SubagentTimingState,
 } from './subagent-wire'
-import type { ActiveTaskView, AgentEvent, CompactionTrigger, EventMsg, SessionEntryLike, SessionListRow, TurnErrorInfo, VerifyState } from './types'
+import type { ActiveTaskView, AgentEvent, CompactionTrigger, EventMsg, ReconcileReply, ReconcileStatus, SessionEntryLike, SessionListRow, TurnErrorInfo, VerifyState } from './types'
 import { archiveImageToPrompt, imageContentBlocks, type PromptImageRef } from './image-ref'
 import type { HostBridge } from './tauri'
 import { startApprovalLease } from './approval-lease'
@@ -658,6 +658,44 @@ function usableActiveTaskView(raw: unknown): ActiveTaskView | null | undefined {
   return view as ActiveTaskView
 }
 
+/** 状态集合：只认后端 `ReconcileStatus::as_str()` 的五个值，认不出就当作对账不可用。 */
+const RECONCILE_STATUSES: readonly ReconcileStatus[] = [
+  'appended', 'already_concluded', 'running', 'no_archive', 'nothing_to_conclude',
+]
+
+/**
+ * 对账返回的形状判据：返回 `undefined` = 对账不可用（载荷不认识），调用方保留
+ * 「状态未知」的本地兜底；返回对象时 `entry` 可能是 undefined（那表示宿主明确说没有结论）。
+ */
+function usableReconcileReply(raw: unknown): ReconcileReply | undefined {
+  if (typeof raw !== 'object' || raw === null) return undefined
+  const reply = raw as { status?: unknown; entry?: unknown }
+  if (typeof reply.status !== 'string') return undefined
+  const status = RECONCILE_STATUSES.find(candidate => candidate === reply.status)
+  if (status === undefined) return undefined
+  if (reply.entry === undefined || reply.entry === null) return { status }
+  const entry = reply.entry as Partial<Extract<SessionEntryLike, { kind: 'turn_end' }>>
+  if (entry.kind !== 'turn_end' || typeof entry.turn !== 'number' || typeof entry.reason !== 'string') {
+    return undefined
+  }
+  return { status, entry: entry as SessionEntryLike }
+}
+
+/**
+ * 档案尾部是否已经是这条结论。
+ *
+ * 只比位置与时刻，不比 task_id：task_id 是审计字段，前端不据此做归属。
+ */
+function hasConclusionAtTail(
+  entries: readonly SessionEntryLike[],
+  entry: SessionEntryLike,
+): boolean {
+  if (entry.kind !== 'turn_end') return false
+  const last = entries[entries.length - 1]
+  return last !== undefined && last.kind === 'turn_end'
+    && last.turn === entry.turn && last.at_ms === entry.at_ms
+}
+
 /**
  * 会话清单形状判据：`list_sessions` 的结果能不能当「事实」用。
  *
@@ -719,10 +757,13 @@ function archiveTurnReason(reason: string, error?: TurnErrorInfo): Record<string
       }
     case 'budget_exhausted':
       return { kind: 'error', error: { code: 'BUDGET_EXHAUSTED', message: '本轮已达到轮次上限' } }
+    case 'indeterminate':
+      // 宿主恢复对账的诚实结论：回合结束了，但档案里没有可信结局。
+      return { kind: 'indeterminate' }
     default:
-      // 档案没记录可信结局（旧档缺 turn_end 行、进程中途退出）。状态源收敛
-      // Phase 1：不再把它翻译成 `interrupted`——那是在替宿主下「已中止」的结论，
-      // 而档案只证明了「没有结论」。`indeterminate` 如实说「状态未知」。
+      // 档案没记录可信结局（旧档缺 turn_end 行、进程中途退出，或后端将来新增了
+      // 前端认不出的结局码）。不再把它翻译成 `interrupted`——那是在替宿主下
+      // 「已中止」的结论，而档案只证明了「没有结论」。`indeterminate` 如实说「状态未知」。
       return { kind: 'indeterminate' }
   }
 }
@@ -1679,15 +1720,15 @@ export function createAdapter(options: AdapterOptions): { remote: unknown; dispo
   /**
    * 60s 无帧兜底（docs/04 §1.4）。
    *
-   * 只观测、不收口（状态源收敛 Phase 1）：
+   * 宿主空闲时请求对账并照结论收口；对账没有结论时保持现状（状态源收敛 Phase 3）：
    * - 宿主说同一个会话还在跑（turn 或 compaction）→ 续期，回合保持打开。长时间
    *   编译/命令执行这类「安静但活着」的回合不会被误杀。
-   * - 宿主确认空闲 → 只留痕，不写 `turn/end`。`session_runtime` 只回答「还有任务吗」，
-   *   「此刻没有任务」不等于「上一回合已中止」；回合的结论由宿主写进档案
-   *   （Phase 3 的 `reconcile_session`），前端宁可为「未知」等一次结论，也不补写。
+   * - 宿主确认空闲 → 请它把最后这个回合的结局幂等地写进档案（`reconcile_session`），
+   *   读回结论后照它收口。`session_runtime` 只回答「还有任务吗」，不回答「上一回合
+   *   怎么结束的」；对账没有结论（或对账不可用）时保持回合打开。
    * - 查询失败 → 不动（未知），下一轮再问；绝不把「问不到」当成「空闲」。
    *
-   * 泳道没有独立的宿主任务，按它的父会话判运行态（`agents` 的 `parentId`）。
+   * 泳道没有自己的档案可对账，按父会话判运行态，空闲时只留痕、不收口。
    */
   const sweepSilentTurns = async (): Promise<void> => {
     const at = now()
@@ -1708,9 +1749,27 @@ export function createAdapter(options: AdapterOptions): { remote: unknown; dispo
           journal.lastFrameAt = now()
           continue
         }
-        // 宿主确认空闲：只留痕。前端不再据此写收口，也不擅自收回运行态、补发排队消息。
+        // 泳道没有自己的档案可对账：只留痕，不收口。
+        if (agents.get(sessionId) !== undefined) {
+          console.info(`[SHANIU] 泳道 ${sessionId} 超过 ${SILENCE_TIMEOUT_MS / 1000}s 无帧且宿主已空闲：`
+            + '泳道没有可对账的档案，保持回合打开')
+          continue
+        }
+        // 顶层会话：宿主确认空闲只证明「回合结束了」，结论由档案给。
+        const reconciled = await reconcileSessionOf(sessionId)
+        // 对账期间 journal 可能已被重建、回合可能已收口：以最新状态为准。
+        if (journals.get(sessionId) !== journal || !journal.taskOpen) continue
+        const entry = reconciled?.entry
+        if (entry !== undefined && entry.kind === 'turn_end') {
+          closeTask(sessionId, journal, archiveTurnReason(entry.reason, entry.error), false)
+          // 与 `turn_completed` 一致：收回运行态并补发排队消息，让 Stop 按钮与队列一起收口。
+          dispatch('api-session/status', sessionId, false)
+          void drainQueues()
+          continue
+        }
+        // 对账没有结论：前端不再据此写收口，也不擅自收回运行态、补发排队消息。
         console.info(`[SHANIU] 会话 ${sessionId} 超过 ${SILENCE_TIMEOUT_MS / 1000}s 无帧且宿主已空闲：`
-          + '保持回合打开，等待宿主结论或用户手动停止')
+          + '对账没有结论，保持回合打开，等待宿主结论或用户手动停止')
       } catch (reason: unknown) {
         console.warn(`[SHANIU] 会话 ${sessionId} 无帧兜底：宿主运行态查询失败，保持现状`, reason)
       } finally {
@@ -2634,6 +2693,19 @@ export function createAdapter(options: AdapterOptions): { remote: unknown; dispo
       })
 
   /**
+   * 恢复对账：宿主确认空闲后，请它把「最后这个回合的结局」幂等地写进档案，
+   * 前端只读回并照它收口。返回 undefined = 对账不可用（调用失败或载荷不认识）。
+   */
+  const reconcileSessionOf = async (sessionId: string): Promise<ReconcileReply | undefined> => {
+    const raw = await bridge.invoke<unknown>('reconcile_session', { sessionId })
+      .catch((reason: unknown) => {
+        console.warn('[SHANIU] 恢复对账失败，按对账不可用处理', reason)
+        return undefined
+      })
+    return usableReconcileReply(raw)
+  }
+
+  /**
    * 从 rollout 档案重建一个会话的 journal（SH-033；SH-056 批 2 从 `follow` 抽出）。
    *
    * 两条入口共用同一套口径：跟随父会话（重启后重开旧会话）与跟随泳道（子代理
@@ -2659,8 +2731,23 @@ export function createAdapter(options: AdapterOptions): { remote: unknown; dispo
     // 形状不合法与查询失败同处理：信息不完整就不猜，既不当空闲也不当在跑。
     const runtimeKnown = host.known && host.view !== undefined
     const runningHere = host.view !== null && host.view !== undefined && host.view.sessionId === sessionId
-    const replayed = replayArchive(entries, {
-      closeOpenTurn: runtimeKnown && !runningHere,
+    // 宿主确认空闲只证明「回合结束了」，不证明「结局」：结论由档案给——先请宿主
+    // 幂等地把最后这个回合的结局写进档案（`reconcile_session`），再照读回的结论收口。
+    const idle = runtimeKnown && !runningHere
+    // 宿主确认空闲时请它把最后这个回合的结局幂等地写进档案；`running` = 两次查询
+    // 之间任务又被发起（宿主改口），那时不能收口。
+    const reconciled = idle ? await reconcileSessionOf(sessionId) : undefined
+    const conclusion = reconciled?.entry
+    // `appended` 一定是新行；`already_concluded` 可能因并发对账在读到档案之后才落行，
+    // 尾部没有它就得补进回放序列，否则宿主已经给出的结论会被末尾兜底盖掉。
+    // `entries` 还要给标题回填与 replayLanes 用，所以另装一个变量，不覆盖它。
+    const archiveEntries = conclusion === undefined || hasConclusionAtTail(entries, conclusion)
+      ? entries
+      : [...entries, conclusion]
+    // 结论来自档案时由回放里的 `turn_end` 收口；只有对账不可用（调用失败 / 载荷不认识 /
+    // 档案里没有可对账的回合）才退回 Phase 1 的本地「状态未知」兜底（不写档案）。
+    const replayed = replayArchive(archiveEntries, {
+      closeOpenTurn: idle && reconciled?.status !== 'running' && conclusion === undefined,
       runtimeUnknown: !runtimeKnown,
     })
     replayed.lastEventId = cursor

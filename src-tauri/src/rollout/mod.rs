@@ -15,13 +15,14 @@
 //! 边界（AGENTS §3）：rollout 含用户代码与对话，属敏感数据。本模块**不**写入任何密钥；
 //! `config_snapshot` 只存端点/模型/模式等非凭据字段，`base_url` 允许入库但禁止含 query 凭据。
 
+pub mod reconcile;
 pub mod resume;
 
 use std::fs::{File, OpenOptions};
 use std::io::{BufRead, BufReader, Write};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU32, Ordering};
-use std::sync::Mutex;
+use std::sync::{Mutex, MutexGuard};
 
 use serde::{Deserialize, Serialize};
 
@@ -226,6 +227,19 @@ pub struct RolloutWriter {
     user_turns: AtomicU32,
 }
 
+/// 档案级写锁：同进程内所有档案追加串行化。
+///
+/// 为什么是全局一把而不是按路径：SHANIU 是单实例进程（`tests/single_instance_global.rs`），
+/// 一行 JSON + flush 是微秒级操作，按路径拆锁只增加状态、不增加正确性；而恢复对账要做
+/// 「读尾部 → 判断 → 追加」的原子段，必须与别的写入互斥，否则并发对账会各写一条结局。
+static ARCHIVE_WRITE: Mutex<()> = Mutex::new(());
+
+fn archive_write_lock() -> MutexGuard<'static, ()> {
+    // 锁中毒只说明某个写线程 panic 过。档案是 append-only 的单行写，继续追加仍然安全；
+    // 在这里恢复，避免一次 panic 把后续所有回合的落档都拖死。
+    ARCHIVE_WRITE.lock().unwrap_or_else(|poison| poison.into_inner())
+}
+
 /// 一条档案行是否算「一个用户回合的起点」。
 ///
 /// 文本提问与带图提问都算——带图消息也是用户主动发起的一轮。
@@ -322,6 +336,29 @@ impl RolloutWriter {
     /// 落盘前过脱敏过滤器（docs/01 §438）：rollout 与日志同级敏感，用户把密钥
     /// 粘进任务文本这类情况只能在这里兜住。
     pub fn append(&self, item: &RolloutItem) -> Result<(), RolloutError> {
+        let _guard = archive_write_lock();
+        self.append_locked(item)
+    }
+
+    /// 在档案写锁内做「读 → 判断 → 至多追加一次」。
+    ///
+    /// 恢复对账必须原子：重开重建与 60s 兜底可能同时到达，只有一个能看见「没有结局」；
+    /// 另一个在锁内重读后看到刚写的那条，返回 `None`，档案里只留一条结论。
+    pub fn append_once<F>(&self, decide: F) -> Result<Option<RolloutItem>, RolloutError>
+    where
+        F: FnOnce(&[RolloutItem]) -> Option<RolloutItem>,
+    {
+        let _guard = archive_write_lock();
+        let rollout = read(&self.path)?;
+        let Some(item) = decide(&rollout.items) else {
+            return Ok(None);
+        };
+        self.append_locked(&item)?;
+        Ok(Some(item))
+    }
+
+    /// 调用方已持有 [`archive_write_lock`] 时使用，避免重复加锁。
+    fn append_locked(&self, item: &RolloutItem) -> Result<(), RolloutError> {
         let line = serde_json::to_string(item).map_err(|e| RolloutError::Io(format!("序列化失败: {e}")))?;
         let line = crate::config::redact(&line);
         {

@@ -892,6 +892,44 @@ fn session_runtime(app: tauri::AppHandle) -> Option<ActiveTaskView> {
     state.active_task().map(|(session_id, kind)| ActiveTaskView { session_id, kind: kind.as_str() })
 }
 
+/// 恢复对账的返回（状态源收敛 Phase 3）。
+#[derive(Debug, Clone, serde::Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ReconcileReply {
+    /// `appended` / `already_concluded` / `running` / `no_archive` / `nothing_to_conclude`。
+    status: &'static str,
+    /// 结论行（刚补写或档案里已有的最后一条）；前端据此立即收口，不必重读档案。
+    #[serde(skip_serializing_if = "Option::is_none")]
+    entry: Option<SessionEntry>,
+}
+
+/// 恢复对账：宿主确认本会话没有任务后，给最后一个没有结论的用户回合补一条
+/// 「结束原因未知」（`indeterminate`，不是「已中止」）。
+///
+/// 为什么由宿主写：只有宿主知道「此刻没有任务」；前端把「没有帧」翻译成结局
+/// 就是在替宿主下结论。幂等与并发由档案写锁保证（`rollout::reconcile`）。
+#[tauri::command]
+fn reconcile_session(app: tauri::AppHandle, session_id: String) -> Result<ReconcileReply, String> {
+    let state = app.state::<AppState>();
+    // 运行态只认宿主的活动任务槽：单任务闸下，别的会话在跑不影响本会话已空闲。
+    let running = state.active_task().is_some_and(|(id, _)| id == session_id);
+    let path = state
+        .data_root()
+        .join(rollout::ROLLOUT_DIR)
+        .join(format!("{session_id}.jsonl"));
+    let outcome = rollout::reconcile::reconcile_once(&path, running, now_ms())
+        .map_err(|error| format!("恢复对账失败: {error}"))?;
+    let entry = outcome.entry.map(|entry| SessionEntry::TurnEnd {
+        turn: entry.turn,
+        task_id: entry.task_id,
+        iterations: entry.iterations,
+        reason: entry.reason,
+        at_ms: entry.at_ms,
+        error: entry.error,
+    });
+    Ok(ReconcileReply { status: outcome.status.as_str(), entry })
+}
+
 /// 会话内切档（`/permission` 的宿主面，对齐 DSH 的 `sandbox/mode` 会话事件）。
 ///
 /// 只写**本会话档案**，绝不写 `config.toml`——这是会话内切换与设置页默认值的分界线。
@@ -3439,6 +3477,7 @@ pub fn run() {
             resume_session,
             list_sessions,
             session_runtime,
+            reconcile_session,
             load_session,
             search_sessions,
             retry_session_index,
