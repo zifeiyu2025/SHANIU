@@ -1,0 +1,2 @@
+2026-11-14T16:24:46.869535Z  INFO shaniu_lib::agent_loop: token 用量 turn=1 session_id="sess-1794673459052-0002" agent_id=root input_tokens=5052 cached_input_tokens=0 cache_miss_tokens=5052 output_tokens=44 cache_hit_permille=0
+2026-11-14T16:24:48.913899Z  INFO shaniu_lib::agent_loop: token 用量 turn=2 session_id="sess-1794673459052-0002" agent_id=root input_tokens=5191 cached_input_tokens=4992 cache_miss_tokens=199 output_tokens=32 cache_hit_permille=961

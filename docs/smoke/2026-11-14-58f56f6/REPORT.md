@@ -112,6 +112,45 @@
 |---|---|---|---|---|
 | N8 | P2 | 连续压缩时摘要自嵌套、向空转退化：单回合内发生 12 次压缩，摘要里「## 用户原文（压缩时逐字保留，不得改写）」最多嵌套 **11 层**，`history_len` 由 5 增至 28，摘要体积持续膨胀（小改动回合因此用到 92.9K tok、13 步） | 把 `[agent] token_budget` 设为 5000 → 让模型做一个多步小改动并跑测试 → 观察日志 `compressed_items=1` 反复出现、rollout 内 `compacted` 行层层嵌套 | `r2/evidence/04-rollout.jsonl`、日志 `T15:13–15:16` 共 12 条 `上下文已压缩`、`r2/shots/04-test-passed.png` |
 
+### N8 修复复验（2026-11-15 00:06–00:30，被测提交 `93eb2bf`）
+
+> 被测修复：`93eb2bf fix(compaction): 连续压缩不再把旧摘要当用户原文嵌套（真机 N8）`。本次在 `ceffc67` 上重建（该提交仅归档第一轮证据，代码同 `93eb2bf`），未复用旧二进制，按 N8 原复现条件执行。
+
+**构建与运行**
+
+- 构建：`CARGO_TARGET_DIR=scratch\target-n8` → `pnpm tauri build --no-bundle`（5 分 17 秒）；`SHANIU.exe` 28,563,456 B，SHA256 `84ACEF225ED82330E28A9317F2CDDFE1CA8C60AB3A3B3B699AB6E0497CB63156`。相对 `CARGO_TARGET_DIR` 被 tauri 解析到 `src-tauri\scratch\target-n8`，与 N7 同类。
+- 数据目录 C（小预算）：`scratch\smoke-n8\SHANIU-Portable`，`[agent] token_budget=5000`，LongCat + 工作区 `scratch\smoke-proj`，全新会话；会话 `sess-1794672587958-0002`。
+- 数据目录 D（常规预算）：`scratch\smoke-n8-default\SHANIU-Portable`，`token_budget=500000`，全新会话；会话 `sess-1794673459052-0002`。
+
+**逐条结论（对应任务四项）**
+
+| # | 检查点 | 实测 | 结论 | 证据 |
+|---|---|---|---|---|
+| 1 | 单回合压缩次数、摘要嵌套 | 该回合 `上下文已压缩` **3 条**（修复前 12 条），`compressed_items`=1/10/5，`history_len`=9/5/8（修复前 5→28）；三条摘要中 `## 用户原文` 标题各出现 **1 次**，无层层嵌套（修复前最深 11 层）；但该段首位是上一次摘要正文（残留见 N9） | PASS（次数与嵌套层数），残留见 N9 | `r3/evidence/n8-log-excerpt.txt`、`r3/evidence/n8-compacted-summaries.txt` |
+| 2 | 该回合 token 与步数 | 实时「1 轮 6 步」、rollout `turn_end turn=1 iterations=6 reason=completed`；UI「用量 50.6K tok」，日志 6 次调用 input 合计 49,467 + output 1,174 = 50,641（修复前 13 步 / 92.9K tok） | PASS | `r3/shots/01-n8-turn-done.png`、`r3/evidence/n8-rollout.jsonl`、`r3/evidence/n8-log-excerpt.txt` |
+| 3 | 常规预算不受影响 | `token_budget=500000` 新会话正常完成（1 轮 2 步、10.3K tok、4 秒），全日志无 `上下文已压缩`；强杀重开仍 1 轮 2 步、回答保留；rollout 1 条 `turn_end`。默认预算在冒烟中无法填满 50 万 token，故「压缩仍会触发」由上一行小预算会话的 3 次压缩证明，本行验证的是「不产生多余压缩、问答正常、计数一致」 | PASS（含口径说明） | `r3/shots/04-default-budget-live.png`、`r3/shots/05-default-budget-reopen.png`、`r3/evidence/n8-default-budget-rollout.jsonl`、`r3/evidence/n8-default-budget-log-excerpt.txt` |
+| 4 | 压缩后追问 | 「继续，用一句话说明当前进度。」4 秒得到正常回答（「当前进度：五步任务已全部完成…」）；全程 `Cannot resolve tool name` 计数 **0** | PASS | `r3/shots/02-n8-followup.png`、`r3/evidence/n8-log-excerpt.txt` |
+
+**轮次/步数四处一致（小预算会话，2 轮）**
+
+- 实时 2 轮 7 步（6+1）→ 强杀重开 2 轮 7 步 → 导出 `session.v4.jsonl` 为 `turn/start=2`、`turn/end=2`、`user/message=2` → rollout 2 条 `turn_end`（iterations 6+1=7）。四处一致。
+
+**残留问题**
+
+| 编号 | 严重度 | 问题 | 复现步骤 / 时间点 | 证据 |
+|---|---|---|---|---|
+| N9 | P2 | 「## 用户原文（压缩时逐字保留，不得改写）」段首仍是上一次压缩摘要（模型生成内容），不是用户原文：第 2、3 次摘要的该段依次包含第 1、2 次摘要正文，之后才是用户原话。层数已从 11 层降到 1 层，但「摘要在用户原文段内自重」仍在。触发源是首次空转压缩：`2026-11-14T16:10:31.117818Z` `compressed_items=1`，摘要自述「压缩对象为空集…本轮未收到具体用户任务」，该空摘要随后被当作用户原文保留 | 新建数据目录 + `token_budget=5000` → 一条多步任务（大输出命令 + 改文件 + 跑测试）→ 看 3 条 `compacted.summary` 的 `## 用户原文` 段首 | `r3/evidence/n8-compacted-summaries.txt`（第 10–18、29–37 行）、`r3/evidence/n8-rollout.jsonl`（第 12/18/26 行 `compacted`）、`r3/evidence/n8-log-excerpt.txt` |
+
+**顺带观察（未定性，P3）**
+
+- 同一回合时长重开后由「7 分 15 秒」变为「2 分 42 秒」，追问回合 4 秒 → 3 秒；轮次/步数不变。疑为重开后按回合内步骤耗时重算、不含审批等待，需单独立项确认，未计入 N8 结论。证据 `r3/shots/01-n8-turn-done.png`、`r3/shots/02-n8-followup.png`、`r3/shots/03-n8-reopen.png`。
+
+**证据索引（`r3/`）**
+
+- 截图：`01-n8-turn-done.png`（回合完成，1 轮 6 步 / 50.6K tok）、`02-n8-followup.png`（追问后 2 轮 7 步）、`03-n8-reopen.png`（强杀重开 2 轮 7 步）、`04-default-budget-live.png`、`05-default-budget-reopen.png`
+- 档案：`n8-rollout.jsonl`、`n8-events.jsonl`、`n8-log-excerpt.txt`、`n8-compacted-summaries.txt`、`n8-followup-session-log.zip`（导出，2 轮）、`n8-default-budget-rollout.jsonl`、`n8-default-budget-log-excerpt.txt`
+- 全部运行在 `scratch\` 隔离目录，未改产品代码（`multiply` 在测试工程中已存在，模型仅补断言并改的是 `scratch\smoke-proj`）。
+
 ## 本轮证据索引（`r2/`）
 
 - 截图（`r2/shots/`）：`01-live-completed.png`、`01-reopen.png`、`02-approval-card.png`、`02-reopen.png`、`03-live-after-compaction.png`、`03-reopen1.png`、`03-reopen2.png`、`04-tool-approval.png`、`04-test-passed.png`、`05-fresh-data-dir.png`、`06-before-close.png`、`06-closed-to-tray.png`、`06-tray-restore.png`、`07-silent-40s.png`、`07-silent-70s.png`、`07-after-70s.png`、`07-after-90s.png`、`08-live.png`、`08-live-done.png`、`08-subagent-lane.png`、`08-reopen.png`、`09-export-session.png`、`10-legacy-open.png`

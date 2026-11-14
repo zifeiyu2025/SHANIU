@@ -1,0 +1,10 @@
+2026-11-14T16:10:21.387805Z  INFO shaniu_lib::agent_loop: token 用量 turn=1 session_id="sess-1794672587958-0002" agent_id=root input_tokens=5136 cached_input_tokens=4864 cache_miss_tokens=272 output_tokens=229 cache_hit_permille=947
+2026-11-14T16:10:31.117818Z  INFO shaniu_lib::agent_loop: 上下文已压缩（SH-032） compressed_items=1 history_len=9
+2026-11-14T16:10:38.145124Z  INFO shaniu_lib::agent_loop: token 用量 turn=2 session_id="sess-1794672587958-0002" agent_id=root input_tokens=5730 cached_input_tokens=0 cache_miss_tokens=5730 output_tokens=326 cache_hit_permille=0
+2026-11-14T16:12:15.691383Z  INFO shaniu_lib::agent_loop: 上下文已压缩（SH-032） compressed_items=10 history_len=5
+2026-11-14T16:12:21.514639Z  INFO shaniu_lib::agent_loop: token 用量 turn=3 session_id="sess-1794672587958-0002" agent_id=root input_tokens=18869 cached_input_tokens=0 cache_miss_tokens=18869 output_tokens=203 cache_hit_permille=0
+2026-11-14T16:15:02.954251Z  INFO shaniu_lib::agent_loop: 上下文已压缩（SH-032） compressed_items=5 history_len=8
+2026-11-14T16:15:08.426713Z  INFO shaniu_lib::agent_loop: token 用量 turn=4 session_id="sess-1794672587958-0002" agent_id=root input_tokens=6346 cached_input_tokens=0 cache_miss_tokens=6346 output_tokens=284 cache_hit_permille=0
+2026-11-14T16:15:10.741756Z  INFO shaniu_lib::agent_loop: token 用量 turn=5 session_id="sess-1794672587958-0002" agent_id=root input_tokens=6657 cached_input_tokens=6272 cache_miss_tokens=385 output_tokens=29 cache_hit_permille=942
+2026-11-14T16:17:30.392515Z  INFO shaniu_lib::agent_loop: token 用量 turn=6 session_id="sess-1794672587958-0002" agent_id=root input_tokens=6729 cached_input_tokens=6656 cache_miss_tokens=73 output_tokens=103 cache_hit_permille=989
+2026-11-14T16:20:51.438348Z  INFO shaniu_lib::agent_loop: token 用量 turn=1 session_id="sess-1794672587958-0002" agent_id=root input_tokens=6989 cached_input_tokens=6656 cache_miss_tokens=333 output_tokens=137 cache_hit_permille=952
