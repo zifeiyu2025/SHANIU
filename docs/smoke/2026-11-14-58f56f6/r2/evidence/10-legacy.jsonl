@@ -1,0 +1,4 @@
+{"type":"session_meta","session_id":"sess-legacy-r2-0001","agent_id":"sess-legacy-r2-0001","parent_id":null,"created_at":1794600000000,"config_snapshot":{"provider":"openai-chat","base_url":"https://api.longcat.chat/openai/v1","model":"LongCat-2.5-Preview","sandbox":"WorkspaceWrite","approval":"OnRequest","workspace_root":"D:\\MyWorkspace\\SHANIU\\scratch\\smoke-r2-fresh\\SHANIU-Portable\\data\\Workspace"}}
+{"type":"system_prompt","text":"legacy smoke r2 archive","sha256":"0000000000000000000000000000000000000000000000000000000000000000","at_ms":1794600000001,"turn":1}
+{"type":"response_item","item":{"type":"message","role":"user","text":"第二轮旧档案：没有 TurnEnd、没有 task_id。"},"at_ms":1794600000002}
+{"type":"response_item","item":{"type":"message","role":"assistant","text":"第二轮旧档案回放：只有消息行，没有结局行。"},"at_ms":1794600000003}

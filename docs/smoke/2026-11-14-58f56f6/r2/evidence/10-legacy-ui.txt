@@ -1,0 +1,23 @@
+第二轮旧档案重开 UI 无障碍树导出（2026-11-14 23:2x，portable 数据目录 smoke-r2-fresh）
+会话：sess-legacy-r2-0001（无 turn_end、无 task_id）
+进程：SHANIU.exe pid=10844
+
+text val="第二轮旧档案：没有 TurnEnd、没有 task_id。" id=50
+text val="04:00" id=51
+button "复制" id=52
+status-bar id=53
+  text val="本轮状态未知" id=54
+button "本轮状态未知" (disabled) id=55
+text val="第二轮旧档案回放：只有消息行，没有结局行。" id=56
+status-bar id=57
+  text val="本轮状态未知" id=58
+  text val="没有找到本轮的收口记录：进程可能在完成前退出（被强制结束或崩溃），也可能仍在运行。未完成工具调用的结果同样未知。" id=59
+button "复制" id=60
+button "在新对话中分支" (disabled) id=61
+text val="仅可从已完成轮次的最后一条消息分支" id=62
+text val="04:00" id=63
+...
+text val="1 轮 1 步" id=71
+
+结论：顶部回合过程控件（id=55）与回合内状态（id=54/58）均为「本轮状态未知」，
+未出现「已完成，用时 X 小时」，未出现伪造 completed/interrupted。
