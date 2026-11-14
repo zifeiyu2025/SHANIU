@@ -174,7 +174,7 @@ pub fn resume(path: &Path) -> Result<Resumed, RolloutError> {
     // 接着说的话、以及写在其后的压缩锚点都不该陪葬。
     //
     // 配对必须按**最终历史**判：锚点可能把调用连同输出一起压掉，也可能只压掉调用、留下
-    // 输出（落单输出是 `chat_messages` 明确容忍的形态，按 call_id 原样发出）。
+    // 输出（落单输出在发请求前会被降级成文本，见 `model_client::degrade_orphan_tool_outputs`）。
     let answered: HashSet<String> = history
         .iter()
         .filter_map(|item| match item {
@@ -237,9 +237,9 @@ pub fn nearest_safe_cut(items: &[RolloutItem], want: usize) -> usize {
 /// `[0, items.len())` 里是否**每个调用都有输出**。
 ///
 /// 只判这一个方向，不要求"每个输出都有调用"：截断只会制造有 call 无 output 的尾巴，
-/// 反过来（有 output 无 call）只会来自档案被外部裁剪/重排，`chat_messages` 明确容忍
-/// 它（"落单的 tool 输出……按 call_id 原样发出"）。要求双向包含会把这类档案的切点
-/// 一路退到 0，把正常消息与压缩锚点一起丢掉。
+/// 反过来（有 output 无 call）只会来自档案被外部裁剪/重排，发请求前会被降级成文本
+/// （`model_client::degrade_orphan_tool_outputs`），不会让请求失败。要求双向包含会把
+/// 这类档案的切点一路退到 0，把正常消息与压缩锚点一起丢掉。
 fn paired_prefix(items: &[RolloutItem]) -> bool {
     let mut calls: Vec<&str> = Vec::new();
     let mut outputs: Vec<&str> = Vec::new();

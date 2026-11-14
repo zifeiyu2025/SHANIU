@@ -250,7 +250,7 @@ pub fn build_responses_request(
 /// `{"role","content":[{"type":"input_text"},{"type":"input_image","image_url":"data:…"}]}`：
 /// 真机探针验证过，`image_url` 写成对象会 400（`image_url is required`）。
 fn responses_input(history: &[HistoryItem]) -> Vec<serde_json::Value> {
-    history
+    degrade_orphan_tool_outputs(history)
         .iter()
         .map(|item| match item {
             HistoryItem::ImageMessage { role, text, images } => {
@@ -351,6 +351,7 @@ pub fn build_chat_request(
 /// 于是"已声明但未执行"的调用没有输出项。这里必须给它补一条 tool 消息，否则该会话
 /// 的后续每一轮请求都会 400——历史已经不可修复，只能就地补齐。
 pub fn chat_messages(instructions: &str, history: &[HistoryItem]) -> Vec<serde_json::Value> {
+    let history = degrade_orphan_tool_outputs(history);
     let mut messages = vec![serde_json::json!({ "role": "system", "content": instructions })];
     let mut i = 0;
     while i < history.len() {
@@ -359,7 +360,7 @@ pub fn chat_messages(instructions: &str, history: &[HistoryItem]) -> Vec<serde_j
             HistoryItem::Message { role, text, reasoning }
                 if *role == Role::Assistant && matches!(history.get(i + 1), Some(HistoryItem::FunctionCall { .. })) =>
             {
-                let (calls, outputs, next) = collect_call_group(history, i + 1);
+                let (calls, outputs, next) = collect_call_group(&history, i + 1);
                 messages.extend(assistant_group_messages(
                     Some(text.as_str()),
                     reasoning.as_deref(),
@@ -369,7 +370,7 @@ pub fn chat_messages(instructions: &str, history: &[HistoryItem]) -> Vec<serde_j
                 i = next;
             }
             HistoryItem::FunctionCall { .. } => {
-                let (calls, outputs, next) = collect_call_group(history, i);
+                let (calls, outputs, next) = collect_call_group(&history, i);
                 messages.extend(assistant_group_messages(None, None, &calls, &outputs));
                 i = next;
             }
@@ -395,7 +396,8 @@ pub fn chat_messages(instructions: &str, history: &[HistoryItem]) -> Vec<serde_j
                 }));
                 i += 1;
             }
-            // 落单的 tool 输出：只有外部裁剪/重排历史才会出现，按 call_id 原样发出
+            // 落单的 tool 输出：`degrade_orphan_tool_outputs` 已把"无调用"的这类条目
+            // 换成 user 文本；走到这里说明它的调用确实在历史里，按 call_id 原样发出。
             HistoryItem::FunctionCallOutput { call_id, output } => {
                 messages.push(tool_message(call_id, output));
                 i += 1;
@@ -403,6 +405,43 @@ pub fn chat_messages(instructions: &str, history: &[HistoryItem]) -> Vec<serde_j
         }
     }
     messages
+}
+
+/// 发请求前，把"只有输出、没有调用"的工具记录降级成普通文本。
+///
+/// 为什么必须在发请求前做：ChatCompletions 端点要求每条 `role=tool` 的 `tool_call_id`
+/// 能从前面的 assistant `tool_calls` 解析出工具名，否则整条请求 500
+/// `Cannot resolve tool name for tool_call_id=...`。这类 500 与网络抖动无关，重试
+/// 次数再多也不会变好——会话从此每条请求都失败（2026-11-14 真机冒烟 N1）。压缩切点
+/// 已在 `compaction::tail_target` 修成不拆组；这里兜住另外两条会留下孤立的路径：
+/// 旧版本写下的档案、被外部裁剪/重排的历史。
+///
+/// 降级而不是丢弃：工具输出是模型已经看过的证据，丢了等于静默改历史；换成 user 文本
+/// 后信息完整保留，请求合法。`Reasoning` 不参与配对判断——它不是工具记录。
+fn degrade_orphan_tool_outputs(history: &[HistoryItem]) -> Vec<HistoryItem> {
+    let mut declared: std::collections::HashSet<&str> = std::collections::HashSet::new();
+    history
+        .iter()
+        .map(|item| match item {
+            HistoryItem::FunctionCall { call_id, .. } => {
+                declared.insert(call_id.as_str());
+                item.clone()
+            }
+            HistoryItem::FunctionCallOutput { call_id, output }
+                if !declared.contains(call_id.as_str()) =>
+            {
+                HistoryItem::Message {
+                    role: Role::User,
+                    text: format!(
+                        "[工具输出：call_id={call_id} 对应的调用记录已不在上下文中（历史被压缩或裁剪），\
+以下为原始输出]\n{output}"
+                    ),
+                    reasoning: None,
+                }
+            }
+            _ => item.clone(),
+        })
+        .collect()
 }
 
 /// 一次工具调用：(工具名, 参数 JSON 文本, call_id)。
@@ -1069,6 +1108,36 @@ mod tests {
         assert_eq!(body["tools"][0]["type"], "function");
         assert_eq!(body["tools"][0]["name"], "unified_exec");
     }
+
+    /// Responses 路径同一兜底：`function_call_output` 找不到对应的 `function_call`
+    /// 时端点同样会拒绝。降级后不得再出现该类型；配对完整时协议原样保留（正向）。
+    #[test]
+    fn responses_input_downgrades_orphan_tool_output() {
+        let p = ProviderConfig {
+            provider: "openai-responses".into(),
+            base_url: "https://x/v1".into(),
+            model: "m1".into(),
+            reasoning_effort: None,
+            headers: Default::default(),
+        };
+        let history = vec![
+            HistoryItem::Message { role: Role::User, text: "任务".into(), reasoning: None },
+            HistoryItem::FunctionCallOutput { call_id: "c-orphan".into(), output: "结果".into() },
+        ];
+        let body = build_responses_request(&p, &history, &[], "SYS");
+        let input = body["input"].as_array().unwrap();
+        assert!(input.iter().all(|item| item["type"] != "function_call_output"), "{input:?}");
+        assert_eq!(input[1]["type"], "message");
+        assert_eq!(input[1]["role"], "user");
+
+        let paired = vec![
+            HistoryItem::FunctionCall { name: "t".into(), arguments: "{}".into(), call_id: "c".into() },
+            HistoryItem::FunctionCallOutput { call_id: "c".into(), output: "ok".into() },
+        ];
+        let body = build_responses_request(&p, &paired, &[], "SYS");
+        assert_eq!(body["input"][0]["type"], "function_call");
+        assert_eq!(body["input"][1]["type"], "function_call_output");
+    }
 }
 
 #[cfg(test)]
@@ -1247,6 +1316,41 @@ mod chat_tests {
         assert_eq!(msgs[2]["tool_calls"].as_array().unwrap().len(), 2);
         assert_eq!(msgs[4]["tool_call_id"], "c2");
         assert_eq!(msgs[4]["content"], CANCELLED_CALL_NOTE);
+    }
+
+    /// 压缩把调用压掉、输出留下时的重放（2026-11-14 真机冒烟 N1）：孤立输出不能再
+    /// 发成 `role=tool`，否则端点 500 `Cannot resolve tool name for tool_call_id=...`，
+    /// 重试多少次都不会好。
+    /// 反向对照：撤掉 `degrade_orphan_tool_outputs`，这里会出现一条 role=tool，断言红。
+    #[test]
+    fn orphan_tool_output_is_downgraded_to_text() {
+        let p = ProviderConfig {
+            provider: "openai-chat".into(),
+            base_url: "https://x/v1".into(),
+            model: "m".into(),
+            reasoning_effort: None,
+            headers: Default::default(),
+        };
+        let history = vec![
+            HistoryItem::Message { role: Role::User, text: "任务".into(), reasoning: None },
+            HistoryItem::FunctionCallOutput {
+                call_id: "call_0e6f3061a37b43cf96c3ef09".into(),
+                output: "package.json 的内容".into(),
+            },
+            HistoryItem::Message { role: Role::User, text: "继续".into(), reasoning: None },
+        ];
+        let body = build_chat_request(&p, &history, &[], "SYS");
+        let msgs = body["messages"].as_array().unwrap();
+        assert!(msgs.iter().all(|m| m["role"] != "tool"), "孤立输出不得发成 role=tool：{msgs:?}");
+        assert_tool_calls_are_answered(msgs);
+
+        let downgraded = msgs
+            .iter()
+            .find(|m| m["content"].as_str().unwrap_or("").contains("package.json 的内容"))
+            .expect("降级不能丢内容");
+        assert_eq!(downgraded["role"], "user");
+        assert!(downgraded["content"].as_str().unwrap().contains("call_0e6f3061a37b43cf96c3ef09"),
+            "要留下 call_id 供对账");
     }
 
     #[test]

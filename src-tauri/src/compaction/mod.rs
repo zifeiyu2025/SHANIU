@@ -128,12 +128,18 @@ pub fn history_tokens(items: &[HistoryItem]) -> usize {
 
 /// 从尾部往前装，算出「保留哪些」的切点：`[0, range_end)` 是要压掉的区间。
 ///
-/// 三条不变量是这层抽象**唯一**的存在理由，改任何一条都会让某条路径的行为变坏：
+/// 四条不变量是这层抽象**唯一**的存在理由，改任何一条都会让某条路径的行为变坏：
 /// 1. **严格大于**：判据是 `kept + cost > keep_allowance`，保留额度**刚好**装得下一条时
 ///    必须留下它。写成 `>=` 会在边界上少留一条，压得比配置口径更狠。
 /// 2. **至少留一条**：`split >= len` 时钳到 `len - 1`。全压掉会让下一轮看到的历史只剩
 ///    一段摘要，模型连"刚才那条命令的输出是什么"都无从得知。
-/// 3. **钳到 1**：`range_end` 至少为 1。判据已经说超预算、而按字节估算整段都装得进
+/// 3. **不拆工具调用组**：切点回退到被保留输出所对应的调用下标（见 [`cut_keeps_pairs`]）。
+///    切在组中间会让保留段以一条"调用已被摘要取代"的 `tool_call_id` 开头，端点直接
+///    500 `Cannot resolve tool name for tool_call_id=...`，而这个错误重试多少次都
+///    不会好——整个会话从此报废（2026-11-14 真机冒烟 N1）。代价是保留段可能比
+///    `keep_allowance` 多出半个组的 token：多留一点只多花上下文，拆散配对则让会话
+///    永久不可用，两者不对称。判据按 `call_id` 实配，整段无调用的孤立输出不触发回退。
+/// 4. **钳到 1**：`range_end` 至少为 1。判据已经说超预算、而按字节估算整段都装得进
 ///    保留额度时（观测值含推理 token 与工具声明开销，字节估算看不见），退化成压掉
 ///    最旧的一条让每轮稳定回收一点，而不是返回 `[0,0)` 空转。
 ///
@@ -157,8 +163,48 @@ fn tail_target(items: &[HistoryItem], keep_allowance: usize) -> Target {
     if split >= items.len() {
         split = items.len() - 1;
     }
-    // 不变量③：绝不空压。
+    // 不变量③：切点不能落在工具调用组中间（调用被压掉、输出还留在保留段）。
+    let split = cut_keeps_pairs(items, split);
+    // 不变量④：绝不空压。
     Target { range_start: 0, range_end: split.max(1) }
+}
+
+/// 把切点向前回退，直到丢弃段里不再有"输出仍留在保留段"的调用。
+///
+/// 判据必须按 `call_id` 的实际配对算，而不是按条目类型：历史里可能存在**整段都没有
+/// 调用**的孤立输出（旧版本档案、外部裁剪）。那种输出本来就不指向任何被丢弃的调用，
+/// 切在它旁边不会拆散配对——降级成文本由 `model_client` 兜住；按类型一刀切会把这类
+/// 历史的切点一路退到 0，连压缩都不做了（那是另一个方向的坏）。
+///
+/// 组内顺序固定为「先连续 `FunctionCall`、再连续 `FunctionCallOutput`」，所以回退
+/// 只会发生两种形态：切在输出上（它的调用在丢弃段里）、切在一组多个调用的中间
+/// （前半个调用的输出还在保留段里）。回退到调用的下标让整组留在保留段：保留段可能
+/// 比 `keep_allowance` 长一点，但配对完整。旧实现只按 token 切，真机上就是这里把
+/// `call_0e6f3061…` 的调用压掉、输出留下，端点 500 后会话永久不可用。
+fn cut_keeps_pairs(items: &[HistoryItem], mut split: usize) -> usize {
+    loop {
+        // 丢弃段里的调用：id → 下标（同 id 重复出现时取最靠前的那条）。
+        let mut dropped: std::collections::HashMap<&str, usize> = std::collections::HashMap::new();
+        for (index, item) in items[..split].iter().enumerate() {
+            if let HistoryItem::FunctionCall { call_id, .. } = item {
+                dropped.entry(call_id.as_str()).or_insert(index);
+            }
+        }
+        // 保留段里只要有输出指向被丢弃的调用，切点就必须退到那条调用之前。
+        let mut moved = None;
+        for item in &items[split..] {
+            if let HistoryItem::FunctionCallOutput { call_id, .. } = item {
+                if let Some(&index) = dropped.get(call_id.as_str()) {
+                    moved = Some(moved.map_or(index, |current: usize| current.min(index)));
+                }
+            }
+        }
+        // 回退后新并入保留段的条目可能再引出更早的调用，循环到稳定为止。
+        match moved {
+            Some(index) if index < split => split = index,
+            _ => return split,
+        }
+    }
 }
 
 /// 是否需要压缩，以及压哪一段。
@@ -311,6 +357,22 @@ mod tests {
         HistoryItem::FunctionCallOutput { call_id: id.into(), output: output.into() }
     }
 
+    /// 保留段里每个工具输出都必须能找到同段的调用。
+    fn assert_pairs_complete(items: &[HistoryItem]) {
+        let mut calls = std::collections::HashSet::new();
+        for item in items {
+            match item {
+                HistoryItem::FunctionCall { call_id, .. } => {
+                    calls.insert(call_id.as_str());
+                }
+                HistoryItem::FunctionCallOutput { call_id, .. } => {
+                    assert!(calls.contains(call_id.as_str()), "保留段出现孤立工具输出：{call_id}");
+                }
+                _ => {}
+            }
+        }
+    }
+
     /// 压缩阈值必须跟着窗口走：`context_window = 0` 曾被短路成"照用 50 万预算"，
     /// 128K 模型跑满也不会压缩，等端点 400 才暴露（2026-11-10 修复）。
     #[test]
@@ -431,6 +493,80 @@ mod tests {
         let items = vec![msg(Role::User, "任务"), out("c1", &"y".repeat(100_000))];
         let target = plan_if_needed(0, &items, 1_000).expect("超预算必须给出区间");
         assert_eq!(target.range_end, 1, "只压第一条，最新那条必须留下");
+    }
+
+    /// 2026-11-14 真机冒烟 N1：切点落在「调用 → 输出」组中间时，保留段以孤立的
+    /// `tool_call_id` 开头，端点 500 `Cannot resolve tool name for tool_call_id=...`，
+    /// 重试多少次都不好，会话永久不可用。
+    ///
+    /// 反向对照：删掉 `tail_target` 里的 `cut_keeps_pairs`，这里会得到 `range_end = 3`
+    /// （切在输出上），`assert_pairs_complete` 立刻红。
+    #[test]
+    fn cut_never_splits_a_tool_call_group() {
+        let items = vec![
+            msg(Role::User, "任务目标"),   // 3 token
+            msg(Role::Assistant, "先读文件"), // 3
+            call("call_0e6f3061a37b43cf96c3ef09", "{\"path\":\"package.json\"}"), // 9
+            out("call_0e6f3061a37b43cf96c3ef09", &"x".repeat(100)), // 25
+            msg(Role::User, "继续"),      // 2
+        ];
+        // 手动：预算 100 → 保留额度 30，旧算法只能装下 [输出, 继续]
+        let manual = plan_manual(&items, 100).expect("有可压区间");
+        assert_eq!(manual.range_end, 2, "切点必须回退到调用组起点，而不是落在输出上");
+        assert_pairs_complete(&items[manual.range_end..]);
+
+        // 自动路径共用同一段装填，口径必须一致
+        let auto = plan_if_needed(100, &items, 100).expect("观测值已顶到预算");
+        assert_eq!(auto, manual);
+        assert_pairs_complete(&items[auto.range_end..]);
+    }
+
+    /// 第二种拆组形态：切在一组多个调用的中间。前半个调用被压掉，它的输出却还
+    /// 留在保留段里——同样是孤立 `tool_call_id`。
+    #[test]
+    fn cut_inside_a_multi_call_group_moves_to_the_group_start() {
+        let items = vec![
+            msg(Role::User, "任务"),   // 2 token
+            call("c1", "{}"),          // 4
+            call("c2", "{}"),          // 4
+            out("c1", &"a".repeat(100)), // 25
+            out("c2", &"b".repeat(100)), // 25
+            msg(Role::User, "继续"),   // 2
+        ];
+        // 预算 190 → 保留额度 57：旧算法从尾部装到 call c2 为止（56 ≤ 57 < 60）
+        let target = plan_manual(&items, 190).expect("有可压区间");
+        assert_eq!(target.range_end, 1, "切到组中间会丢掉 c1 却留下它的输出");
+        assert_pairs_complete(&items[target.range_end..]);
+    }
+
+    /// 配对完整的尾巴不会被无谓地多留：切点本来就是组边界时，回退逻辑不得再动它。
+    #[test]
+    fn cut_on_a_group_boundary_is_left_untouched() {
+        let items = vec![
+            msg(Role::User, "任务"),          // 2 token
+            call("c1", "{}"),                 // 4
+            out("c1", &"a".repeat(100)),      // 25
+            msg(Role::User, &"y".repeat(4_000)), // 1000
+            msg(Role::User, "继续"),          // 2
+        ];
+        // 预算 3400 → 保留额度 1020：装得下最后两条（1002），装不下输出（1027）。
+        let target = plan_manual(&items, 3_400).expect("有可压区间");
+        assert_eq!(target.range_end, 3, "切点已在消息边界上，回退逻辑不得再动它");
+        assert_pairs_complete(&items[target.range_end..]);
+    }
+
+    /// 反向回归：历史是一串**没有调用**的孤立输出（旧档案形态）时，切点不得一路退到 0。
+    /// 按条目类型一刀切的实现会在这里把压缩做废（7 条进、7 条出）。
+    #[test]
+    fn orphan_outputs_do_not_block_compaction() {
+        let mut items = vec![msg(Role::User, "任务")];
+        for index in 0..6 {
+            items.push(out(&format!("c{index}"), &"z".repeat(40_000)));
+        }
+        let target = plan_if_needed(0, &items, 50_000).expect("超预算必须给出区间");
+        assert!(target.range_end < items.len(), "至少留最新一条");
+        let after = 1 + items.len() - target.range_end;
+        assert!(after < items.len(), "压缩必须真的让历史变短：{after} → {}", items.len());
     }
 
     #[test]
