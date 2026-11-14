@@ -125,8 +125,11 @@ export function sessionEntriesToEvents(
 
   for (const entry of entries) {
     // 结局行由宿主在回合收口时写入；它不属于新回合，只负责关闭当前回合。
+    // 按档案位置收口：结局行紧跟在所属回合之后，档案顺序即回合顺序。
+    // 不用 `entry.turn` 比较——旧档案那是采样迭代号，新档案才是用户回合号，
+    // 两种口径都不该和导出侧按用户消息自增的 `turn` 做等值判断。
     if (entry.kind === 'turn_end') {
-      if (entry.turn === turn) closeTurn(entry.reason, entryTime(entry), entry.error)
+      closeTurn(entry.reason, entryTime(entry), entry.error)
       continue
     }
     if (entry.kind === 'compaction_summary') {

@@ -67,8 +67,11 @@ const RULES: &[Rule] = &[
     Rule {
         owner: "SessionEntry",
         variant: "TurnEnd",
-        fields: "turn reason at_ms error",
-        overrides: &[],
+        fields: "turn task_id iterations reason at_ms error",
+        overrides: &[
+            ("task_id", Status::BackendOnly("Phase 3 的 reconcile 幂等键；前端只透传、不参与判定")),
+            ("iterations", Status::BackendOnly("采样统计与审计；前端只透传、不参与判定")),
+        ],
     },
     Rule {
         owner: "SessionEntry",

@@ -2453,8 +2453,31 @@ impl AgentLoop {
                     tracing::warn!(target: "rollout", %message);
                 }
             }
+            // Phase 2：`TurnEnd.turn` 是**用户回合号**，采样迭代数改由 `iterations` 承担。
+            // 计数来自 writer 对档案的累计（本回合用户消息此时已 flush）；为 0 属于异常
+            // 路径——记 0 且 `task_id` 留空，不伪造 `#0`，否则旧档判据（task_id 缺席）
+            // 会把一条编号不可用的结局误认成新档。
+            let user_turn = writer.user_turns();
+            if user_turn == 0 {
+                tracing::warn!(
+                    target: "rollout",
+                    "收口时用户回合计数为 0：TurnEnd 记 turn=0 / task_id=None（编号不可用）"
+                );
+            }
+            let task_id = (user_turn > 0).then(|| {
+                // 用档案文件名（= 建档时的 agent_id）而不是引擎作用域里的 `root`：
+                // `task_id` 要跨会话唯一，`root#1` 会在每个根会话里撞成同一个值。
+                let archive_agent = writer
+                    .path()
+                    .file_stem()
+                    .and_then(|stem| stem.to_str())
+                    .unwrap_or(scope.agent_id.as_str());
+                format!("{archive_agent}#{user_turn}")
+            });
             if let Err(error) = writer.append(&crate::rollout::RolloutItem::TurnEnd {
-                turn: last_turn,
+                turn: user_turn,
+                task_id,
+                iterations: Some(last_turn),
                 reason: reason_code.to_string(),
                 at_ms: now_ms(),
                 error: turn_error.clone(),
@@ -4893,10 +4916,67 @@ mod tests {
         let text = std::fs::read_to_string(writer.path()).unwrap();
         let last = text.lines().rev().find(|line| !line.trim().is_empty()).unwrap();
         match serde_json::from_str::<crate::rollout::RolloutItem>(last).unwrap() {
-            crate::rollout::RolloutItem::TurnEnd { turn, reason, error, .. } => {
+            crate::rollout::RolloutItem::TurnEnd { turn, task_id, iterations, reason, error, .. } => {
                 assert_eq!(turn, 1);
+                // Phase 2：新档必须带 `task_id`/`iterations`，否则旧档判据（缺席即 legacy）
+                // 会把这条新结局误读成旧口径。
+                assert_eq!(task_id.as_deref(), Some("agent#1"));
+                assert_eq!(iterations, Some(1));
                 assert_eq!(reason, "failed");
                 assert_eq!(error.expect("失败结局必须带结构化原因").code, "UNKNOWN");
+            }
+            other => panic!("档案最后一行必须是回合结局，实际为 {other:?}"),
+        }
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// Phase 2：`TurnEnd.turn` 数的是**用户回合**，不是采样迭代。
+    ///
+    /// 反向对照：把收口写入改回 `turn: last_turn`，本用例得 2（采样迭代数）而不是 1，必红；
+    /// 把 `task_id` 改成 `None`，前半条断言同样红。
+    #[tokio::test]
+    async fn turn_end_turn_is_user_turn_not_sampling_iteration() {
+        let dir = std::env::temp_dir().join(format!(
+            "shaniu-phase2-turnend-{}",
+            std::process::id()
+        ));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let meta = crate::rollout::RolloutItem::SessionMeta {
+            session_id: "session".into(),
+            agent_id: "agent".into(),
+            parent_id: None,
+            created_at: 0,
+            config_snapshot: crate::rollout::ConfigSnapshot::default(),
+        };
+        let writer = Arc::new(crate::rollout::RolloutWriter::create(&dir, &meta).unwrap());
+        // 同一个用户回合里跑两次采样：先派工具，再收尾。
+        let (mut agent, store, cancel, _broker) = make_loop(vec![
+            vec![
+                ModelStreamEvent::OutputItem(ResponseItem::FunctionCall {
+                    name: "read_file".into(),
+                    arguments: r#"{}"#.into(),
+                    call_id: "c1".into(),
+                }),
+                usage_ev(),
+            ],
+            vec![
+                ModelStreamEvent::OutputTextDelta { delta: "完成".into() },
+                usage_ev(),
+            ],
+        ]);
+        agent.rollout = Some(writer.clone());
+
+        agent.run_task("唯一问题", Arc::new(CapturingSink(store)), cancel).await;
+
+        let text = std::fs::read_to_string(writer.path()).unwrap();
+        let last = text.lines().rev().find(|line| !line.trim().is_empty()).unwrap();
+        match serde_json::from_str::<crate::rollout::RolloutItem>(last).unwrap() {
+            crate::rollout::RolloutItem::TurnEnd { turn, task_id, iterations, reason, .. } => {
+                assert_eq!(turn, 1, "回合号必须是用户回合（1），不能是采样迭代数");
+                assert_eq!(task_id.as_deref(), Some("agent#1"));
+                assert_eq!(iterations, Some(2), "采样迭代数只能出现在 iterations");
+                assert_eq!(reason, "completed");
             }
             other => panic!("档案最后一行必须是回合结局，实际为 {other:?}"),
         }

@@ -154,6 +154,28 @@ describe('档案条目 → 逻辑事件', () => {
     expect(end.data['reason']).toBe('unknown')
   })
 
+  it('结局行的 turn 是旧口径也不影响导出轮次：按档案位置收口', () => {
+    // 旧档的 turn 是本次 run 内的采样迭代号（这里是 3），导出侧的 turn 按用户消息自增（1）。
+    // 反向对照：恢复 `entry.turn === turn` 后，这条结局被丢弃，导出回落到 unknown。
+    const legacy = sessionEntriesToEvents([
+      { kind: 'message', role: 'user', text: '唯一问题' },
+      { kind: 'message', role: 'assistant', text: '回答' },
+      { kind: 'turn_end', turn: 3, reason: 'completed', at_ms: 20 },
+    ], '标题')
+    const ends = ofType(legacy, 'turn/end') as { data: Record<string, unknown> }[]
+    expect(ends).toHaveLength(1)
+    expect(ends[0].data['turn']).toBe(1)
+    expect(ends[0].data['reason']).toBe('completed')
+
+    // 新档同结论：turn 是用户回合号，task_id/iterations 只作审计，不改变导出结果。
+    const fresh = sessionEntriesToEvents([
+      { kind: 'message', role: 'user', text: '唯一问题' },
+      { kind: 'message', role: 'assistant', text: '回答' },
+      { kind: 'turn_end', turn: 1, task_id: 'agent#1', iterations: 5, reason: 'completed', at_ms: 20 },
+    ], '标题')
+    expect(ofType(fresh, 'turn/end').map(event => event.data)).toEqual(ends.map(event => event.data))
+  })
+
   it('事件时间取档案 at_ms，不再让整份导出只有一两个时间', () => {
     const events = sessionEntriesToEvents([
       { kind: 'message', role: 'user', text: '问', at_ms: 1_700_000_000_000 },

@@ -1122,8 +1122,16 @@ pub enum SessionEntry {
         at_ms: u64,
     },
     /// 回合结局（A0-3）。旧档案没有这一条，导出侧必须标 `unknown` 而不是成功。
+    ///
+    /// `turn` 自 Phase 2 起是**用户回合号**；`task_id`/`iterations` 是 Phase 2 新增。
+    /// 旧档没有这两个键（序列化时省略 → 前端 `undefined`），据此判 legacy：
+    /// 那时 `turn` 是本次 run 内的采样迭代序号，不可用于回合归属。
     TurnEnd {
         turn: u32,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        task_id: Option<String>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        iterations: Option<u32>,
         reason: String,
         at_ms: u64,
         #[serde(skip_serializing_if = "Option::is_none")]
@@ -1259,9 +1267,11 @@ fn project_slots(items: &[rollout::RolloutItem]) -> Vec<Slot> {
                 images: images.clone(),
             })),
             // 回合结局：如实带给导出/审计，不进对话历史。
-            rollout::RolloutItem::TurnEnd { turn, reason, at_ms, error } => {
+            rollout::RolloutItem::TurnEnd { turn, task_id, iterations, reason, at_ms, error } => {
                 out.push(Slot::Audit(SessionEntry::TurnEnd {
                     turn: *turn,
+                    task_id: task_id.clone(),
+                    iterations: *iterations,
                     reason: reason.clone(),
                     at_ms: *at_ms,
                     error: error.clone(),
@@ -4197,6 +4207,8 @@ mod session_projection_tests {
             msg(Role::User, "第一条"),
             RolloutItem::TurnEnd {
                 turn: 1,
+                task_id: None,
+                iterations: None,
                 reason: "completed".into(),
                 at_ms: 3,
                 error: None,
@@ -4207,7 +4219,36 @@ mod session_projection_tests {
         let entries = project_entries(&items).expect("锚点区间合法");
         assert_eq!(entries.len(), 2, "摘要取代两条历史，TurnEnd 原样留着：{entries:?}");
         assert!(matches!(&entries[0], SessionEntry::CompactionSummary { text, .. } if text == "摘要"));
-        assert!(matches!(&entries[1], SessionEntry::TurnEnd { turn: 1, .. }));
+        assert!(matches!(
+            &entries[1],
+            SessionEntry::TurnEnd { turn: 1, task_id: None, iterations: None, .. }
+        ));
+    }
+
+    /// 旧档结局行投影到前端时必须**不出现** `task_id`/`iterations` 键：前端据此判 legacy。
+    /// 反向验证：给这两个字段补默认值（空串 / 0），本条红——那正是「用默认值掩盖语义差」。
+    #[test]
+    fn legacy_turn_end_projection_omits_new_fields() {
+        let legacy: RolloutItem = serde_json::from_str(
+            r#"{"type":"turn_end","turn":3,"reason":"completed","at_ms":5}"#,
+        )
+        .expect("缺字段的旧结局行必须可读");
+        let entries = project_entries(&[legacy]).expect("审计行不参与历史校验");
+        let value = serde_json::to_value(&entries[0]).unwrap();
+        assert_eq!(value["kind"], "turn_end");
+        assert_eq!(value["turn"], 3, "旧档 turn 原样保留，由读侧按 legacy 解释");
+        assert!(value.get("task_id").is_none(), "旧档不能凭空长出 task_id：{value}");
+        assert!(value.get("iterations").is_none(), "旧档不能凭空长出 iterations：{value}");
+
+        let fresh: RolloutItem = serde_json::from_str(
+            r#"{"type":"turn_end","turn":2,"task_id":"agent#2","iterations":4,"reason":"cancelled","at_ms":6}"#,
+        )
+        .unwrap();
+        let entries = project_entries(&[fresh]).unwrap();
+        let value = serde_json::to_value(&entries[0]).unwrap();
+        assert_eq!(value["turn"], 2);
+        assert_eq!(value["task_id"], "agent#2");
+        assert_eq!(value["iterations"], 4);
     }
 
     /// 越界锚点必须报错，而不是"能显示多少显示多少"：resume 会直接拒绝加载，

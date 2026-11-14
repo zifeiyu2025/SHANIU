@@ -83,7 +83,17 @@ export type SessionEntryLike =
   | {
     /** 回合结局（A0-3）：`completed` / `cancelled` / `failed` / `budget_exhausted`。 */
     readonly kind: 'turn_end'
+    /**
+     * 用户回合号（1 起，跨 run 累计）；`0` = 编号不可用。
+     *
+     * 旧档案没有 `task_id`，那时这个值是**本次 run 内的采样迭代序号**——口径不同，
+     * 不能拿它和前端按用户消息计的回合号做等值比较。
+     */
     readonly turn: number
+    /** 新档有、旧档无。缺失即 legacy：`turn` 是旧口径，禁止用于归属。 */
+    readonly task_id?: string
+    /** 本用户回合内的采样迭代数；旧档缺失 = 未知。 */
+    readonly iterations?: number
     readonly reason: string
     readonly at_ms: number
     readonly error?: TurnErrorInfo

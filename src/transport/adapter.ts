@@ -1785,9 +1785,10 @@ export function createAdapter(options: AdapterOptions): { remote: unknown; dispo
         replayClock = 'at_ms' in entry && (entry.at_ms ?? 0) > 0 ? entry.at_ms : 0
         if (entry.kind === 'turn_end') {
           // 结局行：新档案才有；旧档案走到末尾时由宿主的结论（或「状态未知」）收口。
-          // 档案顺序即回合顺序，结局行收的就是当前还开着的那个回合。`entry.turn` 是
-          // 后端采样迭代序号，不是前端按用户消息计的回合号——拿它做等值比较，口径一旦
-          // 不同就把宿主已经给出的结论丢掉，末尾兜底随后会补一条收口盖掉它。
+          // 档案顺序即回合顺序，结局行收的就是当前还开着的那个回合。`entry.turn` 在
+          // 旧档是本次 run 内的采样迭代序号、在新档是用户回合号——两种口径都不与前端
+          // 按用户消息计的回合号做等值比较，否则口径一旦不同就把宿主已经给出的结论
+          // 丢掉，末尾兜底随后会补一条收口盖掉它。
           if (journal.taskOpen) closeTurn(archiveTurnReason(entry.reason, entry.error))
           journal.entryToSeq[index] = journal.seq
           return

@@ -20,11 +20,12 @@ pub mod resume;
 use std::fs::{File, OpenOptions};
 use std::io::{BufRead, BufReader, Write};
 use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicU32, Ordering};
 use std::sync::Mutex;
 
 use serde::{Deserialize, Serialize};
 
-use crate::model_client::HistoryItem;
+use crate::model_client::{HistoryItem, Role};
 
 /// 会话文件目录名（04 §3.1：`<data_root>/rollouts/<agent_id>.jsonl`）。
 pub const ROLLOUT_DIR: &str = "rollouts";
@@ -98,8 +99,26 @@ pub enum RolloutItem {
     /// 回合结局（A0-3）：档案必须如实记录成功/失败/取消/超时，导出与统计都靠它。
     ///
     /// 旧档案没有这一行——那是历史事实，读侧只能标 `unknown`，不许默认成成功。
+    ///
+    /// **`turn` 语义（Phase 2 起）**：1 起的**用户回合号**（跨 run 累计，只数真实用户提问）；
+    /// 本次 run 的采样迭代数改由 `iterations` 承担。三条兼容判定按顺序生效：
+    /// 1. `turn == 0` → 编号不可用（异常路径），只信 `reason`；
+    /// 2. `task_id` 缺失（`turn > 0`）→ **legacy**：`turn` 是旧口径（本次 run 内从 1 起的
+    ///    采样迭代序号），禁止用于回合归属或等值比较，`iterations` 未知；
+    /// 3. `task_id` 存在 → 新档，`turn`/`iterations` 均可信。
+    ///
+    /// 判据刻意用「`task_id` 是否存在」而不是 `turn` 的取值：旧档的 `turn` 一定存在且从 1 起，
+    /// 与新口径首回合同值，无法区分。缺字段保持 `None`/省略，不填默认值——填了默认值就把
+    /// 「旧口径」伪装成「新口径」，语义差会被静默抹掉。
     TurnEnd {
+        #[serde(default)]
         turn: u32,
+        /// `"{agent_id}#{turn}"`：确定性生成，重开/重放同值（Phase 3 的 reconcile 幂等键）。
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        task_id: Option<String>,
+        /// 本用户回合内的采样迭代数；旧档缺失 = 未知。
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        iterations: Option<u32>,
         /// `completed` / `cancelled` / `failed` / `budget_exhausted`。
         reason: String,
         at_ms: u64,
@@ -200,6 +219,25 @@ pub enum RolloutError {
 pub struct RolloutWriter {
     path: PathBuf,
     file: Mutex<File>,
+    /// 已成功落档的用户提问数（跨 run 累计）。`TurnEnd.turn` 的唯一口径。
+    ///
+    /// 只数 `ResponseItem` 里的用户消息：压缩摘要落的是 `Compacted`，不是 `ResponseItem`，
+    /// 因此不会被算进回合（Phase 4 的 `CompactionSummary` 同理）。
+    user_turns: AtomicU32,
+}
+
+/// 一条档案行是否算「一个用户回合的起点」。
+///
+/// 文本提问与带图提问都算——带图消息也是用户主动发起的一轮。
+fn counts_as_user_turn(item: &RolloutItem) -> bool {
+    matches!(
+        item,
+        RolloutItem::ResponseItem {
+            item: HistoryItem::Message { role: Role::User, .. }
+                | HistoryItem::ImageMessage { role: Role::User, .. },
+            ..
+        }
+    )
 }
 
 impl RolloutWriter {
@@ -223,7 +261,7 @@ impl RolloutWriter {
                     RolloutError::Io(format!("{path:?}: {e}"))
                 }
             })?;
-        let writer = Self { path, file: Mutex::new(file) };
+        let writer = Self { path, file: Mutex::new(file), user_turns: AtomicU32::new(0) };
         writer.append(meta)?;
         Ok(writer)
     }
@@ -233,27 +271,51 @@ impl RolloutWriter {
     /// 校验首行确实是 `session_meta` 才允许续写：往一个没有建档的文件里追加，
     /// 产出的是一份 resume 时才发现读不了的档案，错误被推迟到最难定位的时刻。
     pub fn open_existing(path: &Path) -> Result<Self, RolloutError> {
-        let head = File::open(path)
+        let scan = File::open(path)
             .map_err(|e| RolloutError::Io(format!("{path:?}: {e}")))?;
-        let first_line = BufReader::new(head)
-            .lines()
-            .next()
-            .ok_or_else(|| RolloutError::NoSessionMeta(format!("{}", path.display())))?
-            .map_err(|e| RolloutError::Io(format!("{}", e)))?;
-        let first: RolloutItem = serde_json::from_str(&first_line)
+        let mut reader = BufReader::new(scan);
+        let mut first_line = String::new();
+        if reader
+            .read_line(&mut first_line)
+            .map_err(|e| RolloutError::Io(format!("{path:?}: {e}")))?
+            == 0
+        {
+            return Err(RolloutError::NoSessionMeta(format!("{}", path.display())));
+        }
+        let first: RolloutItem = serde_json::from_str(first_line.trim_end())
             .map_err(|e| RolloutError::Corrupted { line: 1, message: e.to_string() })?;
         if !matches!(first, RolloutItem::SessionMeta { .. }) {
             return Err(RolloutError::NoSessionMeta(format!("{}", path.display())));
+        }
+        // 用户回合计数必须在续写前建立：`TurnEnd.turn` 是跨 run 累计的用户回合号，
+        // 只看本次 run 会每次从 1 重来。坏行跳过（与 `read` 同忍耐度），不因单行
+        // 解析失败拒绝续写；读失败则停止扫描，已扫到的部分仍可用。
+        let mut user_turns = 0u32;
+        for line in reader.lines().map_while(Result::ok) {
+            if let Ok(item) = serde_json::from_str::<RolloutItem>(&line) {
+                if counts_as_user_turn(&item) {
+                    user_turns += 1;
+                }
+            }
         }
         let file = OpenOptions::new()
             .append(true)
             .open(path)
             .map_err(|e| RolloutError::Io(format!("{path:?}: {e}")))?;
-        Ok(Self { path: path.to_path_buf(), file: Mutex::new(file) })
+        Ok(Self {
+            path: path.to_path_buf(),
+            file: Mutex::new(file),
+            user_turns: AtomicU32::new(user_turns),
+        })
     }
 
     pub fn path(&self) -> &Path {
         &self.path
+    }
+
+    /// 已落档的用户提问数（跨 run 累计）。回合收口时用它的值作为 `TurnEnd.turn`。
+    pub fn user_turns(&self) -> u32 {
+        self.user_turns.load(Ordering::Relaxed)
     }
 
     /// 追加一行并立即 flush（设计选择 1）。
@@ -262,10 +324,17 @@ impl RolloutWriter {
     pub fn append(&self, item: &RolloutItem) -> Result<(), RolloutError> {
         let line = serde_json::to_string(item).map_err(|e| RolloutError::Io(format!("序列化失败: {e}")))?;
         let line = crate::config::redact(&line);
-        let mut file = self.file.lock().map_err(|_| RolloutError::Io("rollout 写入锁中毒".into()))?;
-        file.write_all(line.as_bytes()).map_err(|e| RolloutError::Io(format!("{}", e)))?;
-        file.write_all(b"\n").map_err(|e| RolloutError::Io(format!("{}", e)))?;
-        file.flush().map_err(|e| RolloutError::Io(format!("flush 失败: {e}")))
+        {
+            let mut file = self.file.lock().map_err(|_| RolloutError::Io("rollout 写入锁中毒".into()))?;
+            file.write_all(line.as_bytes()).map_err(|e| RolloutError::Io(format!("{}", e)))?;
+            file.write_all(b"\n").map_err(|e| RolloutError::Io(format!("{}", e)))?;
+            file.flush().map_err(|e| RolloutError::Io(format!("flush 失败: {e}")))?;
+        }
+        // 只在真正落盘之后计数：写失败的行不该让回合号往前跑。
+        if counts_as_user_turn(item) {
+            self.user_turns.fetch_add(1, Ordering::Relaxed);
+        }
+        Ok(())
     }
 }
 
@@ -728,6 +797,137 @@ mod tests {
         let _w = RolloutWriter::create(&dir, &meta("dup")).unwrap();
         let err = RolloutWriter::create(&dir, &meta("dup")).unwrap_err();
         assert!(matches!(err, RolloutError::AlreadyExists(_)), "覆盖历史档案不可逆，必须拒绝：{err}");
+    }
+
+    fn user_msg(text: &str, at_ms: u64) -> RolloutItem {
+        RolloutItem::ResponseItem {
+            item: HistoryItem::Message { role: Role::User, text: text.into(), reasoning: None },
+            at_ms,
+        }
+    }
+
+    fn assistant_msg(text: &str, at_ms: u64) -> RolloutItem {
+        RolloutItem::ResponseItem {
+            item: HistoryItem::Message { role: Role::Assistant, text: text.into(), reasoning: None },
+            at_ms,
+        }
+    }
+
+    /// Phase 2：`TurnEnd.turn` 是**用户回合号**，本次 run 的采样迭代数进 `iterations`。
+    ///
+    /// 反向验证：把 `turn` 写回 `last_turn`（采样迭代号）或不写 `task_id`，本条必红。
+    #[test]
+    fn turn_end_records_user_turn_and_iterations() {
+        let dir = temp_dir();
+        let agent = "agent-turn";
+        let w = RolloutWriter::create(&dir, &meta(agent)).unwrap();
+
+        w.append(&user_msg("第一个问题", 1)).unwrap();
+        w.append(&assistant_msg("第一条回答", 2)).unwrap();
+        assert_eq!(w.user_turns(), 1, "用户消息落档后回合号应为 1");
+        w.append(&RolloutItem::TurnEnd {
+            turn: w.user_turns(),
+            task_id: Some(format!("{agent}#1")),
+            iterations: Some(3),
+            reason: "completed".into(),
+            at_ms: 3,
+            error: None,
+        }).unwrap();
+
+        // 带图提问同样是一个用户回合（只数文本会漏判）。
+        w.append(&RolloutItem::ResponseItem {
+            item: HistoryItem::ImageMessage { role: Role::User, text: "看图".into(), images: Vec::new() },
+            at_ms: 4,
+        }).unwrap();
+        w.append(&assistant_msg("第二条回答", 5)).unwrap();
+        assert_eq!(w.user_turns(), 2);
+        w.append(&RolloutItem::TurnEnd {
+            turn: w.user_turns(),
+            task_id: Some(format!("{agent}#2")),
+            iterations: Some(5),
+            reason: "cancelled".into(),
+            at_ms: 6,
+            error: None,
+        }).unwrap();
+
+        let path = w.path().to_path_buf();
+        drop(w);
+
+        let rollout = read(&path).unwrap();
+        let ends: Vec<(u32, Option<String>, Option<u32>, String)> = rollout
+            .items
+            .iter()
+            .filter_map(|item| match item {
+                RolloutItem::TurnEnd { turn, task_id, iterations, reason, .. } => {
+                    Some((*turn, task_id.clone(), *iterations, reason.clone()))
+                }
+                _ => None,
+            })
+            .collect();
+        assert_eq!(
+            ends,
+            vec![
+                (1, Some(format!("{agent}#1")), Some(3), "completed".into()),
+                (2, Some(format!("{agent}#2")), Some(5), "cancelled".into()),
+            ],
+            "turn 必须是用户回合号，采样迭代数只能出现在 iterations"
+        );
+
+        // 重开后的计数必须与追加口径一致（否则同一回合在两条路径下轮次不同）。
+        let reopened = RolloutWriter::open_existing(&path).unwrap();
+        assert_eq!(reopened.user_turns(), 2);
+    }
+
+    /// 旧档案兼容：缺 `task_id`/`iterations` 的结局行照常读，按 legacy 解释；
+    /// 续写时计数只数用户消息，不被结局行污染；新旧混档仍可读且无坏行。
+    #[test]
+    fn legacy_turn_end_without_task_id_reads_and_marks_legacy() {
+        let dir = temp_dir();
+        let agent = "agent-legacy";
+        let w = RolloutWriter::create(&dir, &meta(agent)).unwrap();
+        w.append(&user_msg("旧问题", 1)).unwrap();
+        let path = w.path().to_path_buf();
+        drop(w);
+
+        // 旧版结局行：只有 turn/reason/at_ms（turn=3 是采样迭代号，不是用户回合号）。
+        let legacy = r#"{"type":"turn_end","turn":3,"reason":"completed","at_ms":2}"#;
+        let mut file = std::fs::OpenOptions::new().append(true).open(&path).unwrap();
+        file.write_all(legacy.as_bytes()).unwrap();
+        file.write_all(b"\n").unwrap();
+        drop(file);
+
+        let rollout = read(&path).expect("旧档必须照常读");
+        assert!(rollout.damaged_lines.is_empty(), "旧结局行不是坏行：{:?}", rollout.damaged_lines);
+        let (turn, task_id, iterations) = rollout
+            .items
+            .iter()
+            .find_map(|item| match item {
+                RolloutItem::TurnEnd { turn, task_id, iterations, .. } => {
+                    Some((*turn, task_id.clone(), *iterations))
+                }
+                _ => None,
+            })
+            .expect("结局行应在");
+        assert_eq!(
+            (turn, task_id, iterations),
+            (3, None, None),
+            "缺 task_id 即 legacy：turn 保留旧口径原值，iterations 未知"
+        );
+
+        let reopened = RolloutWriter::open_existing(&path).unwrap();
+        assert_eq!(reopened.user_turns(), 1, "结局行不能被数成用户回合");
+        reopened.append(&RolloutItem::TurnEnd {
+            turn: 2,
+            task_id: Some(format!("{agent}#2")),
+            iterations: Some(4),
+            reason: "completed".into(),
+            at_ms: 3,
+            error: None,
+        }).unwrap();
+        drop(reopened);
+
+        let mixed = read(&path).expect("新旧混档必须可读");
+        assert!(mixed.damaged_lines.is_empty(), "新旧混档不得互相污染：{:?}", mixed.damaged_lines);
     }
 
     /// 会话内切档**只落档案**：配置文件一个字节都不许动。

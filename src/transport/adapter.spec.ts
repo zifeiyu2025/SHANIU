@@ -2233,6 +2233,63 @@ describe('适配层的命令面映射', () => {
     expect(replayTypes).toEqual(liveTypes)
   })
 
+  it('同一用户回合：实时与重开重建的轮次和结局一致（TurnEnd.turn 是用户回合号）', async () => {
+    // Phase 2 的验收判据：`TurnEnd.turn` 改成用户回合号之后，实时跑出来的轮次/结局
+    // 必须与重开档案重建出来的完全一致。反向对照：写入端把 `turn` 退回采样迭代号时，
+    // Rust 侧 turn_end_records_user_turn_and_iterations 必红；这里锁住读路径不比较编号。
+    const liveBridge = scriptedBridge()
+    const live = createAdapter({ bridge: liveBridge })
+    const liveSession = faceOf(live.remote).session
+    await liveSession.prompt({
+      sessionId: 'agent-turn',
+      requestId: 'rpc-turn',
+      content: [{ type: 'text', text: '唯一问题' }],
+    })
+    // 后端每个采样迭代都发 turn_started：那是 step 游标，不是用户回合。
+    liveBridge.emit('agent-turn', { type: 'turn_started', turn: 2 })
+    liveBridge.emit('agent-turn', { type: 'agent_message_delta', delta: '回答' })
+    liveBridge.emit('agent-turn', { type: 'turn_completed', turn: 2, reason: 'completed' })
+
+    const liveIterator = liveSession.follow({ address: { kind: 'session', sessionId: 'agent-turn' } })
+    const liveEvents = eventsOf((await liveIterator.next()).value as Record<string, unknown>)
+    await liveIterator.return?.(undefined)
+    live.dispose()
+
+    // 同一回合落进档案：结局行带 task_id/iterations，turn 是用户回合号（1），
+    // 采样迭代数（2）只出现在 iterations。
+    const archive = [
+      { kind: 'message', role: 'user', text: '唯一问题', at_ms: 1 },
+      { kind: 'message', role: 'assistant', text: '回答', at_ms: 2 },
+      {
+        kind: 'turn_end',
+        turn: 1,
+        task_id: 'agent#1',
+        iterations: 2,
+        reason: 'completed',
+        at_ms: 3,
+      },
+    ]
+    const reopened = createAdapter({ bridge: scriptedBridge(undefined, archive) })
+    const iterator = faceOf(reopened.remote).session.follow({ address: { kind: 'session', sessionId: 'agent-old' } })
+    const replayEvents = eventsOf((await iterator.next()).value as Record<string, unknown>)
+    await iterator.return?.(undefined)
+    reopened.dispose()
+
+    const summarize = (events: Record<string, unknown>[]) => ({
+      starts: events.filter(event => event['type'] === 'turn/start').length,
+      ends: events
+        .filter(event => event['type'] === 'turn/end')
+        .map(event => {
+          const data = event['data'] as { turn: number; reason: { kind: string } }
+          return { turn: data.turn, reason: data.reason.kind }
+        }),
+    })
+    const liveSummary = summarize(liveEvents as unknown as Record<string, unknown>[])
+    const replaySummary = summarize(replayEvents as unknown as Record<string, unknown>[])
+    expect(liveSummary).toEqual({ starts: 1, ends: [{ turn: 1, reason: 'completed' }] })
+    expect(replaySummary).toEqual(liveSummary)
+  })
+
   it('重开档案按结局行收口：失败回合不会在回放里变成 completed', async () => {
     const archive = [
       { kind: 'message', role: 'user', text: '问' },
