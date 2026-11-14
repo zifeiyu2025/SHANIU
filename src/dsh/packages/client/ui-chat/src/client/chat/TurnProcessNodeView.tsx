@@ -6,6 +6,33 @@ import { formatRunDuration } from './message-chrome.ts'
 import a11yCss from './accessibility.module.css'
 import css from './TurnProcessNodeView.module.css'
 
+/** What the settled Turn control says about how the Turn ended. */
+export type TurnProcessOutcome =
+  | { readonly kind: 'stopped' }
+  | { readonly kind: 'failed' }
+  | { readonly kind: 'unknown' }
+  | { readonly kind: 'worked' }
+  | { readonly kind: 'took'; readonly elapsedMs: number }
+
+/**
+ * Map a Turn's end reason to its control label.
+ *
+ * `indeterminate` is SHANIU's "no recorded ending" reason (see `turn-error.ts`).
+ * It must not fall through to the completed branch: that renders
+ * 「已完成，用时 N」for a Turn the archive never concluded, which contradicts
+ * the「本轮状态未知」row inside the same Turn. Unknown means unknown — no
+ * duration either, because a duration would again read as "it finished".
+ */
+export function turnProcessOutcome(
+  reasonKind: string | undefined,
+  elapsedMs: number | undefined,
+): TurnProcessOutcome {
+  if (reasonKind === 'aborted' || reasonKind === 'interrupted') return { kind: 'stopped' }
+  if (reasonKind === 'error') return { kind: 'failed' }
+  if (reasonKind === 'indeterminate') return { kind: 'unknown' }
+  return elapsedMs === undefined ? { kind: 'worked' } : { kind: 'took', elapsedMs }
+}
+
 /** Settled Turn duration and process disclosure above its content. */
 export const TurnProcessNodeView = memo(function TurnProcessNodeView({
   node, turnProcess, t,
@@ -18,19 +45,20 @@ export const TurnProcessNodeView = memo(function TurnProcessNodeView({
   if (turn?.status !== 'closed') return null
   const canCollapse = turnProcess.foldable && turnProcess.hasContent && !turnProcessAlwaysOpen(node)
   const reason = turn.end?.data.reason.kind
-  const stopped = reason === 'aborted' || reason === 'interrupted'
   const elapsedMs = turn.start === undefined || turn.end === undefined ? undefined
     : Math.max(1000, turn.end.time - turn.start.time)
-  const duration = elapsedMs === undefined || stopped || reason === 'error' ? undefined
-    : formatRunDuration(elapsedMs, t)
-  // Other end reasons retain elapsed time; only stops and failure replace it.
-  const label = stopped ? t('message.stopped')
-    : reason === 'error' ? t('message.turnProcess.failed')
-      : duration === undefined ? t('message.turnProcess.worked')
-        : t('message.turnProcess.took')
-  const announcement = stopped ? t('message.stopped')
-    : reason === 'error' ? t('message.turnProcess.failed')
-      : t('message.turnProcess.worked')
+  const outcome = turnProcessOutcome(reason, elapsedMs)
+  const duration = outcome.kind === 'took' ? formatRunDuration(outcome.elapsedMs, t) : undefined
+  // Stops, failures and unknown endings replace elapsed time; the rest keep it.
+  const label = outcome.kind === 'stopped' ? t('message.stopped')
+    : outcome.kind === 'failed' ? t('message.turnProcess.failed')
+      : outcome.kind === 'unknown' ? t('message.turnUnknown')
+        : outcome.kind === 'took' ? t('message.turnProcess.took')
+          : t('message.turnProcess.worked')
+  const announcement = outcome.kind === 'stopped' ? t('message.stopped')
+    : outcome.kind === 'failed' ? t('message.turnProcess.failed')
+      : outcome.kind === 'unknown' ? t('message.turnUnknown')
+        : t('message.turnProcess.worked')
   return (
     <>
       <span className={a11yCss.visuallyHidden} role="status" aria-live="polite" aria-atomic="true">{announcement}</span>
