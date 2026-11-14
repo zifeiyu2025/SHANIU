@@ -2313,7 +2313,9 @@ describe('适配层的命令面映射', () => {
     expect(detailOf(zeroEvents)).not.toContain('重试')
   })
 
-  it('旧档案没有结局行 → 宿主确认空闲后收口为 interrupted，不冒充成功', async () => {
+  it('无结论回合 + 强杀 + 重开：单条 indeterminate 结束，不冒充已中止', async () => {
+    // 档案只有「问/答到一半」，没有结局行，宿主确认该会话没有任务在跑。
+    // 状态源收敛 Phase 1：前端只陈述「没有结论」，不写 interrupted（那是宿主的结论）。
     const archive = [
       { kind: 'message', role: 'user', text: '问' },
       { kind: 'message', role: 'assistant', text: '答' },
@@ -2324,10 +2326,53 @@ describe('适配层的命令面映射', () => {
     await iterator.return?.(undefined)
     reopened.dispose()
 
-    const reason = (events.find(event => event['type'] === 'turn/end')?.['data'] as {
-      reason: { kind: string }
-    }).reason
-    expect(reason.kind).toBe('interrupted')
+    const ends = events.filter(event => event['type'] === 'turn/end')
+    // 反向对照：末尾收口退回 `closeTurn()` 的默认 interrupted，这里会红。
+    expect(ends).toHaveLength(1)
+    expect((ends[0]!['data'] as { reason: { kind: string } }).reason.kind).toBe('indeterminate')
+    expect(JSON.stringify(ends)).not.toContain('interrupted')
+  })
+
+  it('旧档案有多轮且都没有结局行：中间回合也标 indeterminate，不显示成进行中', async () => {
+    // 旧档案没有 TurnEnd 行：每个用户消息都会开一个回合。前一个回合不能留成
+    // 「进行中」（会一直转圈），也不能补「已中止」——一律如实标「状态未知」。
+    const archive = [
+      { kind: 'message', role: 'user', text: '第一问' },
+      { kind: 'message', role: 'assistant', text: '第一答' },
+      { kind: 'message', role: 'user', text: '第二问' },
+      { kind: 'message', role: 'assistant', text: '第二答' },
+    ]
+    const reopened = createAdapter({ bridge: scriptedBridge(undefined, archive) })
+    const iterator = faceOf(reopened.remote).session.follow({ address: { kind: 'session', sessionId: 'agent-two-turns' } })
+    const events = eventsOf((await iterator.next()).value as Record<string, unknown>)
+    await iterator.return?.(undefined)
+    reopened.dispose()
+
+    const ofType = (type: string): Record<string, unknown>[] => events.filter(event => event['type'] === type)
+    expect(ofType('turn/start')).toHaveLength(2)
+    const ends = ofType('turn/end')
+    expect(ends).toHaveLength(2)
+    expect(ends.map(end => (end['data'] as { reason: { kind: string } }).reason.kind))
+      .toEqual(['indeterminate', 'indeterminate'])
+  })
+
+  it('结局行 reason 不是已知结局 → indeterminate，不臆断为已中止', async () => {
+    const archive = [
+      { kind: 'message', role: 'user', text: '问' },
+      { kind: 'message', role: 'assistant', text: '答' },
+      { kind: 'turn_end', turn: 1, reason: 'future-code', at_ms: 1_700_000_030_000 },
+    ]
+    const bridge = scriptedBridge(undefined, archive)
+    bridge.host.active = null
+    const reopened = createAdapter({ bridge })
+    const iterator = faceOf(reopened.remote).session.follow({ address: { kind: 'session', sessionId: 'agent-unknown-reason' } })
+    const events = eventsOf((await iterator.next()).value as Record<string, unknown>)
+    await iterator.return?.(undefined)
+    reopened.dispose()
+
+    const ends = events.filter(event => event['type'] === 'turn/end')
+    expect(ends).toHaveLength(1)
+    expect((ends[0]!['data'] as { reason: { kind: string } }).reason.kind).toBe('indeterminate')
   })
 
   it('已收口回合 + 进程被杀 + 重启重建：仍是 completed、单条结束、轮次不变', async () => {
@@ -2467,7 +2512,7 @@ describe('适配层的命令面映射', () => {
     first.dispose()
     expect(opaqueEvents.find(event => event['type'] === 'turn/end')).toBeUndefined()
 
-    // 反向对照：宿主明确说空闲，仍然要补 interrupted（别把"该收"一起堵死）。
+    // 反向对照：宿主明确说空闲，仍然要收口——但结论只能是 indeterminate（别把"该收"一起堵死）。
     const idle = scriptedBridge(undefined, archive)
     idle.host.active = null
     const second = createAdapter({ bridge: idle })
@@ -2476,7 +2521,7 @@ describe('适配层的命令面映射', () => {
     await secondIterator.return?.(undefined)
     second.dispose()
     const end = idleEvents.find(event => event['type'] === 'turn/end')
-    expect((end?.['data'] as { reason: { kind: string } }).reason.kind).toBe('interrupted')
+    expect((end?.['data'] as { reason: { kind: string } }).reason.kind).toBe('indeterminate')
   })
 
   it('重开档案按条目 at_ms 还原时间：不再把整段历史压成打开会话那一刻', async () => {
@@ -4731,7 +4776,7 @@ describe('续播幂等与无帧兜底（阶段 2）', () => {
     }
   })
 
-  it('60s 无帧且宿主确认空闲：前端 fail-closed 收口为 interrupted', async () => {
+  it('60s 无帧且宿主确认空闲：只观测、不收口（不再自动补 interrupted）', async () => {
     vi.useFakeTimers()
     const bridge = scriptedBridge()
     const { remote, dispose } = createAdapter({ bridge })
@@ -4744,9 +4789,8 @@ describe('续播幂等与无帧兜底（阶段 2）', () => {
 
       const iterator = session.follow({ address: { kind: 'session', sessionId: 'agent-dead' } })
       const snapshot = (await iterator.next()).value as Record<string, unknown>
-      const ends = eventsOf(snapshot).filter(event => event['type'] === 'turn/end')
-      expect(ends).toHaveLength(1)
-      expect((ends[0]!['data'] as { reason: unknown }).reason).toEqual({ kind: 'interrupted' })
+      // 反向对照：退回旧逻辑（空闲即 closeTask），这里会变成 1 条。
+      expect(eventsOf(snapshot).filter(event => event['type'] === 'turn/end')).toHaveLength(0)
       await iterator.return?.(undefined)
     } finally {
       dispose()
@@ -4775,7 +4819,7 @@ describe('续播幂等与无帧兜底（阶段 2）', () => {
     }
   })
 
-  it('60s 无帧但运行态是空壳 {}：保持现状；宿主改口空闲后才收口', async () => {
+  it('60s 无帧但运行态是空壳 {}：保持现状；宿主改口空闲也保持打开', async () => {
     vi.useFakeTimers()
     const bridge = scriptedBridge()
     bridge.host.runtimeRaw = {}
@@ -4791,15 +4835,14 @@ describe('续播幂等与无帧兜底（阶段 2）', () => {
         .filter(event => event['type'] === 'turn/end')).toHaveLength(0)
       await before.return?.(undefined)
 
-      // 反向对照：宿主明确说空闲，下一轮扫描必须照常收口。
+      // 宿主改口空闲也不收口：结论由宿主写进档案，前端只留痕。
       bridge.host.runtimeRaw = undefined
       bridge.host.active = null
       await vi.advanceTimersByTimeAsync(6_000)
       const after = session.follow({ address: { kind: 'session', sessionId: 'agent-opaque' } })
       const ends = eventsOf((await after.next()).value as Record<string, unknown>)
         .filter(event => event['type'] === 'turn/end')
-      expect(ends).toHaveLength(1)
-      expect((ends[0]!['data'] as { reason: { kind: string } }).reason.kind).toBe('interrupted')
+      expect(ends).toHaveLength(0)
       await after.return?.(undefined)
     } finally {
       dispose()

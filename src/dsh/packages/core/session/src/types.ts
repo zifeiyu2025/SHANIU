@@ -226,6 +226,13 @@ export interface TurnEndReasonMap {
    */
   interrupted: { kind: 'interrupted' }
   /**
+   * SHANIU：档案里没有这一轮的收口记录，适配层只能如实标「状态未知」。
+   * 它与 `interrupted` 的差别是不声称「进程在回合中途退出」——没有证据；
+   * 也不声称「已中止」。agent loop 从不发出它，只有会话重建在宿主无法给出
+   * 结论时补一次（状态源收敛 Phase 1）。
+   */
+  indeterminate: { kind: 'indeterminate' }
+  /**
    * Fork-seed construction closed a turn that was still open at the fork
    * boundary in the source session. Only fork seeds carry this marker — the
    * loop never emits it — and the source events before the boundary remain

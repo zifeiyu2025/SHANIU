@@ -55,6 +55,7 @@ function failureMessage(
 ): string {
   if (code === 'ACCOUNT_SIGNED_OUT') return t('message.failure.accountSignedOut')
   if (code === 'INTERRUPTED') return t('message.failure.interrupted')
+  if (code === 'TURN_UNKNOWN') return t('message.failure.turnUnknown')
   if (code === 'ACCOUNT_SIGN_IN_REQUIRED') return t('message.failure.accountSignInRequired')
   if (code === 'QUOTA' || code === 'ACCOUNT_QUOTA') return t('message.failure.quota')
   return code === 'AUTH' ? t('message.failure.auth') : message
@@ -137,9 +138,11 @@ function TurnErrorItem({ node, t }: {
   const detail = node.detail
   return (
     <div className={css.turnErrorRow} role="status">
-      <StateDot state="error" className={css.turnErrorDot} />
+      <StateDot state={node.code === 'TURN_UNKNOWN' ? 'warning' : 'error'} className={css.turnErrorDot} />
       <div className={css.turnErrorCopy}>
-        <span className={css.turnErrorTitle}>{node.code === 'ACCOUNT_SIGNED_OUT' || node.code === 'INTERRUPTED' ? t('message.taskStopped') : t('message.turnError')}</span>
+        <span className={css.turnErrorTitle}>{node.code === 'TURN_UNKNOWN'
+          ? t('message.turnUnknown')
+          : node.code === 'ACCOUNT_SIGNED_OUT' || node.code === 'INTERRUPTED' ? t('message.taskStopped') : t('message.turnError')}</span>
         <span className={css.turnErrorMessage}>{failureMessage(node.message, node.code, t)}</span>
         {detail !== undefined && detail !== '' && (
           <details className={css.turnErrorDetail}>
@@ -159,7 +162,7 @@ function TurnErrorItem({ node, t }: {
           </details>
         )}
       </div>
-      {node.code !== undefined && node.code !== 'INTERRUPTED' && <code className={css.turnErrorCode}>{node.code}</code>}
+      {node.code !== undefined && node.code !== 'INTERRUPTED' && node.code !== 'TURN_UNKNOWN' && <code className={css.turnErrorCode}>{node.code}</code>}
     </div>
   )
 }

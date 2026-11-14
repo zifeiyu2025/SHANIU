@@ -720,10 +720,10 @@ function archiveTurnReason(reason: string, error?: TurnErrorInfo): Record<string
     case 'budget_exhausted':
       return { kind: 'error', error: { code: 'BUDGET_EXHAUSTED', message: '本轮已达到轮次上限' } }
     default:
-      // 档案没记录可信结局（旧档缺 turn_end 行、进程中途退出）。上游 `turn/end`
-      // 没有 `unknown` 这个 reason，语义对应的就是 `interrupted`：
-      // 「崩溃/缺结尾的回合事后被补上收口」。界面据此常开，不折叠成正常完成。
-      return { kind: 'interrupted' }
+      // 档案没记录可信结局（旧档缺 turn_end 行、进程中途退出）。状态源收敛
+      // Phase 1：不再把它翻译成 `interrupted`——那是在替宿主下「已中止」的结论，
+      // 而档案只证明了「没有结论」。`indeterminate` 如实说「状态未知」。
+      return { kind: 'indeterminate' }
   }
 }
 
@@ -1679,11 +1679,12 @@ export function createAdapter(options: AdapterOptions): { remote: unknown; dispo
   /**
    * 60s 无帧兜底（docs/04 §1.4）。
    *
-   * 只负责**发现问题并请求事实**，收口的唯一依据是宿主 `session_runtime`：
+   * 只观测、不收口（状态源收敛 Phase 1）：
    * - 宿主说同一个会话还在跑（turn 或 compaction）→ 续期，回合保持打开。长时间
    *   编译/命令执行这类「安静但活着」的回合不会被误杀。
-   * - 宿主确认空闲 → 前端 fail-closed 收口（`turn/end{kind:'interrupted'}`），
-   *   并收回运行态、补发排队消息。
+   * - 宿主确认空闲 → 只留痕，不写 `turn/end`。`session_runtime` 只回答「还有任务吗」，
+   *   「此刻没有任务」不等于「上一回合已中止」；回合的结论由宿主写进档案
+   *   （Phase 3 的 `reconcile_session`），前端宁可为「未知」等一次结论，也不补写。
    * - 查询失败 → 不动（未知），下一轮再问；绝不把「问不到」当成「空闲」。
    *
    * 泳道没有独立的宿主任务，按它的父会话判运行态（`agents` 的 `parentId`）。
@@ -1696,7 +1697,7 @@ export function createAdapter(options: AdapterOptions): { remote: unknown; dispo
       silenceChecking.add(sessionId)
       try {
         const view = usableActiveTaskView(await bridge.invoke<unknown>('session_runtime'))
-        // 查询期间 journal 可能已被重建、回合可能已收口：以最新状态为准，不重复收口。
+        // 查询期间 journal 可能已被重建、回合可能已收口：以最新状态为准。
         if (journals.get(sessionId) !== journal || !journal.taskOpen) continue
         const runtimeId = agents.get(sessionId)?.parentId ?? sessionId
         if (view === undefined) {
@@ -1707,9 +1708,9 @@ export function createAdapter(options: AdapterOptions): { remote: unknown; dispo
           journal.lastFrameAt = now()
           continue
         }
-        closeTask(sessionId, journal, { kind: 'interrupted' }, true)
-        dispatch('api-session/status', sessionId, false)
-        void drainQueues()
+        // 宿主确认空闲：只留痕。前端不再据此写收口，也不擅自收回运行态、补发排队消息。
+        console.info(`[SHANIU] 会话 ${sessionId} 超过 ${SILENCE_TIMEOUT_MS / 1000}s 无帧且宿主已空闲：`
+          + '保持回合打开，等待宿主结论或用户手动停止')
       } catch (reason: unknown) {
         console.warn(`[SHANIU] 会话 ${sessionId} 无帧兜底：宿主运行态查询失败，保持现状`, reason)
       } finally {
@@ -1756,16 +1757,18 @@ export function createAdapter(options: AdapterOptions): { remote: unknown; dispo
       closeStepMetrics(journal)
       stepOpen = false
     }
-    // 默认收口只用于「回合没有可信结局」：上游对应 `interrupted`（事后补收口），
-    // 不用 `unknown`——它不在 turn/end 的合法 reason 里。
-    const closeTurn = (reason: Record<string, unknown> = { kind: 'interrupted' }): void => {
+    // 默认收口只用于「回合没有可信结局」：说「状态未知」，不说「已中止」
+    // （状态源收敛 Phase 1）。`interrupted` 是宿主对「进程在回合中途退出」的结论，
+    // 前端没有依据下这个结论；`indeterminate` 只陈述「没有结论」。
+    const closeTurn = (reason: Record<string, unknown> = { kind: 'indeterminate' }): void => {
       closeStep()
       if (!journal.taskOpen) return
       pushEvent(journal, 'turn/end', { turn: journal.turn, reason })
       journal.taskOpen = false
     }
+    // 开新回合不再顺带收掉旧回合：收口是宿主的结论，不该是新回合的副作用。
+    // 旧档里前一个回合还开着的情形，由调用点显式标「状态未知」（见 user message 分支）。
     const startTurn = (): void => {
-      closeTurn()
       journal.turn += 1
       journal.step = 0
       journal.taskOpen = true
@@ -1781,10 +1784,10 @@ export function createAdapter(options: AdapterOptions): { remote: unknown; dispo
         // 每条档案条目带自己的落档时刻：本条事件取它，不再取打开会话那一刻。
         replayClock = 'at_ms' in entry && (entry.at_ms ?? 0) > 0 ? entry.at_ms : 0
         if (entry.kind === 'turn_end') {
-          // 结局行：新档案才有；旧档案走到末尾时由宿主确认空闲后补 `interrupted`。
+          // 结局行：新档案才有；旧档案走到末尾时由宿主的结论（或「状态未知」）收口。
           // 档案顺序即回合顺序，结局行收的就是当前还开着的那个回合。`entry.turn` 是
           // 后端采样迭代序号，不是前端按用户消息计的回合号——拿它做等值比较，口径一旦
-          // 不同就把宿主已经给出的结论丢掉，末尾兜底随后会补一条 `interrupted` 盖掉它。
+          // 不同就把宿主已经给出的结论丢掉，末尾兜底随后会补一条收口盖掉它。
           if (journal.taskOpen) closeTurn(archiveTurnReason(entry.reason, entry.error))
           journal.entryToSeq[index] = journal.seq
           return
@@ -1817,6 +1820,9 @@ export function createAdapter(options: AdapterOptions): { remote: unknown; dispo
         }
 
         if (entry.kind === 'message' && entry.role === 'user') {
+          // 旧档案没有结局行：上一条用户消息开的回合还开着。留成「进行中」同样是猜，
+          // 而且会一直转圈；这里如实标「状态未知」，不补「已中止」。
+          if (journal.taskOpen) closeTurn()
           startTurn()
           openStep(0)
           // 新档案带结构化 `images`；旧档案只有正文里的 marker，按旧形态解码。
@@ -1929,7 +1935,8 @@ export function createAdapter(options: AdapterOptions): { remote: unknown; dispo
       // 末尾收口只在宿主**确认**本会话没有任务时执行（运行态以宿主为准）：
       // 任务真在跑还补一条 turn_end，后续实时帧会挂到已收口的回合上。
       // 查询失败同样不写——那是「不知道」，不是「空闲」。
-      if (close.closeOpenTurn) closeTurn()
+      // 结论只能是「状态未知」：档案没有结局行，宿主也没给出结局（Phase 1）。
+      if (close.closeOpenTurn) closeTurn({ kind: 'indeterminate' })
       else journal.hostRuntimeUnknown = close.runtimeUnknown
     } finally {
       replayClock = undefined

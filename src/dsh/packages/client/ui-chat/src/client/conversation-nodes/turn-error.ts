@@ -45,6 +45,9 @@ function endFailure(reason: TurnEndReason): { readonly message: string; readonly
         : undefined
     case 'interrupted':
       return { message: 'The DSH process exited before this turn finished.', code: 'INTERRUPTED' }
+    case 'indeterminate':
+      // SHANIU：档案没有收口记录，不知道这一轮是结束了还是还在跑。
+      return { message: 'This turn has no recorded ending.', code: 'TURN_UNKNOWN' }
     default:
       // Completed, blocked, max-tokens, forked, and plugin-merged endings have no failure row.
       return undefined
