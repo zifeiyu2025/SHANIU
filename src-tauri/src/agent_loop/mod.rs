@@ -701,6 +701,7 @@ impl AgentLoop {
                 emit(
                     EventMsg::CompactionEnded {
                         compaction_id,
+                        trigger,
                         ok: true,
                         error: None,
                         history_tokens_after: Some(stats.history_tokens_after),
@@ -720,6 +721,7 @@ impl AgentLoop {
                 emit(
                     EventMsg::CompactionEnded {
                         compaction_id,
+                        trigger,
                         ok: false,
                         error: Some(abort.message()),
                         history_tokens_after: None,
@@ -1275,6 +1277,7 @@ impl AgentLoop {
                             &sink,
                             EventMsg::CompactionEnded {
                                 compaction_id,
+                                trigger: crate::events::CompactionTrigger::Pressure,
                                 ok: true,
                                 error: None,
                                 history_tokens_after: Some(stats.history_tokens_after),
@@ -1287,6 +1290,7 @@ impl AgentLoop {
                             &sink,
                             EventMsg::CompactionEnded {
                                 compaction_id,
+                                trigger: crate::events::CompactionTrigger::Pressure,
                                 ok: false,
                                 error: Some(message.clone()),
                                 history_tokens_after: None,

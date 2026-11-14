@@ -83,6 +83,9 @@ export function sessionEntriesToEvents(
   let seq = 0
   let turn = 0
   let open = false
+  // 压缩锚点编号：`seq` 由 `push` 自增，读到的是"下一条事件序号"而不是锚点编号，
+  // 所以单独计数，导出 id 才稳定（同一个锚点三条事件共用一个编号）。
+  let compactionIndex = 0
 
   /** 推入一条事件：`time` 取档案时刻，未知则 0 + `timeUnreliable`（只加不改已有字段）。 */
   const push = (event: Record<string, unknown>, at: { time: number; unreliable: boolean }): void => {
@@ -133,10 +136,27 @@ export function sessionEntriesToEvents(
       continue
     }
     if (entry.kind === 'compaction_summary') {
-      // 压缩摘要不是用户回合：上游 formatter 只把 `source.kind === 'user'` 的
+      // 跳过用户消息的语义不变（N3）：上游 formatter 只把 `source.kind === 'user'` 的
       // user/message 计入分段（`markdown.ts` 的 `collectTurns`），压缩锚点在上游也
-      // 从不导出成用户消息。这里跳过，既不虚增回合，也不把摘要伪装成用户发言；
-      // 原文仍完整保留在会话档案里。
+      // 从不导出成用户消息。但三条 log-only 压缩事务必须补上——否则导出档案里
+      // compaction 恒为 0，与宿主 events 对不上，事后无法回答"这段历史为什么没了"。
+      // 这里不发任何 surface 事件（无 `surfaceOp`/`sourceEventSeqs`）：历史用户回合
+      // 保持不变，压缩前后的可见节点仍与档案一致。
+      compactionIndex += 1
+      const compactionId = `shaniu-export-compaction-${String(compactionIndex)}`
+      const at = entryTime(entry)
+      // `turn: null` 是上游"回合外的独立事务"语义，与锚点在档案里的位置一致：
+      // 上一回合已经 turn/end、下一回合还没 turn/start。写当前 `turn` 会让上游
+      // "带号事务必须被该回合严格包住"的关系校验失败（锚点在回合之外）。
+      push({ type: 'compaction/start', data: { compactionId, turn: null } }, at)
+      // 只带档案里确有的正文：`shadowedRange`/`shadowedSeqs` 在档案里是历史条目下标、
+      // 不是 surface seq，`shadowedTokenCount`/`provider`/`model` 也没有可信来源，
+      // 一律不填——宁缺勿造，不拿猜测值污染审计档案。
+      push({
+        type: 'compaction/summary',
+        data: { compactionId, summary: [{ type: 'text', text: entry.text }] },
+      }, at)
+      push({ type: 'compaction/end', data: { compactionId, turn: null } }, at)
       continue
     }
     if (entry.kind === 'message') {

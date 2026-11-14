@@ -115,6 +115,68 @@ describe('档案条目 → 逻辑事件', () => {
     expect((events[0] as { type: string }).type).toBe('session/title')
   })
 
+  it('压缩锚点补三条 log-only 事务事件，摘要不伪装成用户发言', () => {
+    const anchorAt = 1_700_000_500_000
+    const events = sessionEntriesToEvents([
+      { kind: 'message', role: 'user', text: '第一问', at_ms: 1_700_000_000_000 },
+      { kind: 'message', role: 'assistant', text: '第一答', at_ms: 1_700_000_001_000 },
+      {
+        kind: 'compaction_summary',
+        text: '## 摘要正文',
+        range_start: 0,
+        range_end: 2,
+        at_ms: anchorAt,
+      },
+      { kind: 'message', role: 'user', text: '第二问', at_ms: 1_700_000_600_000 },
+      { kind: 'message', role: 'assistant', text: '第二答', at_ms: 1_700_000_601_000 },
+    ], '标题')
+
+    const start = ofType(events, 'compaction/start')
+    const summary = ofType(events, 'compaction/summary')
+    const end = ofType(events, 'compaction/end')
+    // 反向对照：删掉该分支里的三条 push（A2 修复前的行为），这三条断言必红——
+    // 导出档案里 compaction 恒为 0，宿主 events 里的压缩记录在导出里凭空消失。
+    expect([start.length, summary.length, end.length]).toEqual([1, 1, 1])
+    // 顺序固定：start → summary → end（上游按此配对，乱序即孤儿事务）
+    expect(events.map(event => (event as { type: string }).type)
+      .filter(type => type.startsWith('compaction/'))).toEqual([
+      'compaction/start', 'compaction/summary', 'compaction/end',
+    ])
+
+    const idOf = (event: Record<string, unknown>): unknown => (event['data'] as { compactionId: string }).compactionId
+    expect(idOf(start[0]!)).toBe('shaniu-export-compaction-1')
+    expect(idOf(summary[0]!)).toBe(idOf(start[0]!))
+    expect(idOf(end[0]!)).toBe(idOf(start[0]!))
+    // 正文取锚点 text；`shadowed*`/`provider`/`model` 没有可信来源，一条也不编造
+    expect((summary[0]!['data'] as { summary: unknown }).summary)
+      .toEqual([{ type: 'text', text: '## 摘要正文' }])
+    expect(Object.keys(summary[0]!['data'] as object).sort())
+      .toEqual(['compactionId', 'summary'])
+    // 锚点在回合外：上一回合已 turn/end、下一回合还没 turn/start
+    expect((start[0]!['data'] as { turn: number | null }).turn).toBeNull()
+    expect((end[0]!['data'] as { turn: number | null }).turn).toBeNull()
+    expect('error' in (end[0]!['data'] as object)).toBe(false)
+
+    for (const event of [start[0]!, summary[0]!, end[0]!]) {
+      // 与相邻事件同一口径：取锚点的 at_ms
+      expect(event['time']).toBe(anchorAt)
+      // log-only：带 surfaceOp 会改变 surface 并触发上游 system 头保护
+      expect('surfaceOp' in event).toBe(false)
+    }
+
+    // N3 不变：摘要不当用户发言，用户消息仍只有档案里那两条，且正文不含摘要
+    const users = ofType(events, 'user/message')
+    expect(users).toHaveLength(2)
+    expect(users.map(event => (event['data'] as { content: { text?: string }[] }).content[0]?.text))
+      .toEqual(['第一问', '第二问'])
+    const serialized = JSON.stringify(events)
+    expect(serialized.split('## 摘要正文')).toHaveLength(2) // 只出现一次（summary 事件内）
+
+    // seq 仍从 1 连续递增（新增三条事件不破坏本地单调序号）
+    const seqs = events.map(event => (event as { seq: number }).seq)
+    expect(seqs).toEqual(seqs.map((_, index) => index + 1))
+  })
+
   it('档案结局行如实进 turn/end：失败不写成成功，原始错误一并带出', () => {
     const events = sessionEntriesToEvents([
       { kind: 'message', role: 'user', text: '问' },

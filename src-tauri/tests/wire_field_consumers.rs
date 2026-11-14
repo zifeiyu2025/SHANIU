@@ -223,7 +223,7 @@ const RULES: &[Rule] = &[
     Rule {
         owner: "EventMsg",
         variant: "CompactionEnded",
-        fields: "compaction_id ok error",
+        fields: "compaction_id trigger ok error",
         overrides: &[("history_tokens_after", Status::Gap("待前端补读：用户最想看压缩后是否真的变短"))],
     },
     // ── resume 的产出（内部结构，不是前端 wire；Read = 生产调用点有消费方） ──

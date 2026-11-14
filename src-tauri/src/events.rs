@@ -489,6 +489,9 @@ pub enum EventMsg {
     /// 「一次普通的工具失败」分开，事后也没有时间线可对。
     CompactionEnded {
         compaction_id: String,
+        /// 与 started/summarized 同型：成败事件本身要能回答是哪条路径收的口，
+        /// 不依赖消费端记 trace。
+        trigger: CompactionTrigger,
         ok: bool,
         /// 失败原因；成功时缺省（`skip_serializing_if` 保证不产生该键）。
         #[serde(default, skip_serializing_if = "Option::is_none")]

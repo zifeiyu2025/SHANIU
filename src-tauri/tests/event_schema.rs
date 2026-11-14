@@ -224,12 +224,14 @@ fn all_variants() -> Vec<EventMsg> {
         // ended 的两个分支：成功只带 history_tokens_after，失败只带 error
         EventMsg::CompactionEnded {
             compaction_id: "cmp-1-0".into(),
+            trigger: CompactionTrigger::Pressure,
             ok: true,
             error: None,
             history_tokens_after: Some(900),
         },
         EventMsg::CompactionEnded {
             compaction_id: "cmp-2-0".into(),
+            trigger: CompactionTrigger::Manual,
             ok: false,
             error: Some("压缩被用户取消".into()),
             history_tokens_after: None,

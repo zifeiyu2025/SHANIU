@@ -107,6 +107,13 @@ pub async fn compact_now(
         emit_ended(sink, &compaction_id, Err(error.clone()));
         return Err(error);
     }
+    // 与自动路径同一文案，排障时用一条 grep 能同时看到两条路径。
+    tracing::info!(
+        trigger = "manual",
+        compressed_items = shadowed_items,
+        history_len = resumed.history.len() - shadowed_items + 1,
+        "上下文已压缩（SH-032）"
+    );
     emit(
         sink,
         EventMsg::CompactionSummarized {
@@ -135,6 +142,10 @@ fn emit(sink: &dyn EventSink, msg: EventMsg) {
     }
 }
 
+/// 发 `compaction_ended`。
+///
+/// 仅手动路径使用，故固定 [`CompactionTrigger::Manual`]；自动路径由 `agent_loop`
+/// 各自填（预算压力 / 溢出补救）。
 fn emit_ended(
     sink: &dyn EventSink,
     compaction_id: &str,
@@ -148,6 +159,7 @@ fn emit_ended(
         sink,
         EventMsg::CompactionEnded {
             compaction_id: compaction_id.to_string(),
+            trigger: CompactionTrigger::Manual,
             ok,
             error,
             history_tokens_after,

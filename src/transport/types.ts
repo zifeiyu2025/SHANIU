@@ -189,7 +189,7 @@ export type EventMsg =
   | { type: 'system_prompt'; text: string; sha256: string; at_ms: number; turn: number; step: number }
   | { type: 'compaction_started'; compaction_id: string; trigger: CompactionTrigger; range_start: number; range_end: number; estimated_tokens: number; budget_tokens: number; turn: number | null }
   | { type: 'compaction_summarized'; compaction_id: string; trigger: CompactionTrigger; range_start: number; range_end: number; shadowed_items: number; shadowed_tokens: number; summary: string }
-  | { type: 'compaction_ended'; compaction_id: string; ok: boolean; error?: string | null; history_tokens_after?: number | null };
+  | { type: 'compaction_ended'; compaction_id: string; trigger: CompactionTrigger; ok: boolean; error?: string | null; history_tokens_after?: number | null };
 
 export interface AgentEvent {
   event_id: string;

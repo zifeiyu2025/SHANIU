@@ -36,7 +36,7 @@ import {
   relaySourceOf, settledNoticeOf, timingProjectionOf,
   type SubagentCatalogEntry, type SubagentCatalogEventData, type SubagentTimingState,
 } from './subagent-wire'
-import type { ActiveTaskView, AgentEvent, CompactionTrigger, EventMsg, ReconcileReply, ReconcileStatus, SessionEntryLike, SessionListRow, TurnErrorInfo, VerifyState } from './types'
+import type { ActiveTaskView, AgentEvent, EventMsg, ReconcileReply, ReconcileStatus, SessionEntryLike, SessionListRow, TurnErrorInfo, VerifyState } from './types'
 import { archiveImageToPrompt, imageContentBlocks, type PromptImageRef } from './image-ref'
 import type { HostBridge } from './tauri'
 import { startApprovalLease } from './approval-lease'
@@ -808,7 +808,6 @@ export function createAdapter(options: AdapterOptions): { remote: unknown; dispo
    * 契约上每次压缩都必然成对发 started/ended（失败/取消也发 ended），这里不会无界增长。
    */
   interface CompactionTrace {
-    trigger: CompactionTrigger
     /** started 事件的 seq：checkpoint 用它当被替换项之一（该事件不产出任何节点）。 */
     startSeq?: number
     /** summarized 的摘要正文与 seq；checkpoint 的正文只取这一份，实时/回放才同文。 */
@@ -2570,7 +2569,6 @@ export function createAdapter(options: AdapterOptions): { remote: unknown; dispo
           compactionId: msg.compaction_id,
         })
         compactionTraces.set(msg.compaction_id, {
-          trigger: msg.trigger,
           startSeq,
         })
         return
@@ -2603,7 +2601,7 @@ export function createAdapter(options: AdapterOptions): { remote: unknown; dispo
         // 只透传 `error` 的话，刚被显式化的失败会在前端被抹平成正常结束。
         const trace = compactionTraces.get(msg.compaction_id)
         compactionTraces.delete(msg.compaction_id)
-        const trigger = trace?.trigger
+        const trigger = msg.trigger
         const reason = typeof msg.error === 'string' && msg.error.trim() !== '' ? msg.error : undefined
         const failure = msg.ok ? undefined : (reason ?? '宿主未给出原因')
         pushEvent(journal, 'compaction/end', {

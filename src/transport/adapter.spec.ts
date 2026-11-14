@@ -1296,7 +1296,7 @@ describe('适配层把 EventMsg 流映射成 DSH 会话 journal', () => {
       range_start: 0, range_end: 3, shadowed_items: 3, shadowed_tokens: 640, summary: '摘要',
     })
     bridge.emit('agent-ok', {
-      type: 'compaction_ended', compaction_id: 'c2', ok: true, history_tokens_after: 120,
+      type: 'compaction_ended', compaction_id: 'c2', trigger: 'pressure', ok: true, history_tokens_after: 120,
     })
 
     const iterator = session.follow({ address: { kind: 'session', sessionId: 'agent-ok' } })
@@ -1359,7 +1359,7 @@ describe('适配层把 EventMsg 流映射成 DSH 会话 journal', () => {
       type: 'compaction_started', compaction_id: 'c1', trigger: 'pressure',
       range_start: 0, range_end: 3, estimated_tokens: 900, budget_tokens: 800, turn: 1,
     })
-    bridge.emit('agent-compact', { type: 'compaction_ended', compaction_id: 'c1', ok: false })
+    bridge.emit('agent-compact', { type: 'compaction_ended', compaction_id: 'c1', trigger: 'pressure', ok: false })
 
     const iterator = session.follow({ address: { kind: 'session', sessionId: 'agent-compact' } })
     const journal = eventsOf((await iterator.next()).value as Record<string, unknown>)
@@ -1385,7 +1385,7 @@ describe('适配层把 EventMsg 流映射成 DSH 会话 journal', () => {
       type: 'compaction_started', compaction_id: 'c2', trigger: 'pressure',
       range_start: 0, range_end: 3, estimated_tokens: 900, budget_tokens: 800, turn: 1,
     })
-    bridge.emit('agent-ok', { type: 'compaction_ended', compaction_id: 'c2', ok: true, history_tokens_after: 200 })
+    bridge.emit('agent-ok', { type: 'compaction_ended', compaction_id: 'c2', trigger: 'pressure', ok: true, history_tokens_after: 200 })
 
     const iterator = session.follow({ address: { kind: 'session', sessionId: 'agent-ok' } })
     const journal = eventsOf((await iterator.next()).value as Record<string, unknown>)
@@ -1466,7 +1466,7 @@ describe('适配层把 EventMsg 流映射成 DSH 会话 journal', () => {
       type: 'compaction_summarized', compaction_id: 'c9', trigger: 'pressure',
       range_start: 0, range_end: 2, shadowed_items: 2, shadowed_tokens: 320, summary: '同一段摘要',
     })
-    liveBridge.emit('agent-live', { type: 'compaction_ended', compaction_id: 'c9', ok: true, history_tokens_after: 100 })
+    liveBridge.emit('agent-live', { type: 'compaction_ended', compaction_id: 'c9', trigger: 'pressure', ok: true, history_tokens_after: 100 })
     const liveIterator = liveSession.follow({ address: { kind: 'session', sessionId: 'agent-live' } })
     const liveEvents = eventsOf((await liveIterator.next()).value as Record<string, unknown>)
     await liveIterator.return?.(undefined)
@@ -1500,7 +1500,7 @@ describe('适配层把 EventMsg 流映射成 DSH 会话 journal', () => {
       type: 'compaction_started', compaction_id: 'c3', trigger: 'manual',
       range_start: 0, range_end: 3, estimated_tokens: 900, budget_tokens: 800, turn: null,
     })
-    bridge.emit('agent-manual', { type: 'compaction_ended', compaction_id: 'c3', ok: false })
+    bridge.emit('agent-manual', { type: 'compaction_ended', compaction_id: 'c3', trigger: 'manual', ok: false })
 
     const iterator = session.follow({ address: { kind: 'session', sessionId: 'agent-manual' } })
     const journal = eventsOf((await iterator.next()).value as Record<string, unknown>)
