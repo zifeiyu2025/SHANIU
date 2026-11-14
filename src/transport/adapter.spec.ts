@@ -9,6 +9,9 @@ import { assertSessionWireEvent } from '../dsh/packages/api/session-controller/s
 import { ClientSessions } from '../dsh/packages/api/session-controller/src/client/sessions/service.ts'
 import { ClientWorkspaceModel } from '../dsh/packages/api/workspace-controller/src/client/model.ts'
 import { compactionDefinition } from '../dsh/packages/client/ui-chat/src/client/conversation-nodes/compaction.ts'
+import { commandDefinition } from '../dsh/packages/client/ui-chat/src/client/conversation-nodes/command.ts'
+import { SurfaceManager } from '../dsh/packages/core/session/src/surface.ts'
+import { R4_EVENT_LINES, R4_MANUAL_EVENT_LINES, R4_THIRD_SUMMARY_LINE } from './fixtures/r4-compaction'
 import { createAdapter } from './adapter'
 import { PRESET_BUNDLES } from './permission-presets'
 import { registerExportTrigger } from './command-triggers'
@@ -483,8 +486,45 @@ function eventsOf(snapshot: Record<string, unknown>): Record<string, unknown>[] 
   return (snapshot['records'] as { event: Record<string, unknown> }[]).map(record => record.event)
 }
 
+/** 压缩 checkpoint 的唯一形态（上游 `CompactionItem` 只认它）。 */
+function isCompactCheckpoint(event: Record<string, unknown>): boolean {
+  return event['type'] === 'user/message'
+    && (event['data'] as { source?: { kind?: string } }).source?.kind === 'compact-checkpoint'
+}
+
+/** 原样回放 r4 事件信封：会话 / agent / 时间 / 事件 id 全部照用，不改写任何字段。 */
+function replayR4(bridge: ScriptedBridge, lines: readonly string[]): string {
+  let sessionId = ''
+  for (const line of lines) {
+    const envelope = JSON.parse(line) as {
+      event_id: string; session_id: string; agent_id: string; ts_ms: number; msg: EventMsg
+    }
+    sessionId = envelope.session_id
+    bridge.emit(envelope.session_id, envelope.msg, envelope.agent_id, envelope.ts_ms, envelope.event_id)
+  }
+  return sessionId
+}
+
+/**
+ * 用 DSH 客户端真正会走的 surface 折叠器折这份 journal。
+ *
+ * `assertSessionWireEvent` 只做事件级校验；替换区间是否成立、有没有改写 system 头节点，
+ * 只有 `foldSurface` 会判——真机「压缩发生了但界面什么都没有」正是丢在这一步。
+ */
+function foldedSurface(journal: Record<string, unknown>[]): number[] {
+  return new SurfaceManager(journal as never).nodes as unknown as number[]
+}
+
 /** 让 manager 的微任务通知落地：`sessions.list` 的订阅回填要等一拍才可见。 */
 const flush = (): Promise<void> => new Promise(resolve => { setTimeout(resolve, 0) })
+
+/** 命令面的窄形状：r4 手动 `/compact` 用例只需要 `commands.execute`。 */
+function commandFaceOf(remote: unknown): {
+  session: SessionFace
+  commands: { execute(sessionId: string, input: string): Promise<Record<string, unknown>> }
+} {
+  return remote as never
+}
 
 /** 会话面在测试里的窄形状：只声明被测方法，避免每处都写类型断言。 */
 interface SessionFace {
@@ -1394,6 +1434,158 @@ describe('适配层把 EventMsg 流映射成 DSH 会话 journal', () => {
     expect(journal.some(event => event['type'] === 'developer/message')).toBe(false)
 
     await iterator.return?.(undefined)
+    dispose()
+  })
+
+  // ── N5 返工：用 r4 真机证据原样回放，锁住「真机那条路径」 ──────────────────
+  it('N5 真机复现（r4 事件原样回放）：实时自动压缩后必须落可见节点，替换要过客户端 foldSurface', async () => {
+    const bridge = scriptedBridge()
+    const { remote, dispose } = createAdapter({ bridge })
+    const session = faceOf(remote).session
+    const sessionId = replayR4(bridge, R4_EVENT_LINES)
+    expect(sessionId).toBe('sess-1794677442737-0002')
+
+    const iterator = session.follow({ address: { kind: 'session', sessionId } })
+    const journal = eventsOf((await iterator.next()).value as Record<string, unknown>)
+    await iterator.return?.(undefined)
+
+    journal.forEach(event => expect(() => assertSessionWireEvent(event)).not.toThrow())
+    const checkpoints = journal.filter(isCompactCheckpoint)
+    expect(checkpoints).toHaveLength(1)
+    const checkpoint = checkpoints[0]!
+
+    // 真机消费端的闸门：事件级校验之上还有整段 surface 折叠（system 头节点保护）。
+    let nodes: number[] = []
+    expect(() => { nodes = foldedSurface(journal) }).not.toThrow()
+    expect(nodes).toContain(checkpoint['seq'] as number)
+    const systemSeq = journal.find(event => event['type'] === 'system/message')?.['seq'] as number
+    expect(nodes[0]).toBe(systemSeq)
+
+    expect(compactionDefinition.match!(checkpoint as never)).toMatchObject({ role: 'update' })
+    const summaryEvent = journal.find(event => event['type'] === 'compaction/summary')!
+    const node = compactionDefinition.buildViewNode!({
+      key: 'r4', id: 'r4', start: { event: checkpoint, location: { kind: 'unresolved' } },
+      matches: [
+        { event: summaryEvent, location: { kind: 'unresolved' } },
+        { event: checkpoint, location: { kind: 'unresolved' } },
+      ],
+      state: {
+        summary: { event: summaryEvent, location: { kind: 'unresolved' } },
+        checkpoint: { event: checkpoint, location: { kind: 'unresolved' } },
+      },
+    } as never) as unknown as { kind: string; data: { summary: string | null } } | null
+    expect(node?.kind).toBe('compaction')
+    expect((node?.data.summary ?? '').length).toBeGreaterThan(0)
+    expect(journal.some(event => event['type'] === 'developer/message'
+      && (event['data'] as { source?: { kind?: string } }).source?.kind === 'compaction-notice')).toBe(false)
+    dispose()
+  })
+
+  it('N5 真机复现（r4 真实档案）：锚点是档案第一条时，重开必须落同形压缩节点而不是通知', async () => {
+    const third = JSON.parse(R4_THIRD_SUMMARY_LINE) as {
+      msg: { summary: string; range_start: number; range_end: number }
+    }
+    const archive = [{
+      kind: 'compaction_summary',
+      text: third.msg.summary,
+      range_start: third.msg.range_start,
+      range_end: third.msg.range_end,
+    }]
+    const bridge = scriptedBridge(undefined, archive)
+    const { remote, dispose } = createAdapter({ bridge })
+    const iterator = faceOf(remote).session.follow({ address: { kind: 'session', sessionId: 'agent-r4-reopen' } })
+    const journal = eventsOf((await iterator.next()).value as Record<string, unknown>)
+    await iterator.return?.(undefined)
+
+    journal.forEach(event => expect(() => assertSessionWireEvent(event)).not.toThrow())
+    expect(journal.some(event => (event['data'] as { source?: { kind?: string } }).source?.kind === 'compaction-notice')).toBe(false)
+    const checkpoints = journal.filter(isCompactCheckpoint)
+    expect(checkpoints).toHaveLength(1)
+    // 与实时同形：替换型 checkpoint，不是通知、也不是裸摘要 user/message。
+    expect(checkpoints[0]!['surfaceOp']).toMatchObject({ op: 'replace' })
+    let nodes: number[] = []
+    expect(() => { nodes = foldedSurface(journal) }).not.toThrow()
+    expect(nodes).toContain(checkpoints[0]!['seq'] as number)
+    dispose()
+  })
+
+  it('N5 真机复现（r4 手动 /compact）：命令卡与压缩节点合成一个 manual-compaction 节点，会话区不再铺摘要正文', async () => {
+    const manual = R4_MANUAL_EVENT_LINES.map(line => JSON.parse(line) as {
+      event_id: string; session_id: string; agent_id: string; ts_ms: number; msg: EventMsg
+    })
+    const summarized = manual[1]!.msg as Extract<EventMsg, { type: 'compaction_summarized' }> & {
+      shadowed_items?: number
+    }
+    let bridge!: ScriptedBridge
+    bridge = scriptedBridge(undefined, [], undefined, undefined, undefined, () => {
+      // 真机顺序：命令卡先入 journal，宿主在 compact_session 期间广播三次压缩事件。
+      for (const envelope of manual) {
+        bridge.emit(envelope.session_id, envelope.msg, envelope.agent_id, envelope.ts_ms, envelope.event_id)
+      }
+      return {
+        summary: summarized.summary,
+        shadowedItems: summarized.shadowed_items,
+        shadowedTokens: summarized.shadowed_tokens,
+      }
+    })
+    const { remote, dispose } = createAdapter({ bridge })
+    const face = commandFaceOf(remote)
+    const sessionId = manual[0]!.session_id
+    expect(await face.commands.execute(sessionId, '/compact')).toMatchObject({
+      ok: true,
+      value: { result: { kind: 'success' } },
+    })
+
+    const iterator = face.session.follow({ address: { kind: 'session', sessionId } })
+    const journal = eventsOf((await iterator.next()).value as Record<string, unknown>)
+    await iterator.return?.(undefined)
+
+    journal.forEach(event => expect(() => assertSessionWireEvent(event)).not.toThrow())
+    expect(journal.some(event => (event['data'] as { source?: { kind?: string } }).source?.kind === 'compaction-notice')).toBe(false)
+    const checkpoints = journal.filter(isCompactCheckpoint)
+    expect(checkpoints).toHaveLength(1)
+    const checkpoint = checkpoints[0]!
+    const run = journal.find(event => event['type'] === 'command/run')!
+    const done = journal.find(event => event['type'] === 'command/done')!
+    const runData = run['data'] as { commandId: string; name: string; args?: string }
+    const doneData = done['data'] as { kind: 'success' | 'error'; text?: string }
+    const source = (checkpoint['data'] as { source: { sourceCommandId?: string } }).source
+    expect(source.sourceCommandId).toBe(runData.commandId)
+    // 手动压缩归命令节点：自动节点明确不看它，因此不会出现两条。
+    expect(compactionDefinition.match!(checkpoint as never)).toBeNull()
+    expect(commandDefinition.match!(checkpoint as never)).toMatchObject({ id: runData.commandId })
+
+    const summaryEvent = journal.find(event => event['type'] === 'compaction/summary')!
+    const node = commandDefinition.buildViewNode!({
+      key: 'r4m', id: 'r4m', start: { event: run, location: { kind: 'unresolved' } },
+      matches: [],
+      state: {
+        command: {
+          kind: 'command', seq: run['seq'], time: run['time'], commandId: runData.commandId,
+          name: runData.name, args: runData.args ?? null,
+          outcome: doneData.kind === 'success'
+            ? { kind: 'success', ...(doneData.text === undefined ? {} : { text: doneData.text }) }
+            : { kind: 'error', text: doneData.text ?? '' },
+        },
+        summary: { event: summaryEvent, location: { kind: 'unresolved' } },
+        checkpoint: { event: checkpoint, location: { kind: 'unresolved' } },
+      },
+    } as never) as unknown as {
+      kind: string
+      data: { command: { name: string | null }; compaction: { summary: string | null } | null }
+    } | null
+    expect(node?.kind).toBe('manual-compaction')
+    expect(node?.data.command.name).toBe('compact')
+    expect(node?.data.compaction?.summary).toBe(summarized.summary)
+
+    // 会话区不再出现"原始摘要正文"的普通用户消息（真机 01:51 的那条）。
+    const rawSummaries = journal.filter(event => event['type'] === 'user/message'
+      && !isCompactCheckpoint(event)
+      && JSON.stringify(event['data']).includes('## 用户原文'))
+    expect(rawSummaries).toHaveLength(0)
+    let nodes: number[] = []
+    expect(() => { nodes = foldedSurface(journal) }).not.toThrow()
+    expect(nodes).toContain(checkpoint['seq'] as number)
     dispose()
   })
 
@@ -2704,14 +2896,19 @@ describe('适配层的命令面映射', () => {
     const ends = ofType('turn/end')
     expect(ends).toHaveLength(1)
     expect((ends[0]!['data'] as { reason: { kind: string } }).reason.kind).toBe('completed')
-    // 摘要不伪装成用户气泡；它按实时路径的形状落成 compaction/summary + 一条通知。
-    expect(ofType('user/message').some(event => JSON.stringify(event['data']).includes('早期对话摘要')))
-      .toBe(false)
+    // 摘要只作为压缩节点的正文出现；会话区仍只有原来那条用户气泡。
+    const users = ofType('user/message')
+    const plainSummaries = users.filter(event => (event['data'] as { source?: { kind?: string } }).source?.kind !== 'compact-checkpoint'
+      && JSON.stringify(event['data']).includes('早期对话摘要'))
+    expect(plainSummaries).toHaveLength(0)
+    expect(users.filter(event => (event['data'] as { source?: { kind?: string } }).source?.kind === 'compact-checkpoint'))
+      .toHaveLength(1)
     const summaries = ofType('compaction/summary')
     expect(summaries).toHaveLength(1)
     expect(JSON.stringify(summaries[0]!['data'])).toContain('早期对话摘要')
+    // 重开与实时同形：不再退回「已压缩」通知。
     expect(ofType('developer/message').some(event => JSON.stringify(event['data']).includes('已压缩')))
-      .toBe(true)
+      .toBe(false)
   })
 
   it('宿主说本会话还在跑 → 重建不补 turn_end，实时帧继续落在同一回合', async () => {
@@ -3472,7 +3669,7 @@ describe('Plan 芯片与客户端排队', () => {
     dispose()
   })
 
-  it('/compact：成功推 run + 摘要 user 消息 + done；无可压历史与失败各回各的文案', async () => {
+  it('/compact：成功只推 run + done，摘要不再铺成用户气泡；无可压历史与失败各回各的文案', async () => {
     const bridge = scriptedBridge(undefined, undefined, undefined, undefined, undefined, () => ({
       summary: '五段式交接摘要',
       shadowedItems: 12,
@@ -3494,8 +3691,10 @@ describe('Plan 芯片与客户端排队', () => {
     const types = events.map(event => event['type'])
     expect(types).toContain('command/run')
     expect(types).toContain('command/done')
-    const summary = events.filter(event => event['type'] === 'user/message').at(-1) as { data: { content: { text: string }[] } }
-    expect(summary.data.content[0]!['text']).toBe('五段式交接摘要')
+    // 摘要正文不再作为普通用户消息铺进会话区；可见呈现由压缩事件落下的 checkpoint 负责
+    // （真机顺序见本文件「r4 手动 /compact」用例）。
+    expect(events.filter(event => event['type'] === 'user/message'
+      && JSON.stringify(event['data']).includes('五段式交接摘要'))).toHaveLength(0)
 
     // 带参数：上游 USAGE 文案原样拒绝
     const usage = await face.commands.execute('agent-new', '/compact 现在')

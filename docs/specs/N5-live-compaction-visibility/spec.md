@@ -1,101 +1,102 @@
-# N5（P2）压缩提示实时不显示 — 规格
+# N5（P2）压缩提示实时显示 — 规格 v2（真机返工）
 
-> 范围：只改前端适配层（`src/transport/`），不动 `src-tauri/`、不动 `src/dsh/` 的 vendored 代码。
-> 目标：压缩发生的当下，聊天时间线出现一条可见的压缩条目；重开后同一位置仍只有这一条，文案/位置与实时一致。
+> v1（`4a8d0be`）的口径与实现已被真机否决，本文件取代 v1 的 §2/§3/§4；v1 §1 的链路定责仍然成立（后端已广播、适配层已接收），错的只是"发出什么形状"和"何时发出"。
+> 范围：`src/transport/`（适配层 + 用例）与 `src-tauri/` 三笔 additive；不改 `src/dsh/` vendored 代码。
 
-## 1. 链路定责（依据）
+## 0. 为什么 v1 单测绿、真机红
 
-| 环节 | 结论 | 依据 |
+v1 的用例是**自造序列**：先 `prompt`（或夹具预置 surface 事件）再发 `compaction_*`，于是 `pushCompactionCheckpoint` 读到的 `journal.surfaceSeqs` 一定非空，`replace` 一定命中。它证明的只是"有 surface 时能替换"，而真机要证明的是"压缩发生的那一刻能不能自己立起锚点"。真机路径里 `surfaceSeqs` 为空（或替换被消费端整帧丢弃）时，`pushCompactionCheckpoint` 静默 `return undefined`，用例与真机就此分叉：
+
+| 真机现象 | 直接位置 | 本质 |
 |---|---|---|
-| 后端广播 | **已广播** | 两轮真机证据里 `compaction_started / compaction_summarized / compaction_ended` 三件套齐全：`docs/smoke/2026-11-14-58f56f6/r2/evidence/03-events-final.jsonl:2083-2085`、同文件 `2134-2136`、`2283-2285`；第一轮 `evidence/03-events.jsonl:722-724`。发送链路见 `src-tauri/src/events.rs:791-811`（落盘 → gateway 广播 → Tauri IPC）。 |
-| 前端接收 | **已接收并落了 journal** | `src/transport/adapter.ts:2519-2599`：`compaction_started→compaction/start`、`compaction_summarized→compaction/summary`、`compaction_ended→compaction/end`，并在 ended 追加一条 `developer/message`（`source.kind='compaction-notice'`, `form:'notice'`）。现有用例 `src/transport/adapter.spec.ts:1284-1313` 断言了这条通知存在。 |
-| 界面显示 | **收下了但没有可渲染的「压缩」节点** | 聊天面板的压缩行只由 `compactionDefinition` 产出，而它要求一个 **checkpoint**：`user/message` 替换事件 + `source.kind='compact-checkpoint'`（`src/dsh/packages/client/ui-chat/src/client/conversation-nodes/compaction.ts:31-57`，识别逻辑在 `command.ts:78-93`；`buildViewNode` 找不到 checkpoint 直接 `return null`）。适配层两条路径都**从不发**这个事件，所以实时永远不会出现压缩行。 |
+| 实时无节点、连摘要都没有 | `src/transport/adapter.ts` `pushCompactionCheckpoint` 的 `startSeq === undefined → return undefined` | 唯一出口无声，没有降级 |
+| 重开只有一条 notice | `adapter.ts` `replayArchive` 的 `entry.kind === 'compaction_summary'` 分支 | 档案首条即锚点 → surface 空 → 退回通知 |
+| 手动 `/compact` 铺原始摘要 | `adapter.ts` 手动 `/compact` 执行段把命令返回的摘要当普通 `user/message` append | 手动路径根本没走 checkpoint |
 
-补充（「只有重开才有」的来源）：重开时 `adapter.ts:1893-1917` 会为每个 `compaction_summary` 条目补一条 `compaction/summary` + 一条 `developer/message` 通知；这条通知被渲染成「上下文注入」上下文行。实时那条同形通知落在当前**未收口回合的步内**（`turn/step` = 当前），随回合过程收拢；回放那条落在**回合边界**，才单独成行。两者不是同一条渲染路径，因此表现为「实时没有、重开一条」。
+v1 还漏了一件事：实时与回放**只有"有 surface"时才同形**，而真机的两种失败恰好都是 surface 为空。
 
-结论：**不是没广播，也不是没接收，是「收下后没有生成可见的压缩节点」**；重开看到的是回放路径补的替代物。
+## 1. 第一步：用 r4 真实事件复现（必须先红）
 
-## 2. 方案（决策）
+**禁止自造事件。** 夹具逐字节取自真机证据，只在测试内做类型断言，不改写任何字段值。
 
-复用 dsh 既有的自动压缩节点 `CompactionNodeView`/`CompactionItem`——它就是为「压缩发生」设计的既有视觉，不新增任何组件或样式；同时把两条路径统一到**同一个事件形状**，保证实时/重开同位、同文、只一条。
+新增 `src/transport/fixtures/r4-compaction.ts`（测试专用，非产品代码）：
 
-### 2.1 适配层统一发出 checkpoint 锚点
+1. `R4_HOST_EVENTS`：从 `docs/smoke/2026-11-14-58f56f6/r4/evidence/r4-events-compaction.txt` 原样摘录的宿主事件 JSON 行（主实例 4 次压缩 + 失败实例 1 次），每行附来源行号注释；用 `as EventMsg` 断言，不做字段补全。
+2. `R4_EXPORT_JOURNAL`：`evidence/live-export-session-log.zip` 解出的 `session.v4.jsonl` 的 53 条真实 journal 事件（原样），用于「会话已有真实历史」的基线。
+3. `R4_ARCHIVE_ENTRY`：`evidence/r4-rollout-analysis.txt` 里真实 `compaction_summary` 条目的字段（`text`/`range_start`/`range_end`），用于重开路径。
+4. 文件头注释写明证据路径、被测提交 `9d0cfd9`、采集批次 `58f56f6`。
 
-新增内部函数（`src/transport/adapter.ts` 模块内，`pushEvent` 附近）：
+`src/transport/adapter.spec.ts` 新增 3 条用例（复用现有 fake bridge / `follow` 支架）：
 
-```
-pushCompactionCheckpoint(journal, compactionId, hiddenSeq)
-  → pushEvent(journal, 'user/message', {
-      id: `shaniu-compact-checkpoint-${compactionId}`,
-      role: 'user',
-      content: [],
-      source: { kind: 'compact-checkpoint', compactionId },
-    }, { surfaceOp: 'replace', sourceEventSeqs: [hiddenSeq] })
-```
+- **R1 实时（真实事件）**：把 `R4_HOST_EVENTS` 按原顺序 `bridge.emit` 进同一会话，断言 journal 里
+  ①恰 1 条 `user/message` 且 `source.kind === 'compact-checkpoint'`；
+  ②该事件过 `assertSessionWireEvent`；
+  ③`compactionDefinition.buildViewNode` 产出 `kind: 'compaction'` 且卡片摘要非空；
+  ④不存在 `source.kind === 'compaction-notice'` 的 `developer/message`。
+- **R2 重开（真实档案）**：用 `R4_ARCHIVE_ENTRY` 走 `replayArchive`，断言 ①产出 ≥1 条 checkpoint、②0 条 `compaction-notice`、③每条 checkpoint 都能被 `compactionDefinition` 认成节点。
+- **R3 手动（真实手动事件）**：`R4_HOST_EVENTS` 里的 `trigger: 'manual'` 段 + 命令返回，断言恰好 1 条压缩节点、0 条「原始摘要正文」形态的普通 `user/message`（判据：无 `source.kind` 且 `content` 含 `## 用户原文`）。
 
-- `surfaceOp: 'replace'` + `sourceEventSeqs` 满足 `isReplacementSurfaceEvent` 与 wire 校验；
-- `hiddenSeq` 指向本次压缩的 `compaction/start` 事件 seq（该事件本身不产出节点，隐藏它零损失），避免自引用；
-- `messageDefinition` 明确排除 checkpoint（`message.ts:46-50`），不会多出一条用户气泡；`compactionDefinition` 据此产出唯一压缩节点。
+**验收门槛**：先在未改代码上跑这 3 条，必须红；把红输出（用例名 + 断言差异）记入报告。若 R1 在现有代码上意外为绿，说明夹具没有命中真机分支，必须回到证据重取，不得改断言迁就。
 
-### 2.2 实时路径（`case 'compaction_ended'`，成功分支）
+## 2. 修复决策
 
-- `CompactionTrace` 增加 `startSeq?: number`；`compaction_started` 分支把 `pushEvent` 返回的 seq 存进去。
-- `compaction_ended && ok` 时：**删掉**原来的 `developer/message` 通知，改为 `pushCompactionCheckpoint(journal, msg.compaction_id, trace.startSeq)`。
-  - 卡片摘要来自同批 `compaction/summary`（`command.ts:101-131` 从 summary 事件取文本与 shadowed 计数/token），实时信息最全。
-- 失败分支维持现状（`developer/message` 失败通知 + `compaction/end.error`），因为失败时没有「压缩发生」可标记。
+### D1 `pushCompactionCheckpoint` 永不无声（`adapter.ts`）
 
-### 2.3 回放路径（`entry.kind === 'compaction_summary'`）
+签名不变（`journal, compactionId, summary, hiddenSeqs`），内部分两支：
 
-改成与实时同构的三步：
+- `journal.surfaceSeqs` 非空：保持 replace，`startSeq = surfaceSeqs[0]`、`endSeq = 末项`，`sourceEventSeqs = [...surfaceSeqs, ...hiddenSeqs 去重]`。
+- **为空**：发 `surfaceOp: 'append'` 的 checkpoint（上游 `buildViewNode` 只要求 `state.checkpoint` 存在，append 型 checkpoint 同样是可见节点），并写一条 `console.warn`：`[shaniu] 压缩节点降级为 append：journal.surfaceSeqs 为空（compactionId=…）`。
 
-1. `compaction/start`（记 seq，给 checkpoint 当 `hiddenSeq`）；
-2. `compaction/summary`（保留现有 `summary` 文本）；
-3. `pushCompactionCheckpoint(journal, compactionId, startSeq)`，`compactionId` 仍用 `shaniu-replay-compaction-${index}`。
+理由：这是"实时路径自己产出可替换锚点"的最小实现——锚点就是这条 checkpoint 本身，后续 surface 事件顺序 append 在它之后，不再依赖"event 先到、surface 后到"的时序巧合。返回值不再可能为 `undefined`，调用点无需再判空。
 
-**删掉** 回放的 `developer/message` 通知。这样重开后：一条压缩卡、零条「上下文注入」替代物；与实时同形同位置口径（都锚在被压缩区间的锚点处）。
+实现时确认 `validateSurfaceMetadata` 对 append 型是否允许携带 `sourceEventSeqs`；若要求 append 必须不带，则 append 分支省略该字段（只留 `surfaceOp: 'append'`）。
 
-### 2.4 文案一致性
+顺带删掉 `pushCompactionNotice` 在成功/回放路径的调用（失败路径保留）。
 
-- 实时/回放的卡片文本都只取自 `compaction/summary.summary`（实时=模型摘要，回放=档案里同一条摘要），不会出现两套措辞。
-- 回放没有 `history_tokens_after`/压力值可填，`shadowedTokenCount` 由 summary 事件带（实时有、回放无）；**不伪造**缺失数字，卡片按可选字段渲染。这是「不回放不可知事实」的既有纪律（同 A0-4）。
-- 旧的 `compactedNotice()` 通知文案仅在**失败**路径保留。
+### D2 回放与实时同形（`replayArchive`）
 
-### 2.5 明确不做
+`entry.kind === 'compaction_summary'` 分支改为：`compaction/start` → `compaction/summary` → `pushCompactionCheckpoint`（不再判断返回值、不再发 notice）。档案首条即锚点时走 D1 的 append 分支，重开后看到的就是节点而不是通知。
 
-- 不改 `src-tauri/`（后端已正确广播）。
-- 不改 `src/dsh/` vendored 代码（避免上游漂移，`align` 账本不受影响）。
-- 不给压缩新增 toast/横幅等第二套视觉。
+### D3 手动 `/compact` 走 checkpoint（`adapter.ts` 命令执行段）
 
-## 3. 回归用例
+- 删除"把 `compact_session` 返回的摘要作为普通 `user/message` 推入会话区"的代码路径（真机第 3 项的直接原因）。
+- `compaction_ended` 成功分支**去掉 `trigger !== 'manual'` 排除**：手动也发 checkpoint，与自动同口径。
+- checkpoint 的 `source` **不写 `sourceCommandId`**：上游 `compactionDefinition.match` 对带 `sourceCommandId` 的 checkpoint 显式 `return null`（手动压缩另有命令卡）；写空即等价于"自动口径"的节点，符合"同口径"要求，也不伪造上游语义。
+- 去重：同一 `compactionId` 只发一条，命令返回与事件流都到时不产生第二条。
 
-文件：`src/transport/adapter.spec.ts`
+### D4 不改 vendored 代码
 
-1. **实时即出现**：模拟 `prompt → compaction_started → summarized → ended(ok)`，断言 journal 中：
-   - 恰有一条 `user/message` 且 `source.kind === 'compact-checkpoint'`、`source.compactionId === 'c2'`、`surfaceOp === 'replace'`；
-   - **没有** `source.kind === 'compaction-notice'` 的 `developer/message`；
-   - 所有事件过 `assertSessionWireEvent`。
-2. **能被 UI 认成压缩节点**：用同一份 journal 事件调用 `compactionDefinition.match`，断言返回 `{ id: 'c2', role: 'update' }`；构造 `state = { checkpoint, summary }` 走 `buildViewNode`，断言产出 `kind: 'compaction'` 且 `summary` 文本正确（证明「可见」而不只是「落 journal」）。
-3. **压缩失败仍出声**：沿用/调整现有 `ok:false` 用例——失败不产 checkpoint、仍有一条 `form:'notice'` 的失败通知。
-4. **重开不重复**：用两条 `compaction_summary` 条目走回放，断言 journal 中 checkpoint 恰 2 条（每个锚点一条）、`developer/message` 的 `compaction-notice` 为 0 条；同一会话再回放一次，条数不变（无累积）。
-5. **反向验证**：
-   - 临时把 `pushCompactionCheckpoint` 改回发 `developer/message` 通知 → 用例 1/2 必红；
-   - 临时保留回放通知 → 用例 4 必红。
-   - 两次反向都在本地跑出红，再恢复，留命令与输出摘要进报告。
+`src/dsh/*` 只读。若实现中发现上游契约确实无法承载 append 型 checkpoint，停止并回报，不在 vendored 里打补丁。
 
-## 4. 验证命令
+## 3. 三笔 additive（单独一笔提交）
 
-- 前端：`pnpm typecheck`、`pnpm test`
-- 仓库根：`.\scripts\check-deps.ps1`
-- 不改 Rust，仍跑一遍 `cargo test`（确认无跨层影响）与 `cargo clippy --all-targets -- -D warnings`
-- 格式化：只对改动文件跑 `rustfmt`（本任务无 Rust 改动，预计不触发）
+- **A1 `CompactionEnded` 补 `trigger`**：`src-tauri/src/events.rs` 变体加 `trigger: CompactionTrigger`（与 started/summarized 同型），所有发出点（自动/手动/失败）都填；`src/transport/types.ts` 对应字段设为必填；`adapter.ts` 改用 `msg.trigger`，删掉 `CompactionTrace.trigger` 的兜底。事件顺序/失败用例同步更新期望。
+- **A2 导出补压缩事务**：结论先写清——`session.v4.jsonl` 里 compaction 为 0 是**导出侧主动跳过**（`src/header-actions/session-events.ts` 的 `sessionEntriesToEvents` 明确跳过 `kind === 'compaction_summary'`，属 N3 的"不把摘要伪装成用户发言"），不是事件没落档（宿主 events 里 9 条齐全）。修法：在锚点条目的位置补三条 **log-only** 事件 `compaction/start`、`compaction/summary`（`summary` 取 `entry.text`、`shadowedTokenCount` 不填）、`compaction/end`（`ok: true`），id 用 `shaniu-export-compaction-${index}`；不新增任何 surface 事件，历史用户回合保持不变。`turn`/`at_ms` 能取到就取，取不到不伪造。
+- **A3 手动压缩补日志**：在手动 `compact_session` 路径写与自动同一条「上下文已压缩（SH-032）」日志行（含 `trigger=manual` 与条数），位置与文案对齐自动路径。
 
-## 5. 提交与发布
+**A1/A2 的参照与取舍**：A1 取 dsh `fcc0ad4` 的 `repair.ts` 口径——结局事件自己带足以独立判读的字段，不靠消费端从上下文补推（故前端删掉 trace 副本）。A2 取 dsh「不猜、不补」：`compaction/summary` 只写档案里确有的正文，`shadowedRange`/`shadowedSeqs` 在档案里是历史条目下标而非 surface seq，`shadowedTokenCount`/`provider`/`model` 无可信来源，一律留空。已知代价：该导出档案若被 DSH 当原生 v4 导入做关系校验，会因子段缺失报错（`relationships.ts` 的 `span()` 强制要求）；SHANIU 导出链路不做该校验，且伪造比缺失更坏，故按缺失落地。
 
-- 只 `git add src/transport/adapter.ts src/transport/adapter.spec.ts docs/specs/N5-live-compaction-visibility/spec.md docs/specs/N5-live-compaction-visibility/tasks.md`。
-- **不碰** 其他会话的 `docs/smoke/`。
-- 推前 `git fetch`，`git push` 不带 `--force`；盯 GitHub Actions 到 gate + product-smoke 出结论再报。
+## 4. 回归与反向验证
 
-## 6. 风险与替代
+正向：R1/R2/R3 + 现有压缩用例（通知→checkpoint、失败仍出声、重开不重复）+ 导出用例（每锚点 3 条事件、0 条伪用户消息）。
 
-- 视觉差异：压缩卡（`CompactionItem`）与「上下文注入」行不是同一外观。理由：现有「上下文注入」行在实时只能落在回合内并被回合过程收拢，无法与重开同位；checkpoint 是上游为「压缩发生」预留的唯一实时可见载体。若评审要求必须沿用上下文注入行的外观，备选方案是在 vendored `ui-chat` 里为 `compaction-notice` 增加「回合边界常显」规则——代价是改上游代码并登记 align 账本，本规格不采用。
-- 兼容：改后旧档案重开时由 `compaction_summary` 回放生成 checkpoint，历史面板不受影响（`SessionEntry` 形状未变）。
+反向（必须红，记录命令与输出后恢复）：
+
+1. 把 D1 空 surface 分支退回 `return undefined` → R1/R2 红；
+2. 恢复手动/回放发 `compaction-notice`、恢复手动铺原始摘要 → R3 红；
+3. 删除导出侧三条 log-only 事件 → 导出用例红。
+
+## 5. 验证命令
+
+`pnpm typecheck`；`pnpm exec vitest run --exclude "scratch/**"`；`cargo test -- --test-threads=1`；`cargo clippy --all-targets -- -D warnings`；`.\scripts\check-deps.ps1`；`.\scripts\dev\check-doc-claims.ps1`。Rust 只对改动文件跑 `rustfmt`（禁止 `cargo fmt`）。
+
+## 6. 提交与发布
+
+- 两笔提交：`fix(N5)`（复现用例 + D1–D3）、`chore(N5)`（A1–A3）。
+- 只显式 `git add` 本任务路径；**不碰 `docs/smoke/`**（夹具是逐字摘录到 `src/transport/fixtures/`，不引用运行期 `docs/smoke/`）。
+- 推前 `git fetch`，不带 `--force`；盯 gate + product-smoke 到结论再报；真机结案另行安排。
+
+## 7. 风险
+
+- replace 整段 surface 依赖"压缩发生在回合边界、被压缩区间即当前全部前置历史"；真机证据（range 0–N、压缩后 `history_len` 很小）符合该前提。若将来出现"压缩只覆盖历史中段"，需要后端在事件里带可映射的区间，本规格不预先实现。
+- append 型 checkpoint 的卡片位置在"历史顶部"还是"当前位置"取决于回放顺序；R2 会把它钉死在真实档案的顺序上。

@@ -340,6 +340,15 @@ interface Journal {
    */
   surfaceSeqs: number[]
   /**
+   * `surfaceSeqs` 里每个 seq 的事件类型。
+   *
+   * 上游只允许 **system→system** 改写 surface 的 0 号节点（`surface.ts` 的
+   * `assertSystemHeadRewrite`）。压缩锚点要整段替换 surface，就必须认出 0 号是不是
+   * system/message——真机会话的第一条 surface 正是系统提示词，认不出就会发出被客户端
+   * 整帧拒绝的替换事件（界面表现为"压缩发生了但什么都没有"）。
+   */
+  surfaceTypes: Map<number, string>
+  /**
    * 最近一帧 `turn_started` 的**采样迭代号**（事件面 `turn` 的语义，1 起）。
    *
    * 与 `turn`（用户回合号）同名不同义，所以单独存：step 只由它推导（`iterations - 1`），
@@ -760,7 +769,7 @@ function newJournal(createdAt: number): Journal {
   return {
     serial: journalSerial,
     seq: -1, revision: 0, log: new FrameLog(), createdAt,
-    turn: 0, step: 0, surfaceSeqs: [], iterations: 0, taskOpen: false, hostRuntimeUnknown: false, lastEventId: undefined, lastFrameAt: createdAt, text: '', reasoning: '', chunkIndex: 0,
+    turn: 0, step: 0, surfaceSeqs: [], surfaceTypes: new Map(), iterations: 0, taskOpen: false, hostRuntimeUnknown: false, lastEventId: undefined, lastFrameAt: createdAt, text: '', reasoning: '', chunkIndex: 0,
     attemptOpen: false, attemptSeq: -1, attemptId: '',
     attemptStream: [], attemptTurn: 0, attemptStep: 0, attemptStartedAfterSeq: -1,
     usage: undefined, outputs: new Map(),
@@ -813,8 +822,20 @@ export function createAdapter(options: AdapterOptions): { remote: unknown; dispo
     /** summarized 的摘要正文与 seq；checkpoint 的正文只取这一份，实时/回放才同文。 */
     summary?: string
     summarySeq?: number
+    /**
+     * 手动 `/compact` 对应的命令卡 id。带上它，上游 `commandDefinition` 会把压缩事实
+     * 折进同一张命令卡（`manual-compaction` 节点），而不是另起一条压缩节点。
+     */
+    commandId?: string
   }
   const compactionTraces = new Map<string, CompactionTrace>()
+  /**
+   * 进行中的手动 `/compact`：会话 id → 命令卡 id。
+   *
+   * 命令执行与压缩事件是两条异步线：命令卡先落账，宿主随后广播 started/summarized/ended。
+   * 这里把两者焊上，`compaction_started` 才能在自己的 trace 里记住该归哪张卡。
+   */
+  const pendingManualCompact = new Map<string, string>()
   /**
    * 审批监听器（DSH 的 ui-approval 在装配时注册）。`this` 由 typert 派发时绑定，
    * 所以这里保留函数本体、由调用点用 `.call(scope, …)` 触发。
@@ -988,10 +1009,13 @@ export function createAdapter(options: AdapterOptions): { remote: unknown; dispo
         const start = typeof startSeq === 'number' ? journal.surfaceSeqs.indexOf(startSeq) : -1
         const end = typeof endSeq === 'number' ? journal.surfaceSeqs.indexOf(endSeq) : -1
         if (start !== -1 && end !== -1 && start <= end) {
-          journal.surfaceSeqs.splice(start, end - start + 1)
+          for (const shadowed of journal.surfaceSeqs.splice(start, end - start + 1)) {
+            journal.surfaceTypes.delete(shadowed)
+          }
         }
       }
       journal.surfaceSeqs.push(journal.seq)
+      journal.surfaceTypes.set(journal.seq, type)
     }
     return journal.seq
   }
@@ -999,38 +1023,63 @@ export function createAdapter(options: AdapterOptions): { remote: unknown; dispo
   /**
    * 压缩锚点：上游 `CompactionItem` 的**唯一**触发条件是一个替换型 user/message，
    * 且 `source.kind === 'compact-checkpoint'`（ui-chat `compaction.ts` 的 `buildViewNode`
-   * 找不到它就 `return null`）。实时与回放都只经这一个入口发，形状、位置、计数才会一致。
+   * 找不到它就 `return null`，`command.ts` 的 `compactSource` 还要求 `surfaceOp` 是替换）。
+   * 实时与回放都只经这一个入口发，形状、位置、计数才会一致。
    *
-   * 区间取当前 surface 的头尾（与上游一致：把被压历史整体换成这条摘要节点），
-   * `sourceEventSeqs` 必须覆盖区间内每个被遮蔽节点，外加本次的 start/summary 事件——
-   * 少一个，客户端 `foldSurface` 就会拒绝这条替换。
+   * 两条上游硬约束决定了区间的取法：
+   * ① `sourceEventSeqs` 必须覆盖区间内每个被遮蔽节点，少一个客户端 `foldSurface` 就拒绝；
+   * ② surface 的 0 号节点若是 system/message，只允许 system→system 改写它
+   *    （`assertSystemHeadRewrite`）——所以系统提示词永远留在区间之外。
    *
-   * surface 为空时不发：一条非法的替换事件会打断实时流，宁可本次无节点，也不冒险。
+   * surface 为空（档案第一条就是锚点）时**不静默跳过**：先补一个空内容 user/message
+   * 作为锚点占位（它立刻被替换遮蔽、不会渲染），再按常规替换。这样实时与回放都产出
+   * 同一条可见节点，而不是退回一条通知。
+   *
+   * 手动压缩带上 `sourceCommandId`：上游 `commandDefinition` 会把它和命令卡合成
+   * **一个** `manual-compaction` 节点（命令卡是主呈现，压缩事实折在同一节点里）。
    */
   const pushCompactionCheckpoint = (
     journal: Journal,
     compactionId: string,
     summary: string,
     hiddenSeqs: readonly number[],
-  ): number | undefined => {
-    const startSeq = journal.surfaceSeqs[0]
-    const endSeq = journal.surfaceSeqs[journal.surfaceSeqs.length - 1]
-    if (startSeq === undefined || endSeq === undefined) return undefined
+    sourceCommandId?: string,
+  ): number => {
+    const head = journal.surfaceSeqs[0]
+    const anchors = head !== undefined && journal.surfaceTypes.get(head) === 'system/message'
+      ? journal.surfaceSeqs.slice(1)
+      : [...journal.surfaceSeqs]
+    if (anchors.length === 0) {
+      console.warn(`[SHANIU] 压缩节点没有可替换的会话表面，改用自建锚点后替换（compactionId=${compactionId}）`)
+      anchors.push(pushEvent(journal, 'user/message', {
+        id: `shaniu-compact-anchor-${compactionId}`,
+        role: 'user',
+        content: [],
+        source: { kind: 'user' as const },
+      }, { surfaceOp: 'append' }))
+    }
+    const sources = [...anchors]
+    for (const seq of hiddenSeqs) {
+      if (!sources.includes(seq)) sources.push(seq)
+    }
     return pushEvent(journal, 'user/message', {
       id: `shaniu-compact-checkpoint-${compactionId}`,
       role: 'user',
       content: summary.trim() === '' ? [] : [{ type: 'text', text: summary }],
-      source: { kind: 'compact-checkpoint' as const, compactionId },
+      source: {
+        kind: 'compact-checkpoint' as const,
+        compactionId,
+        ...sourceCommandId === undefined ? {} : { sourceCommandId: sourceCommandId as never },
+      },
     }, {
-      surfaceOp: { op: 'replace' as const, startSeq, endSeq },
-      sourceEventSeqs: [...journal.surfaceSeqs, ...hiddenSeqs],
+      surfaceOp: { op: 'replace' as const, startSeq: anchors[0]!, endSeq: anchors[anchors.length - 1]! },
+      sourceEventSeqs: sources,
     })
   }
 
   /**
-   * 压缩的用户可见兜底出口（上下文注入行）：只在失败、或档案里已经没有可替换的
-   * surface（所有历史都被压掉、锚点落在档案第一条）时使用。它不伪装成压缩节点，
-   * 因为压缩节点必须挂在一个真实的替换区间上。
+   * 压缩失败的用户可见兜底出口（上下文注入行）。成功路径不再走这里——
+   * 它只在宿主明确回了 `ok:false` 时说明"历史保持原样"。
    */
   const pushCompactionNotice = (journal: Journal, id: string, text: string): void => {
     pushEvent(journal, 'developer/message', {
@@ -1949,15 +1998,9 @@ export function createAdapter(options: AdapterOptions): { remote: unknown; dispo
             compactionId,
             summary: [{ type: 'text', text: entry.text }],
           })
-          const checkpoint = pushCompactionCheckpoint(journal, compactionId, entry.text, [startSeq, summarySeq])
-          if (checkpoint === undefined) {
-            // 档案第一条就是锚点（整段历史都已被压掉）：没有可替换的 surface，
-            // 发不出合法的压缩节点，退回上下文注入行——宁可与实时不同形，也不能
-            // 让「上下文被改写」在重开后彻底不可见。
-            const notice = `上下文已压缩：历史第 ${entry.range_start + 1}–${entry.range_end} 条`
-              + '被一条摘要取代；原文仍保留在会话档案里。'
-            pushCompactionNotice(journal, `shaniu-replay-compaction-notice-${index}`, notice)
-          }
+          // 返回值必然是一条真实事件：档案第一条就是锚点时，`pushCompactionCheckpoint`
+          // 会先自建一个被遮蔽的占位锚点，再按替换形态落节点——与实时同形。
+          pushCompactionCheckpoint(journal, compactionId, entry.text, [startSeq, summarySeq])
           journal.entryToSeq[index] = journal.seq
           return
         }
@@ -2564,12 +2607,17 @@ export function createAdapter(options: AdapterOptions): { remote: unknown; dispo
       case 'compaction_started': {
         // 有损操作必须出声（对齐上游 `compaction/start`）：起点先落 journal，之后
         // 无论成功、失败还是取消，时间线上都能回答「这次上下文为什么变短」。
+        // 手动压缩还要把命令卡 id 挂进 data：`commandDefinition` 只认带
+        // `sourceCommandId` 的压缩事件，靠它把事实折进同一张卡。
+        const commandId = msg.trigger === 'manual' ? pendingManualCompact.get(sessionId) : undefined
         const startSeq = pushEvent(journal, 'compaction/start', {
           turn: journal.turn,
           compactionId: msg.compaction_id,
+          ...commandId === undefined ? {} : { sourceCommandId: commandId },
         })
         compactionTraces.set(msg.compaction_id, {
           startSeq,
+          ...commandId === undefined ? {} : { commandId },
         })
         return
       }
@@ -2577,20 +2625,19 @@ export function createAdapter(options: AdapterOptions): { remote: unknown; dispo
         // 摘要与「丢了什么」同一条（对齐上游 `compaction/summary`）。上游的
         // `shadowedSeqs` 是会话 seq 集合，我们没有等价物——不编造条数，只给真实
         // 的 token 数与摘要；卡片文本只取这一条，实时与回放才同文。
+        const trace = compactionTraces.get(msg.compaction_id)
         const summarySeq = pushEvent(journal, 'compaction/summary', {
           turn: journal.turn,
           compactionId: msg.compaction_id,
           summary: [{ type: 'text', text: msg.summary }],
           shadowedTokenCount: msg.shadowed_tokens,
+          ...trace?.commandId === undefined ? {} : { sourceCommandId: trace.commandId },
         })
         // checkpoint **不在这里发**：终局要等 `compaction_ended` 才知道成败，
         // 而且它要把 start/summary 两个 seq 一起列进被替换集，必须等两件都落账。
-        {
-          const trace = compactionTraces.get(msg.compaction_id)
-          if (trace !== undefined) {
-            trace.summary = msg.summary
-            trace.summarySeq = summarySeq
-          }
+        if (trace !== undefined) {
+          trace.summary = msg.summary
+          trace.summarySeq = summarySeq
         }
         return
       }
@@ -2607,25 +2654,28 @@ export function createAdapter(options: AdapterOptions): { remote: unknown; dispo
         pushEvent(journal, 'compaction/end', {
           turn: journal.turn,
           compactionId: msg.compaction_id,
+          ...trace?.commandId === undefined ? {} : { sourceCommandId: trace.commandId },
           // 失败但宿主没给原因时也必须给一句话：`compaction/end` 的 `error` 是唯一的
           // 失败信号，空着等于把失败说成成功。
           ...(failure === undefined ? {} : { error: reason ?? `压缩未生效（${failure}）` }),
         })
-        if (failure === undefined && trigger !== 'manual' && trace?.summary !== undefined) {
-          // 成功的自动压缩：落 checkpoint（替换锚点）。上游 `CompactionItem` 只认它，
-          // 这也是实时时间线上唯一能证明「上下文刚被改写」的节点；手动 `/compact`
-          // 的结局由命令卡片展示，不再重复。
+        if (failure === undefined && trace?.summary !== undefined) {
+          // 成功（含手动 `/compact`）：落 checkpoint（替换锚点）。上游 `CompactionItem`
+          // 只认它，这也是时间线上唯一能证明「上下文刚被改写」的节点。手动路径带
+          // `sourceCommandId`，由上游并进同一张命令卡；自动路径是独立压缩节点。
           const hidden = [trace.startSeq, trace.summarySeq]
             .filter((seq): seq is number => seq !== undefined)
-          pushCompactionCheckpoint(journal, msg.compaction_id, trace.summary, hidden)
+          pushCompactionCheckpoint(journal, msg.compaction_id, trace.summary, hidden, trace.commandId)
+        } else if (failure !== undefined && trigger !== 'manual') {
+          // 失败必须出声：自动压缩没有别的痕迹，用户只会发现「上下文没变短」。
+          // 手动的失败由命令卡回显错误文本，不重复插通知。
+          pushCompactionNotice(
+            journal,
+            `shaniu-compact-failed-${msg.compaction_id}`,
+            `上下文压缩未生效：${failure}。历史保持原样，可以继续对话。`,
+          )
         }
-        // 失败必须出声：自动压缩没有别的痕迹，用户只会发现「上下文没变短」。
-        const notice = failure === undefined
-          ? undefined
-          : (trigger === 'manual' ? undefined : `上下文压缩未生效：${failure}。历史保持原样，可以继续对话。`)
-        if (notice !== undefined) {
-          pushCompactionNotice(journal, `shaniu-compact-failed-${msg.compaction_id}`, notice)
-        }
+        if (trigger === 'manual') pendingManualCompact.delete(sessionId)
         return
       }
       case 'system_prompt':
@@ -4082,28 +4132,27 @@ export function createAdapter(options: AdapterOptions): { remote: unknown; dispo
         }
         const run = pushCommandRun(sessionId, 'compact', '')
         let result: { kind: 'success' | 'error'; text: string }
+        // 命令卡先落账；压缩事件随后由宿主广播。把这张卡 id 登记下来，
+        // started/summarized/ended 与 checkpoint 才能归到同一张卡上。
+        pendingManualCompact.set(sessionId, run.commandId)
         try {
           const outcome = await bridge.invoke<{ summary: string; shadowedItems: number; shadowedTokens: number } | null>(
             'compact_session', { agentId: sessionId },
           )
           if (outcome === null) {
+            pendingManualCompact.delete(sessionId)
             result = { kind: 'success', text: 'No compactable history yet.' }
           } else {
-            // 摘要正文推一条 user 消息：重开/回放时档案锚点本来就投影成 user 消息
-            // （lib.rs project_entries），活态推同形状，两边渲染一致。
-            const journal = journalOf(sessionId)
-            pushEvent(journal, 'user/message', {
-              id: `shaniu-compact-${journal.seq + 1}`,
-              role: 'user',
-              content: [{ type: 'text', text: outcome.summary }],
-              source: { kind: 'user' },
-            }, { surfaceOp: 'append' })
+            // 摘要正文**不**直接铺进会话区：可见呈现由 `compaction_ended` 落的
+            // checkpoint 负责，上游会把压缩事实折进这张命令卡（一个 manual-compaction
+            // 节点，命令卡是主呈现），因此这里也不再产生第二条节点或大段原文。
             result = {
               kind: 'success',
               text: `Compacted ${outcome.shadowedItems} history items (~${outcome.shadowedTokens} tokens).`,
             }
           }
         } catch (reason) {
+          pendingManualCompact.delete(sessionId)
           result = { kind: 'error', text: reason instanceof Error ? reason.message : String(reason) }
         }
         pushCommandDone(sessionId, run.commandId, result)
