@@ -356,9 +356,16 @@ interface Journal {
   revision: number
   log: FrameLog
   createdAt: number
-  /** DSH 的 turn = 一次用户任务；后端的 turn = 任务内一次采样迭代（= DSH 的 step）。 */
+  /** DSH 的 turn = 一次用户任务；后端事件面的 `turn` = 任务内一次采样迭代（= DSH 的 step）。 */
   turn: number
   step: number
+  /**
+   * 最近一帧 `turn_started` 的**采样迭代号**（事件面 `turn` 的语义，1 起）。
+   *
+   * 与 `turn`（用户回合号）同名不同义，所以单独存：step 只由它推导（`iterations - 1`），
+   * 用户回合号只由本层计数。任何一边都不去读另一边的值，避免两个口径互相借值。
+   */
+  iterations: number
   taskOpen: boolean
   /**
    * 重建档案时宿主运行态查询失败（IPC 异常）。它只用于避免把用户消息压进
@@ -773,7 +780,7 @@ function newJournal(createdAt: number): Journal {
   return {
     serial: journalSerial,
     seq: -1, revision: 0, log: new FrameLog(), createdAt,
-    turn: 0, step: 0, taskOpen: false, hostRuntimeUnknown: false, lastEventId: undefined, lastFrameAt: createdAt, text: '', reasoning: '', chunkIndex: 0,
+    turn: 0, step: 0, iterations: 0, taskOpen: false, hostRuntimeUnknown: false, lastEventId: undefined, lastFrameAt: createdAt, text: '', reasoning: '', chunkIndex: 0,
     attemptOpen: false, attemptSeq: -1, attemptId: '',
     attemptStream: [], attemptTurn: 0, attemptStep: 0, attemptStartedAfterSeq: -1,
     usage: undefined, outputs: new Map(),
@@ -1699,6 +1706,7 @@ export function createAdapter(options: AdapterOptions): { remote: unknown; dispo
   const openTask = (journal: Journal): void => {
     journal.turn += 1
     journal.step = 0
+    journal.iterations = 0
     journal.taskOpen = true
     // 真实回合已经开始，重建时那次「宿主运行态查询失败」不再成立。
     journal.hostRuntimeUnknown = false
@@ -2211,8 +2219,13 @@ export function createAdapter(options: AdapterOptions): { remote: unknown; dispo
         // step/start → user/message，输入行必须落在回合内，否则回合头不显示用时）。
         // 因此后端的第一次 turn_started 通常是空操作；从第二次起才推进 step——
         // 后端每个采样迭代都发 turn_started，它对应 DSH 的 step 而不是 DSH 的回合。
+        //
+        // step 号由 `iterations`（事件面 turn 的语义：采样迭代号）推导，用户回合号
+        // `journal.turn` 只由本层计数，两者不互相借值。
         if (!journal.taskOpen) {
           openTask(journal)
+          // 这一帧就是本回合的第一次采样（后端从 1 起编号）。
+          journal.iterations = msg.turn
           pushTurnStart(sessionId, journal)
           if (laneId !== undefined) foldLaneTiming(laneId, 'turn/start')
           pushEvent(journal, 'step/start', { turn: journal.turn, step: 0 })
@@ -2220,12 +2233,16 @@ export function createAdapter(options: AdapterOptions): { remote: unknown; dispo
           // 不经 prompt 起来的回合（`resume_session` 续跑）也要报运行中，否则
           // 恢复出来的会话跑着任务却没有 Stop 按钮。
           dispatch('api-session/status', sessionId, true)
-        } else if (msg.turn > 1) {
-          pushEvent(journal, 'step/end', { turn: journal.turn, step: journal.step })
-          closeStepMetrics(journal)
-          journal.step = msg.turn - 1
-          pushEvent(journal, 'step/start', { turn: journal.turn, step: journal.step })
-          beginStepMetrics(journal)
+        } else {
+          journal.iterations = msg.turn
+          // 第一帧已经在开回合时算过（prompt 路径），不再另起一个空 step。
+          if (journal.iterations > 1) {
+            pushEvent(journal, 'step/end', { turn: journal.turn, step: journal.step })
+            closeStepMetrics(journal)
+            journal.step = journal.iterations - 1
+            pushEvent(journal, 'step/start', { turn: journal.turn, step: journal.step })
+            beginStepMetrics(journal)
+          }
         }
         return
       }

@@ -156,6 +156,13 @@ export type SkipReason = 'no_source_write' | 'no_command_configured';
  */
 export type VerifyState = 'passed' | 'failed' | { inconclusive: InconclusiveReason } | { skipped: SkipReason };
 
+/**
+ * 后端事件面的时间线。
+ *
+ * 口径提醒：`turn_started` / `turn_completed` 的 `turn` 是**本回合内的采样迭代号**
+ * （= DSH 的 step），与档案 `TurnEnd.turn`（1 起用户回合号）同名不同义。
+ * 消费方不得把两者互相比较或赋值——step 只由迭代号推导，回合号只由本层计数。
+ */
 export type EventMsg =
   | { type: 'turn_started'; turn: number }
   | { type: 'turn_completed'; turn: number; reason: TurnEndReason; error?: TurnErrorInfo; unverified?: boolean }

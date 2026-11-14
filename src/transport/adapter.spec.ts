@@ -2295,6 +2295,38 @@ describe('适配层的命令面映射', () => {
     expect(replaySummary).toEqual(liveSummary)
   })
 
+  it('step 游标只认采样迭代号：事件面 turn 不会漏进用户回合号', async () => {
+    // 反向对照：把 step 改成跟用户回合号走（或让事件 turn 直接当回合号），这里会变成
+    // step=[0,1] 或 turn 号被推到 4；两种口径必须各走各的。
+    const bridge = scriptedBridge()
+    const adapter = createAdapter({ bridge })
+    const session = faceOf(adapter.remote).session
+    await session.prompt({
+      sessionId: 'agent-step',
+      requestId: 'rpc-step',
+      content: [{ type: 'text', text: '多步任务' }],
+    })
+    // 事件面的 turn 是采样迭代号：第 4 次采样 → step 3，而用户回合号仍是 1。
+    bridge.emit('agent-step', { type: 'turn_started', turn: 4 })
+    bridge.emit('agent-step', { type: 'agent_message_delta', delta: '继续' })
+
+    const iterator = session.follow({ address: { kind: 'session', sessionId: 'agent-step' } })
+    const events = eventsOf((await iterator.next()).value as Record<string, unknown>)
+    await iterator.return?.(undefined)
+    adapter.dispose()
+
+    const steps = events
+      .filter(event => event['type'] === 'step/start')
+      .map(event => (event['data'] as { step: number }).step)
+    expect(steps).toEqual([0, 3])
+    const turnNumbers = new Set(
+      events
+        .filter(event => event['type'] === 'step/start' || event['type'] === 'turn/start')
+        .map(event => (event['data'] as { turn: number }).turn),
+    )
+    expect([...turnNumbers]).toEqual([1])
+  })
+
   it('重开档案按结局行收口：失败回合不会在回放里变成 completed', async () => {
     const archive = [
       { kind: 'message', role: 'user', text: '问' },
