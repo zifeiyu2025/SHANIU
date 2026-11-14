@@ -422,11 +422,19 @@ impl ApprovalBroker {
             Decision::Deny => GateOutcome::Forbidden,
             Decision::Prompt if batched => GateOutcome::Allowed,
             Decision::Prompt => {
+                let base = prompt_reason(risk);
+                // 执行类在写约束档必须把沙箱边界写在卡上：审批只决定「能不能跑」，
+                // 不放宽写范围，用户点「允许」后发现写外部被拒会以为按钮没用。
+                let reason = if risk == RiskLevel::Execute && policy.sandbox == SandboxMode::WorkspaceWrite {
+                    format!("{base}。{WRITE_SCOPE_NOTE}")
+                } else {
+                    base.to_string()
+                };
                 self.request_approval(
                     tool,
                     args,
                     call_id,
-                    ApprovalPrompt { risk, reason: Some(prompt_reason(risk)), remember: true, escalation: false },
+                    ApprovalPrompt { risk, reason: Some(&reason), remember: true, escalation: false },
                     subject,
                     env,
                 )
@@ -752,6 +760,16 @@ fn prompt_reason(risk: RiskLevel) -> &'static str {
         RiskLevel::PlanReview => "计划评审：退出计划态需要用户确认",
     }
 }
+
+/// 写约束档下「允许 ≠ 可写外部」的说明，附在执行类审批卡的原因后面。
+///
+/// 为什么是说明而不是放宽：写范围不是审批层能改的——受限令牌的 restricting SID 与
+/// allow ACE 由 `sandbox::prepare_write_restricted` 按工作区根一次性算好
+/// （工作区 / TEMP / 工具链目录），本模块按 FF-1 也不允许依赖 sandbox。
+/// 要「只放宽这一条路径」，只能从命令行文本里猜目标路径，而命令可以在运行时拼路径
+/// （这正是我们拒绝解析重定向的同一理由），猜不准就又变成一次假承诺。
+const WRITE_SCOPE_NOTE: &str = "允许只放行执行，不会放宽沙箱：写入工作区、TEMP、工具链目录之外的路径会被拒绝\
+（读取不受影响）；需要写到外部时请改到工作区内，或切换访问模式";
 
 #[cfg(test)]
 mod tests {
@@ -1167,6 +1185,90 @@ mod tests {
             .gate("apply_patch", &serde_json::json!({}), "c1", policy::SessionPolicy { approval: ApprovalMode::OnRequest, sandbox: SandboxMode::ReadOnly }, GateSubject::root("root"), GateEnv { sink: &sink(), cancel: &cancel })
             .await;
         assert_eq!(out, GateOutcome::Forbidden, "沙箱拒绝属于策略拒绝，不是用户拒绝");
+    }
+
+    /// 回归（真机现象）：用户允许一条要写工作区外的命令 → OS 报「拒绝访问」，
+    /// 卡上却没有任何说明，看起来像按钮失效。卡必须先说清允许不放宽沙箱。
+    #[tokio::test]
+    async fn execute_prompt_states_write_scope_is_not_widened() {
+        let broker = Arc::new(ApprovalBroker::new());
+        let cancel = CancellationToken::new();
+        let capture = Arc::new(CaptureSink::default());
+        let sink: Arc<dyn EventSink> = capture.clone();
+        let (b, s, c) = (broker.clone(), sink, cancel.clone());
+        let gate = tokio::spawn(async move {
+            b.gate(
+                "unified_exec",
+                &serde_json::json!({"command": "echo hi > C:\\outside\\x.txt"}),
+                "c-scope",
+                policy::SessionPolicy { approval: ApprovalMode::OnRequest, sandbox: SandboxMode::WorkspaceWrite },
+                GateSubject::root("root"),
+                GateEnv { sink: &s, cancel: &c },
+            )
+            .await
+        });
+        let mut prompted = false;
+        for _ in 0..200 {
+            if broker.has_pending("appr-c-scope") {
+                prompted = true;
+                assert!(broker.resolve("appr-c-scope", ApprovalDecision::Deny));
+                break;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+        }
+        assert!(prompted, "执行类在 on_request 下必须弹卡");
+        let _ = gate.await.unwrap();
+
+        let reason = capture
+            .take()
+            .into_iter()
+            .find_map(|event| match event {
+                EventMsg::ExecApprovalRequest { reason, .. } => reason,
+                _ => None,
+            })
+            .expect("审批卡必须带原因");
+        assert!(reason.contains("不会放宽沙箱"), "卡上必须说明允许不放宽沙箱: {reason}");
+        assert!(reason.contains("会被拒绝"), "卡上必须说明外部写入会被拒: {reason}");
+        assert!(reason.contains("工作区") && reason.contains("TEMP"), "卡上必须写出可写范围: {reason}");
+    }
+
+    /// 非执行类（破坏性）审批卡保持原口径：沙箱写范围与它无关，追加只会变成噪音。
+    #[tokio::test]
+    async fn destructive_prompt_keeps_plain_reason() {
+        let broker = Arc::new(ApprovalBroker::new());
+        let cancel = CancellationToken::new();
+        let capture = Arc::new(CaptureSink::default());
+        let sink: Arc<dyn EventSink> = capture.clone();
+        let (b, s, c) = (broker.clone(), sink, cancel.clone());
+        let gate = tokio::spawn(async move {
+            // 未登记的工具落 destructive 档，on_request 下必问。
+            b.gate(
+                "some_unknown_tool",
+                &serde_json::json!({}),
+                "c-plain",
+                policy::SessionPolicy { approval: ApprovalMode::OnRequest, sandbox: SandboxMode::WorkspaceWrite },
+                GateSubject::root("root"),
+                GateEnv { sink: &s, cancel: &c },
+            )
+            .await
+        });
+        for _ in 0..200 {
+            if broker.has_pending("appr-c-plain") {
+                assert!(broker.resolve("appr-c-plain", ApprovalDecision::Deny));
+                break;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+        }
+        let _ = gate.await.unwrap();
+        let reason = capture
+            .take()
+            .into_iter()
+            .find_map(|event| match event {
+                EventMsg::ExecApprovalRequest { reason, .. } => reason,
+                _ => None,
+            })
+            .expect("审批卡必须带原因");
+        assert_eq!(reason, prompt_reason(RiskLevel::Destructive));
     }
 
     #[tokio::test]
