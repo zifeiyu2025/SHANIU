@@ -98,6 +98,11 @@ function scriptedBridge(
   approvalSnapshot?: () => PendingApprovalsSnapshotWire,
   /** 状态源收敛 Phase 3：`reconcile_session` 的宿主替身；缺省 = 档案里没有可对账的回合。 */
   reconcileHandler?: (args: Record<string, unknown> | undefined) => unknown,
+  /**
+   * N3：`load_session_full` 的宿主替身（未压缩的完整档案）。缺省回落到 `archive`，
+   * 既有用例不必改；要区分「压缩视图」与「完整视图」时两条各传一份。
+   */
+  fullArchive?: Record<string, unknown>[],
 ): ScriptedBridge {
   const calls: ScriptedBridge['calls'] = []
   const host: ScriptedBridge['host'] = { active: null, failRuntime: false, listRunning: false }
@@ -254,6 +259,8 @@ function scriptedBridge(
         if (sendTaskHandler !== undefined) return sendTaskHandler(args) as T
         return (args?.agentId ?? 'agent-new') as T
       }
+      // N3：导出走完整档案（不做压缩替换）。
+      if (command === 'load_session_full') return (fullArchive ?? archive) as T
       if (command === 'load_session') {
         // SH-056 批 2：给了事件档案就以它判断"该会话有没有自己的 rollout"——
         // 子代理没有独立档案，宿主对缺失档案是抛错（不是空表），替身照做；
@@ -3080,6 +3087,124 @@ describe('权限挡位与底部指标的数据面', () => {
     expect(values['permissions']).toEqual({ currentValue: 'workspace-write' })
     await iterator.return?.(undefined)
     dispose()
+  })
+
+  it('N3：压缩档案重开 = 完整档案重开 = 实时——同一轮次/步数', async () => {
+    // 真机形状（03-rollout.jsonl）：turn4 内含 `Compacted range 0..6`，压缩视图里前三个
+    // 回合的用户消息被摘要取代，但它们的 `TurnEnd` 作为审计行留在档案里。
+    const full = [
+      { kind: 'message', role: 'user', text: '第一问', at_ms: 1 },
+      { kind: 'message', role: 'assistant', text: '答一', at_ms: 2 },
+      { kind: 'turn_end', turn: 1, task_id: 'agent#1', iterations: 1, reason: 'completed', at_ms: 3 },
+      { kind: 'message', role: 'user', text: '第二问', at_ms: 4 },
+      { kind: 'message', role: 'assistant', text: '答二（第一次采样）', at_ms: 5 },
+      { kind: 'message', role: 'assistant', text: '答二（第二次采样）', at_ms: 6 },
+      { kind: 'turn_end', turn: 2, task_id: 'agent#2', iterations: 2, reason: 'completed', at_ms: 7 },
+      { kind: 'message', role: 'user', text: '第三问', at_ms: 8 },
+      { kind: 'message', role: 'assistant', text: '答三', at_ms: 9 },
+      { kind: 'turn_end', turn: 3, task_id: 'agent#3', iterations: 1, reason: 'completed', at_ms: 10 },
+      { kind: 'message', role: 'user', text: '第四问', at_ms: 11 },
+      { kind: 'message', role: 'assistant', text: '答四', at_ms: 12 },
+      { kind: 'turn_end', turn: 4, task_id: 'agent#4', iterations: 1, reason: 'completed', at_ms: 13 },
+    ]
+    const compressed = [
+      full[2]!,
+      full[6]!,
+      full[9]!,
+      { kind: 'compaction_summary', text: '前三轮摘要', range_start: 0, range_end: 9, at_ms: 10 },
+      full[10]!,
+      full[11]!,
+      full[12]!,
+    ]
+
+    /** 开一次 follow 取 sessionStats（用完即关，避免生成器挂住）。 */
+    const statsOf = async (bridge: ReturnType<typeof scriptedBridge>): Promise<unknown> => {
+      const { remote, dispose } = createAdapter({ bridge })
+      const iterator = faceOf(remote).session.follow({ address: { kind: 'session', sessionId: 'agent-n3' } })
+      const values = ((await iterator.next()).value as { projections: { values: Record<string, unknown> } }).projections.values
+      await iterator.return?.(undefined)
+      dispose()
+      return values['sessionStats']
+    }
+
+    // 实时：4 轮、每轮采样迭代 1/2/1/1 → 5 步（后端每次采样都发 turn_started）。
+    const liveBridge = scriptedBridge(undefined, full)
+    const live = createAdapter({ bridge: liveBridge })
+    const liveSession = faceOf(live.remote).session
+    const iterationsPerTurn = [1, 2, 1, 1]
+    for (const [index, iterations] of iterationsPerTurn.entries()) {
+      await liveSession.prompt({
+        sessionId: 'agent-n3',
+        requestId: `rpc-n3-${index}`,
+        content: [{ type: 'text', text: `第${index + 1}问` }],
+      })
+      for (let sample = 1; sample <= iterations; sample += 1) {
+        liveBridge.emit('agent-n3', { type: 'turn_started', turn: sample })
+      }
+      liveBridge.emit('agent-n3', { type: 'turn_completed', turn: iterations, reason: 'completed' })
+    }
+    const liveIterator = liveSession.follow({ address: { kind: 'session', sessionId: 'agent-n3' } })
+    const liveValues = ((await liveIterator.next()).value as { projections: { values: Record<string, unknown> } }).projections.values
+    await liveIterator.return?.(undefined)
+    live.dispose()
+
+    const expected = {
+      turns: 4, steps: 5, llmMs: 0, toolMs: 0, ttftMs: 0, ttftSteps: 0, decodeMs: 0, decodeTokens: 0,
+    }
+    expect(liveValues['sessionStats']).toEqual(expected)
+    // 反向对照一：删掉「压缩区间内的 TurnEnd 补统计」→ 压缩重开只剩 1 轮 1 步。
+    expect(await statsOf(scriptedBridge(undefined, compressed))).toEqual(expected)
+    // 完整档案与压缩档案必须同值：压缩只替换历史，不该改变统计口径。
+    expect(await statsOf(scriptedBridge(undefined, full))).toEqual(expected)
+    // 同一个压缩档案重复重开：数值必须一模一样（N3 的「多次重开数字还会变」）。
+    expect(await statsOf(scriptedBridge(undefined, compressed))).toEqual(expected)
+  })
+
+  it('N3：重复结局行只算一轮，重复重开数值不变', async () => {
+    // 真机档案出现过 7 条 turn_end / 3~4 轮：同一轮被多个写者各收口一次。
+    const duplicated = [
+      { kind: 'turn_end', turn: 1, task_id: 'agent#1', iterations: 1, reason: 'completed', at_ms: 1 },
+      { kind: 'turn_end', turn: 2, task_id: 'agent#2', iterations: 1, reason: 'completed', at_ms: 2 },
+      { kind: 'turn_end', turn: 3, task_id: 'agent#3', iterations: 1, reason: 'completed', at_ms: 3 },
+      { kind: 'compaction_summary', text: '前三轮摘要', range_start: 0, range_end: 5, at_ms: 4 },
+      { kind: 'message', role: 'user', text: '第四问', at_ms: 5 },
+      { kind: 'message', role: 'assistant', text: '答四', at_ms: 6 },
+      { kind: 'turn_end', turn: 4, task_id: 'agent#4', iterations: 1, reason: 'completed', at_ms: 7 },
+      { kind: 'turn_end', turn: 4, task_id: 'agent#4', iterations: 1, reason: 'completed', at_ms: 8 },
+      { kind: 'turn_end', turn: 4, task_id: 'agent#4', iterations: 1, reason: 'completed', at_ms: 9 },
+      { kind: 'turn_end', turn: 4, task_id: 'agent#4', iterations: 1, reason: 'completed', at_ms: 10 },
+    ]
+    const statsOf = async (): Promise<unknown> => {
+      const { remote, dispose } = createAdapter({ bridge: scriptedBridge(undefined, duplicated) })
+      const iterator = faceOf(remote).session.follow({ address: { kind: 'session', sessionId: 'agent-dup' } })
+      const values = ((await iterator.next()).value as { projections: { values: Record<string, unknown> } }).projections.values
+      await iterator.return?.(undefined)
+      dispose()
+      return values['sessionStats']
+    }
+    const expected = {
+      turns: 4, steps: 4, llmMs: 0, toolMs: 0, ttftMs: 0, ttftSteps: 0, decodeMs: 0, decodeTokens: 0,
+    }
+    // 反向对照：去掉 `concludedTurns` 去重 → 后三条重复结局各补一轮，turns 变成 7。
+    expect(await statsOf()).toEqual(expected)
+    expect(await statsOf()).toEqual(expected)
+  })
+
+  it('N3：失败/空迭代回合用 TurnEnd.iterations 校正步数（实时 3 步 = 重开 3 步）', async () => {
+    const archive = [
+      { kind: 'message', role: 'user', text: '跑三次', at_ms: 1 },
+      { kind: 'message', role: 'assistant', text: '最后一次才失败', at_ms: 2 },
+      { kind: 'turn_end', turn: 1, task_id: 'agent#1', iterations: 3, reason: 'failed', at_ms: 3 },
+    ]
+    const { remote, dispose } = createAdapter({ bridge: scriptedBridge(undefined, archive) })
+    const iterator = faceOf(remote).session.follow({ address: { kind: 'session', sessionId: 'agent-n6' } })
+    const values = ((await iterator.next()).value as { projections: { values: Record<string, unknown> } }).projections.values
+    await iterator.return?.(undefined)
+    dispose()
+    // 反向对照：只数助手消息边界 → 这里得 1 步（N6：实时 3、重开 2 的同一类偏差）。
+    expect(values['sessionStats']).toEqual({
+      turns: 1, steps: 3, llmMs: 0, toolMs: 0, ttftMs: 0, ttftSteps: 0, decodeMs: 0, decodeTokens: 0,
+    })
   })
 })
 

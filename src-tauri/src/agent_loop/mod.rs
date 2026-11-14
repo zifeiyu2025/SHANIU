@@ -2454,34 +2454,28 @@ impl AgentLoop {
                 }
             }
             // Phase 2：`TurnEnd.turn` 是**用户回合号**，采样迭代数改由 `iterations` 承担。
-            // 计数来自 writer 对档案的累计（本回合用户消息此时已 flush）；为 0 属于异常
-            // 路径——记 0 且 `task_id` 留空，不伪造 `#0`，否则旧档判据（task_id 缺席）
-            // 会把一条编号不可用的结局误认成新档。
-            let user_turn = writer.user_turns();
-            if user_turn == 0 {
-                tracing::warn!(
-                    target: "rollout",
-                    "收口时用户回合计数为 0：TurnEnd 记 turn=0 / task_id=None（编号不可用）"
-                );
-            }
-            let task_id = (user_turn > 0).then(|| {
-                // 用档案文件名（= 建档时的 agent_id）而不是引擎作用域里的 `root`：
-                // `task_id` 要跨会话唯一，`root#1` 会在每个根会话里撞成同一个值。
-                let archive_agent = writer
-                    .path()
-                    .file_stem()
-                    .and_then(|stem| stem.to_str())
-                    .unwrap_or(scope.agent_id.as_str());
-                format!("{archive_agent}#{user_turn}")
+            // 编号在写锁内从档案重数，不用 writer 的缓存计数：多个写者（对账、
+            // 重启后的新 writer）各自的缓存可能落后，落后就会给同一轮写出两个号。
+            let archive_agent = writer
+                .path()
+                .file_stem()
+                .and_then(|stem| stem.to_str())
+                .map(str::to_string)
+                .unwrap_or_else(|| scope.agent_id.to_string());
+            let error_for_archive = turn_error.clone();
+            let reason_for_archive = reason_code.to_string();
+            let appended = writer.append_once(move |items| {
+                crate::rollout::conclude_turn(
+                    items,
+                    &archive_agent,
+                    &reason_for_archive,
+                    Some(last_turn),
+                    error_for_archive,
+                    now_ms(),
+                )
+                .item
             });
-            if let Err(error) = writer.append(&crate::rollout::RolloutItem::TurnEnd {
-                turn: user_turn,
-                task_id,
-                iterations: Some(last_turn),
-                reason: reason_code.to_string(),
-                at_ms: now_ms(),
-                error: turn_error.clone(),
-            }) {
+            if let Err(error) = appended {
                 tracing::warn!(
                     target: "rollout",
                     %error,

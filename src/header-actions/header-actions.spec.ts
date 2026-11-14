@@ -174,8 +174,9 @@ describe('header actions', () => {
 
     await actions.find(action => action.id === 'copy-markdown')?.run?.()
 
-    // 取数走 `load_session`（整份档案），不读 UI 快照——这是"未加载历史也能导出"的落点。
-    expect(invoke).toHaveBeenCalledWith('load_session', { agentId: SESSION_ID })
+    // 取数走 `load_session_full`（整份未压缩档案），不读 UI 快照——这是"未加载历史也能导出"的落点。
+    // 用压缩视图导出会让「导出 3 轮、实时 4 轮」（N3）重现。
+    expect(invoke).toHaveBeenCalledWith('load_session_full', { agentId: SESSION_ID })
     const markdown = String(writeText.mock.calls[0]?.[0] ?? '')
     expect(markdown.startsWith('# 多步演示')).toBe(true)
     expect(markdown).toContain('> 梳理一下 mock')

@@ -10,7 +10,7 @@
 
 use std::path::Path;
 
-use super::{counts_as_user_turn, RolloutError, RolloutItem, RolloutWriter};
+use super::{conclude_turn, RolloutError, RolloutItem, RolloutWriter, TurnConclusion};
 
 /// 对账结果分类（日志与前端只读它决定要不要收口，不参与语义推断）。
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -64,17 +64,6 @@ impl ConcludedTurn {
             _ => None,
         }
     }
-
-    fn to_item(&self) -> RolloutItem {
-        RolloutItem::TurnEnd {
-            turn: self.turn,
-            task_id: self.task_id.clone(),
-            iterations: self.iterations,
-            reason: self.reason.clone(),
-            at_ms: self.at_ms,
-            error: self.error.clone(),
-        }
-    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -114,31 +103,25 @@ pub fn reconcile_once(
         .and_then(|stem| stem.to_str())
         .unwrap_or("session")
         .to_string();
-    let fresh = ConcludedTurn {
-        turn,
-        task_id: Some(format!("{agent_id}#{turn}")),
-        // 对账不知道本次 run 跑了多少次采样；留空就是「未知」，不猜。
-        iterations: None,
-        reason: "indeterminate".into(),
-        at_ms,
-        error: None,
-    };
-    let mut existing: Option<ConcludedTurn> = None;
+    let mut conclusion: Option<TurnConclusion> = None;
     let appended = writer.append_once(|items| {
-        let last_user = items.iter().rposition(counts_as_user_turn)?;
-        if let Some(entry) = items[last_user + 1..]
-            .iter()
-            .rev()
-            .find_map(ConcludedTurn::from_item)
-        {
-            existing = Some(entry);
-            return None;
-        }
-        Some(fresh.to_item())
+        // 判定与编号与 agent_loop 收口共用同一份口径（`conclude_turn`）：
+        // 最后一条提问已经有结局时返回 None，档案里只留一条结论。
+        let mut decided = conclude_turn(items, &agent_id, "indeterminate", None, None, at_ms);
+        let item = decided.item.take();
+        conclusion = Some(decided);
+        item
     })?;
+    let conclusion = conclusion.take().expect("append_once 一定调用一次判定");
     match appended {
-        Some(_) => Ok(outcome(ReconcileStatus::Appended, Some(fresh))),
-        None => Ok(outcome(ReconcileStatus::AlreadyConcluded, existing)),
+        Some(item) => Ok(outcome(
+            ReconcileStatus::Appended,
+            ConcludedTurn::from_item(&item),
+        )),
+        None => Ok(outcome(
+            ReconcileStatus::AlreadyConcluded,
+            conclusion.existing.as_ref().and_then(ConcludedTurn::from_item),
+        )),
     }
 }
 

@@ -1812,6 +1812,8 @@ export function createAdapter(options: AdapterOptions): { remote: unknown; dispo
      * 同一个档案回合会被拆成两套步序，回合头与「用时 N 秒」的分组就和实时跑出来的不一样。
      */
     let stepHasAssistant = false
+    /** 本回合已经折叠掉的 step 数：`TurnEnd.iterations` 拿它做口径校正。 */
+    let stepsThisTurn = 0
     const openStep = (step: number): void => {
       pushEvent(journal, 'step/start', { turn: journal.turn, step })
       stepOpen = true
@@ -1822,16 +1824,31 @@ export function createAdapter(options: AdapterOptions): { remote: unknown; dispo
       pushEvent(journal, 'step/end', { turn: journal.turn, step: journal.step })
       // 重建只有计数、没有可信时刻：步/回合数如实折叠，墙钟一律不计。
       closeStepMetrics(journal)
+      stepsThisTurn += 1
       stepOpen = false
     }
+    /** 已按结局行统计过的用户回合号（防重复结局行把一轮数成两轮）。 */
+    const concludedTurns = new Set<number>()
     // 默认收口只用于「回合没有可信结局」：说「状态未知」，不说「已中止」
     // （状态源收敛 Phase 1）。`interrupted` 是宿主对「进程在回合中途退出」的结论，
     // 前端没有依据下这个结论；`indeterminate` 只陈述「没有结论」。
-    const closeTurn = (reason: Record<string, unknown> = { kind: 'indeterminate' }): void => {
+    const closeTurn = (
+      reason: Record<string, unknown> = { kind: 'indeterminate' },
+      iterations?: number,
+    ): void => {
       closeStep()
       if (!journal.taskOpen) return
+      // 步数只由采样迭代推进：档案里的 `iterations` 就是实时路径的
+      // `turn_started` 次数。重建若只数助手消息，失败/空迭代的回合会少记一步
+      // （N6：实时 3 步、重开 2 步）。旧档没有这个字段，保持推导值。
+      if (iterations !== undefined) {
+        const authoritative = Math.max(1, iterations)
+        journal.metrics.steps += authoritative - stepsThisTurn
+        stepsThisTurn = authoritative
+      }
       pushEvent(journal, 'turn/end', { turn: journal.turn, reason })
       journal.taskOpen = false
+      concludedTurns.add(journal.turn)
     }
     // 开新回合不再顺带收掉旧回合：收口是宿主的结论，不该是新回合的副作用。
     // 旧档里前一个回合还开着的情形，由调用点显式标「状态未知」（见 user message 分支）。
@@ -1839,6 +1856,7 @@ export function createAdapter(options: AdapterOptions): { remote: unknown; dispo
       journal.turn += 1
       journal.step = 0
       journal.taskOpen = true
+      stepsThisTurn = 0
       // 档案重建没有投影流可推，只折叠状态：最终快照带出的就是 fold 到尾的值
       pushTurnStart(undefined, journal)
     }
@@ -1856,7 +1874,19 @@ export function createAdapter(options: AdapterOptions): { remote: unknown; dispo
           // 旧档是本次 run 内的采样迭代序号、在新档是用户回合号——两种口径都不与前端
           // 按用户消息计的回合号做等值比较，否则口径一旦不同就把宿主已经给出的结论
           // 丢掉，末尾兜底随后会补一条收口盖掉它。
-          if (journal.taskOpen) closeTurn(archiveTurnReason(entry.reason, entry.error))
+          if (journal.taskOpen) {
+            closeTurn(archiveTurnReason(entry.reason, entry.error), entry.iterations)
+          } else if (entry.task_id !== undefined && !concludedTurns.has(entry.turn)) {
+            // 压缩区间里的结局行：它的用户消息已被摘要取代，看不到消息，但这一轮
+            // 真实存在。只计入统计，不造事件——否则重开后凭空多一个空回合。
+            // 同一 `turn` 的重复结局行（历史档案里出现过）只算一次；`task_id` 缺席
+            // 的旧档没有可信回合号，宁可不猜。
+            concludedTurns.add(entry.turn)
+            journal.turn = Math.max(journal.turn, entry.turn)
+            journal.countedTurn = journal.turn
+            journal.metrics.turns += 1
+            journal.metrics.steps += entry.iterations ?? 0
+          }
           journal.entryToSeq[index] = journal.seq
           return
         }

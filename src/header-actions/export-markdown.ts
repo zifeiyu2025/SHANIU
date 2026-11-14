@@ -56,9 +56,11 @@ export function exportMarkdownFetcher(
     const sessionId = url.searchParams.get('sessionId') ?? ''
     if (sessionId === '') return notFound()
     init?.signal?.throwIfAborted()
-    // `load_session` 读的是整份档案，不依赖界面已加载多少——这正是本卡
-    // 「未加载历史也能导出」的落点。
-    const entries = await bridge.invoke<SessionEntryLike[]>('load_session', { agentId: sessionId })
+    // `load_session_full` 读整份档案且**不做压缩替换**：导出是用户可见的完整记录，
+    // 压缩只是喂模型的上下文优化。用压缩视图导出会让「导出 3 轮、实时 4 轮」
+    // （N3）重现；压缩摘要仍以 `compaction_summary` 条目返回，导出侧跳过它。
+    // 不依赖界面已加载多少——这正是本卡「未加载历史也能导出」的落点。
+    const entries = await bridge.invoke<SessionEntryLike[]>('load_session_full', { agentId: sessionId })
     init?.signal?.throwIfAborted()
     const markdown = formatSessionMarkdown(sessionEntriesToEvents(entries, titleOf(sessionId)))
     return {

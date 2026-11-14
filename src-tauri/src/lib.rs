@@ -1198,6 +1198,11 @@ fn project_entries(items: &[rollout::RolloutItem]) -> Result<Vec<SessionEntry>, 
         }
     }
 
+    Ok(slots_to_entries(slots))
+}
+
+/// 槽位 → 展示条目：工具输出按 `call_id` 并回对应的调用。
+fn slots_to_entries(slots: Vec<Slot>) -> Vec<SessionEntry> {
     let mut outputs: std::collections::HashMap<String, String> = std::collections::HashMap::new();
     for slot in &slots {
         if let Slot::Output { call_id, output } = slot {
@@ -1220,7 +1225,7 @@ fn project_entries(items: &[rollout::RolloutItem]) -> Result<Vec<SessionEntry>, 
             Slot::Output { .. } => {}
         }
     }
-    Ok(out)
+    out
 }
 
 /// 投影槽位：只有**会进历史序列**的条目才占压缩锚点的序号。
@@ -1262,7 +1267,22 @@ fn summary_entry(summary: &str, range_start: usize, range_end: usize) -> Session
     }
 }
 
+/// 完整档案 → 展示条目（导出用）：不做压缩替换，被压缩的原文照常出现。
+///
+/// 压缩锚点仍投影成 `CompactionSummary`，但只作为"这里压过一次"的标记留在原位；
+/// 导出侧（`header-actions/session-events.ts`）跳过它，不会把摘要当用户发言。
+fn project_entries_full(items: &[rollout::RolloutItem]) -> Result<Vec<SessionEntry>, String> {
+    Ok(slots_to_entries(project_slots_with(items, true)))
+}
+
 fn project_slots(items: &[rollout::RolloutItem]) -> Vec<Slot> {
+    project_slots_with(items, false)
+}
+
+/// @param include_compaction - 是否把压缩锚点投影成 `CompactionSummary` 槽位。
+///   压缩视图（`load_session`）传 false：锚点由 `apply_compaction` 在槽位序列上替换；
+///   完整视图（导出）传 true：锚点只做标记，原文一条不删。
+fn project_slots_with(items: &[rollout::RolloutItem], include_compaction: bool) -> Vec<Slot> {
     let mut out = Vec::with_capacity(items.len());
     for item in items {
         match item {
@@ -1289,8 +1309,14 @@ fn project_slots(items: &[rollout::RolloutItem]) -> Vec<Slot> {
                 item: model_client::HistoryItem::FunctionCallOutput { call_id, output },
                 ..
             } => out.push(Slot::Output { call_id: call_id.clone(), output: output.clone() }),
-            // 压缩锚点本身在这里不产出条目：它的位置与内容由 `apply_compaction`
+            // 压缩视图里锚点本身不产出条目：位置与内容由 `apply_compaction`
             // 在槽位序列上做替换（先收全部槽位、再按记录顺序应用锚点）。
+            // 完整视图里只插一条摘要标记，原文照留——导出不能因为压缩少掉用户回合。
+            rollout::RolloutItem::Compacted { range_start, range_end, summary }
+                if include_compaction =>
+            {
+                out.push(Slot::Summary(summary_entry(summary, *range_start, *range_end)))
+            }
             rollout::RolloutItem::Compacted { .. } => {}
             // 带图消息保留结构化引用：展示层自己决定怎么渲染图片卡片，
             // 重放也不再依赖正文里的历史 marker。字节永远不进档案。
@@ -1394,8 +1420,11 @@ fn apply_compaction(
 /// 走 `rollout::read`：中间坏行**跳过并计数**（`read` 内已 warn），末行撕裂丢弃，
 /// 都不再判定整份档案失败；读回后经 [`notify_rollout_degraded`] 让用户看见"这份历史
 /// 不完整"。首行坏仍报错——没有 meta 就没有会话可开。
-#[tauri::command]
-fn load_session(app: tauri::AppHandle, agent_id: String) -> Result<Vec<SessionEntry>, String> {
+fn read_session_entries(
+    app: tauri::AppHandle,
+    agent_id: String,
+    full: bool,
+) -> Result<Vec<SessionEntry>, String> {
     let state = app.state::<AppState>();
     let path = state
         .data_root()
@@ -1406,7 +1435,29 @@ fn load_session(app: tauri::AppHandle, agent_id: String) -> Result<Vec<SessionEn
     // `load_session` 不做重放，所以没有"不安全尾部"这一项。
     let sink: Arc<dyn events::EventSink> = Arc::new(events::TauriEventSink::root(app.clone(), agent_id.clone()).with_journal(Arc::new(event_journal::FileEventJournal::new(state.data_root().join(config::SESSIONS_DIR)))).with_broadcast(app.state::<gateway::GatewayHub>().broadcast_sender()).with_viewers(app.state::<gateway::GatewayHub>().viewers()));
     notify_rollout_degraded(sink.as_ref(), &agent_id, archive.torn_tail_lines, &archive.damaged_lines, 0);
-    project_entries(&archive.items).map_err(|e| format!("档案读不回: {e}"))
+    let entries = if full {
+        project_entries_full(&archive.items)
+    } else {
+        project_entries(&archive.items)
+    };
+    entries.map_err(|e| format!("档案读不回: {e}"))
+}
+
+/// 读回一个会话的历史条目，供前端渲染（SH-033 的"打开会话"）。
+#[tauri::command]
+fn load_session(app: tauri::AppHandle, agent_id: String) -> Result<Vec<SessionEntry>, String> {
+    read_session_entries(app, agent_id, false)
+}
+
+/// 读回**未做压缩替换**的完整档案（导出用）。
+///
+/// 与 [`load_session`] 只差一处：不把压缩区间换成摘要。压缩是喂模型的上下文优化，
+/// 不是用户发过的回合被删除；导出跟着压缩视图走，用户就会看到「导出少一轮」
+/// （N3：导出 3 轮、实时 4 轮、档案 4 条结局）。锚点仍以 `CompactionSummary`
+/// 留在原位，导出侧跳过它，不把摘要伪装成用户发言。
+#[tauri::command]
+fn load_session_full(app: tauri::AppHandle, agent_id: String) -> Result<Vec<SessionEntry>, String> {
+    read_session_entries(app, agent_id, true)
 }
 
 /// 会话全文搜索（SH-113）：宿主侧 SQLite FTS5 派生索引。
@@ -3479,6 +3530,7 @@ pub fn run() {
             session_runtime,
             reconcile_session,
             load_session,
+            load_session_full,
             search_sessions,
             retry_session_index,
             fork_session,

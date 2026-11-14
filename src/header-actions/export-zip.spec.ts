@@ -134,7 +134,7 @@ describe('SessionLogDownloadController 集成（三态 / 并发 / 取消）', ()
     const { bridge, calls } = harness({
       export_probe: async () => HEADER,
       pick_save_file: async () => 'C:\\tmp\\会话.zip',
-      load_session: async () => ENTRIES,
+      load_session_full: async () => ENTRIES,
       export_session_log: async () => ({ path: 'C:\\tmp\\会话.zip', bytes: 2048, entries: 1 }),
     })
     const controller = new SessionLogDownloadController(
@@ -149,7 +149,7 @@ describe('SessionLogDownloadController 集成（三态 / 并发 / 取消）', ()
       expect(names(calls)).toContain('export_session_log')
     })
     expect(names(calls)).toEqual([
-      'export_probe', 'pick_save_file', 'export_probe', 'load_session', 'export_session_log',
+      'export_probe', 'pick_save_file', 'export_probe', 'load_session_full', 'export_session_log',
     ])
 
     const write = calls.find(c => c.command === 'export_session_log')!
@@ -223,7 +223,7 @@ describe('SessionLogDownloadController 集成（三态 / 并发 / 取消）', ()
     const { bridge } = harness({
       export_probe: async () => HEADER,
       pick_save_file: async () => 'C:\\tmp\\x.zip',
-      load_session: async () => ENTRIES,
+      load_session_full: async () => ENTRIES,
       export_session_log: async () => { throw new Error('磁盘已满') },
     })
     const warn = vi.fn()

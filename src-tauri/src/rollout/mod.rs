@@ -243,7 +243,7 @@ fn archive_write_lock() -> MutexGuard<'static, ()> {
 /// 一条档案行是否算「一个用户回合的起点」。
 ///
 /// 文本提问与带图提问都算——带图消息也是用户主动发起的一轮。
-fn counts_as_user_turn(item: &RolloutItem) -> bool {
+pub(crate) fn counts_as_user_turn(item: &RolloutItem) -> bool {
     matches!(
         item,
         RolloutItem::ResponseItem {
@@ -252,6 +252,55 @@ fn counts_as_user_turn(item: &RolloutItem) -> bool {
             ..
         }
     )
+}
+
+/// 收口判定的结果（写入端唯一口径，agent_loop 收口与 reconcile 共用）。
+pub(crate) struct TurnConclusion {
+    /// 本次应当追加的结局；`None` = 最后一条提问已经有结局，不重复写。
+    pub item: Option<RolloutItem>,
+    /// 档案里该提问已有的结局（`item` 为 `None` 时才有值），对账据此回答「早已收口」。
+    pub existing: Option<RolloutItem>,
+}
+
+/// 判定「这次收口该不该写」。
+///
+/// 只有**最后一条用户提问之后还没有结局**时才产生一条 `TurnEnd`：重入/空转的 run
+/// 没有新增提问，再写一条结局就是同一轮两个结论（N3：7 条 turn_end / 4 轮）。
+/// `turn` 在这里从档案重数，不取任何写者的缓存计数——多个写者的缓存可能落后，
+/// 落后就会给同一轮写出两个号。
+pub(crate) fn conclude_turn(
+    items: &[RolloutItem],
+    archive_agent: &str,
+    reason: &str,
+    iterations: Option<u32>,
+    error: Option<crate::events::TurnErrorInfo>,
+    at_ms: u64,
+) -> TurnConclusion {
+    let Some(last_user) = items.iter().rposition(counts_as_user_turn) else {
+        return TurnConclusion { item: None, existing: None };
+    };
+    if let Some(existing) = items[last_user + 1..]
+        .iter()
+        .rev()
+        .find(|item| matches!(item, RolloutItem::TurnEnd { .. }))
+    {
+        return TurnConclusion { item: None, existing: Some(existing.clone()) };
+    }
+    let turn = items.iter().filter(|item| counts_as_user_turn(item)).count() as u32;
+    // `task_id` 要跨会话唯一：文件名的 agent_id 才是建档时的身份，引擎作用域里的
+    // `root#1` 会在每个根会话里撞成同一个值。
+    let task_id = Some(format!("{archive_agent}#{turn}"));
+    TurnConclusion {
+        item: Some(RolloutItem::TurnEnd {
+            turn,
+            task_id,
+            iterations,
+            reason: reason.to_string(),
+            at_ms,
+            error,
+        }),
+        existing: None,
+    }
 }
 
 impl RolloutWriter {
@@ -848,6 +897,49 @@ mod tests {
             item: HistoryItem::Message { role: Role::Assistant, text: text.into(), reasoning: None },
             at_ms,
         }
+    }
+
+    /// N3：同一提问只有一次收口——判定由 `conclude_turn` 独占，重入/重放不再多写结局。
+    ///
+    /// 反向验证：去掉「最后一条提问之后已有 TurnEnd」的检查 → 第二次调用仍返回 Some，
+    /// 档案里同一 `turn` 出现两条结论（真机 7 条 turn_end / 4 轮的形状）。
+    #[test]
+    fn conclude_turn_is_idempotent_per_user_turn() {
+        let mut items = vec![user_msg("第一问", 1), assistant_msg("答", 2)];
+        let first = conclude_turn(&items, "agent", "completed", Some(2), None, 3);
+        match first.item.as_ref() {
+            Some(RolloutItem::TurnEnd { turn, task_id, iterations, .. }) => {
+                assert_eq!(*turn, 1, "turn 必须是用户回合号，不是采样迭代数");
+                assert_eq!(task_id.as_deref(), Some("agent#1"));
+                assert_eq!(*iterations, Some(2), "采样迭代数只能进 iterations");
+            }
+            other => panic!("第一次收口必须给出结局行，实际 {other:?}"),
+        }
+        assert!(first.existing.is_none());
+        items.push(first.item.expect("第一次收口应有结局行"));
+
+        // 同一提问的第二次收口：不追加，只回报已有结局。
+        let second = conclude_turn(&items, "agent", "failed", Some(5), None, 4);
+        assert!(second.item.is_none(), "同一轮不许写第二个结论");
+        assert!(
+            matches!(second.existing, Some(RolloutItem::TurnEnd { turn: 1, .. })),
+            "第二次收口必须回报已有结局"
+        );
+
+        // 新提问 → 下一次收口编号 +1。
+        items.push(user_msg("第二问", 5));
+        let third = conclude_turn(&items, "agent", "completed", Some(1), None, 6);
+        match third.item.as_ref() {
+            Some(RolloutItem::TurnEnd { turn, task_id, .. }) => {
+                assert_eq!(*turn, 2);
+                assert_eq!(task_id.as_deref(), Some("agent#2"));
+            }
+            other => panic!("第二次提问应编号 2，实际 {other:?}"),
+        }
+
+        // 没有提问（只有脚手架/元数据）→ 什么都不写，也不产生编号。
+        let empty = conclude_turn(&[meta("agent")], "agent", "completed", None, None, 7);
+        assert!(empty.item.is_none() && empty.existing.is_none());
     }
 
     /// Phase 2：`TurnEnd.turn` 是**用户回合号**，本次 run 的采样迭代数进 `iterations`。

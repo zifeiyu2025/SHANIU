@@ -172,7 +172,9 @@ export function exportZipSaver(
       if (dest === null) return
 
       const header = await bridge.invoke<ExportHeaderLike>('export_probe', { sessionId })
-      const entries = await bridge.invoke<SessionEntryLike[]>('load_session', { agentId: sessionId })
+      // 导出是用户可见的完整记录：读未压缩档案（`load_session_full`）。压缩只是喂模型的
+      // 上下文优化，用压缩视图导出会让「导出 3 轮、实时 4 轮」（N3）在 ZIP 里重现。
+      const entries = await bridge.invoke<SessionEntryLike[]>('load_session_full', { agentId: sessionId })
       const events = sessionEntriesToEvents(entries, titleOf(sessionId))
 
       // 子会话（subagents/<id>/…，待 SH-056）与附件（media/…、files/…）两段的
