@@ -659,6 +659,26 @@ function usableActiveTaskView(raw: unknown): ActiveTaskView | null | undefined {
 }
 
 /**
+ * 会话清单形状判据：`list_sessions` 的结果能不能当「事实」用。
+ *
+ * 返回 `undefined` = 查询失败或形状不可判（非数组、单条缺 `agentId` / `workspaceRoot`）；
+ * `[]` 只表示宿主**明确**说「一条会话都没有」。两者不能混：把未知折成空表，界面会把
+ * 「不知道」渲染成确定的「没有会话 / 计数 0」，用户没有任何待重试的信号。
+ */
+function usableSessionRows(raw: unknown): SessionListRow[] | undefined {
+  if (!Array.isArray(raw)) return undefined
+  const rows: SessionListRow[] = []
+  for (const item of raw) {
+    if (typeof item !== 'object' || item === null) return undefined
+    const row = item as Partial<SessionListRow>
+    if (typeof row.agentId !== 'string' || row.agentId.length === 0) return undefined
+    if (typeof row.workspaceRoot !== 'string') return undefined
+    rows.push(row as SessionListRow)
+  }
+  return rows
+}
+
+/**
  * 失败回合的原始诊断（供 UI 展开与复制，审计 A0）。
  * 文案只在展开区出现，不参与"一句人话"的展示；后端已做过脱敏。
  */
@@ -852,6 +872,21 @@ export function createAdapter(options: AdapterOptions): { remote: unknown; dispo
 
   /** 设置页 / 凭据 / 模型目录三张面：事实来源是宿主的 `[[providers]]` 文档。 */
   const face = createSettingsFace(bridge, { emit: dispatch })
+
+  /**
+   * 查会话清单的唯一入口：查询失败与形状不可判统一收敛成 `undefined`。
+   *
+   * 调用点各自决定「未知」怎么表现，不再各写一遍 `catch(() => [])`——那种写法会把
+   * 失败伪装成空列表，调用方再也分不清「没有会话」和「没查到」。
+   */
+  const readSessionRows = async (): Promise<SessionListRow[] | undefined> => {
+    try {
+      return usableSessionRows(await bridge.invoke<unknown>('list_sessions'))
+    } catch (reason) {
+      console.warn('[SHANIU] 会话清单查询失败，按未知处理', reason)
+      return undefined
+    }
+  }
 
   /**
    * 记下一条已接受的 event_id；返回 false = 重复帧，调用方必须原样丢弃。
@@ -2586,9 +2621,8 @@ export function createAdapter(options: AdapterOptions): { remote: unknown; dispo
     replayed.lastEventId = cursor
     journals.set(sessionId, replayed)
     if (!titles.has(sessionId)) {
-      const rows = await bridge.invoke<SessionListRow[]>('list_sessions')
-        .catch((): SessionListRow[] => [])
-      const hostTitle = rows.find(row => row.agentId === sessionId)?.title ?? ''
+      // 标题是「有就用」：查询不可用时回退本地首条用户消息，不把未知当空标题。
+      const hostTitle = (await readSessionRows())?.find(row => row.agentId === sessionId)?.title ?? ''
       if (hostTitle !== '') {
         pushTitle(sessionId, hostTitle)
       } else {
@@ -2710,7 +2744,9 @@ export function createAdapter(options: AdapterOptions): { remote: unknown; dispo
 
   const sessionNamespace = {
     list: async () => {
-      const rows = await bridge.invoke<SessionListRow[]>('list_sessions')
+      const rows = await readSessionRows()
+      // 查不到就说查不到：返回空列表等于把「不知道」伪装成「一条会话都没有」。
+      if (rows === undefined) return FAIL('会话列表暂时不可用，请重试')
       return OK({
         items: rows.map(row => {
           const title = titles.get(row.agentId) ?? row.title
@@ -2756,13 +2792,9 @@ export function createAdapter(options: AdapterOptions): { remote: unknown; dispo
       // 成员里找第一条可复用的空白（blank + cwd 匹配 + 未归档），带 sessionId 请求
       // 创建——宿主二次校验后复用同 id 或新造。没有这步，每次点新建/每次启动恢复
       // 都会无声积累一份空白档案（真机曾积累到 10 份）。
-      const [flags, rows] = await Promise.all([
-        readWorkspaceFlags(),
-        bridge
-          .invoke<SessionListRow[]>('list_sessions')
-          .catch((): SessionListRow[] => []),
-      ])
-      const reusableBlank = rows.find(row =>
+      const [flags, rows] = await Promise.all([readWorkspaceFlags(), readSessionRows()])
+      // 不知道有没有可复用的空白会话时直接新建：误复用比多建一份更难收拾。
+      const reusableBlank = rows?.find(row =>
         row.blank && row.workspaceRoot === cwd
           && !flags.archivedSessionIds.includes(row.agentId)
           && row.running !== true,
@@ -2782,7 +2814,7 @@ export function createAdapter(options: AdapterOptions): { remote: unknown; dispo
       // 而资源管理器按钮与官方 `workspace.openLocal` 都以列表行的 cwd 为前置条件——
       // 少了这条事件，新会话在本次运行内一直"点了没反应"，要重开窗口（list 刷新）才补上。
       // 复用空白会话时 rows 里已有该行，按它的 blank / 工作区如实上报。
-      const reused = rows.find(row => row.agentId === agentId)
+      const reused = rows?.find(row => row.agentId === agentId)
       dispatch('api-session/added', {
         agentAvailable: true,
         sessionId: agentId,
@@ -2795,7 +2827,8 @@ export function createAdapter(options: AdapterOptions): { remote: unknown; dispo
       // 工作区分组按 sessionIds 显示：新会话建完就要推一帧，否则侧栏的工作区树
       // 里看不到它，要重开窗口才出现。目标工作区可能不是默认那家，按路径找视图。
       const target = registered.find(ws => ws.path === cwd) ?? registered[0]
-      if (target !== undefined) {
+      // 清单不可判时跳过推帧：空表会把目标工作区已有的会话从侧栏抹掉。
+      if (target !== undefined && rows !== undefined) {
         workspaceLog.append({ type: 'upsert', workspace: await workspaceViewFor(target, rows, flags) })
       }
       return OK({ sessionId: agentId })
@@ -2833,11 +2866,12 @@ export function createAdapter(options: AdapterOptions): { remote: unknown; dispo
       journals.delete(agentId)
       // fork 会话继承源会话的工作区（可能在任意一家）：逐家重推受影响的视图
       const flags = await readWorkspaceFlags()
-      const rows = await bridge
-        .invoke<SessionListRow[]>('list_sessions')
-        .catch((): SessionListRow[] => [])
-      for (const ws of registeredWorkspaces()) {
-        workspaceLog.append({ type: 'upsert', workspace: await workspaceViewFor(ws, rows, flags) })
+      const rows = await readSessionRows()
+      // 查询不可用时保持既有视图：不能用空表把各工作区的会话计数刷成 0。
+      if (rows !== undefined) {
+        for (const ws of registeredWorkspaces()) {
+          workspaceLog.append({ type: 'upsert', workspace: await workspaceViewFor(ws, rows, flags) })
+        }
       }
       return OK({ sessionId: agentId })
     },
@@ -3404,10 +3438,9 @@ export function createAdapter(options: AdapterOptions): { remote: unknown; dispo
     }
   }
 
-  const allWorkspaceViews = async (flags: WorkspaceFlags): Promise<Record<string, unknown>[]> => {
-    const rows = await bridge
-      .invoke<{ agentId: string; workspaceRoot: string; updatedAt: number }[]>('list_sessions')
-      .catch((): { agentId: string; workspaceRoot: string; updatedAt: number }[] => [])
+  const allWorkspaceViews = async (flags: WorkspaceFlags): Promise<Record<string, unknown>[] | undefined> => {
+    const rows = await readSessionRows()
+    if (rows === undefined) return undefined
     return Promise.all(registeredWorkspaces().map(ws => workspaceViewFor(ws, rows, flags)))
   }
 
@@ -3483,8 +3516,12 @@ export function createAdapter(options: AdapterOptions): { remote: unknown; dispo
     }
     if (orderChanged || !sameSet(previous.sessionOrder, next.sessionOrder)) {
       // 手动顺序在 sidecar 是全局扁平表，任何一家都可能受影响：逐家重推视图
-      for (const view of await allWorkspaceViews(next)) {
-        workspaceLog.append({ type: 'upsert', workspace: view })
+      const views = await allWorkspaceViews(next)
+      // 查询不可用时跳过重推：保持既有视图，不用空表把各工作区的计数刷成 0。
+      if (views !== undefined) {
+        for (const view of views) {
+          workspaceLog.append({ type: 'upsert', workspace: view })
+        }
       }
     }
     return value
@@ -3495,9 +3532,12 @@ export function createAdapter(options: AdapterOptions): { remote: unknown; dispo
       await face.refresh()
       const flags = await readWorkspaceFlags()
       const from = workspaceLog.length
+      const views = await allWorkspaceViews(flags)
+      // 首次订阅拿不到清单：不能伪造空 items，明确失败让上层重试。
+      if (views === undefined) throw new Error('会话清单暂时不可用')
       yield {
         type: 'baseline',
-        value: { items: await allWorkspaceViews(flags), archivedSessionIds: flags.archivedSessionIds, pinnedSessionIds: flags.pinnedSessionIds },
+        value: { items: views, archivedSessionIds: flags.archivedSessionIds, pinnedSessionIds: flags.pinnedSessionIds },
       }
       // 同 control：signal 传进 tail，客户端 teardown 的 `dispose()` 才能落地。
       for await (const frame of workspaceLog.tail(from, signal)) yield frame
@@ -3512,6 +3552,8 @@ export function createAdapter(options: AdapterOptions): { remote: unknown; dispo
       if (face.workspaceHidden()) return OK(undefined)
       const flags = await readWorkspaceFlags()
       const views = await allWorkspaceViews(flags)
+      // 查不到视图就明确失败：`OK(undefined)` 会被读成「没有默认工作区」，是另一种猜测。
+      if (views === undefined) return FAIL('工作区列表暂时不可用，请重试')
       // 顺序可被拖拽改（SH-111），默认项不一定在 [0]：按 id 找，找不到 = 无默认项
       const view = views.find(item => item['workspaceId'] === HOST_WORKSPACE_ID)
       return view === undefined ? OK(undefined) : OK({ workspace: view })

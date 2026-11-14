@@ -60,6 +60,10 @@ interface ScriptedBridge extends HostBridge {
     listRunning: boolean
     /** 直接覆盖 `session_runtime` 的原始返回值，用来模拟形状不合法的载荷（如 `{}`）。 */
     runtimeRaw?: unknown
+    /** 直接覆盖 `list_sessions` 的原始返回值，用来模拟非数组等形状不合法的载荷。 */
+    listRowsRaw?: unknown
+    /** 为 true 时 `list_sessions` 直接拒绝，模拟查询失败。 */
+    throwList?: boolean
   }
   emit(sessionId: string, msg: EventMsg, agentId?: string, tsMs?: number, eventId?: string): void
   /** 阶段 3：推送一份待审批快照（模拟 `approval/pending-changed`）。 */
@@ -295,6 +299,8 @@ function scriptedBridge(
         return host.active as T
       }
       if (command === 'list_sessions') {
+        if (host.throwList === true) throw { code: 'IPC_FAILED', message: '会话清单查询失败' }
+        if (host.listRowsRaw !== undefined) return host.listRowsRaw as T
         return [{
           agentId: 'agent-new',
           updatedAt: 1,
@@ -1393,6 +1399,64 @@ describe('适配层的命令面映射', () => {
     bridge.host.listRunning = true
     expect(((await session.list())['value'] as { items: { running: boolean }[] }).items[0]?.running).toBe(true)
     dispose()
+  })
+
+  it('list_sessions 形状不可判与「确实没有会话」分开表达：不再把未知折成空表', async () => {
+    // 非数组：旧实现 `rows.map` 直接抛 TypeError；现在按「未知」返回内部错误。
+    const broken = scriptedBridge()
+    broken.host.listRowsRaw = {}
+    const brokenAdapter = createAdapter({ bridge: broken })
+    const brokenResult = await faceOf(brokenAdapter.remote).session.list()
+    expect(brokenResult['ok']).toBe(false)
+    expect((brokenResult as unknown as { error: { message: string } }).error.message).toContain('暂时不可用')
+    brokenAdapter.dispose()
+
+    // 查询失败：与形状不可判同一处理，不是「一条会话都没有」。
+    const failed = scriptedBridge()
+    failed.host.throwList = true
+    const failedAdapter = createAdapter({ bridge: failed })
+    const failedResult = await faceOf(failedAdapter.remote).session.list()
+    expect(failedResult['ok']).toBe(false)
+    expect((failedResult as unknown as { error: { message: string } }).error.message).toContain('暂时不可用')
+    failedAdapter.dispose()
+
+    // 宿主明确说没有会话：这才是空列表。
+    const empty = scriptedBridge()
+    empty.host.listRowsRaw = []
+    const emptyAdapter = createAdapter({ bridge: empty })
+    const emptyResult = await faceOf(emptyAdapter.remote).session.list()
+    expect(emptyResult['ok']).toBe(true)
+    expect((emptyResult as unknown as { value: { items: unknown[] } }).value.items).toEqual([])
+    emptyAdapter.dispose()
+
+    // 正常数组照常工作：判据不能把合法行也挡掉。
+    const normal = scriptedBridge()
+    const normalAdapter = createAdapter({ bridge: normal })
+    const normalResult = await faceOf(normalAdapter.remote).session.list()
+    expect(normalResult['ok']).toBe(true)
+    expect((normalResult as unknown as { value: { items: { sessionId: string }[] } }).value.items
+      .map(item => item.sessionId)).toEqual(['agent-new'])
+    normalAdapter.dispose()
+  })
+
+  it('工作区首次订阅：清单不可判时明确失败，空数组才产出空 items', async () => {
+    interface FollowFace { workspace: { follow(): AsyncGenerator<Record<string, unknown>> } }
+    const broken = scriptedBridge()
+    broken.host.listRowsRaw = {}
+    const brokenAdapter = createAdapter({ bridge: broken })
+    const brokenFace = faceOf(brokenAdapter.remote) as unknown as FollowFace
+    await expect(brokenFace.workspace.follow().next()).rejects.toThrow('会话清单暂时不可用')
+    brokenAdapter.dispose()
+
+    const empty = scriptedBridge()
+    empty.host.listRowsRaw = []
+    const emptyAdapter = createAdapter({ bridge: empty })
+    const emptyFace = faceOf(emptyAdapter.remote) as unknown as FollowFace
+    const baseline = (await emptyFace.workspace.follow().next()).value as {
+      value: { items: { sessionIds: string[] }[] }
+    }
+    expect(baseline.value.items.every(view => view.sessionIds.length === 0)).toBe(true)
+    emptyAdapter.dispose()
   })
 
   it('create 成功后补发 api-session/added：列表行要带 cwd，否则资源管理器与官方 openLocal 都缺前置条件', async () => {
