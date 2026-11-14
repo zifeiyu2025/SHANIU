@@ -61,7 +61,8 @@ export type SessionEntryLike =
     /**
      * 压缩锚点摘要：历史区间 `[range_start, range_end)` 被这一条取代。
      *
-     * **不是用户回合**：实时路径把压缩记成 `compaction/summary` 事件 + 一条通知；
+     * **不是用户回合**：实时路径把压缩记成 `compaction/start → compaction/summary →
+     * 一条 checkpoint（替换型 user/message）`；重建按同一形状落，重开才与实时同节点。
      * 重建若按 `message` 处理，会凭空多一轮，紧随其后的用户消息还会先补一条中止横幅。
      */
     readonly kind: 'compaction_summary'

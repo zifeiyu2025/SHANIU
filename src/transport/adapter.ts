@@ -141,34 +141,6 @@ function approvalSubject(msg: Extract<EventMsg, { type: 'exec_approval_request' 
 }
 
 /**
- * 压缩成功的通知文案。
- *
- * 一条通知要回答四个问题，且每个数都来自后端字段本身：
- * - 压的是哪一段：`range_start`/`range_end`（`[start, end)` 的历史下标，界面按 1 起数）；
- * - 压了多少：`shadowed_items` 条、约 `shadowed_tokens` token；
- * - 为什么现在压：`estimated_tokens` 与 `budget_tokens`（触发时的上下文规模 vs 预算）；
- * - 压完还剩多少：`history_tokens_after`（只有 `compaction_ended` 带，缺省时不编）。
- */
-function compactedNotice(
-  trace: {
-    estimatedTokens: number
-    budgetTokens: number
-    rangeStart: number
-    rangeEnd: number
-    shadowed: { items: number; tokens: number }
-  },
-  historyTokensAfter: number | null | undefined,
-): string {
-  const head = `上下文已压缩：历史第 ${trace.rangeStart + 1}–${trace.rangeEnd} 条`
-    + `（共 ${trace.shadowed.items} 条，约 ${trace.shadowed.tokens} token）被一条摘要取代；`
-  const pressure = `触发时上下文约 ${trace.estimatedTokens} token（预算 ${trace.budgetTokens} token）`
-  const tail = typeof historyTokensAfter === 'number'
-    ? `压缩后历史约 ${historyTokensAfter} token；${pressure}。`
-    : `${pressure}。`
-  return `${head}${tail}原文仍保留在会话档案里。`
-}
-
-/**
  * `batch_scope` 是范围标识，不是文案：协议里不写中文，措辞在这里映射。
  * 未识别的标识必须显式暴露——静默当成「不批量」会让卡片少说一句它本应说的事。
  */
@@ -359,6 +331,14 @@ interface Journal {
   /** DSH 的 turn = 一次用户任务；后端事件面的 `turn` = 任务内一次采样迭代（= DSH 的 step）。 */
   turn: number
   step: number
+  /**
+   * 当前模型可见 surface 上的事件 seq（按落账顺序，含替换后的节点）。
+   *
+   * 压缩锚点是一条**替换**事件：区间必须指向 surface 上既有节点，且 `sourceEventSeqs`
+   * 必须指名区间内全部被遮蔽节点（dsh `foldSurface` 的硬约束）。不维护这份镜像就只能
+   * 发出非法事件，实时流会在客户端校验处直接断开。
+   */
+  surfaceSeqs: number[]
   /**
    * 最近一帧 `turn_started` 的**采样迭代号**（事件面 `turn` 的语义，1 起）。
    *
@@ -780,7 +760,7 @@ function newJournal(createdAt: number): Journal {
   return {
     serial: journalSerial,
     seq: -1, revision: 0, log: new FrameLog(), createdAt,
-    turn: 0, step: 0, iterations: 0, taskOpen: false, hostRuntimeUnknown: false, lastEventId: undefined, lastFrameAt: createdAt, text: '', reasoning: '', chunkIndex: 0,
+    turn: 0, step: 0, surfaceSeqs: [], iterations: 0, taskOpen: false, hostRuntimeUnknown: false, lastEventId: undefined, lastFrameAt: createdAt, text: '', reasoning: '', chunkIndex: 0,
     attemptOpen: false, attemptSeq: -1, attemptId: '',
     attemptStream: [], attemptTurn: 0, attemptStep: 0, attemptStartedAfterSeq: -1,
     usage: undefined, outputs: new Map(),
@@ -819,24 +799,21 @@ export function createAdapter(options: AdapterOptions): { remote: unknown; dispo
   const seenEventIds = new Map<string, { ids: Set<string>; order: string[] }>()
   const titles = new Map<string, string>()
   /**
-   * compactionId → 本次压缩的取证（触发原因 + 规模 + 实际被替换的区间）。
+   * compactionId → 本次压缩的取证（触发原因 + 摘要与两个锚点事件的 seq）。
    *
-   * `CompactionEnded` 不带 trigger / 区间 / 条数（只有 started、summarized 带），
-   * 而「压缩了多少、压的是哪一段、为什么现在压、压完还剩多少」必须汇成**一条**
-   * 通知——所以在 started 建档、summarized 补实测值、ended 时一次落盘。
-   * 失败通知要不要插取决于手动还是自动：手动 `/compact` 的结局由命令卡片自己展示。
+   * checkpoint 要等 `compaction_ended` 才知道成败，而它必须指名本次的
+   * start/summary 事件作为被替换集；所以在 started 建档、summarized 补摘要，
+   * ended 一次落 checkpoint。失败通知要不要插取决于手动还是自动：手动 `/compact`
+   * 的结局由命令卡片自己展示。
    * 契约上每次压缩都必然成对发 started/ended（失败/取消也发 ended），这里不会无界增长。
    */
   interface CompactionTrace {
     trigger: CompactionTrigger
-    /** 触发时的上下文规模与预算（只有 `compaction_started` 带这两个数）。 */
-    estimatedTokens: number
-    budgetTokens: number
-    /** 计划区间（started）；summarized 到达后用**实际**被替换的区间覆盖。 */
-    rangeStart: number
-    rangeEnd: number
-    /** summarized 到达才有；没有它就不发「已压缩」通知——说不出压了什么。 */
-    shadowed?: { items: number; tokens: number }
+    /** started 事件的 seq：checkpoint 用它当被替换项之一（该事件不产出任何节点）。 */
+    startSeq?: number
+    /** summarized 的摘要正文与 seq；checkpoint 的正文只取这一份，实时/回放才同文。 */
+    summary?: string
+    summarySeq?: number
   }
   const compactionTraces = new Map<string, CompactionTrace>()
   /**
@@ -987,6 +964,11 @@ export function createAdapter(options: AdapterOptions): { remote: unknown; dispo
     return journal
   }
 
+  /** 能进入模型可见 surface 的事件类型（与 dsh `surface.ts` 的 SURFACE_EVENT_TYPES 同集）。 */
+  const SURFACE_EVENT_TYPES = new Set([
+    'system/message', 'developer/message', 'user/message', 'assistant/message', 'tool/result',
+  ])
+
   const pushEvent = (journal: Journal, type: string, data: unknown, extra: Record<string, unknown> = {}): number => {
     journal.seq += 1
     journal.log.append({
@@ -999,7 +981,69 @@ export function createAdapter(options: AdapterOptions): { remote: unknown; dispo
         data,
       },
     })
+    if (SURFACE_EVENT_TYPES.has(type)) {
+      const surfaceOp = extra.surfaceOp
+      if (surfaceOp !== undefined && surfaceOp !== 'append'
+        && typeof surfaceOp === 'object' && surfaceOp !== null) {
+        const { startSeq, endSeq } = surfaceOp as { startSeq?: unknown; endSeq?: unknown }
+        const start = typeof startSeq === 'number' ? journal.surfaceSeqs.indexOf(startSeq) : -1
+        const end = typeof endSeq === 'number' ? journal.surfaceSeqs.indexOf(endSeq) : -1
+        if (start !== -1 && end !== -1 && start <= end) {
+          journal.surfaceSeqs.splice(start, end - start + 1)
+        }
+      }
+      journal.surfaceSeqs.push(journal.seq)
+    }
     return journal.seq
+  }
+
+  /**
+   * 压缩锚点：上游 `CompactionItem` 的**唯一**触发条件是一个替换型 user/message，
+   * 且 `source.kind === 'compact-checkpoint'`（ui-chat `compaction.ts` 的 `buildViewNode`
+   * 找不到它就 `return null`）。实时与回放都只经这一个入口发，形状、位置、计数才会一致。
+   *
+   * 区间取当前 surface 的头尾（与上游一致：把被压历史整体换成这条摘要节点），
+   * `sourceEventSeqs` 必须覆盖区间内每个被遮蔽节点，外加本次的 start/summary 事件——
+   * 少一个，客户端 `foldSurface` 就会拒绝这条替换。
+   *
+   * surface 为空时不发：一条非法的替换事件会打断实时流，宁可本次无节点，也不冒险。
+   */
+  const pushCompactionCheckpoint = (
+    journal: Journal,
+    compactionId: string,
+    summary: string,
+    hiddenSeqs: readonly number[],
+  ): number | undefined => {
+    const startSeq = journal.surfaceSeqs[0]
+    const endSeq = journal.surfaceSeqs[journal.surfaceSeqs.length - 1]
+    if (startSeq === undefined || endSeq === undefined) return undefined
+    return pushEvent(journal, 'user/message', {
+      id: `shaniu-compact-checkpoint-${compactionId}`,
+      role: 'user',
+      content: summary.trim() === '' ? [] : [{ type: 'text', text: summary }],
+      source: { kind: 'compact-checkpoint' as const, compactionId },
+    }, {
+      surfaceOp: { op: 'replace' as const, startSeq, endSeq },
+      sourceEventSeqs: [...journal.surfaceSeqs, ...hiddenSeqs],
+    })
+  }
+
+  /**
+   * 压缩的用户可见兜底出口（上下文注入行）：只在失败、或档案里已经没有可替换的
+   * surface（所有历史都被压掉、锚点落在档案第一条）时使用。它不伪装成压缩节点，
+   * 因为压缩节点必须挂在一个真实的替换区间上。
+   */
+  const pushCompactionNotice = (journal: Journal, id: string, text: string): void => {
+    pushEvent(journal, 'developer/message', {
+      turn: journal.turn,
+      step: journal.step,
+      message: {
+        id,
+        role: 'developer',
+        source: { kind: 'compaction-notice' as const, form: 'notice' as const, summary: text },
+        content: [{ type: 'text', text }],
+      },
+    }, { surfaceOp: 'append' })
   }
 
   const pushStreamFrame = (journal: Journal, frame: Record<string, unknown>): void => {
@@ -1891,28 +1935,30 @@ export function createAdapter(options: AdapterOptions): { remote: unknown; dispo
           return
         }
         if (entry.kind === 'compaction_summary') {
-          // 压缩摘要是历史替换锚点，不是用户回合：实时路径记成 `compaction/summary`
-          // 事件 + 一条通知（adapter.ts 的 compaction_summarized/ended）。这里同样只落
-          // 记录与通知，不开回合、不开步——否则压缩过的会话重开就多一轮，紧随其后的
-          // 用户消息还会先补一条中止横幅。
+          // 压缩摘要是历史替换锚点，不是用户回合：实时路径记成
+          // `compaction/start → compaction/summary → checkpoint` 三件，这里同构重建，
+          // 才能让重开后的呈现与实时那次是同一个节点、同一条文案，而不是另一种视觉。
+          // 不开回合、不开步——否则压缩过的会话重开就多一轮，紧随其后的用户消息
+          // 还会先补一条中止横幅。
           const compactionId = `shaniu-replay-compaction-${index}`
-          pushEvent(journal, 'compaction/summary', {
+          const startSeq = pushEvent(journal, 'compaction/start', {
+            turn: journal.turn,
+            compactionId,
+          })
+          const summarySeq = pushEvent(journal, 'compaction/summary', {
             turn: journal.turn,
             compactionId,
             summary: [{ type: 'text', text: entry.text }],
           })
-          const notice = `上下文已压缩：历史第 ${entry.range_start + 1}–${entry.range_end} 条`
-            + '被一条摘要取代；原文仍保留在会话档案里。'
-          pushEvent(journal, 'developer/message', {
-            turn: journal.turn,
-            step: journal.step,
-            message: {
-              id: `shaniu-replay-compaction-notice-${index}`,
-              role: 'developer',
-              source: { kind: 'compaction-notice' as const, form: 'notice' as const, summary: notice },
-              content: [{ type: 'text', text: notice }],
-            },
-          }, { surfaceOp: 'append' })
+          const checkpoint = pushCompactionCheckpoint(journal, compactionId, entry.text, [startSeq, summarySeq])
+          if (checkpoint === undefined) {
+            // 档案第一条就是锚点（整段历史都已被压掉）：没有可替换的 surface，
+            // 发不出合法的压缩节点，退回上下文注入行——宁可与实时不同形，也不能
+            // 让「上下文被改写」在重开后彻底不可见。
+            const notice = `上下文已压缩：历史第 ${entry.range_start + 1}–${entry.range_end} 条`
+              + '被一条摘要取代；原文仍保留在会话档案里。'
+            pushCompactionNotice(journal, `shaniu-replay-compaction-notice-${index}`, notice)
+          }
           journal.entryToSeq[index] = journal.seq
           return
         }
@@ -2516,42 +2562,36 @@ export function createAdapter(options: AdapterOptions): { remote: unknown; dispo
           },
         }, { surfaceOp: 'append' })
         return
-      case 'compaction_started':
+      case 'compaction_started': {
         // 有损操作必须出声（对齐上游 `compaction/start`）：起点先落 journal，之后
         // 无论成功、失败还是取消，时间线上都能回答「这次上下文为什么变短」。
-        compactionTraces.set(msg.compaction_id, {
-          trigger: msg.trigger,
-          estimatedTokens: msg.estimated_tokens,
-          budgetTokens: msg.budget_tokens,
-          rangeStart: msg.range_start,
-          rangeEnd: msg.range_end,
-        })
-        pushEvent(journal, 'compaction/start', {
+        const startSeq = pushEvent(journal, 'compaction/start', {
           turn: journal.turn,
           compactionId: msg.compaction_id,
         })
+        compactionTraces.set(msg.compaction_id, {
+          trigger: msg.trigger,
+          startSeq,
+        })
         return
+      }
       case 'compaction_summarized': {
         // 摘要与「丢了什么」同一条（对齐上游 `compaction/summary`）。上游的
-        // `shadowedSeqs` 是会话 seq 集合，我们没有等价物——不编造，只给真实的
-        // token 数与摘要；条数由 ended 的通知说清楚。
-        pushEvent(journal, 'compaction/summary', {
+        // `shadowedSeqs` 是会话 seq 集合，我们没有等价物——不编造条数，只给真实
+        // 的 token 数与摘要；卡片文本只取这一条，实时与回放才同文。
+        const summarySeq = pushEvent(journal, 'compaction/summary', {
           turn: journal.turn,
           compactionId: msg.compaction_id,
           summary: [{ type: 'text', text: msg.summary }],
           shadowedTokenCount: msg.shadowed_tokens,
         })
-        // 通知**不在这里发**：`history_tokens_after`（压缩后历史规模）只有 ended 带，
-        // 而用户最关心的正是「压完还剩多少」。在这里发就得在 ended 再补一条，
-        // 两条相邻通知说同一件事；改成 ended 一次说全（区间/条数/压力/剩余）。
+        // checkpoint **不在这里发**：终局要等 `compaction_ended` 才知道成败，
+        // 而且它要把 start/summary 两个 seq 一起列进被替换集，必须等两件都落账。
         {
           const trace = compactionTraces.get(msg.compaction_id)
           if (trace !== undefined) {
-            // 以**实际**被替换的区间为准：started 的区间是计划值，两者不一致时
-            // 用户该看到的是真正发生的那个。
-            trace.rangeStart = msg.range_start
-            trace.rangeEnd = msg.range_end
-            trace.shadowed = { items: msg.shadowed_items, tokens: msg.shadowed_tokens }
+            trace.summary = msg.summary
+            trace.summarySeq = summarySeq
           }
         }
         return
@@ -2573,27 +2613,20 @@ export function createAdapter(options: AdapterOptions): { remote: unknown; dispo
           // 失败信号，空着等于把失败说成成功。
           ...(failure === undefined ? {} : { error: reason ?? `压缩未生效（${failure}）` }),
         })
-        // 手动 `/compact` 的结局由命令卡片（`command/done`）自己展示，不再重复；
-        // 自动压缩没有别的痕迹，不补这一行，用户只会发现「上下文没变短」。
-        const shadowed = trace?.shadowed
-        const notice = failure !== undefined
-          ? (trigger === 'manual'
-              ? undefined
-              : `上下文压缩未生效：${failure}。历史保持原样，可以继续对话。`)
-          : (trigger === 'manual' || trace === undefined || shadowed === undefined
-              ? undefined
-              : compactedNotice({ ...trace, shadowed }, msg.history_tokens_after))
+        if (failure === undefined && trigger !== 'manual' && trace?.summary !== undefined) {
+          // 成功的自动压缩：落 checkpoint（替换锚点）。上游 `CompactionItem` 只认它，
+          // 这也是实时时间线上唯一能证明「上下文刚被改写」的节点；手动 `/compact`
+          // 的结局由命令卡片展示，不再重复。
+          const hidden = [trace.startSeq, trace.summarySeq]
+            .filter((seq): seq is number => seq !== undefined)
+          pushCompactionCheckpoint(journal, msg.compaction_id, trace.summary, hidden)
+        }
+        // 失败必须出声：自动压缩没有别的痕迹，用户只会发现「上下文没变短」。
+        const notice = failure === undefined
+          ? undefined
+          : (trigger === 'manual' ? undefined : `上下文压缩未生效：${failure}。历史保持原样，可以继续对话。`)
         if (notice !== undefined) {
-          pushEvent(journal, 'developer/message', {
-            turn: journal.turn,
-            step: journal.step,
-            message: {
-              id: `shaniu-compact-${failure === undefined ? 'done' : 'failed'}-${msg.compaction_id}`,
-              role: 'developer',
-              source: { kind: 'compaction-notice' as const, form: 'notice' as const, summary: notice },
-              content: [{ type: 'text', text: notice }],
-            },
-          }, { surfaceOp: 'append' })
+          pushCompactionNotice(journal, `shaniu-compact-failed-${msg.compaction_id}`, notice)
         }
         return
       }

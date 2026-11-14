@@ -8,6 +8,7 @@ import { describe, expect, it, vi } from 'vitest'
 import { assertSessionWireEvent } from '../dsh/packages/api/session-controller/src/client/session-wire-event.ts'
 import { ClientSessions } from '../dsh/packages/api/session-controller/src/client/sessions/service.ts'
 import { ClientWorkspaceModel } from '../dsh/packages/api/workspace-controller/src/client/model.ts'
+import { compactionDefinition } from '../dsh/packages/client/ui-chat/src/client/conversation-nodes/compaction.ts'
 import { createAdapter } from './adapter'
 import { PRESET_BUNDLES } from './permission-presets'
 import { registerExportTrigger } from './command-triggers'
@@ -1281,7 +1282,7 @@ describe('适配层把 EventMsg 流映射成 DSH 会话 journal', () => {
     dispose()
   })
 
-  it('压缩成功：一条通知回答区间、条数、压力与压缩后规模', async () => {
+  it('压缩成功：实时落一条 checkpoint（上游压缩节点），不再发上下文注入通知', async () => {
     const bridge = scriptedBridge()
     const { remote, dispose } = createAdapter({ bridge })
     const session = faceOf(remote).session
@@ -1300,13 +1301,47 @@ describe('适配层把 EventMsg 流映射成 DSH 会话 journal', () => {
 
     const iterator = session.follow({ address: { kind: 'session', sessionId: 'agent-ok' } })
     const journal = eventsOf((await iterator.next()).value as Record<string, unknown>)
-    const notices = journal.filter(event => event['type'] === 'developer/message')
-    // 一次压缩只该有一条通知：summarized 时不发，ended 时说全（那时才知道剩余规模）。
-    expect(notices).toHaveLength(1)
-    expect(((notices[0]?.['data'] as { message: { content: { text: string }[] } }).message.content[0]?.text))
-      .toBe('上下文已压缩：历史第 1–3 条（共 3 条，约 640 token）被一条摘要取代；'
-        + '压缩后历史约 120 token；触发时上下文约 900 token（预算 800 token）。'
-        + '原文仍保留在会话档案里。')
+
+    // 判据一：压缩发生的那一刻就有一条替换型 user/message checkpoint——
+    // 上游 CompactionItem 只认这个，旧路径的 developer 通知本人看不见。
+    const checkpoints = journal.filter(event => event['type'] === 'user/message'
+      && (event['data'] as { source?: { kind?: string } }).source?.kind === 'compact-checkpoint')
+    expect(checkpoints).toHaveLength(1)
+    const checkpoint = checkpoints[0]!
+    const userSeq = (journal.find(event => event['type'] === 'user/message')?.['seq']) as number
+    expect((checkpoint['data'] as { source: { compactionId: string } }).source.compactionId).toBe('c2')
+    // 区间必须指向真实 surface 节点，且把本次 start/summary 也列进被遮蔽集——
+    // 少一个，客户端 foldSurface 会拒绝整条替换。
+    expect(checkpoint['surfaceOp']).toEqual({ op: 'replace', startSeq: userSeq, endSeq: userSeq })
+    const summarySeq = (journal.find(event => event['type'] === 'compaction/summary')?.['seq']) as number
+    const startSeq = (journal.find(event => event['type'] === 'compaction/start')?.['seq']) as number
+    expect(checkpoint['sourceEventSeqs']).toEqual([userSeq, startSeq, summarySeq])
+
+    // 判据二：可见——走 UI 自己的节点定义，产出的必须是 compaction 卡片而不是 null。
+    const summaryEvent = journal.find(event => event['type'] === 'compaction/summary')!
+    const match = (event: Record<string, unknown>) =>
+      compactionDefinition.match!(event as never) as { id: string; role: string } | null
+    expect(match(checkpoint)).toEqual({ id: 'c2', role: 'update' })
+    const node = compactionDefinition.buildViewNode!({
+      key: 'c2',
+      id: 'c2',
+      start: { event: checkpoint, location: { kind: 'unresolved' } },
+      matches: [
+        { event: summaryEvent, location: { kind: 'unresolved' } },
+        { event: checkpoint, location: { kind: 'unresolved' } },
+      ],
+      state: {
+        summary: { event: summaryEvent, location: { kind: 'unresolved' } },
+        checkpoint: { event: checkpoint, location: { kind: 'unresolved' } },
+      },
+    } as never) as unknown as { kind: string; visibility: string; data: { summary: string | null } } | null
+    expect(node?.kind).toBe('compaction')
+    expect(node?.visibility).toBe('visible')
+    expect(node?.data.summary).toBe('摘要')
+
+    // 判据三：成功不再补上下文注入通知（否则同一件事会出现两条）。
+    expect(journal.some(event => event['type'] === 'developer/message')).toBe(false)
+    journal.forEach(event => expect(() => assertSessionWireEvent(event)).not.toThrow())
 
     await iterator.return?.(undefined)
     dispose()
@@ -1360,6 +1395,100 @@ describe('适配层把 EventMsg 流映射成 DSH 会话 journal', () => {
 
     await iterator.return?.(undefined)
     dispose()
+  })
+
+  it('压缩过的会话重开：每个锚点只生成一条 checkpoint，重复重开不叠加', async () => {
+    const archive = [
+      { kind: 'message', role: 'user', text: '第一问' },
+      { kind: 'message', role: 'assistant', text: '第一答' },
+      { kind: 'compaction_summary', text: '第一段摘要', range_start: 0, range_end: 2 },
+      { kind: 'message', role: 'user', text: '第二问' },
+      { kind: 'message', role: 'assistant', text: '第二答' },
+      { kind: 'compaction_summary', text: '第二段摘要', range_start: 0, range_end: 5 },
+      { kind: 'message', role: 'user', text: '第三问' },
+      { kind: 'message', role: 'assistant', text: '第三答' },
+    ]
+    const read = async (): Promise<Record<string, unknown>[]> => {
+      const bridge = scriptedBridge(undefined, archive)
+      bridge.host.active = null
+      const { remote, dispose } = createAdapter({ bridge })
+      const iterator = faceOf(remote).session.follow({ address: { kind: 'session', sessionId: 'agent-compacted' } })
+      const events = eventsOf((await iterator.next()).value as Record<string, unknown>)
+      await iterator.return?.(undefined)
+      dispose()
+      return events
+    }
+    const isCheckpoint = (event: Record<string, unknown>): boolean => event['type'] === 'user/message'
+      && (event['data'] as { source?: { kind?: string } }).source?.kind === 'compact-checkpoint'
+
+    const events = await read()
+    const checkpoints = events.filter(isCheckpoint)
+    // 反向对照：退回「回放只发 summary + 通知」时这里是 0；退回两条通知时会多出行。
+    expect(checkpoints).toHaveLength(2)
+    expect(JSON.stringify(checkpoints[0]!['data'])).toContain('第一段摘要')
+    expect(JSON.stringify(checkpoints[1]!['data'])).toContain('第二段摘要')
+    expect(events.some(event => event['type'] === 'developer/message')).toBe(false)
+    events.forEach(event => expect(() => assertSessionWireEvent(event)).not.toThrow())
+
+    // 同一份档案重复重开：条数必须稳定，不能越开越多。
+    expect((await read()).filter(isCheckpoint)).toHaveLength(2)
+  })
+
+  it('实时与回放同形：同一段压缩在两条路径产出同一种 checkpoint', async () => {
+    const isCheckpoint = (event: Record<string, unknown>): boolean => event['type'] === 'user/message'
+      && (event['data'] as { source?: { kind?: string } }).source?.kind === 'compact-checkpoint'
+    const shapeOf = (events: Record<string, unknown>[]): unknown[] => events
+      .filter(isCheckpoint)
+      .map(event => ({
+        type: event['type'],
+        // 两条路径的 compactionId 来源不同（实时用后端 id，回放用锚点下标），
+        // 但节点标识的前缀必须一致：换一套命名就说明呈现不是一个东西。
+        idPattern: String((event['data'] as { id: string }).id).startsWith('shaniu-compact-checkpoint-')
+          ? 'shaniu-compact-checkpoint-'
+          : 'other',
+        sourceKind: (event['data'] as { source: { kind: string } }).source.kind,
+        hasSummary: JSON.stringify((event['data'] as { content: unknown }).content).includes('同一段摘要'),
+        op: (event['surfaceOp'] as { op: string }).op,
+        // 被遮蔽集的内容随事件 seq 变化，只比「是否非空」
+        shadowed: (event['sourceEventSeqs'] as number[]).length > 0,
+      }))
+
+    // 实时：prompt 后收到压缩三件套。
+    const liveBridge = scriptedBridge()
+    const live = createAdapter({ bridge: liveBridge })
+    const liveSession = faceOf(live.remote).session
+    await liveSession.prompt({ sessionId: 'agent-live', requestId: 'rpc-live', content: [{ type: 'text', text: '长任务' }] })
+    liveBridge.emit('agent-live', {
+      type: 'compaction_started', compaction_id: 'c9', trigger: 'pressure',
+      range_start: 0, range_end: 2, estimated_tokens: 900, budget_tokens: 800, turn: 1,
+    })
+    liveBridge.emit('agent-live', {
+      type: 'compaction_summarized', compaction_id: 'c9', trigger: 'pressure',
+      range_start: 0, range_end: 2, shadowed_items: 2, shadowed_tokens: 320, summary: '同一段摘要',
+    })
+    liveBridge.emit('agent-live', { type: 'compaction_ended', compaction_id: 'c9', ok: true, history_tokens_after: 100 })
+    const liveIterator = liveSession.follow({ address: { kind: 'session', sessionId: 'agent-live' } })
+    const liveEvents = eventsOf((await liveIterator.next()).value as Record<string, unknown>)
+    await liveIterator.return?.(undefined)
+    live.dispose()
+
+    // 回放：同一段历史重开会话。
+    const reopenBridge = scriptedBridge(undefined, [
+      { kind: 'message', role: 'user', text: '长任务' },
+      { kind: 'message', role: 'assistant', text: '答' },
+      { kind: 'compaction_summary', text: '同一段摘要', range_start: 0, range_end: 2 },
+    ])
+    reopenBridge.host.active = null
+    const reopened = createAdapter({ bridge: reopenBridge })
+    const reopenedIterator = faceOf(reopened.remote).session.follow({ address: { kind: 'session', sessionId: 'agent-live' } })
+    const replayEvents = eventsOf((await reopenedIterator.next()).value as Record<string, unknown>)
+    await reopenedIterator.return?.(undefined)
+    reopened.dispose()
+
+    expect(liveEvents.filter(isCheckpoint)).toHaveLength(1)
+    expect(replayEvents.filter(isCheckpoint)).toHaveLength(1)
+    // 换一种呈现（通知行）或两个路径形状不一致，这里都会红。
+    expect(shapeOf(liveEvents)).toEqual(shapeOf(replayEvents))
   })
 
   it('手动压缩失败由命令卡片展示，不再插一条通知（不重复）', async () => {
