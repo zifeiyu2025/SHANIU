@@ -504,8 +504,13 @@ mod tests {
         let cfg = s.config();
         assert_eq!(
             cfg.sandbox.mode,
-            crate::config::SandboxMode::ReadOnly,
-            "部署默认必须是只读，否则「不带档位」本身就是一次隐式提权"
+            crate::config::SandboxMode::WorkspaceWrite,
+            "部署默认对齐 codex Auto：受限可写，不是只读"
+        );
+        assert_eq!(
+            cfg.approval.mode,
+            crate::config::ApprovalMode::OnRequest,
+            "审批维保持 on_request"
         );
 
         let full = *crate::permission::preset::from_id("danger-full-access").unwrap();

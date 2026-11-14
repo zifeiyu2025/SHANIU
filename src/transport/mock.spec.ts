@@ -238,7 +238,7 @@ describe('mock 权限挡位目录', () => {
       .toEqual(['read-only', 'workspace-write', 'danger-full-access'])
     expect(catalog.value.defaultOptions.map(option => option.value))
       .toEqual(catalog.value.options.map(option => option.value))
-    expect(catalog.value.defaultPreset).toBe('read-only')
+    expect(catalog.value.defaultPreset).toBe('workspace-write')
   })
 
   it('/permission 按目录白名单裁决：挡内切换推投影，auto 回未命中且挡位不动', async () => {

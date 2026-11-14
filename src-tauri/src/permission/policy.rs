@@ -508,6 +508,23 @@ pub fn plan_mode_allows(tool_name: &str) -> bool {
 mod tests {
     use super::*;
 
+    /// 新用户首次启动的实际生效档：出厂配置 + 无会话预设 → 受限可写 + 按需审批。
+    /// 这条把「配置默认值」和「运行时真正跑的档」钉在一起，避免只改 serde 默认、
+    /// 启动时又被别处改回只读。
+    #[test]
+    fn first_launch_lands_on_workspace_write_under_on_request() {
+        let cfg = crate::config::AppConfig::fresh_install();
+        let handle = SessionPolicyHandle::new(SessionPolicy {
+            approval: cfg.approval.mode,
+            sandbox: cfg.sandbox.mode,
+        });
+        let effective = handle.snapshot();
+        assert_eq!(effective.approval, ApprovalMode::OnRequest);
+        assert_eq!(effective.sandbox, SandboxMode::WorkspaceWrite);
+        assert_ne!(effective.sandbox, SandboxMode::ReadOnly);
+        assert_ne!(effective.approval, ApprovalMode::FullAccess);
+    }
+
     #[test]
     fn read_tools_are_always_allowed() {
         for sandbox in [SandboxMode::ReadOnly, SandboxMode::WorkspaceWrite, SandboxMode::DangerFullAccess] {

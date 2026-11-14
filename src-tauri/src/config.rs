@@ -1003,16 +1003,19 @@ pub enum OsSandbox {
 
 /// 三档文件效果（对齐 DSH `SandboxMode`，docs/04 §4 `[sandbox] mode`）。
 ///
-/// 默认 `ReadOnly`，与 DSH 一致（2026-11-10 产品决策，此前曾短暂默认
-/// `workspace_write`）。解析优先级（对齐 DSH `SandboxPolicyService.resolve`）：
+/// 默认 `WorkspaceWrite`（2026-11-14 对齐 codex 的 Auto 档）：版本受控工作区里
+/// 可读、可写、可执行，越界写与提权才走审批。此前默认 `ReadOnly` 是 2026-11-10
+/// 的保守选择，代价是新用户第一条会改文件的任务每一步都弹审批；dsh 的 `read-only`
+/// 是通用运行时的 fail-safe，而我们已有工作区根唯一判据 + 受限令牌写沙箱。
+/// 解析优先级（对齐 DSH `SandboxPolicyService.resolve`）：
 /// **本次调用显式指定 > 会话设置 > 部署默认**——显式指定只有 on-failure 提权那一条
 /// （单次调用），会话设置是运行中切换的 `SessionPolicyHandle`，部署默认是
 /// config.toml。fail-closed 语义见 ADR-002。
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum SandboxMode {
-    #[default]
     ReadOnly,
+    #[default]
     WorkspaceWrite,
     DangerFullAccess,
 }
@@ -3104,11 +3107,30 @@ mod tests {
     }
 
     #[test]
+    fn fresh_install_defaults_to_codex_auto_tier() {
+        let cfg = AppConfig::fresh_install();
+        assert_eq!(
+            cfg.sandbox.mode,
+            SandboxMode::WorkspaceWrite,
+            "新用户首次启动必须落到受限可写，而不是只读"
+        );
+        assert_eq!(
+            cfg.approval.mode,
+            ApprovalMode::OnRequest,
+            "审批维保持 on_request（对齐 codex，比 dsh 的只读默认更可用）"
+        );
+    }
+
+    #[test]
     fn config_round_trips_and_defaults_fill_missing_fields() {
         let base = crate::test_support::TestTempDir::new("cfg");
         let root = base.join("cfg");
         let (cfg, path) = AppConfig::load_or_create(&root).unwrap();
-        assert_eq!(cfg.sandbox.mode, SandboxMode::ReadOnly, "默认档必须与 DSH 一致（只读）");
+        assert_eq!(
+            cfg.sandbox.mode,
+            SandboxMode::WorkspaceWrite,
+            "默认档对齐 codex Auto：受限可写，不是只读"
+        );
         assert_eq!(cfg.approval.mode, ApprovalMode::OnRequest);
         assert_eq!(cfg.model.max_turns, 0, "轮数默认不限（0 = 不限）");
 
@@ -3118,7 +3140,7 @@ mod tests {
         let (cfg2, _) = AppConfig::load_or_create(&root).unwrap();
         assert_eq!(cfg2.model.provider, "openai-chat");
         assert_eq!(cfg2.model.max_turns, 0, "旧配置缺字段时也必须落到「不限」");
-        assert_eq!(cfg2.sandbox.mode, SandboxMode::ReadOnly);
+        assert_eq!(cfg2.sandbox.mode, SandboxMode::WorkspaceWrite);
         assert_eq!(
             cfg2.sandbox.os,
             OsSandbox::RestrictedToken,

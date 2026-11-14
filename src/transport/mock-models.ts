@@ -331,7 +331,7 @@ export function createModelsMock(options: ModelsMockOptions = { emit: () => fals
     ['permission', {
       // 设置-通用里的「权限默认档」行读这个命名空间；新建会话按它初始化
       schema: envelope(z.object({ defaultPreset: z.string() })),
-      base: { defaultPreset: 'read-only' },
+      base: { defaultPreset: 'workspace-write' },
       user: {},
       revision: 0,
     }],

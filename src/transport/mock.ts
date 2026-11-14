@@ -48,7 +48,7 @@ const PERMISSION_PRESETS = [
   { value: 'danger-full-access', name: 'danger-full-access', description: '不受工作区边界限制' },
 ] as const
 
-const DEFAULT_PERMISSION = 'read-only'
+const DEFAULT_PERMISSION = 'workspace-write'
 
 /** 一个工作区在 mock 里的全部可变状态。 */
 interface MockWorkspace {

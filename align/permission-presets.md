@@ -300,3 +300,42 @@ and process visibility are NOT」）。用户若把「只读」理解成「数�
 
 **本文件随第二笔入库**：档位语义的唯一事实源只躺在工作区就等于没有——下一个人改档位时
 不会读到它，也就不会知道自己正在违反一条已批准的裁决。
+
+## 11. 默认档位对齐（2026-11-14）
+
+**参考事实**
+
+| 项目 | 默认审批 | 默认沙箱 | 首次任务实际体验 | 源码位置 |
+| --- | --- | --- | --- | --- |
+| codex | `on-request` | 版本受控目录 `workspace-write`；非受控/未信任目录 `read-only` | 区内自动读写执行，越界/联网才问 | `codex-rs/protocol/src/protocol.rs:1187-1197`（`AskForApproval::#[default] OnRequest`）；`core/src/config/mod.rs:4013-4025`（未配置时按信任度解析）；`protocol/src/config_types.rs:97-104`（`SandboxMode` 类型默认 `ReadOnly`）；官方 `agent-approvals-security` Defaults 段（CLI 默认 Auto = workspace-write + on-request，非版本受控目录 read-only） |
+| dsh | `ask`（无作答者 → `unavailable`） | `read-only` | 只读，每次都要批准 | `packages/interaction/user-approval/src/index.ts:62-68、171、271、309-317`；`packages/sandbox/sandbox-policy/src/index.ts:88-95、137、159、200` |
+| SHANIU（本次前） | `on_request` | `read_only` | 只读 + 按风险审批 | `src-tauri/src/config.rs` 的 `ApprovalMode` / `SandboxMode` 默认档 |
+
+**决定**：默认 = `on_request` + `workspace_write`，即 codex 的 Auto 那一档。
+
+- 理由是可用性：默认 `read_only` 会让新用户第一条会改文件的任务每次写盘都走审批，
+  而这正是 codex 用 `workspace-write` 默认值刻意消除的摩擦。
+- dsh 的 `read-only` 是通用运行时、没有「受信工作区」概念时的 fail-safe；我们已有工作区根
+  唯一判据（`AppState::check_workspace_root`）与受限令牌写沙箱，不是那个形态。
+- 两家的共同红线都保留：默认绝不 `danger-full-access`、绝不 `never`。
+- 审批维不动：`on_request` 与 codex 的 `on-request` 同义，且我们有前端审批租约，
+  不存在 dsh 那种「没有作答者」的常态。
+
+**新用户首次启动落到哪档（明确结论）**
+
+1. `config.toml` 不存在 → `AppConfig::fresh_install()`（`config.rs:477-487`，`..Self::default()`）
+   生成 `[sandbox].mode = workspace_write`、`[approval].mode = on_request` 并落盘。
+2. `AppState::new` 用这两个值构造 `SessionPolicyHandle::new_with_availability(...)`；
+   `normalize` 只处理 `full_access`，该组合原样通过。
+3. 首条任务无会话预设 → `reset_policy(None)` 从 config 重新装载同一组两维。
+4. `get_settings` / `sandbox_status` / 档案 `config_snapshot` 都走
+   `effective_pair(..., danger_full_access_available())`，回显 `workspace_write`；
+   前端目录 `defaultPreset` 精确反推为 `workspace-write`。
+5. 实际行为：**区内写入直接放行（沙箱即边界）；命令执行按 `on-request` 询问；
+   破坏性操作每次必问；越界写被沙箱拒绝**。不是只读，也不是完全放开。
+6. `full_access` 语义不变：选中即提升沙箱为 `danger_full_access`、审批全放行（§10），
+   本次不回退成钳制。
+
+**代价**：默认档从「不可能造成写盘」变成「可在工作区内写盘」。边界由工作区根判据 +
+OS 写沙箱承担；用户仍可在设置页选 `read-only` 回到严格档。
+

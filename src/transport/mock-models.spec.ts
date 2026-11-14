@@ -348,11 +348,11 @@ describe('mock-models：模型的推理等级', () => {
 })
 
 describe('mock-models：权限默认档设置', () => {
-  it('挂出 permission 命名空间，默认档是 read-only', async () => {
+  it('挂出 permission 命名空间，默认档是 workspace-write', async () => {
     const mock = createModelsMock()
     const view = await viewOf(mock, 'permission')
-    expect(schema.getPath(view.value, ['defaultPreset'])).toBe('read-only')
-    expect(mock.permissionDefault()).toBe('read-only')
+    expect(schema.getPath(view.value, ['defaultPreset'])).toBe('workspace-write')
+    expect(mock.permissionDefault()).toBe('workspace-write')
   })
 
   it('写入 defaultPreset 后视图与访问器一起更新', async () => {
