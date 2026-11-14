@@ -198,7 +198,7 @@ pub fn piped_stdio_hint(tool: &str, mode: SandboxMode, output: &str) -> Option<&
     }
     Some(
         "沙箱说明：本次失败是「工作区内修改」档的管道 stdio 限制（EPERM / errno -4048），\
-不是项目代码问题；原样重试同一条命令不会成功，换个别名或再加参数重跑也不会。可行做法：\
+不是项目代码问题；原样重试同一条命令、或换个包管理器包一层，都不会成功。可行做法：\
 1) 直接跑单个测试文件，如 `node test/stats.test.js`——测试在主进程内执行，不需要再起子进程；\
 2) 需要整目录跑测试时用 `node --test --test-isolation=none`（改为同进程执行，隔离语义会变；\
 老版本 Node 里这个开关叫 `--experimental-test-isolation=none`）；\
