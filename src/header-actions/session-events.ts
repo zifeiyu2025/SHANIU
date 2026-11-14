@@ -129,6 +129,13 @@ export function sessionEntriesToEvents(
       if (entry.turn === turn) closeTurn(entry.reason, entryTime(entry), entry.error)
       continue
     }
+    if (entry.kind === 'compaction_summary') {
+      // 压缩摘要不是用户回合：上游 formatter 只把 `source.kind === 'user'` 的
+      // user/message 计入分段（`markdown.ts` 的 `collectTurns`），压缩锚点在上游也
+      // 从不导出成用户消息。这里跳过，既不虚增回合，也不把摘要伪装成用户发言；
+      // 原文仍完整保留在会话档案里。
+      continue
+    }
     if (entry.kind === 'message') {
       if (entry.role === 'user') {
         closeTurn()

@@ -2383,6 +2383,42 @@ describe('适配层的命令面映射', () => {
     expect((ends[0]!['data'] as { reason: { kind: string } }).reason.kind).toBe('completed')
   })
 
+  it('压缩过的会话重开：摘要不占回合，轮次与实时路径一致、不补中止横幅', async () => {
+    // 投影顺序与 `apply_compaction` 一致：摘要插在被替换区间的位置（通常是开头），
+    // 后面是保留的用户/助手消息与结局行。
+    const archive = [
+      { kind: 'compaction_summary', text: '早期对话摘要', range_start: 0, range_end: 4 },
+      { kind: 'message', role: 'user', text: '压缩后的问题' },
+      { kind: 'message', role: 'assistant', text: '压缩后的回答' },
+      { kind: 'turn_end', turn: 1, reason: 'completed', at_ms: 1_700_000_020_000 },
+    ]
+    const bridge = scriptedBridge(undefined, archive)
+    bridge.host.active = null
+    const reopened = createAdapter({ bridge })
+    const iterator = faceOf(reopened.remote).session.follow({ address: { kind: 'session', sessionId: 'agent-compacted' } })
+    const events = eventsOf((await iterator.next()).value as Record<string, unknown>)
+    await iterator.return?.(undefined)
+    reopened.dispose()
+
+    const ofType = (type: string): Record<string, unknown>[] =>
+      events.filter(event => event['type'] === type)
+    // 反向对照：把摘要当用户消息处理（退回改动前），这里会变成 2 条 turn/start，
+    // 第一条 turn/end 还是 interrupted——压缩过的会话重开就多一轮、多一条横幅。
+    expect(ofType('turn/start')).toHaveLength(1)
+    expect(ofType('step/start')).toHaveLength(1)
+    const ends = ofType('turn/end')
+    expect(ends).toHaveLength(1)
+    expect((ends[0]!['data'] as { reason: { kind: string } }).reason.kind).toBe('completed')
+    // 摘要不伪装成用户气泡；它按实时路径的形状落成 compaction/summary + 一条通知。
+    expect(ofType('user/message').some(event => JSON.stringify(event['data']).includes('早期对话摘要')))
+      .toBe(false)
+    const summaries = ofType('compaction/summary')
+    expect(summaries).toHaveLength(1)
+    expect(JSON.stringify(summaries[0]!['data'])).toContain('早期对话摘要')
+    expect(ofType('developer/message').some(event => JSON.stringify(event['data']).includes('已压缩')))
+      .toBe(true)
+  })
+
   it('宿主说本会话还在跑 → 重建不补 turn_end，实时帧继续落在同一回合', async () => {
     const archive = [
       { kind: 'message', role: 'user', text: '问' },

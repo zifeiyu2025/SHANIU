@@ -58,6 +58,20 @@ export type SessionEntryLike =
     readonly at_ms?: number
   }
   | {
+    /**
+     * 压缩锚点摘要：历史区间 `[range_start, range_end)` 被这一条取代。
+     *
+     * **不是用户回合**：实时路径把压缩记成 `compaction/summary` 事件 + 一条通知；
+     * 重建若按 `message` 处理，会凭空多一轮，紧随其后的用户消息还会先补一条中止横幅。
+     */
+    readonly kind: 'compaction_summary'
+    readonly text: string
+    readonly range_start: number
+    readonly range_end: number
+    /** 压缩锚点没有独立时刻；缺省或 0 = 不可信（A0-4）。 */
+    readonly at_ms?: number
+  }
+  | {
     readonly kind: 'tool_call'
     readonly call_id: string
     readonly tool: string

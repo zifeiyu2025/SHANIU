@@ -1789,6 +1789,33 @@ export function createAdapter(options: AdapterOptions): { remote: unknown; dispo
           journal.entryToSeq[index] = journal.seq
           return
         }
+        if (entry.kind === 'compaction_summary') {
+          // 压缩摘要是历史替换锚点，不是用户回合：实时路径记成 `compaction/summary`
+          // 事件 + 一条通知（adapter.ts 的 compaction_summarized/ended）。这里同样只落
+          // 记录与通知，不开回合、不开步——否则压缩过的会话重开就多一轮，紧随其后的
+          // 用户消息还会先补一条中止横幅。
+          const compactionId = `shaniu-replay-compaction-${index}`
+          pushEvent(journal, 'compaction/summary', {
+            turn: journal.turn,
+            compactionId,
+            summary: [{ type: 'text', text: entry.text }],
+          })
+          const notice = `上下文已压缩：历史第 ${entry.range_start + 1}–${entry.range_end} 条`
+            + '被一条摘要取代；原文仍保留在会话档案里。'
+          pushEvent(journal, 'developer/message', {
+            turn: journal.turn,
+            step: journal.step,
+            message: {
+              id: `shaniu-replay-compaction-notice-${index}`,
+              role: 'developer',
+              source: { kind: 'compaction-notice' as const, form: 'notice' as const, summary: notice },
+              content: [{ type: 'text', text: notice }],
+            },
+          }, { surfaceOp: 'append' })
+          journal.entryToSeq[index] = journal.seq
+          return
+        }
+
         if (entry.kind === 'message' && entry.role === 'user') {
           startTurn()
           openStep(0)

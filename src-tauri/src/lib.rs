@@ -1097,6 +1097,20 @@ pub enum SessionEntry {
         #[serde(default, skip_serializing_if = "Vec::is_empty")]
         images: Vec<images::ImageRef>,
     },
+    /// 压缩锚点摘要（`Compacted` 的展示投影）：历史区间 `[range_start, range_end)`
+    /// 被这一条取代。
+    ///
+    /// 它不是用户回合：实时路径把压缩记成 `compaction/summary` 事件 + 一条通知，
+    /// 投影若仍叫「role=user 的 message」，重建就会把它当一轮新任务（多一轮，
+    /// 紧随其后的用户消息还会先补一条中止横幅）。
+    CompactionSummary {
+        text: String,
+        range_start: usize,
+        range_end: usize,
+        /// 压缩锚点没有独立时刻；`0` = 旧档案未记录（A0-4）。
+        #[serde(default)]
+        at_ms: u64,
+    },
     ToolCall {
         call_id: String,
         tool: String,
@@ -1133,7 +1147,7 @@ fn project_entries(items: &[rollout::RolloutItem]) -> Result<Vec<SessionEntry>, 
                 &mut slots,
                 *range_start,
                 *range_end,
-                summary_entry(summary),
+                summary_entry(summary, *range_start, *range_end),
             )?;
         }
     }
@@ -1187,16 +1201,18 @@ impl Slot {
     }
 }
 
-/// 角色取 user：与 resume 回放、thinking 档协议三者同源（摘要没有
-/// `reasoning_content`，以 assistant 身份喂端点会 400）。
-fn summary_entry(summary: &str) -> SessionEntry {
-    SessionEntry::Message {
-        role: "user".to_string(),
+/// 压缩锚点的展示条目。
+///
+/// 喂给模型时它仍是 `role=user`（与 resume 回放同源：摘要没有 `reasoning_content`，
+/// 以 assistant 身份喂 thinking 端点会 400）；但**展示投影**必须和用户消息分开，
+/// 否则重建会按用户回合计数、多出一轮。
+fn summary_entry(summary: &str, range_start: usize, range_end: usize) -> SessionEntry {
+    SessionEntry::CompactionSummary {
         text: summary.to_string(),
-        reasoning: None,
+        range_start,
+        range_end,
         // 压缩锚点没有独立时刻；取不到就标不可信，不借用导出时刻。
         at_ms: 0,
-        images: Vec::new(),
     }
 }
 
@@ -4151,13 +4167,12 @@ mod session_projection_tests {
         // 期望：摘要（取代前两条）+ 区间外的工具调用（输出仍在）+ 锚点之后的新回复
         assert_eq!(entries.len(), 3, "被取代的条目不得再出现在视图里：{entries:?}");
         match &entries[0] {
-            // 角色取 user 与回放同源：摘要没有 reasoning_content，以 assistant 身份
-            // 喂 thinking 端点会 400（SH-032 的真机回归就是这么撞出来的）。
-            SessionEntry::Message { role, text, .. } => {
-                assert_eq!(role, "user");
+            // 摘要必须与用户消息区分开：它不是回合，重建时不能开 turn。
+            SessionEntry::CompactionSummary { text, range_start, range_end, .. } => {
                 assert_eq!(text, "已压缩的上下文");
+                assert_eq!((*range_start, *range_end), (0, 2), "区间要如实带给展示侧");
             }
-            other => panic!("期望 Message，得到 {other:?}"),
+            other => panic!("期望 CompactionSummary，得到 {other:?}"),
         }
         match &entries[1] {
             SessionEntry::ToolCall { call_id, output, .. } => {
@@ -4191,7 +4206,7 @@ mod session_projection_tests {
         ];
         let entries = project_entries(&items).expect("锚点区间合法");
         assert_eq!(entries.len(), 2, "摘要取代两条历史，TurnEnd 原样留着：{entries:?}");
-        assert!(matches!(&entries[0], SessionEntry::Message { text, .. } if text == "摘要"));
+        assert!(matches!(&entries[0], SessionEntry::CompactionSummary { text, .. } if text == "摘要"));
         assert!(matches!(&entries[1], SessionEntry::TurnEnd { turn: 1, .. }));
     }
 
