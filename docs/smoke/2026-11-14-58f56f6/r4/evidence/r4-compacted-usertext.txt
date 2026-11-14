@@ -1,0 +1,32 @@
+===== compacted #1  range=0-12
+## 用户原文（压缩时逐字保留，不得改写）
+
+按顺序执行并如实报告：1) 运行 powershell -NoProfile -Command "1..2000 | ForEach-Object { 'line ' + $_ }" 并确认输出正好 2000 行；2) 在 src/sum.js 新增并导出 divide(a,b)，除数为 0 时抛错；3) 在 test/sum.test.js 增加 3 条 divide 断言；4) 运行 pnpm test 确认全部通过；5) 用一句话总结。
+
+
+===== compacted #2  range=0-3
+## 用户原文（压缩时逐字保留，不得改写）
+
+按顺序执行并如实报告：1) 运行 powershell -NoProfile -Command "1..2000 | ForEach-Object { 'line ' + $_ }" 并确认输出正好 2000 行；2) 在 src/sum.js 新增并导出 divide(a,b)，除数为 0 时抛错；3) 在 test/sum.test.js 增加 3 条 divide 断言；4) 运行 pnpm test 确认全部通过；5) 用一句话总结。
+
+
+===== compacted #3  range=0-32
+## 用户原文（压缩时逐字保留，不得改写）
+
+按顺序执行并如实报告：1) 运行 powershell -NoProfile -Command "1..2000 | ForEach-Object { 'line ' + $_ }" 并确认输出正好 2000 行；2) 在 src/sum.js 新增并导出 divide(a,b)，除数为 0 时抛错；3) 在 test/sum.test.js 增加 3 条 divide 断言；4) 运行 pnpm test 确认全部通过；5) 用一句话总结。
+
+继续，用一句话说明当前进度。
+
+再跑一次 powershell -NoProfile -Command "1..2000 | ForEach-Object { 'line ' + $_ }"，然后告诉我输出最后一行的内容。
+
+
+===== compacted #4  range=0-3
+## 用户原文（压缩时逐字保留，不得改写）
+
+按顺序执行并如实报告：1) 运行 powershell -NoProfile -Command "1..2000 | ForEach-Object { 'line ' + $_ }" 并确认输出正好 2000 行；2) 在 src/sum.js 新增并导出 divide(a,b)，除数为 0 时抛错；3) 在 test/sum.test.js 增加 3 条 divide 断言；4) 运行 pnpm test 确认全部通过；5) 用一句话总结。
+
+继续，用一句话说明当前进度。
+
+再跑一次 powershell -NoProfile -Command "1..2000 | ForEach-Object { 'line ' + $_ }"，然后告诉我输出最后一行的内容。
+
+

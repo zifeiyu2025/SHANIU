@@ -1,0 +1,36 @@
+== A/B 组会话 sess-1794686409659-0001（token_budget=100） ==
+文件：d:\MyWorkspace\SHANIU\scratch\smoke-r5-auto\SHANIU-Portable\data\rollouts\sess-1794686409659-0001.jsonl
+行数：29
+turn_end 条数：4
+iterations 合计：5
+compacted 条数：5
+  compacted range=0-4 summaryChars=319
+  compacted range=0-2 summaryChars=194
+  compacted range=0-3 summaryChars=177
+  compacted range=0-4 summaryChars=208
+  compacted range=0-3 summaryChars=208
+  turn_end turn=1 iterations=1 reason=completed
+  turn_end turn=2 iterations=1 reason=completed
+  turn_end turn=3 iterations=1 reason=completed
+  turn_end turn=4 iterations=2 reason=completed
+
+== A4 失败注入会话 sess-1794686113918-0002（base_url=127.0.0.1:9） ==
+文件：d:\MyWorkspace\SHANIU\scratch\smoke-r5-fail\SHANIU-Portable\data\rollouts\sess-1794686113918-0002.jsonl
+行数：22
+turn_end 条数：4
+iterations 合计：4
+compacted 条数：2
+  compacted range=0-4 summaryChars=407
+  compacted range=0-4 summaryChars=415
+  turn_end turn=1 iterations=1 reason=completed
+  turn_end turn=2 iterations=1 reason=completed
+  turn_end turn=3 iterations=1 reason=completed
+  turn_end turn=4 iterations=1 reason=failed
+
+== B 常规预算会话 sess-1794688885397-0002（token_budget=500000） ==
+文件：d:\MyWorkspace\SHANIU\scratch\smoke-r5-default\SHANIU-Portable\data\rollouts\sess-1794688885397-0002.jsonl
+行数：25
+turn_end 条数：0
+iterations 合计：0
+compacted 条数：0
+

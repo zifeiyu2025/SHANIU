@@ -166,3 +166,73 @@
 - 第 6 项关闭方式为向主窗口发送 `WM_CLOSE`（等价点关闭），未强杀进程。
 - 第 5、10 项在 B2 全新数据目录执行；旧档案 `sess-legacy-r2-0001` 无 `turn_end`、无 `task_id`。
 - 全部运行均在 `scratch\` 下的隔离数据目录，未触碰用户现有数据目录。
+
+## 第四轮真机复验：N5 实时压缩节点 + N9 残留（2026-11-15 01:20–02:00，被测提交 `9d0cfd9`）
+
+被测二进制：现场重建（`CARGO_TARGET_DIR=scratch\target-n5r4` + `pnpm tauri build --no-bundle`，5 分 14 秒），
+`git rev-parse HEAD` = `origin/main` = `9d0cfd9`，SHA256 `147C500E…CD06`，大小 28,563,456 B。
+数据目录 `scratch\smoke-r4`（`token_budget=5000`）、`scratch\smoke-r4-auto`（`token_budget=100`）、`scratch\smoke-r4-fail`（同 100，`base_url=http://127.0.0.1:9/v1` 注入失败）。未改产品代码。
+
+| 项 | 结论 | 现象与判据 | 证据 |
+|---|---|---|---|
+| A-1 实时压缩节点 | **FAIL** | 01:58:49 自动压缩（`compressed_items=3 history_len=2`）后立刻取现场：UIA 全树里「压缩 / compact / 用户原文」关键字命中 **0**，会话区没被替换，既没有「上下文已压缩」卡片也没有摘要正文；上一轮用户气泡、思考行、底部「深度求索中，用时 14 秒」原样保留 | `r4/shots/04-live-auto-compaction-no-node.jpg`、`r4/evidence/r4-compaction-log.txt`、`r4/evidence/r4-ui-observations.txt` |
+| A-2 强杀重开唯一性/一致性 | **FAIL（不一致）** | 重开后同一次压缩只出现 **1 条**（不重复，这一点达标），但它是 `compaction-notice` 兜底通知（「上下文已压缩：历史第 1–3 条被一条摘要取代；原文仍保留在会话档案里。」），不是节点；实时 0 条 vs 重开 1 条，**呈现不一致**，也不符合「形状与上下文注入同口径」 | `r4/shots/06-reopen-after-kill-notice.jpg`、`r4/evidence/r4-ui-observations.txt` |
+| A-3 手动 `/compact` | **FAIL** | 发送后先出现命令卡片 `> compact · 正在压缩…`（单条）；压缩完成后命令卡片消失，会话区被**原始摘要正文**占据（以「## 用户原文（压缩时逐字保留，不得改写）」开头，含「1. 任务目标 … 5. 下一步」，时间 01:51，带「复制」），全树没有「上下文已压缩」节点 | `r4/shots/02-manual-compact-running.jpg`、`r4/shots/03-manual-compact-raw-summary.jpg`、`r4/evidence/r4-rollout-analysis.txt`（compacted #4） |
+| A-4 失败压缩通知 | **PASS** | 注入 `base_url=127.0.0.1:9` 后自动压缩失败（`compaction_ended{ok:false,error:"压缩请求发起失败，本轮中止：无法连接到模型服务"}`），界面出现「处理失败」+ 通知行「上下文压缩未生效：压缩请求发起失败，本轮中止：无法连接到模型服务。历史保持原样，可以继续对话。」 | `r4/shots/05-failed-compaction-notice.jpg`、`r4/evidence/r4-events-compaction.txt` |
+| B N9 残留 | **PASS** | 4 条 `compacted`（range 0-12 / 0-3 / 0-32 / 0-3），每条「## 用户原文」段长度 225/225/338/338，内容分别是第 1、3 条真实用户发言（逐字），段内**没有**任何模型生成的摘要分节（`1. 任务目标` 等只出现在 `---` 之后）；`history_len` = 3 / 8 / 3 / 2，有界 | `r4/evidence/r4-compacted-usertext.txt`、`r4/evidence/r4-rollout-analysis.txt` |
+| C 回归 | **PASS** | 实时 3 轮 14 步 = 重开 3 轮 14 步 = 导出 `turn/start` 3 / `turn/end` 3 = rollout `turn_end` 3 条（iterations 11+1+2=14）；压缩后追问「继续，用一句话说明当前进度。」5 秒内正常回答；日志扫描 `Cannot resolve tool name` 命中 0 | `r4/shots/01-live-turn-done.png`、`r4/evidence/r4-export-counts.txt`、`r4/evidence/r4-rollout-analysis.txt`、`r4/evidence/r4-toolname-scan.txt` |
+
+**B 的补充（压缩次数）**：14 步共压缩 4 次（3 次自动 + 1 次手动），约每 3–4 步一次，仍随步数增长；
+但每次压缩后 `history_len` 落在 2–8，没有无界膨胀。`compacted` 时间点与摘要原文见 `r4-compacted-usertext.txt`
+（原文照抄，未删改）。
+
+**A 的定位线索（黑盒只能到这，照实写）**
+
+- 实时压缩后既无节点也无替换，最接近的代码分支是 `pushCompactionCheckpoint` 在 `journal.surfaceSeqs` 为空时**静默返回 undefined**（[adapter.ts](file:///d:/MyWorkspace/SHANIU/src/transport/adapter.ts) 约 L1005–L1020）。但本轮无法证明是「surface 未登记」还是「替换事件被消费端丢弃」，需要打点复现。
+- 手动 `/compact` 完成后出现原始摘要正文，形态与「重开时首条即摘要」的重放路径一致（[adapter.ts](file:///d:/MyWorkspace/SHANIU/src/transport/adapter.ts) 约 L1890–L1990：首条 `compaction_summary` 之前没有 surface → 落 notice；有 surface → 走 checkpoint）。手动压缩为何把摘要铺成普通消息，与本轮证据吻合但未逐行证实。
+- 顺带发现的不对称（当前不影响判据）：`EventMsg::CompactionEnded` 不带 `trigger`，而 `compaction_started` / `compaction_summarized` 都带（[events.rs](file:///d:/MyWorkspace/SHANIU/src-tauri/src/events.rs) 的 `CompactionEnded` 分支）。适配层目前从 trace 取 trigger，所以没炸；但协议上建议 additive 补齐，否则以后任何新增消费方都会踩空。
+
+**顺带观察（未定性）**
+
+- 导出 `session.v4.jsonl`（53 行）里 `compaction` 事件为 **0**，而宿主 `data\sessions\*.events.jsonl` 有 9 条 compaction 事件。导出链路把压缩事件丢了；本轮四处计数不依赖它，但导入/回放对账会缺证据。
+- 手动压缩不写 `上下文已压缩（SH-032）` 日志行（该行只在自动压缩路径出现），排障时别拿它当手动压缩的判据。
+
+**证据索引（`r4/`）**
+
+- 截图（`r4/shots/`）：`01-live-turn-done.png`、`02-manual-compact-running.jpg`、`03-manual-compact-raw-summary.jpg`、`04-live-auto-compaction-no-node.jpg`、`05-failed-compaction-notice.jpg`、`06-reopen-after-kill-notice.jpg`、`live-compaction-1.png`、`live-compaction-2.png`、`live-compaction3-3.png`
+- 档案（`r4/evidence/`）：`r4-build.txt`、`r4-compaction-log.txt`、`r4-rollout-analysis.txt`、`r4-compacted-usertext.txt`、`r4-events-compaction.txt`、`r4-export-counts.txt`、`r4-toolname-scan.txt`、`r4-ui-observations.txt`、`live-export-session-log.zip`
+
+## 第五轮真机复验：N5 返工（2026-11-15 03:54–04:45，被测提交 `408dee9`）
+
+被测二进制：现场重建，未复用旧包（`CARGO_TARGET_DIR=scratch\target-r5` 全新目录 + `pnpm tauri build --no-bundle`，339.7 秒），
+`git rev-parse HEAD` = `origin/main` = `408dee9`（含 `c6a89be`），产物 28,564,480 B，SHA256 `775C9851…9BC2`（详见 `r5/evidence/r5-build.txt`）。
+数据目录：`scratch\smoke-r5-auto`（`token_budget=100`，自动压缩）、`scratch\smoke-r5-fail`（同 100 + `base_url=http://127.0.0.1:9/v1`）、`scratch\smoke-r5-default`（`token_budget=500000`）。未改产品代码。
+
+| 项 | 结论 | 现象与判据 | 证据 |
+|---|---|---|---|
+| A1 实时压缩节点 | **PASS（带条件）** | 04:15:47.041 自动压缩（`compressed_items=4`）；04:15:54 立刻取 UIA 全树：**0 条**「上下文已压缩」，也没有任何 notice —— 节点此时被折叠在「已完成，用时 9秒」→「已完成分析」两级组内。04:16:35 用真实鼠标展开两级后取全树：**1 条** `button "上下文已压缩 点击查看压缩摘要"`（两棵重复文档各映射一次，unique=1），点击展开可见完整摘要（`## 用户原文（压缩时逐字保留，不得改写）` → `1. 任务目标`…`5. 下一步`，319 字符，与档案 summary 一致）。会话区已被替换（原消息收进组内，正文显示摘要）。**注**：若按「不展开也必须全树可见」的字面口径，本项仍算不达标，见残留 R5-1 | `r5/shots/a1-live-collapsed-tree.png`、`a1-expand-turn-group.png`、`a1-expand-analysis-group.png`、`a1-node-summary-expanded.png`、`r5/evidence/r5-ui-observations.txt` |
+| A2 强杀重开 | **PASS** | 强杀后重开，同一次压缩仍只有 **1 条**，且形状与实时**同形**：`button "上下文已压缩 点击查看压缩摘要"`，**不是** notice（r4 的 `compaction-notice` 兜底文案 0 命中）。2 轮 2 步与实时一致 | `r5/shots/a2-reopen-1.png`…`a2-reopen-4-node.png` |
+| A3 手动 `/compact` | **PASS** | 命令卡完成后**仍是命令卡**：`button "compact Compacted 2 history items (~200 tokens)."`（val=collapsed）；会话区 `## 用户原文` 命中 **0**（不再被原始摘要正文占据）；压缩节点仍 **1 条**，未出现两条。日志 04:18:49.695096Z `trigger="manual"` | `r5/shots/a3-command-menu.png`、`a3-after-compact-card.png`、`r5/evidence/r5-log-compaction.txt` |
+| A4 失败压缩 | **PASS** | 注入不可达 provider 后，本轮以失败区块呈现「处理失败 / 压缩请求发起失败，本轮中止：无法连接到模型服务」（`COMPACTION_FAILED` + 「原始错误 ▶」），**没有**压缩节点、没有摘要正文；`compacted` 仍 2 条（range 0-4 ×2），历史原样 | `r5/shots/a4-fail-1-start.png`、`a4-fail-2-baseline-3turns.png`、`a4-fail-3-notice.png`、`r5/evidence/r5-rollout-analysis.txt` |
+| B 回归 | **PASS** | 四处一致：实时 **4 轮 5 步** = 重开 **4 轮 5 步** = 导出 `turn/start` 4 / `turn/end` 4 = rollout `turn_end` 4 条（iterations 1+1+1+2=5）。压缩后追问正常完成，轮内 `read_file` 成功读到 `smoke-proj`。`Cannot resolve tool name` 四路扫描 **0**。常规预算（500000）同一回合 23 条 response_item、多次工具调用，`SH-032` 0 行、`compacted` 0 条 | `r5/shots/b-followup-toolcall-4turns.png`、`b-reopen-counts-4turns.png`、`b-default-budget-1.png`、`b-default-budget-2.png`、`r5/evidence/r5-toolname-scan.txt`、`r5-export-counts.txt` |
+| C 导出与日志 | **PASS** | 导出 `session.v4.jsonl` 36 行：`compaction/start|summary|end` 各 **5** 条（每次压缩 3 条 log-only 事件），summary 非空（319/194/177/208/208 字符）；`turn/start` 4、`turn/end` 4，**未虚增回合**。手动压缩有 SH-032 行（04:18:49.695096Z，`trigger="manual"`） | `r5/shots/c-session-menu.png`、`c-save-dialog.png`、`c-export-toast.png`、`r5/evidence/r5-export-counts.txt` |
+
+**残留（照实报，均不改变上面 PASS 判据）**
+
+- **R5-1（A1 可见性，P2）**：压缩节点默认藏在「轮次过程」(`已完成，用时 N秒`) → `已完成分析` 两级折叠组内；不展开时 UIA 全树与界面上都看不到「上下文已压缩」。所以「自动压缩后立刻取全树即可见」的字面要求未满足——本轮 PASS 判的是"形态已从通知变成节点且含摘要"。
+  - 最小复现：`token_budget=100` 的会话发任意一句 → 等日志出现 `SH-032` → 不点任何折叠组直接取全树，命中 0；点开两级后命中 1。
+  - 日志时间点：`2026-11-14T20:15:47.041068Z`（压缩）→ `20:15:54`（折叠态取样 0 条）→ `20:16:35`（展开后 1 条）。
+- **R5-2（A2 位置与时间，P3）**：实时节点挂在当轮组内，重开挂在压缩 range 首轮组内；重开视图出现 `text "记录时刻不可用"`（重放缺时间戳）。
+- **R5-3（A3 文案，P3）**：`/compact` 命令卡完成后文案为英文 `Compacted 2 history items (~200 tokens).`，未本地化。
+- **R5-4（C 导出自描述不全，P2）**：导出里的压缩事件 `turn=null`、`time=0`、`timeUnreliable=true`，且**没有 trigger 字段**——能看到 3 条 log-only 事件和摘要，但无法从导出区分手动/自动、也无法归到具体回合。`c6a89be` 的自描述只补在了宿主侧事件，导出合成分支没带上。
+  - 最小复现：任一有压缩的会话 → 「···」→「下载 Session 日志」→ 看 `session.v4.jsonl` 的 `compaction/*`。
+- **R5-5（A4 文案与可观测性，P3）**：失败区块标题为「本本轮运行失败」（重复一个「本」）；且压缩失败在日志里 **0 行**，只有 UI 与 rollout `turn_end.error` 有痕迹，排障得翻档案。
+- **R5-6（测试环境，非产品问题）**：`token_budget=100` 时每个步骤都触发压缩（04:27:34 / 04:28:08 / 04:28:16 各一次），4 轮产生了 5 个压缩节点，属测试配置放大；常规预算（500000）不产生任何压缩，两侧对照成立。
+- 另记：本轮 `smoke-r5-default` 的会话在观察窗口内一直停在「等待审批」（模型连续请求 `unified_exec`），随后被强杀，因此没有 `turn_end`；「常规预算不产生多余压缩」的结论只依赖 `SH-032=0` 与 `compacted=0`，与这个未完成回合无关。
+
+**证据索引（`r5/`）**
+
+- 构建：`r5/evidence/r5-build.txt`
+- 截图（`r5/shots/`）：`a1-live-collapsed-tree.png`、`a1-expand-turn-group.png`、`a1-expand-analysis-group.png`、`a1-node-summary-expanded.png`、`a2-reopen-1..3.png`、`a2-reopen-4-node.png`、`a3-command-menu.png`、`a3-after-compact-card.png`、`a4-fail-1-start.png`、`a4-fail-2-baseline-3turns.png`、`a4-fail-3-notice.png`、`b-followup-turn3.png`、`b-followup-toolcall-4turns.png`、`b-reopen-counts-4turns.png`、`b-reopen-node.png`、`b-default-budget-1.png`、`b-default-budget-2.png`、`c-session-menu.png`、`c-save-dialog.png`、`c-export-toast.png`
+- 档案（`r5/evidence/`）：`r5-build.txt`、`r5-ui-observations.txt`、`r5-log-compaction.txt`、`r5-rollout-analysis.txt`、`r5-export-counts.txt`、`r5-toolname-scan.txt`、`r5-session.v4.jsonl`、`dsh-session-sess-1794686409659-0001.zip`
+- 全部运行在 `scratch\` 隔离目录，未改产品代码。

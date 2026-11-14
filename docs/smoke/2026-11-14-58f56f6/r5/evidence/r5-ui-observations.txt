@@ -1,0 +1,44 @@
+被测提交：408dee9；实例：`scratch\smoke-r5-auto`（token_budget=100）、`scratch\smoke-r5-fail`（token_budget=100 + base_url=http://127.0.0.1:9/v1）、`scratch\smoke-r5-default`（token_budget=500000）。
+时间均为本机时区（UTC+8），与日志里的 UTC 相差 8 小时。
+
+== A1 实时压缩节点（会话 sess-1794686409659-0001）==
+- 04:15:38 发送首轮消息；04:15:47.041 自动压缩（SH-032，compressed_items=4）。
+- 04:15:54 立刻取 UIA 全树：整树文本中「上下文已压缩」「点击查看压缩摘要」命中 **0**；该轮显示「已完成，用时 9秒」（折叠组），摘要正文在「已完成分析」折叠组内；全程无 notice/通知。
+- 04:16:35 真实鼠标依次点开「已完成，用时 9秒」→「已完成分析」后再取全树：命中 **1 条** `button "上下文已压缩 点击查看压缩摘要"`（同一元素在 SHANIU.exe 与 msedgewebview2 两棵重复文档里各映射一次，unique=1）。
+- 04:16:5x 点击该节点：展开出完整摘要（`## 用户原文（压缩时逐字保留，不得改写）` → `1. 任务目标` … `5. 下一步`），与会话档案 `compacted` 的 summary 一致（319 字符）。
+- 截图：`r5/shots/a1-live-collapsed-tree.png`、`a1-expand-turn-group.png`、`a1-expand-analysis-group.png`、`a1-node-summary-expanded.png`
+
+== A2 强杀重开（同一次压缩唯一且同形）==
+- 04:17:0x 强杀 pid 15984（Stop-Process -Force），重开 pid 4548。
+- 重开后会话「简单问候」显示 **2 轮 2 步**，与实时一致。
+- 逐层展开后，压缩节点出现在**第 1 轮**「已完成分析」组内，形状与实时完全相同：`button "上下文已压缩 点击查看压缩摘要"`，unique 计数 **1**；无 notice / 无「上下文已压缩：历史第 N–M 条…」兜底文案。
+- 截图：`r5/shots/a2-reopen-1.png` … `a2-reopen-4-node.png`
+- 残留：① 实时节点挂在当轮（第 2 轮）组内，重开挂在压缩 range 首轮（第 1 轮）组内；② 重开视图出现 `text "记录时刻不可用"`（重放缺时间戳）。
+
+== A3 手动 /compact（命令卡内折叠）==
+- 04:18:4x 输入 `/` 打开命令菜单，点 `list-item "压缩 compact 压缩以上对话内容"`。
+- 04:18:49.695 手动压缩日志 `trigger="manual" compressed_items=2 history_len=2`。
+- 完成后命令卡**保留**：`button "compact Compacted 2 history items (~200 tokens)."`（val=collapsed）；会话区 `## 用户原文` 命中 **0**（不再被原始摘要正文占据）；压缩节点仍 **1 条**。
+- 截图：`r5/shots/a3-command-menu.png`、`a3-after-compact-card.png`
+- 残留：命令卡文案为英文（`Compacted 2 history items (~200 tokens).`），未走中文文案。
+
+== A4 失败压缩（通知呈现、历史原样）==
+- 04:38 启动 fail 实例，打开植入会话「简单问候」（基线 3 轮 3 步，rollout 18 行）。
+- 04:40 发送「继续，用一句话说明当前进度。」：出现**失败区块**「处理失败 / 本本轮运行失败 —— 压缩请求发起失败，本轮中止：无法连接到模型服务」，含 `COMPACTION_FAILED` 与「原始错误 ▶」；**没有**压缩节点、没有摘要正文。
+- 历史保持原样：`compacted` 仍 2 条（range 0-4、0-4），新增仅 `turn_end turn=4 reason=failed error.code=COMPACTION_FAILED`。
+- 截图：`r5/shots/a4-fail-1-start.png`、`a4-fail-2-baseline-3turns.png`、`a4-fail-3-notice.png`
+- 残留：失败区块标题文案「本本轮运行失败」重复了一个「本」；压缩失败在日志里 **0 行**（只有 UI + rollout 有痕迹）。
+
+== B 回归 ==
+- 四处计数一致：实时 **4 轮 5 步**（`b-followup-toolcall-4turns.png`）= 重开 **4 轮 5 步**（`b-reopen-counts-4turns.png`）= 导出 `turn/start` 4 / `turn/end` 4 = rollout `turn_end` 4 条（iterations 1+1+1+2=5）。
+- 压缩后追问：04:28 发送「请读取当前工作区的 package.json，只回复 name 字段的值。」→ 回合正常完成，轮内 `read_file` 成功返回 `smoke-proj`（导出里 `tool/call`、`tool/result` 各 1 条）。
+- `Cannot resolve tool name`：auto/fail/default 三套数据目录的 logs、rollouts、sessions 与导出 session.v4.jsonl 全量扫描，命中 **0**。
+- 常规预算：default 实例（500000）同一回合跑出 23 条 response_item、多次 `unified_exec` 调用，`SH-032` 行数 **0**、`compacted` **0**；该回合在观察窗口内一直停在「等待审批」，随后被强杀，因此**没有 turn_end**（计数一致性不依赖这个未完成回合）。
+- 截图：`r5/shots/b-followup-turn3.png`、`b-followup-toolcall-4turns.png`、`b-reopen-counts-4turns.png`、`b-reopen-node.png`、`b-default-budget-1.png`、`b-default-budget-2.png`
+
+== C 导出与日志 ==
+- 04:33 会话头部「···」→「下载 Session 日志」导出 ZIP（保存对话框默认落在上一轮目录，已归档为 `r5/evidence/dsh-session-sess-1794686409659-0001.zip`）。
+- 导出 `session.v4.jsonl` 36 行：`compaction/start|summary|end` 各 **5** 条（5 次压缩 × 3 条 log-only 事件），summary 文本非空（319/194/177/208/208 字符）；`turn/start` 4、`turn/end` 4，**未被压缩事件虚增**。
+- 手动压缩有 SH-032 日志行（04:18:49，trigger="manual"）。
+- 截图：`r5/shots/c-session-menu.png`、`c-save-dialog.png`、`c-export-toast.png`；计数明细 `r5/evidence/r5-export-counts.txt`
+- 残留：导出里的压缩事件 `turn=null`、`time=0`、`timeUnreliable=true`，且**没有 trigger 字段**，无法从导出区分手动/自动、也无法归到某一回合。

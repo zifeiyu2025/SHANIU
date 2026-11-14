@@ -1,0 +1,53 @@
+本轮 UI 观测（UIA 无障碍树 + 截图，时间均为本地时间 2026-11-15，时区 Asia/Shanghai）
+
+被测二进制
+- 提交 9d0cfd9，release 便携包，本轮现场重建（详见 r4-build.txt）
+- 测试数据目录：scratch\smoke-r4（token_budget=5000）、scratch\smoke-r4-auto（token_budget=100，真实 provider）、
+  scratch\smoke-r4-fail（token_budget=100，base_url=http://127.0.0.1:9/v1，用于注入压缩失败）
+
+A-1 自动压缩「当下」是否有压缩节点
+- 17:58:49.97Z（01:58:49）日志：上下文已压缩（SH-032） compressed_items=3 history_len=2
+- 01:58:56 现场截图 04-live-auto-compaction-no-node.jpg + 同一时刻 UIA 全树：
+  * 树里出现「压缩 / compact / 用户原文」关键字的节点数 = 0
+  * 上一轮的「继续」用户气泡（01:58）、正在分析请求行、底部「深度求索中，用时 14 秒」都在，
+    会话区没有被替换，也没有出现「上下文已压缩」卡片或摘要正文
+- 结论：本轮自动压缩在发生时界面无任何提示
+
+A-2 强杀重开后的呈现（同一次压缩）
+- 02:00:32 强杀 pid 20000 后重开，会话自动恢复到同一 session
+- 05 号证据（06-reopen-after-kill-notice.jpg）UIA：
+  * 「继续」气泡（01:58）
+  * 「本轮状态未知」条（强杀导致回合未收口，属预期）
+  * 只有 1 条与压缩相关的行：按钮「已注入上下文」，展开后内容为
+    button "上下文注入 compaction-notice 上下文已压缩：历史第 1–3 条被一条摘要取代；原文仍保留在会话档案里。"
+- 关键字扫描「压缩 / 用户原文 / 注入上下文」命中 = 1 条（不重复）
+- 结论：重开只有一条，但它是 compaction-notice 兜底通知，不是「上下文已压缩」节点；
+  与实时（0 条）呈现不一致
+
+A-3 手动 /compact
+- 01:51:31 输入框输入 /compact，弹出候选「压缩 compact 压缩以上对话内容」，点击发送后：
+  * 02-manual-compact-running.jpg：出现命令卡片 `> compact · 正在压缩…`（单条，未出现两条）
+- 01:51:57 rollout 写入第 4 条 compacted（range 0-3），UI 在 01:52 变为：
+  * 03-manual-compact-raw-summary.jpg：命令卡片消失，会话区被一段原始摘要正文占据，
+    正文以「## 用户原文（压缩时逐字保留，不得改写）」开头，含 1. 任务目标 … 5. 下一步，
+    时间戳 01:51，右侧有「复制」按钮
+  * UIA 全树无「上下文已压缩」按钮/卡片，只有上述纯文本块
+- 结论：手动 /compact 期间是命令卡片，但完成后不是「只留命令卡片」，而是把完整摘要正文
+  当普通消息铺在会话区
+
+A-4 失败压缩是否仍以通知出现
+- 01:57:28（smoke-r4-fail，base_url 指向 127.0.0.1:9，token_budget=100）：
+  * 发送「继续」后自动压缩触发并失败，宿主事件为
+    compaction_started{trigger:"pressure"} → compaction_ended{ok:false,error:"压缩请求发起失败，本轮中止：无法连接到模型服务"}
+  * 05-failed-compaction-notice.jpg：界面出现「处理失败」+ 展开的通知行
+    button "上下文注入 compaction-notice 上下文压缩未生效：压缩请求发起失败，本轮中止：无法连接到模型服务。历史保持原样，可以继续对话。"
+  * 同一屏另有「本轮运行失败 … COMPACTION_FAILED」错误条
+- 结论：失败压缩仍以通知形式出现，PASS
+
+C 计数
+- 实时（01:44 截图 01-live-turn-done.png）：3 轮 14 步
+- 重开（01:46 之后同一 session）：3 轮 14 步
+- 导出 session.v4.jsonl：turn/start=3、turn/end=3（见 r4-export-counts.txt）
+- rollout：turn_end 3 条，iterations 11+1+2=14（见 r4-rollout-analysis.txt）
+- 追问：压缩后发「继续，用一句话说明当前进度。」5 秒内正常回答，计数 +1 轮 +1 步
+- 日志扫描「Cannot resolve tool name」命中 0（见 r4-toolname-scan.txt）

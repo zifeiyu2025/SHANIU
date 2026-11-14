@@ -1,0 +1,6 @@
+被测提交: 9d0cfd9c288c6693ec6336778bdb2ac5c8d62c3b (origin/main = HEAD)
+构建命令: $env:CARGO_TARGET_DIR='scratch\target-n5r4'; pnpm tauri build --no-bundle
+产物: src-tauri\scratch\target-n5r4\release\shaniu.exe
+SHA256: 147C500EFB769B4029D9595C110B878B4A9897F8F7BEFA9EACEE160816ACCD06
+大小: 28563456 B
+构建耗时: 5 分 14 秒（本轮现场重建，未复用旧包）

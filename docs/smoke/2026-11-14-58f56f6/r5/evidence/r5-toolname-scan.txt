@@ -1,0 +1,15 @@
+扫描目标：`Cannot resolve tool name`（大小写敏感，原文匹配）
+扫描范围（本轮全部数据目录，非缓存）：
+- scratch\smoke-r5-auto\SHANIU-Portable\data\logs\*.log*
+- scratch\smoke-r5-auto\SHANIU-Portable\data\rollouts\*.jsonl
+- scratch\smoke-r5-auto\SHANIU-Portable\data\sessions\*.jsonl
+- scratch\smoke-r5-fail\… 同上三类
+- scratch\smoke-r5-default\… 同上三类
+- docs\smoke\2026-11-14-58f56f6\r5\evidence\r5-session.v4.jsonl（UI 导出的 session.v4.jsonl）
+
+结果：命中 **0** 次（日志 0 / rollout 0 / events 0 / 导出 0）。
+
+旁证：压缩后追问回合里确实发生过一次工具调用并成功返回——
+导出 `session.v4.jsonl` 中 `tool/call name=read_file` 1 条、`tool/result` 1 条，
+结果为工作区 `scratch\smoke-proj\package.json` 的 `name = smoke-proj`，
+说明工具名解析链路正常（不只是"没报错"）。

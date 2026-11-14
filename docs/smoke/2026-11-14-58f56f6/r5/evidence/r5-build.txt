@@ -1,0 +1,17 @@
+第五轮真机复验（r5）构建记录
+
+- 被测提交：main = 408dee9（`408dee9 fix(N5): 压缩节点用真机事件复现并修掉「实时不可见」`，含 `c6a89be chore(N5): 压缩事件自描述`）
+- 工作树：HEAD = 408dee9 = origin/main（git rev-parse HEAD 输出 408dee971cf2002ef730d3acad13e7d493e0b3bc）
+- 构建命令：$env:CARGO_TARGET_DIR='d:\MyWorkspace\SHANIU\scratch\target-r5'; pnpm tauri build --no-bundle
+- 独立 target 目录：scratch\target-r5（全新，未复用任何旧包/旧 target）
+- 构建耗时：339.7 秒（5 分 40 秒，cargo "Finished `release` profile [optimized] target(s) in 5m 12s"）
+- 产物：scratch\target-r5\release\shaniu.exe
+  - 大小 28,564,480 B
+  - SHA256 775C985163A2003878506FC95852874B06C6F337C8742CE1E26BE7DE5BBC9BC2
+  - 生成时间 2026-11-15 03:53:53（本地时间，Asia/Shanghai）
+- 便携装配：四个隔离数据目录均复制同一枚 exe（SHA256 前 16 位 775C985163A20038 一致）：
+  - scratch\smoke-r5-auto\SHANIU-Portable（token_budget=100，真实 provider，自动压缩触发用）
+  - scratch\smoke-r5\SHANIU-Portable（token_budget=5000，手动 /compact 与 B 多步任务）
+  - scratch\smoke-r5-fail\SHANIU-Portable（token_budget=100，base_url=http://127.0.0.1:9/v1，注入压缩失败）
+  - scratch\smoke-r5-default\SHANIU-Portable（token_budget=500000，常规预算回归）
+- 未改动产品代码；全部运行在 scratch\ 隔离目录。

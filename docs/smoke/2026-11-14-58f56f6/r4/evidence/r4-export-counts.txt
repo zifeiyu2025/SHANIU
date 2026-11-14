@@ -1,0 +1,11 @@
+导出: r4\evidence\live-export-session-log.zip -> session.v4.jsonl（14233 B 原包）
+行数: 53
+  assistant/message = 10
+  session = 1
+  session/title = 1
+  tool/call = 16
+  tool/result = 16
+  turn/end = 3
+  turn/start = 3
+  user/message = 3
+压缩事件数: 0

@@ -1,0 +1,27 @@
+被测提交：408dee9（现场重建，见 r5-build.txt）
+复验日期：2026-11-15 04:00–04:45（本机时区 Asia/Shanghai，日志内为 UTC）
+
+== auto 实例（token_budget=100）压缩日志行 ==
+2026-11-14T19:56:20.793944Z  INFO shaniu_lib::agent_loop: 上下文已压缩（SH-032） compressed_items=4 history_len=2
+2026-11-14T20:00:47.449443Z  INFO shaniu_lib::agent_loop: 上下文已压缩（SH-032） compressed_items=4 history_len=2
+2026-11-14T20:15:47.041068Z  INFO shaniu_lib::agent_loop: 上下文已压缩（SH-032） compressed_items=4 history_len=2
+2026-11-14T20:18:49.695096Z  INFO shaniu_lib::session_compact: 上下文已压缩（SH-032） trigger="manual" compressed_items=2 history_len=2
+2026-11-14T20:27:34.357519Z  INFO shaniu_lib::agent_loop: 上下文已压缩（SH-032） compressed_items=3 history_len=2
+2026-11-14T20:28:08.041743Z  INFO shaniu_lib::agent_loop: 上下文已压缩（SH-032） compressed_items=4 history_len=2
+2026-11-14T20:28:16.970593Z  INFO shaniu_lib::agent_loop: 上下文已压缩（SH-032） compressed_items=3 history_len=3
+
+判读：
+- A1 自动压缩时点 20:15:47.041068Z（消息发送于 20:15:38，UIA 全树取样 20:15:54，展开取样 20:16:35）。
+- A3 手动压缩 20:18:49.695096Z 带 trigger="manual"，说明 c6a89be 的手动压缩日志补齐已生效（r4 残留已修）。
+- 追问回合 20:27:34 / 20:28:08 / 20:28:16 各压一次，是 token_budget=100 的测试配置所致（每步都会越过预算），不代表产品默认行为。
+
+== fail 实例（base_url=http://127.0.0.1:9/v1）压缩失败日志行 ==
+（无）—— 日志里 0 条与压缩失败相关的行，失败只体现在 UI 失败区块与 rollout turn_end.error。
+shaniu.log 尾部只有 startup 与 prompt 组装行，例如：
+2026-11-14T20:40:04.160525Z  INFO shaniu_lib::agent_loop::prompt: 系统提示已组装（内容锁） prompt_version="2026-11-13.1" ...
+
+== default 实例（token_budget=500000）日志中 SH-032 行数 = 0 ==
+该会话跑出 23 条 response_item（含多次 unified_exec 调用），仍未触发任何压缩。
+
+== 失败回合的 rollout 尾部 ==
+{"type":"turn_end","turn":4,"task_id":"sess-1794686113918-0002#4","iterations":1,"reason":"failed","at_ms":1794688806209,"error":{"code":"COMPACTION_FAILED","message":"压缩请求发起失败，本轮中止：无法连接到模型服务"}}

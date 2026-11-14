@@ -1,0 +1,3 @@
+扫描范围: scratch\smoke-r4\SHANIU-Portable\data\logs\*
+关键字: Cannot resolve tool name
+命中数: 0

@@ -1,0 +1,45 @@
+导出文件：dsh-session-sess-1794686409659-0001.zip（UI「下载 Session 日志」），内含 session.v4.jsonl（36 行）
+
+== 事件类型计数 ==
+assistant/message    5
+compaction/end       5
+compaction/start     5
+compaction/summary   5
+session              1
+session/title        1
+tool/call            1
+tool/result          1
+turn/end             4
+turn/start           4
+user/message         4
+
+== compaction/* 明细（5 次压缩 × 3 条 log-only 事件 = 15 条）==
+compaction/start     seq=8   compactionId=shaniu-export-compaction-1     summaryChars=0     turn= hasTrigger=False
+compaction/summary   seq=9   compactionId=shaniu-export-compaction-1     summaryChars=319   turn= hasTrigger=False
+compaction/end       seq=10  compactionId=shaniu-export-compaction-1     summaryChars=0     turn= hasTrigger=False
+compaction/start     seq=13  compactionId=shaniu-export-compaction-2     summaryChars=0     turn= hasTrigger=False
+compaction/summary   seq=14  compactionId=shaniu-export-compaction-2     summaryChars=194   turn= hasTrigger=False
+compaction/end       seq=15  compactionId=shaniu-export-compaction-2     summaryChars=0     turn= hasTrigger=False
+compaction/start     seq=18  compactionId=shaniu-export-compaction-3     summaryChars=0     turn= hasTrigger=False
+compaction/summary   seq=19  compactionId=shaniu-export-compaction-3     summaryChars=177   turn= hasTrigger=False
+compaction/end       seq=20  compactionId=shaniu-export-compaction-3     summaryChars=0     turn= hasTrigger=False
+compaction/start     seq=25  compactionId=shaniu-export-compaction-4     summaryChars=0     turn= hasTrigger=False
+compaction/summary   seq=26  compactionId=shaniu-export-compaction-4     summaryChars=208   turn= hasTrigger=False
+compaction/end       seq=27  compactionId=shaniu-export-compaction-4     summaryChars=0     turn= hasTrigger=False
+compaction/start     seq=31  compactionId=shaniu-export-compaction-5     summaryChars=0     turn= hasTrigger=False
+compaction/summary   seq=32  compactionId=shaniu-export-compaction-5     summaryChars=208   turn= hasTrigger=False
+compaction/end       seq=33  compactionId=shaniu-export-compaction-5     summaryChars=0     turn= hasTrigger=False
+
+== turn/start & turn/end（回合未被压缩事件虚增）==
+turn/start turn=1 reason=
+turn/end   turn=1 reason=completed
+turn/start turn=2 reason=
+turn/end   turn=2 reason=completed
+turn/start turn=3 reason=
+turn/end   turn=3 reason=completed
+turn/start turn=4 reason=
+turn/end   turn=4 reason=completed
+
+== tool 事件（压缩后追问里 read_file 正常解析）==
+tool/call name=read_file status=
+tool/result name= status=
