@@ -70,6 +70,14 @@ const RULES: &[Rule] = &[
         fields: "turn reason at_ms error",
         overrides: &[],
     },
+    Rule {
+        owner: "SessionEntry",
+        variant: "CompactionSummary",
+        fields: "text range_start range_end at_ms",
+        // 摘要正文与区间都进重建事件（`compaction/summary` + 一条通知），前端全读。
+        // `at_ms` 只是档案留档：压缩锚点没有独立时刻，前端不按它排序/展示。
+        overrides: &[("at_ms", Status::BackendOnly("压缩锚点没有独立时刻；前端只按档案顺序重建"))],
+    },
     // ── EventMsg ────────────────────────────────────────────────────────────
     Rule { owner: "EventMsg", variant: "TurnStarted", fields: "turn", overrides: &[] },
     Rule {
