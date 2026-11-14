@@ -2330,6 +2330,59 @@ describe('适配层的命令面映射', () => {
     expect(reason.kind).toBe('interrupted')
   })
 
+  it('已收口回合 + 进程被杀 + 重启重建：仍是 completed、单条结束、轮次不变', async () => {
+    // 真机档案 sess-1794648331061-0001 的投影形状：环境快照 system 消息 → 用户消息 →
+    // 助手回复 → 结局行。强杀进程后重启，宿主确认该会话没有任务在跑。
+    const archive = [
+      { kind: 'message', role: 'system', text: '## 环境快照\n- Git：main，0 个未提交改动' },
+      { kind: 'message', role: 'user', text: '只回复：hi' },
+      { kind: 'message', role: 'assistant', text: 'hi' },
+      { kind: 'turn_end', turn: 1, reason: 'completed', at_ms: 1_700_000_013_000 },
+    ]
+    const bridge = scriptedBridge(undefined, archive)
+    bridge.host.active = null
+    const reopened = createAdapter({ bridge })
+    const iterator = faceOf(reopened.remote).session.follow({ address: { kind: 'session', sessionId: 'agent-crash' } })
+    const events = eventsOf((await iterator.next()).value as Record<string, unknown>)
+    await iterator.return?.(undefined)
+    reopened.dispose()
+
+    const ofType = (type: string): Record<string, unknown>[] =>
+      events.filter(event => event['type'] === type)
+    // 反向对照：去掉 replayArchive 里对 system 消息的跳过，「环境快照」会先开一个回合，
+    // 用户消息再补一条 interrupted，这里变成 2 条 turn/start、2 条 turn/end。
+    expect(ofType('turn/start')).toHaveLength(1)
+    expect(ofType('step/start')).toHaveLength(1)
+    const ends = ofType('turn/end')
+    expect(ends).toHaveLength(1)
+    expect((ends[0]!['data'] as { reason: { kind: string } }).reason.kind).toBe('completed')
+    // 脚手架消息不得伪装成助手气泡。
+    expect(ofType('assistant/message').some(event => JSON.stringify(event['data']).includes('环境快照')))
+      .toBe(false)
+  })
+
+  it('结局行编号是后端采样迭代序号：与前端回合号不同口径也照档案收口', async () => {
+    // 多步任务里后端 TurnEnd.turn 会大于前端按用户消息计的回合号；用等值比较会把
+    // 宿主已经给出的结论丢掉，末尾兜底随后补一条 interrupted。
+    const archive = [
+      { kind: 'message', role: 'user', text: '问' },
+      { kind: 'message', role: 'assistant', text: '答' },
+      { kind: 'turn_end', turn: 2, reason: 'completed', at_ms: 1_700_000_013_000 },
+    ]
+    const bridge = scriptedBridge(undefined, archive)
+    bridge.host.active = null
+    const reopened = createAdapter({ bridge })
+    const iterator = faceOf(reopened.remote).session.follow({ address: { kind: 'session', sessionId: 'agent-multi-step' } })
+    const events = eventsOf((await iterator.next()).value as Record<string, unknown>)
+    await iterator.return?.(undefined)
+    reopened.dispose()
+
+    const ends = events.filter(event => event['type'] === 'turn/end')
+    // 反向对照：判据收回 `entry.turn === journal.turn`，这里会变成 interrupted。
+    expect(ends).toHaveLength(1)
+    expect((ends[0]!['data'] as { reason: { kind: string } }).reason.kind).toBe('completed')
+  })
+
   it('宿主说本会话还在跑 → 重建不补 turn_end，实时帧继续落在同一回合', async () => {
     const archive = [
       { kind: 'message', role: 'user', text: '问' },

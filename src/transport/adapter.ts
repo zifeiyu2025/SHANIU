@@ -1782,7 +1782,10 @@ export function createAdapter(options: AdapterOptions): { remote: unknown; dispo
         replayClock = 'at_ms' in entry && (entry.at_ms ?? 0) > 0 ? entry.at_ms : 0
         if (entry.kind === 'turn_end') {
           // 结局行：新档案才有；旧档案走到末尾时由宿主确认空闲后补 `interrupted`。
-          if (entry.turn === journal.turn) closeTurn(archiveTurnReason(entry.reason, entry.error))
+          // 档案顺序即回合顺序，结局行收的就是当前还开着的那个回合。`entry.turn` 是
+          // 后端采样迭代序号，不是前端按用户消息计的回合号——拿它做等值比较，口径一旦
+          // 不同就把宿主已经给出的结论丢掉，末尾兜底随后会补一条 `interrupted` 盖掉它。
+          if (journal.taskOpen) closeTurn(archiveTurnReason(entry.reason, entry.error))
           journal.entryToSeq[index] = journal.seq
           return
         }
@@ -1806,6 +1809,13 @@ export function createAdapter(options: AdapterOptions): { remote: unknown; dispo
             source: { kind: 'user' },
           }, { surfaceOp: 'append' })
         } else if (entry.kind === 'message') {
+          // 环境快照等 system 消息是 prompt 脚手架（agent_loop/prompt.rs 以尾部 system
+          // 消息注入历史），实时路径从不把它当对话展示；这里也不给它开回合，否则紧随
+          // 其后的用户消息会先补一条结束，档案里的结局行随后因回合号错位被丢掉。
+          if (entry.role === 'system') {
+            journal.entryToSeq[index] = journal.seq
+            return
+          }
           // 档案开头就是助手消息（压缩锚点之类）：也得给它一个回合，否则这条消息
           // 在界面上没有归属，会被静默丢掉。
           if (!journal.taskOpen) startTurn()
