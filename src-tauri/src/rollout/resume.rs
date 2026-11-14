@@ -155,6 +155,10 @@ pub fn resume(path: &Path) -> Result<Resumed, RolloutError> {
                 // 结局只服务于导出/统计/审计，不参与模型历史重建。
                 tracing::debug!("会话档案回合结局：{reason}");
             }
+            RolloutItem::Verification { .. } => {
+                // 写后验证裁决是审计记录：它描述的是「宿主跑过什么」，不是对话内容。
+                // 重放它会让模型把上一次的命令与诊断当成自己的话，故只留在盘上。
+            }
             RolloutItem::SessionMeta { .. } => {
                 return Err(RolloutError::Corrupted {
                     line: 0,

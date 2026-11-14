@@ -17,6 +17,7 @@ use tokio_util::sync::CancellationToken;
 
 use crate::config::{BaselineMode, VerifyConfig};
 use crate::events::{InconclusiveReason, SkipReason, VerifyState};
+use crate::rollout::VerifyRun;
 use crate::tool_router::FileWrite;
 
 /// 一次验证的总时限（跨命令）。单命令另受 `[verify].timeout_ms` 限制。
@@ -121,6 +122,10 @@ pub struct VerifyCommand {
 pub struct VerifyOutcome {
     pub state: VerifyState,
     pub commands: Vec<String>,
+    /// 每条命令的执行事实（退出码/耗时/是否超时）。事件面只有四态与输出尾部，
+    /// 「宿主真的跑过」这件事只有退出码能证；它随裁决一起落档供事后审计。
+    /// 未执行（总时限已到）或走「终端通过计入」时为空。
+    pub runs: Vec<VerifyRun>,
     pub duration_ms: u64,
     pub summary: String,
     pub diagnostics: Vec<String>,
@@ -328,6 +333,7 @@ pub async fn run_commands(
     let mut combined = String::new();
     let mut state = VerifyState::Passed;
     let mut duration_ms = 0u64;
+    let mut runs: Vec<VerifyRun> = Vec::new();
 
     for command in commands {
         let elapsed = started.elapsed();
@@ -349,6 +355,12 @@ pub async fn run_commands(
         match result {
             Ok(run) => {
                 duration_ms += run.duration_ms;
+                runs.push(VerifyRun {
+                    command: command.display.clone(),
+                    exit_code: run.exit_code,
+                    timed_out: run.timed_out,
+                    duration_ms: run.duration_ms,
+                });
                 let baseline_hit = baseline
                     .is_some_and(|cache| cache.hit(&command.display, &run.output));
                 let current = classify(&run, baseline_hit);
@@ -358,12 +370,24 @@ pub async fn run_commands(
                 }
             }
             Err(crate::sandbox::capture::CaptureError::Cancelled) => {
+                runs.push(VerifyRun {
+                    command: command.display.clone(),
+                    exit_code: -1,
+                    timed_out: false,
+                    duration_ms: 0,
+                });
                 state = merge_state(state, VerifyState::Failed);
                 combined.push_str(&format!("\n[{}] 被取消\n", command.display));
             }
             Err(crate::sandbox::capture::CaptureError::Spawn(message))
             | Err(crate::sandbox::capture::CaptureError::Denied(message))
             | Err(crate::sandbox::capture::CaptureError::Wait(message)) => {
+                runs.push(VerifyRun {
+                    command: command.display.clone(),
+                    exit_code: -1,
+                    timed_out: false,
+                    duration_ms: 0,
+                });
                 // 沙箱拒绝/进程起不来不是「代码错了」，但也不能当成通过：
                 // 归入环境失败这个具名原因，由它承担「不清脏、不否决」的语义。
                 state = merge_state(state, VerifyState::Inconclusive(InconclusiveReason::EnvFailure));
@@ -379,6 +403,7 @@ pub async fn run_commands(
     VerifyOutcome {
         state,
         commands: commands.iter().map(|c| c.display.clone()).collect(),
+        runs,
         duration_ms,
         summary: tail(&combined),
         diagnostics,
@@ -508,6 +533,7 @@ pub async fn evaluate(request: &VerifyRequest<'_>, cancel: &CancellationToken) -
         return VerifyOutcome {
             state: VerifyState::Passed,
             commands,
+            runs: Vec::new(),
             duration_ms: 0,
             summary: "终端里已按原样跑过同一条验证命令并通过".into(),
             diagnostics: Vec::new(),
@@ -529,6 +555,7 @@ pub async fn evaluate(request: &VerifyRequest<'_>, cancel: &CancellationToken) -
         Err(reason) => VerifyOutcome {
             state: VerifyState::Skipped(reason),
             commands: Vec::new(),
+            runs: Vec::new(),
             duration_ms: 0,
             summary: String::new(),
             diagnostics: Vec::new(),
@@ -725,6 +752,12 @@ mod tests {
         let outcome = VerifyOutcome {
             state: VerifyState::Failed,
             commands: vec!["cargo check".into()],
+            runs: vec![VerifyRun {
+                command: "cargo check".into(),
+                exit_code: 101,
+                timed_out: false,
+                duration_ms: 12,
+            }],
             duration_ms: 12,
             summary: "boom".into(),
             diagnostics: vec!["src/lib.rs:3:5 mismatched types".into()],

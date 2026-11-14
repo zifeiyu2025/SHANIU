@@ -226,6 +226,58 @@ fn stop_verify_view(
     }
 }
 
+/// 把一次写后验证裁决写进档案（审计用）。
+///
+/// 事件流不落盘，`TurnEnd.unverified` 又只有布尔值——不落这一条，「宿主真的跑过
+/// 哪条命令、退出码是什么、为什么判成某一态」事后就无法对账。写入失败只降级，
+/// 不影响判定与回合结局：档案可写性不该绑架收口。
+fn archive_verification(
+    writer: Option<&crate::rollout::RolloutWriter>,
+    outcome: &verify::VerifyOutcome,
+    turn: u32,
+    at_close: bool,
+) -> Result<(), String> {
+    let Some(writer) = writer else { return Ok(()) };
+    writer
+        .append(&crate::rollout::RolloutItem::Verification {
+            turn,
+            state: Some(outcome.state),
+            commands: outcome.commands.clone(),
+            runs: outcome.runs.clone(),
+            duration_ms: outcome.duration_ms,
+            summary: outcome.summary.clone(),
+            diagnostics: outcome.diagnostics.clone(),
+            at_close,
+            at_ms: now_ms(),
+        })
+        .map_err(|error| format!("验证裁决写入档案失败：{error}"))
+}
+
+/// 收口补记：本任务有源码写入、但整场没拿到过任何裁决（取消 / 模型请求失败）。
+///
+/// 这两条路径按设计不跑验证（用户喊停时再起编译是错的），但档案必须能回答
+/// 「为什么没有验证结论」。`state: None` 与 `Skipped` 不同：后者是宿主判了跳过，
+/// 前者是宿主根本没来得及判——审计要能区分。
+fn archive_missing_verification(
+    writer: &crate::rollout::RolloutWriter,
+    turn: u32,
+    reason_code: &str,
+) -> Result<(), String> {
+    writer
+        .append(&crate::rollout::RolloutItem::Verification {
+            turn,
+            state: None,
+            commands: Vec::new(),
+            runs: Vec::new(),
+            duration_ms: 0,
+            summary: format!("回合以 {reason_code} 结束，写后验证未执行"),
+            diagnostics: Vec::new(),
+            at_close: true,
+            at_ms: now_ms(),
+        })
+        .map_err(|error| format!("「验证未执行」记录写入档案失败：{error}"))
+}
+
 /// 评测消融开关（与 `SHANIU_EVAL_ABLATE_AR6` / `SHANIU_EVAL_ABLATE_REPAIR` 同口径）：
 /// `SHANIU_EVAL_ABLATE_VERIFY=1` 关掉写后验证闸门。
 ///
@@ -947,6 +999,9 @@ impl AgentLoop {
         // 本任务最近一次验证裁决。停止钩子要看到「本回合的结论」，而结论可能来自
         // 本轮的②、前一轮的闸门，或末轮收口——都收在这一处，不另算一份。
         let mut last_verify: Option<verify::VerifySnapshot> = None;
+        // 本任务是否已把裁决写进档案（审计用）。收口补记靠它区分
+        // 「已经落过真裁决」与「整场都没跑验证（取消/失败）」。
+        let mut verification_archived = false;
         // 写后验证的脏状态：只由「真的落盘且内容变了」的源码写入置脏。
         // 审批被拒的写入根本到不了写日志（工具不执行、不登记），因此天然不置脏。
         let mut dirty = verify::DirtyTracker::default();
@@ -1598,6 +1653,15 @@ impl AgentLoop {
                     );
                     // 本任务最近一次裁决：③ 与后续轮次的钩子读的就是这一份。
                     last_verify = Some(verify::VerifySnapshot::from_outcome(&outcome, turn));
+                    // 审计落档：事件流不落盘，`unverified` 只有布尔值——不写这一条，
+                    // 「宿主真的跑过哪条命令、退出码是什么」事后无从证明。
+                    if let Err(message) =
+                        archive_verification(rollout.as_deref(), &outcome, turn, false)
+                    {
+                        degrade_rollout(&sink, message);
+                    } else {
+                        verification_archived = true;
+                    }
                     match outcome.state {
                         crate::events::VerifyState::Passed => {
                             if repair_enabled {
@@ -2324,6 +2388,15 @@ impl AgentLoop {
                     diagnostics: outcome.diagnostics.clone(),
                 },
             );
+            // 收口复查的裁决同样落档（`at_close = true`）：这条覆盖「预算耗尽」等
+            // 循环内闸门跑不到的路径。
+            if let Err(message) =
+                archive_verification(rollout.as_deref(), &outcome, last_turn, true)
+            {
+                degrade_rollout(&sink, message);
+            } else {
+                verification_archived = true;
+            }
             match outcome.state {
                 crate::events::VerifyState::Passed => {
                     dirty.clear();
@@ -2363,13 +2436,23 @@ impl AgentLoop {
         // A0-3：回合结局必须落档。导出/统计只认这一行；不写就等于把失败当成功。
         // 写失败不阻断退出（档案已处于不可写状态），但必须在日志里点名——
         // 导出侧看不到 TurnEnd 时会标 unknown，不会被当成成功。
-        if let Some(writer) = rollout {
-            let reason_code = match reason {
-                TurnEndReasonLocal::Completed => "completed",
-                TurnEndReasonLocal::Cancelled => "cancelled",
-                TurnEndReasonLocal::Failed => "failed",
-                TurnEndReasonLocal::BudgetExhausted => "budget_exhausted",
-            };
+        let reason_code = match reason {
+            TurnEndReasonLocal::Completed => "completed",
+            TurnEndReasonLocal::Cancelled => "cancelled",
+            TurnEndReasonLocal::Failed => "failed",
+            TurnEndReasonLocal::BudgetExhausted => "budget_exhausted",
+        };
+        if let Some(writer) = rollout.as_ref() {
+            // 收口补记：取消/模型失败路径按设计不跑验证（用户喊停时再起编译是错的），
+            // 但档案仍要能回答「这次为什么没有验证裁决」。只在本任务有源码写入、
+            // 且整场一条裁决都没落过时补 `state: None`；纯问答/只读任务不产生噪声。
+            if !verification_archived && dirty.is_dirty() {
+                if let Err(message) =
+                    archive_missing_verification(writer, last_turn, reason_code)
+                {
+                    tracing::warn!(target: "rollout", %message);
+                }
+            }
             if let Err(error) = writer.append(&crate::rollout::RolloutItem::TurnEnd {
                 turn: last_turn,
                 reason: reason_code.to_string(),
@@ -2728,6 +2811,27 @@ mod tests {
             if is_begin {
                 // notify_one 在没有等待者时会保存一个 permit，等待者还没被调度到也不丢信号。
                 self.first_begin.notify_one();
+            }
+            outcome
+        }
+    }
+
+    /// 转发 sink，并在第一条 `ToolCallEnd` 到达时取消本任务。
+    ///
+    /// 用于「工具已经真的写过盘、随后被取消」这条收口路径：验证按设计不再跑，
+    /// 但档案必须留下「未执行」的补记。取消点挂在事件上而不是 sleep，慢 runner 上
+    /// 不会漂到「还没写就取消」（那时没有脏文件，用例等于什么都没测）。
+    struct CancelOnToolEnd {
+        inner: Arc<dyn EventSink>,
+        cancel: tokio_util::sync::CancellationToken,
+    }
+
+    impl EventSink for CancelOnToolEnd {
+        fn emit(&self, msg: &EventMsg) -> Result<(), String> {
+            let is_end = matches!(msg, EventMsg::ToolCallEnd { .. });
+            let outcome = self.inner.emit(msg);
+            if is_end {
+                self.cancel.cancel();
             }
             outcome
         }
@@ -3243,7 +3347,7 @@ mod tests {
     /// 新行为：末轮仍要拿到真实裁决；没有下一轮可修时，失败即如实收口为 `failed`。
     #[tokio::test]
     async fn verification_gate_last_turn_still_runs_and_fails_the_turn() {
-        let (agent, store, cancel, _ws) = verify_demo(
+        let (mut agent, store, cancel, _ws) = verify_demo(
             vec![
                 script_call_with("apply_patch", r#"{"body":"pub fn f() {}"}"#, "w1"),
                 script_text("写完了"),
@@ -3252,6 +3356,18 @@ mod tests {
             2,
             crate::config::VerifyMode::Enforce,
         );
+        // 审计：这一路的裁决（末轮收口口）必须落档，而不只是发事件。
+        let dir = crate::test_support::TestTempDir::new("verify-archive-last-turn");
+        let meta = crate::rollout::RolloutItem::SessionMeta {
+            session_id: "session".into(),
+            agent_id: "agent".into(),
+            parent_id: None,
+            created_at: 0,
+            config_snapshot: crate::rollout::ConfigSnapshot::default(),
+        };
+        let writer =
+            Arc::new(crate::rollout::RolloutWriter::create(dir.path(), &meta).unwrap());
+        agent.rollout = Some(writer.clone());
         let summary = agent.run_task("任务", Arc::new(CapturingSink(store.clone())), cancel).await;
 
         assert_eq!(summary.reason, TurnEndReason::Failed, "无剩余轮次时不得伪装成完成");
@@ -3261,6 +3377,34 @@ mod tests {
             vec![crate::events::VerifyState::Failed],
             "末轮也必须向宿主拿一次裁决"
         );
+        drop(events);
+        // 档案侧的裁决必须与事件面同值，且带命令原文与真实退出码。
+        let archived = crate::rollout::read(writer.path()).unwrap();
+        let record = archived
+            .items
+            .iter()
+            .find_map(|item| match item {
+                crate::rollout::RolloutItem::Verification {
+                    turn,
+                    state,
+                    commands,
+                    runs,
+                    at_close,
+                    ..
+                } => Some((*turn, *state, commands.clone(), runs.clone(), *at_close)),
+                _ => None,
+            })
+            .expect("写后验证必须落进档案（审计缺口）");
+        assert_eq!(record.0, 2);
+        assert_eq!(record.1, Some(crate::events::VerifyState::Failed));
+        assert_eq!(record.2, vec!["exit 1".to_string()]);
+        assert_eq!(record.3.len(), 1, "每条命令都要留下执行事实");
+        assert_eq!(record.3[0].command, "exit 1");
+        assert_eq!(record.3[0].exit_code, 1, "退出码是「宿主真的跑过」的硬证据");
+        assert!(!record.3[0].timed_out);
+        assert!(record.4, "末轮收口由统一收口口产出");
+        drop(archived);
+        let events = store.lock().unwrap();
         assert!(completed_unverified(&events), "失败后仍标记未验证");
         assert!(
             events.iter().any(|event| matches!(
@@ -4747,6 +4891,161 @@ mod tests {
             other => panic!("档案最后一行必须是回合结局，实际为 {other:?}"),
         }
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// 审计：写后验证的完整裁决（命令 + 退出码 + 四态 + 诊断）必须落进档案；
+    /// 同时它不得污染模型历史（resume 后 history 为空）。
+    ///
+    /// 反向对照：撤掉 `archive_verification` 里那次 `append`，本用例红在「找不到
+    /// verification 行」——事件流不落盘，这正是审计缺口的原貌。
+    #[test]
+    fn verification_outcome_is_archived_with_exit_code() {
+        use crate::rollout::{ConfigSnapshot, RolloutItem, RolloutWriter};
+        let dir = crate::test_support::TestTempDir::new("verify-archive-outcome");
+        let meta = RolloutItem::SessionMeta {
+            session_id: "session".into(),
+            agent_id: "agent".into(),
+            parent_id: None,
+            created_at: 0,
+            config_snapshot: ConfigSnapshot::default(),
+        };
+        let writer = RolloutWriter::create(dir.path(), &meta).unwrap();
+        let outcome = verify::VerifyOutcome {
+            state: crate::events::VerifyState::Failed,
+            commands: vec!["cargo check".into()],
+            runs: vec![crate::rollout::VerifyRun {
+                command: "cargo check".into(),
+                exit_code: 101,
+                timed_out: false,
+                duration_ms: 4321,
+            }],
+            duration_ms: 4321,
+            summary: "error[E0308]: mismatched types".into(),
+            diagnostics: vec!["src/lib.rs:3:5 mismatched types".into()],
+            output: "error[E0308]: mismatched types".into(),
+        };
+        archive_verification(Some(&writer), &outcome, 3, false).unwrap();
+
+        let archived = crate::rollout::read(writer.path()).unwrap();
+        match archived
+            .items
+            .iter()
+            .find(|item| matches!(item, RolloutItem::Verification { .. }))
+        {
+            Some(RolloutItem::Verification {
+                turn,
+                state,
+                commands,
+                runs,
+                duration_ms,
+                diagnostics,
+                at_close,
+                at_ms,
+                ..
+            }) => {
+                assert_eq!(*turn, 3);
+                assert_eq!(*state, Some(crate::events::VerifyState::Failed));
+                assert_eq!(commands, &vec!["cargo check".to_string()]);
+                assert_eq!(runs.len(), 1);
+                assert_eq!(runs[0].exit_code, 101);
+                assert_eq!(runs[0].duration_ms, 4321);
+                assert_eq!(*duration_ms, 4321);
+                assert_eq!(diagnostics, &vec!["src/lib.rs:3:5 mismatched types".to_string()]);
+                assert!(!at_close, "循环内闸门产出，不是统一收口补验");
+                assert!(*at_ms > 0);
+            }
+            other => panic!("档案里必须有写后验证裁决，实际 {other:?}"),
+        }
+        // 只落档案、不进模型历史：否则模型会把上次的命令与诊断当成自己的话。
+        assert!(crate::rollout::resume::resume(writer.path()).unwrap().history.is_empty());
+    }
+
+    /// 收口补记：取消/失败路径没有验证裁决，但档案要写明「未执行」及其原因，
+    /// 不能让后来者把「没有 verification 行」误解成「验证通过了」。
+    #[test]
+    fn missing_verification_is_recorded_at_close() {
+        use crate::rollout::{ConfigSnapshot, RolloutItem, RolloutWriter};
+        let dir = crate::test_support::TestTempDir::new("verify-archive-missing");
+        let meta = RolloutItem::SessionMeta {
+            session_id: "session".into(),
+            agent_id: "agent".into(),
+            parent_id: None,
+            created_at: 0,
+            config_snapshot: ConfigSnapshot::default(),
+        };
+        let writer = RolloutWriter::create(dir.path(), &meta).unwrap();
+        archive_missing_verification(&writer, 4, "cancelled").unwrap();
+
+        let archived = crate::rollout::read(writer.path()).unwrap();
+        match archived
+            .items
+            .iter()
+            .find(|item| matches!(item, RolloutItem::Verification { .. }))
+        {
+            Some(RolloutItem::Verification { state, runs, summary, at_close, .. }) => {
+                assert_eq!(*state, None, "没跑过验证 ≠ 宿主判了跳过");
+                assert!(runs.is_empty(), "没有执行事实，不许伪造退出码");
+                assert!(summary.contains("cancelled") && summary.contains("未执行"));
+                assert!(at_close, "这是统一收口处的补记");
+            }
+            other => panic!("收口补记必须落档案，实际 {other:?}"),
+        }
+        assert!(crate::rollout::resume::resume(writer.path()).unwrap().history.is_empty());
+    }
+
+    /// 取消路径也要收口：工具已经写盘、随后被取消，验证按设计不跑，但档案必须写明
+    /// 「未执行」——否则「没有 verification 行」会被误读成「验证通过了」。
+    #[tokio::test]
+    async fn cancelled_task_with_writes_archives_missing_verification() {
+        let (mut agent, store, cancel, _ws) = verify_demo(
+            vec![script_call_with("apply_patch", r#"{"body":"pub fn f() {}"}"#, "w1")],
+            vec!["exit 1".into()],
+            1,
+            crate::config::VerifyMode::Enforce,
+        );
+        let dir = crate::test_support::TestTempDir::new("verify-archive-cancelled");
+        let meta = crate::rollout::RolloutItem::SessionMeta {
+            session_id: "session".into(),
+            agent_id: "agent".into(),
+            parent_id: None,
+            created_at: 0,
+            config_snapshot: crate::rollout::ConfigSnapshot::default(),
+        };
+        let writer =
+            Arc::new(crate::rollout::RolloutWriter::create(dir.path(), &meta).unwrap());
+        agent.rollout = Some(writer.clone());
+        // 工具一结束就取消：此刻脏标记已置、验证还没跑，正是「取消」要覆盖的那条口。
+        let sink = Arc::new(CancelOnToolEnd {
+            inner: Arc::new(CapturingSink(store.clone())),
+            cancel: cancel.clone(),
+        });
+        let summary = agent.run_task("任务", sink, cancel).await;
+
+        assert!(
+            matches!(
+                summary.reason,
+                TurnEndReason::Cancelled | TurnEndReason::BudgetExhausted
+            ),
+            "取消/预算耗尽是这条路径的合法收口，实际 {:?}",
+            summary.reason
+        );
+        // 事件面没有裁决（验证确实没跑）；档案里有一条「未执行」补记。
+        assert!(verification_states(&store.lock().unwrap()).is_empty());
+        let archived = crate::rollout::read(writer.path()).unwrap();
+        let record = archived
+            .items
+            .iter()
+            .find_map(|item| match item {
+                crate::rollout::RolloutItem::Verification { state, runs, summary, at_close, .. } => {
+                    Some((*state, runs.clone(), summary.clone(), *at_close))
+                }
+                _ => None,
+            })
+            .expect("取消/预算耗尽也必须留下收口补记");
+        assert_eq!(record.0, None, "没跑过验证 ≠ 宿主判了跳过");
+        assert!(record.1.is_empty(), "没有执行事实，不许伪造退出码");
+        assert!(record.2.contains("未执行"), "{}", record.2);
+        assert!(record.3, "补记出自统一收口");
     }
 
     #[tokio::test]

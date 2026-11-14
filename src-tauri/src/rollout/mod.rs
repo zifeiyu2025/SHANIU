@@ -123,6 +123,52 @@ pub enum RolloutItem {
         #[serde(default)]
         turn: u32,
     },
+    /// 写后验证的完整裁决（审计缺口：此前只有 `verification_result` 事件与 `TurnEnd`，
+    /// 事件流不落盘、`unverified` 只有布尔值，事后无法证明「宿主真的跑过哪条命令、
+    /// 退出码是什么、为什么判成某一态」）。
+    ///
+    /// **只落档案、不进模型历史**：验证是过去时的事实，不是对话内容，resume 不重放。
+    /// 只记录裁决，不参与任何判定——写它不改变否决、通过率或回合结局。
+    Verification {
+        /// 裁决所属轮次（与 `verification_result` 事件同值）。
+        turn: u32,
+        /// 四态裁决；`None` = 本任务收口时**从未执行过**验证（取消/模型请求失败等路径）。
+        ///
+        /// 它与 `Skipped` 不是一回事：`Skipped` 是一个已作出的裁决，`None` 表示
+        /// 连裁决都没有——审计要能区分「宿主判了跳过」与「宿主根本没来得及判」。
+        #[serde(default)]
+        state: Option<crate::events::VerifyState>,
+        #[serde(default)]
+        commands: Vec<String>,
+        /// 每条命令的执行事实；空 = 没有命令真的被执行（通过计入/跳过/未执行）。
+        #[serde(default)]
+        runs: Vec<VerifyRun>,
+        #[serde(default)]
+        duration_ms: u64,
+        #[serde(default)]
+        summary: String,
+        #[serde(default)]
+        diagnostics: Vec<String>,
+        /// `true` = 统一收口复查产出；`false` = 循环内收工闸门产出。
+        /// 审计据此区分「模型收工前验证」与「宿主兜底补验」。
+        #[serde(default)]
+        at_close: bool,
+        at_ms: u64,
+    },
+}
+
+/// 单条验证命令的执行事实（[`RolloutItem::Verification`] 的载荷）。
+///
+/// 定义在 rollout 而不是 agent_loop：档案是共享基础设施的读写对象，
+/// 依赖方向要求 rollout 不依赖业务模块（docs/01 §2.3.1 E21）。
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct VerifyRun {
+    /// 命令原文（与 `commands` 同一份 `display`）。
+    pub command: String,
+    /// 进程退出码；`-1` = 没拿到（超时收割 / 起不来 / 被取消）。
+    pub exit_code: i32,
+    pub timed_out: bool,
+    pub duration_ms: u64,
 }
 
 /// 系统提示词落盘文本的 sha256。

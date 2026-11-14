@@ -1255,12 +1255,15 @@ fn project_slots(items: &[rollout::RolloutItem]) -> Vec<Slot> {
             // 档位事件是控制面记录，退出留痕是审计记录——都不进对话历史。
             // 系统提示词同样不进：它在轨迹视图里由 `system/message` 事件承载，
             // 这里再投影一份会造成两份真相。
+            // 写后验证裁决同理：它是档案侧审计事实，事件侧已有 `verification_result`，
+            // 投影进导出会变成第三份真相（且旧档案没有这一行，导出反而更不可比）。
             rollout::RolloutItem::SessionMeta { .. }
             | rollout::RolloutItem::SubagentRef { .. }
             | rollout::RolloutItem::SandboxMode { .. }
             | rollout::RolloutItem::PermissionPreset { .. }
             | rollout::RolloutItem::AbortNote { .. }
-            | rollout::RolloutItem::SystemPrompt { .. } => {}
+            | rollout::RolloutItem::SystemPrompt { .. }
+            | rollout::RolloutItem::Verification { .. } => {}
         }
     }
     out
