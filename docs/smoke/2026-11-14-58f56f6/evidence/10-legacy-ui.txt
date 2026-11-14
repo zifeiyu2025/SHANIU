@@ -1,0 +1,19 @@
+旧档案：data/rollouts/sess-legacy-0001.jsonl（无 turn_end、无 task_id）
+打开后无障碍树摘录（pid 4536，全新数据目录 B）：
+
+text val="这条来自旧档案：没有 TurnEnd、没有 task_id。"
+text val="04:00"
+status-bar
+  text val="已完成"
+button "已完成，用时 17小时44分56秒" (disabled)
+text val="旧档案回放：本条回复只有消息行，没有结局行。"
+status-bar
+  text val="本轮状态未知"
+  text val="没有找到本轮的收口记录：进程可能在完成前退出（被强制结束或崩溃），也可能仍在运行。未完成工具调用的结果同样未知。"
+button "在新对话中分支" (disabled)
+text val="仅可从已完成轮次的最后一条消息分支"
+group
+  text val="1 轮 1 步"
+
+结论：同一屏内出现两种口径——回合级 status-bar 如实写「本轮状态未知」，
+顶部回合过程控件却写「已完成，用时 …」。截图为 shots/10-legacy-open.png。
