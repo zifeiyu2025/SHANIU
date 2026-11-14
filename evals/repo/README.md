@@ -12,6 +12,22 @@
 - 防作弊：judge 与 `guards.json` 放在**工作区之外**；工作区的 git 历史里只有「本题初始状态」一条提交，
   `git show` 拿不到答案；测试区/判据文件被改会被守卫直接判失败。
 
+## 评测环境注记（工作区副本的 `AGENTS.md`）
+
+评测里的命令跑在 AppContainer 内。全量 `cargo test` 有 41 条用例在**该环境内**必然红，
+全部落在 `sandbox::*`、`tools::terminal`、`tools::unified_exec`：它们要在沙箱里再创建受限令牌、
+写 DACL，嵌套必然被拒（`0x80070005`、`CreateRestrictedToken` 参数错误 `0x80070057`、DACL 写拒绝）。
+
+- **不是回归**：同一测试二进制在宿主机上 `cargo test --lib -- sandbox:: tools::terminal tools::unified_exec`
+  的结果是 108 passed / 0 failed / 2 ignored；CI 也是绿的。差异只来自容器嵌套，不来自代码。
+- **处理方式**：`prepare_workspace` 在**每题基线提交之前**把这段事实与替代命令
+  （`cargo test --lib <模块前缀>`、`cargo test --test <名>`、`cargo check --all-targets`）幂等写进
+  工作区副本的 `AGENTS.md`。仓库里的 `AGENTS.md` 不动，判据与 `guards.json` 不动，通过率口径不动。
+- **为什么不让这些用例「变绿」**：给它们加环境跳过 = 在真机上同时失去 41 条覆盖；改判据 = 放松。
+  让评测环境说清「哪些红是环境造成的、该跑什么」才是信息增量，且不掩盖真实回归。
+
+依据与实测见 `RESULTS-2026-11-13-c.md`「评测自身的问题」第 2 条与「失败分层归因」。
+
 ## 运行
 
 ```powershell

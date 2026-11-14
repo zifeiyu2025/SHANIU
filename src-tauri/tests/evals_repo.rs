@@ -819,6 +819,44 @@ fn mirror_into_workspace(pristine: &Path, ws: &Path) -> Result<(), String> {
     Ok(())
 }
 
+/// 评测环境注记：写进**工作区副本**的 `AGENTS.md`，不改仓库里的那份。
+///
+/// 依据（`evals/repo/RESULTS-2026-11-13-c.md` 专项二）：评测里的命令跑在 AppContainer
+/// 内，`sandbox::*`、`tools::terminal`、`tools::unified_exec` 里 41 条用例要在沙箱内再
+/// 创建受限令牌/写 DACL，嵌套必然被拒（`0x80070005` / `CreateRestrictedToken` 参数错误
+/// `0x80070057` / DACL 写拒绝）；它们在宿主机与 CI 上通过，不是回归。
+/// 不点名这条事实，模型会把全量 `cargo test` 的红当成自己的改动，被自愈提醒引去改
+/// 无关文件、白烧轮次。这里只陈述环境事实与替代命令，不放松任何判据。
+const EVAL_AGENTS_NOTE: &str = "\
+\n## 评测环境（评测器注入，勿改动本节）\n\
+\n\
+- 本工作区的命令运行在 AppContainer 沙箱内。全量 `cargo test` 会有 41 条用例必然红，\n\
+  全部落在 `sandbox::*`、`tools::terminal`、`tools::unified_exec`：它们要在沙箱里再创建\n\
+  受限令牌、写 DACL，嵌套调用被系统拒绝（`0x80070005`、`CreateRestrictedToken` 参数错误\n\
+  `0x80070057`、DACL 写拒绝）。这些用例在宿主机与 CI 上通过，**不是你的改动造成的回归**。\n\
+  不要为它们修改 `src-tauri/src/sandbox/**`、`tools/terminal*`、`tools/unified_exec*` 等\n\
+  与题目无关的文件。\n\
+- 收工验证用定向命令：`cargo test --lib <模块前缀>`、`cargo test --test <集成测试名>`、\n\
+  `cargo check --all-targets`。除非题目明确要求，不要用全量 `cargo test`。\n";
+
+/// 把 [`EVAL_AGENTS_NOTE`] 幂等写进工作区副本的 `AGENTS.md`。
+///
+/// 必须在 `git init` + 基线提交**之前**调用：这样注记属于本题基线，`git status`
+/// 仍是干净的，判据看到的「改动文件」也不会多出这一份。
+fn inject_eval_agents_note(ws: &Path) -> Result<(), String> {
+    const MARKER: &str = "## 评测环境（评测器注入，勿改动本节）";
+    let path = ws.join("AGENTS.md");
+    let mut text = std::fs::read_to_string(&path).unwrap_or_default();
+    if text.contains(MARKER) {
+        return Ok(());
+    }
+    if !text.is_empty() && !text.ends_with('\n') {
+        text.push('\n');
+    }
+    text.push_str(EVAL_AGENTS_NOTE);
+    std::fs::write(&path, text).map_err(|e| format!("评测环境注记写入 AGENTS.md 失败：{e}"))
+}
+
 /// 准备工作区；失败返回 `(原因, patch_applied)`。
 /// 成功返回 `(预热耗时, task_base, 预热是否编译通过)`。
 fn prepare_workspace(
@@ -886,6 +924,9 @@ fn prepare_workspace(
     }
 
     // 4) 新历史：只有「本题基线」一条提交，agent 无法 `git show` 出答案。
+    //    评测环境注记必须在提交前落盘：否则它会以「未提交改动」出现在 `git status`，
+    //    判据的改动面统计与 agent 的「工作区干净」预期都会被它污染。
+    inject_eval_agents_note(ws).map_err(|reason| (reason, patch_applied))?;
     let commit_message = format!("task {}", task.id);
     for args in [
         vec!["add", "-A"],
@@ -1599,6 +1640,35 @@ async fn evals_repo_pipeline_selfcheck() {
         failures.len(),
         failures.join("\n")
     );
+}
+
+/// 评测环境注记：幂等、只动工作区副本、原有规则逐字保留。
+/// 反向对照：去掉 `prepare_workspace` 里的注入调用，工作区 `AGENTS.md` 不含本节，
+/// 模型仍会把全量 `cargo test` 的 41 条环境红当成自己的回归。
+#[test]
+fn eval_agents_note_is_injected_once_and_keeps_original_rules() {
+    let dir = std::env::temp_dir().join(format!("shaniu-eval-notes-{}", id()));
+    std::fs::remove_dir_all(&dir).ok();
+    std::fs::create_dir_all(&dir).unwrap();
+    std::fs::write(dir.join("AGENTS.md"), "# AGENTS\n\n原有规则").unwrap();
+
+    inject_eval_agents_note(&dir).unwrap();
+    inject_eval_agents_note(&dir).unwrap();
+
+    let text = std::fs::read_to_string(dir.join("AGENTS.md")).unwrap();
+    assert_eq!(
+        text.matches("## 评测环境（评测器注入").count(),
+        1,
+        "重复准备不得叠加注记"
+    );
+    assert!(
+        text.starts_with("# AGENTS\n\n原有规则\n"),
+        "原有规则必须逐字保留：{text}"
+    );
+    assert!(text.contains("41 条用例必然红"));
+    assert!(text.contains("不是你的改动造成的回归"));
+    assert!(text.contains("不要为它们修改"));
+    std::fs::remove_dir_all(&dir).ok();
 }
 
 #[tokio::test]
