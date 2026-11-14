@@ -25,6 +25,7 @@
  * 产物，不入库（见 .gitignore 与 docs/09 §1），所以也不参与比对。
  */
 import { createHash } from 'node:crypto'
+import { execFileSync } from 'node:child_process'
 import { mkdir, readdir, readFile, writeFile } from 'node:fs/promises'
 import { existsSync } from 'node:fs'
 import path from 'node:path'
@@ -45,6 +46,48 @@ if (CHECK && !existsSync(upstreamBase)) {
   console.error(`[align] --check 需要上游源码，但 ${upstreamBase} 不存在。`)
   console.error('  把 DSH_UPSTREAM 指到 deepseek-harness 的检出（commit 见 docs/09 §0）。')
   process.exit(2)
+}
+
+/**
+ * 冻结基线（docs/09 §0 是唯一声明处）。
+ *
+ * 为什么要在这里校验：账本的每一行只对「这一个 commit」成立。上游检出错版本时，
+ * 生成出来的是一份**看着合法、数值全错**的账本——「环境漂移导致的红」和「真 drift」
+ * 从此分不开。CI 里虽然已经 fetch + checkout 冻结 commit，但缓存检出被别的流程
+ * 改过时没有任何东西会发现；这一步把基线变成硬约束，而不是口头约定。
+ *
+ * 非 git 检出（解压源码包）无法校验：如实放行，不假装校验过。
+ */
+async function frozenBaseline() {
+  const docsDir = path.join(repoRoot, 'docs')
+  const entry = (await readdir(docsDir)).find(name => /^09-.*\.md$/u.test(name))
+  if (entry === undefined) {
+    console.error('[align] docs/ 下找不到 09-*.md（冻结基线的声明处）。')
+    process.exit(2)
+  }
+  const text = await readFile(path.join(docsDir, entry), 'utf8')
+  const match = /^\|\s*HEAD commit\s*\|\s*`([0-9a-f]{40})`\s*\|/mu.exec(text)
+  if (match === null) {
+    console.error(`[align] ${entry} §0 里没有找到「| HEAD commit | \`<sha>\` |」。`)
+    process.exit(2)
+  }
+  return match[1]
+}
+
+if (existsSync(path.join(upstreamRoot, '.git'))) {
+  const frozen = await frozenBaseline()
+  let head = ''
+  try {
+    head = execFileSync('git', ['-C', upstreamRoot, 'rev-parse', 'HEAD'], { encoding: 'utf8' }).trim()
+  } catch (error) {
+    console.error(`[align] 无法读取 ${upstreamRoot} 的 HEAD：${error instanceof Error ? error.message : error}`)
+    process.exit(2)
+  }
+  if (head !== frozen) {
+    console.error(`[align] 上游检出不在冻结基线：HEAD=${head}，基线=${frozen}`)
+    console.error('  切到 docs/09 §0 的 commit，或先按 §0 的流程登记基线变更；不要用它生成账本。')
+    process.exit(2)
+  }
 }
 
 /** 目录级忽略：构建产物与依赖不进账本。 */
