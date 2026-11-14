@@ -4354,8 +4354,15 @@ mod tests {
     #[tokio::test]
     async fn auto_compaction_emits_started_summarized_ended_in_order() {
         let (mut agent, store, cancel, _broker) = make_loop(vec![
-            // 第 1 轮：一个工具调用 + 端点报回大用量 → 第 2 轮开头判定超预算
-            vec![fn_call_ev(), big_usage_ev()],
+            // 第 1 轮：一段真实助手文本 + 一个工具调用 + 端点报回大用量。
+            // 这段文本是**压缩区间的必要输入**：历史开头是环境快照（`Role::System`），
+            // 小预算下 `tail_target` 会把切点钳到 1，区间只剩那条快照；
+            // 「区间没有真实内容就不压」生效后（N9），必须让区间里确有可总结的内容。
+            vec![
+                ModelStreamEvent::OutputTextDelta { delta: "x".repeat(4_000) },
+                fn_call_ev(),
+                big_usage_ev(),
+            ],
             // 压缩请求（不带工具声明）：只回摘要文本
             vec![
                 ModelStreamEvent::OutputTextDelta { delta: "摘要正文".into() },
@@ -4426,7 +4433,9 @@ mod tests {
         assert_eq!(summarized_id, compaction_id, "三条事件必须配成同一组");
         assert_eq!(*shadowed_items, *range_end - *range_start, "被替换的条目数要与区间一致");
         assert!(*shadowed_tokens > 0, "被丢掉的量必须可量化，不能只报条目数");
-        assert_eq!(summary, "摘要正文");
+        // 事件里带的是**写回历史的那份内容**：模型摘要外还包着逐字保留的用户原文段。
+        assert!(summary.ends_with("摘要正文"), "模型摘要正文必须在：{summary}");
+        assert!(summary.contains("任务"), "用户原文段必须逐字保留：{summary}");
 
         let EventMsg::CompactionEnded { ok, error, history_tokens_after, .. } = compaction[2] else {
             unreachable!()
@@ -4618,8 +4627,14 @@ mod tests {
                 _instructions: &str,
             ) -> Result<ModelStream, crate::model_client::ModelError> {
                 if self.calls.fetch_add(1, std::sync::atomic::Ordering::SeqCst) == 0 {
-                    // 第 1 轮采样：工具调用 + 大用量，让压缩在**第 2 轮开头**触发
-                    return Ok(Box::pin(futures::stream::iter(vec![fn_call_ev(), big_usage_ev()])));
+                    // 第 1 轮采样：真实助手文本 + 工具调用 + 大用量，让压缩在**第 2 轮开头**
+                    // 触发。文本不能省：历史开头是环境快照，小预算下区间会被钳到只剩它，
+                    // 而「区间没有真实内容就不压」会直接跳过（N9）。
+                    return Ok(Box::pin(futures::stream::iter(vec![
+                        ModelStreamEvent::OutputTextDelta { delta: "x".repeat(4_000) },
+                        fn_call_ev(),
+                        big_usage_ev(),
+                    ])));
                 }
                 // 第 2 次调用 = 压缩请求：先告知测试再挂住，模拟端点不回响应头
                 self.entered.notify_one();
@@ -5244,7 +5259,13 @@ mod tests {
         };
         let writer = Arc::new(crate::rollout::RolloutWriter::create(&dir, &meta).unwrap());
         let (mut agent, store, cancel, _broker) = make_loop(vec![
-            vec![fn_call_ev(), big_usage_ev()],
+            // 真实助手文本 + 工具调用 + 大用量：小预算下若区间只剩环境快照，
+            // 「没有真实内容就不压」会跳过压缩（N9），本用例就测不到失败路径。
+            vec![
+                ModelStreamEvent::OutputTextDelta { delta: "x".repeat(4_000) },
+                fn_call_ev(),
+                big_usage_ev(),
+            ],
             // 压缩流：先吐了半截摘要，然后断流
             vec![
                 ModelStreamEvent::OutputTextDelta { delta: "半截摘要".into() },

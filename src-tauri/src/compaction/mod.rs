@@ -207,28 +207,64 @@ fn cut_keeps_pairs(items: &[HistoryItem], mut split: usize) -> usize {
     }
 }
 
-/// 自动压缩的空转判据：区间里只有一条本模块生成的摘要。
+/// 这一条是否是**本模块此前生成的摘要**（以 user 身份写回历史）。
 ///
-/// 摘要以 user 身份留在历史开头。当保留额度装得下整个尾部、而观测用量已顶到预算时
-/// （推理 token 与工具声明开销不在字节估算里），[`tail_target`] 的不变量④ 会退化成
-/// `[0,1)`——「压掉最旧的一条」。最旧的那条如果正是上一条摘要，结果就是 1 条换 1 条：
-/// 条目数不减、摘要被重新包装一次，而判定在每一步都成立，于是每步压一次。真机上
-/// 这条路径在一回合内跑了 12 次（2026-11-14 冒烟 N8）。
+/// 识别依据只有 [`compose_summary`] 写出的固定两段式（标题 + 分隔线），
+/// 结构上无法与真实的用户发言混淆；旧版本无标题的裸摘要不在识别范围内。
 ///
-/// 跳过它没有副作用：尾部继续累积，等真的超出保留额度时切点会落到摘要之后，那次
-/// 压缩才会回收空间。只有**自动**路径跳过——手动 `/compact` 与溢出补救由用户或
-/// 端点溢出显式触发，不属于「每步判定」的循环；而且摘要本身过大时，重新总结它是
-/// 唯一的收缩手段，不能一并禁掉。
-fn is_lone_generated_summary(items: &[HistoryItem], target: &Target) -> bool {
-    if target.range_end != 1 {
-        return false;
-    }
-    match items.get(target.range_start) {
-        Some(HistoryItem::Message { role: Role::User, text, .. }) => {
-            carried_user_text(text).is_some()
-        }
-        _ => false,
-    }
+/// **口径：只保证新数据不再产生，不追溯剥离历史档案里的裸摘要。** 裸摘要没有结构
+/// 标记，按内容（如「压缩对象为空集」）猜测识别既把语言细节焊进判据，又可能误删
+/// 真实用户原文；重放/再压缩时它按普通用户消息处理，代价是旧档案多背一段文字。
+fn is_generated_summary(item: &HistoryItem) -> bool {
+    matches!(
+        item,
+        HistoryItem::Message { role: Role::User, text, .. } if carried_user_text(text).is_some()
+    )
+}
+
+/// 区间里是否有真实对话内容可供总结。
+///
+/// **系统注入**（环境快照等，`Role::System`）与**旧摘要**都不算内容：
+/// [`tail_target`] 的不变量④ 会把区间钳到 `[0,1)`，若最旧一条正好是系统注入，
+/// 送进总结请求的就只有一段环境描述，模型只能回「压缩对象为空集」。这条空摘要
+/// 随后以 user 身份写回历史，下一轮就被当成用户原文逐字继承（2026-11-15 真机 N9：
+/// 第 2、3 次摘要依次把前一次摘要正文当原文保留）。
+///
+/// 跳过它没有副作用：尾部继续累积，等真的出现可压缩内容时再压。
+fn has_real_content(items: &[HistoryItem], target: &Target) -> bool {
+    items[target.range_start..target.range_end]
+        .iter()
+        .any(|item| match item {
+            // 系统注入不是对话内容：压掉它只会得到一段「本轮未收到具体用户任务」。
+            HistoryItem::Message { role: Role::System, .. }
+            | HistoryItem::ImageMessage { role: Role::System, .. } => false,
+            // 旧摘要也不是：再压一层只会把摘要换一层包装（N8）。
+            item if is_generated_summary(item) => false,
+            HistoryItem::Message { text, .. } => !text.trim().is_empty(),
+            HistoryItem::ImageMessage { text, images, .. } => {
+                !text.trim().is_empty() || !images.is_empty()
+            }
+            HistoryItem::FunctionCall { .. } | HistoryItem::FunctionCallOutput { .. } => true,
+        })
+}
+
+/// 区间里是否有任何可总结的非系统条目（旧摘要算）。
+///
+/// 手动 `/compact` 与溢出补救**允许**重新总结一条旧摘要——摘要本身过大时，那是
+/// 唯一的收缩手段；它们只跳过「只有系统注入」的区间。自动路径的判据更严，
+/// 见 [`has_real_content`]。
+fn has_any_content(items: &[HistoryItem], target: &Target) -> bool {
+    items[target.range_start..target.range_end]
+        .iter()
+        .any(|item| match item {
+            HistoryItem::Message { role: Role::System, .. }
+            | HistoryItem::ImageMessage { role: Role::System, .. } => false,
+            HistoryItem::Message { text, .. } => !text.trim().is_empty(),
+            HistoryItem::ImageMessage { text, images, .. } => {
+                !text.trim().is_empty() || !images.is_empty()
+            }
+            HistoryItem::FunctionCall { .. } | HistoryItem::FunctionCallOutput { .. } => true,
+        })
 }
 
 /// 是否需要压缩，以及压哪一段。
@@ -254,8 +290,9 @@ pub fn plan_if_needed(observed_tokens: usize, items: &[HistoryItem], budget: usi
 
     // 从尾部往前装，装不下的那些进摘要。不变量见 [`tail_target`]。
     let target = tail_target(items, budget.saturating_mul(KEEP_RATIO_PERCENT) / 100);
-    if is_lone_generated_summary(items, &target) {
-        // 没有任何可回收内容，压了也只是把摘要换一层包装；等尾部攒够再压。
+    if !has_real_content(items, &target) {
+        // 区间里只有系统注入或上一条摘要：压了要么得到「压缩对象为空集」，
+        // 要么只是把摘要换一层包装；等尾部攒够真实内容再压。
         return None;
     }
     Some(target)
@@ -280,7 +317,13 @@ pub fn plan_manual(items: &[HistoryItem], budget: usize) -> Option<Target> {
     } else {
         budget.saturating_mul(KEEP_RATIO_PERCENT) / 100
     };
-    Some(tail_target(items, keep_allowance))
+    let target = tail_target(items, keep_allowance);
+    if !has_any_content(items, &target) {
+        // 只有系统注入（如环境快照）：压掉它得到的只是「本轮未收到具体用户任务」，
+        // 与自动路径同一条空集摘要来源。旧摘要仍允许重压，见 [`has_any_content`]。
+        return None;
+    }
+    Some(target)
 }
 
 /// 构造总结请求：被压区间的全部条目 + 末尾一条总结指令。
@@ -320,9 +363,10 @@ const SUMMARY_SEPARATOR: &str = "\n\n---\n\n";
 /// 单回合 12 次压缩，摘要里标题嵌套 11 层，167 → 6412 字节）。
 ///
 /// 形态是 [`compose_summary`] 写出的固定两段式：标题 + 原文段 + 分隔线 + 模型摘要。
-/// 旧版本写出的嵌套摘要（标题里再套标题）逐层剥掉，只留最内层原文；只有标题、
-/// 没有分隔线的正文（用户自己写的，或摘要没有用户原文时的纯模型摘要）不改写，
-/// 宁可当普通用户消息处理，也不猜。
+/// 没有用户原文时原文段为空，但仍保留标题与分隔线，返回值是 `Some("")`——调用方
+/// 据此把它认成「生成摘要、无可继承原文」，而不是退化成整段继承（N9）。
+/// 旧版本写出的嵌套摘要（标题里再套标题）逐层剥掉，只留最内层原文；没有分隔线的
+/// 正文（用户自己写的，或旧版本无标题的裸摘要）不改写，宁可当普通用户消息处理，也不猜。
 fn carried_user_text(text: &str) -> Option<&str> {
     let mut rest = text.strip_prefix(USER_TEXT_HEADER)?;
     if !rest.contains(SUMMARY_SEPARATOR) {
@@ -351,6 +395,9 @@ fn carried_user_text(text: &str) -> Option<&str> {
 /// 1. **首条用户消息无条件保留**：它承载任务目标与硬约束，丢了等于丢任务本身；
 /// 2. 其余从最新往回装，装不下的直接截断（更旧的同样不装），保证留下的是连续近段；
 /// 3. 输出按时间顺序、每段原样引用，不做任何改写，便于逐字核对。
+///
+/// 区间里没有可继承的真实用户发言（空集摘要、纯系统注入）时**仍写出标题与分隔线**，
+/// 只留一个空原文段：结构标记是下一轮唯一的身份依据，省略它就会退化成整段继承（N9）。
 pub fn compose_summary(items: &[HistoryItem], target: &Target, budget: usize, summary: &str) -> String {
     let users: Vec<(usize, &str)> = items[target.range_start..target.range_end]
         .iter()
@@ -359,18 +406,24 @@ pub fn compose_summary(items: &[HistoryItem], target: &Target, budget: usize, su
             HistoryItem::Message { role: Role::User, text, .. } if !text.trim().is_empty() => {
                 // 已经压缩过的区段只传递它逐字保留的原文段，不再把整份旧摘要
                 // 当成新的「用户原文」嵌进来（否则每压一次就多包一层，N8）。
-                Some((target.range_start + offset, carried_user_text(text).unwrap_or(text)))
+                // 原文段可能为空（空集摘要），空段没有信息，直接丢弃（N9）。
+                let carried = carried_user_text(text).unwrap_or(text);
+                (!carried.trim().is_empty()).then_some((target.range_start + offset, carried))
             }
             _ => None,
         })
         .collect();
-    let Some(&(first_index, first_text)) = users.first() else {
-        return summary.to_string();
-    };
 
     let allowance = budget.saturating_mul(USER_TEXT_KEEP_PERCENT) / 100;
-    let mut picked: Vec<(usize, &str)> = vec![(first_index, first_text)];
-    let mut used = approx_tokens(USER_TEXT_HEADER) + approx_tokens(first_text);
+    let mut picked: Vec<(usize, &str)> = Vec::new();
+    // 规则 1：首条用户消息无条件保留；整个区间没有用户发言时 picked 保持空。
+    if let Some(&(first_index, first_text)) = users.first() {
+        picked.push((first_index, first_text));
+    }
+    let mut used = picked
+        .first()
+        .map(|(_, text)| approx_tokens(USER_TEXT_HEADER) + approx_tokens(text))
+        .unwrap_or_default();
     for &(index, text) in users.iter().skip(1).rev() {
         let cost = approx_tokens(text);
         if used + cost > allowance {
@@ -794,11 +847,29 @@ mod tests {
         assert!(!zero.contains(&near));
     }
 
+    /// N9：区间没有用户发言时也必须留下结构标记，且原文段为空而不是整段继承。
+    ///
+    /// 反向对照：退回「无用户消息就 `return summary.to_string()`」，这里会拿到裸摘要，
+    /// `carried_user_text` 返回 None——下一轮就把它整段当成用户原文（真机 N9）。
     #[test]
-    fn compose_without_user_messages_leaves_summary_untouched() {
+    fn compose_without_user_messages_marks_an_empty_user_section() {
         let items = vec![msg(Role::Assistant, "只有模型发言")];
         let target = Target { range_start: 0, range_end: 1 };
-        assert_eq!(compose_summary(&items, &target, 100_000, "摘要正文"), "摘要正文");
+        let composed = compose_summary(&items, &target, 100_000, "摘要正文");
+
+        assert_eq!(composed.matches(USER_TEXT_HEADER).count(), 1, "标题必须保留：{composed}");
+        assert!(composed.contains(SUMMARY_SEPARATOR), "没有分隔线就认不出这是生成摘要");
+        assert!(composed.ends_with("摘要正文"), "模型摘要正文必须在：{composed}");
+        assert_eq!(
+            carried_user_text(&composed),
+            Some(""),
+            "空原文段必须被识别成空，而不是退化成整段继承"
+        );
+
+        // 空白用户消息不算原文：标题下不能出现一段纯空白。
+        let items = vec![msg(Role::User, "   \n"), msg(Role::Assistant, "只有模型发言")];
+        let target = Target { range_start: 0, range_end: 2 };
+        assert_eq!(carried_user_text(&compose_summary(&items, &target, 5_000, "摘要正文")), Some(""));
     }
 
     // ============================== 连续压缩的幂等性（N8） ==============================
@@ -833,6 +904,11 @@ mod tests {
                 "第 {round} 轮：原文应恰好保留一份"
             );
             assert!(composed.contains(&summary), "第 {round} 轮：本次模型摘要必须在");
+            assert_eq!(
+                carried_user_text(&composed),
+                Some("硬约束：只改测试，不要 push"),
+                "第 {round} 轮：用户原文段被模型摘要正文污染"
+            );
             if round > 0 {
                 assert!(
                     !composed.contains(&format!("旧摘要-{:02}-END", round - 1)),
@@ -851,8 +927,9 @@ mod tests {
 
     /// N8 的空转形态：最旧一条就是上一条摘要时，自动压缩必须跳过。
     ///
-    /// 反向对照：去掉 `is_lone_generated_summary`，这里会返回 `[0,1)`——真机上
-    /// 那条每步重复、日志里 `compressed_items=1` 的空转。
+    /// 反向对照：退回 `is_lone_generated_summary`（只认 `Role::User` 的摘要）而不看
+    /// 循环里的系统注入，`automatic_planning_skips_a_system_only_range` 会红；这里
+    /// 换成退回「所有区间都放行」，本用例立刻返回 `Some([0,1))`。
     #[test]
     fn automatic_planning_skips_a_lone_generated_summary() {
         let generated = compose_summary(
@@ -876,6 +953,99 @@ mod tests {
             plan_if_needed(5_000, &plain, 5_000),
             Some(Target { range_start: 0, range_end: 1 })
         );
+    }
+
+    /// N9 的触发源：区间只有系统注入（环境快照）时，自动压缩必须跳过。
+    ///
+    /// 真机 `2026-11-14T16:10:31.117818Z` 就是这里放行的：`tail_target` 的不变量④
+    /// 把区间钳到 `[0,1)`，唯一一条是 `Role::System` 的环境快照；旧守卫
+    /// `is_lone_generated_summary` 只认 `Role::User`，于是 `compressed_items=1`
+    /// 的空转摘要被写进历史。
+    ///
+    /// 反向对照：退回旧守卫，本用例第一段返回 `Some([0,1))` 变红。
+    #[test]
+    fn automatic_planning_skips_a_system_only_range() {
+        let items = vec![
+            msg(Role::System, "## 环境快照\n- workdir: repo"),
+            msg(Role::Assistant, "最新的真实内容"),
+        ];
+        assert_eq!(
+            plan_if_needed(5_000, &items, 5_000),
+            None,
+            "系统注入不是可总结内容，压它只会得到空集摘要"
+        );
+
+        // 反例：区间里确实有真实助手内容时不得跳过，否则观测值虚高就永远回收不了。
+        let items = vec![
+            msg(Role::System, "## 环境快照"),
+            msg(Role::Assistant, "真实内容"),
+            msg(Role::Assistant, &"x".repeat(8_000)),
+        ];
+        assert_eq!(
+            plan_if_needed(5_000, &items, 5_000),
+            Some(Target { range_start: 0, range_end: 2 })
+        );
+    }
+
+    /// 手动 `/compact` 与溢出补救：允许重压旧摘要（那是唯一收缩手段），
+    /// 但只有系统注入的区间仍然不压——它同样是空集摘要的来源。
+    #[test]
+    fn manual_planning_recompacts_summaries_but_skips_system_only_ranges() {
+        let items = vec![msg(Role::System, "## 环境快照"), msg(Role::Assistant, "最新一条")];
+        assert_eq!(plan_manual(&items, 5_000), None);
+
+        let generated = compose_summary(
+            &[msg(Role::User, "任务目标")],
+            &Target { range_start: 0, range_end: 1 },
+            5_000,
+            "模型摘要",
+        );
+        let items = vec![msg(Role::User, &generated), msg(Role::Assistant, "最新一条")];
+        assert_eq!(
+            plan_manual(&items, 5_000),
+            Some(Target { range_start: 0, range_end: 1 }),
+            "摘要过大时重压是手动路径的正当用途"
+        );
+    }
+
+    /// N9 的真机链路：空集摘要落进历史后，不得成为下一份摘要的用户原文段。
+    ///
+    /// 真机形态：区间 `[0,1)` 只有环境快照，模型回「压缩对象为空集…本轮未收到
+    /// 具体用户任务」，这条裸摘要以 user 身份写回，下一轮 `carried_user_text`
+    /// 认不出（无标题+分隔线），整段被当成用户原文逐字继承，此后每次压缩都多背一段。
+    ///
+    /// 两侧都要堵住：空集区间不产生计划；即便摘要真被写出（手动路径），
+    /// `compose_summary` 也会给它结构标记，下一轮只继承空原文段。
+    ///
+    /// 反向对照：单独退回 `compose_summary` 的裸摘要分支，第 2 段 `Some("")` 变 None；
+    /// 单独退回 `plan_if_needed` 的旧守卫，第 1 段变红。
+    #[test]
+    fn empty_range_never_produces_inheritable_user_text() {
+        let mut history = vec![
+            msg(Role::System, "## 环境快照\n- workdir: repo"),
+            msg(Role::User, "任务：跑测试"),
+            msg(Role::Assistant, "好"),
+        ];
+        // 1) 只有系统注入的区间不产生压缩计划（真机空转的直接来源）。
+        assert_eq!(plan_if_needed(5_000, &history, 5_000), None);
+
+        // 2) 假使走手动路径写出摘要，它也必须带结构标记、原文段为空。
+        let target = Target { range_start: 0, range_end: 1 };
+        let checkpoint = compose_summary(&history, &target, 5_000, "压缩对象为空集，本轮未收到具体用户任务。");
+        assert_eq!(
+            carried_user_text(&checkpoint),
+            Some(""),
+            "空集摘要必须被认出是生成摘要，且没有可继承原文"
+        );
+        replace_with_summary(&mut history, target, checkpoint);
+
+        // 3) 下一轮压缩：用户原文段只含真实用户发言，不含模型摘要正文。
+        let target = Target { range_start: 0, range_end: 2 };
+        let next = compose_summary(&history, &target, 5_000, "第二份摘要");
+        let carried = carried_user_text(&next).expect("两段式输出必须可识别");
+        assert!(carried.contains("任务：跑测试"), "真实用户发言要留下：{carried}");
+        assert!(!carried.contains("压缩对象为空集"), "模型摘要正文不得进入用户原文段：{carried}");
+        assert_eq!(next.matches(USER_TEXT_HEADER).count(), 1, "标题不得嵌套：{next}");
     }
 
     /// N8 的循环形态：小预算 + 每步追加少量条目，自动压缩不得每步空转、摘要不得膨胀、
@@ -903,8 +1073,8 @@ mod tests {
 
             if let Some(target) = plan_if_needed(observed, &history, budget) {
                 assert!(
-                    !is_lone_generated_summary(&history, &target),
-                    "第 {step} 步仍在压一条摘要（range={target:?}）"
+                    has_real_content(&history, &target),
+                    "第 {step} 步压缩了没有真实内容的区间（range={target:?}）"
                 );
                 let composed = compose_summary(
                     &history,
