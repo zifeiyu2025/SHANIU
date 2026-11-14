@@ -7,8 +7,8 @@
 ## 统计
 
 - 条目总数：3314
-- same：2679
-- drift：76
+- same：2678
+- drift：77
 - missing：0
 - not-applicable：559
 - 待复核（needs-review）：0
@@ -153,6 +153,7 @@
 | `packages/client/ui-chat/src/client/chat/ChatView.tsx` | drift | 已登记 | 类型级修复（第 9 行批次）+ fileImages.labels 传 image.openExternal（第 22 行） | 两项分别按对应行规则同步：上游统一文案则删本地传参，类型批随 React 19 升级重跑 tsc -b |
 | `packages/client/ui-chat/src/client/chat/MessageItem.module.css` | drift | 已登记 | A0-2 失败行可展开/复制所需的样式（docs/07 #23） | 上游若提供等价诊断 UI，删本地改动 |
 | `packages/client/ui-chat/src/client/chat/MessageItem.tsx` | drift | 已登记 | A0-2 TurnErrorItem 增加可展开的原始诊断与复制（docs/07 #23） | 上游若已提供等价原始诊断，删本地改动改跟上游 |
+| `packages/client/ui-chat/src/client/chat/TurnProcessNodeView.tsx` | drift | 已登记 | N1 顶部回合摘要识别 indeterminate：显示「本轮状态未知」，不再按 completed 计时（docs/07 #33） | 上游若原生支持「无结论」reason 并同步改顶部控件，删本地分支改跟上游；若只同步 turn-error 不改顶部，必须补回本分支，否则「未知」会重新渲染成「已完成 + 时长」 |
 | `packages/client/ui-chat/src/client/chat/TurnTriggerNodeView.tsx` | drift | 已登记 | A0-4 未知时刻改用 span、不挂 dateTime（docs/07 #24） | 同步后确认 time=0 不再渲染成 1970 |
 | `packages/client/ui-chat/src/client/chat/flow-motion.ts` | drift | 已登记 | 类型级修复（docs/07 #9） | 同第 9 行类型批 |
 | `packages/client/ui-chat/src/client/chat/message-chrome.ts` | drift | 已登记 | A0-4 time<=0 返回「记录时刻不可用」（docs/07 #24） | 同步后确认旧档案不再显示假时钟 |

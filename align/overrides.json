@@ -19,6 +19,10 @@
       "reason": "A0-T7：面板导出与槽接线（docs/07 #25）",
       "guard": "上游若提供等价入口则改调上游"
     },
+    "ui-chat/src/client/chat/TurnProcessNodeView.tsx": {
+      "reason": "N1 顶部回合摘要识别 indeterminate：显示「本轮状态未知」，不再按 completed 计时（docs/07 #33）",
+      "guard": "上游若原生支持「无结论」reason 并同步改顶部控件，删本地分支改跟上游；若只同步 turn-error 不改顶部，必须补回本分支，否则「未知」会重新渲染成「已完成 + 时长」"
+    },
     "ui-chat/src/client/chat/ApprovalCommand.module.css": {
       "reason": "A0-T7 本地新增样式（上游无此文件，docs/07 #25）",
       "guard": "上游若自带详情样式，删本地文件"
