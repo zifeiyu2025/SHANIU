@@ -207,6 +207,30 @@ fn cut_keeps_pairs(items: &[HistoryItem], mut split: usize) -> usize {
     }
 }
 
+/// 自动压缩的空转判据：区间里只有一条本模块生成的摘要。
+///
+/// 摘要以 user 身份留在历史开头。当保留额度装得下整个尾部、而观测用量已顶到预算时
+/// （推理 token 与工具声明开销不在字节估算里），[`tail_target`] 的不变量④ 会退化成
+/// `[0,1)`——「压掉最旧的一条」。最旧的那条如果正是上一条摘要，结果就是 1 条换 1 条：
+/// 条目数不减、摘要被重新包装一次，而判定在每一步都成立，于是每步压一次。真机上
+/// 这条路径在一回合内跑了 12 次（2026-11-14 冒烟 N8）。
+///
+/// 跳过它没有副作用：尾部继续累积，等真的超出保留额度时切点会落到摘要之后，那次
+/// 压缩才会回收空间。只有**自动**路径跳过——手动 `/compact` 与溢出补救由用户或
+/// 端点溢出显式触发，不属于「每步判定」的循环；而且摘要本身过大时，重新总结它是
+/// 唯一的收缩手段，不能一并禁掉。
+fn is_lone_generated_summary(items: &[HistoryItem], target: &Target) -> bool {
+    if target.range_end != 1 {
+        return false;
+    }
+    match items.get(target.range_start) {
+        Some(HistoryItem::Message { role: Role::User, text, .. }) => {
+            carried_user_text(text).is_some()
+        }
+        _ => false,
+    }
+}
+
 /// 是否需要压缩，以及压哪一段。
 ///
 /// `observed_tokens` 是上一次采样端点报回的真实用量（含推理 token 与工具声明开销，
@@ -228,8 +252,13 @@ pub fn plan_if_needed(observed_tokens: usize, items: &[HistoryItem], budget: usi
         return None;
     }
 
-    // 从尾部往前装，装不下的那些进摘要。三条不变量见 [`tail_target`]。
-    Some(tail_target(items, budget.saturating_mul(KEEP_RATIO_PERCENT) / 100))
+    // 从尾部往前装，装不下的那些进摘要。不变量见 [`tail_target`]。
+    let target = tail_target(items, budget.saturating_mul(KEEP_RATIO_PERCENT) / 100);
+    if is_lone_generated_summary(items, &target) {
+        // 没有任何可回收内容，压了也只是把摘要换一层包装；等尾部攒够再压。
+        return None;
+    }
+    Some(target)
 }
 
 /// 手动压缩（`/compact`，SH-115）的目标规划：与 [`plan_if_needed`] 同一条尾部保留
@@ -278,6 +307,41 @@ const USER_TEXT_KEEP_PERCENT: usize = 30;
 /// 「用户原话」与「模型写的交接摘要」。
 const USER_TEXT_HEADER: &str = "## 用户原文（压缩时逐字保留，不得改写）";
 
+/// 原文段与模型摘要之间的分隔线，由 [`compose_summary`] 写入。它是识别
+/// 「这条 user 消息是本模块生成的摘要」的唯一依据，改动格式必须同步这里。
+const SUMMARY_SEPARATOR: &str = "\n\n---\n\n";
+
+/// 若 `text` 是本模块生成的摘要，返回其中逐字保留的原始用户段；否则 `None`。
+///
+/// 摘要以 **user** 身份写回历史（thinking 档要求 assistant 必带 reasoning，见
+/// `agent_loop::replace_with_summary`），于是下一次压缩时它和真正的用户消息一样
+/// 落在区间的 `Role::User` 条目里。不作区分，就会把上一条摘要整段当成「用户原文」
+/// 再包一层标题：每压一次标题多一层、摘要越滚越大（2026-11-14 真机冒烟 N8：
+/// 单回合 12 次压缩，摘要里标题嵌套 11 层，167 → 6412 字节）。
+///
+/// 形态是 [`compose_summary`] 写出的固定两段式：标题 + 原文段 + 分隔线 + 模型摘要。
+/// 旧版本写出的嵌套摘要（标题里再套标题）逐层剥掉，只留最内层原文；只有标题、
+/// 没有分隔线的正文（用户自己写的，或摘要没有用户原文时的纯模型摘要）不改写，
+/// 宁可当普通用户消息处理，也不猜。
+fn carried_user_text(text: &str) -> Option<&str> {
+    let mut rest = text.strip_prefix(USER_TEXT_HEADER)?;
+    if !rest.contains(SUMMARY_SEPARATOR) {
+        return None;
+    }
+    loop {
+        // 本层原文只可能在第一条分隔线之前；之后的模型摘要不再逐字传递，
+        // 由这次总结请求重新生成（`build_request` 仍会把旧摘要整段送给模型）。
+        let segment = match rest.split_once(SUMMARY_SEPARATOR) {
+            Some((before, _)) => before.trim_start_matches('\n'),
+            None => rest.trim_start_matches('\n'),
+        };
+        match segment.strip_prefix(USER_TEXT_HEADER) {
+            Some(inner) => rest = inner,
+            None => return Some(segment.trim_end()),
+        }
+    }
+}
+
 /// 压缩前收集区间内的用户原文，拼在摘要之前，作为 `Compacted` 锚点 summary 的前半段。
 ///
 /// 仍然只写一条字符串、只改 summary 内容，**不动档案结构**——旧档案里没有这段的
@@ -293,7 +357,9 @@ pub fn compose_summary(items: &[HistoryItem], target: &Target, budget: usize, su
         .enumerate()
         .filter_map(|(offset, item)| match item {
             HistoryItem::Message { role: Role::User, text, .. } if !text.trim().is_empty() => {
-                Some((target.range_start + offset, text.as_str()))
+                // 已经压缩过的区段只传递它逐字保留的原文段，不再把整份旧摘要
+                // 当成新的「用户原文」嵌进来（否则每压一次就多包一层，N8）。
+                Some((target.range_start + offset, carried_user_text(text).unwrap_or(text)))
             }
             _ => None,
         })
@@ -322,7 +388,7 @@ pub fn compose_summary(items: &[HistoryItem], target: &Target, budget: usize, su
         composed.push_str("\n\n");
         composed.push_str(text);
     }
-    composed.push_str("\n\n---\n\n");
+    composed.push_str(SUMMARY_SEPARATOR);
     composed.push_str(summary);
     composed
 }
@@ -355,6 +421,21 @@ mod tests {
 
     fn out(id: &str, output: &str) -> HistoryItem {
         HistoryItem::FunctionCallOutput { call_id: id.into(), output: output.into() }
+    }
+
+    /// 与 `agent_loop::replace_with_summary` 同语义：区间 → 一条 user 摘要。
+    fn replace_with_summary(items: &mut Vec<HistoryItem>, target: Target, summary: String) {
+        let mut next: Vec<HistoryItem> = items[..target.range_start].to_vec();
+        next.push(msg(Role::User, &summary));
+        next.extend(items[target.range_end..].iter().cloned());
+        *items = next;
+    }
+
+    fn first_text(items: &[HistoryItem]) -> &str {
+        match &items[0] {
+            HistoryItem::Message { text, .. } => text,
+            other => panic!("首条不是消息：{other:?}"),
+        }
     }
 
     /// 保留段里每个工具输出都必须能找到同段的调用。
@@ -718,5 +799,136 @@ mod tests {
         let items = vec![msg(Role::Assistant, "只有模型发言")];
         let target = Target { range_start: 0, range_end: 1 };
         assert_eq!(compose_summary(&items, &target, 100_000, "摘要正文"), "摘要正文");
+    }
+
+    // ============================== 连续压缩的幂等性（N8） ==============================
+
+    /// 2026-11-14 真机冒烟 N8 的形态：每次压缩只覆盖上一条摘要（`range=0-1`）。
+    ///
+    /// 摘要以 user 身份进历史，旧实现把它当「用户原文」整段再包一层新标题：
+    /// 12 次之后标题嵌套 11 层、体积 167 → 6412 字节。
+    ///
+    /// 反向对照：去掉 `compose_summary` 里的 `carried_user_text`，第二轮起
+    /// 标题数变 2、3…，且「旧摘要-00-END」会被逐字嵌入下一版，本用例立刻红。
+    #[test]
+    fn recompacting_a_generated_summary_does_not_nest_it_again() {
+        let mut history = vec![
+            msg(Role::User, "硬约束：只改测试，不要 push"),
+            msg(Role::Assistant, "收到"),
+        ];
+        let mut sizes = Vec::new();
+        for round in 0..12 {
+            let target = Target { range_start: 0, range_end: 1 };
+            let summary = format!("旧摘要-{round:02}-END");
+            let composed = compose_summary(&history, &target, 5_000, &summary);
+
+            assert_eq!(
+                composed.matches(USER_TEXT_HEADER).count(),
+                1,
+                "第 {round} 轮：标题被嵌套了"
+            );
+            assert_eq!(
+                composed.matches("硬约束：只改测试，不要 push").count(),
+                1,
+                "第 {round} 轮：原文应恰好保留一份"
+            );
+            assert!(composed.contains(&summary), "第 {round} 轮：本次模型摘要必须在");
+            if round > 0 {
+                assert!(
+                    !composed.contains(&format!("旧摘要-{:02}-END", round - 1)),
+                    "第 {round} 轮：上一版模型摘要被当成用户原文逐字嵌入"
+                );
+            }
+            sizes.push(composed.len());
+            history = vec![msg(Role::User, &composed), msg(Role::Assistant, "继续")];
+        }
+        assert!(
+            sizes.windows(2).all(|pair| pair[1] <= pair[0] + 32),
+            "摘要体积随压缩次数膨胀：{sizes:?}"
+        );
+        assert_eq!(history.len(), 2, "1 条换 1 条，条目数不变");
+    }
+
+    /// N8 的空转形态：最旧一条就是上一条摘要时，自动压缩必须跳过。
+    ///
+    /// 反向对照：去掉 `is_lone_generated_summary`，这里会返回 `[0,1)`——真机上
+    /// 那条每步重复、日志里 `compressed_items=1` 的空转。
+    #[test]
+    fn automatic_planning_skips_a_lone_generated_summary() {
+        let generated = compose_summary(
+            &[msg(Role::User, "任务目标")],
+            &Target { range_start: 0, range_end: 1 },
+            5_000,
+            "模型摘要",
+        );
+        assert!(carried_user_text(&generated).is_some(), "构造前提：本模块生成的摘要");
+
+        let items = vec![msg(Role::User, &generated), msg(Role::Assistant, "最新一条")];
+        assert_eq!(
+            plan_if_needed(5_000, &items, 5_000),
+            None,
+            "只有上一条摘要的区间没有任何可回收内容"
+        );
+
+        // 反例：最旧一条是真用户消息时，退化压缩照旧保留，否则观测值虚高时无法回收。
+        let plain = vec![msg(Role::User, "任务目标"), msg(Role::Assistant, "最新一条")];
+        assert_eq!(
+            plan_if_needed(5_000, &plain, 5_000),
+            Some(Target { range_start: 0, range_end: 1 })
+        );
+    }
+
+    /// N8 的循环形态：小预算 + 每步追加少量条目，自动压缩不得每步空转、摘要不得膨胀、
+    /// 历史不得无界增长。
+    ///
+    /// 反向对照（两个修复各撤一个都会红）：撤掉跳过空转检查，第 1 步起标题数就 +1；
+    /// 撤掉原文提取，摘要体积随压缩次数线性增长，token 上界断言同样会红。
+    #[test]
+    fn repeated_pressure_compaction_keeps_summary_flat_and_history_bounded() {
+        let budget = 5_000usize;
+        let observed = budget; // 真机同款：端点报回的用量已顶到预算
+        let mut history = vec![
+            msg(Role::User, "任务：改 src/sum.js 并跑 pnpm test"),
+            msg(Role::Assistant, "先读文件"),
+            call("c1", "{\"path\":\"src/sum.js\"}"),
+            out("c1", "export function sum(a, b) { return a + b }"),
+            msg(Role::Assistant, "看到了"),
+        ];
+        let mut compactions = 0;
+        let mut largest = 0usize;
+        for step in 0..40 {
+            history.push(msg(Role::Assistant, &format!("第 {step} 步")));
+            history.push(call(&format!("c{step}"), "{}"));
+            history.push(out(&format!("c{step}"), &"y".repeat(200)));
+
+            if let Some(target) = plan_if_needed(observed, &history, budget) {
+                assert!(
+                    !is_lone_generated_summary(&history, &target),
+                    "第 {step} 步仍在压一条摘要（range={target:?}）"
+                );
+                let composed = compose_summary(
+                    &history,
+                    &target,
+                    budget,
+                    &format!("模型摘要-{step:02}-END"),
+                );
+                replace_with_summary(&mut history, target, composed);
+                compactions += 1;
+            }
+            assert_eq!(
+                first_text(&history).matches(USER_TEXT_HEADER).count(),
+                1,
+                "第 {step} 步摘要出现嵌套"
+            );
+            assert!(
+                history_tokens(&history) <= 2_000,
+                "第 {step} 步历史 token 无界：{}",
+                history_tokens(&history)
+            );
+            largest = largest.max(history.len());
+        }
+        assert!(compactions < 40, "每一步都在压缩：{compactions}");
+        // 保留额度是 1500 token，条目这一侧的上界由它换算而来；这里留足余量。
+        assert!(largest <= 90, "history_len 无界：{largest}");
     }
 }
