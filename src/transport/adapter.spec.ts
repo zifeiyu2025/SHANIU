@@ -58,6 +58,8 @@ interface ScriptedBridge extends HostBridge {
     active: { sessionId: string; kind: 'turn' | 'compaction' } | null
     failRuntime: boolean
     listRunning: boolean
+    /** 直接覆盖 `session_runtime` 的原始返回值，用来模拟形状不合法的载荷（如 `{}`）。 */
+    runtimeRaw?: unknown
   }
   emit(sessionId: string, msg: EventMsg, agentId?: string, tsMs?: number, eventId?: string): void
   /** 阶段 3：推送一份待审批快照（模拟 `approval/pending-changed`）。 */
@@ -289,6 +291,7 @@ function scriptedBridge(
       }
       if (command === 'session_runtime') {
         if (host.failRuntime) throw { code: 'IPC_FAILED', message: '运行态查询失败' }
+        if (host.runtimeRaw !== undefined) return host.runtimeRaw as T
         return host.active as T
       }
       if (command === 'list_sessions') {
@@ -2293,6 +2296,34 @@ describe('适配层的命令面映射', () => {
     reopened.dispose()
 
     expect(events.find(event => event['type'] === 'turn/end')).toBeUndefined()
+  })
+
+  it('宿主运行态是空壳 {}：重建不补 turn_end；合法空闲仍照常收口', async () => {
+    const archive = [
+      { kind: 'message', role: 'user', text: '问' },
+      { kind: 'message', role: 'assistant', text: '答到一半' },
+    ]
+
+    // 信息不完整 → 既不当空闲也不当在跑：不写 turn_end。
+    const opaque = scriptedBridge(undefined, archive)
+    opaque.host.runtimeRaw = {}
+    const first = createAdapter({ bridge: opaque })
+    const firstIterator = faceOf(first.remote).session.follow({ address: { kind: 'session', sessionId: 'agent-old' } })
+    const opaqueEvents = eventsOf((await firstIterator.next()).value as Record<string, unknown>)
+    await firstIterator.return?.(undefined)
+    first.dispose()
+    expect(opaqueEvents.find(event => event['type'] === 'turn/end')).toBeUndefined()
+
+    // 反向对照：宿主明确说空闲，仍然要补 interrupted（别把"该收"一起堵死）。
+    const idle = scriptedBridge(undefined, archive)
+    idle.host.active = null
+    const second = createAdapter({ bridge: idle })
+    const secondIterator = faceOf(second.remote).session.follow({ address: { kind: 'session', sessionId: 'agent-old' } })
+    const idleEvents = eventsOf((await secondIterator.next()).value as Record<string, unknown>)
+    await secondIterator.return?.(undefined)
+    second.dispose()
+    const end = idleEvents.find(event => event['type'] === 'turn/end')
+    expect((end?.['data'] as { reason: { kind: string } }).reason.kind).toBe('interrupted')
   })
 
   it('重开档案按条目 at_ms 还原时间：不再把整段历史压成打开会话那一刻', async () => {
@@ -4585,6 +4616,38 @@ describe('续播幂等与无帧兜底（阶段 2）', () => {
       const snapshot = (await iterator.next()).value as Record<string, unknown>
       expect(eventsOf(snapshot).filter(event => event['type'] === 'turn/end')).toHaveLength(0)
       await iterator.return?.(undefined)
+    } finally {
+      dispose()
+      vi.useRealTimers()
+    }
+  })
+
+  it('60s 无帧但运行态是空壳 {}：保持现状；宿主改口空闲后才收口', async () => {
+    vi.useFakeTimers()
+    const bridge = scriptedBridge()
+    bridge.host.runtimeRaw = {}
+    const { remote, dispose } = createAdapter({ bridge })
+    try {
+      const session = faceOf(remote).session
+      await session.prompt({ sessionId: 'agent-opaque', requestId: 'rpc-opaque', content: [{ type: 'text', text: '跑一下' }] })
+
+      // 形状不合法 = 信息不完整：不续期，也不收口。
+      await vi.advanceTimersByTimeAsync(61_000)
+      const before = session.follow({ address: { kind: 'session', sessionId: 'agent-opaque' } })
+      expect(eventsOf((await before.next()).value as Record<string, unknown>)
+        .filter(event => event['type'] === 'turn/end')).toHaveLength(0)
+      await before.return?.(undefined)
+
+      // 反向对照：宿主明确说空闲，下一轮扫描必须照常收口。
+      bridge.host.runtimeRaw = undefined
+      bridge.host.active = null
+      await vi.advanceTimersByTimeAsync(6_000)
+      const after = session.follow({ address: { kind: 'session', sessionId: 'agent-opaque' } })
+      const ends = eventsOf((await after.next()).value as Record<string, unknown>)
+        .filter(event => event['type'] === 'turn/end')
+      expect(ends).toHaveLength(1)
+      expect((ends[0]!['data'] as { reason: { kind: string } }).reason.kind).toBe('interrupted')
+      await after.return?.(undefined)
     } finally {
       dispose()
       vi.useRealTimers()

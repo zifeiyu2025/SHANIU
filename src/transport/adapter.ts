@@ -637,6 +637,28 @@ const SILENCE_SCAN_INTERVAL_MS = 5_000
 const SILENCE_TIMEOUT_MS = 60_000
 
 /**
+ * 运行时形状判据：`session_runtime` 的结果能不能用来判断运行态。
+ *
+ * 刻意返回三态，不让「判不出来」落进任何一边：
+ * - `null` = 宿主明确说没有任务（可以收口）；
+ * - `ActiveTaskView` = 宿主明确说某个会话在跑（可以续期）；
+ * - `undefined` = 载荷形状不合法（`{}`、缺 `sessionId`、`kind` 不认识）——信息不完整，
+ *   既不能当空闲去收口，也不能当在跑去续期。
+ *
+ * 只判空值是不够的：`{}` 不等于 `null`，把它当「没有在跑」会把活跃回合误收口为
+ * `interrupted`，或把未收口的回合误合掉（与 `usablePendingSnapshot` 同一原则）。
+ */
+function usableActiveTaskView(raw: unknown): ActiveTaskView | null | undefined {
+  if (raw === null) return null
+  if (raw === undefined) return undefined
+  if (typeof raw !== 'object') return undefined
+  const view = raw as Partial<ActiveTaskView>
+  if (typeof view.sessionId !== 'string' || view.sessionId.length === 0) return undefined
+  if (view.kind !== 'turn' && view.kind !== 'compaction') return undefined
+  return view as ActiveTaskView
+}
+
+/**
  * 失败回合的原始诊断（供 UI 展开与复制，审计 A0）。
  * 文案只在展开区出现，不参与"一句人话"的展示；后端已做过脱敏。
  */
@@ -1638,11 +1660,15 @@ export function createAdapter(options: AdapterOptions): { remote: unknown; dispo
       if (at - journal.lastFrameAt < SILENCE_TIMEOUT_MS) continue
       silenceChecking.add(sessionId)
       try {
-        const view = await bridge.invoke<ActiveTaskView | null>('session_runtime')
+        const view = usableActiveTaskView(await bridge.invoke<unknown>('session_runtime'))
         // 查询期间 journal 可能已被重建、回合可能已收口：以最新状态为准，不重复收口。
         if (journals.get(sessionId) !== journal || !journal.taskOpen) continue
         const runtimeId = agents.get(sessionId)?.parentId ?? sessionId
-        if (view !== null && view !== undefined && view.sessionId === runtimeId) {
+        if (view === undefined) {
+          // 形状不合法：信息不完整，既不当空闲也不当在跑——不续期、不收口，下一轮再问。
+          continue
+        }
+        if (view !== null && view.sessionId === runtimeId) {
           journal.lastFrameAt = now()
           continue
         }
@@ -2544,16 +2570,18 @@ export function createAdapter(options: AdapterOptions): { remote: unknown; dispo
     if (entries.length === 0) return undefined
     // 运行态只问宿主：只有它确认「本会话没有任务」才允许把未收口的回合并掉。
     // 查询失败如实按未知处理——不写 turn_end，也不冒充空闲。
-    const host = await bridge.invoke<ActiveTaskView | null>('session_runtime')
-      .then(view => ({ known: true as const, view }))
+    const host = await bridge.invoke<unknown>('session_runtime')
+      .then(raw => ({ known: true as const, view: usableActiveTaskView(raw) }))
       .catch((reason: unknown) => {
         console.warn('[SHANIU] 宿主运行态查询失败，档案重建按未知处理', reason)
-        return { known: false as const, view: null }
+        return { known: false as const, view: undefined }
       })
-    const runningHere = host.known && host.view?.sessionId === sessionId
+    // 形状不合法与查询失败同处理：信息不完整就不猜，既不当空闲也不当在跑。
+    const runtimeKnown = host.known && host.view !== undefined
+    const runningHere = host.view !== null && host.view !== undefined && host.view.sessionId === sessionId
     const replayed = replayArchive(entries, {
-      closeOpenTurn: host.known && !runningHere,
-      runtimeUnknown: !host.known,
+      closeOpenTurn: runtimeKnown && !runningHere,
+      runtimeUnknown: !runtimeKnown,
     })
     replayed.lastEventId = cursor
     journals.set(sessionId, replayed)
