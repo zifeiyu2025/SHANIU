@@ -1080,6 +1080,10 @@ impl AgentLoop {
                     ),
                 };
                 emit(&sink, EventMsg::Error { message });
+                // 预算耗尽也得先落盘提问：「没有模型请求」不等于「没有用户输入」。
+                if let Err(message) = self.flush_history(rollout, history, recorded) {
+                    degrade_rollout(&sink, message);
+                }
                 reason = TurnEndReasonLocal::BudgetExhausted;
                 break 'outer;
             }
@@ -1128,6 +1132,13 @@ impl AgentLoop {
                     "运行事实变化，已作为尾部 system 消息注入"
                 );
                 history.push(HistoryItem::Message { role: Role::System, text: note, reasoning: None });
+            }
+            // 「提交即落盘」：提问（含 steering 与环境快照）在首次模型请求之前写入档案。
+            // 以前只在每轮收尾/压缩前 flush：审批卡挂起时强杀进程，这一轮的提问从未落盘，
+            // 重开后提问与卡片一起消失（冒烟 N6 的不可接受丢失）。flush 是增量的，
+            // 已落盘条目不会重复。必须放在环境快照注入之后：fresh_task 靠「末尾有未落盘用户消息」定位。
+            if let Err(message) = self.flush_history(rollout, history, recorded) {
+                degrade_rollout(&sink, message);
             }
             let instructions = session_prompt.instructions().to_string();
             // 系统提示词入轨迹：记录点必须在**实际下发路径**上——`instructions` 就是紧接着
@@ -5408,6 +5419,59 @@ mod tests {
             EventMsg::ToolCallEnd { call_id, error: Some(msg), result: Some(ToolCallResult::Denied), .. }
                 if call_id == "c7" && msg.contains("用户拒绝")
         )));
+    }
+
+    /// N6：审批挂起时强杀进程——用户提问必须已经落盘。
+    ///
+    /// 「提交即落盘」：用户消息在首次模型请求与任何工具/审批之前写入档案。
+    /// 反向验证：去掉循环起点的 flush → 待审批期间档案里只有 SessionMeta，
+    /// 强杀重启后提问与审批卡一起凭空消失。
+    #[tokio::test]
+    async fn user_question_is_flushed_before_waiting_for_approval() {
+        let dir = crate::test_support::TestTempDir::new("flush-on-submit");
+        let writer = Arc::new(
+            crate::rollout::RolloutWriter::create(
+                &dir,
+                &crate::rollout::RolloutItem::SessionMeta {
+                    session_id: "s-flush".into(),
+                    agent_id: "a-flush".into(),
+                    parent_id: None,
+                    created_at: 1,
+                    config_snapshot: crate::rollout::ConfigSnapshot::default(),
+                },
+            )
+            .unwrap(),
+        );
+        let (mut agent, _store, cancel, broker) = make_loop_with_destructive(vec![vec![
+            ModelStreamEvent::OutputItem(ResponseItem::FunctionCall {
+                name: "wipe_disk".into(),
+                arguments: "{}".into(),
+                call_id: "c-kill".into(),
+            }),
+            usage_ev(),
+        ]]);
+        agent.rollout = Some(writer.clone());
+        let (sink, _) = CapturingSink::new();
+        let sink: Arc<dyn EventSink> = Arc::new(sink);
+        let run = tokio::spawn(async move { agent.run_task("强杀前的问题", sink, cancel).await });
+
+        assert!(
+            await_approval_pending(&broker, "appr-c-kill").await,
+            "5s 内没有等到审批请求 appr-c-kill 进入 pending：同步点未成立，显式失败"
+        );
+        // 此刻就是「卡片挂着、进程被强杀」的那一刻：不回执，直接读档案。
+        let archive = crate::rollout::read(writer.path()).unwrap();
+        assert!(
+            archive.items.iter().any(|item| matches!(
+                item,
+                crate::rollout::RolloutItem::ResponseItem {
+                    item: crate::model_client::HistoryItem::Message { role: crate::model_client::Role::User, text, .. },
+                    ..
+                } if text == "强杀前的问题"
+            )),
+            "待审批期间用户提问必须已落盘，否则强杀重启后提问凭空消失"
+        );
+        run.abort();
     }
 
     /// SH-125 接线：命令工具失败后，下一轮请求里必须多出一条带「文件:行」的 System 提醒。

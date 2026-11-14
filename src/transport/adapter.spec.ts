@@ -2434,6 +2434,26 @@ describe('适配层的命令面映射', () => {
     expect(JSON.stringify(ends)).not.toContain('interrupted')
   })
 
+  it('N6：审批挂起时强杀——重开后用户提问仍在，回合标「状态未知」', async () => {
+    // 档案只到「用户提交」为止：审批卡还没回执、进程被杀，没有助手消息与结局行。
+    // 后端「提交即落盘」保证这条提问在档案里；重建必须把它显示出来，不能整段消失。
+    const archive = [{ kind: 'message', role: 'user', text: '需要审批的那一问' }]
+    const bridge = scriptedBridge(undefined, archive)
+    bridge.host.active = null
+    const reopened = createAdapter({ bridge })
+    const iterator = faceOf(reopened.remote).session.follow({ address: { kind: 'session', sessionId: 'agent-killed' } })
+    const events = eventsOf((await iterator.next()).value as Record<string, unknown>)
+    await iterator.return?.(undefined)
+    reopened.dispose()
+
+    const users = events.filter(event => event['type'] === 'user/message')
+    expect(users).toHaveLength(1)
+    expect(JSON.stringify(users)).toContain('需要审批的那一问')
+    const ends = events.filter(event => event['type'] === 'turn/end')
+    expect(ends).toHaveLength(1)
+    expect((ends[0]!['data'] as { reason: { kind: string } }).reason.kind).toBe('indeterminate')
+  })
+
   it('旧档案有多轮且都没有结局行：中间回合也标 indeterminate，不显示成进行中', async () => {
     // 旧档案没有 TurnEnd 行：每个用户消息都会开一个回合。前一个回合不能留成
     // 「进行中」（会一直转圈），也不能补「已中止」——一律如实标「状态未知」。
