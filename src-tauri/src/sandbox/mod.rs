@@ -185,6 +185,28 @@ pub fn execution_note(tool: &str, mode: SandboxMode, output: &str) -> Option<Str
     Some(note)
 }
 
+/// 命中「管道 stdio 被拒」时给人/模型的一句解释与出路（`None` 表示与预置无关）。
+///
+/// 只解释、不放宽：写边界靠 restricting SID，而命名管道 DACL 只给创建者本人（用户 SID）
+/// 全权，它不在 restricting 列表里，所以写打开被拒；改 default DACL 对本路径无效
+/// （docs/16 §10.7.2 有五种形状的实测）。因此这里**不**自动改写命令、**不**自动降档，
+/// 只把「原样重试无用 + 三条已验证的替代」交出去，由用户/模型自己选。
+/// 措辞里的可替代路径都真机验过：`docs/evidence/2026-11-14/piped-stdio-node-test/`。
+pub fn piped_stdio_hint(tool: &str, mode: SandboxMode, output: &str) -> Option<&'static str> {
+    if !EXEC_TOOLS.contains(&tool) || !denied_piped_stdio(mode, output) {
+        return None;
+    }
+    Some(
+        "沙箱说明：本次失败是「工作区内修改」档的管道 stdio 限制（EPERM / errno -4048），\
+不是项目代码问题；原样重试同一条命令不会成功，换个别名或再加参数重跑也不会。可行做法：\
+1) 直接跑单个测试文件，如 `node test/stats.test.js`——测试在主进程内执行，不需要再起子进程；\
+2) 需要整目录跑测试时用 `node --test --test-isolation=none`（改为同进程执行，隔离语义会变；\
+老版本 Node 里这个开关叫 `--experimental-test-isolation=none`）；\
+3) 确需原样跑 `npm test`：把 `[sandbox] os` 切到 `logical`（只剥特权、不做路径写边界，状态显示 partial），\
+或由用户临时切到全权档。",
+    )
+}
+
 /// 命令失败时补给人/模型的一句解释（`None` 表示与预置无关）。
 fn ancestor_hint() -> Option<&'static str> {
     if current_os_mode() != OsSandbox::AppContainer {
@@ -1870,6 +1892,43 @@ mod tests {
             let note = execution_note("unified_exec", SandboxMode::WorkspaceWrite, text).unwrap();
             assert!(!note.contains("denied="), "「{text}」不该命中: {note}");
         }
+    }
+
+    /// 命中管道 EPERM 时，人话解释与可行替代必须真的出现（否则模型只会重试同一条命令）。
+    ///
+    /// 输入取自 2026-11-14 真机 `node --test` 的原始 stderr（`Error: spawn EPERM` +
+    /// `errno: -4048` + `syscall: 'spawn'`），不是编的：这条形态与 `spawnSync` 不同，
+    /// 但已有标记 `spawn EPERM` 覆盖，缺的只是「为什么 + 怎么办」。
+    #[test]
+    fn piped_stdio_hint_explains_failure_and_offers_verified_alternatives() {
+        let stderr = "✖ test\\stats.test.js (2.1528ms)\n\
+  Error: spawn EPERM\n\
+      at ChildProcess.spawn (node:internal/child_process:486:11)\n\
+    errno: -4048,\n    code: 'EPERM',\n    syscall: 'spawn'\n";
+        let hint = piped_stdio_hint("unified_exec", SandboxMode::WorkspaceWrite, stderr)
+            .expect("写约束档的管道 EPERM 必须给出解释");
+        // 三件事缺一不可：说清「不是项目问题」、说清「重试无用」、给出可执行替代。
+        for needle in [
+            "不是项目代码问题",
+            "原样重试",
+            "node test/stats.test.js",
+            "--test-isolation=none",
+            "[sandbox] os",
+        ] {
+            assert!(hint.contains(needle), "解释里缺少「{needle}」：{hint}");
+        }
+
+        // 不该出现的场景一律不给：非执行工具、非写约束档、只是普通失败。
+        assert!(piped_stdio_hint("read_file", SandboxMode::WorkspaceWrite, stderr).is_none());
+        for mode in [SandboxMode::ReadOnly, SandboxMode::DangerFullAccess] {
+            assert!(piped_stdio_hint("terminal", mode, stderr).is_none(), "{mode:?}");
+        }
+        assert!(piped_stdio_hint(
+            "unified_exec",
+            SandboxMode::WorkspaceWrite,
+            "[exit code: 1]\nEPERM: operation not permitted"
+        )
+        .is_none());
     }
 
     /// 非法 server id 派生不出容器名：必须**直接失败**，不能悄悄退回受限令牌。

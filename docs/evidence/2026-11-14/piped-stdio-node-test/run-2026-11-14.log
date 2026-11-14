@@ -1,0 +1,132 @@
+===== control(outside sandbox) exit=Some(0)
+✔ ok (0.3757ms)
+ℹ tests 1
+ℹ suites 0
+ℹ pass 1
+ℹ fail 0
+ℹ cancelled 0
+ℹ skipped 0
+ℹ todo 0
+ℹ duration_ms 69.8788
+
+===== end control
+===== node --test [os=RestrictedToken] exit=1
+✖ test\stats.test.js (2.1528ms)
+ℹ tests 1
+ℹ suites 0
+ℹ pass 0
+ℹ fail 1
+ℹ cancelled 0
+ℹ skipped 0
+ℹ todo 0
+ℹ duration_ms 9.7059
+
+✖ failing tests:
+
+test at test\stats.test.js:1:1
+✖ test\stats.test.js (2.1528ms)
+  Error: spawn EPERM
+      at ChildProcess.spawn (node:internal/child_process:486:11)
+      at spawn (node:child_process:860:9)
+      at TestContext.<anonymous> (node:internal/test_runner/runner:581:21)
+      at FileTest.runInAsyncScope (node:async_hooks:226:14)
+      at FileTest.run (node:internal/test_runner/test:1402:25)
+      at FileTest.start (node:internal/test_runner/test:1262:17)
+      at runTestFile (node:internal/test_runner/runner:670:32)
+      at node:internal/test_runner/runner:1100:25
+      at node:internal/per_context/primordials:600:37
+      at new Promise (<anonymous>) {
+    errno: -4048,
+    code: 'EPERM',
+    syscall: 'spawn'
+  }
+
+===== end node --test
+===== node test/stats.test.js [os=RestrictedToken] exit=0
+✔ ok (0.394ms)
+ℹ tests 1
+ℹ suites 0
+ℹ pass 1
+ℹ fail 0
+ℹ cancelled 0
+ℹ skipped 0
+ℹ todo 0
+ℹ duration_ms 4.0514
+
+===== end node test/stats.test.js
+===== node --test --test-isolation=none [os=RestrictedToken] exit=0
+✔ ok (0.3807ms)
+ℹ tests 1
+ℹ suites 0
+ℹ pass 1
+ℹ fail 0
+ℹ cancelled 0
+ℹ skipped 0
+ℹ todo 0
+ℹ duration_ms 10.6609
+
+===== end node --test --test-isolation=none
+===== node --test (logical) [os=Logical] exit=0
+✔ ok (0.3949ms)
+ℹ tests 1
+ℹ suites 0
+ℹ pass 1
+ℹ fail 0
+ℹ cancelled 0
+ℹ skipped 0
+ℹ todo 0
+ℹ duration_ms 67.4408
+
+===== end node --test (logical)
+===== npm test [os=RestrictedToken] exit=1
+
+> probe@1.0.0 test
+> node --test
+
+✖ test\stats.test.js (2.2052ms)
+ℹ tests 1
+ℹ suites 0
+ℹ pass 0
+ℹ fail 1
+ℹ cancelled 0
+ℹ skipped 0
+ℹ todo 0
+ℹ duration_ms 9.7989
+
+✖ failing tests:
+
+test at test\stats.test.js:1:1
+✖ test\stats.test.js (2.2052ms)
+  Error: spawn EPERM
+      at ChildProcess.spawn (node:internal/child_process:486:11)
+      at spawn (node:child_process:860:9)
+      at TestContext.<anonymous> (node:internal/test_runner/runner:581:21)
+      at FileTest.runInAsyncScope (node:async_hooks:226:14)
+      at FileTest.run (node:internal/test_runner/test:1402:25)
+      at FileTest.start (node:internal/test_runner/test:1262:17)
+      at runTestFile (node:internal/test_runner/runner:670:32)
+      at node:internal/test_runner/runner:1100:25
+      at node:internal/per_context/primordials:600:37
+      at new Promise (<anonymous>) {
+    errno: -4048,
+    code: 'EPERM',
+    syscall: 'spawn'
+  }
+
+===== end npm test
+===== npm test (logical) exit=0
+
+> probe@1.0.0 test
+> node --test
+
+✔ ok (0.3669ms)
+ℹ tests 1
+ℹ suites 0
+ℹ pass 1
+ℹ fail 0
+ℹ cancelled 0
+ℹ skipped 0
+ℹ todo 0
+ℹ duration_ms 71.6823
+
+===== end npm test (logical)

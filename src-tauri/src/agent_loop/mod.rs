@@ -2604,9 +2604,19 @@ fn record_tool_result(
     };
     history.push(HistoryItem::FunctionCallOutput {
         call_id: call_id.to_string(),
-        output: match crate::sandbox::execution_note(name, sandbox, &output_text) {
-            Some(note) => format!("{output_text}\n{note}"),
-            None => output_text.clone(),
+        output: {
+            // 机器可读自报与「人话出路」分开拼：前者字段固定，不随界面文案漂移；
+            // 后者只在真的命中管道 stdio 拒绝时出现，避免每条命令都带一段长文。
+            let mut text = output_text.clone();
+            if let Some(note) = crate::sandbox::execution_note(name, sandbox, &output_text) {
+                text.push('\n');
+                text.push_str(&note);
+            }
+            if let Some(hint) = crate::sandbox::piped_stdio_hint(name, sandbox, &output_text) {
+                text.push('\n');
+                text.push_str(hint);
+            }
+            text
         },
     });
     // SH-072：view_image 的图片以引用形式回填成一条用户消息——Chat 协议不允许
