@@ -4535,7 +4535,13 @@ export function createAdapter(options: AdapterOptions): { remote: unknown; dispo
   const unlisten = bridge.listenEvents(onEvent)
   // 待审批表变化：刷新重建与卡片撤销都只认这一条通道。先订阅再查询，
   // 中间新插入的请求不会既不在查询结果里、也收不到事件。
-  const unlistenPending = bridge.listenApprovalPending?.((snapshot) => { reconcilePending(snapshot, true) })
+  const unlistenPending = bridge.listenApprovalPending?.((raw) => {
+    // 事件通道允许删除（快照里消失 = 请求已被收口），但只对**形状合法**的载荷生效：
+    // `{}` 之类非法载荷必须按「本次没有可用结论」处理，否则会被当成空表撤掉所有卡。
+    const snapshot = usablePendingSnapshot(raw)
+    if (snapshot === undefined) return
+    reconcilePending(snapshot, true)
+  })
   refreshPending()
   // 租约：页面在，后端才允许挂起等待审批；心跳中断 15s 后宿主统一按无人可答收口。
   const approvalLease = startApprovalLease(bridge)

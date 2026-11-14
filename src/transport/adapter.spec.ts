@@ -1726,6 +1726,38 @@ describe('适配层的命令面映射', () => {
     dispose()
   })
 
+  // 事件通道也带 `allowRemoval=true`：非法载荷若被当成空表，会把所有卡误撤。
+  // 反向对照：形状合法的空表**仍然**要撤卡，否则已收口的卡会永远留在界面上。
+  it('事件通道收到非法载荷时不撤卡，合法空表仍然撤卡', async () => {
+    let release: (() => void) | undefined
+    const answered = new Promise<string>((resolve) => { release = () => resolve('rejected') })
+    const bridge = approvalBridge(() => pendingSnapshot([SNAP_VIEW], 1))
+    const { remote, dispose } = createAdapter({ bridge })
+    const signals: AbortSignal[] = []
+    faceOf(remote).$on('approval/request', async (request: Record<string, unknown>) => {
+      const signal = (request as { signal?: AbortSignal }).signal
+      if (signal !== undefined) signals.push(signal)
+      return answered
+    })
+    bridge.pushApproval(pendingSnapshot([SNAP_VIEW], 1))
+    await vi.waitFor(() => { expect(signals).toHaveLength(1) })
+    expect(signals[0]?.aborted).toBe(false)
+
+    // 非法 `{}`：本次没有可用结论 → 不撤卡、也不补回执。
+    bridge.pushApproval({} as PendingApprovalsSnapshotWire)
+    await flush()
+    await flush()
+    expect(signals[0]?.aborted).toBe(false)
+    expect(bridge.calls.some(call => call.command === 'approve')).toBe(false)
+
+    // 合法空表：请求确实被收口 → 卡必须退场（别把"该撤"一起堵死）。
+    bridge.pushApproval(pendingSnapshot([], 2))
+    await vi.waitFor(() => { expect(signals[0]?.aborted).toBe(true) })
+    expect(bridge.calls.some(call => call.command === 'approve')).toBe(false)
+    release?.()
+    dispose()
+  })
+
   // CI 事实：run 43465798164 的前端测试里，测试桥的 `pending_approvals` 回了 `{}`，
   // 旧实现把它缓存成「最近快照」，注册审批 UI 时的补派发在微任务里抛
   // `TypeError: snapshot.approvals is not iterable`，两个文件记未捕获异常、整段判红。
