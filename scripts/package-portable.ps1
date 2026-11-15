@@ -7,9 +7,14 @@
 #
 # exe 取自 -Exe > $env:CARGO_TARGET_DIR\release\shaniu.exe > src-tauri\target\release\shaniu.exe；
 # 三处都找不到就直接报错，不拿旧产物凑。
+#
+# -Stage 可选（N7 补）：不传时仍是 `$OutDir\SHANIU-Portable`（历史行为）。要保留上一版的
+# 未压缩目录、只新增本版时用 `-Stage dist-release\SHANIU-Portable-0.2.7`，否则 stage 里的
+# SHANIU.exe 会被本版覆盖——0.2.7 出包时正是这个原因加的，不改默认值以免影响既有一键出包。
 param(
   [string]$Exe = "",
-  [string]$OutDir = "dist-portable"
+  [string]$OutDir = "dist-portable",
+  [string]$Stage = ""
 )
 $ErrorActionPreference = "Stop"
 $root = Split-Path -Parent $PSScriptRoot
@@ -73,7 +78,13 @@ $exeVersion = (Get-Item $Exe).VersionInfo.FileVersion
 if ($exeVersion -ne $version) {
   throw "[package-portable] 产物版本 $exeVersion 与版本源 $version 不一致（多半是旧 exe）：$Exe。先重新 pnpm tauri build，或用 -Exe 指定本次构建的产物。"
 }
-$stage = Join-Path $root "$OutDir\SHANIU-Portable"
+$stage = if ([string]::IsNullOrWhiteSpace($Stage)) {
+  Join-Path $root "$OutDir\SHANIU-Portable"
+} elseif ([System.IO.Path]::IsPathRooted($Stage)) {
+  $Stage
+} else {
+  Join-Path $root $Stage
+}
 # **只删脚本自己产出的文件**。data\ 是便携版的真实运行数据（配置、DPAPI 密钥、
 # 会话档案、日志、默认工作区），曾出现过在默认 stage 目录里直接双击试跑留下的 data\，
 # 旧版 `Remove-Item $stage -Recurse -Force` 会在下次出包时把它整棵删掉。
