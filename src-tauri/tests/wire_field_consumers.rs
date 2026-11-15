@@ -76,9 +76,10 @@ const RULES: &[Rule] = &[
     Rule {
         owner: "SessionEntry",
         variant: "CompactionSummary",
-        fields: "text range_start range_end at_ms trigger",
+        fields: "text range_start range_end at_ms trigger turn_start_at_ms",
         // 摘要正文与区间都进重建事件；`at_ms` 进导出事件时间（旧档 0 → 标不可信）；
-        // `trigger` 进导出三条 `compaction/*` 的 data，用来分辨手动/自动（R5-4）。
+        // `trigger` 进导出三条 `compaction/*` 的 data，用来分辨手动/自动（R5-4）；
+        // `turn_start_at_ms` 由重开重建读取，作为压缩后回合的墙钟起点（N10）。
         overrides: &[],
     },
     // ── EventMsg ────────────────────────────────────────────────────────────

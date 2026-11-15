@@ -1906,6 +1906,14 @@ export function createAdapter(options: AdapterOptions): { remote: unknown; dispo
     let stepHasAssistant = false
     /** 本回合已经折叠掉的 step 数：`TurnEnd.iterations` 拿它做口径校正。 */
     let stepsThisTurn = 0
+    /**
+     * 压缩摘要带出的回合墙钟起点。
+     *
+     * 压缩把本回合的用户消息换成摘要后，档案里再没有那次提交的条目；若拿首条幸存
+     * 条目的时刻当回合起点，「用时」就只算压缩之后那段（真机 7 分 15 秒 → 2 分 42 秒）。
+     * 只在没有用户消息可依时消费它；新用户消息自己就是下一回合的起点。
+     */
+    let pendingTurnStartMs: number | undefined
     const openStep = (step: number): void => {
       pushEvent(journal, 'step/start', { turn: journal.turn, step })
       stepOpen = true
@@ -1950,7 +1958,12 @@ export function createAdapter(options: AdapterOptions): { remote: unknown; dispo
       journal.taskOpen = true
       stepsThisTurn = 0
       // 档案重建没有投影流可推，只折叠状态：最终快照带出的就是 fold 到尾的值
+      // 回合起点取摘要带出的墙钟时刻（若有），`turn/start` 之后立刻恢复本条目的时刻。
+      const entryClock = replayClock
+      if (pendingTurnStartMs !== undefined) replayClock = pendingTurnStartMs
+      pendingTurnStartMs = undefined
       pushTurnStart(undefined, journal)
+      replayClock = entryClock
     }
 
     // 回放期间所有事件时刻都来自档案；没有任何条目时刻时是 0，读侧据此显示
@@ -2001,6 +2014,9 @@ export function createAdapter(options: AdapterOptions): { remote: unknown; dispo
           // 返回值必然是一条真实事件：档案第一条就是锚点时，`pushCompactionCheckpoint`
           // 会先自建一个被遮蔽的占位锚点，再按替换形态落节点——与实时同形。
           pushCompactionCheckpoint(journal, compactionId, entry.text, [startSeq, summarySeq])
+          // 摘要是被压缩区间里那次用户提交换来的：记下墙钟起点，等首条幸存条目建
+          // 回合时用它，否则回合用时只从压缩之后算起。旧档案没有这个键 → 保持缺省。
+          if ((entry.turn_start_at_ms ?? 0) > 0) pendingTurnStartMs = entry.turn_start_at_ms
           journal.entryToSeq[index] = journal.seq
           return
         }
@@ -2009,6 +2025,8 @@ export function createAdapter(options: AdapterOptions): { remote: unknown; dispo
           // 旧档案没有结局行：上一条用户消息开的回合还开着。留成「进行中」同样是猜，
           // 而且会一直转圈；这里如实标「状态未知」，不补「已中止」。
           if (journal.taskOpen) closeTurn()
+          // 新用户消息自己就是本回合的墙钟起点，不继承摘要里上一回合的时刻。
+          pendingTurnStartMs = undefined
           startTurn()
           openStep(0)
           // 新档案带结构化 `images`；旧档案只有正文里的 marker，按旧形态解码。

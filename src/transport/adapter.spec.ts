@@ -3510,6 +3510,64 @@ describe('权限挡位与底部指标的数据面', () => {
     expect(await statsOf(scriptedBridge(undefined, compressed))).toEqual(expected)
   })
 
+  it('N10：压缩重开后回合用时按墙钟算，不按首条幸存条目重算', async () => {
+    // 真机形状（r3 n8-rollout.jsonl）：turn 1 的用户消息 16:10:15 落档，回合 16:17:30 结束；
+    // 压缩把用户消息换成摘要后，档案里只剩 16:14:47 的助手条目。重建若拿它当回合起点，
+    // 用时就从 7 分 15 秒掉到 2 分 42 秒。
+    const compressed = [
+      // 后端投影在摘要上带出被吞用户消息的落档时刻。
+      { kind: 'compaction_summary', text: '前几步摘要', range_start: 0, range_end: 3, at_ms: 272_000, turn_start_at_ms: 1_000 },
+      { kind: 'message', role: 'assistant', text: '压缩后的回复', at_ms: 288_000 },
+      { kind: 'turn_end', turn: 1, task_id: 'agent#1', iterations: 3, reason: 'completed', at_ms: 436_000 },
+    ]
+    // 完整档案（导出/rollout 口径）：用户消息还在，起点本来就是 1_000。
+    const full = [
+      { kind: 'message', role: 'user', text: '原始任务', at_ms: 1_000 },
+      { kind: 'message', role: 'assistant', text: '压缩后的回复', at_ms: 288_000 },
+      { kind: 'turn_end', turn: 1, task_id: 'agent#1', iterations: 3, reason: 'completed', at_ms: 436_000 },
+    ]
+
+    const replay = async (entries: Record<string, unknown>[]) => {
+      const { remote, dispose } = createAdapter({ bridge: scriptedBridge(undefined, entries) })
+      const iterator = faceOf(remote).session.follow({ address: { kind: 'session', sessionId: 'agent-n10' } })
+      const events = eventsOf((await iterator.next()).value as Record<string, unknown>)
+      await iterator.return?.(undefined)
+      dispose()
+      const start = events.find(event => event['type'] === 'turn/start')
+      const end = events.find(event => event['type'] === 'turn/end')
+      return {
+        start: start?.['time'] as number,
+        end: end?.['time'] as number,
+        elapsed: (end?.['time'] as number) - (start?.['time'] as number),
+      }
+    }
+
+    // 反向对照：把 `pendingTurnStartMs` 的消费去掉 → start 变成 288_000，用时 2 分 28 秒。
+    const reopened = await replay(compressed)
+    expect(reopened.start).toBe(1_000)
+    expect(reopened.elapsed).toBe(435_000)
+    // 三处一致：压缩重开 = 完整档案（导出/rollout 同一对时刻）。
+    expect(await replay(full)).toEqual(reopened)
+    // 同一份档案重复重开：数值必须一模一样。
+    expect(await replay(compressed)).toEqual(reopened)
+  })
+
+  it('N10：压缩后的新用户消息自己就是回合起点，不继承上一回合的墙钟', async () => {
+    const archive = [
+      { kind: 'compaction_summary', text: '旧回合摘要', range_start: 0, range_end: 3, at_ms: 272_000, turn_start_at_ms: 1_000 },
+      { kind: 'message', role: 'user', text: '新问题', at_ms: 500_000 },
+      { kind: 'message', role: 'assistant', text: '答', at_ms: 501_000 },
+      { kind: 'turn_end', turn: 2, task_id: 'agent#2', iterations: 1, reason: 'completed', at_ms: 502_000 },
+    ]
+    const { remote, dispose } = createAdapter({ bridge: scriptedBridge(undefined, archive) })
+    const iterator = faceOf(remote).session.follow({ address: { kind: 'session', sessionId: 'agent-n10b' } })
+    const events = eventsOf((await iterator.next()).value as Record<string, unknown>)
+    await iterator.return?.(undefined)
+    dispose()
+    const start = events.find(event => event['type'] === 'turn/start')
+    expect(start?.['time']).toBe(500_000)
+  })
+
   it('N3：重复结局行只算一轮，重复重开数值不变', async () => {
     // 真机档案出现过 7 条 turn_end / 3~4 轮：同一轮被多个写者各收口一次。
     const duplicated = [

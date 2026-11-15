@@ -77,6 +77,13 @@ export type SessionEntryLike =
      * 缺省 = 旧档案未记录（R5-4 之前）。导出用它分辨手动与自动，不再从事件流反推。
      */
     readonly trigger?: string
+    /**
+     * 被本区间吞掉的那个用户回合的墙钟起点（用户消息落档时刻，Unix 毫秒）。
+     *
+     * 压缩视图里原用户消息已被摘要取代，重建 `turn/start` 只能用它；缺省或 0 =
+     * 区间里没有用户消息（或旧档案未记录），读侧退回首条幸存条目的时刻。
+     */
+    readonly turn_start_at_ms?: number
   }
   | {
     readonly kind: 'tool_call'

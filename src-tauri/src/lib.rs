@@ -1152,6 +1152,13 @@ pub enum SessionEntry {
         /// `None` = 旧档案未记录（R5-4）。原样来自 `RolloutItem::Compacted`。
         #[serde(default, skip_serializing_if = "Option::is_none")]
         trigger: Option<String>,
+        /// 被本区间吞掉的那个用户回合的墙钟起点（用户消息落档时刻）。
+        ///
+        /// 压缩视图里原用户消息已被摘要取代，重开后只能用这个时刻重建 `turn/start`；
+        /// 否则用时从首条幸存条目算起，真机 7 分 15 秒会显示成 2 分 42 秒。
+        /// `0` = 区间里没有用户消息（或旧档案未记录），读侧退回首条幸存条目的时刻。
+        #[serde(default)]
+        turn_start_at_ms: u64,
     },
     ToolCall {
         call_id: String,
@@ -1200,11 +1207,19 @@ fn project_entries(items: &[rollout::RolloutItem]) -> Result<Vec<SessionEntry>, 
             trigger,
         } = item
         {
+            let turn_start_at_ms = compacted_turn_start_at_ms(&slots, *range_start, *range_end);
             apply_compaction(
                 &mut slots,
                 *range_start,
                 *range_end,
-                summary_entry(summary, *range_start, *range_end, *at_ms, trigger.as_deref()),
+                summary_entry(
+                    summary,
+                    *range_start,
+                    *range_end,
+                    *at_ms,
+                    trigger.as_deref(),
+                    turn_start_at_ms,
+                ),
             )?;
         }
     }
@@ -1274,6 +1289,7 @@ fn summary_entry(
     range_end: usize,
     at_ms: u64,
     trigger: Option<&str>,
+    turn_start_at_ms: u64,
 ) -> SessionEntry {
     SessionEntry::CompactionSummary {
         text: summary.to_string(),
@@ -1282,6 +1298,7 @@ fn summary_entry(
         // 有落档时刻就用它；旧档没有（`0`）由读侧标不可信，不借用导出时刻。
         at_ms,
         trigger: trigger.map(str::to_string),
+        turn_start_at_ms,
     }
 }
 
@@ -1339,6 +1356,8 @@ fn project_slots_with(items: &[rollout::RolloutItem], include_compaction: bool) 
                     *range_end,
                     *at_ms,
                     trigger.as_deref(),
+                    // 完整视图不替换原文，用户消息还在，导出侧不需要这个回退起点。
+                    0,
                 )))
             }
             rollout::RolloutItem::Compacted { .. } => {}
@@ -1390,6 +1409,39 @@ fn role_name(role: &model_client::Role) -> String {
         model_client::Role::System => "system",
     }
     .to_string()
+}
+
+/// 压缩区间被摘要取代后，本回合的墙钟起点必须跟着摘要留在视图里：
+/// 区间里**最后一条**用户消息的落档时刻；若区间只含旧摘要（连续压缩），沿用它的起点。
+///
+/// 取"最后一条"是因为摘要吞掉的若是多个回合，幸存尾巴承接的是最近那一轮；
+/// 而连续压缩时区间里已没有用户消息，只能从旧摘要继承，不能归零。
+fn compacted_turn_start_at_ms(slots: &[Slot], range_start: usize, range_end: usize) -> u64 {
+    let mut start = 0;
+    let Some(mut index) = history_position(slots, range_start) else {
+        return 0;
+    };
+    let mut remaining = range_end.saturating_sub(range_start);
+    while remaining > 0 && index < slots.len() {
+        if slots[index].is_history() {
+            match &slots[index] {
+                Slot::Message(SessionEntry::Message { role, at_ms, .. })
+                    if role == "user" && *at_ms > 0 =>
+                {
+                    start = *at_ms;
+                }
+                Slot::Summary(SessionEntry::CompactionSummary { turn_start_at_ms, .. })
+                    if *turn_start_at_ms > 0 =>
+                {
+                    start = *turn_start_at_ms;
+                }
+                _ => {}
+            }
+            remaining -= 1;
+        }
+        index += 1;
+    }
+    start
 }
 
 /// 第 `n` 个历史槽位在槽位序列里的下标（`n` 等于历史长度时无对应项 = 追加到末尾）。
@@ -4167,9 +4219,13 @@ mod session_projection_tests {
     }
 
     fn msg(role: Role, text: &str) -> RolloutItem {
+        msg_at(role, text, 0)
+    }
+
+    fn msg_at(role: Role, text: &str, at_ms: u64) -> RolloutItem {
         RolloutItem::ResponseItem {
             item: HistoryItem::Message { role, text: text.into(), reasoning: None },
-            at_ms: 0,
+            at_ms,
         }
     }
 
@@ -4319,6 +4375,59 @@ mod session_projection_tests {
             )),
             "被压缩区间里的原文不得混进正常视图：{entries:?}"
         );
+    }
+
+    /// 回合用时的墙钟起点必须跨压缩保留：摘要吞掉用户消息后，投影要带出那次提交的
+    /// 落档时刻；否则重开只能从首条幸存条目算起（真机 7 分 15 秒 → 2 分 42 秒）。
+    ///
+    /// 反向对照：`compacted_turn_start_at_ms` 恒返回 0，本用例两次 `1_000` 断言变红。
+    #[test]
+    fn compaction_summary_keeps_the_turn_wall_clock_start() {
+        let anchor = |start: usize, end: usize, summary: &str, at_ms: u64| RolloutItem::Compacted {
+            range_start: start,
+            range_end: end,
+            summary: summary.into(),
+            at_ms,
+            trigger: Some("pressure".into()),
+        };
+
+        let items = vec![
+            msg_at(Role::User, "原始任务", 1_000),
+            msg_at(Role::Assistant, "答一", 1_200),
+            anchor(0, 2, "第一版摘要", 2_000),
+            msg_at(Role::Assistant, "压缩后的回复", 30_000),
+        ];
+        let first = project_entries(&items).expect("锚点区间合法");
+        assert_eq!(
+            turn_start_of(&first[0]),
+            1_000,
+            "摘要必须带出被吞用户消息的落档时刻：{first:?}"
+        );
+        let value = serde_json::to_value(&first[0]).expect("投影可序列化");
+        assert_eq!(value["turn_start_at_ms"], 1_000, "字段名必须与前端契约一致：{value}");
+
+        // 连续压缩：第二个锚点只覆盖第一版摘要，起点必须继承，不能归零。
+        let items = vec![
+            msg_at(Role::User, "原始任务", 1_000),
+            msg_at(Role::Assistant, "答一", 1_200),
+            anchor(0, 2, "第一版摘要", 2_000),
+            msg_at(Role::Assistant, "压缩后的回复", 30_000),
+            anchor(0, 1, "第二版摘要", 40_000),
+        ];
+        let second = project_entries(&items).expect("锚点区间合法");
+        assert_eq!(second.len(), 2, "只剩摘要与压缩后的回复：{second:?}");
+        assert_eq!(
+            turn_start_of(&second[0]),
+            1_000,
+            "连续压缩不得丢掉回合起点：{second:?}"
+        );
+    }
+
+    fn turn_start_of(entry: &SessionEntry) -> u64 {
+        match entry {
+            SessionEntry::CompactionSummary { turn_start_at_ms, .. } => *turn_start_at_ms,
+            other => panic!("期望 CompactionSummary，得到 {other:?}"),
+        }
     }
 
     /// 夹在压缩区间里的 `TurnEnd` 是审计记录：不占锚点序号，也不该被区间吞掉。
