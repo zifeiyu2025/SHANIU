@@ -235,8 +235,16 @@ fn gitdir_target(pointer: &Path, root: &Path) -> Option<PathBuf> {
 }
 
 /// 候选路径是否落在某个受保护子路径之下；命中时返回命中的保护根（用于报错文案）。
+///
+/// 比较前必须把候选路径的**最深已存在祖先**展开：保护根是 canonical 形态（长名），
+/// 而候选常常还不存在（`Add File: .git/hooks/pre-commit`）。只用 [`normalize`]
+/// 会让不存在的尾段保留调用方拼写——8.3 短名工作区（CI 的 `RUNNER~1`）里短名与
+/// 长名前缀永远对不上，保护静默失效（CI run 43753711989 就是这样红的）。
+/// [`normalize`] 的口径不能改：它是 ACL 键（创建前后必须是同一个键）。
 pub fn is_protected_path(workspace_root: &Path, candidate: &Path) -> Option<PathBuf> {
-    let candidate = normalize(candidate);
+    let candidate = crate::config::path_norm::strip_verbatim(
+        &crate::config::path_norm::deepest_existing(candidate),
+    );
     protected_subpaths(workspace_root)
         .into_iter()
         .find(|guard| starts_with_path(&candidate, guard))
@@ -2048,6 +2056,42 @@ mod tests {
                 "{target} 不该命中保护"
             );
         }
+    }
+
+    /// 8.3 短名（CI 的 `RUNNER~1`）下，未落盘的尾段也必须命中保护根。
+    ///
+    /// 回归锁：保护根展开成长名、候选只剩调用方给的短名时，纯字面前缀比较会漏判，
+    /// 保护在 CI 上静默失效（run 43753711989）。卷上禁用 8.3 时短名等于长名，
+    /// 断言退化为恒等；CI 的临时目录会真正走到短名分支。
+    #[cfg(windows)]
+    #[test]
+    fn protected_path_matches_through_8_3_short_names() {
+        use std::os::windows::ffi::{OsStrExt, OsStringExt};
+        use windows::core::PCWSTR;
+        use windows::Win32::Storage::FileSystem::GetShortPathNameW;
+
+        let ws = temp_dir("protected-short-name");
+        std::fs::create_dir_all(ws.path().join(".git").join("hooks")).unwrap();
+
+        let wide: Vec<u16> = ws
+            .path()
+            .as_os_str()
+            .encode_wide()
+            .chain(std::iter::once(0))
+            .collect();
+        let mut buffer = vec![0u16; 512];
+        let len = unsafe { GetShortPathNameW(PCWSTR(wide.as_ptr()), Some(&mut buffer)) };
+        assert!(len > 0, "GetShortPathNameW 必须成功");
+        buffer.truncate(len as usize);
+        let short = PathBuf::from(std::ffi::OsString::from_wide(&buffer));
+
+        // 工作区与候选都用短名（CI 的真实形态）：保护根会被展开成长名，
+        // 候选的未落盘尾段只有展开已存在祖先后才能与它前缀对齐。
+        assert!(
+            is_protected_path(&short, &short.join(".git").join("hooks").join("pre-commit"))
+                .is_some(),
+            "短名工作区里未落盘的钩子路径必须命中保护：{short:?}"
+        );
     }
 
     /// T10：装/卸后 `.git` 的 DACL 逐字节一致。
