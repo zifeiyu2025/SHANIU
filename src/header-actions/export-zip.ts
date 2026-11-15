@@ -16,10 +16,9 @@
  * 用户主动行为，静默结束；「写盘失败」是下载开始之后的事，走日志留痕。
  * 想让失败可见需要另立 toast 通道，**不要**在这里 hack vendored controller 的内部 store。
  *
- * **为什么 canonical JSONL 由前端产出、ZIP 由 Rust 编码**：见
- * `.workbuddy/reports/shaniu-m4-sh114-batch2-plan-2026-11-07.md` D1——事件语义只有
- * `session-events.ts` 一份实现（与 Markdown 导出同源），Rust 只负责压缩与路径安全，
- * 避免出现"导出 / 回放 / 搜索"三套事件推导。
+ * **为什么 canonical JSONL 由前端产出、ZIP 由 Rust 编码**（SH-114 批 2 的设计决定）：
+ * 事件语义只有 `session-events.ts` 一份实现（与 Markdown 导出同源），Rust 只负责压缩
+ * 与路径安全，避免出现"导出 / 回放 / 搜索"三套事件推导。
  */
 import type { SessionEvent } from '@deepseek-ai/dsh-session/types'
 import { SESSION_LOG_EXPORT_ROUTE } from '../dsh/packages/session-query/session-log-export/src/routes'
