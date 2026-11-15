@@ -245,14 +245,33 @@ pub fn build_responses_request(
 
 /// history → Responses `input` 数组。
 ///
-/// 除图片消息外一律沿用 serde 的既有形状（`message` / `function_call` /
-/// `function_call_output`），不顺手改协议。图片消息必须发成
+/// **每一条都必须显式构造成 Responses 的形状，不能沿用 `HistoryItem` 的 serde 形态。**
+/// 后者是 ChatCompletions 的形状：纯文本消息序列化成
+/// `{"type":"message","role":"user","text":"…"}`，而 Responses 的 message 输入项只认
+/// `content` 数组——`text` 是陌生键，端点忽略、不报错，**用户消息就此静默消失**
+/// （2026-11-15 评测线实测：Responses 臂 4 轮 0 文件改动，模型反复说「这条消息里没有
+/// 具体任务内容」；同一题换 chat 协议立刻通过）。同一坑覆盖 assistant 文本与 system
+/// 注入，因此三类文本一律走 [`responses_message_item`]。
+///
+/// 形状与 codex 对齐（`protocol/src/models.rs` 的
+/// `ResponseItem::Message { content: Vec<ContentItem> }`）：user/system 用
+/// `input_text`，assistant 用 `output_text`（assistant 文本是模型产出物，回放时仍是
+/// output 语义）。`arguments` 是 JSON **字符串**、`function_call_output.output` 是字符串，
+/// 这两项与本仓库既有形态一致，显式构造只是把形状钉在一处，不再依赖「serde 的字段名
+/// 恰好等于 wire 字段名」。
+///
+/// `reasoning` 在这里**不发**：Responses 回放推理要独立的 `reasoning` item（需
+/// `encrypted_content`），我们没有加密推理可回放；把明文 `reasoning` 当消息字段塞进去
+/// 反而是陌生键。ChatCompletions 侧仍按 SH-083 回传。
+///
+/// 图片消息必须发成
 /// `{"role","content":[{"type":"input_text"},{"type":"input_image","image_url":"data:…"}]}`：
 /// 真机探针验证过，`image_url` 写成对象会 400（`image_url is required`）。
 fn responses_input(history: &[HistoryItem]) -> Vec<serde_json::Value> {
     degrade_orphan_tool_outputs(history)
         .iter()
         .map(|item| match item {
+            HistoryItem::Message { role, text, .. } => responses_message_item(*role, text),
             HistoryItem::ImageMessage { role, text, images } => {
                 let mut content = Vec::new();
                 if !text.trim().is_empty() {
@@ -270,9 +289,36 @@ fn responses_input(history: &[HistoryItem]) -> Vec<serde_json::Value> {
                 }
                 serde_json::json!({ "role": role, "content": content })
             }
-            other => serde_json::to_value(other).expect("HistoryItem 序列化不应失败"),
+            HistoryItem::FunctionCall { name, arguments, call_id } => serde_json::json!({
+                "type": "function_call",
+                "name": name,
+                "arguments": arguments,
+                "call_id": call_id,
+            }),
+            HistoryItem::FunctionCallOutput { call_id, output } => serde_json::json!({
+                "type": "function_call_output",
+                "call_id": call_id,
+                "output": output,
+            }),
         })
         .collect()
+}
+
+/// 一条纯文本历史项 → Responses message 输入项。
+///
+/// `content` 是**唯一**被端点读到的正文位置；写成同级 `text` 字段等于发一条空消息。
+/// 角色只决定 part 类型，不改消息结构。
+fn responses_message_item(role: Role, text: &str) -> serde_json::Value {
+    let part = match role {
+        // assistant 的文本是模型产出物；codex 回放时用 output_text。
+        Role::Assistant => "output_text",
+        Role::User | Role::System => "input_text",
+    };
+    serde_json::json!({
+        "type": "message",
+        "role": role,
+        "content": [{ "type": part, "text": text }],
+    })
 }
 
 /// 缓存里没有图片字节时的替代文本（进程重启或缓存淘汰）。
@@ -1107,6 +1153,43 @@ mod tests {
         assert_eq!(body["input"][2]["type"], "function_call_output");
         assert_eq!(body["tools"][0]["type"], "function");
         assert_eq!(body["tools"][0]["name"], "unified_exec");
+        // 文本必须落在 `content` 数组里：同级的 `text` 字段是 ChatCompletions 形状，
+        // Responses 端点会静默忽略（用户消息消失，评测线 2026-11-15 实测）。
+        assert!(body["input"][0].get("text").is_none(), "不得再出现同级 text 字段");
+        assert_eq!(body["input"][0]["content"][0]["type"], "input_text");
+        assert_eq!(body["input"][0]["content"][0]["text"], "任务");
+        assert_eq!(body["input"][1]["arguments"], "{}", "arguments 必须是 JSON 字符串");
+    }
+
+    /// 三个角色共用同一条 message 形状，只有 content part 类型不同：
+    /// assistant 用 `output_text`（模型产出物），user/system 用 `input_text`。
+    #[test]
+    fn responses_message_roles_use_content_parts() {
+        let p = provider("openai-responses");
+        let history = vec![
+            HistoryItem::Message { role: Role::System, text: "注入".into(), reasoning: None },
+            HistoryItem::Message { role: Role::User, text: "任务".into(), reasoning: None },
+            HistoryItem::Message {
+                role: Role::Assistant,
+                text: "回复".into(),
+                reasoning: Some("推理".into()),
+            },
+        ];
+        let body = build_responses_request(&p, &history, &[], "SYS");
+        let input = body["input"].as_array().unwrap();
+        assert_eq!(input.len(), 3);
+        for (idx, role) in ["system", "user", "assistant"].iter().enumerate() {
+            assert_eq!(input[idx]["role"], *role);
+            assert_eq!(input[idx]["type"], "message");
+            assert!(input[idx].get("text").is_none(), "{role} 仍是同级 text：{input:?}");
+        }
+        assert_eq!(input[0]["content"][0]["type"], "input_text");
+        assert_eq!(input[1]["content"][0]["type"], "input_text");
+        assert_eq!(input[2]["content"][0]["type"], "output_text");
+        assert_eq!(input[2]["content"][0]["text"], "回复");
+        // reasoning 不能混进 Responses 的消息项：那边回放推理要独立的 reasoning item
+        // （带 encrypted_content），明文 reasoning 是陌生键。
+        assert!(input[2].get("reasoning").is_none(), "{input:?}");
     }
 
     /// Responses 路径同一兜底：`function_call_output` 找不到对应的 `function_call`
