@@ -1089,4 +1089,42 @@ mod tests {
         // 保留额度是 1500 token，条目这一侧的上界由它换算而来；这里留足余量。
         assert!(largest <= 90, "history_len 无界：{largest}");
     }
+
+    /// 问题一（真机 14 步 4 次压缩）的判据：常规预算下压缩次数不随步数增长。
+    ///
+    /// 真机那几次压缩都发生在 `token_budget=5000`（r4）/ `100`（r5-auto）的冒烟配置里：
+    /// 同会话首个请求报回 5,154 tokens，其中 system prompt 与工具声明是**固定开销**，
+    /// 压缩动不了它。预算低于固定开销时，每一步都必然越过阈值——这是预算定义下的
+    /// 必然结果，不是策略在空转；产品默认 500,000 时同样的 14 步应当一次都不压。
+    ///
+    /// 这里用真机量级（每步约 1.5k tokens）锁住常规预算的判据；小预算下"只压真实
+    /// 内容、不压纯系统注入/旧摘要"的回收口径由 `automatic_planning_*` 三条钉住。
+    ///
+    /// 反向对照：把判据改成不比较预算（恒返回 `Some`），本用例立刻红。
+    #[test]
+    fn normal_budget_does_not_compact_a_fourteen_step_turn() {
+        let mut history = vec![msg(Role::User, "跑一遍冒烟并汇报")];
+        let mut compactions = 0;
+        for step in 0..14 {
+            history.push(msg(
+                Role::Assistant,
+                &format!("第 {step} 步说明：{}", "说明".repeat(300)),
+            ));
+            history.push(msg(
+                Role::Assistant,
+                &format!("工具输出：{}", "结果".repeat(600)),
+            ));
+            let estimate = history_tokens(&history);
+            if plan_if_needed(estimate, &history, 500_000).is_some() {
+                compactions += 1;
+            }
+        }
+        assert_eq!(compactions, 0, "常规预算下 14 步触发了压缩");
+        // 按 128K 窗口推导的阈值（102,400）同样够用。
+        assert!(
+            history_tokens(&history) < 102_400,
+            "14 步估算 {} 已逼近窗口阈值",
+            history_tokens(&history)
+        );
+    }
 }

@@ -267,3 +267,15 @@ SHA256 `7CC9F73A7851574FD03AA1A559A3A2B3AE497ACACF7F9EB39D0FC1B6629C0D24`（详�
 - 截图（`r6/shots/`）：`r51-live-compaction-node.png`、`r51-live-after-followup.png`、`r51-click-once-summary.png`、`r54-save-dialog.png`、`r55-failure-block.png`、`r55-manual-compact-fail.png`、`r55-fail-instance-new.png`
 - 档案（`r6/evidence/`）：`r6-ui-observations.txt`、`r6-export-check.txt`、`r6-log-compaction.txt`、`r6-scans.txt`、`r6-uia-tree-post-turn.txt`、`r6-uia-tree-reopen.txt`、`r6-dom-after-click.json`、`r6-export-session.v4.jsonl`、`r6-export-session-manual.v4.jsonl`
 - 全部运行在 `scratch\` 隔离目录，未改产品代码。
+
+---
+
+## 2026-11-15 复核：两条登记问题的定性
+
+### 问题一：压缩次数随步数线性增长（14 步 4 次压缩）→ 判定为设计/配置放大，关闭，不改压缩策略
+
+- **可复现条件**：两次运行都把 `token_budget` 压到固定开销以下——r4 用 `5000`，同一会话首个请求就报回 `input_tokens=5154`；r5-auto / r6-auto 用 `100`，而摘要正文本身 177–319 字符（约 44–80 tokens），加 30% 保留段后不可能落回 100。
+- **预算量的是整个请求**：system prompt + 工具声明属于固定开销，压缩动不了；预算低于固定开销时每一步都必然越阈，压缩是判据的必然结果，不是策略空转。
+- **压缩确实在回收**（不是"为几十 token 付一次摘要"）：r4 三次自动压缩 `compressed_items=12/3/32`，之后 `history_len` 稳定在 2–8；N9 守卫后小预算也只放过含真实内容的区间（r3 的 `turn=4..6` 报文 6.3–6.7k，但不再写摘要，也不再有 `compressed_items=1` 的空转）。
+- **常规预算**：产品默认 `500000` 的会话（r5-default 23 条 response_item、r6）`SH-032=0`、`compacted=0`；按 128K 窗口推导的 `102400` 阈值下，14 步量级也只到约 21k。
+- **结论**：不加减压节流。任何"看起来少"的魔法阈值要么压住合法压缩、要么让历史无界增长。已用 `normal_budget_does_not_compact_a_fourteen_step_turn` 钉住"常规预算下 14 步 0 次压缩"；小预算下"只压真实内容"的口径由既有 `automatic_planning_*` 三条守住。需要在低预算下少压时，改配置（`token_budget` 设到固定开销 + 预期历史之上，或设 0 关闭自动压缩），不改策略。
