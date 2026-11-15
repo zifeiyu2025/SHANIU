@@ -23,11 +23,59 @@
    改为确定性重建 DACL（逐条复制、跳过匹配项）。T10 判据用仓库既有的
    `compare_restored`（DACL 本体逐字节一致，只白名单 `SE_DACL_AUTO_INHERITED`）。
 2. **§3.4#4「删 `.git/index` 必失败」未达成**：`WRITE_RESTRICTED` 的 restricting SID
-   只在**写访问**评估时参与（`CreateRestrictedToken` 文档），实测删除仍成功；
-   AppContainer 档连普通文件都删不掉，探针不具区分力。破坏性删除未防护（非提权路径，
-   写入/新建/改名仍被拒）。详见 `docs/16` §12.5。
+   只在**写访问**评估时参与（`CreateRestrictedToken` 文档），实测 `del` / `rmdir /s /q`
+   均成功；AppContainer 档连普通文件都删不掉，探针不具区分力。
+   **不当作已接受偏差**，见下方「待批项 P1」；`docs/16` §12.5 记录了探针与评估路径。
 3. **T4 的早拒从 `tool_router::resolve_for_write` 下移到 `tools/apply_patch.rs`**：
    `scripts/check-deps.ps1` 按 `docs/01 §2.3.1` 只允许 `tools → sandbox`，`tool_router`
    不含 sandbox 边；硬加边要改门禁权威表，等于为一个函数放宽架构约束。`resolve_for_write`
    的唯一生产调用方就是 `apply_patch`（4 处），下移后强制力与文案不变，
    组件边界（`.gitignore` 可写）用例也随之下移。
+
+---
+
+## 待批项 P1（**未接受**，需用户裁决）：删除防护
+
+§3.4#4「删 `.git/index` 必失败」**当前不成立**。这不是「先放着」，也不是已接受的偏差；
+本条需要改身份模型或放宽其他边界，超出 D7 授权范围，**必须由用户拍板**。
+
+### 事实（2026-11-16 本机探针，`WorkspaceWrite` + `OsSandbox::RestrictedToken`）
+
+工作区 `.git` 已带 D7 的 deny ACE（掩码 `0x001F_0156`），命令逐条执行：
+
+| 命令 | 结果 |
+|---|---|
+| `echo x> .git\config` | exit 1，`Access is denied.`（写/覆盖被拒） |
+| `ren .git\index index2` | exit 1，`Access is denied.`（改名被拒） |
+| `del .git\config` | **exit 0，文件真的没了** |
+| `rmdir /s /q .git` | **exit 0，整个 `.git` 被删** |
+
+即：写/新建/改名被挡，**删除不受任何约束**，包括对 `.git` 的递归删除。
+
+### 为什么在本机制内修不了（访问位评估路径）
+
+1. 写约束档的令牌是 `CreateRestrictedToken(..., DISABLE_MAX_PRIVILEGE | LUA_TOKEN |
+   WRITE_RESTRICTED)`，工作区写 SID **只出现在 restricting 列表**
+   （`src-tauri/src/sandbox/windows_impl.rs:184-238`），不在令牌的普通 SID 列表里。
+2. `WRITE_RESTRICTED` 的官方口径是「restricting SID **只在评估写访问时**参与」
+   （`CreateRestrictedToken` 的 flags 说明）。内核因此做两次检查：
+   - pass 1：用令牌**普通 SID** 过整条 DACL——所有访问位都算；
+   - pass 2：用 **restricting SID** 再过一遍——**只对写访问位**做。
+3. D7 的 deny ACE 只匹配工作区写 SID，所以它**只在 pass 2 命中**。`DELETE` /
+   `FILE_DELETE_CHILD` 不是写访问位 → pass 2 不评估 → 永远不生效；pass 1 里工作区
+   写 SID 不在令牌 SID 列表里 → 也不命中。
+4. 因此「把 deny DELETE 收窄成只作用于 `.git` 内的目标文件」**不解决问题**：失败原因
+   不是 ACE 的作用域，而是这条 SID 根本不参与 DELETE 判定。加在文件上、加在目录上、
+   加 `INHERIT_ONLY`，结果都一样。
+5. 反向验证：AppContainer 档下容器 SID 是**普通** SID（走 pass 1），删除确实被拒；
+   但那一档连普通文件都删不掉，探针不具区分力，也不能当作默认档。
+
+### 候选方案与代价（供裁决，未实施）
+
+| 方案 | 做法 | 代价 / 风险 |
+|---|---|---|
+| A（正确解） | 沙箱子进程改用**独立低权 Windows 账户**：deny ACE 打在该账户用户 SID 上，走 pass 1，DELETE 生效；用户本人 SID 不受影响 | 大：账户/配置文件/`CARGO_HOME`/temp/凭据管理，安装与升级链路全要改 |
+| B（中） | 对「会触碰 `.git` 的命令」切 AppContainer 档执行 | 中：要按命令选档、补容器授权；AppContainer 读限制更严，行为差异大 |
+| C（小，仅纵深） | `unified_exec` 命令级拒绝删除类操作（`del` / `rmdir` / `Remove-Item` / `git clean -fdx`…）并留审计 | 小：**可绕过**（`[IO.File]::Delete`、编译出的 helper、脚本），不能当验收判据 |
+
+建议：先上 C 作纵深（不改任何验收判据），A 另立规格。**在用户裁决前，§3.4#4 保持未达成**。
