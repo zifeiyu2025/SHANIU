@@ -33,7 +33,7 @@
 ## 收尾
 
 31. [x] 全量：`pnpm typecheck`、`pnpm exec vitest run --exclude "scratch/**"`（491 passed）、`cargo test -- --test-threads=1`（1095 passed）、`cargo clippy --all-targets -- -D warnings`（0，`compact_in_place` 加 8 参数 allow）、`check-deps`（0 违规）、`check-doc-claims`（A 类缺口 0）、`align-report --check`（通过）。
-32. [ ] 四笔提交（只 add 本任务路径，不碰 `docs/smoke/`）；`git fetch` 后非 force 推送；盯 gate + product-smoke + 对齐账本到结论，逐项报告。
+32. [x] 五笔提交（`e816b7b` `6806856` `26f0603` `d8ab83f` `02250ba`，只 add 本任务路径，不碰 `docs/smoke/`）；`git fetch` 后非 force 推送 `73546f9..02250ba`；CI run [43664959027](https://github.com/zifeiyu2025/SHANIU/actions/runs/43664959027) 全绿：`product-smoke` success、`gate` success（依赖方向 / 文档断言 / clippy / 后端测试 / 前端测试 / 上游对齐账本 / 前端构建 七步全 ✓）。
 
 ## v2 历史（已完成）
 
