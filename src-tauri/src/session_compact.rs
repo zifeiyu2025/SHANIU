@@ -153,7 +153,13 @@ fn emit_ended(
 ) {
     let (ok, error, history_tokens_after) = match result {
         Ok(tokens) => (true, None, Some(tokens)),
-        Err(error) => (false, Some(error), None),
+        Err(error) => {
+            // R5-5：手动压缩失败此前只有前端痕迹与 rollback，日志 0 行——事后无法回答
+            // "这次为什么没压成"。与成功日志同 tag（SH-032）、不同级别（失败必须 warn，
+            // 才会进用户可见的日志级别）。
+            tracing::warn!(trigger = "manual", error = %error, "上下文压缩失败（SH-032）");
+            (false, Some(error), None)
+        }
     };
     emit(
         sink,

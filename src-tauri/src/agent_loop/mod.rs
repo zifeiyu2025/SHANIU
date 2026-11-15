@@ -348,6 +348,12 @@ pub struct AgentLoop {
 /// 磁盘满/权限错这类持续性故障会在第一次 flush 就触顶。
 const MAX_ROLLOUT_WRITE_ATTEMPTS: u32 = 3;
 
+/// 压缩总结请求发起失败时给用户看的正文前缀（R5-5）。
+///
+/// 刻意不带「本轮中止」：失败区块的标题已经是「本轮运行失败」，正文再出现一次
+/// 「本轮」会在辅助功能读到的全树文本里连成「本本轮运行失败」。
+const COMPACT_REQUEST_FAILED: &str = "压缩请求发起失败：";
+
 /// 把 `history[*recorded..]` 逐条追加进档案，成功一条推进一格。
 ///
 /// **失败时游标停在失败条目前**（审计 H3）：已成功写入的前缀不回退，失败条目与它之后
@@ -542,7 +548,7 @@ impl AgentLoop {
         let mut stream = tokio::select! {
             _ = cancel.cancelled() => return Err(CompactAbort::Cancelled),
             result = opening => result
-                .map_err(|e| CompactAbort::Failed(format!("压缩请求发起失败，本轮中止：{e}")))?,
+                .map_err(|e| CompactAbort::Failed(format!("{COMPACT_REQUEST_FAILED}{e}")))?,
         };
         let mut summary = String::new();
         // P0-2：压缩流也必须收到终态标记才算成功；中途 `Failed`/`Incomplete`/静默 EOF
@@ -743,7 +749,11 @@ impl AgentLoop {
                     // 压缩失败不顶替原始错误：用户要看的是「上下文超出窗口」，
                     // 「总结请求也失败」只是补救没成功，不能当成终局原因。
                     CompactAbort::Failed(message) => {
-                        tracing::warn!(turn, error = %message, "溢出补救失败，保留原始 ContextOverflow");
+                        tracing::warn!(
+                            turn,
+                            error = %message,
+                            "上下文压缩失败（SH-032）：溢出补救失败，保留原始 ContextOverflow"
+                        );
                         OverflowOutcome::GiveUp
                     }
                     CompactAbort::ArchiveUnavailable(message) => {
@@ -1322,6 +1332,12 @@ impl AgentLoop {
                                 break 'outer;
                             }
                             CompactAbort::Failed(_) => {
+                                // R5-5：轮前预算压缩失败此前既无日志也无 turn_error 之外的
+                                // 痕迹；与手动/溢出同一 tag，事后一条 grep 能定位是哪条路径。
+                                tracing::warn!(
+                                    error = %message,
+                                    "上下文压缩失败（SH-032）：轮前预算压缩失败"
+                                );
                                 // P0-2：本地失败也要写明分类，前端才能显示「为什么失败」。
                                 turn_error = Some(local_turn_error("COMPACTION_FAILED", message.clone()));
                                 emit(&sink, EventMsg::Error { message });
@@ -4857,6 +4873,15 @@ mod tests {
             "必须重试满次数再放弃，避免一次瞬时占用就把压缩作废"
         );
         assert!(error.contains("本次压缩未生效"), "文案要说明压缩没有发生：{error}");
+    }
+
+    /// R5-5：失败区块的标题已经是「本轮运行失败」，正文前缀不得再出现「本轮」——
+    /// 否则读屏/全树文本会连成「本本轮运行失败」。反向对照：把前缀改回「本轮中止」，红。
+    #[test]
+    fn compact_failure_prefix_does_not_repeat_turn_word() {
+        let message = format!("{COMPACT_REQUEST_FAILED}{}", "连接到模型服务失败");
+        assert_eq!(message, "压缩请求发起失败：连接到模型服务失败");
+        assert!(!message.contains("本轮"), "失败正文不得重复标题里的「本轮」：{message}");
     }
 
     /// 压缩有两份实现：回合内的内存替换（[`replace_with_summary`]）与 `rollout::resume`

@@ -4141,14 +4141,14 @@ export function createAdapter(options: AdapterOptions): { remote: unknown; dispo
           )
           if (outcome === null) {
             pendingManualCompact.delete(sessionId)
-            result = { kind: 'success', text: 'No compactable history yet.' }
+            result = { kind: 'success', text: '暂无可压缩的历史。' }
           } else {
             // 摘要正文**不**直接铺进会话区：可见呈现由 `compaction_ended` 落的
             // checkpoint 负责，上游会把压缩事实折进这张命令卡（一个 manual-compaction
             // 节点，命令卡是主呈现），因此这里也不再产生第二条节点或大段原文。
             result = {
               kind: 'success',
-              text: `Compacted ${outcome.shadowedItems} history items (~${outcome.shadowedTokens} tokens).`,
+              text: `已压缩 ${String(outcome.shadowedItems)} 条历史（约 ${String(outcome.shadowedTokens)} tokens）。`,
             }
           }
         } catch (reason) {

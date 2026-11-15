@@ -3682,7 +3682,7 @@ describe('Plan 芯片与客户端排队', () => {
     const ok = await face.commands.execute('agent-new', '/compact')
     expect(ok).toMatchObject({
       ok: true,
-      value: { result: { kind: 'success', text: 'Compacted 12 history items (~3456 tokens).' } },
+      value: { result: { kind: 'success', text: '已压缩 12 条历史（约 3456 tokens）。' } },
     })
 
     const iterator = session.follow({ address: { kind: 'session', sessionId: 'agent-new' } })
@@ -3699,6 +3699,13 @@ describe('Plan 芯片与客户端排队', () => {
     // 带参数：上游 USAGE 文案原样拒绝
     const usage = await face.commands.execute('agent-new', '/compact 现在')
     expect(usage).toMatchObject({ ok: true, value: { result: { kind: 'error', text: 'Usage: /compact (no arguments)' } } })
+
+    // 无可压历史：也必须说中文（R5-3），且不冒充"成功压缩了 0 条"
+    const emptyBridge = scriptedBridge(undefined, undefined, undefined, undefined, undefined, () => null)
+    const empty = createAdapter({ bridge: emptyBridge })
+    const none = await faceOf3(empty.remote).commands.execute('agent-new', '/compact')
+    expect(none).toMatchObject({ ok: true, value: { result: { kind: 'success', text: '暂无可压缩的历史。' } } })
+    empty.dispose()
 
     // 宿主失败：错误文本如实回传（含宿主原因），不吞成"没搜到历史"
     const failingBridge = scriptedBridge(undefined, undefined, undefined, undefined, undefined, () => {
