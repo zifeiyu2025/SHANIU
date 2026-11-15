@@ -468,6 +468,9 @@ pub struct ResolvedModel {
     /// 上下文窗口（SH-132）：0 = 未知。已知时压缩触发点取
     /// `min(token_budget, context_window * 4/5)`，不再一个固定预算吃到底。
     pub context_window: u32,
+    /// 该模型的单次输出上限（`max_tokens_effective` 的结果）。压缩预算要用它扣掉
+    /// 「下一轮回复要占的地方」（D3）；0 = 未知，压缩侧回退到保守默认。
+    pub max_output: u32,
     /// 是否发送 Responses 扩展字段（D1，`[model].responses_extras`）。
     pub responses_extras: bool,
     /// 响应端 `parallel_tool_calls`（D1，`[model].parallel_tool_calls`）。
@@ -665,6 +668,7 @@ impl AppConfig {
                     context_window: row
                         .map(|m| m.context_window_effective(&p.base_url))
                         .unwrap_or(0),
+                    max_output: row.map(|m| m.max_tokens_effective(&p.base_url)).unwrap_or(0),
                     responses_extras: self.model.responses_extras,
                     parallel_tool_calls: self.model.parallel_tool_calls,
                     reasoning_replay: self.model.reasoning_replay,
@@ -684,6 +688,8 @@ impl AppConfig {
                 // 也不要在没声明的地方假装能用。
                 vision: false,
                 context_window: 0,
+                // 回落段没有模型行也没有内置表可查：输出上限未知，压缩侧按保守值推导。
+                max_output: 0,
                 responses_extras: self.model.responses_extras,
                 parallel_tool_calls: self.model.parallel_tool_calls,
                 reasoning_replay: self.model.reasoning_replay,
@@ -3790,6 +3796,39 @@ network = \"restricted\"\n";
     }
 
     // ---- 自定义请求头（SH-097）----
+
+    /// D3：压缩预算要扣「输出预留」，所以解析结果必须带上 `max_tokens_effective`。
+    /// 反向对照：把 `max_output` 写死成 0，第一条断言变红。
+    #[test]
+    fn max_tokens_effective_reaches_resolved_model() {
+        // 显式：模型行的 max_tokens 优先
+        let mut p = profile("local", "https://local/v1", "m1");
+        p.models = vec![row("m1")];
+        let cfg = AppConfig {
+            providers: vec![p],
+            active_provider: "local".into(),
+            ..Default::default()
+        };
+        assert_eq!(cfg.effective_model().max_output, 8_192);
+
+        // 内置表：模型行没填 max_tokens 时取端点声明的输出上限
+        let mut builtin = profile("ds", "https://api.deepseek.com/v1", "deepseek-flash");
+        let mut builtin_row = row("deepseek-flash");
+        builtin_row.max_tokens = 0;
+        builtin.models = vec![builtin_row];
+        let cfg = AppConfig {
+            providers: vec![builtin],
+            active_provider: "ds".into(),
+            ..Default::default()
+        };
+        assert_eq!(cfg.effective_model().max_output, 393_216);
+
+        // 回落段（只有 [model]）：没有行可查，0 = 未知，压缩侧按保守值推导
+        let cfg: AppConfig =
+            toml::from_str("[model]\nprovider = \"openai-chat\"\nbase_url = \"https://a/v1\"\nmodel = \"m1\"\n")
+                .unwrap();
+        assert_eq!(cfg.effective_model().max_output, 0);
+    }
 
     #[test]
     fn headers_round_trip_through_toml_and_reach_resolved_model() {

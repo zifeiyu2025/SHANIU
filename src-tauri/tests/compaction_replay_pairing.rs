@@ -223,7 +223,7 @@ fn summary(text: &str) -> HistoryItem {
     }
 }
 
-/// 真机里被拆散的那一组：预算 100 → 保留额度 30 token，旧切点正好落在输出上。
+/// 真机里被拆散的那一组：预算 190 → 保留额度 30 token（16%），切点正好落在输出上。
 fn smoke_history() -> Vec<HistoryItem> {
     vec![
         message(Role::User, "任务目标"),
@@ -243,7 +243,7 @@ fn apply_target(history: &mut Vec<HistoryItem>, target: compaction::Target) {
 async fn compaction_keeps_tool_pairing_and_first_request_succeeds() {
     let endpoint = StrictEndpoint::start();
     let mut history = smoke_history();
-    let target = compaction::plan_manual(&history, 100).expect("有可压区间");
+    let target = compaction::plan_manual(&history, 190).expect("有可压区间");
     assert_eq!(
         target.range_end, 2,
         "切点必须回退到调用组的起点，而不是落在输出上"

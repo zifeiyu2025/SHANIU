@@ -19,12 +19,15 @@ use crate::model_client::{HistoryItem, Role};
 /// 与逐模型词表选择，换来的精度用不上。
 const APPROX_BYTES_PER_TOKEN: usize = 4;
 
-/// 压缩后**保留**的额度占预算的比例。
+/// 压缩后**保留**的额度占预算的比例（D3：16%，对齐上游 dsh `retainRatio`）。
 ///
-/// 取 30% 而不是更高：压缩完成后历史只占预算三成，剩下七成留给新一轮工具输出。
-/// 留得太满会让下一轮立刻再次触发压缩，等于把一次摘要的代价反复付。
-/// 这条是设计选择，04 §6.4 只规定了摘要必含字段、没规定保留比例。
-const KEEP_RATIO_PERCENT: usize = 30;
+/// 不是越高越好：留 30% 时一次摘要后上下文仍占近三分之一，大工具输出一来就再次撞线，
+/// 同一段历史要压两三遍，摘要开销与「失忆」风险都翻倍。16% 让一轮摘要后剩出的空间
+/// 足够容纳下一轮正常工具输出。
+///
+/// 与 [`USER_TEXT_KEEP_PERCENT`] **不是一回事**：那个约束的是摘要正文里保留多少用户
+/// 原文，属于摘要质量；这里约束的是压缩后历史还能占多少上下文。
+const KEEP_RATIO_PERCENT: usize = 16;
 
 /// 模型行未声明 `context_window` 时用于推导压缩阈值的保守窗口。
 ///
@@ -32,25 +35,53 @@ const KEEP_RATIO_PERCENT: usize = 30;
 /// 那等于永不压缩，128K 模型跑到一半直接 400，代价比多压几次大得多。
 pub const FALLBACK_CONTEXT_WINDOW: usize = 128_000;
 
-/// 单个上下文窗口允许占用的量：窗口 × 80%，留 20% 给下一轮回复与工具结果。
-fn window_allowance(window: usize) -> usize {
-    let window = if window == 0 { FALLBACK_CONTEXT_WINDOW } else { window };
-    window.saturating_mul(4) / 5
+/// 模型未声明输出上限时的保守预留（D3）。取 16K：覆盖大多数端点的默认输出上限，
+/// 又不会在小窗口上白送太多空间。
+const FALLBACK_MAX_OUTPUT: usize = 16_384;
+
+/// 固定 headroom（D3，与上游同值）：留给协议开销、工具声明与下一轮零碎输出。
+///
+/// 上游假设窗口 ≥192K，固定 64K 不会超过消息预算的一半；我们支持 32K–128K，
+/// 所以下面用 `min(message_budget / 2)` 夹取——32K 窗口下固定 64K 会把阈值压成 0，
+/// 每轮都压缩比不压缩更糟。
+const DEFAULT_HEADROOM_TOKENS: usize = 65_536;
+
+/// 把窗口与输出预留规整成可用值：窗口 0 按保守窗口；输出上限不超过窗口 1/4，
+/// 防止小窗口被「输出预留」吃光预算。
+fn window_and_output(window: usize, max_output: usize) -> (usize, usize) {
+    let w = if window == 0 { FALLBACK_CONTEXT_WINDOW } else { window };
+    let o = if max_output == 0 { FALLBACK_MAX_OUTPUT } else { max_output };
+    (w, o.min(w / 4))
 }
 
-/// 自动压缩阈值：`min(配置预算, 窗口 × 80%)`。
+/// 单个上下文窗口允许占用的量（D3）：
+/// `min(窗口 × 80%, (窗口 - 输出预留) - headroom)`。
+///
+/// - 扣输出预留：下一轮回复也要占窗口，不扣等于按「只能输入」估预算；
+/// - 扣 headroom：协议开销与工具声明在字节估算里看不见，留出固定缓冲；
+/// - 仍保留 80% 封顶：headroom 夹取后不能反过来超过窗口的安全占比。
+fn window_allowance(window: usize, max_output: usize) -> usize {
+    let (w, o) = window_and_output(window, max_output);
+    let message_budget = w.saturating_sub(o);
+    let headroom = DEFAULT_HEADROOM_TOKENS.min(message_budget / 2);
+    message_budget
+        .saturating_sub(headroom)
+        .min(w.saturating_mul(4) / 5)
+}
+
+/// 自动压缩阈值：`min(配置预算, 窗口额度)`。
 ///
 /// - `configured == 0`：显式关闭压缩，保持 0（不替用户改主意）；
 /// - `window == 0`（模型未声明）：按 [`FALLBACK_CONTEXT_WINDOW`] 推导，调用方负责告警；
-/// - 其余：留 20% 给下一轮回复与工具结果。
+/// - `max_output == 0`（输出上限未知）：按 [`FALLBACK_MAX_OUTPUT`] 保守预留。
 ///
 /// 回合内自动压缩与手动 `/compact` **必须**共用这一份口径（见 [`manual_token_budget`]）：
 /// 两处各算一遍时，手动路径拿到的是未经窗口裁剪的配置值，会出现「压完仍然超窗口」。
-pub fn compact_token_budget(configured: usize, window: usize) -> usize {
+pub fn compact_token_budget(configured: usize, window: usize, max_output: usize) -> usize {
     if configured == 0 {
         return 0;
     }
-    configured.min(window_allowance(window))
+    configured.min(window_allowance(window, max_output))
 }
 
 /// 手动压缩阈值：用户显式要求压缩时，`configured == 0` 不能解释成「关掉」。
@@ -58,11 +89,11 @@ pub fn compact_token_budget(configured: usize, window: usize) -> usize {
 /// 用 0 直接进 [`plan_manual`] 会算出「保留 0 条尾部」，把历史压到只剩最后一条——
 /// 那不是任何人的预期。这里的 0 表示「不设配置上限」，于是按窗口算：与自动路径
 /// 同一个窗口口径，只是不因为「关掉自动压缩」而拒绝用户显式要求的这一次。
-pub fn manual_token_budget(configured: usize, window: usize) -> usize {
+pub fn manual_token_budget(configured: usize, window: usize, max_output: usize) -> usize {
     if configured == 0 {
-        return window_allowance(window);
+        return window_allowance(window, max_output);
     }
-    configured.min(window_allowance(window))
+    configured.min(window_allowance(window, max_output))
 }
 
 /// 摘要提示词。五个必含字段逐条来自 04 §6.4：
@@ -509,17 +540,18 @@ mod tests {
 
     /// 压缩阈值必须跟着窗口走：`context_window = 0` 曾被短路成"照用 50 万预算"，
     /// 128K 模型跑满也不会压缩，等端点 400 才暴露（2026-11-10 修复）。
+    /// D3 起还要扣输出预留与 headroom，见 `budget_subtracts_output_reservation_and_headroom`。
     #[test]
     fn compact_budget_follows_window_and_never_uses_configured_limit_blindly() {
-        // 已知窗口：80% 封顶，配置更小时以配置为准
-        assert_eq!(compact_token_budget(500_000, 128_000), 102_400);
-        assert_eq!(compact_token_budget(50_000, 128_000), 50_000);
+        // 已知窗口：16K 输出预留 + 64K headroom，且不超过窗口 80%
+        assert_eq!(compact_token_budget(500_000, 128_000, 16_000), 56_000);
+        assert_eq!(compact_token_budget(50_000, 128_000, 16_000), 50_000);
         // 未知窗口：按保守窗口推导，而不是退回到 50 万
-        assert_eq!(compact_token_budget(500_000, 0), 102_400);
-        assert!(compact_token_budget(500_000, 0) < 500_000);
+        assert_eq!(compact_token_budget(500_000, 0, 16_000), 56_000);
+        assert!(compact_token_budget(500_000, 0, 16_000) < 500_000);
         // 显式关闭压缩仍然是关闭
-        assert_eq!(compact_token_budget(0, 128_000), 0);
-        assert_eq!(compact_token_budget(0, 0), 0);
+        assert_eq!(compact_token_budget(0, 128_000, 16_000), 0);
+        assert_eq!(compact_token_budget(0, 0, 16_000), 0);
     }
 
     /// I1 / P3 反向对照：手动压缩不能再拿未经窗口裁剪的配置值。
@@ -527,13 +559,13 @@ mod tests {
     /// 500K 配置 + 128K 窗口会保留 15 万 token 尾巴，压完仍然超窗口。
     #[test]
     fn manual_budget_is_clamped_by_window_and_survives_disabled_auto_compaction() {
-        assert_eq!(manual_token_budget(500_000, 128_000), 102_400);
+        assert_eq!(manual_token_budget(500_000, 128_000, 16_000), 56_000);
         // `token_budget = 0` 只关自动压缩；用户显式 `/compact` 按窗口算，
         // 不能算出「保留 0 条尾部」把历史压到只剩最后一条。
-        assert_eq!(manual_token_budget(0, 128_000), 102_400);
-        assert_eq!(manual_token_budget(0, 0), 102_400);
+        assert_eq!(manual_token_budget(0, 128_000, 16_000), 56_000);
+        assert_eq!(manual_token_budget(0, 0, 16_000), 56_000);
         // 配置小于窗口时仍以配置为准
-        assert_eq!(manual_token_budget(50_000, 128_000), 50_000);
+        assert_eq!(manual_token_budget(50_000, 128_000, 16_000), 50_000);
     }
 
     #[test]
@@ -583,26 +615,32 @@ mod tests {
     /// 保留额度**刚好**装得下一条时必须装下：判据是严格大于。
     ///
     /// 反向对照：把 `kept + cost > keep_allowance` 写成 `>=`，最后两条会被挤掉一条，
-    /// 区间从 `[0,2)` 变成 `[0,3)`，本用例立刻红。自动/手动两条路径共用同一段装填，
+    /// 区间从 `[0,1)` 变成 `[0,2)`，本用例立刻红。自动/手动两条路径共用同一段装填，
     /// 所以两边都钉一遍。
     #[test]
     fn keep_allowance_boundary_keeps_the_item_that_fits_exactly() {
-        // 每条 60_000 字节 ≈ 15_000 token（4 字节/token）；budget 100_000 → 额度 30_000
-        let big = "x".repeat(60_000);
-        let items: Vec<HistoryItem> = (0..4).map(|_| msg(Role::User, &big)).collect();
-        assert_eq!(item_tokens(&items[0]), 15_000, "构造前提：每条恰好 15_000 token");
+        // 预算 100_000 → 保留额度 16_000；最后一条 2 token + 上一条 15_998 token = 16_000，
+        // 刚好装下（判据严格大于），再往前那条 40_000 token 必须被压掉。
+        let big = "x".repeat(160_000); // 40_000 token
+        let exact = "y".repeat(63_992); // 15_998 token
+        let items = vec![
+            msg(Role::User, &big),
+            msg(Role::Assistant, &exact),
+            msg(Role::User, "继续"),
+        ];
+        assert_eq!(item_tokens(&items[1]), 15_998, "构造前提：上一条恰好 15_998 token");
 
         let manual = plan_manual(&items, 100_000).expect("手动压缩总要给出目标");
         assert_eq!(
             manual,
-            Target { range_start: 0, range_end: 2 },
-            "额度刚好装下最后两条时，第二条必须留下"
+            Target { range_start: 0, range_end: 1 },
+            "额度刚好装下最后两条时，上一条必须留下"
         );
 
         let auto = plan_if_needed(100_000, &items, 100_000).expect("观测值已顶到预算");
         assert_eq!(
             auto,
-            Target { range_start: 0, range_end: 2 },
+            Target { range_start: 0, range_end: 1 },
             "自动路径与手动路径必须同一口径"
         );
     }
@@ -644,13 +682,13 @@ mod tests {
             out("call_0e6f3061a37b43cf96c3ef09", &"x".repeat(100)), // 25
             msg(Role::User, "继续"),      // 2
         ];
-        // 手动：预算 100 → 保留额度 30，旧算法只能装下 [输出, 继续]
-        let manual = plan_manual(&items, 100).expect("有可压区间");
+        // 预算 190 → 保留额度 30（16%）：从尾部装到 call c2 为止（28 ≤ 30 < 32）
+        let manual = plan_manual(&items, 190).expect("有可压区间");
         assert_eq!(manual.range_end, 2, "切点必须回退到调用组起点，而不是落在输出上");
         assert_pairs_complete(&items[manual.range_end..]);
 
         // 自动路径共用同一段装填，口径必须一致
-        let auto = plan_if_needed(100, &items, 100).expect("观测值已顶到预算");
+        let auto = plan_if_needed(190, &items, 190).expect("观测值已顶到预算");
         assert_eq!(auto, manual);
         assert_pairs_complete(&items[auto.range_end..]);
     }
@@ -667,7 +705,8 @@ mod tests {
             out("c2", &"b".repeat(100)), // 25
             msg(Role::User, "继续"),   // 2
         ];
-        // 预算 190 → 保留额度 57：旧算法从尾部装到 call c2 为止（56 ≤ 57 < 60）
+        // 预算 190 → 保留额度 30：从尾部只装得下 c2 的输出，其调用已被压掉，
+        // 切点必须回退到整组之前。
         let target = plan_manual(&items, 190).expect("有可压区间");
         assert_eq!(target.range_end, 1, "切到组中间会丢掉 c1 却留下它的输出");
         assert_pairs_complete(&items[target.range_end..]);
@@ -714,6 +753,55 @@ mod tests {
         assert_eq!(target.range_end, 1, "推理项必须和它的助手消息一起留下");
     }
 
+    /// D3：阈值必须扣掉「该模型单次输出预留」与固定 headroom，口径对齐上游
+    /// （dsh `compaction-basic`）。200K/16K 这一组与 dsh 的 118_464 同值。
+    #[test]
+    fn budget_subtracts_output_reservation_and_headroom() {
+        // min(200K×0.8=160_000, (200K-16K)-65_536=118_464)
+        assert_eq!(compact_token_budget(500_000, 200_000, 16_000), 118_464);
+        // min(128K×0.8=102_400, (128K-16K)-56_000=56_000)：headroom 被消息预算一半夹住
+        assert_eq!(compact_token_budget(500_000, 128_000, 16_000), 56_000);
+        // 配置预算更小时仍以配置为准
+        assert_eq!(compact_token_budget(50_000, 128_000, 16_000), 50_000);
+    }
+
+    /// D3：小窗口不能被固定 headroom 压成 0——那会让每轮都压缩，比不压更糟。
+    #[test]
+    fn tiny_window_never_collapses_to_zero_budget() {
+        let budget = compact_token_budget(500_000, 32_000, 4_000);
+        assert!(budget >= 8_000, "32K 窗口必须有可用阈值：{budget}");
+        // 输出上限配得比窗口 1/4 还大（未探测到上限时的误填）：必须先按窗口夹住，
+        // 否则 32K 窗口会被「输出预留」吃光，阈值塌成 0。
+        let pathological = compact_token_budget(500_000, 32_000, 32_000);
+        assert!(pathological >= 8_000, "窗口被输出预留吃光时也必须留出可用阈值：{pathological}");
+        // 显式关闭（configured=0）语义不变
+        assert_eq!(compact_token_budget(0, 32_000, 4_000), 0);
+    }
+
+    /// D3：模型未声明输出上限时按保守预留推导，而不是当 0 白送。
+    #[test]
+    fn unknown_output_falls_back_to_conservative_reservation() {
+        assert_eq!(
+            compact_token_budget(500_000, 200_000, 0),
+            compact_token_budget(500_000, 200_000, 16_384),
+            "max_output=0 必须等价于保守的 16_384"
+        );
+    }
+
+    /// D3：压缩后保留额度占预算 16%（原先 30% 压得太晚、留得太多）。
+    /// 反向对照：把 `KEEP_RATIO_PERCENT` 改回 30，这里会返回 1。
+    #[test]
+    fn retain_ratio_is_sixteen_percent() {
+        let items = vec![
+            msg(Role::User, &"u".repeat(16_000 * 4)), // 16_000 token
+            msg(Role::Assistant, &"a".repeat(1_600 * 4)), // 1_600 token
+            msg(Role::User, "继续"),                  // 2 token
+        ];
+        // 预算 10_000 → 保留额度 1_600：最后两条合计 1_602，装不下。
+        let target = plan_manual(&items, 10_000).expect("有可压区间");
+        assert_eq!(target.range_end, 2, "保留额度应为 16%");
+    }
+
     /// 配对完整的尾巴不会被无谓地多留：切点本来就是组边界时，回退逻辑不得再动它。
     #[test]
     fn cut_on_a_group_boundary_is_left_untouched() {
@@ -724,8 +812,8 @@ mod tests {
             msg(Role::User, &"y".repeat(4_000)), // 1000
             msg(Role::User, "继续"),          // 2
         ];
-        // 预算 3400 → 保留额度 1020：装得下最后两条（1002），装不下输出（1027）。
-        let target = plan_manual(&items, 3_400).expect("有可压区间");
+        // 预算 6_300 → 保留额度 1_008：装得下最后两条（1_002），装不下输出（1_027）。
+        let target = plan_manual(&items, 6_300).expect("有可压区间");
         assert_eq!(target.range_end, 3, "切点已在消息边界上，回退逻辑不得再动它");
         assert_pairs_complete(&items[target.range_end..]);
     }

@@ -115,6 +115,7 @@ mod tests {
             headers: Default::default(),
             vision: false,
             context_window: 0,
+            max_output: 0,
             responses_extras: true,
             parallel_tool_calls: true,
             reasoning_replay: true,

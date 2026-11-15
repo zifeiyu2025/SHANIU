@@ -827,6 +827,7 @@ impl AgentLoop {
         rollout: Option<Arc<crate::rollout::RolloutWriter>>,
     ) -> Self {
         let window = cfg.effective_model().context_window as usize;
+        let max_output = cfg.effective_model().max_output as usize;
         if window == 0 && cfg.agent.token_budget != 0 {
             tracing::warn!(
                 configured = cfg.agent.token_budget,
@@ -845,12 +846,18 @@ impl AgentLoop {
             // 固定预算吃到底——128K 窗口配 500K 预算等于永远不压缩，等端点溢出才报错。
             // 窗口未知时同样不能退化成「50 万才压」：过去 `window == 0` 直接返回配置预算，
             // 配置里 context_window 缺省即 0，压缩于是永不触发（2026-11-10 修复）。
-            token_budget: crate::compaction::compact_token_budget(cfg.agent.token_budget, window),
+            // D3：再扣掉该模型的单次输出预留——不扣等于按「只能输入」估预算。
+            token_budget: crate::compaction::compact_token_budget(
+                cfg.agent.token_budget,
+                window,
+                max_output,
+            ),
             // 溢出补救与手动压缩共用同一口径：服务端已经报溢出时不能再拿「自动阈值」
             // 当借口拒绝压缩，也不能在自动压缩被关掉时把历史压到只剩最后一条。
             manual_token_budget: crate::compaction::manual_token_budget(
                 cfg.agent.token_budget,
                 window,
+                max_output,
             ),
             tree_budget: TreeBudget::unlimited(),
             policy: Arc::new(policy::SessionPolicyHandle::new(policy::SessionPolicy {
