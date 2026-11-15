@@ -7,8 +7,8 @@
 ## 统计
 
 - 条目总数：3314
-- same：2678
-- drift：77
+- same：2677
+- drift：78
 - missing：0
 - not-applicable：559
 - 待复核（needs-review）：0
@@ -163,6 +163,7 @@
 | `packages/client/ui-chat/src/client/chat/use-chat-viewport.ts` | drift | 已登记 | 类型级修复（docs/07 #9） | 同第 9 行类型批 |
 | `packages/client/ui-chat/src/client/chat/use-process-scroll.ts` | drift | 已登记 | 类型级修复（docs/07 #9） | 同第 9 行类型批 |
 | `packages/client/ui-chat/src/client/contract/slots.ts` | drift | 已登记 | 类型级修复（docs/07 #9） | 同第 9 行类型批 |
+| `packages/client/ui-chat/src/client/conversation-nodes/compaction.ts` | drift | 已登记 | N5 R5-1：压缩节点补 groupTree:'turn'，留在 Turn 层不被「已完成，用时 N 秒」→「已完成分析」两级过程组折叠（docs/07 #34） | 上游若把压缩节点移出过程组、或给节点定义提供 default-open 配置，删本地 groupTree 改跟上游；同步后必须确认不展开任何组时节点仍可见 |
 | `packages/client/ui-chat/src/client/conversation-nodes/event-projection.ts` | drift | 已登记 | A0-2 失败节点 detail 透传（docs/07 #23） | 上游若自带 detail，删本地透传 |
 | `packages/client/ui-chat/src/client/conversation-nodes/turn-error.ts` | drift | 已登记 | A0-2 TurnErrorNode 增加可选 detail（docs/07 #23） | 上游若等价则删本地字段；字段必须保持可选 |
 | `packages/client/ui-chat/src/client/locale.ts` | drift | 已登记 | 8 套词典各加 image.openExternal（共 8 条）（docs/07 #22） | 上游若已加等价键，删本地 8 条改指上游键 |

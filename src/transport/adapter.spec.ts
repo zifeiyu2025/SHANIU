@@ -1476,6 +1476,10 @@ describe('适配层把 EventMsg 流映射成 DSH 会话 journal', () => {
     } as never) as unknown as { kind: string; data: { summary: string | null } } | null
     expect(node?.kind).toBe('compaction')
     expect((node?.data.summary ?? '').length).toBeGreaterThan(0)
+    // R5-1：节点必须留在 Turn 层。`groupTree` 是折叠决策的唯一输入——不传就会按位置
+    // 落进 process 组，被「已完成，用时 N 秒」→「已完成分析」两级折叠，真机不展开时
+    // UIA 全树命中 0。这里钉的是「不展开也可见」的契约，不靠截图。
+    expect((node as unknown as { groupTree?: string }).groupTree).toBe('turn')
     expect(journal.some(event => event['type'] === 'developer/message'
       && (event['data'] as { source?: { kind?: string } }).source?.kind === 'compaction-notice')).toBe(false)
     dispose()

@@ -52,7 +52,10 @@ export const compactionDefinition: ConversationNodeDefinition<CompactionState> =
     const state = context.state ?? fallbackState(context)
     if (state.checkpoint === undefined) return null
     const marker = compactSummary(state.summary, state.checkpoint)
-    return chatNode(context, 'compaction', marker.seq, marker)
+    // 留在 Turn 层：压缩是「历史被替换」的整段事实，不是过程披露里的细节。
+    // 不传 groupTree 会按位置落进 process 组，被「已完成，用时 N 秒」→「已完成分析」
+    // 两级折叠；用户不展开就看不到（真机 R5-1）。与 turn-error / turn-max-tokens 同口径。
+    return chatNode(context, 'compaction', marker.seq, marker, { groupTree: 'turn' })
   },
 }
 
