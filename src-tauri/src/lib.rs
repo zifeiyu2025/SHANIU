@@ -1145,9 +1145,13 @@ pub enum SessionEntry {
         text: String,
         range_start: usize,
         range_end: usize,
-        /// 压缩锚点没有独立时刻；`0` = 旧档案未记录（A0-4）。
+        /// 压缩锚点落档时刻；`0` = 旧档案未记录（A0-4）。
         #[serde(default)]
         at_ms: u64,
+        /// 这次压缩由什么触发（`pressure` / `manual` / `context_overflow`）；
+        /// `None` = 旧档案未记录（R5-4）。原样来自 `RolloutItem::Compacted`。
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        trigger: Option<String>,
     },
     ToolCall {
         call_id: String,
@@ -1188,12 +1192,19 @@ fn project_entries(items: &[rollout::RolloutItem]) -> Result<Vec<SessionEntry>, 
     // `history.splice(start..end, [summary])` 逐条对齐，否则同一份档案在
     // 「模型看到的历史」与「用户看到的视图」会分叉。
     for item in items {
-        if let rollout::RolloutItem::Compacted { range_start, range_end, summary } = item {
+        if let rollout::RolloutItem::Compacted {
+            range_start,
+            range_end,
+            summary,
+            at_ms,
+            trigger,
+        } = item
+        {
             apply_compaction(
                 &mut slots,
                 *range_start,
                 *range_end,
-                summary_entry(summary, *range_start, *range_end),
+                summary_entry(summary, *range_start, *range_end, *at_ms, trigger.as_deref()),
             )?;
         }
     }
@@ -1257,13 +1268,20 @@ impl Slot {
 /// 喂给模型时它仍是 `role=user`（与 resume 回放同源：摘要没有 `reasoning_content`，
 /// 以 assistant 身份喂 thinking 端点会 400）；但**展示投影**必须和用户消息分开，
 /// 否则重建会按用户回合计数、多出一轮。
-fn summary_entry(summary: &str, range_start: usize, range_end: usize) -> SessionEntry {
+fn summary_entry(
+    summary: &str,
+    range_start: usize,
+    range_end: usize,
+    at_ms: u64,
+    trigger: Option<&str>,
+) -> SessionEntry {
     SessionEntry::CompactionSummary {
         text: summary.to_string(),
         range_start,
         range_end,
-        // 压缩锚点没有独立时刻；取不到就标不可信，不借用导出时刻。
-        at_ms: 0,
+        // 有落档时刻就用它；旧档没有（`0`）由读侧标不可信，不借用导出时刻。
+        at_ms,
+        trigger: trigger.map(str::to_string),
     }
 }
 
@@ -1312,10 +1330,16 @@ fn project_slots_with(items: &[rollout::RolloutItem], include_compaction: bool) 
             // 压缩视图里锚点本身不产出条目：位置与内容由 `apply_compaction`
             // 在槽位序列上做替换（先收全部槽位、再按记录顺序应用锚点）。
             // 完整视图里只插一条摘要标记，原文照留——导出不能因为压缩少掉用户回合。
-            rollout::RolloutItem::Compacted { range_start, range_end, summary }
+            rollout::RolloutItem::Compacted { range_start, range_end, summary, at_ms, trigger }
                 if include_compaction =>
             {
-                out.push(Slot::Summary(summary_entry(summary, *range_start, *range_end)))
+                out.push(Slot::Summary(summary_entry(
+                    summary,
+                    *range_start,
+                    *range_end,
+                    *at_ms,
+                    trigger.as_deref(),
+                )))
             }
             rollout::RolloutItem::Compacted { .. } => {}
             // 带图消息保留结构化引用：展示层自己决定怎么渲染图片卡片，
@@ -4261,7 +4285,13 @@ mod session_projection_tests {
                 item: HistoryItem::FunctionCallOutput { call_id: "c1".into(), output: "旧输出".into() },
                 at_ms: 6,
             },
-            RolloutItem::Compacted { range_start: 0, range_end: 2, summary: "已压缩的上下文".into() },
+            RolloutItem::Compacted {
+                range_start: 0,
+                range_end: 2,
+                summary: "已压缩的上下文".into(),
+                at_ms: 0,
+                trigger: None,
+            },
             msg(Role::Assistant, "压缩后的新回复"),
         ];
         let entries = project_entries(&items).expect("锚点区间合法");
@@ -4305,7 +4335,13 @@ mod session_projection_tests {
                 error: None,
             },
             msg(Role::Assistant, "第二条"),
-            RolloutItem::Compacted { range_start: 0, range_end: 2, summary: "摘要".into() },
+            RolloutItem::Compacted {
+                range_start: 0,
+                range_end: 2,
+                summary: "摘要".into(),
+                at_ms: 0,
+                trigger: None,
+            },
         ];
         let entries = project_entries(&items).expect("锚点区间合法");
         assert_eq!(entries.len(), 2, "摘要取代两条历史，TurnEnd 原样留着：{entries:?}");
@@ -4348,10 +4384,52 @@ mod session_projection_tests {
     fn out_of_range_compaction_anchor_is_rejected() {
         let items = vec![
             msg(Role::User, "only"),
-            RolloutItem::Compacted { range_start: 0, range_end: 5, summary: "摘要".into() },
+            RolloutItem::Compacted {
+                range_start: 0,
+                range_end: 5,
+                summary: "摘要".into(),
+                at_ms: 0,
+                trigger: None,
+            },
         ];
         let error = project_entries(&items).expect_err("越界锚点必须拒绝");
         assert!(error.contains("[0,5)"), "{error}");
+    }
+
+    /// R5-4：档案里的 `at_ms` / `trigger` 必须一路透到展示条目。
+    #[test]
+    fn compaction_anchor_keeps_recorded_time_and_trigger() {
+        // 旧档没有这两个键：`serde(default)` 解出 0 / None，不报错也不伪造。
+        let legacy: crate::rollout::RolloutItem = serde_json::from_str(
+            r#"{"type":"compacted","range_start":0,"range_end":1,"summary":"旧摘要"}"#,
+        )
+        .expect("旧档案必须可解码");
+        assert!(
+            matches!(legacy, crate::rollout::RolloutItem::Compacted { at_ms: 0, trigger: None, .. }),
+            "旧档缺键必须落到默认值而不是解码失败"
+        );
+
+        let items = vec![
+            msg(Role::User, "问"),
+            RolloutItem::Compacted {
+                range_start: 0,
+                range_end: 1,
+                summary: "新摘要".into(),
+                at_ms: 1_700_000_005_000,
+                trigger: Some("manual".into()),
+            },
+        ];
+        let entries = crate::project_entries_full(&items).expect("锚点区间合法");
+        let marker = entries
+            .iter()
+            .find_map(|entry| match entry {
+                SessionEntry::CompactionSummary { at_ms, trigger, .. } => {
+                    Some((*at_ms, trigger.clone()))
+                }
+                _ => None,
+            })
+            .expect("完整视图必须留下压缩标记");
+        assert_eq!(marker, (1_700_000_005_000, Some("manual".into())));
     }
 
     #[test]

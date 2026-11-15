@@ -544,6 +544,19 @@ fn every_enum_variant_is_mirrored_in_frontend_types() {
     assert_union_covers("SkipReason", SkipReason::all_variants());
 }
 
+/// R5-4：档案层要落一份可 grep 的触发原因，机器值由 `CompactionTrigger::as_str` 单点提供。
+/// 它必须与 serde 的 wire 名逐字一致，否则会出现「事件说 manual、档案说 Manual」的漂移。
+#[test]
+fn compaction_trigger_as_str_matches_wire_value() {
+    for trigger in CompactionTrigger::all_variants() {
+        assert_eq!(
+            serde_json::to_value(trigger).unwrap(),
+            serde_json::Value::String(trigger.as_str().into()),
+            "{trigger:?} 的 as_str 与 serde 名不一致"
+        );
+    }
+}
+
 /// SH-079：EventMsg tag 与前端镜像**机械绑定**（此前 EXPECTED_TAGS 与 types.ts 无人校验关联）。
 /// 从 types.ts 的 EventMsg 声明提取所有 `type: '...'` 字面量，与 Rust 侧 tag 做双向集合相等。
 /// EventMsg union 里只有判别字段带字符串字面量（其余字段引用枚举名，无内联字面量），

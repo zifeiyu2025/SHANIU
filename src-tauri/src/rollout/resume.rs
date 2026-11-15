@@ -120,7 +120,8 @@ pub fn resume(path: &Path) -> Result<Resumed, RolloutError> {
                     turn: *turn,
                 });
             }
-            RolloutItem::Compacted { range_start, range_end, summary } => {
+            // 回放只关心区间与摘要正文；时刻/触发是审计字段，重放历史里没有位置。
+            RolloutItem::Compacted { range_start, range_end, summary, .. } => {
                 let (start, end) = (*range_start, *range_end);
                 if end > history.len() || start > end {
                     return Err(RolloutError::Corrupted {
@@ -380,7 +381,13 @@ mod tests {
         w.append(&call("c1")).unwrap(); // 崩溃/坏行：c1 永远等不到 output
         w.append(&msg("补一句")).unwrap(); // 崩溃之后用户接着说的话，不许陪葬
         // 锚点只压第一轮任务，落单的 c1 留给重放剔除——两种机制互不干扰。
-        w.append(&RolloutItem::Compacted { range_start: 0, range_end: 1, summary: "此前：任务".into() })
+        w.append(&RolloutItem::Compacted {
+            range_start: 0,
+            range_end: 1,
+            summary: "此前：任务".into(),
+            at_ms: 0,
+            trigger: None,
+        })
             .unwrap();
         drop(w);
 
@@ -434,6 +441,8 @@ mod tests {
             range_start: 0,
             range_end: 3,
             summary: "此前：已完成第一轮".into(),
+            at_ms: 0,
+            trigger: None,
         })
         .unwrap();
         w.append(&msg("第二轮")).unwrap();
@@ -459,7 +468,14 @@ mod tests {
         let dir = temp_dir("badanchor");
         let w = RolloutWriter::create(&dir, &meta("a")).unwrap();
         w.append(&msg("只有一条")).unwrap();
-        w.append(&RolloutItem::Compacted { range_start: 0, range_end: 9, summary: "越界".into() }).unwrap();
+        w.append(&RolloutItem::Compacted {
+            range_start: 0,
+            range_end: 9,
+            summary: "越界".into(),
+            at_ms: 0,
+            trigger: None,
+        })
+        .unwrap();
         drop(w);
         let err = resume(&dir.join("a.jsonl")).unwrap_err();
         assert!(matches!(err, RolloutError::Corrupted { .. }), "越界锚点必须报错：{err}");

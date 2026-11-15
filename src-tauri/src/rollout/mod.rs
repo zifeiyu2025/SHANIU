@@ -75,6 +75,19 @@ pub enum RolloutItem {
         range_start: usize,
         range_end: usize,
         summary: String,
+        /// 锚点落档时刻（Unix 毫秒）。
+        ///
+        /// `0` = 旧档案没有记录时刻（R5-4 之前写下的档）。读侧必须标「不可信」，
+        /// 不能拿回放/导出那一刻冒充。
+        #[serde(default)]
+        at_ms: u64,
+        /// 这次压缩由什么触发：`pressure` / `manual` / `context_overflow`。
+        ///
+        /// `None` = 旧档案未记录（R5-4 之前）。存字符串而不是 `events::CompactionTrigger`：
+        /// 档案格式层不该依赖协议层枚举，且字符串对 grep 与外部审计更直接；
+        /// 机器值由 `CompactionTrigger::as_str()` 单点提供，不在此另立一套。
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        trigger: Option<String>,
     },
     /// 父文件中指向子代理 rollout 的引用（SH-056 用）。
     SubagentRef { child_id: String, rollout_path: String },
@@ -1107,7 +1120,13 @@ mod tests {
             RolloutItem::ResponseItem { item: HistoryItem::Message { role: Role::User, text: "任务".into(), reasoning: None }, at_ms: 1_000 },
             RolloutItem::ResponseItem { item: HistoryItem::FunctionCall { name: "read_file".into(), arguments: "{}".into(), call_id: "c1".into() }, at_ms: 1_500 },
             RolloutItem::ResponseItem { item: HistoryItem::FunctionCallOutput { call_id: "c1".into(), output: "内容".into() }, at_ms: 2_000 },
-            RolloutItem::Compacted { range_start: 0, range_end: 2, summary: "前两轮摘要".into() },
+            RolloutItem::Compacted {
+                range_start: 0,
+                range_end: 2,
+                summary: "前两轮摘要".into(),
+                at_ms: 0,
+                trigger: None,
+            },
             RolloutItem::SubagentRef { child_id: "child-1".into(), rollout_path: "rollouts/child-1.jsonl".into() },
         ];
         for it in &items {

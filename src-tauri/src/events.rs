@@ -519,6 +519,19 @@ pub enum CompactionTrigger {
 }
 
 impl CompactionTrigger {
+    /// 机器值（与 serde 的 `snake_case` 名逐字一致）。
+    ///
+    /// 存在的理由：档案层（`RolloutItem::Compacted`）要落一份可 grep 的触发原因，
+    /// 但不该反向依赖协议枚举。让枚举自己给出字符串，改 serde 重命名时这里必然
+    /// 编译失败（无通配臂 match），不会出现「事件说 manual、档案说 Manual」的漂移。
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Pressure => "pressure",
+            Self::Manual => "manual",
+            Self::ContextOverflow => "context_overflow",
+        }
+    }
+
     /// FF-2 单一事实源（SH-078）：同 `TurnEndReason::all_variants` 的穷举约定。
     pub fn all_variants() -> &'static [Self] {
         match Self::Pressure {

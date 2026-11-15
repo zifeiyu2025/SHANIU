@@ -399,6 +399,8 @@ where
 fn append_anchor<F>(
     target: crate::compaction::Target,
     summary: &str,
+    at_ms: u64,
+    trigger: crate::events::CompactionTrigger,
     mut append: F,
 ) -> Result<(), String>
 where
@@ -408,6 +410,9 @@ where
         range_start: target.range_start,
         range_end: target.range_end,
         summary: summary.to_string(),
+        at_ms,
+        // 档案自己回答「这次是谁触发的」（R5-4）：导出/审计不必再从事件流反推。
+        trigger: Some(trigger.as_str().to_string()),
     };
     let mut last_error = None;
     for _ in 0..MAX_ROLLOUT_WRITE_ATTEMPTS {
@@ -514,6 +519,9 @@ impl AgentLoop {
     /// 3. **压缩完必须把落盘游标收到新历史末尾**。`flush_history` 按
     ///    `history[*recorded..]` 切片，而压缩让 history 变短了：不收游标就是 start > len
     ///    直接 panic，而且是只在长会话跑到第 N 轮才炸的那种 panic。
+    // 参数多是因为要同时接住「历史可变借用 + 事件通道 + 取消 + 回合号 + 压缩触发原因」；
+    // 与 `compact_after_overflow` 保持同构比再包一层上下文结构体更重要。
+    #[allow(clippy::too_many_arguments)]
     async fn compact_in_place(
         &self,
         rollout: &Option<Arc<crate::rollout::RolloutWriter>>,
@@ -521,6 +529,7 @@ impl AgentLoop {
         recorded: &mut usize,
         target: crate::compaction::Target,
         instructions: &str,
+        trigger: crate::events::CompactionTrigger,
         cancel: &tokio_util::sync::CancellationToken,
     ) -> Result<CompactionStats, CompactAbort> {
         let request = crate::compaction::build_request(history, &target);
@@ -584,8 +593,10 @@ impl AgentLoop {
         if let Some(writer) = rollout {
             // 先落锚点、再改内存（顺序见上面第 1 点）。写不进去就**不提交**：
             // 此刻 history 与 recorded 都还没动，回放与运行态继续一致。
-            append_anchor(target, &summary, |item| writer.append(item))
-                .map_err(CompactAbort::ArchiveUnavailable)?;
+            append_anchor(target, &summary, crate::clock::now_ms(), trigger, |item| {
+                writer.append(item)
+            })
+            .map_err(CompactAbort::ArchiveUnavailable)?;
         }
 
         replace_with_summary(history, target, &summary);
@@ -683,7 +694,7 @@ impl AgentLoop {
             },
         );
         match self
-            .compact_in_place(rollout, history, recorded, target, instructions, cancel)
+            .compact_in_place(rollout, history, recorded, target, instructions, trigger, cancel)
             .await
         {
             Ok(stats) => {
@@ -1257,7 +1268,15 @@ impl AgentLoop {
                     },
                 );
                 match self
-                    .compact_in_place(rollout, history, recorded, target, &instructions, cancel)
+                    .compact_in_place(
+                        rollout,
+                        history,
+                        recorded,
+                        target,
+                        &instructions,
+                        crate::events::CompactionTrigger::Pressure,
+                        cancel,
+                    )
                     .await
                 {
                     Ok(stats) => {
@@ -4825,6 +4844,8 @@ mod tests {
         let error = append_anchor(
             crate::compaction::Target { range_start: 0, range_end: 2 },
             "摘要",
+            1_700_000_000_000,
+            crate::events::CompactionTrigger::Pressure,
             |_| {
                 calls += 1;
                 Err(crate::rollout::RolloutError::Io("磁盘满".into()))
@@ -4880,6 +4901,8 @@ mod tests {
                 range_start: first.range_start,
                 range_end: first.range_end,
                 summary: "第一次交接摘要".into(),
+                at_ms: 0,
+                trigger: None,
             })
             .unwrap();
         let second = crate::compaction::Target { range_start: 0, range_end: 2 };
@@ -4888,6 +4911,8 @@ mod tests {
                 range_start: second.range_start,
                 range_end: second.range_end,
                 summary: "第二次交接摘要".into(),
+                at_ms: 0,
+                trigger: None,
             })
             .unwrap();
         let path = writer.path().to_path_buf();

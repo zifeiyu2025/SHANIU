@@ -120,12 +120,14 @@ describe('档案条目 → 逻辑事件', () => {
     const events = sessionEntriesToEvents([
       { kind: 'message', role: 'user', text: '第一问', at_ms: 1_700_000_000_000 },
       { kind: 'message', role: 'assistant', text: '第一答', at_ms: 1_700_000_001_000 },
+      { kind: 'turn_end', turn: 1, reason: 'completed', at_ms: 1_700_000_001_500 },
       {
         kind: 'compaction_summary',
         text: '## 摘要正文',
         range_start: 0,
         range_end: 2,
         at_ms: anchorAt,
+        trigger: 'manual',
       },
       { kind: 'message', role: 'user', text: '第二问', at_ms: 1_700_000_600_000 },
       { kind: 'message', role: 'assistant', text: '第二答', at_ms: 1_700_000_601_000 },
@@ -151,11 +153,16 @@ describe('档案条目 → 逻辑事件', () => {
     expect((summary[0]!['data'] as { summary: unknown }).summary)
       .toEqual([{ type: 'text', text: '## 摘要正文' }])
     expect(Object.keys(summary[0]!['data'] as object).sort())
-      .toEqual(['compactionId', 'summary'])
-    // 锚点在回合外：上一回合已 turn/end、下一回合还没 turn/start
+      .toEqual(['compactionId', 'summary', 'trigger'])
+    // 锚点在回合外（手动 `/compact`）：上一回合已 turn/end、下一回合还没 turn/start。
+    // 不把它归给"即将开始的下一轮"——只陈述档案里已成立的归属（R5-4）。
     expect((start[0]!['data'] as { turn: number | null }).turn).toBeNull()
     expect((end[0]!['data'] as { turn: number | null }).turn).toBeNull()
     expect('error' in (end[0]!['data'] as object)).toBe(false)
+    // 三条都带 trigger：导出必须能自己分辨手动/自动，不必再拿事件流反推。
+    for (const event of [start[0]!, summary[0]!, end[0]!]) {
+      expect((event['data'] as { trigger?: string }).trigger).toBe('manual')
+    }
 
     for (const event of [start[0]!, summary[0]!, end[0]!]) {
       // 与相邻事件同一口径：取锚点的 at_ms
@@ -175,6 +182,49 @@ describe('档案条目 → 逻辑事件', () => {
     // seq 仍从 1 连续递增（新增三条事件不破坏本地单调序号）
     const seqs = events.map(event => (event as { seq: number }).seq)
     expect(seqs).toEqual(seqs.map((_, index) => index + 1))
+  })
+
+  it('回合内压缩（溢出补救/预算）如实带当轮号：归属来自档案已成立的事实', () => {
+    // 档案顺序就是真实发生顺序：用户提问 → 溢出补救（锚点）→ 回合结局。
+    // 锚点落在 turn/start 与 turn/end 之间，导出必须写 `turn: 1` 而不是 null。
+    const events = sessionEntriesToEvents([
+      { kind: 'message', role: 'user', text: '第一问', at_ms: 1_700_000_000_000 },
+      { kind: 'message', role: 'assistant', text: '第一答', at_ms: 1_700_000_001_000 },
+      {
+        kind: 'compaction_summary',
+        text: '溢出后压缩',
+        range_start: 0,
+        range_end: 2,
+        at_ms: 1_700_000_002_000,
+        trigger: 'context_overflow',
+      },
+      { kind: 'turn_end', turn: 1, reason: 'completed', at_ms: 1_700_000_003_000 },
+    ], '标题')
+
+    const start = ofType(events, 'compaction/start')
+    const end = ofType(events, 'compaction/end')
+    expect([start.length, end.length]).toEqual([1, 1])
+    expect((start[0]!['data'] as { turn: number | null }).turn).toBe(1)
+    expect((end[0]!['data'] as { turn: number | null }).turn).toBe(1)
+    expect((start[0]!['data'] as { trigger?: string }).trigger).toBe('context_overflow')
+    // 时刻取档案的落档时刻，不是导出那一刻
+    expect(start[0]!['time']).toBe(1_700_000_002_000)
+  })
+
+  it('旧档案（无 at_ms / trigger）如实标不可信，不编造触发原因', () => {
+    const events = sessionEntriesToEvents([
+      { kind: 'message', role: 'user', text: '旧问' },
+      { kind: 'compaction_summary', text: '旧摘要', range_start: 0, range_end: 1 },
+    ], '标题')
+
+    for (const event of [...ofType(events, 'compaction/start'), ...ofType(events, 'compaction/end')]) {
+      expect(event['time']).toBe(0)
+      expect(event['timeUnreliable']).toBe(true)
+      // 未知触发 = 不落键（不是 `trigger: null`，也不是猜一个值）
+      expect('trigger' in (event['data'] as object)).toBe(false)
+    }
+    const summary = ofType(events, 'compaction/summary')
+    expect(Object.keys(summary[0]!['data'] as object).sort()).toEqual(['compactionId', 'summary'])
   })
 
   it('档案结局行如实进 turn/end：失败不写成成功，原始错误一并带出', () => {

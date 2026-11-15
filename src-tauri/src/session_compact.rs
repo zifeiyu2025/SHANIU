@@ -241,6 +241,10 @@ fn write_anchor(resumed: &Resumed, target: Target, summary: String) -> Result<()
             range_start: target.range_start,
             range_end: target.range_end,
             summary,
+            // 落档那一刻：导出/重开用它回答"这段历史何时被替换"（R5-4）。
+            at_ms: crate::clock::now_ms(),
+            // 手动路径只有这一种触发（自动路径由 `agent_loop` 自己写）。
+            trigger: Some(CompactionTrigger::Manual.as_str().to_string()),
         })
         .map_err(|e| format!("压缩锚点写入失败: {e}"))
 }

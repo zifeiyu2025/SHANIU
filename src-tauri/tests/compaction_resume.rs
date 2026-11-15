@@ -72,6 +72,8 @@ fn anchor_written_by_compaction_replays_into_a_shorter_but_complete_history() {
             range_start: target.range_start,
             range_end: target.range_end,
             summary: "交接摘要：目标是把端口改成 9090".into(),
+            at_ms: 0,
+            trigger: None,
         })
         .unwrap();
     drop(writer);
@@ -124,6 +126,8 @@ fn summary_lands_as_a_user_message_not_an_assistant_one() {
             range_start: target.range_start,
             range_end: target.range_end,
             summary: "摘要".into(),
+            at_ms: 0,
+            trigger: None,
         })
         .unwrap();
     drop(writer);
@@ -158,6 +162,8 @@ fn out_of_range_target_is_rejected_by_resume() {
             range_start: 0,
             range_end: 9,
             summary: "越界摘要".into(),
+            at_ms: 0,
+            trigger: None,
         })
         .unwrap();
     drop(writer);
@@ -197,6 +203,8 @@ fn compacted_history_still_satisfies_thinking_mode_reasoning_requirement() {
             range_start: target.range_start,
             range_end: target.range_end,
             summary: "交接摘要".into(),
+            at_ms: 0,
+            trigger: None,
         })
         .unwrap();
     drop(writer);
@@ -259,6 +267,8 @@ fn orphan_tool_outputs_do_not_cut_away_the_tail_anchor() {
             range_start: target.range_start,
             range_end: target.range_end,
             summary: "摘要".into(),
+            at_ms: 0,
+            trigger: None,
         })
         .unwrap();
     drop(writer);
@@ -293,7 +303,7 @@ fn anchor_written_after_an_unfinished_round_is_still_applied() {
     }
     let path = writer.path().to_path_buf();
     writer
-        .append(&RolloutItem::Compacted { range_start: 0, range_end: 3, summary: "交接摘要".into() })
+        .append(&RolloutItem::Compacted { range_start: 0, range_end: 3, summary: "交接摘要".into(), at_ms: 0, trigger: None })
         .unwrap();
     drop(writer);
 
@@ -319,7 +329,7 @@ fn anchor_survives_an_unfinished_round_that_follows_it() {
         writer.append(&RolloutItem::ResponseItem { item, at_ms: 0 }).unwrap();
     }
     writer
-        .append(&RolloutItem::Compacted { range_start: 0, range_end: 3, summary: "交接摘要".into() })
+        .append(&RolloutItem::Compacted { range_start: 0, range_end: 3, summary: "交接摘要".into(), at_ms: 0, trigger: None })
         .unwrap();
     // 崩溃点：c2 只有调用、没有输出。
     writer.append(&RolloutItem::ResponseItem { item: tool_call("c2"), at_ms: 0 }).unwrap();

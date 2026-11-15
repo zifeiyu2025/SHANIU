@@ -69,8 +69,14 @@ export type SessionEntryLike =
     readonly text: string
     readonly range_start: number
     readonly range_end: number
-    /** 压缩锚点没有独立时刻；缺省或 0 = 不可信（A0-4）。 */
+    /** 压缩锚点落档时刻（Unix 毫秒）；缺省或 0 = 旧档案未记录（A0-4）。 */
     readonly at_ms?: number
+    /**
+     * 这次压缩由什么触发：`pressure` / `manual` / `context_overflow`。
+     *
+     * 缺省 = 旧档案未记录（R5-4 之前）。导出用它分辨手动与自动，不再从事件流反推。
+     */
+    readonly trigger?: string
   }
   | {
     readonly kind: 'tool_call'

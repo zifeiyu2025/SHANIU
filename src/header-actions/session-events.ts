@@ -145,18 +145,26 @@ export function sessionEntriesToEvents(
       compactionIndex += 1
       const compactionId = `shaniu-export-compaction-${String(compactionIndex)}`
       const at = entryTime(entry)
-      // `turn: null` 是上游"回合外的独立事务"语义，与锚点在档案里的位置一致：
-      // 上一回合已经 turn/end、下一回合还没 turn/start。写当前 `turn` 会让上游
-      // "带号事务必须被该回合严格包住"的关系校验失败（锚点在回合之外）。
-      push({ type: 'compaction/start', data: { compactionId, turn: null } }, at)
+      // 归属：只陈述档案里已成立的回合。锚点落在回合内（溢出补救 / 预算压缩）就带
+      // 当轮号；落在回合外（手动 `/compact`）就是"回合外独立事务"，坚持 `null`。
+      // 参照 dsh `repair.ts` 的 `openTurnClosers`（只对日志末尾还开着的回合补 closer）
+      // 与 codex `thread_history_projection`（投影只陈述已记录的归属）：不猜、不把
+      // 它归给"即将开始的下一轮"。代价是回合外锚点回答不了"属于哪一轮"——这与上游
+      // `compaction/*` 的 `turn: null` 语义一致，也胜过一次虚构归属（R5-4）。
+      const compactionTurn = open ? turn : null
+      // `trigger` 是档案里的审计事实（`pressure` / `manual` / `context_overflow`）；
+      // 旧档没有就省略，不猜。上游 `compaction/*` 没有这个字段，属显式扩展
+      // （`formatSessionMarkdown` 不读它），代价见规格 §8.2。
+      const trigger = entry.trigger === undefined ? {} : { trigger: entry.trigger }
+      push({ type: 'compaction/start', data: { compactionId, turn: compactionTurn, ...trigger } }, at)
       // 只带档案里确有的正文：`shadowedRange`/`shadowedSeqs` 在档案里是历史条目下标、
       // 不是 surface seq，`shadowedTokenCount`/`provider`/`model` 也没有可信来源，
       // 一律不填——宁缺勿造，不拿猜测值污染审计档案。
       push({
         type: 'compaction/summary',
-        data: { compactionId, summary: [{ type: 'text', text: entry.text }] },
+        data: { compactionId, summary: [{ type: 'text', text: entry.text }], ...trigger },
       }, at)
-      push({ type: 'compaction/end', data: { compactionId, turn: null } }, at)
+      push({ type: 'compaction/end', data: { compactionId, turn: compactionTurn, ...trigger } }, at)
       continue
     }
     if (entry.kind === 'message') {

@@ -469,7 +469,13 @@ fn document_extraction_is_stable_across_live_and_replayed_history() {
         call("unified_exec", "{\"cmd\":\"ls\"}", "c2"),
         output("c2", "a.txt\nb.txt"),
         output("c1", "文件内容"),
-        RolloutItem::Compacted { range_start: 0, range_end: 2, summary: "前两轮摘要".into() },
+        RolloutItem::Compacted {
+            range_start: 0,
+            range_end: 2,
+            summary: "前两轮摘要".into(),
+            at_ms: 0,
+            trigger: None,
+        },
         RolloutItem::SubagentRef { child_id: "child".into(), rollout_path: "p".into() },
     ];
     let direct = documents::build_documents(&items, 1_700_000_000_000);
@@ -717,7 +723,13 @@ fn documents_mark_compacted_originals_as_shadowed() {
         message(Role::User, "旧目标：端口 3306"),
         call("unified_exec", "{\"cmd\":\"ls\"}", "c1"),
         output("c1", "旧工具输出"),
-        RolloutItem::Compacted { range_start: 0, range_end: 2, summary: "摘要：数据库配置已确定".into() },
+        RolloutItem::Compacted {
+            range_start: 0,
+            range_end: 2,
+            summary: "摘要：数据库配置已确定".into(),
+            at_ms: 0,
+            trigger: None,
+        },
         message(Role::Assistant, "压缩后的新回复"),
     ];
     let docs = documents::build_documents(&items, 1_700_000_000_000);
@@ -754,6 +766,8 @@ fn searching_a_compacted_original_says_the_model_no_longer_sees_it() {
                 range_start: 0,
                 range_end: 1,
                 summary: "摘要：已确定数据库配置".into(),
+                at_ms: 0,
+                trigger: None,
             },
             message(Role::Assistant, "收到"),
         ],
