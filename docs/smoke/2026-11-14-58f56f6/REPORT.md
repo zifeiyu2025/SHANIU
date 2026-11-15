@@ -236,3 +236,34 @@
 - 截图（`r5/shots/`）：`a1-live-collapsed-tree.png`、`a1-expand-turn-group.png`、`a1-expand-analysis-group.png`、`a1-node-summary-expanded.png`、`a2-reopen-1..3.png`、`a2-reopen-4-node.png`、`a3-command-menu.png`、`a3-after-compact-card.png`、`a4-fail-1-start.png`、`a4-fail-2-baseline-3turns.png`、`a4-fail-3-notice.png`、`b-followup-turn3.png`、`b-followup-toolcall-4turns.png`、`b-reopen-counts-4turns.png`、`b-reopen-node.png`、`b-default-budget-1.png`、`b-default-budget-2.png`、`c-session-menu.png`、`c-save-dialog.png`、`c-export-toast.png`
 - 档案（`r5/evidence/`）：`r5-build.txt`、`r5-ui-observations.txt`、`r5-log-compaction.txt`、`r5-rollout-analysis.txt`、`r5-export-counts.txt`、`r5-toolname-scan.txt`、`r5-session.v4.jsonl`、`dsh-session-sess-1794686409659-0001.zip`
 - 全部运行在 `scratch\` 隔离目录，未改产品代码。
+
+## 第六轮聚焦复验：R5 五条收口（2026-11-15 10:35–11:05，被测提交 `02d13d2`）
+
+被测二进制：现场重建，未复用旧包（`CARGO_TARGET_DIR=scratch\target-r6` 全新目录 + `pnpm tauri build --no-bundle`，334 秒），
+`git rev-parse HEAD` = `origin/main` = `02d13d2`（含 `e816b7b`、`26f0603`、`d8ab83f`、`02250ba`），产物 28,569,088 B，
+SHA256 `7CC9F73A7851574FD03AA1A559A3A2B3AE497ACACF7F9EB39D0FC1B6629C0D24`（详见 `r6/evidence/r6-build.txt`）。
+数据目录：`scratch\smoke-r6-auto`（`token_budget=100`，真实 provider）、`scratch\smoke-r6-fail`（同预算 + `base_url=http://127.0.0.1:9/v1`）。未改产品代码。
+
+本轮只验 5 项，未重跑十项。
+
+| 项 | 结论 | 现象与判据 | 证据 |
+|---|---|---|---|
+| R5-1 压缩节点默认可见（**硬判据**） | **FAIL（仅摘要内容一项）** | 自动压缩 `2026-11-15T02:39:55.845461Z 上下文已压缩（SH-032） compressed_items=3 history_len=5`；**不展开任何组**直接取 UIA 全树：`Button "上下文已压缩 点击查看压缩摘要"` **×3**（回合结束态 157 节点、重开态 184 节点两份树一致），`用户原文\|任务目标\|已完成事项\|关键文件与改动` 命中 **0**。即：节点已从 r5 的「两级折叠组内」搬到 Turn 层默认可见，但**摘要正文默认不可见**，必须点一次才出现（DOM click 一次后 `afterClickSummary=true`，可见「用户原文（压缩时逐字保留，不得改写）」）。按"靠展开才算命中就记 FAIL"的口径，本项判 FAIL | `r6/evidence/r6-uia-tree-post-turn.txt`、`r6-uia-tree-reopen.txt`、`r6-dom-after-click.json`、`r6/shots/r51-live-compaction-node.png`、`r51-live-after-followup.png`、`r51-click-once-summary.png` |
+| R5-4 导出可分辨 | **PASS** | 真实 UI 导出（`···` → 下载 Session 日志）：`compaction/start\|summary\|end` 各 6 条，**全部带 `time`**（真实毫秒时间戳）；`trigger` 可分辨自动/手动——自动 5 组 `"pressure"`、手动 1 组 `"manual"`。回合内锚点带当轮号（turn=1 ×3、turn=2 ×2），**回合外为显式 `"turn":null`**（手动 `/compact` 那组）；`compaction/summary` 不带 turn，与 `session-events.ts` 实现一致。**未虚增回合**：导出 `turn/start` ×2、`turn/end` ×2，与实时/重开的 `2 轮 6 步` 对齐 | `r6/evidence/r6-export-check.txt`、`r6-export-session.v4.jsonl`、`r6-export-session-manual.v4.jsonl`、`r6/shots/r54-save-dialog.png` |
+| R5-5 文案与日志 | **PASS** | 失败区块文案为「处理失败 / **本轮运行失败**」（`COMPACTION_FAILED`），**「本本轮」命中 0**；三处压缩失败日志可 grep 到「上下文压缩失败（SH-032）」：`03:01:37.380245Z agent_loop`（轮前预算压缩）、`03:02:00.283152Z session_compact trigger="manual"`（手动），第三处 `agent_loop/mod.rs:755`（溢出补救）本轮未构造出超窗场景，仅源码核对文案一致 | `r6/evidence/r6-log-compaction.txt`、`r6-scans.txt`、`r6/shots/r55-failure-block.png`、`r55-manual-compact-fail.png` |
+| R5-3 中文文案 | **PASS** | `/compact` 完成卡：`compact` + 「已压缩 5 条历史（约 640 tokens）。」；空会话 `/compact`：「暂无可压缩的历史。」；运行中「正在压缩…」。三处均中文（r5 的英文 `Compacted 2 history items (~200 tokens).` 已消除） | `r6/shots/r51-live-after-followup.png`、`r6/evidence/r6-ui-observations.txt` |
+| 回归 | **PASS** | 实时 `2 轮 6 步` = 强杀重开 `2 轮 6 步` = 导出 `turn/start` 2 / `turn/end` 2；压缩后追问「继续：只读列出 src 目录内容，别改文件」正常作答并调用工具读到 `sum.js（262 B）`，无上下文丢失；`Cannot resolve tool name` 三路递归扫描（auto/fail 数据根 + 导出）**0** 命中 | `r6/evidence/r6-scans.txt`、`r6-export-check.txt`、`r51-live-after-followup.png` |
+
+**残留（照实报，附最小复现）**
+
+- **R6-1（R5-1 硬判据未满足，P2）**：压缩节点默认可见已达成，**摘要内容仍默认不可见**。
+  - 最小复现：`token_budget=100` 的会话发一句话并等回合结束 → 日志出现 `上下文已压缩（SH-032）`（如 `02:39:55.845461Z`）→ **不点任何折叠组**取 UIA 全树：`Button "上下文已压缩 点击查看压缩摘要"` ×3、摘要关键字 0 命中 → 点该按钮一次，摘要正文立即出现。
+  - 与产品行为的对应关系：`CompactionItem` 用本地展开态控制摘要渲染（标题固定为「点击查看压缩摘要」），因此"默认展开到 Turn 层"只解决了节点所在层级，没有把摘要正文铺进默认视图。
+- **备注（测试环境，非产品问题）**：同一台机器上 `smoke-r6-auto` 运行时再启动 `smoke-r6-fail`，后者会停在白屏（全局单实例守卫，`%LOCALAPPDATA%\SHANIU\data-root\running.json` 被占用）；先关前一个实例再启即正常。另外 Chromium 无障碍树懒激活，UIA 全树第一次抓取常只返回 21–37 个节点，需连续两次取样才是完整树（本轮全部证据均为第二次取样结果）。
+
+**证据索引（`r6/`）**
+
+- 构建：`r6/evidence/r6-build.txt`
+- 截图（`r6/shots/`）：`r51-live-compaction-node.png`、`r51-live-after-followup.png`、`r51-click-once-summary.png`、`r54-save-dialog.png`、`r55-failure-block.png`、`r55-manual-compact-fail.png`、`r55-fail-instance-new.png`
+- 档案（`r6/evidence/`）：`r6-ui-observations.txt`、`r6-export-check.txt`、`r6-log-compaction.txt`、`r6-scans.txt`、`r6-uia-tree-post-turn.txt`、`r6-uia-tree-reopen.txt`、`r6-dom-after-click.json`、`r6-export-session.v4.jsonl`、`r6-export-session-manual.v4.jsonl`
+- 全部运行在 `scratch\` 隔离目录，未改产品代码。

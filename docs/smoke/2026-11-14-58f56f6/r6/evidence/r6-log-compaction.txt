@@ -1,0 +1,27 @@
+第六轮复验（r6）· R5-5 压缩失败日志（被测 02d13d2）
+实例：
+- auto = scratch\smoke-r6-auto\SHANIU-Portable（真实 provider，压缩成功路径）
+- fail = scratch\smoke-r6-fail\SHANIU-Portable（provider base_url=http://127.0.0.1:9/v1，压缩失败路径）
+
+=== fail 实例：上下文压缩失败（SH-032） ===
+2026-11-15T03:01:37.380245Z  WARN shaniu_lib::agent_loop: 上下文压缩失败（SH-032）：轮前预算压缩失败 error=压缩请求发起失败：无法连接到模型服务
+2026-11-15T03:02:00.283152Z  WARN shaniu_lib::session_compact: 上下文压缩失败（SH-032） trigger="manual" error=无法连接到模型服务
+
+对应触发：
+- 03:01:37 = 追问「继续：只读列出 test 目录内容」发送后，轮前预算压缩（token_budget=100）发起摘要请求失败。
+- 03:02:00 = 手动 `/compact` 摘要请求失败。
+grep 命令可复现：
+  Select-String -Path <data>\logs\shaniu.log.2026-11-15 -Pattern '上下文压缩失败（SH-032）'
+
+=== 三处代码点位（本轮源码核对，均含同一文案） ===
+- src-tauri/src/session_compact.rs:160  手动 /compact 失败（运行时已验证，见上）
+- src-tauri/src/agent_loop/mod.rs:1339  轮前预算压缩失败（运行时已验证，见上）
+- src-tauri/src/agent_loop/mod.rs:755   溢出补救压缩失败（仅源码核对；本轮未构造出超窗溢出场景）
+
+=== auto 实例：压缩成功（对照，同一 SH-032 编码） ===
+2026-11-15T02:39:55.845461Z  INFO shaniu_lib::agent_loop: 上下文已压缩（SH-032） compressed_items=3 history_len=5
+2026-11-15T02:40:05.897927Z  INFO shaniu_lib::agent_loop: 上下文已压缩（SH-032） compressed_items=6 history_len=7
+2026-11-15T02:40:15.743754Z  INFO shaniu_lib::agent_loop: 上下文已压缩（SH-032） compressed_items=7 history_len=5
+2026-11-15T02:53:16.305840Z  INFO shaniu_lib::session_compact: 上下文已压缩（SH-032） trigger="manual" compressed_items=5 history_len=2
+2026-11-15T02:56:55.757738Z  INFO shaniu_lib::agent_loop: 上下文已压缩（SH-032） compressed_items=3 history_len=2
+2026-11-15T02:57:19.183320Z  INFO shaniu_lib::agent_loop: 上下文已压缩（SH-032） compressed_items=3 history_len=3

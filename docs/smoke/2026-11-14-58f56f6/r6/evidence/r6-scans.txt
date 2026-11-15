@@ -1,0 +1,3 @@
+d:\MyWorkspace\SHANIU\scratch\smoke-r6-auto\SHANIU-Portable\data files=7 CannotResolveToolName=0 本本轮=0 压缩失败=0
+d:\MyWorkspace\SHANIU\scratch\smoke-r6-fail\SHANIU-Portable\data files=9 CannotResolveToolName=0 本本轮=0 压缩失败=2
+d:\MyWorkspace\SHANIU\scratch\r6-evi\export files=3 CannotResolveToolName=0 本本轮=0 压缩失败=0

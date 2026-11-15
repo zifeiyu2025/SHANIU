@@ -1,0 +1,45 @@
+第六轮聚焦复验（r6）UI 观察记录
+被测提交：main = 02d13d2（e816b7b → 02d13d2）
+二进制：scratch\target-r6\release\shaniu.exe（SHA256 7CC9F73A7851574FD03AA1A559A3A2B3AE497ACACF7F9EB39D0FC1B6629C0D24）
+实例：scratch\smoke-r6-auto\SHANIU-Portable（token_budget=100，真实 provider）、scratch\smoke-r6-fail\SHANIU-Portable（同预算，provider base_url=http://127.0.0.1:9/v1）
+
+== R5-1 压缩节点默认可见（硬判据） ==
+
+1) 自动压缩发生：日志 2026-11-15T02:39:55.845461Z `上下文已压缩（SH-032） compressed_items=3 history_len=5`（另 02:40:05、02:40:15 各一次，本回合共 3 次）。
+2) 未展开任何折叠组，直接取 UIA 全树（uia-tree.ps1，RawViewWalker 递归）：
+   - 回合结束态 `scratch\r6-evi\tree-post-turn.txt`（157 节点）：
+     - `Button "上下文已压缩 点击查看压缩摘要"` ×3（均带子节点 Text "上下文已压缩" / Text "点击查看压缩摘要"）
+     - `用户原文|任务目标|已完成事项|关键文件与改动` 命中 **0**
+   - 追问后重开态 `scratch\r6-evi\tree-reopen2.txt`（184 节点）：
+     - `Button "上下文已压缩 点击查看压缩摘要"` ×3
+     - 摘要正文关键字命中 **0**
+   - 判据结论：**压缩节点默认可见 = 是；摘要内容默认可见 = 否**。
+3) 对照（证明内容存在、只差一次点击）：同一定位按钮用 DOM click 触发一次后
+   `scratch\r6-evi\dom-after-click.json` → `afterClickSummary: true`，可见
+   `用户原文（压缩时逐字保留，不得改写）` → `你好，这是第一轮。` → `1. 任务目标` …。
+   截图 `r6/shots/r51-click-once-summary.png`。
+4) 界面态：`r6/shots/r51-live-compaction-node.png`、`r51-live-after-followup.png`
+   —— 节点在 Turn 层（"已完成 / 已完成分析"之后）直接可见，标题为
+   「上下文已压缩 · 点击查看压缩摘要」，无 notice。
+
+判定：硬判据要求"不展开任何组直接取全树，必须命中压缩节点且能看到摘要内容"。
+节点部分满足，摘要内容不满足（必须点一次）→ **FAIL（仅摘要内容一项）**。
+
+== R5-3 中文文案 ==
+
+- 手动 `/compact` 完成卡：`compact` + `已压缩 5 条历史（约 640 tokens）。`（全中文，r51-live-after-followup.png 中可见）
+- 空会话 `/compact`：`compact` + `暂无可压缩的历史。`（全中文）
+- 运行中文案：`compact` / `正在压缩…`
+
+== R5-5 失败区块文案 ==
+
+- 注入不可达 provider 后本轮失败区块：标题 `处理失败` → 行首
+  `本轮运行失败`（**无「本本轮」**），detail `压缩请求发起失败：无法连接到模型服务`，
+  右侧 `COMPACTION_FAILED`，下方 `原始错误` 折叠。
+- 截图：`r6/shots/r55-failure-block.png`、`r55-manual-compact-fail.png`
+
+== 回归观感 ==
+
+- 实时（追问完成）`2 轮 6 步`；强杀重开后仍 `2 轮 6 步`；导出 `turn/start`×2、`turn/end`×2。
+- 压缩后追问「继续：只读列出 src 目录内容，别改文件」正常作答（列出 `sum.js（262 B）`），
+  未出现上下文丢失或重复摘要串味。

@@ -1,0 +1,9 @@
+{
+  "result": {
+    "type": "object",
+    "value": {
+      "afterClickSummary": true,
+      "excerpt": "上下文已压缩\n点击查看压缩摘要\n用户原文（压缩时逐字保留，不得改写）\n\n你好，这是第一轮。\n\n1. 任务目标\n\n用户仅发送了「你好，这是第一轮。」，没有任何具体编码或操作需求。尚未明确任务目标、无范围声明、无验收约束。\n\n2. 已完成事项\n完成一次工作区只读探查，获取到三处结果：\npackage.json 内容（9 行）。\nsrc/ 目录列表：sum.js（262 B）。\ntest/ 目录列表：sum.test.js（579 B）。\n未做任何写入、执行、提交或验证动作。\n3. 关键文件与改动\npackage.json（只读）：项目 smoke-proj，private，version 1.0.0，\"type\": \"module\"，唯一脚本 \"test\": \"node test/sum.test.js\"。\nsrc/sum.js（仅列目录，未读取内容，262 B）。\ntest/sum.test.js（仅列目录，未读取内容，579 B）。\n无任何文件被修改。\n4. 未解决问题\n无失败或被拒绝的操作记录。\n未知项：src/sum.js 与 test/sum.test.js 的实际内容、项目预期"
+    }
+  }
+}

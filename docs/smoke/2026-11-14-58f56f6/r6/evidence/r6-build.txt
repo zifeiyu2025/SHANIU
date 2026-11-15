@@ -1,0 +1,8 @@
+被测提交：02d13d2（origin/main head）
+构建命令：$env:CARGO_TARGET_DIR='d:\MyWorkspace\SHANIU\scratch\target-r6'; pnpm tauri build --no-bundle
+耗时：334s（cargo release 5m07s）
+产物：d:\MyWorkspace\SHANIU\scratch\target-r6\release\shaniu.exe
+大小：28569088 B
+SHA256：7CC9F73A7851574FD03AA1A559A3A2B3AE497ACACF7F9EB39D0FC1B6629C0D24
+生成时间：2026-11-15 10:35:30
+说明：全新 CARGO_TARGET_DIR，未复用 r5 产物

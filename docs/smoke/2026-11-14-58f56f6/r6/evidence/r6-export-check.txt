@@ -1,0 +1,44 @@
+第六轮复验（r6）· R5-4 导出可分辨性（被测 02d13d2）
+操作路径：会话「你好，第一轮对话」→ 右上「···」→「下载 Session 日志」→ 保存对话框填入绝对路径。
+导出产物（真实 UI 触发，非离线重算）：
+- scratch\r6-evi\export\session-r6.zip（1 轮 4 步时点）
+- scratch\r6-evi\export\session-r6-manual.zip（手动 /compact 之后）
+- scratch\r6-evi\export\session-r6-final.zip（追问完成，2 轮 6 步；结论以此为准）
+同名 jsonl 已归档：r6-export-session.v4.jsonl / r6-export-session-manual.v4.jsonl
+
+=== session-r6-final.zip 统计 ===
+总事件 47；turn/start ×2、turn/end ×2、user/message ×2、assistant/message ×5、
+tool/call ×8、tool/result ×8、compaction/start ×6、compaction/summary ×6、compaction/end ×6。
+turn/start turn=1 reason=（空）；turn/end turn=1 reason=completed；
+turn/start turn=2 reason=（空）；turn/end turn=2 reason=completed。
+
+=== compaction/* 逐条（type turn trigger time） ===
+compaction/start   turn=1  trigger=pressure  time=1794710395845
+compaction/summary turn=（无） trigger=pressure time=1794710395845
+compaction/end     turn=1  trigger=pressure  time=1794710395845
+compaction/start   turn=1  trigger=pressure  time=1794710405897
+compaction/summary turn=（无） trigger=pressure time=1794710405897
+compaction/end     turn=1  trigger=pressure  time=1794710405897
+compaction/start   turn=1  trigger=pressure  time=1794710415743
+compaction/summary turn=（无） trigger=pressure time=1794710415743
+compaction/end     turn=1  trigger=pressure  time=1794710415743
+compaction/start   turn=null trigger=manual  time=1794711196305
+compaction/summary turn=（无） trigger=manual   time=1794711196305
+compaction/end     turn=null trigger=manual  time=1794711196305
+compaction/start   turn=2  trigger=pressure  time=1794711415757
+compaction/summary turn=（无） trigger=pressure time=1794711415757
+compaction/end     turn=2  trigger=pressure  time=1794711415757
+compaction/start   turn=2  trigger=pressure  time=1794711439183
+compaction/summary turn=（无） trigger=pressure time=1794711439183
+compaction/end     turn=2  trigger=pressure  time=1794711439183
+
+=== 判定要点 ===
+1. time：18 条 compaction 事件全部带 `time`（真实毫秒时间戳，非 0、无 timeUnreliable）。
+2. 手动/自动可分辨：自动=`trigger:"pressure"`（6 组中 5 组），手动 `/compact`=`trigger:"manual"`（1 组）。
+   手动那一组的原始行：
+   {"type":"compaction/start","data":{"compactionId":"shaniu-export-compaction-4","turn":null,"trigger":"manual"},"time":1794711196305,"seq":31}
+3. 锚点回合归属：回合内的 5 组 start/end 均带当轮号（turn=1 ×3、turn=2 ×2）；
+   回合外的手动压缩 start/end 为 `"turn":null`（显式 null，不是省略）。
+   `compaction/summary` 不带 turn，与实现一致（session-events.ts:163-166 只写 compactionId/summary/trigger）。
+4. 未虚增回合：导出 `turn/start` 与 `turn/end` 各 2 条，与实时/重开的 `2 轮 6 步` 对齐；
+   6 组压缩事件全部落在 turn 1/turn 2 内或 turn=null，没有凭空多出第 3 轮。
