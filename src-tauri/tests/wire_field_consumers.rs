@@ -76,10 +76,10 @@ const RULES: &[Rule] = &[
     Rule {
         owner: "SessionEntry",
         variant: "CompactionSummary",
-        fields: "text range_start range_end at_ms",
-        // 摘要正文与区间都进重建事件（`compaction/summary` + 一条通知），前端全读。
-        // `at_ms` 只是档案留档：压缩锚点没有独立时刻，前端不按它排序/展示。
-        overrides: &[("at_ms", Status::BackendOnly("压缩锚点没有独立时刻；前端只按档案顺序重建"))],
+        fields: "text range_start range_end at_ms trigger",
+        // 摘要正文与区间都进重建事件；`at_ms` 进导出事件时间（旧档 0 → 标不可信）；
+        // `trigger` 进导出三条 `compaction/*` 的 data，用来分辨手动/自动（R5-4）。
+        overrides: &[],
     },
     // ── EventMsg ────────────────────────────────────────────────────────────
     Rule { owner: "EventMsg", variant: "TurnStarted", fields: "turn", overrides: &[] },
