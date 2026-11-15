@@ -1382,7 +1382,7 @@ impl AgentLoop {
             //    不能重来，否则用户会看到两遍。
             let mut retries: u32 = 0;
             let mut retry_chain: Option<String> = None;
-            let (assistant_text, mut reasoning_text, full_message, calls, usage) = 'sample: loop {
+            let (assistant_text, mut reasoning_text, full_message, calls, usage, reasoning_items) = 'sample: loop {
                 // 每次尝试独占的状态：重试之间直接丢弃——它们没进历史、没执行工具。
                 let mut emitted_delta = false;
                 let mut assistant_text = String::new();
@@ -1390,6 +1390,9 @@ impl AgentLoop {
                 let mut full_message: Option<String> = None;
                 let mut calls: Vec<(String, String, String)> = Vec::new(); // (name, arguments, call_id)
                 let mut usage: Option<Usage> = None;
+                // 本步的 Responses 推理项（D2）：按端点给的顺序攒着，入历史时排在
+                // assistant 消息之前。Chat 路径不会产生它们（推理走 ReasoningDelta）。
+                let mut reasoning_items: Vec<HistoryItem> = Vec::new();
 
                 // 建立流本身也要能被取消（审计 H1）：端点迟迟不回响应头时，
                 // 只在流建立之后检查取消等于"取消点永远到不了"。
@@ -1449,6 +1452,19 @@ impl AgentLoop {
                                     Some(ModelStreamEvent::OutputItem(ResponseItem::FunctionCall { name, arguments, call_id })) => {
                                         calls.push((name, arguments, call_id));
                                     }
+                                    // 可回放的推理项（D2）：原样收下，下一轮按原顺序回放。
+                                    // 密文不解读、不进事件面——UI 的推理展示仍走 ReasoningDelta。
+                                    Some(ModelStreamEvent::OutputItem(ResponseItem::Reasoning {
+                                        id,
+                                        summary,
+                                        encrypted_content,
+                                    })) => {
+                                        reasoning_items.push(HistoryItem::Reasoning {
+                                            id,
+                                            summary,
+                                            encrypted_content,
+                                        });
+                                    }
                                     Some(ModelStreamEvent::Completed { usage: u }) => {
                                         usage = Some(u);
                                         finished = true;
@@ -1489,7 +1505,14 @@ impl AgentLoop {
                 });
 
                 let Some(error) = failure else {
-                    break 'sample (assistant_text, reasoning_text, full_message, calls, usage);
+                    break 'sample (
+                        assistant_text,
+                        reasoning_text,
+                        full_message,
+                        calls,
+                        usage,
+                        reasoning_items,
+                    );
                 };
 
                 // 重试的硬约束：只在**尚未向用户交付任何内容**时重试。
@@ -1665,6 +1688,11 @@ impl AgentLoop {
                 }
             }
 
+            // 推理项必须排在对应 assistant 消息**之前**（D2）：严格端点按「推理 → 消息/调用」
+            // 的顺序续写，顺序反了会对不上号。Chat 路径这里恒为空，不影响既有形状。
+            for item in reasoning_items {
+                history.push(item);
+            }
             if !text.trim().is_empty() || reasoning.is_some() {
                 history.push(HistoryItem::Message { role: Role::Assistant, text, reasoning });
             }

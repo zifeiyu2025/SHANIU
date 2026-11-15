@@ -121,6 +121,7 @@ fn options(cache_key: &str) -> RequestOptions {
         cache_key: Some(cache_key.to_string()),
         responses_extras: true,
         parallel_tool_calls: true,
+        reasoning_replay: true,
     }
 }
 
@@ -268,10 +269,11 @@ async fn responses_body_carries_protocol_fields() {
     assert_eq!(body["tool_choice"], "auto", "tool_choice 不能被端点默认值决定：{body}");
     assert_eq!(body["parallel_tool_calls"], true);
     assert_eq!(body["prompt_cache_key"], "sess-1");
+    // D2：推理回放默认打开，端点才会在响应里带 `encrypted_content`。
     assert_eq!(
-        body["include"].as_array().expect("include 必须是数组").len(),
-        0,
-        "D1 阶段 include 固定空数组：不替用户多付密文体积"
+        body["include"],
+        serde_json::json!(["reasoning.encrypted_content"]),
+        "默认声明 reasoning.encrypted_content：{body}"
     );
 }
 

@@ -38,6 +38,7 @@
 - **增量拼装集中在累加器**：`text-delta` / `reasoning-delta` / `tool-call-delta` 被压成 chunks 并保留时间戳与索引，`usage`、`finish` 等原样保留（`src/dsh/packages/llm/llm/src/assistant-stream.ts:99-193`）。
 - **可逆**：`expandAssistantStream` 按 `dt` 还原原始 `TimedStreamChunk` 序列，用于回放与统计（同文件 `:196-220`）。
 - **用量统计单独投影**：`token-meter` 按 `request/header`、`step/start`、`step/end`、`assistant/message` 推进，assistant 侧用同一套流拼装结果计算（`src/dsh/packages/llm/token-meter/src/measurement-projection.ts:44-78`）。
+- **差异（D2，SHANIU 自建）**：Responses 的 `reasoning` item 在 SHANIU 里按**独立历史项**捕获与回放（含端点给的 `encrypted_content`），排在 assistant 消息之前；dsh 的 `reasoning-delta` 只做流式展示。ChatCompletions 路径仍走 `Message.reasoning`，两者不混用（见 `docs/04` §4.3）。
 
 ### 3.3 失败与重试
 

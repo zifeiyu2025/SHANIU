@@ -41,6 +41,23 @@ const REQUEST_TIMEOUT: Duration = Duration::from_secs(900);
 pub enum ResponseItem {
     Message { role: String, text: String },
     FunctionCall { name: String, arguments: String, call_id: String },
+    /// 可回放的推理项（D2）：密文由端点生成，我们只负责原样保存、原样回放。
+    Reasoning {
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        id: Option<String>,
+        #[serde(default)]
+        summary: Vec<ReasoningSummary>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        encrypted_content: Option<String>,
+    },
+}
+
+/// 推理摘要项。`kind` 是端点给的 `type`（通常 `summary_text`），存什么回放什么。
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ReasoningSummary {
+    #[serde(rename = "type")]
+    pub kind: String,
+    pub text: String,
 }
 
 /// Token 用量（agent_loop 映射到 EventMsg::TokenUsage 广播）。
@@ -107,6 +124,19 @@ pub enum HistoryItem {
         role: Role,
         text: String,
         images: Vec<ImageRef>,
+    },
+    /// 一个可回放的推理项（D2）。`encrypted_content` 是端点给的密文，原样保存、
+    /// 原样回放；我们不生成也不解读它。`summary` 用于 UI/摘要，回放按原结构送回。
+    ///
+    /// 只走 Responses 路径：ChatCompletions 的推理走 `Message.reasoning`（SH-083），
+    /// `chat_messages` 会跳过本变体。
+    Reasoning {
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        id: Option<String>,
+        #[serde(default)]
+        summary: Vec<ReasoningSummary>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        encrypted_content: Option<String>,
     },
 }
 
@@ -209,8 +239,34 @@ fn parse_item(item: &serde_json::Value) -> Option<ResponseItem> {
             arguments: item.get("arguments")?.as_str()?.to_string(),
             call_id: item.get("call_id")?.as_str()?.to_string(),
         }),
+        "reasoning" => Some(ResponseItem::Reasoning {
+            id: item.get("id").and_then(|v| v.as_str()).map(str::to_string),
+            summary: parse_reasoning_summary(item.get("summary")),
+            encrypted_content: item
+                .get("encrypted_content")
+                .and_then(|v| v.as_str())
+                .map(str::to_string),
+        }),
         _ => None,
     }
+}
+
+/// `summary: [{type, text}]` → 结构化摘要；缺字段或形状不符的条目跳过。
+fn parse_reasoning_summary(value: Option<&serde_json::Value>) -> Vec<ReasoningSummary> {
+    value
+        .and_then(|v| v.as_array())
+        .map(|parts| {
+            parts
+                .iter()
+                .filter_map(|part| {
+                    Some(ReasoningSummary {
+                        kind: part.get("type")?.as_str()?.to_string(),
+                        text: part.get("text")?.as_str()?.to_string(),
+                    })
+                })
+                .collect()
+        })
+        .unwrap_or_default()
 }
 
 // ============================== 请求体构造（纯函数） ==============================
@@ -248,8 +304,13 @@ pub fn build_responses_request(
         body["tool_choice"] = serde_json::json!("auto");
         // 只影响模型一次返回几个调用；宿主执行顺序仍由 agent_loop 决定。
         body["parallel_tool_calls"] = serde_json::json!(options.parallel_tool_calls);
-        // D1 阶段固定空数组（D2 打开 reasoning.encrypted_content）：不替用户多付密文体积。
-        body["include"] = serde_json::json!([]);
+        // 推理回放（D2）：打开后端点会在响应里带上 `encrypted_content`，
+        // 我们原样存进历史、下一轮原样回放。关掉时保持 D1 的空数组，不替用户多付密文体积。
+        body["include"] = if options.reasoning_replay {
+            serde_json::json!(["reasoning.encrypted_content"])
+        } else {
+            serde_json::json!([])
+        };
         // 会话级前缀缓存键：缺省不发（给不认它的端点/夹具留退路）。
         if let Some(key) = options.cache_key.as_deref().filter(|key| !key.is_empty()) {
             body["prompt_cache_key"] = serde_json::json!(key);
@@ -280,9 +341,10 @@ pub fn build_responses_request(
 /// 这两项与本仓库既有形态一致，显式构造只是把形状钉在一处，不再依赖「serde 的字段名
 /// 恰好等于 wire 字段名」。
 ///
-/// `reasoning` 在这里**不发**：Responses 回放推理要独立的 `reasoning` item（需
-/// `encrypted_content`），我们没有加密推理可回放；把明文 `reasoning` 当消息字段塞进去
-/// 反而是陌生键。ChatCompletions 侧仍按 SH-083 回传。
+/// `reasoning` 在这里按独立 `reasoning` item 回放（D2）：Responses 的续写要求带上
+/// 上一轮的推理项（含端点给的 `encrypted_content`），否则严格网关会对带工具调用的
+/// 多轮直接 400。密文只存不读，`encrypted_content` 为空时省掉该键（部分端点不收空串）。
+/// ChatCompletions 侧仍按 SH-083 走 `Message.reasoning`。
 ///
 /// 图片消息必须发成
 /// `{"role","content":[{"type":"input_text"},{"type":"input_image","image_url":"data:…"}]}`：
@@ -320,6 +382,22 @@ fn responses_input(history: &[HistoryItem]) -> Vec<serde_json::Value> {
                 "call_id": call_id,
                 "output": output,
             }),
+            HistoryItem::Reasoning { id, summary, encrypted_content } => {
+                let mut item = serde_json::json!({
+                    "type": "reasoning",
+                    "summary": summary.iter().map(|part| serde_json::json!({
+                        "type": part.kind,
+                        "text": part.text,
+                    })).collect::<Vec<_>>(),
+                });
+                if let Some(id) = id.as_deref().filter(|id| !id.is_empty()) {
+                    item["id"] = serde_json::json!(id);
+                }
+                if let Some(encrypted) = encrypted_content.as_deref().filter(|c| !c.is_empty()) {
+                    item["encrypted_content"] = serde_json::json!(encrypted);
+                }
+                item
+            }
         })
         .collect()
 }
@@ -453,6 +531,12 @@ pub fn chat_messages(instructions: &str, history: &[HistoryItem]) -> Vec<serde_j
                     m["reasoning_content"] = serde_json::Value::String(r.to_string());
                 }
                 messages.push(m);
+                i += 1;
+            }
+            // Responses 的推理项在 Chat 路径没有对等位置：推理走 `Message.reasoning`
+            // （SH-083），不能把 Responses 的 item 塞进 messages 数组。跳过即可——
+            // 它不参与工具配对，也不影响相邻消息的顺序。
+            HistoryItem::Reasoning { .. } => {
                 i += 1;
             }
             HistoryItem::ImageMessage { role, text, images } => {
@@ -1253,11 +1337,43 @@ mod tests {
         assert_eq!(body["input"][0]["type"], "function_call");
         assert_eq!(body["input"][1]["type"], "function_call_output");
     }
+
+    #[test]
+    fn reasoning_item_is_parsed_from_output_item_done() {
+        let ev = event(
+            "response.output_item.done",
+            r#"{"item":{"type":"reasoning","id":"rs_1",
+                "summary":[{"type":"summary_text","text":"think"}],
+                "encrypted_content":"gAAA"}}"#,
+        );
+        assert_eq!(
+            translate_sse_event(&ev),
+            Some(ModelStreamEvent::OutputItem(ResponseItem::Reasoning {
+                id: Some("rs_1".into()),
+                summary: vec![ReasoningSummary {
+                    kind: "summary_text".into(),
+                    text: "think".into(),
+                }],
+                encrypted_content: Some("gAAA".into()),
+            }))
+        );
+    }
 }
 
 #[cfg(test)]
 mod chat_tests {
     use super::*;
+
+    /// 与 `tests` 模块同形的最小端点描述：本模块的用例也要构造同一份 `ProviderConfig`。
+    fn provider(protocol: &str) -> ProviderConfig {
+        ProviderConfig {
+            provider: protocol.into(),
+            base_url: "https://x/v1".into(),
+            model: "m1".into(),
+            reasoning_effort: None,
+            headers: Default::default(),
+        }
+    }
 
     #[test]
     fn chat_request_carries_reasoning_effort_only_when_set() {
@@ -1310,6 +1426,87 @@ mod chat_tests {
         assert!(body["include"].as_array().is_some(), "include 必须是数组：{body}");
         // 缺省不带缓存键：单测/评测夹具没有会话 id，不能凭空造一个。
         assert!(body.get("prompt_cache_key").is_none(), "{body}");
+    }
+
+    #[test]
+    fn chat_messages_skips_reasoning_items() {
+        // ChatCompletions 没有 reasoning item：塞进去是陌生键，必须整条跳过。
+        let history = vec![
+            HistoryItem::Reasoning {
+                id: Some("rs_1".into()),
+                summary: vec![],
+                encrypted_content: Some("gAAA".into()),
+            },
+            HistoryItem::Message {
+                role: Role::Assistant,
+                text: "a".into(),
+                reasoning: None,
+            },
+            HistoryItem::Message { role: Role::User, text: "u".into(), reasoning: None },
+        ];
+        let body = build_chat_request(&provider("openai-chat"), &history, &[], "SYS");
+        let messages = body["messages"].as_array().expect("messages 数组");
+        // system + assistant + user；推理项不占位。
+        assert_eq!(messages.len(), 3, "{body}");
+        assert!(messages.iter().all(|m| m.get("reasoning").is_none()), "{body}");
+        let raw = body.to_string();
+        assert!(!raw.contains("gAAA"), "密文不得进 chat 请求：{raw}");
+    }
+
+    #[test]
+    fn responses_input_places_reasoning_before_assistant_message() {
+        let history = vec![
+            HistoryItem::Reasoning {
+                id: Some("rs_1".into()),
+                summary: vec![ReasoningSummary {
+                    kind: "summary_text".into(),
+                    text: "think".into(),
+                }],
+                encrypted_content: Some("gAAA".into()),
+            },
+            HistoryItem::Message {
+                role: Role::Assistant,
+                text: "done".into(),
+                reasoning: None,
+            },
+            HistoryItem::Message { role: Role::User, text: "next".into(), reasoning: None },
+        ];
+        let body = build_responses_request(
+            &provider("openai-responses"),
+            &history,
+            &[],
+            "SYS",
+            &RequestOptions::default(),
+        );
+        assert_eq!(body["input"][0]["type"], "reasoning", "{body}");
+        assert_eq!(body["input"][0]["encrypted_content"], "gAAA");
+        assert_eq!(body["input"][0]["summary"][0]["type"], "summary_text");
+        assert_eq!(body["input"][1]["role"], "assistant", "{body}");
+        assert_eq!(body["input"][2]["role"], "user", "{body}");
+        assert_eq!(body["include"], serde_json::json!(["reasoning.encrypted_content"]));
+        // 空密文不带该键：部分端点不收空串。
+        let empty = vec![HistoryItem::Reasoning {
+            id: None,
+            summary: vec![],
+            encrypted_content: None,
+        }];
+        let body = build_responses_request(
+            &provider("openai-responses"),
+            &empty,
+            &[],
+            "SYS",
+            &RequestOptions::default(),
+        );
+        assert!(body["input"][0].get("encrypted_content").is_none(), "{body}");
+        assert!(body["input"][0].get("id").is_none(), "{body}");
+    }
+
+    #[test]
+    fn reasoning_replay_off_keeps_include_empty() {
+        let options = RequestOptions { reasoning_replay: false, ..RequestOptions::default() };
+        let body =
+            build_responses_request(&provider("openai-responses"), &[], &[], "SYS", &options);
+        assert_eq!(body["include"], serde_json::json!([]), "{body}");
     }
 
     #[test]

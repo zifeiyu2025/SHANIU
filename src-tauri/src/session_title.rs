@@ -230,6 +230,7 @@ pub fn spawn_generation(app: tauri::AppHandle, agent_id: String, first_message: 
         cache_key: None,
         responses_extras: active.responses_extras,
         parallel_tool_calls: active.parallel_tool_calls,
+        reasoning_replay: active.reasoning_replay,
     };
     let dir = state.data_root().join(crate::rollout::ROLLOUT_DIR);
     tauri::async_runtime::spawn(async move {

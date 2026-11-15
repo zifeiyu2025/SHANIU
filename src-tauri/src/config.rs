@@ -472,6 +472,8 @@ pub struct ResolvedModel {
     pub responses_extras: bool,
     /// 响应端 `parallel_tool_calls`（D1，`[model].parallel_tool_calls`）。
     pub parallel_tool_calls: bool,
+    /// 是否捕获并回放 Responses 推理项（D2，`[model].reasoning_replay`）。
+    pub reasoning_replay: bool,
 }
 
 impl AppConfig {
@@ -665,6 +667,7 @@ impl AppConfig {
                         .unwrap_or(0),
                     responses_extras: self.model.responses_extras,
                     parallel_tool_calls: self.model.parallel_tool_calls,
+                    reasoning_replay: self.model.reasoning_replay,
                 }
             }
             None => ResolvedModel {
@@ -683,6 +686,7 @@ impl AppConfig {
                 context_window: 0,
                 responses_extras: self.model.responses_extras,
                 parallel_tool_calls: self.model.parallel_tool_calls,
+                reasoning_replay: self.model.reasoning_replay,
             },
         }
     }
@@ -829,6 +833,11 @@ pub struct ModelConfig {
     /// **不改变**宿主执行顺序：批次的串并行仍由 agent_loop 决定。
     #[serde(default = "default_true")]
     pub parallel_tool_calls: bool,
+    /// 是否捕获并回放 Responses 推理项（D2）。默认 true：多轮续写带上上一轮推理状态，
+    /// 避免模型每轮从零推理、严格网关因缺 reasoning item 直接 400。关掉可省密文体积，
+    /// 代价是回到 D1 的「每轮清空推理」行为。
+    #[serde(default = "default_true")]
+    pub reasoning_replay: bool,
 }
 
 /// 布尔项的缺省值 `true`。
@@ -849,6 +858,7 @@ impl Default for ModelConfig {
             max_retries: 5,
             responses_extras: true,
             parallel_tool_calls: true,
+            reasoning_replay: true,
         }
     }
 }

@@ -1363,6 +1363,13 @@ fn project_slots_with(items: &[rollout::RolloutItem], include_compaction: bool) 
                 )))
             }
             rollout::RolloutItem::Compacted { .. } => {}
+            // 推理项（D2）：展示/导出都不投影。密文是"可见但不可读"的数据，
+            // 投影进 SessionEntry 只会把推理正文与密文混进对话时间线；导出仍按
+            // rollout 原样序列化（本函数只决定界面条目）。
+            rollout::RolloutItem::ResponseItem {
+                item: model_client::HistoryItem::Reasoning { .. },
+                ..
+            } => {}
             // 带图消息保留结构化引用：展示层自己决定怎么渲染图片卡片，
             // 重放也不再依赖正文里的历史 marker。字节永远不进档案。
             rollout::RolloutItem::ResponseItem {
@@ -2331,6 +2338,7 @@ fn build_agent_with(
         cache_key: Some(agent_id.to_string()),
         responses_extras: active.responses_extras,
         parallel_tool_calls: active.parallel_tool_calls,
+        reasoning_replay: active.reasoning_replay,
     };
     let backend: Arc<dyn ModelBackend> =
         Arc::new(agent_loop::ResponsesBackend { provider, api_key, options });
@@ -3079,6 +3087,7 @@ async fn compact_session(app: tauri::AppHandle, agent_id: String) -> Result<Opti
         cache_key: Some(agent_id.clone()),
         responses_extras: active.responses_extras,
         parallel_tool_calls: active.parallel_tool_calls,
+        reasoning_replay: active.reasoning_replay,
     };
     let path = state
         .data_root()

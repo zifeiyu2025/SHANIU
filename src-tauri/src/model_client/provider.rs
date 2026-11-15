@@ -68,11 +68,20 @@ pub struct RequestOptions {
     /// 响应端 `parallel_tool_calls`。只影响模型一次返回几个调用，
     /// **不改变**宿主的工具执行顺序（那由 agent_loop 决定）。
     pub parallel_tool_calls: bool,
+    /// 是否捕获并回放 Responses 的推理项（D2）。默认 true：请求声明
+    /// `include: ["reasoning.encrypted_content"]`，历史里的 `Reasoning` 项原样回放。
+    /// 关掉后两步都不做，请求体回到 D1 形状（不付密文体积，也不带推理状态续写）。
+    pub reasoning_replay: bool,
 }
 
 impl Default for RequestOptions {
     fn default() -> Self {
-        Self { cache_key: None, responses_extras: true, parallel_tool_calls: true }
+        Self {
+            cache_key: None,
+            responses_extras: true,
+            parallel_tool_calls: true,
+            reasoning_replay: true,
+        }
     }
 }
 
@@ -89,6 +98,7 @@ mod tests {
             max_retries: 0,
             responses_extras: true,
             parallel_tool_calls: true,
+            reasoning_replay: true,
         }
     }
 
@@ -107,6 +117,7 @@ mod tests {
             context_window: 0,
             responses_extras: true,
             parallel_tool_calls: true,
+            reasoning_replay: true,
         };
         let p = ProviderConfig::from_resolved(&resolved);
         assert_eq!(p.reasoning_effort.as_deref(), Some("high"));

@@ -115,6 +115,12 @@ pub fn item_tokens(item: &HistoryItem) -> usize {
             approx_tokens(name) + approx_tokens(arguments)
         }
         HistoryItem::FunctionCallOutput { output, .. } => approx_tokens(output),
+        // 密文确实占输入 token（下一轮原样回放），不计数会让预算系统性低估、
+        // 压缩比实际需要更晚触发。摘要文本也随请求发出，一并计入。
+        HistoryItem::Reasoning { summary, encrypted_content, .. } => {
+            summary.iter().map(|part| approx_tokens(&part.text)).sum::<usize>()
+                + encrypted_content.as_deref().map(approx_tokens).unwrap_or_default()
+        }
         // 图片字节不在历史里，按 view_image 记下的分辨率估算值计入预算。
         HistoryItem::ImageMessage { text, images, .. } => {
             approx_tokens(text) + images.iter().map(|image| image.tokens as usize).sum::<usize>()
@@ -164,9 +170,25 @@ fn tail_target(items: &[HistoryItem], keep_allowance: usize) -> Target {
         split = items.len() - 1;
     }
     // 不变量③：切点不能落在工具调用组中间（调用被压掉、输出还留在保留段）。
-    let split = cut_keeps_pairs(items, split);
-    // 不变量④：绝不空压。
+    // 不变量④：推理项必须和它后面的消息一起留下——"有消息没推理"无害，
+    // "推理被压掉、消息还在"会让严格端点在续写时对不上号（D2）。
+    let split = cut_keeps_reasoning(items, cut_keeps_pairs(items, split));
+    // 不变量⑤：绝不空压。
     Target { range_start: 0, range_end: split.max(1) }
+}
+
+/// 把切点向前回退，直到丢弃段不再以「推理项」结尾（推理与它附着的消息被拆开）。
+///
+/// 规则只在这里实现：切点的另一处来源是手动压缩，它同样走 [`tail_target`]；
+/// 在下游补一遍会让两处口径漂移。多枚连续推理项时一并回退到整段之前。
+fn cut_keeps_reasoning(items: &[HistoryItem], mut split: usize) -> usize {
+    if !matches!(items.get(split), Some(HistoryItem::Message { .. })) {
+        return split;
+    }
+    while split > 0 && matches!(items.get(split - 1), Some(HistoryItem::Reasoning { .. })) {
+        split -= 1;
+    }
+    split
 }
 
 /// 把切点向前回退，直到丢弃段里不再有"输出仍留在保留段"的调用。
@@ -245,6 +267,9 @@ fn has_real_content(items: &[HistoryItem], target: &Target) -> bool {
                 !text.trim().is_empty() || !images.is_empty()
             }
             HistoryItem::FunctionCall { .. } | HistoryItem::FunctionCallOutput { .. } => true,
+            // 推理项本身不是可总结的对话内容；它附着在紧接着的助手消息上，
+            // 那条消息会决定这段区间是否值得压。
+            HistoryItem::Reasoning { .. } => false,
         })
 }
 
@@ -646,6 +671,47 @@ mod tests {
         let target = plan_manual(&items, 190).expect("有可压区间");
         assert_eq!(target.range_end, 1, "切到组中间会丢掉 c1 却留下它的输出");
         assert_pairs_complete(&items[target.range_end..]);
+    }
+
+    /// D2：密文随下一轮请求原样回放，确实占输入 token。不计入就会让预算系统性
+    /// 低估、压缩比实际需要更晚触发。
+    ///
+    /// 反向对照：删掉 `item_tokens` 的 `Reasoning` 分支，差值变成 0，这里变红。
+    #[test]
+    fn reasoning_tokens_are_counted() {
+        let plain = vec![msg(Role::User, "任务")];
+        let mut with_reasoning = plain.clone();
+        with_reasoning.push(HistoryItem::Reasoning {
+            id: None,
+            summary: vec![],
+            encrypted_content: Some("x".repeat(400)),
+        });
+        assert_eq!(
+            history_tokens(&with_reasoning) - history_tokens(&plain),
+            100,
+            "400 字节密文应按 100 token 计入预算"
+        );
+    }
+
+    /// D2：切点不能落在「推理项 → 它的助手消息」之间。只看保留侧，有消息没推理无害；
+    /// 推理被压掉、消息还在，严格端点在续写时会对不上号。
+    ///
+    /// 反向对照：去掉 `tail_target` 里的 `cut_keeps_reasoning`，这里会得到 `range_end = 2`。
+    #[test]
+    fn cut_never_separates_reasoning_from_its_message() {
+        let items = vec![
+            msg(Role::User, &"u".repeat(400)), // 100 token
+            HistoryItem::Reasoning {
+                id: None,
+                summary: vec![],
+                encrypted_content: Some("g".repeat(40)), // 10
+            },
+            msg(Role::Assistant, &"a".repeat(20)), // 5
+            msg(Role::User, "继续"),                // 2
+        ];
+        // 预算 50 → 保留额度 15：装得下最后两条（7），装不下推理项（17）。
+        let target = plan_manual(&items, 50).expect("有可压区间");
+        assert_eq!(target.range_end, 1, "推理项必须和它的助手消息一起留下");
     }
 
     /// 配对完整的尾巴不会被无谓地多留：切点本来就是组边界时，回退逻辑不得再动它。

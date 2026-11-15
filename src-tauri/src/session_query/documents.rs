@@ -159,6 +159,12 @@ pub fn build_documents(items: &[RolloutItem], created_at: u64) -> Vec<SearchDoc>
                     &mut documents,
                 );
             }
+            // 推理项（D2）不进索引：密文不可读、摘要也不是用户/模型的语义发言；
+            // 索引它们会让搜索命中一段模型内部状态。
+            RolloutItem::ResponseItem {
+                item: HistoryItem::Reasoning { .. },
+                ..
+            } => {}
             // 首行 meta、子代理引用、档位事件、退出留痕与回合结局都不是可搜索内容。
             // 系统提示词也不进索引：它是宿主拼装的固定说明，不是用户/模型对话；
             // 混进来会让每次搜索都命中同一段模板，把真正的会话内容压下去。
@@ -212,7 +218,10 @@ fn is_history_item(item: &RolloutItem) -> bool {
             item: HistoryItem::Message { .. }
                 | HistoryItem::FunctionCall { .. }
                 | HistoryItem::FunctionCallOutput { .. }
-                | HistoryItem::ImageMessage { .. },
+                | HistoryItem::ImageMessage { .. }
+                // 推理项进历史序列（resume 原样重放）但不进索引：漏数会让压缩锚点的
+                // 区间下标整体错位一格。
+                | HistoryItem::Reasoning { .. },
             ..
         }
     )
