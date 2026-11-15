@@ -13,7 +13,8 @@
 - [x] T9 反向验证 5 条（§3.4），含"删 `.git/index`"探针，记录输出后恢复。
 - [x] T10 卸载回归：装/卸后 `.git` DACL 逐字节一致。
 - [x] T11 文档：`docs/16-沙箱改为只约束写.md` 补保护子路径与升级通道；`docs/11-使用指南.md` 补"git 写操作为什么要升级"。
-- [ ] T12 验收：全量测试、探针、clippy、fmt、check-deps、check-doc-claims 全绿；一笔提交，非 force。
+- [x] T12 验收：全量测试、探针、clippy、fmt、check-deps、check-doc-claims 全绿；一笔提交，非 force。
+  结论：CI run `43757124549` success（含 8.3 短名修复与字段消费登记两笔补丁）。
 
 ## 落地偏差（2026-11-16）
 
