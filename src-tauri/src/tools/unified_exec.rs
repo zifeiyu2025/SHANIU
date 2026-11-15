@@ -628,6 +628,11 @@ impl ToolExecutor for UnifiedExec {
                     if let Some(hint) = self.write_file_hint(ctx, command) {
                         text.push_str(&hint);
                     }
+                    // D7：受保护元数据路径的写入被 DACL 拒绝（err 5）→ 回填升级提示，
+                    // 否则模型只会换十种写法在沙箱里反复试，每次都撞同一堵墙。
+                    if let Some(hint) = protected_path_hint(ctx, command, &text) {
+                        text.push_str(&hint);
+                    }
                     break if code == 0 {
                         Ok(ToolOutput::ok(text))
                     } else {
@@ -652,6 +657,38 @@ impl ToolExecutor for UnifiedExec {
 
 fn to_io_channel(code: u8) -> IoChannel {
     if code == 0 { IoChannel::Stdout } else { IoChannel::Stderr }
+}
+
+/// 受保护元数据路径（`.git` / `.agents` / `.codex`）的写入被 DACL 拒绝时的回填提示（D7）。
+///
+/// 触发条件刻意收窄：**写约束档 + 失败 + 报错是拒绝访问 + 命令里出现受保护目录名**。
+/// 三者缺一都不提示——读 `.git/config` 被拒绝是另一类问题，乱给升级建议只会诱导模型
+/// 把只读操作也拿去申请出沙箱。
+fn protected_path_hint(ctx: &ToolContext, command: &str, text: &str) -> Option<String> {
+    if ctx.sandbox != crate::config::SandboxMode::WorkspaceWrite {
+        return None;
+    }
+    let denied = ["拒绝访问", "Access is denied", "Access denied", "Permission denied"]
+        .iter()
+        .any(|needle| text.contains(needle));
+    if !denied {
+        return None;
+    }
+    let command = command.to_lowercase();
+    let guard = crate::sandbox::acl::protected_subpaths(&ctx.workspace_root)
+        .into_iter()
+        .find(|path| {
+            path.file_name()
+                .map(|name| command.contains(&name.to_string_lossy().to_lowercase()))
+                .unwrap_or(false)
+        })?;
+    Some(format!(
+        "\n[提示] 这条命令写入的是工作区内的只读元数据路径「{}」（`.git` / `.agents` / `.codex` 只读，\
+         防止模型改写 git 钩子在用户下次 `git commit` 时以用户身份执行任意命令）。\
+         如确需修改，请在参数中加 \"escalate\": true 重试：会先弹一次审批，批准后这条命令在沙箱外、\
+         以用户本人身份执行；不要换写法继续在沙箱内重试。",
+        guard.display()
+    ))
 }
 
 #[cfg(test)]

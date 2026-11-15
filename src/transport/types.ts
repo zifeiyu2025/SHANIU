@@ -189,6 +189,7 @@ export type EventMsg =
   | { type: 'exec_approval_request'; request_id: string; tool: string; args: JsonValue; risk: RiskLevel; agent_id?: string; task_summary?: string; reason?: string; call_id?: string; batch_scope?: string }
   | { type: 'exec_approval_resolved'; request_id: string; decision: ApprovalDecision }
   | { type: 'allowlist_hit'; tool: string; command: string; rule_id: string }
+  | { type: 'sandbox_escalated'; call_id: string; tool: string; request_id: string; command?: string | null }
   | { type: 'plan_delta'; delta: string }
   | { type: 'turn_diff'; files: string[] }
   | { type: 'error'; message: string }

@@ -1062,6 +1062,19 @@ impl AgentLoop {
         let emit = |sink: &Arc<dyn crate::events::EventSink>, msg: EventMsg| {
             let _ = sink.emit(&msg);
         };
+        // 提权执行审计（D7）：批准升级后**真正换档**时发一次，命令原文一起留痕。
+        // 请求 id 与审批卡同一份（`escalation_request_id`），前端与日志能对上号。
+        let emit_escalated = |sink: &Arc<dyn crate::events::EventSink>,
+                              tool: &str,
+                              call_id: &str,
+                              args: &serde_json::Value| {
+            let _ = sink.emit(&EventMsg::SandboxEscalated {
+                call_id: call_id.to_string(),
+                tool: tool.to_string(),
+                request_id: crate::permission::escalation_request_id(call_id),
+                command: args.get("command").and_then(|value| value.as_str()).map(str::to_string),
+            });
+        };
         // 档案写入失败 = 降级，不是失败。
         //
         // 观测（轨迹/审计）不能决定主流程成败：磁盘满或 ACL 挡一下，用户要的是把话
@@ -1995,7 +2008,8 @@ impl AgentLoop {
                                 )
                                 .await
                             {
-                                crate::permission::GateOutcome::Allowed => {}
+                                crate::permission::GateOutcome::Allowed
+                                | crate::permission::GateOutcome::AllowedEscalated => {}
                                 crate::permission::GateOutcome::Denied => {
                                     emit(&sink, EventMsg::ToolCallEnd {
                                         call_id: b_call_id.clone(),
@@ -2211,7 +2225,8 @@ impl AgentLoop {
                     )
                     .await
                 {
-                    crate::permission::GateOutcome::Allowed => {}
+                    crate::permission::GateOutcome::Allowed
+                    | crate::permission::GateOutcome::AllowedEscalated => {}
                     crate::permission::GateOutcome::Denied => {
                         emit(&sink, EventMsg::ToolCallEnd {
                             call_id: call_id.clone(),
@@ -2251,12 +2266,71 @@ impl AgentLoop {
                     }
                 }
 
+                // 模型显式申请升级（D7）：受保护路径的 err 5 会被回填成「带 escalate 重试」，
+                // 这里把标记变成一次**真实审批**——批准才换档，拒绝就不执行。
+                // 参数里写 `escalate` 绝不等于自动出沙箱：`Never` 档根本没有询问通道，
+                // 所以那里直接忽略标记，仍按沙箱执行（DACL 照旧拒绝并回填提示）。
+                let mut escalated_now = false;
+                if turn_policy.sandbox == crate::config::SandboxMode::WorkspaceWrite
+                    && turn_policy.approval != crate::config::ApprovalMode::Never
+                    && args_val.get("escalate").and_then(|value| value.as_bool()) == Some(true)
+                {
+                    let escalation = self
+                        .broker
+                        .request_escalation(
+                            name,
+                            &args_val,
+                            call_id,
+                            "命令要写的路径是工作区内的只读元数据（.git / .agents / .codex）",
+                            call_subject,
+                            crate::permission::GateEnv { sink: &sink, cancel },
+                        )
+                        .await;
+                    match escalation {
+                        crate::permission::GateOutcome::Allowed
+                        | crate::permission::GateOutcome::AllowedEscalated => {
+                            escalated_now = true;
+                            emit_escalated(&sink, name, call_id, &args_val);
+                        }
+                        crate::permission::GateOutcome::Cancelled => {
+                            emit(&sink, EventMsg::ToolCallEnd {
+                                call_id: call_id.clone(),
+                                exit_code: None,
+                                error: Some("已取消".into()),
+                                result: Some(ToolCallResult::Cancelled),
+                            });
+                            reason = TurnEndReasonLocal::Cancelled;
+                            break 'outer;
+                        }
+                        _ => {
+                            // 拒绝升级：明确回填「别再在沙箱内重试同一写入」，
+                            // 否则模型会拿着 err 5 反复试，每次都弹一次卡。
+                            emit(&sink, EventMsg::ToolCallEnd {
+                                call_id: call_id.clone(),
+                                exit_code: None,
+                                error: Some("用户拒绝升级".into()),
+                                result: Some(ToolCallResult::Denied),
+                            });
+                            history.push(HistoryItem::FunctionCallOutput {
+                                call_id: call_id.clone(),
+                                output: "用户拒绝了「沙箱外执行」的升级申请；该路径受保护，\
+不要在沙箱内重试同一写入，请改路径或说明限制"
+                                    .into(),
+                            });
+                            continue;
+                        }
+                    }
+                }
                 let tool_ctx = ToolContext::new(
                     self.workspace_root.clone(),
                     cancel.clone(),
                     call_id.clone(),
                     sink.clone(),
-                    turn_policy.sandbox,
+                    if escalated_now {
+                        crate::config::SandboxMode::DangerFullAccess
+                    } else {
+                        turn_policy.sandbox
+                    },
                 )
                 .with_jobs(session_id.clone(), self.jobs.clone())
                 .with_reads(read_registry.clone())
@@ -2292,13 +2366,15 @@ impl AgentLoop {
                             )
                             .await;
                         match escalation {
-                            crate::permission::GateOutcome::Allowed => {
+                            crate::permission::GateOutcome::Allowed
+                            | crate::permission::GateOutcome::AllowedEscalated => {
                                 // 只在这一次调用上放宽沙箱；会话策略与后续命令不受影响
                                 let retry_ctx = ToolContext {
                                     sandbox: crate::config::SandboxMode::DangerFullAccess,
                                     ..tool_ctx
                                 };
                                 effective_sandbox = retry_ctx.sandbox;
+                                emit_escalated(&sink, name, call_id, &args_val);
                                 result = self.router.execute(name, args_val, &retry_ctx).await;
                             }
                             crate::permission::GateOutcome::Cancelled => {

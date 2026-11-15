@@ -38,12 +38,12 @@ use std::collections::HashSet;
 use std::ffi::c_void;
 use std::path::{Path, PathBuf};
 
-use windows::core::{PCWSTR, PWSTR};
+use windows::core::{BOOL, PCWSTR, PWSTR};
 use windows::Win32::Foundation::{LocalFree, ERROR_SUCCESS, HLOCAL};
 use windows::Win32::Security::Authorization::{
     ConvertSidToStringSidW, ConvertStringSidToSidW, GetNamedSecurityInfoW, SetEntriesInAclW,
-    SetNamedSecurityInfoW, EXPLICIT_ACCESS_W, GRANT_ACCESS, NO_MULTIPLE_TRUSTEE, REVOKE_ACCESS,
-    SE_FILE_OBJECT, TRUSTEE_IS_SID, TRUSTEE_IS_UNKNOWN, TRUSTEE_W,
+    SetNamedSecurityInfoW, ACCESS_MODE, DENY_ACCESS, EXPLICIT_ACCESS_W, GRANT_ACCESS,
+    NO_MULTIPLE_TRUSTEE, SE_FILE_OBJECT, TRUSTEE_IS_SID, TRUSTEE_IS_UNKNOWN, TRUSTEE_W,
 };
 use windows::Win32::Security::{
     AclSizeInformation, EqualSid, GetAce, GetAclInformation, GetSecurityDescriptorDacl,
@@ -83,6 +83,18 @@ pub enum Access {
 /// 逐档实测（容器内 `fs::metadata`）：`FILE_READ_ATTRIBUTES` 单独**不够**、
 /// `READ_CONTROL` 单独**不够**、本条**够用且 `read_dir` 仍被拒**。
 pub const ANCESTOR_ACCESS_MASK: u32 = 0x0000_0080 | 0x0010_0000;
+
+/// 受保护子路径上拒绝给写 SID 的权限集合（D7）：`0x001F_0156`。
+///
+/// 为什么不能只拒 `FILE_GENERIC_WRITE`：`FILE_GENERIC_WRITE` 不含 `DELETE`，
+/// 而 `cmd /C del .git\index`、`Remove-Item .git\config` 走的是删除权限——
+/// 只拒写会让「删掉整个 `.git`」成为完整绕过路径。`WRITE_DAC`/`WRITE_OWNER`
+/// 一并拒绝，否则子进程可以改回 DACL 再写（自我解封）。
+pub const DENY_WRITE_MASK: u32 = FILE_GENERIC_WRITE.0
+    | DELETE.0
+    | FILE_DELETE_CHILD.0
+    | 0x0004_0000 // WRITE_DAC
+    | 0x0008_0000; // WRITE_OWNER
 
 impl Access {
     pub(crate) fn mask(self) -> u32 {
@@ -170,6 +182,81 @@ fn drop_nested(mut paths: Vec<PathBuf>) -> Vec<PathBuf> {
         kept.push(path);
     }
     kept
+}
+
+/// 工作区内**只读**的元数据路径（对齐 codex `read_only_subpaths`，D7）。
+///
+/// 三类：`.git`（目录，或 worktree 的 `gitdir: …` 指针文件——指针目标同样保护，
+/// 否则改 `.git` 文件把 gitdir 指到别处就绕过了）、`.agents` / `.codex`（代理自己的配置面）。
+///
+/// 这些路径一旦可写，模型改一次 `.git/hooks/pre-commit` 就能在用户下一次
+/// `git commit` 时以**用户身份**执行任意命令——沙箱边界被一次性绕过且不留痕。
+///
+/// 返回绝对、规范化路径（`..`、尾斜杠、junction 收敛到同一形态），只含**存在**的项：
+/// 不存在的路径没有 DACL 可写，也不会被创建（创建动作本身已被工作区边界约束）。
+pub fn protected_subpaths(workspace_root: &Path) -> Vec<PathBuf> {
+    let root = normalize(workspace_root);
+    let mut paths: Vec<PathBuf> = Vec::new();
+    for name in [".git", ".agents", ".codex"] {
+        let candidate = root.join(name);
+        if !candidate.exists() {
+            continue;
+        }
+        paths.push(normalize(&candidate));
+        // worktree 的 `.git` 是文件，真正的对象库在 `gitdir:` 指向的目录里。
+        if name == ".git" && candidate.is_file() {
+            if let Some(target) = gitdir_target(&candidate, &root) {
+                if target.exists() {
+                    paths.push(target);
+                }
+            }
+        }
+    }
+    let mut seen = HashSet::new();
+    paths.retain(|path| seen.insert(path.to_string_lossy().to_lowercase()));
+    paths
+}
+
+/// 解析 `.git` 指针文件里的 `gitdir:` 目标；相对路径按工作区根解析。
+fn gitdir_target(pointer: &Path, root: &Path) -> Option<PathBuf> {
+    let body = std::fs::read_to_string(pointer).ok()?;
+    let first = body.lines().next()?;
+    let rest = first.trim().strip_prefix("gitdir:")?.trim();
+    if rest.is_empty() {
+        return None;
+    }
+    let raw = PathBuf::from(rest);
+    let joined = if raw.is_absolute() {
+        raw
+    } else {
+        root.join(raw)
+    };
+    Some(normalize(&joined))
+}
+
+/// 候选路径是否落在某个受保护子路径之下；命中时返回命中的保护根（用于报错文案）。
+pub fn is_protected_path(workspace_root: &Path, candidate: &Path) -> Option<PathBuf> {
+    let candidate = normalize(candidate);
+    protected_subpaths(workspace_root)
+        .into_iter()
+        .find(|guard| starts_with_path(&candidate, guard))
+}
+
+/// 前缀判定：两侧都规范化后按 Windows 口径忽略大小写，且**必须落在组件边界上**。
+///
+/// 组件边界不能省：`.gitignore` 以 `.git` 开头，纯字符串前缀会把它误判成受保护路径，
+/// `apply_patch` 改 `.gitignore` 就会无端失败。
+fn starts_with_path(path: &Path, prefix: &Path) -> bool {
+    let path = path.to_string_lossy().to_lowercase();
+    let prefix = prefix.to_string_lossy().to_lowercase();
+    let prefix = prefix.trim_end_matches(['\\', '/']);
+    if !path.starts_with(prefix) {
+        return false;
+    }
+    match path.as_bytes().get(prefix.len()) {
+        None => true,
+        Some(byte) => *byte == b'\\' || *byte == b'/',
+    }
 }
 
 /// 「盘根以下 → 父目录」的完整祖先链，最外层在前，**不含自己、不含盘根**。
@@ -290,6 +377,11 @@ pub struct AclManager {
     /// 只给 `restore_all` 收尾复查用：如果某次备份还原把持久 ACE 一并抹掉了，
     /// 退出日志要能看见（下一次启动会重新补齐，不在退出路径重写 DACL）。
     persistent: Vec<(PathBuf, String)>,
+    /// 已加过 deny ACE 的受保护子路径：`(规范化路径, SID 文本)`（D7）。
+    ///
+    /// 只做进程内幂等：同一工作区根解析一次 scope 后，重复 exec 不再碰 DACL。
+    /// **不参与判断「DACL 上到底有没有」**——那必须按真实 DACL 探测（`has_explicit_deny`）。
+    denied: HashSet<(PathBuf, String)>,
     recovered_stale: usize,
 }
 
@@ -305,6 +397,7 @@ impl AclManager {
             audit_path,
             granted: HashSet::new(),
             persistent: Vec::new(),
+            denied: HashSet::new(),
             recovered_stale: 0,
         }
     }
@@ -521,6 +614,93 @@ impl AclManager {
                 Err(failure.message)
             }
         }
+    }
+
+    /// 给受保护的工作区元数据子路径加**拒绝写** ACE（D7）。不存在 → 视为已满足。
+    ///
+    /// 与 `grant` 的关键差别：
+    ///  - 不备份 DACL 字节、不进 `sandbox/acl/` 备份目录——deny ACE 是**持久**边界，
+    ///    与祖先 `(RA,S)` 同档（每次启动按真实 DACL 探测，命中即跳过）；
+    ///  - 账本单独记 `kind=deny`（`existed_before=false`，卸载时按它精确撤销）；
+    ///  - 失败**不降级**：返回 Err，由调用方终止沙箱启动（fail-closed）。
+    pub fn deny_write(&mut self, dir: &Path, sid: PSID) -> Result<(), String> {
+        if !dir.exists() {
+            return Ok(());
+        }
+        let normalized = normalize(dir);
+        let sid_text = sid_to_string(sid)?;
+        if self.denied.contains(&(normalized.clone(), sid_text.clone())) {
+            return Ok(());
+        }
+        // 真实 DACL 已有 deny 就不再重复写：重复写会让 DACL 出现多条同样 ACE。
+        match has_explicit_deny(&normalized, sid, DENY_WRITE_MASK) {
+            Ok(true) => {
+                self.denied.insert((normalized, sid_text));
+                return Ok(());
+            }
+            Ok(false) => {}
+            Err(error) => {
+                // 探测不清就不许假装成功：fail-closed。
+                self.audit(
+                    "deny_protected",
+                    &normalized,
+                    &sid_text,
+                    "deny",
+                    "error",
+                    Some(&error),
+                );
+                return Err(error);
+            }
+        }
+        match apply_deny(&normalized, sid) {
+            Ok(()) => {
+                self.audit("deny_protected", &normalized, &sid_text, "deny", "ok", None);
+                if let Err(error) = append_ledger(
+                    &self.persistent_ledger(),
+                    LEDGER_KIND_DENY,
+                    &normalized,
+                    sid,
+                    DENY_WRITE_MASK,
+                    true,
+                    false,
+                ) {
+                    // ACE 已生效；账本丢了只影响卸载能否精确撤销这一条。
+                    tracing::warn!(
+                        path = %normalized.display(),
+                        %error,
+                        "受保护路径的 deny ACE 已生效但账本写入失败（卸载时无法精确撤销这一处）"
+                    );
+                }
+                self.denied.insert((normalized, sid_text));
+                Ok(())
+            }
+            Err(failure) => {
+                self.audit(
+                    "deny_protected",
+                    &normalized,
+                    &sid_text,
+                    "deny",
+                    "error",
+                    Some(&failure.message),
+                );
+                Err(format!(
+                    "无法把「{}」设为只读（{}）。该目录是工作区的元数据路径，\
+                     在沙箱内可写会让模型改你的 git 钩子/代理配置；拒绝在沙箱外执行。\
+                     请以 full-access 运行，或修复该目录的所有权后重试",
+                    normalized.display(),
+                    failure.message
+                ))
+            }
+        }
+    }
+
+    /// 持久账本与备份目录同级：`<data_root>/sandbox/ancestor-ace.jsonl`。
+    fn persistent_ledger(&self) -> PathBuf {
+        self.backup_dir
+            .parent()
+            .and_then(|sandbox| sandbox.parent())
+            .map(persistent_ledger_path)
+            .unwrap_or_else(|| persistent_ledger_path(&self.backup_dir))
     }
 
     /// 给目录加容器 SID 的 ACE。备份失败 → 直接失败，**不改安全描述符**。
@@ -1021,7 +1201,8 @@ pub(crate) fn has_explicit_grant(path: &Path, sid: PSID, mask: u32) -> Result<bo
             status.0
         ));
     }
-    let result = unsafe { scan_acl_for_grant(dacl, sid, mask) };
+    // 0 = ACCESS_ALLOWED_ACE_TYPE。
+    let result = unsafe { scan_acl_for_ace_type(dacl, sid, mask, 0) };
     unsafe {
         let _ = LocalFree(Some(HLOCAL(descriptor.0)));
     }
@@ -1037,7 +1218,50 @@ pub(crate) fn has_any_explicit_grant(path: &Path, sid: PSID) -> Result<bool, Str
     has_explicit_grant(path, sid, 0)
 }
 
-unsafe fn scan_acl_for_grant(dacl: *mut ACL, sid: PSID, mask: u32) -> Result<bool, String> {
+/// 受保护子路径上是否已有容器 SID 的显式**拒绝** ACE（掩码覆盖 `mask`）。
+///
+/// 只给 D7 的幂等判定用：每次启动按真实 DACL 探测，命中就跳过写，避免同一目录上
+/// 叠出多条一样的 deny ACE。
+pub(crate) fn has_explicit_deny(path: &Path, sid: PSID, mask: u32) -> Result<bool, String> {
+    let name = wide(path.as_os_str());
+    let mut descriptor = PSECURITY_DESCRIPTOR(std::ptr::null_mut());
+    let mut dacl: *mut ACL = std::ptr::null_mut();
+    let status = unsafe {
+        GetNamedSecurityInfoW(
+            PCWSTR(name.as_ptr()),
+            SE_FILE_OBJECT,
+            DACL_SECURITY_INFORMATION,
+            None,
+            None,
+            Some(&mut dacl),
+            None,
+            &mut descriptor,
+        )
+    };
+    if status != ERROR_SUCCESS {
+        return Err(format!(
+            "读取「{}」的 DACL 做拒绝判定失败（Win32 错误 {}）",
+            path.display(),
+            status.0
+        ));
+    }
+    // 1 = ACCESS_DENIED_ACE_TYPE。
+    let result = unsafe { scan_acl_for_ace_type(dacl, sid, mask, 1) };
+    unsafe {
+        let _ = LocalFree(Some(HLOCAL(descriptor.0)));
+    }
+    result
+}
+
+/// 扫 DACL，找「指定 SID + 指定 ACE 类型 + 显式（非继承）+ 掩码覆盖 `mask`」的一条。
+///
+/// `ace_type` 由调用方给：`has_explicit_grant` 传 0（allowed），`has_explicit_deny` 传 1。
+unsafe fn scan_acl_for_ace_type(
+    dacl: *mut ACL,
+    sid: PSID,
+    mask: u32,
+    ace_type: u8,
+) -> Result<bool, String> {
     if dacl.is_null() {
         // NULL DACL = 所有人完全控制。这种状态本身异常，不往上叠 ACE 掩盖它。
         return Err("目录 DACL 为 NULL（所有人完全控制），拒绝在其上叠加沙箱 ACE".into());
@@ -1059,8 +1283,8 @@ unsafe fn scan_acl_for_grant(dacl: *mut ACL, sid: PSID, mask: u32) -> Result<boo
             .map_err(|e| format!("读取第 {index} 条 ACE 失败: {e}"))?;
         let ace = raw.cast::<ACCESS_ALLOWED_ACE>();
         let header = unsafe { (*ace).Header };
-        // AceType 0 = ACCESS_ALLOWED_ACE_TYPE（windows crate 未导出该常量）。
-        if header.AceType != 0 {
+        // AceType 0 = ACCESS_ALLOWED_ACE_TYPE、1 = ACCESS_DENIED_ACE_TYPE（windows crate 未导出常量）。
+        if header.AceType != ace_type {
             continue;
         }
         // 只认显式 ACE：继承来的（父目录下发的）不代表本目录被单独授权。
@@ -1119,6 +1343,31 @@ pub(crate) fn apply_grant(
     mask: u32,
     inheritance: windows::Win32::Security::ACE_FLAGS,
 ) -> Result<(), GrantFailure> {
+    apply_entry(path, sid, mask, inheritance, GRANT_ACCESS)
+}
+
+/// 受保护子路径的拒绝写 ACE（D7）：`DENY_ACCESS` + [`DENY_WRITE_MASK`]。
+///
+/// 目录带 `SUB_CONTAINERS_AND_OBJECTS_INHERIT`（整棵 `.git` 只读）；worktree 的
+/// `.git` 指针是**文件**，没有子对象可继承，继承位传 0（API 对文件保留该位但不生效，
+/// 显式区分只为让意图可读）。
+pub(crate) fn apply_deny(path: &Path, sid: PSID) -> Result<(), GrantFailure> {
+    let inheritance = if path.is_dir() {
+        SUB_CONTAINERS_AND_OBJECTS_INHERIT
+    } else {
+        ACE_FLAGS(0)
+    };
+    apply_entry(path, sid, DENY_WRITE_MASK, inheritance, DENY_ACCESS)
+}
+
+/// `apply_grant` / `apply_deny` 的唯一实现：差别只在 `grfAccessMode`。
+fn apply_entry(
+    path: &Path,
+    sid: PSID,
+    mask: u32,
+    inheritance: ACE_FLAGS,
+    mode: ACCESS_MODE,
+) -> Result<(), GrantFailure> {
     let denied = |message: String, status: windows::Win32::Foundation::WIN32_ERROR| GrantFailure {
         access_denied: status == windows::Win32::Foundation::ERROR_ACCESS_DENIED,
         message,
@@ -1147,7 +1396,7 @@ pub(crate) fn apply_grant(
 
     let entry = EXPLICIT_ACCESS_W {
         grfAccessPermissions: mask,
-        grfAccessMode: GRANT_ACCESS,
+        grfAccessMode: mode,
         grfInheritance: inheritance,
         Trustee: TRUSTEE_W {
             pMultipleTrustee: std::ptr::null_mut(),
@@ -1205,68 +1454,105 @@ pub(crate) fn apply_grant(
     Ok(())
 }
 
-/// 精确撤销：只删这一条 `(路径, SID)` 的显式 ACE，其它 trustee 的 ACE 原样保留。
-/// 返回是否真的删掉了东西。
+/// 精确撤销：删掉这一条 `(路径, SID)` 的**显式** ACE（allow 与 deny 都删），
+/// 其它 ACE 原样保留、顺序不变。返回是否真的删掉了东西。
+///
+/// **为什么不用 `REVOKE_ACCESS`**：Win32 文档写明它只移除
+/// `ACCESS_ALLOWED_ACE` / `SYSTEM_AUDIT_ACE`，**不动 `ACCESS_DENIED_ACE`**
+/// （见 ACCESS_MODE 枚举）。D7 的只读保护恰好是 deny ACE，用 `REVOKE_ACCESS`
+/// 卸载会「调用成功、ACE 还在」，`.git` 永久停在只读状态（T10 用例实测
+/// `considered=1 revoked=0 unchanged=1`）。这里改成确定性重建：逐条复制 ACE，
+/// 跳过匹配项，再把新 DACL 写回。
+///
+/// 继承来的 ACE 一律保留：它们由父目录下发，本就删不掉；写回时原样带回，
+/// 才不会让「重建」顺手抹掉父目录的授权。
 ///
 /// `pub(crate)`：设备对象（`\Device\Null`，SH-064 B）也要按 SID 精确撤销，
 /// 但它没有 `exists()`、也不进目录备份台账，所以走不了 `AclManager::revoke`。
 pub(crate) fn revoke_ace(path: &Path, sid: PSID) -> Result<bool, String> {
     let name = wide(path.as_os_str());
-    let before = read_dacl_snapshot(path)?;
+    let snapshot = read_dacl_snapshot(path)?;
 
-    let mut descriptor = PSECURITY_DESCRIPTOR(std::ptr::null_mut());
-    let mut old_dacl: *mut ACL = std::ptr::null_mut();
-    let status = unsafe {
-        GetNamedSecurityInfoW(
-            PCWSTR(name.as_ptr()),
-            SE_FILE_OBJECT,
-            DACL_SECURITY_INFORMATION,
-            None,
-            None,
-            Some(&mut old_dacl),
-            None,
-            &mut descriptor,
-        )
-    };
-    if status != ERROR_SUCCESS {
+    // ---- 1. 从快照里取出 DACL 本体（自相对格式内的 ACL 结构） ----
+    let descriptor = PSECURITY_DESCRIPTOR(snapshot.as_ptr() as *mut c_void);
+    let mut present = BOOL(0);
+    let mut defaulted = BOOL(0);
+    let mut dacl: *mut ACL = std::ptr::null_mut();
+    unsafe { GetSecurityDescriptorDacl(descriptor, &mut present, &mut dacl, &mut defaulted) }
+        .map_err(|error| format!("解析「{}」的 DACL 失败: {error}", path.display()))?;
+    if !present.as_bool() || dacl.is_null() {
         return Err(format!(
-            "读取「{}」的 DACL 失败（Win32 错误 {}）",
-            path.display(),
-            status.0
+            "「{}」的 DACL 为 NULL（所有人完全控制），拒绝撤销",
+            path.display()
         ));
     }
+    let mut info = ACL_SIZE_INFORMATION::default();
+    unsafe {
+        GetAclInformation(
+            dacl,
+            &mut info as *mut ACL_SIZE_INFORMATION as *mut c_void,
+            std::mem::size_of::<ACL_SIZE_INFORMATION>() as u32,
+            AclSizeInformation,
+        )
+    }
+    .map_err(|error| format!("读取「{}」的 ACL 信息失败: {error}", path.display()))?;
+    let old = unsafe { std::slice::from_raw_parts(dacl as *const u8, info.AclBytesInUse as usize) };
 
-    let entry = EXPLICIT_ACCESS_W {
-        grfAccessPermissions: 0,
-        grfAccessMode: REVOKE_ACCESS,
-        grfInheritance: SUB_CONTAINERS_AND_OBJECTS_INHERIT,
-        Trustee: TRUSTEE_W {
-            pMultipleTrustee: std::ptr::null_mut(),
-            MultipleTrusteeOperation: NO_MULTIPLE_TRUSTEE,
-            TrusteeForm: TRUSTEE_IS_SID,
-            TrusteeType: TRUSTEE_IS_UNKNOWN,
-            ptstrName: PWSTR(sid.0.cast::<u16>()),
-        },
-    };
-
-    let mut new_acl: *mut ACL = std::ptr::null_mut();
-    let status = unsafe {
-        let old = if old_dacl.is_null() {
-            None
-        } else {
-            Some(old_dacl as *const ACL)
-        };
-        SetEntriesInAclW(Some(std::slice::from_ref(&entry)), old, &mut new_acl)
-    };
-    if status != ERROR_SUCCESS {
-        unsafe {
-            let _ = LocalFree(Some(HLOCAL(descriptor.0)));
+    // ---- 2. 逐条判定：只删「非继承 + 基础类型 + SID 匹配」的 ACE ----
+    // ACL 头 8 字节：AclRevision(1) Sbz1(1) AclSize(2) AceCount(2) Sbz2(2)。
+    const ACL_HEADER_LEN: usize = 8;
+    let mut kept: Vec<&[u8]> = Vec::with_capacity(info.AceCount as usize);
+    let mut removed = 0usize;
+    let mut offset = ACL_HEADER_LEN;
+    for index in 0..info.AceCount {
+        let rest = old
+            .get(offset..)
+            .ok_or_else(|| format!("「{}」第 {} 条 ACE 越界", path.display(), index + 1))?;
+        let ace_size = rest
+            .get(2..4)
+            .map(|bytes| u16::from_le_bytes([bytes[0], bytes[1]]) as usize)
+            .ok_or_else(|| format!("「{}」ACE 头被截断", path.display()))?;
+        if ace_size < 4 || offset + ace_size > old.len() {
+            return Err(format!(
+                "「{}」第 {} 条 ACE 长度异常（{ace_size}）",
+                path.display(),
+                index + 1
+            ));
         }
-        return Err(format!(
-            "构造「{}」的撤销 DACL 失败（Win32 错误 {}）",
-            path.display(),
-            status.0
-        ));
+        let ace = &old[offset..offset + ace_size];
+        // 0 = ACCESS_ALLOWED_ACE_TYPE，1 = ACCESS_DENIED_ACE_TYPE；
+        // 两者的 SID 都从第 8 字节开始（Header 4 + Mask 4）。
+        let basic = (ace[0] == 0 || ace[0] == 1) && ace_size >= 8;
+        let inherited = ace[1] & INHERITED_ACE.0 as u8 != 0;
+        let matches = basic
+            && !inherited
+            && unsafe { EqualSid(PSID(ace.as_ptr().add(8) as *mut c_void), sid).is_ok() };
+        if matches {
+            removed += 1;
+        } else {
+            kept.push(ace);
+        }
+        offset += ace_size;
+    }
+    if removed == 0 {
+        // 幂等：本来就没有这条 ACE，不写 DACL（写一次会触发文件监听器重扫）。
+        return Ok(false);
+    }
+
+    // ---- 3. 重建 ACL：头部原样（保留修订号），只更新大小与计数 ----
+    let new_len = ACL_HEADER_LEN + kept.iter().map(|ace| ace.len()).sum::<usize>();
+    // `ACL` 要求 4 字节对齐；用 `Vec<u32>` 承载，再把字节写进去。
+    let mut buffer: Vec<u32> = vec![0; new_len.div_ceil(4)];
+    let raw = buffer.as_mut_ptr().cast::<u8>();
+    unsafe {
+        std::ptr::copy_nonoverlapping(old.as_ptr(), raw, ACL_HEADER_LEN);
+        *(raw.add(2) as *mut u16) = new_len as u16;
+        *(raw.add(4) as *mut u16) = kept.len() as u16;
+        let mut cursor = ACL_HEADER_LEN;
+        for ace in &kept {
+            std::ptr::copy_nonoverlapping(ace.as_ptr(), raw.add(cursor), ace.len());
+            cursor += ace.len();
+        }
     }
 
     let status = unsafe {
@@ -1276,14 +1562,10 @@ pub(crate) fn revoke_ace(path: &Path, sid: PSID) -> Result<bool, String> {
             DACL_SECURITY_INFORMATION,
             None,
             None,
-            Some(new_acl as *const ACL),
+            Some(buffer.as_ptr().cast::<ACL>()),
             None,
         )
     };
-    unsafe {
-        let _ = LocalFree(Some(HLOCAL(new_acl.cast::<c_void>())));
-        let _ = LocalFree(Some(HLOCAL(descriptor.0)));
-    }
     if status != ERROR_SUCCESS {
         return Err(format!(
             "撤销「{}」的 ACE 失败（Win32 错误 {}）",
@@ -1291,11 +1573,7 @@ pub(crate) fn revoke_ace(path: &Path, sid: PSID) -> Result<bool, String> {
             status.0
         ));
     }
-
-    // DACL 真的变了才算删掉了东西（SID 本来就没有 ACE 时 SetEntriesInAcl 幂等）。
-    Ok(read_dacl_snapshot(path)
-        .map(|after| after != before)
-        .unwrap_or(true))
+    Ok(true)
 }
 
 pub(crate) fn write_backup_file(path: &Path, object: &Path, snapshot: &[u8]) -> Result<(), String> {
@@ -1511,6 +1789,8 @@ pub fn persistent_ledger_path(data_root: &Path) -> PathBuf {
 /// 老版本写的行没有 `kind` 字段，按祖先处理（见 docs/14 §六 的回滚步骤）。
 pub const LEDGER_KIND_ANCESTOR: &str = "ancestor";
 pub const LEDGER_KIND_SCOPE: &str = "scope";
+/// 受保护子路径上的拒绝写 ACE（D7）。
+pub const LEDGER_KIND_DENY: &str = "deny";
 
 /// 追加一条账本记录：只记「我们加的、加之前没有」，供卸载/回滚使用。
 ///
@@ -1690,6 +1970,129 @@ mod tests {
 
     fn temp_dir(tag: &str) -> crate::test_support::TestTempDir {
         crate::test_support::TestTempDir::new(&format!("acl-{tag}"))
+    }
+
+    /// D7：`.git`（目录）、`.agents` 三类元数据进保护清单，且只收存在、绝对、规范化的路径。
+    /// `.codex` 不存在 → 不进清单（没有 DACL 可写，也不该被这条清单创建）。
+    #[test]
+    fn protected_subpaths_covers_git_and_agent_metadata() {
+        let ws = temp_dir("protected-list");
+        let ws_path = ws.path();
+        std::fs::create_dir_all(ws_path.join(".git").join("hooks")).unwrap();
+        std::fs::create_dir_all(ws_path.join(".agents")).unwrap();
+        std::fs::write(ws_path.join("src.txt"), "x").unwrap();
+        std::fs::write(ws_path.join(".gitignore"), "target\n").unwrap();
+
+        let list = protected_subpaths(ws_path);
+        let names: Vec<String> = list
+            .iter()
+            .map(|path| path.file_name().unwrap().to_string_lossy().to_string())
+            .collect();
+        assert!(names.contains(&".git".to_string()), "缺 .git：{names:?}");
+        assert!(names.contains(&".agents".to_string()), "缺 .agents：{names:?}");
+        assert!(
+            !names.contains(&".codex".to_string()),
+            "不存在的路径不该进清单：{names:?}"
+        );
+        assert!(
+            !names.contains(&".gitignore".to_string()),
+            ".gitignore 不是元数据目录：{names:?}"
+        );
+        assert!(list.iter().all(|path| path.is_absolute()), "清单必须是绝对路径");
+        assert!(list.iter().all(|path| path.exists()), "清单只收存在的路径");
+    }
+
+    /// worktree 的 `.git` 是**文件**，真对象库由 `gitdir:` 指向；只保护那个文件等于没保护。
+    #[test]
+    fn gitdir_pointer_target_is_protected() {
+        let ws = temp_dir("protected-gitdir");
+        let ws_path = ws.path();
+        let real = ws_path.join(".git-real");
+        std::fs::create_dir_all(real.join("hooks")).unwrap();
+        std::fs::write(ws_path.join(".git"), "gitdir: .git-real\n").unwrap();
+
+        let list = protected_subpaths(ws_path);
+        assert!(
+            list.iter().any(|path| same_path(path, &real)),
+            "gitdir 目标必须在清单里：{list:?}"
+        );
+        let hook = real.join("hooks").join("pre-commit");
+        assert_eq!(
+            is_protected_path(ws_path, &hook),
+            Some(normalize(&real)),
+            "gitdir 目标下的钩子必须命中保护"
+        );
+    }
+
+    /// 边界：hooks / config / index 命中；`src/main.rs` 与 `.gitignore` 不命中
+    /// （后者是组件边界，纯字符串前缀会把 `.gitignore` 误判成 `.git` 之下）。
+    #[test]
+    fn is_protected_path_rejects_git_hooks_and_config() {
+        let ws = temp_dir("protected-reject");
+        let ws_path = ws.path();
+        std::fs::create_dir_all(ws_path.join(".git").join("hooks")).unwrap();
+        std::fs::write(ws_path.join(".git").join("config"), "[core]\n").unwrap();
+        std::fs::write(ws_path.join(".gitignore"), "target\n").unwrap();
+        std::fs::create_dir_all(ws_path.join("src")).unwrap();
+        std::fs::write(ws_path.join("src").join("main.rs"), "fn main() {}\n").unwrap();
+
+        for target in [".git/hooks/pre-commit", ".git/config", ".git/index"] {
+            assert!(
+                is_protected_path(ws_path, &ws_path.join(target)).is_some(),
+                "{target} 必须命中保护"
+            );
+        }
+        for target in ["src/main.rs", ".gitignore"] {
+            assert!(
+                is_protected_path(ws_path, &ws_path.join(target)).is_none(),
+                "{target} 不该命中保护"
+            );
+        }
+    }
+
+    /// T10：装/卸后 `.git` 的 DACL 逐字节一致。
+    ///
+    /// 卸载路径走持久账本（`revoke_from_ledger`）：deny ACE 是**持久**保护，
+    /// 不随会话退出还原，所以「装→卸」能否回到原样必须单独立锁。
+    #[test]
+    fn deny_ace_round_trip_restores_git_dacl_bytes() {
+        let ws = temp_dir("deny-round-trip");
+        let git = ws.path().join(".git");
+        std::fs::create_dir_all(&git).unwrap();
+        std::fs::write(git.join("config"), "[core]\n").unwrap();
+        let sid = crate::sandbox::write_sid::workspace_write_sid(ws.path()).unwrap();
+        let before = read_dacl_snapshot(&git).unwrap();
+
+        let store = temp_dir("deny-round-trip-store");
+        let acl_dir = store.path().join("sandbox").join("acl");
+        std::fs::create_dir_all(&acl_dir).unwrap();
+        let ledger = store.path().join("sandbox").join("ancestor-ace.jsonl");
+
+        let mut manager = AclManager::new(acl_dir);
+        manager.deny_write(&git, sid.as_psid()).unwrap();
+        let during = read_dacl_snapshot(&git).unwrap();
+        assert_ne!(before, during, "装完 DACL 必须真的变了（否则等于没装）");
+
+        let report = revoke_from_ledger(&ledger);
+        let after = read_dacl_snapshot(&git).unwrap();
+        assert!(
+            !has_explicit_deny(&git, sid.as_psid(), DENY_WRITE_MASK).unwrap(),
+            "卸载后 deny ACE 必须已被撤掉：considered={} revoked={} unchanged={} missing={} failed={:?}",
+            report.considered,
+            report.revoked,
+            report.unchanged,
+            report.missing,
+            report.failed
+        );
+        assert_eq!(
+            (report.considered, report.revoked, report.unchanged, report.missing),
+            (1, 1, 0, 0),
+            "卸载必须真的删掉 deny ACE：failed={:?}",
+            report.failed
+        );
+        // 逐字节回到原样：`compare_restored` 是仓库里既有的还原判据（DACL 本体
+        // 逐字节一致，只白名单 `SE_DACL_AUTO_INHERITED` 这一个人所共知的差异）。
+        compare_restored(&before, &after).unwrap();
     }
 
     /// `\\?\UNC\server\share` 与 `\\server\share` 是同一个目录的两种拼写：归一必须收敛到

@@ -428,6 +428,9 @@ fn grant_write_scope(
         };
         grant_persistent(&dir, sid, is_workspace_root, &ledger)?;
     }
+    // 先授 allow、再给工作区内的元数据子路径加 deny（D7）：deny 对同一 SID 优先于
+    // 继承来的 allow，所以 `.git` 整棵子树只读，而工作区其余部分照常可写。
+    deny_protected_subpaths(workspace_root, workspace_sid.as_psid())?;
 
     tracing::info!(
         workspace = %workspace_root.display(),
@@ -436,6 +439,22 @@ fn grant_write_scope(
         "写约束沙箱就绪：受限令牌 WRITE_RESTRICTED，读与网络不约束"
     );
     Ok(vec![workspace_sid, temp_sid])
+}
+
+/// 给工作区内每个存在的受保护子路径写 deny 写 ACE（D7）。
+///
+/// **fail-closed**：写不进去就拒绝启动——静默放行等于这条边界不存在，
+/// 而它守的是「用户下次 `git commit` 时钩子不会被模型改写成任意命令」。
+#[cfg(windows)]
+fn deny_protected_subpaths(workspace_root: &Path, sid: PSID) -> Result<(), SandboxError> {
+    for dir in acl::protected_subpaths(workspace_root) {
+        with_acl(|acl| acl.deny_write(&dir, sid))?;
+        tracing::info!(
+            path = %dir.display(),
+            "工作区元数据路径已设为只读（deny ACE 已生效）"
+        );
+    }
+    Ok(())
 }
 
 /// 单条写 ACE 的持久授权：命中即跳过，失败一律 fail-closed。
@@ -497,6 +516,9 @@ fn app_container_scope(workspace_root: &Path) -> Result<(PSID, Vec<PSID>), Sandb
                 }
             }
         }
+        // 与写约束档同一条边界：容器 SID 在 `.git` / `.agents` / `.codex` 上被显式拒绝写，
+        // deny 优先于工作区根继承下来的 allow（D7）。
+        deny_protected_subpaths(workspace_root, sid)?;
         runtime.resolved_roots.insert(workspace_root.to_path_buf());
         // 新根第一次被用到：把它的祖先链交给后台补（非阻塞，本轮命令按当前状态跑）。
         // 启动时已预置过的根会被台账挡住，这里等于零成本。

@@ -341,6 +341,12 @@ pub enum EventMsg {
     /// 不弹窗不等于不留痕。`rule_id` 是规则原文（与 config.toml 同一份字符串）。
     /// 旧消费端遇到未知 type 走 default 分支忽略，不破坏兼容。
     AllowlistHit { tool: String, command: String, rule_id: String },
+    /// 命令被批准在**沙箱外、以用户本人身份**执行（additive，D7）。
+    ///
+    /// 只在提权批准且**真正换档执行**时发一次：`request_id` 与那次
+    /// `exec_approval_request` 的 `appr-<call_id>-escalate` 对齐，`command` 是
+    /// `unified_exec` 的 `command` 原文（其它工具为 None）。旧消费端按未知 type 忽略。
+    SandboxEscalated { call_id: String, tool: String, request_id: String, command: Option<String> },
     PlanDelta { delta: String },
     TurnDiff { files: Vec<String> },
     Error { message: String },

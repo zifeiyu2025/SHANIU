@@ -135,6 +135,76 @@ async fn sandbox_can_write_inside_workspace() {
     std::fs::remove_dir_all(&ws).ok();
 }
 
+/// D7：工作区内的 `.git` 只读——写被拒，且普通文件照常可写（证明不是整体写不进）。
+///
+/// 守的是「模型改 `.git/hooks/pre-commit` → 用户下次 `git commit` 时以用户身份执行
+/// 任意命令」这条链。反向对照：注释掉 `deny_protected_subpaths` 的调用，本用例第一条断言必红。
+#[tokio::test]
+async fn workspace_dot_git_write_is_denied() {
+    let ws = unique_dir("dotgit");
+    std::fs::create_dir_all(ws.join(".git")).unwrap();
+    let config = ws.join(".git").join("config");
+    std::fs::write(&config, "[core]\n\trepositoryformatversion = 0\n").unwrap();
+    let before = std::fs::read_to_string(&config).unwrap();
+
+    let (code, output) = run_default_capture(&ws, "echo hacked> .git\\config").await;
+    assert_ne!(code, 0, "写 .git/config 必须失败：{output}");
+    assert_eq!(
+        std::fs::read_to_string(&config).unwrap(),
+        before,
+        ".git/config 的内容一个字节都不许变"
+    );
+
+    let inside = ws.join("inside.txt");
+    let code = run_default_sandboxed(&ws, "echo ok> inside.txt").await;
+    assert_eq!(code, 0, "工作区普通文件的写入必须仍然成功");
+    assert!(inside.is_file(), "普通写入应真实落盘");
+    std::fs::remove_dir_all(&ws).ok();
+}
+
+/// D7：升级通道可用——同一条命令在 full-access 档下成功。
+///
+/// 只证明「离开沙箱就能写」；审批何时放行、`sandbox_escalated` 事件由 agent_loop
+/// 的提权单测覆盖（真机探针拿不到审批会话）。
+#[tokio::test]
+async fn escalated_write_outside_sandbox_succeeds() {
+    let ws = unique_dir("escalate");
+    std::fs::create_dir_all(ws.join(".git")).unwrap();
+    let config = ws.join(".git").join("config");
+    std::fs::write(&config, "[core]\n").unwrap();
+
+    let (code, _) = run_default_capture(&ws, "echo hacked> .git\\config").await;
+    assert_ne!(code, 0, "前提：沙箱内必须被拒");
+
+    let (tx, mut rx) = mpsc::channel::<shaniu_lib::sandbox::ExecLine>(64);
+    let spawn = prepare_spawn_with(
+        SpawnRequest {
+            policy: SandboxMode::DangerFullAccess,
+            workspace_root: &ws,
+            program: "cmd",
+            args: &["/C", "echo escalated> .git\\config"],
+            cwd: &ws,
+            os: OsSandbox::RestrictedToken,
+        },
+        tx,
+    )
+    .expect("full-access 档应可创建");
+    let PreparedSpawn::Plain(mut cmd) = spawn else {
+        panic!("升级执行必须是无容器、无受限令牌的 Plain");
+    };
+    cmd.stdout(std::process::Stdio::null())
+        .stderr(std::process::Stdio::null())
+        .stdin(std::process::Stdio::null());
+    let mut child = cmd.spawn().expect("升级执行应能启动");
+    let status = child.wait().await.expect("等待升级执行");
+    while rx.try_recv().is_ok() {}
+
+    assert!(status.success(), "批准升级后写入必须成功");
+    let written = std::fs::read_to_string(&config).unwrap();
+    assert_eq!(written.trim(), "escalated", "升级后必须真的是新内容：{written:?}");
+    std::fs::remove_dir_all(&ws).ok();
+}
+
 #[tokio::test]
 async fn readonly_mode_refuses_to_spawn() {
     let ws = unique_dir("ro");

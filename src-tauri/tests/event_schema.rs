@@ -17,7 +17,7 @@ use shaniu_lib::events::{
 };
 
 /// 与 src/transport/types.ts 的 type 判别值逐一对应。
-const EXPECTED_TAGS: [&str; 25] = [
+const EXPECTED_TAGS: [&str; 26] = [
     "turn_started",
     "turn_completed",
     "verification_result",
@@ -29,6 +29,7 @@ const EXPECTED_TAGS: [&str; 25] = [
     "exec_approval_request",
     "exec_approval_resolved",
     "allowlist_hit",
+    "sandbox_escalated",
     "plan_delta",
     "turn_diff",
     "error",
@@ -137,6 +138,12 @@ fn all_variants() -> Vec<EventMsg> {
             tool: "unified_exec".into(),
             command: "cargo test --lib".into(),
             rule_id: "cargo test".into(),
+        },
+        EventMsg::SandboxEscalated {
+            call_id: "call_1".into(),
+            tool: "unified_exec".into(),
+            request_id: "appr-call_1-escalate".into(),
+            command: Some("git commit -m x".into()),
         },
         EventMsg::PlanDelta { delta: "step 1".into() },
         EventMsg::TurnDiff { files: vec!["a.rs".into()] },
@@ -252,6 +259,7 @@ fn all_variants() -> Vec<EventMsg> {
             | EventMsg::ExecApprovalRequest { .. }
             | EventMsg::ExecApprovalResolved { .. }
             | EventMsg::AllowlistHit { .. }
+            | EventMsg::SandboxEscalated { .. }
             | EventMsg::PlanDelta { .. }
             | EventMsg::TurnDiff { .. }
             | EventMsg::Error { .. }

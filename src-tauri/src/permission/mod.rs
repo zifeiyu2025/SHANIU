@@ -32,10 +32,23 @@ pub use policy::{
     decide, risk_of, Decision, PrefixAllowlist, SessionPolicy, SessionPolicyHandle, ToolAllowlist,
 };
 
+/// 提权询问的请求 id。单点定义：事件侧（`sandbox_escalated`）要引用同一个 id，
+/// 两处各写一遍 `format!` 会在改格式时静默错位。
+pub fn escalation_request_id(call_id: &str) -> String {
+    format!("appr-{call_id}-escalate")
+}
+
 /// 门禁结果。
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum GateOutcome {
     Allowed,
+    /// 用户批准了**提权重试**（D7）：这一次调用离开沙箱、以用户本人身份执行。
+    ///
+    /// 与 `Allowed` 分开是必须的：调用方要据此换执行档位（`PreparedSpawn::Plain`）
+    /// 并写 `sandbox_escalated` 审计；把它与普通放行混成一个值，等于让沙箱边界
+    /// 在调用点无声消失。只有 [`ApprovalBroker::request_escalation`] 会产出它，
+    /// 且仅当审批档不是 `Never`（`Never` 下根本没有询问通道）。
+    AllowedEscalated,
     /// 用户明确拒绝（审批卡回执 Deny）。
     Denied,
     /// 策略性拒绝：沙箱不允许或工具不在本代理解效工具集内。
@@ -452,9 +465,12 @@ impl ApprovalBroker {
         }
     }
 
-    /// `on-failure` 提权询问（SH-120 / ADR-007②）：沙箱拒绝某条命令后，问用户
-    /// 是否**只这一次**以 full-access 重跑。`AllowAlways` 不写会话记忆——
+    /// `on-failure` / 保护路径提权询问（SH-120 / ADR-007② / D7）：沙箱拒绝某条命令后，
+    /// 问用户是否**只这一次**以 full-access 重跑。`AllowAlways` 不写会话记忆——
     /// 记忆按工具粒度记的是"要不要审批"，而这里要放的是"沙箱边界"，两者不能混。
+    ///
+    /// 批准返回 [`GateOutcome::AllowedEscalated`]（不是 `Allowed`）：调用方必须据它
+    /// 换执行档位并留审计，否则「批准了升级」与「批准了同档执行」无法区分。
     pub async fn request_escalation(
         &self,
         tool: &str,
@@ -464,16 +480,24 @@ impl ApprovalBroker {
         subject: GateSubject<'_>,
         env: GateEnv<'_>,
     ) -> GateOutcome {
-        let reason = format!("沙箱拒绝了这条命令（{sandbox_reason}）；是否仅本次以 full-access 重试？");
-        self.request_approval(
-            tool,
-            args,
-            call_id,
-            ApprovalPrompt { risk: RiskLevel::Execute, reason: Some(&reason), remember: false, escalation: true },
-            subject,
-            env,
-        )
-        .await
+        let reason = format!(
+            "沙箱拒绝了这条命令（{sandbox_reason}）；是否仅本次以 full-access 重试？\
+             批准后这条命令将在**沙箱外、以你的身份**执行，请确认命令内容可信"
+        );
+        match self
+            .request_approval(
+                tool,
+                args,
+                call_id,
+                ApprovalPrompt { risk: RiskLevel::Execute, reason: Some(&reason), remember: false, escalation: true },
+                subject,
+                env,
+            )
+            .await
+        {
+            GateOutcome::Allowed => GateOutcome::AllowedEscalated,
+            other => other,
+        }
     }
 
     /// 发审批请求并挂起等待；取消时撤单。
@@ -491,7 +515,7 @@ impl ApprovalBroker {
     ) -> GateOutcome {
         let ApprovalPrompt { risk, reason, remember, escalation } = prompt;
         let request_id = if escalation {
-            format!("appr-{call_id}-escalate")
+            escalation_request_id(call_id)
         } else {
             format!("appr-{call_id}")
         };
@@ -1845,6 +1869,79 @@ mod tests {
         );
         assert!(broker.resolve("appr-esc1-escalate", ApprovalDecision::Deny));
         assert_eq!(gate.await.unwrap(), GateOutcome::Denied);
+    }
+
+    /// D7：批准提权必须产出 `AllowedEscalated`（不是 `Allowed`），且 `AllowAlways`
+    /// 不得让下一次提权静默放行——升级放的是"沙箱边界"，不能进会话记忆。
+    ///
+    /// 反向对照：把 `request_escalation` 里的映射去掉（直接透传 `Allowed`），
+    /// 第一条断言就红——调用方会把它当普通放行，沙箱边界静默消失。
+    #[tokio::test]
+    async fn escalation_approval_is_marked_and_never_remembered() {
+        let broker = Arc::new(ApprovalBroker::new());
+        let capture = Arc::new(CaptureSink::default());
+        let sink: Arc<dyn EventSink> = capture.clone();
+        let cancel = CancellationToken::new();
+
+        let first = tokio::spawn({
+            let broker = broker.clone();
+            let sink = sink.clone();
+            let cancel = cancel.clone();
+            async move {
+                broker
+                    .request_escalation(
+                        "unified_exec",
+                        &args(),
+                        "call-9",
+                        ".git 只读",
+                        GateSubject::root("root"),
+                        GateEnv { sink: &sink, cancel: &cancel },
+                    )
+                    .await
+            }
+        });
+        assert!(wait_pending(&broker, "appr-call-9-escalate").await);
+        assert!(broker.resolve("appr-call-9-escalate", ApprovalDecision::AllowAlways));
+        assert_eq!(first.await.unwrap(), GateOutcome::AllowedEscalated);
+
+        let reason = capture
+            .take()
+            .into_iter()
+            .find_map(|event| match event {
+                EventMsg::ExecApprovalRequest { reason, .. } => reason,
+                _ => None,
+            })
+            .expect("提权必须走审批卡");
+        assert!(
+            reason.contains("沙箱外") && reason.contains("以你的身份"),
+            "提权卡必须写明执行身份：{reason}"
+        );
+
+        // AllowAlways 不写记忆：同一工具同一参数再申请，仍必须新开一张卡。
+        let again = tokio::spawn({
+            let broker = broker.clone();
+            let sink = sink.clone();
+            let cancel = cancel.clone();
+            async move {
+                broker
+                    .request_escalation(
+                        "unified_exec",
+                        &args(),
+                        "call-10",
+                        ".git 只读",
+                        GateSubject::root("root"),
+                        GateEnv { sink: &sink, cancel: &cancel },
+                    )
+                    .await
+            }
+        });
+        assert!(wait_pending(&broker, "appr-call-10-escalate").await);
+        assert!(broker.resolve("appr-call-10-escalate", ApprovalDecision::Deny));
+        assert_eq!(
+            again.await.unwrap(),
+            GateOutcome::Denied,
+            "AllowAlways 不得让下一次提权静默放行"
+        );
     }
 
     /// 阶段 3 主用例：请求挂着、但最近没有心跳 → 按 TTL 转成「没人可答」，不永远等。

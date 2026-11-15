@@ -726,6 +726,25 @@ fn with_rollback(error: ToolError, report: RollbackReport) -> ToolError {
 
 // ============================== 执行 ==============================
 
+/// 补丁目标路径：工作区边界校验 + 只读元数据早拒（D7）。
+///
+/// 早拒放在工具层而不是 `tool_router::resolve_for_write`：依赖方向门禁
+/// （docs/01 §2.3.1）只允许 `tools → sandbox`，`tool_router` 不依赖 sandbox。
+/// 强制力仍由 DACL 兜底（`sandbox::acl::deny_write`），这里只负责把话说清楚，
+/// 让模型拿到一句可读的拒绝，而不是 shell 的「拒绝访问」（err 5）。
+fn resolve_patch_path(ctx: &ToolContext, path: &str) -> Result<std::path::PathBuf, ToolError> {
+    let resolved = resolve_for_write(&ctx.workspace_root, path)?;
+    if let Some(guard) = crate::sandbox::acl::is_protected_path(&ctx.workspace_root, &resolved) {
+        return Err(ToolError::Execution(format!(
+            "「{}」是工作区内的只读元数据路径（{}），apply_patch 不允许写入。\
+             确需修改请让用户在工作区外、以用户本人身份操作（例如在终端里手动执行 git 命令）",
+            resolved.display(),
+            guard.display()
+        )));
+    }
+    Ok(resolved)
+}
+
 #[async_trait]
 impl ToolExecutor for ApplyPatch {
     fn spec(&self) -> &ToolSpec {
@@ -742,9 +761,9 @@ impl ToolExecutor for ApplyPatch {
             .ok_or_else(|| ToolError::InvalidArgs("缺少 patch".into()))?;
         let sections = parse_patch(patch)?;
 
-        // dry-run：全部路径先过边界校验
+        // dry-run：全部路径先过边界校验与只读元数据早拒
         for section in &sections {
-            resolve_for_write(&ctx.workspace_root, section.path())
+            resolve_patch_path(ctx, section.path())
                 .map_err(|error| with_section(error, section))?;
         }
 
@@ -755,7 +774,7 @@ impl ToolExecutor for ApplyPatch {
         for section in &sections {
             match &section.op {
                 PatchOp::Add { path, lines } => {
-                    let full = resolve_for_write(&ctx.workspace_root, path)
+                    let full = resolve_patch_path(ctx, path)
                         .map_err(|error| with_section(error, section))?;
                     if full.exists() {
                         return Err(with_rollback(
@@ -795,7 +814,7 @@ impl ToolExecutor for ApplyPatch {
                     summary.push(format!("+ {path}"));
                 }
                 PatchOp::Update { path, seq } => {
-                    let full = resolve_for_write(&ctx.workspace_root, path)
+                    let full = resolve_patch_path(ctx, path)
                         .map_err(|error| with_section(error, section))?;
                     let original = match std::fs::read(&full) {
                         Ok(bytes) => bytes,
@@ -863,7 +882,7 @@ impl ToolExecutor for ApplyPatch {
                     });
                 }
                 PatchOp::Delete { path } => {
-                    let full = resolve_for_write(&ctx.workspace_root, path)
+                    let full = resolve_patch_path(ctx, path)
                         .map_err(|error| with_section(error, section))?;
                     let original = match std::fs::read(&full) {
                         Ok(bytes) => bytes,
@@ -949,6 +968,46 @@ mod tests {
         let out = ApplyPatch::new().execute(serde_json::json!({"patch": patch}), &ctx(&ws)).await.unwrap();
         assert!(out.success);
         assert_eq!(std::fs::read_to_string(ws.join("a.txt")).unwrap(), "line1\n第二行(改)\nline3\n");
+    }
+
+    /// D7：补丁改 `.git/hooks/pre-commit` 必须整条失败，且**一个字节都没写**。
+    /// 这是「模型改钩子 → 用户下次 commit 时以用户身份执行」那条链的唯一断点。
+    #[tokio::test]
+    async fn apply_patch_rejects_git_hook_patch() {
+        let ws = workspace();
+        std::fs::create_dir_all(ws.join(".git").join("hooks")).unwrap();
+        let patch =
+            "*** Begin Patch\n*** Add File: .git/hooks/pre-commit\n+rm -rf /\n*** End Patch";
+        let err = ApplyPatch::new()
+            .execute(serde_json::json!({"patch": patch}), &ctx(&ws))
+            .await
+            .unwrap_err();
+        let ToolError::Execution(text) = &err else {
+            panic!("必须是执行错误：{err:?}");
+        };
+        assert!(text.contains("只读元数据"), "拒绝文案必须点明只读元数据：{text}");
+        assert!(
+            !ws.join(".git").join("hooks").join("pre-commit").exists(),
+            "受保护路径不许落任何字节"
+        );
+    }
+
+    /// D7 组件边界：`.gitignore` 以 `.git` 开头，但不是元数据目录，必须照常可写。
+    /// 纯字符串前缀判断会把它误判成受保护路径，让最常见的补丁无端失败。
+    #[tokio::test]
+    async fn apply_patch_still_writes_gitignore() {
+        let ws = workspace();
+        std::fs::create_dir_all(ws.join(".git")).unwrap();
+        let patch = "*** Begin Patch\n*** Add File: .gitignore\n+/target\n*** End Patch";
+        let out = ApplyPatch::new()
+            .execute(serde_json::json!({"patch": patch}), &ctx(&ws))
+            .await
+            .unwrap();
+        assert!(out.success);
+        assert_eq!(
+            std::fs::read_to_string(ws.join(".gitignore")).unwrap(),
+            "/target\n"
+        );
     }
 
     #[tokio::test]
