@@ -288,7 +288,7 @@ fn orphan_tool_outputs_do_not_cut_away_the_tail_anchor() {
         "保留段必须以最新工具输出收尾：{:#?}",
         resumed.history
     );
-    assert_eq!(resumed.dropped_unsafe_tail, 0, "没有任何落单调用，不该报截断");
+    assert_eq!(resumed.patched_orphan_calls, 0, "没有任何落单调用，不该补占位");
 }
 
 /// 锚点写在一轮「有 call 无 output」的落单调用之后（崩溃后先 resume、再压缩就是这个形状）：
@@ -309,18 +309,29 @@ fn anchor_written_after_an_unfinished_round_is_still_applied() {
 
     let resumed = rollout::resume::resume(&path).unwrap();
     assert_eq!(resumed.applied_compactions, 1, "锚点落在落单调用之后，也必须重放");
-    assert_eq!(resumed.dropped_unsafe_tail, 1, "只该丢 c2 这一条落单调用");
+    assert_eq!(resumed.patched_orphan_calls, 1, "只该给 c2 补占位");
     assert_eq!(
         resumed.history.len(),
-        1,
-        "区间 [0,3) 应被换成一条摘要：{:#?}",
+        3,
+        "摘要 + 落单调用 + 占位：{:#?}",
         resumed.history
     );
     assert_eq!(text_of(&resumed.history[0]), Some("交接摘要"));
+    assert!(matches!(
+        &resumed.history[1],
+        HistoryItem::FunctionCall { call_id, .. } if call_id == "c2"
+    ));
+    match &resumed.history[2] {
+        HistoryItem::FunctionCallOutput { call_id, output } => {
+            assert_eq!(call_id, "c2");
+            assert!(output.starts_with("工具调用结果未记录"), "{output}");
+        }
+        other => panic!("落单调用后面应紧跟占位，收到 {other:?}"),
+    }
 }
 
 /// 锚点之后紧跟一轮未完成的工具调用（压缩之后又崩在 call 之后）：
-/// 锚点必须留下，只丢那条落单调用。
+/// 锚点必须留下，只给那条落单调用补占位。
 #[test]
 fn anchor_survives_an_unfinished_round_that_follows_it() {
     let dir = temp_dir("anchor-before-torn");
@@ -338,12 +349,20 @@ fn anchor_survives_an_unfinished_round_that_follows_it() {
 
     let resumed = rollout::resume::resume(&path).unwrap();
     assert_eq!(resumed.applied_compactions, 1, "锚点之后的落单调用不得连带丢掉锚点");
-    assert_eq!(resumed.dropped_unsafe_tail, 1, "只该丢 c2 这一条落单调用");
+    assert_eq!(resumed.patched_orphan_calls, 1, "只该给 c2 补占位");
     assert_eq!(
         resumed.history.len(),
-        1,
-        "区间 [0,3) 应被换成一条摘要：{:#?}",
+        3,
+        "摘要 + 落单调用 + 占位：{:#?}",
         resumed.history
     );
     assert_eq!(text_of(&resumed.history[0]), Some("交接摘要"));
+    assert!(matches!(
+        &resumed.history[1],
+        HistoryItem::FunctionCall { call_id, .. } if call_id == "c2"
+    ));
+    assert!(matches!(
+        &resumed.history[2],
+        HistoryItem::FunctionCallOutput { call_id, .. } if call_id == "c2"
+    ));
 }

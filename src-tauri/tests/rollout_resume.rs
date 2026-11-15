@@ -7,7 +7,7 @@
 //! 2. 重放出的历史里，工具调用与输出**成对存在**（SH-082 的教训：不成对就 400）；
 //! 3. 续跑新增的条目落在旧条目之后，且旧条目**没有被重写一遍**（`persisted` 参数的作用）。
 
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
 
 use async_trait::async_trait;
@@ -145,6 +145,59 @@ fn assert_tool_calls_answered(messages: &[Value]) {
             assert_eq!(answer["tool_call_id"], *id, "应答顺序与 tool_calls 不对应");
         }
         i += 1 + ids.len();
+    }
+}
+
+// ── D10：崩溃后「有调用无输出」的处理 ────────────────────────────────────────
+// 判据只有一条：模型不该被放到“我这轮什么都没调用”的错觉里。恢复时补一条
+// 「结果未知」占位，而不是把调用剔除。
+
+fn user_msg(text: &str) -> RolloutItem {
+    RolloutItem::ResponseItem {
+        item: HistoryItem::Message { role: Role::User, text: text.into(), reasoning: None },
+        at_ms: 1,
+    }
+}
+
+fn tool_call(id: &str) -> RolloutItem {
+    RolloutItem::ResponseItem {
+        item: HistoryItem::FunctionCall { name: "read_file".into(), arguments: "{}".into(), call_id: id.into() },
+        at_ms: 2,
+    }
+}
+
+fn tool_output(id: &str, body: &str) -> RolloutItem {
+    RolloutItem::ResponseItem {
+        item: HistoryItem::FunctionCallOutput { call_id: id.into(), output: body.into() },
+        at_ms: 3,
+    }
+}
+
+/// 写一份可直接 `resume` 的最小档案；临时目录随返回值存活，避免中途被清理。
+fn write_archive(
+    tag: &str,
+    items: &[RolloutItem],
+) -> (shaniu_lib::test_support::TestTempDir, PathBuf) {
+    let dir = temp_dir(tag);
+    let writer = RolloutWriter::create(&dir, &meta("a9", &dir)).unwrap();
+    for item in items {
+        writer.append(item).unwrap();
+    }
+    let path = writer.path().to_path_buf();
+    (dir, path)
+}
+
+/// 断言 `items[index]` 是给定 `call_id` 的「结果未知」占位。
+fn assert_unknown_output(items: &[HistoryItem], index: usize, call_id: &str) {
+    match items.get(index) {
+        Some(HistoryItem::FunctionCallOutput { call_id: got, output }) => {
+            assert_eq!(got.as_str(), call_id, "占位必须挂在 {call_id} 上：{items:#?}");
+            assert!(
+                output.starts_with("工具调用结果未记录"),
+                "占位首句必须固定为「工具调用结果未记录」，实际：{output}"
+            );
+        }
+        other => panic!("第 {index} 条应是 {call_id} 的结果未知占位，实际：{other:?}"),
     }
 }
 
@@ -404,4 +457,124 @@ async fn resume_continues_real_work_on_a_real_endpoint() {
     let replayed = resume::resume(&path).unwrap();
     assert!(replayed.history.len() > persisted, "续跑应追加条目而不是重写：{persisted} → {}", replayed.history.len());
     println!("[resume-e2e] B 之后历史 {} 条，port.txt={:?}", replayed.history.len(), final_text.trim());
+}
+
+/// 崩溃停在 `function_call` 之后：恢复时补一条「结果未知」，调用本身留在历史里。
+///
+/// 剔除的旧行为会让模型以为“那轮什么都没调用”，于是把 `cargo test`/`apply_patch`
+/// 这类命令再跑一遍；补占位之后它至少知道「这条命令是否执行过是未知的」。
+#[test]
+fn orphan_call_gets_unknown_output_on_resume() {
+    let (_dir, path) = write_archive("orphan-basic", &[user_msg("任务"), tool_call("c1")]);
+
+    let resumed = resume::resume(&path).unwrap();
+    assert_eq!(resumed.patched_orphan_calls, 1, "补占位的条数必须带出来");
+    assert_eq!(resumed.history.len(), 3, "任务 + 调用 + 占位：{:#?}", resumed.history);
+    assert!(
+        matches!(&resumed.history[1], HistoryItem::FunctionCall { call_id, .. } if call_id == "c1"),
+        "调用不得被剔除：{:#?}",
+        resumed.history
+    );
+    assert_unknown_output(&resumed.history, 2, "c1");
+}
+
+/// 占位必须**紧跟**它的调用，不能统一追加到历史末尾：末尾可能已有一条用户消息，
+/// 模型会把占位错配到别处（[`collect_call_group`] 只认紧邻的 call/output 段）。
+#[test]
+fn orphan_patch_stays_adjacent_to_its_call() {
+    let (_dir, path) =
+        write_archive("orphan-adjacent", &[user_msg("任务"), tool_call("c1"), user_msg("补一句")]);
+
+    let resumed = resume::resume(&path).unwrap();
+    assert_eq!(resumed.patched_orphan_calls, 1);
+    assert_eq!(resumed.history.len(), 4, "{:#?}", resumed.history);
+    assert!(
+        matches!(&resumed.history[1], HistoryItem::FunctionCall { call_id, .. } if call_id == "c1")
+    );
+    assert_unknown_output(&resumed.history, 2, "c1");
+    assert!(
+        matches!(&resumed.history[3], HistoryItem::Message { text, .. } if text == "补一句"),
+        "占位必须排在用户的后一句话之前：{:#?}",
+        resumed.history
+    );
+}
+
+/// 补写只发生在内存里：档案是 append-only 的，重复 resume 必须得到同一份历史。
+#[test]
+fn resume_is_idempotent_for_patched_calls() {
+    let (_dir, path) = write_archive("orphan-idempotent", &[user_msg("任务"), tool_call("c1")]);
+    let on_disk = std::fs::read_to_string(&path).unwrap();
+
+    let first = resume::resume(&path).unwrap();
+    let second = resume::resume(&path).unwrap();
+    assert_eq!(first.history, second.history, "两次 resume 的历史必须完全一致");
+    assert_eq!(first.patched_orphan_calls, 1);
+    assert_eq!(second.patched_orphan_calls, 1, "占位不得被回写成盘上条目，否则第二次会补两条");
+    assert_eq!(std::fs::read_to_string(&path).unwrap(), on_disk, "resume 不得改动档案");
+    let placeholders = first
+        .history
+        .iter()
+        .filter(|h| matches!(h, HistoryItem::FunctionCallOutput { call_id, .. } if call_id == "c1"))
+        .count();
+    assert_eq!(placeholders, 1, "同一次重放里每条调用只该有一个输出：{:#?}", first.history);
+}
+
+/// 一轮并行调用只回了一个：只补没回包的那条，已有的输出原样保留。
+#[test]
+fn two_calls_only_one_answered_patches_only_the_open_one() {
+    let (_dir, path) = write_archive(
+        "orphan-partial",
+        &[user_msg("任务"), tool_call("c1"), tool_call("c2"), tool_output("c1", "c1-ok")],
+    );
+
+    let resumed = resume::resume(&path).unwrap();
+    assert_eq!(resumed.patched_orphan_calls, 1, "只该补 c2：{:#?}", resumed.history);
+    let c1_outputs: Vec<&str> = resumed
+        .history
+        .iter()
+        .filter_map(|h| match h {
+            HistoryItem::FunctionCallOutput { call_id, output } if call_id == "c1" => {
+                Some(output.as_str())
+            }
+            _ => None,
+        })
+        .collect();
+    assert_eq!(c1_outputs, vec!["c1-ok"], "已回包的 c1 不得被追加第二条输出");
+    assert_unknown_output(&resumed.history, 3, "c2");
+    // 结构判据：喂给请求构造器后仍成对，且并行调用合并在同一条 assistant 里。
+    let msgs = shaniu_lib::model_client::chat_messages("SYS", &resumed.history);
+    assert_tool_calls_answered(&msgs);
+}
+
+/// 配对必须按**锚点生效后的最终历史**判：锚点把 c1 的输出压掉之后，c1 就是落单调用。
+/// 若在锚点之前判配对，这里会漏掉补写，续写第一条请求就 400（SH-082）。
+#[test]
+fn compacted_history_still_patches_open_call() {
+    let (_dir, path) = write_archive(
+        "orphan-compacted",
+        &[
+            user_msg("任务"),
+            tool_call("c1"),
+            tool_output("c1", "旧输出"),
+            // 锚点只覆盖那条输出：区间 [2,3) 换成摘要，调用 c1 留下但没有回包了。
+            RolloutItem::Compacted {
+                range_start: 2,
+                range_end: 3,
+                summary: "压缩".into(),
+                at_ms: 0,
+                trigger: None,
+            },
+        ],
+    );
+
+    let resumed = resume::resume(&path).unwrap();
+    assert_eq!(resumed.applied_compactions, 1);
+    assert_eq!(resumed.patched_orphan_calls, 1, "锚点之后 c1 变成落单调用：{:#?}", resumed.history);
+    assert_eq!(resumed.history.len(), 4, "任务 + 调用 + 占位 + 摘要：{:#?}", resumed.history);
+    assert_unknown_output(&resumed.history, 2, "c1");
+    assert!(
+        matches!(&resumed.history[3], HistoryItem::Message { text, .. } if text == "压缩"),
+        "摘要必须留在原位：{:#?}",
+        resumed.history
+    );
 }

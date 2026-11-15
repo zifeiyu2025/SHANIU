@@ -596,7 +596,7 @@ fn send_task(
     }
 }
 
-/// 档案降级可见化：坏行被跳过、撕裂行被丢弃、落单工具调用被剔除时，**必须让用户看到**。
+/// 档案降级可见化：坏行被跳过、撕裂行被丢弃、落单工具调用被补「结果未知」时，**必须让用户看到**。
 ///
 /// 跳过坏行是读取策略而不是失败（`rollout::read` 的设计选择 2），但"悄悄少了几条
 /// 历史"等于篡改上下文。复用既有 `EventMsg::RolloutDegraded`——前端已有
@@ -606,9 +606,9 @@ fn notify_rollout_degraded(
     agent_id: &str,
     torn_tail_lines: usize,
     damaged_lines: &[usize],
-    dropped_unsafe_tail: usize,
+    patched_orphan_calls: usize,
 ) {
-    if torn_tail_lines == 0 && damaged_lines.is_empty() && dropped_unsafe_tail == 0 {
+    if torn_tail_lines == 0 && damaged_lines.is_empty() && patched_orphan_calls == 0 {
         return;
     }
     let mut parts: Vec<String> = Vec::new();
@@ -622,15 +622,17 @@ fn notify_rollout_degraded(
     if torn_tail_lines > 0 {
         parts.push(format!("丢弃 {torn_tail_lines} 行末行撕裂的写入"));
     }
-    if dropped_unsafe_tail > 0 {
-        parts.push(format!("重放丢弃 {dropped_unsafe_tail} 条落单的工具调用记录（有调用无输出）"));
+    if patched_orphan_calls > 0 {
+        parts.push(format!(
+            "重放时补了 {patched_orphan_calls} 条工具调用的「结果未知」占位，模型不会假设它们成功"
+        ));
     }
     tracing::warn!(
         agent_id,
         torn_tail_lines,
         damaged = ?damaged_lines,
-        dropped_unsafe_tail,
-        "会话档案不完整：已跳过坏行/截断不安全尾部，历史可能缺条目"
+        patched_orphan_calls,
+        "会话档案不完整：已跳过坏行/为落单工具调用补占位，历史可能缺条目"
     );
     let _ = sink.emit(&events::EventMsg::RolloutDegraded {
         message: format!("会话档案不完整：{}；历史可能缺条目", parts.join("，")),
@@ -706,10 +708,10 @@ fn continue_session(
         .join(rollout::ROLLOUT_DIR)
         .join(format!("{agent_id}.jsonl"));
     let resumed = rollout::resume::resume(&path).map_err(|e| format!("恢复会话失败: {e}"))?;
-    // 降级信息在 `history` 被移走前取出：读取侧跳过/截断了多少，必须一路带到事件面。
+    // 降级信息在 `history` 被移走前取出：读取侧跳过/补占位了多少，必须一路带到事件面。
     let torn_tail_lines = resumed.torn_tail_lines;
     let damaged_lines = resumed.damaged_lines.clone();
-    let dropped_unsafe_tail = resumed.dropped_unsafe_tail;
+    let patched_orphan_calls = resumed.patched_orphan_calls;
     let persisted = resumed.history.len();
     // first-prompt 资格看**追加前**的历史：档案里从没有过用户消息、又不是分叉，
     // 这条新任务才是"首条合格消息"（崩溃恢复/续跑/分叉都不重新生成标题）。
@@ -794,7 +796,7 @@ fn continue_session(
     )?;
     let sink: Arc<dyn events::EventSink> = Arc::new(events::TauriEventSink::root(app.clone(), agent_id.clone()).with_journal(Arc::new(event_journal::FileEventJournal::new(app.state::<AppState>().data_root().join(config::SESSIONS_DIR)))).with_broadcast(app.state::<gateway::GatewayHub>().broadcast_sender()).with_viewers(app.state::<gateway::GatewayHub>().viewers()));
     // 档案不完整必须在会话时间线上看得见：重开会话的第一次回执就带上这条降级通知。
-    notify_rollout_degraded(sink.as_ref(), &agent_id, torn_tail_lines, &damaged_lines, dropped_unsafe_tail);
+    notify_rollout_degraded(sink.as_ref(), &agent_id, torn_tail_lines, &damaged_lines, patched_orphan_calls);
     // 权限档被钳制也要在同一时刻告知：它是「本任务实际按什么档跑」的前提。
     notify_policy_downgraded(state, sink.as_ref());
     // spawn 的 future 必须是 'static：借用的 app 只能换成 owned 句柄再 move 进去。
@@ -3099,7 +3101,7 @@ async fn compact_session(app: tauri::AppHandle, agent_id: String) -> Result<Opti
         &agent_id,
         resumed.torn_tail_lines,
         &resumed.damaged_lines,
-        resumed.dropped_unsafe_tail,
+        resumed.patched_orphan_calls,
     );
     // state 的借用止于上面最后一次取值（NLL），不跨下面的 await 点。
     session_compact::compact_now(

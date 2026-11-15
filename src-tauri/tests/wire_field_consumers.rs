@@ -232,7 +232,7 @@ const RULES: &[Rule] = &[
         owner: "Resumed",
         variant: "Resumed",
         fields: "parent_id history path workspace_root sandbox_mode permission_preset \
-                 torn_tail_lines damaged_lines dropped_unsafe_tail",
+                 torn_tail_lines damaged_lines patched_orphan_calls",
         overrides: &[
             ("session_id", Status::Gap("无消费方：身份键实际用 agent_id，首行的 session_id 只被解析")),
             ("agent_id", Status::Gap("无消费方：调用方自己持有 agent_id 并传给运行器")),

@@ -3,8 +3,10 @@
 //! resume 的本质是"把档案重放成运行时的 `history`"，因此它的正确性判据只有一条：
 //! **重放出来的历史必须能直接喂给模型且不违反协议**。SH-082 已经证明，
 //! 一条 `function_call` 后面缺配对的 `function_call_output`，严格端点直接 400——
-//! 所以重放会把"有 call 无 output"的落单调用**原位剔除**（不是截断尾巴），压缩锚点、
-//! 控制面记录与正常消息一条不丢。fork 仍按前缀截断，见 [`nearest_safe_cut`]。
+//! 所以重放会给"有 call 无 output"的落单调用**补一条「结果未知」占位**
+//! （[`ORPHAN_TOOL_OUTPUT`]），调用本身留在原位（不能剔除：剔了模型会以为那轮什么都没执行，
+//! 然后盲目重跑）。压缩锚点、控制面记录与正常消息一条不丢。fork 仍按前缀截断，
+//! 见 [`nearest_safe_cut`]。
 
 use std::collections::HashSet;
 use std::path::{Path, PathBuf};
@@ -39,13 +41,14 @@ pub struct Resumed {
     pub torn_tail_lines: usize,
     /// 中间坏行（已跳过）的 1-based 行号；空 = 档案完好。重放出来的历史因此可能缺条目。
     pub damaged_lines: Vec<usize>,
-    /// 重放时因工具调用配对不完整而剔除的**落单 `function_call`** 条数。
+    /// 重放时给**落单 `function_call`** 补「结果未知」占位的条数。
     ///
     /// 典型成因：崩溃时档案停在 `function_call` 之后、`function_call_output` 之前。
-    /// 这些条目留在盘上，但不进模型历史——带着它们续写，第一条请求就会被严格端点
-    /// 400（SH-082）。只数这个方向（有 call 无 output）：落单输出与 `Compacted` 锚点、
-    /// 控制面/审计记录、正常消息全都保留，不会被这条计数代表。
-    pub dropped_unsafe_tail: usize,
+    /// 这些调用留在模型历史里并紧跟一条 [`ORPHAN_TOOL_OUTPUT`] 占位——带着无回包的调用
+    /// 续写，第一条请求就会被严格端点 400（SH-082）；而直接剔除会让模型以为那一轮
+    /// 什么都没执行，进而盲目重跑非幂等命令。只数这个方向（有 call 无 output）：
+    /// 落单输出与 `Compacted` 锚点、控制面/审计记录、正常消息全都原样保留。
+    pub patched_orphan_calls: usize,
 }
 
 /// 档案里的一条系统提示词版本（只读快照，供审计与轨迹回放）。
@@ -60,6 +63,14 @@ pub struct SystemPromptRecord {
     pub at_ms: u64,
     pub turn: u32,
 }
+
+/// 崩溃恢复时补在孤立调用后面的结果文本。措辞要让模型做两件事：
+/// 1) 不假设它执行成功；2) 需要时重新调用，但先检查副作用。
+///
+/// 首句固定成"工具调用结果未记录"：它同时是用户排查时的检索锚点，
+/// 也是模型区分"宿主没记下来"与"工具真的返回了这句话"的唯一依据。
+pub const ORPHAN_TOOL_OUTPUT: &str = "工具调用结果未记录：宿主在结果写入前中止（会话已恢复）。\
+不要假设该调用已执行或已成功；如需继续，请先确认副作用，再决定是否重新调用。";
 
 /// 重放档案 → 历史。
 ///
@@ -171,11 +182,15 @@ pub fn resume(path: &Path) -> Result<Resumed, RolloutError> {
 
     // 重放不截断：锚点、控制面/审计记录、正常消息一律按档案顺序还原。唯一不安全的是
     // "有 call 无 output"的落单调用（SH-082：带着它续写，第一条请求就 400），所以在重放
-    // 完成后**原位剔除**它，而不是像 d610652 那样"从它开始把后面全丢掉"——崩溃之后用户
-    // 接着说的话、以及写在其后的压缩锚点都不该陪葬。
+    // 完成后**原位补一条「结果未知」占位**，而不是像 d610652 那样"从它开始把后面全丢掉"，
+    // 也不是把调用剔除——剔除会让模型以为那一轮什么都没执行，进而重跑非幂等命令。
+    // 崩溃之后用户接着说的话、以及写在其后的压缩锚点都不该陪葬。
     //
     // 配对必须按**最终历史**判：锚点可能把调用连同输出一起压掉，也可能只压掉调用、留下
     // 输出（落单输出在发请求前会被降级成文本，见 `model_client::degrade_orphan_tool_outputs`）。
+    //
+    // 只在内存里补，不回写档案：档案是 append-only 的，同一份档案重复 resume 必须得到
+    // 同一份历史（幂等），盘上内容一个字都不改。
     let answered: HashSet<String> = history
         .iter()
         .filter_map(|item| match item {
@@ -183,17 +198,31 @@ pub fn resume(path: &Path) -> Result<Resumed, RolloutError> {
             _ => None,
         })
         .collect();
-    let before = history.len();
-    history.retain(|item| match item {
-        HistoryItem::FunctionCall { call_id, .. } => answered.contains(call_id),
-        _ => true,
-    });
-    let dropped_unsafe_tail = before - history.len();
-    if dropped_unsafe_tail > 0 {
+    let mut patched_orphan_calls = 0usize;
+    let mut fixed: Vec<HistoryItem> = Vec::with_capacity(history.len());
+    for item in history {
+        match &item {
+            HistoryItem::FunctionCall { call_id, .. } if !answered.contains(call_id) => {
+                patched_orphan_calls += 1;
+                let call_id = call_id.clone();
+                fixed.push(item);
+                // 紧跟在调用之后：运行时形态是"call 全在前、output 全在后"，但恢复场景下
+                // 必须逐对相邻，否则紧邻段里的 call/output 配对会被打断
+                // （`model_client::collect_call_group` 只收连续段）。
+                fixed.push(HistoryItem::FunctionCallOutput {
+                    call_id,
+                    output: ORPHAN_TOOL_OUTPUT.to_string(),
+                });
+            }
+            _ => fixed.push(item),
+        }
+    }
+    let history = fixed;
+    if patched_orphan_calls > 0 {
         tracing::warn!(
             path = %path.display(),
-            dropped = dropped_unsafe_tail,
-            "档案里存在落单的工具调用：重放已剔除，这些条目不进模型历史（盘上内容未改动）"
+            patched = patched_orphan_calls,
+            "档案里存在落单的工具调用：重放已补「结果未知」占位（盘上内容未改动）"
         );
     }
 
@@ -210,7 +239,7 @@ pub fn resume(path: &Path) -> Result<Resumed, RolloutError> {
         prompt_versions,
         torn_tail_lines: archive.torn_tail_lines,
         damaged_lines: archive.damaged_lines,
-        dropped_unsafe_tail,
+        patched_orphan_calls,
     })
 }
 
@@ -354,21 +383,28 @@ mod tests {
     }
 
     #[test]
-    fn replay_drops_only_the_unpaired_call_and_counts_the_loss() {
+    fn replay_patches_the_unpaired_call_with_unknown_output() {
         let dir = temp_dir("truncate");
         let path = dir.join("a.jsonl");
         let w = RolloutWriter::create(&dir, &meta("a")).unwrap();
         w.append(&msg("任务")).unwrap();
         w.append(&call("c1")).unwrap();
         w.append(&out("c1")).unwrap();
-        // 崩溃点：档案停在 call 之后、output 之前。重放只能剔除 c2 这一条。
+        // 崩溃点：档案停在 call 之后、output 之前。重放给 c2 补一条「结果未知」。
         w.append(&call("c2")).unwrap();
         drop(w);
 
         let r = resume(&path).unwrap();
-        assert_eq!(r.history.len(), 3, "落单的 c2 不得进模型历史：{:#?}", r.history);
-        assert_eq!(r.dropped_unsafe_tail, 1, "被剔除的条目数必须带出来");
-        // 反向对照：盘上内容原样保留，剔除只影响这次重放。
+        assert_eq!(r.history.len(), 5, "c2 必须留在历史里并带占位：{:#?}", r.history);
+        assert_eq!(r.patched_orphan_calls, 1, "补占位的条数必须带出来");
+        match &r.history[4] {
+            HistoryItem::FunctionCallOutput { call_id, output } => {
+                assert_eq!(call_id, "c2");
+                assert_eq!(output, ORPHAN_TOOL_OUTPUT);
+            }
+            other => panic!("落单调用后面应紧跟占位，收到 {other:?}"),
+        }
+        // 反向对照：盘上内容原样保留，补写只影响这次重放。
         assert_eq!(rollout::read(&path).unwrap().items.len(), 4);
     }
 
@@ -380,7 +416,7 @@ mod tests {
         w.append(&msg("任务")).unwrap();
         w.append(&call("c1")).unwrap(); // 崩溃/坏行：c1 永远等不到 output
         w.append(&msg("补一句")).unwrap(); // 崩溃之后用户接着说的话，不许陪葬
-        // 锚点只压第一轮任务，落单的 c1 留给重放剔除——两种机制互不干扰。
+        // 锚点只压第一轮任务，落单的 c1 仍然要在最终历史上补占位——两种机制互不干扰。
         w.append(&RolloutItem::Compacted {
             range_start: 0,
             range_end: 1,
@@ -392,9 +428,9 @@ mod tests {
         drop(w);
 
         let r = resume(&path).unwrap();
-        assert_eq!(r.dropped_unsafe_tail, 1, "只该剔除 c1");
+        assert_eq!(r.patched_orphan_calls, 1, "只该给 c1 补占位");
         assert_eq!(r.applied_compactions, 1, "写在落单调用之后的锚点同样要生效");
-        assert_eq!(r.history.len(), 2, "摘要与「补一句」都必须保留：{:#?}", r.history);
+        assert_eq!(r.history.len(), 4, "摘要、调用、占位与「补一句」都必须保留：{:#?}", r.history);
         match &r.history[0] {
             HistoryItem::Message { role, text, .. } => {
                 assert_eq!(*role, Role::User);
@@ -403,6 +439,17 @@ mod tests {
             other => panic!("压缩锚点应回放为 message，收到 {other:?}"),
         }
         match &r.history[1] {
+            HistoryItem::FunctionCall { call_id, .. } => assert_eq!(call_id, "c1"),
+            other => panic!("落单调用必须保留，收到 {other:?}"),
+        }
+        match &r.history[2] {
+            HistoryItem::FunctionCallOutput { call_id, output } => {
+                assert_eq!(call_id, "c1");
+                assert_eq!(output, ORPHAN_TOOL_OUTPUT);
+            }
+            other => panic!("落单调用后面应紧跟占位，收到 {other:?}"),
+        }
+        match &r.history[3] {
             HistoryItem::Message { text, .. } => assert_eq!(text, "补一句"),
             other => panic!("落单调用之后的消息必须保留，收到 {other:?}"),
         }
