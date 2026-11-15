@@ -13,9 +13,11 @@ use std::io::{Read as _, Write as _};
 use std::sync::{Arc, Mutex};
 
 use futures::StreamExt as _;
+use shaniu_lib::compaction::Target;
 use shaniu_lib::model_client::{
-    stream_responses, HistoryItem, ModelStreamEvent, ProviderConfig, Role,
+    stream_responses, HistoryItem, ModelStreamEvent, ProviderConfig, RequestOptions, Role,
 };
+use shaniu_lib::session_compact::summarize_body;
 
 const TASK: &str = "把 README 第三段译成中文，写到 docs/readme.zh.md";
 
@@ -113,6 +115,15 @@ fn content_length(head: &str) -> usize {
         .unwrap_or(0)
 }
 
+/// 生产主路径的请求选项：带会话缓存键、扩展开关全开。
+fn options(cache_key: &str) -> RequestOptions {
+    RequestOptions {
+        cache_key: Some(cache_key.to_string()),
+        responses_extras: true,
+        parallel_tool_calls: true,
+    }
+}
+
 fn history() -> Vec<HistoryItem> {
     vec![
         // system 注入（环境快照 / 停止钩子提醒）走同一个 message 形状
@@ -136,9 +147,16 @@ fn history() -> Vec<HistoryItem> {
 #[tokio::test]
 async fn user_text_reaches_the_wire_inside_the_content_array() {
     let server = CapturingServer::start();
-    let mut stream = stream_responses(&server.provider(), "sk-test", &history(), &[], "SYS")
-        .await
-        .expect("本地端点应成功建流");
+    let mut stream = stream_responses(
+        &server.provider(),
+        "sk-test",
+        &history(),
+        &[],
+        "SYS",
+        &options("sess-1"),
+    )
+    .await
+    .expect("本地端点应成功建流");
     let events: Vec<ModelStreamEvent> = stream.by_ref().collect().await;
     // 流本身要能走完：请求构造错时端点常常直接 400，这里先把传输面排除掉
     assert!(
@@ -171,9 +189,16 @@ async fn user_text_reaches_the_wire_inside_the_content_array() {
 #[tokio::test]
 async fn other_roles_and_tool_items_use_responses_shapes() {
     let server = CapturingServer::start();
-    let mut stream = stream_responses(&server.provider(), "sk-test", &history(), &[], "SYS")
-        .await
-        .expect("本地端点应成功建流");
+    let mut stream = stream_responses(
+        &server.provider(),
+        "sk-test",
+        &history(),
+        &[],
+        "SYS",
+        &options("sess-1"),
+    )
+    .await
+    .expect("本地端点应成功建流");
     let _: Vec<ModelStreamEvent> = stream.by_ref().collect().await;
 
     let body = server.body();
@@ -216,4 +241,96 @@ async fn other_roles_and_tool_items_use_responses_shapes() {
 
     // 工具声明与 Responses 的扁平形状一致（`function` 对象是 chat 的形状）
     assert_eq!(body["stream"], true);
+}
+
+/// D1：协议字段必须真的出现在 wire 上，而不是只改了一个纯函数。
+///
+/// 断言走真实 HTTP 往返（见文件头）：只在 `build_responses_request` 返回值上断言，
+/// 会漏掉「构造对了、发送时又换成另一份 body」的断链。
+#[tokio::test]
+async fn responses_body_carries_protocol_fields() {
+    let server = CapturingServer::start();
+    let mut stream = stream_responses(
+        &server.provider(),
+        "sk-test",
+        &history(),
+        &[],
+        "SYS",
+        &options("sess-1"),
+    )
+    .await
+    .expect("本地端点应成功建流");
+    let _: Vec<ModelStreamEvent> = stream.by_ref().collect().await;
+
+    let body = server.body();
+    // 档案是唯一事实源：不许服务端替我们落库（否则隐私边界取决于网关默认值）。
+    assert_eq!(body["store"], false, "store 必须显式 false：{body}");
+    assert_eq!(body["tool_choice"], "auto", "tool_choice 不能被端点默认值决定：{body}");
+    assert_eq!(body["parallel_tool_calls"], true);
+    assert_eq!(body["prompt_cache_key"], "sess-1");
+    assert_eq!(
+        body["include"].as_array().expect("include 必须是数组").len(),
+        0,
+        "D1 阶段 include 固定空数组：不替用户多付密文体积"
+    );
+}
+
+/// 老网关回退：`responses_extras=false` 时五个键一个都不出现，请求体回到旧 5 键形状。
+/// 同时验证 `parallel_tool_calls=false` 确实由配置驱动（不是写死 true）。
+#[tokio::test]
+async fn responses_extras_can_be_disabled() {
+    let off = CapturingServer::start();
+    let mut stream = stream_responses(
+        &off.provider(),
+        "sk-test",
+        &history(),
+        &[],
+        "SYS",
+        &RequestOptions { responses_extras: false, ..options("sess-1") },
+    )
+    .await
+    .expect("本地端点应成功建流");
+    let _: Vec<ModelStreamEvent> = stream.by_ref().collect().await;
+    let body = off.body();
+    for key in ["store", "tool_choice", "parallel_tool_calls", "include", "prompt_cache_key"] {
+        assert!(body.get(key).is_none(), "开关关闭后不应出现 {key}：{body}");
+    }
+
+    // 开关打开、但把并行关掉：wire 上必须跟着 false（配置没接上时这里会红）。
+    let serial = CapturingServer::start();
+    let mut stream = stream_responses(
+        &serial.provider(),
+        "sk-test",
+        &history(),
+        &[],
+        "SYS",
+        &RequestOptions { parallel_tool_calls: false, ..options("sess-1") },
+    )
+    .await
+    .expect("本地端点应成功建流");
+    let _: Vec<ModelStreamEvent> = stream.by_ref().collect().await;
+    assert_eq!(
+        serial.body()["parallel_tool_calls"],
+        false,
+        "parallel_tool_calls 必须来自配置，而不是写死 true"
+    );
+}
+
+/// 压缩摘要请求必须与主请求同口径：同一构造入口，不会各拼一份 `json!` 后漂移。
+#[test]
+fn compaction_request_shares_the_same_fields() {
+    let provider = ProviderConfig {
+        provider: "openai-responses".into(),
+        base_url: "http://127.0.0.1:1".into(),
+        model: "gpt-test".into(),
+        reasoning_effort: None,
+        headers: Default::default(),
+    };
+    let body = summarize_body(&provider, &history(), Target { range_start: 0, range_end: 2 }, &options("sess-1"));
+    assert_eq!(body["store"], false, "摘要请求漏了 store：{body}");
+    assert_eq!(body["tool_choice"], "auto", "摘要请求漏了 tool_choice：{body}");
+    assert_eq!(body["parallel_tool_calls"], true, "摘要请求漏了 parallel_tool_calls：{body}");
+    assert_eq!(body["prompt_cache_key"], "sess-1", "摘要请求漏了 prompt_cache_key：{body}");
+    // 辅助请求仍然保留自己的输出上限（不能被"统一"掉）。
+    assert!(body["max_output_tokens"].is_number(), "{body}");
 }

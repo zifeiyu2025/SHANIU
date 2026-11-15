@@ -327,6 +327,7 @@ async fn resume_continues_real_work_on_a_real_endpoint() {
             backend: Arc::new(ResponsesBackend {
                 provider: provider.clone(),
                 api_key: api_key.clone(),
+                options: Default::default(),
             }),
             router: Arc::new(router),
             broker: broker.clone(),

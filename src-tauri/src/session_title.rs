@@ -149,6 +149,7 @@ async fn generate_title(
     api_key: &str,
     first_message: &str,
     config: &SessionTitleConfig,
+    options: &crate::model_client::RequestOptions,
 ) -> Result<String, String> {
     let input = frame_messages(first_message);
     if input.len() as u64 > config.max_input_bytes {
@@ -161,7 +162,7 @@ async fn generate_title(
     let system = system_prompt(config);
     let history = title_history(first_message);
     let mut body = if provider.is_responses() {
-        model_client::build_responses_request(provider, &history, &[], &system)
+        model_client::build_responses_request(provider, &history, &[], &system, options)
     } else {
         model_client::build_chat_request(provider, &history, &[], &system)
     };
@@ -223,9 +224,16 @@ pub fn spawn_generation(app: tauri::AppHandle, agent_id: String, first_message: 
         _ => return,
     };
     let title_config = cfg.session_title.clone();
+    // 标题是辅助请求：扩展开关跟随配置（老网关关掉后标题请求也不能带陌生键），
+    // 但不发 `prompt_cache_key`——它的提示前缀与主回合不同，共用一个缓存键没有收益。
+    let options = crate::model_client::RequestOptions {
+        cache_key: None,
+        responses_extras: active.responses_extras,
+        parallel_tool_calls: active.parallel_tool_calls,
+    };
     let dir = state.data_root().join(crate::rollout::ROLLOUT_DIR);
     tauri::async_runtime::spawn(async move {
-        match generate_title(&provider, &api_key, &first_message, &title_config).await {
+        match generate_title(&provider, &api_key, &first_message, &title_config, &options).await {
             Ok(title) => {
                 if user_took_over(&dir, &agent_id) {
                     return;
@@ -328,9 +336,15 @@ mod tests {
             reasoning_effort: None,
             headers: Default::default(),
         };
-        let err = generate_title(&provider, "k", "这是一条很长很长很长很长的用户消息，用来超出 64 字节的框架上限……", &cfg)
-            .await
-            .unwrap_err();
+        let err = generate_title(
+            &provider,
+            "k",
+            "这是一条很长很长很长很长的用户消息，用来超出 64 字节的框架上限……",
+            &cfg,
+            &crate::model_client::RequestOptions::default(),
+        )
+        .await
+        .unwrap_err();
         assert!(err.contains("64"), "{err}");
     }
 
@@ -346,7 +360,14 @@ mod tests {
             reasoning_effort: None,
             headers: Default::default(),
         };
-        let result = generate_title(&provider, "k", "你好", &cfg).await;
+        let result = generate_title(
+            &provider,
+            "k",
+            "你好",
+            &cfg,
+            &crate::model_client::RequestOptions::default(),
+        )
+        .await;
         // 契约只有一条：端点不可达必须整体失败（fallback 保持），绝不交出空标题
         assert!(result.is_err());
     }

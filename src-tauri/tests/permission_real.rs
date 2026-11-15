@@ -113,7 +113,7 @@ async fn real_model_is_blocked_when_it_reaches_outside_the_narrowed_allowlist() 
     let workspace = shaniu_lib::test_support::TestTempDir::new("permission-real");
 
     let engine = Arc::new(AgentLoop {
-        backend: Arc::new(ResponsesBackend { provider, api_key }),
+        backend: Arc::new(ResponsesBackend { provider, api_key, options: Default::default() }),
         router: Arc::new(router),
         broker: Arc::new(shaniu_lib::permission::ApprovalBroker::new()),
         plan_state: Arc::new(PlanState::new()),

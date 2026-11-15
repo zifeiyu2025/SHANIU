@@ -221,6 +221,7 @@ async fn first_delta_latency_within_budget_on_real_endpoint() {
     let backend = Arc::new(shaniu_lib::agent_loop::ResponsesBackend {
         provider: provider.clone(),
         api_key,
+        options: Default::default(),
     });
 
     let mut displayable_samples = Vec::new();

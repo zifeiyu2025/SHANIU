@@ -2323,7 +2323,15 @@ fn build_agent_with(
         return Err(state.busy_message(agent_id));
     }
 
-    let backend: Arc<dyn ModelBackend> = Arc::new(agent_loop::ResponsesBackend { provider, api_key });
+    // 会话级请求选项（D1）：缓存键按会话派生——fork 出新 id 即换键（不串缓存），
+    // resume 沿用原 id（命中率最高）；两个扩展开关跟随 `[model]` 配置。
+    let options = model_client::RequestOptions {
+        cache_key: Some(agent_id.to_string()),
+        responses_extras: active.responses_extras,
+        parallel_tool_calls: active.parallel_tool_calls,
+    };
+    let backend: Arc<dyn ModelBackend> =
+        Arc::new(agent_loop::ResponsesBackend { provider, api_key, options });
     let mut router = tool_router::ToolRouter::new();
     // 工具面跟随能力（SH-132）：视觉未生效的模型不注册 `view_image`。
     tools::register_builtin(&mut router, state.plan_state.clone(), active.vision);
@@ -3064,6 +3072,12 @@ async fn compact_session(app: tauri::AppHandle, agent_id: String) -> Result<Opti
         .map_err(|e| format!("读取密钥失败: {e}"))?
         .ok_or_else(|| "未配置 API 密钥，无法生成摘要".to_string())?;
     let budget = cfg.agent.token_budget;
+    // 摘要请求与回合内压缩同口径（D1）：同一会话缓存键 + 同样的扩展开关。
+    let options = model_client::RequestOptions {
+        cache_key: Some(agent_id.clone()),
+        responses_extras: active.responses_extras,
+        parallel_tool_calls: active.parallel_tool_calls,
+    };
     let path = state
         .data_root()
         .join(rollout::ROLLOUT_DIR)
@@ -3088,8 +3102,16 @@ async fn compact_session(app: tauri::AppHandle, agent_id: String) -> Result<Opti
         resumed.dropped_unsafe_tail,
     );
     // state 的借用止于上面最后一次取值（NLL），不跨下面的 await 点。
-    session_compact::compact_now(&provider, &api_key, &resumed, budget, sink.as_ref(), &cancel)
-        .await
+    session_compact::compact_now(
+        &provider,
+        &api_key,
+        &resumed,
+        budget,
+        sink.as_ref(),
+        &cancel,
+        &options,
+    )
+    .await
 }
 
 /// 产品目录视图：前端用它把默认工作区基线落到宿主解析出的 `<数据根>\Workspace`。

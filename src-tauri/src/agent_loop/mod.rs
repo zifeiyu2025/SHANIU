@@ -61,6 +61,9 @@ pub use crate::model_client::ToolDeclaration as ToolDeclarationShim;
 pub struct ResponsesBackend {
     pub provider: ProviderConfig,
     pub api_key: String,
+    /// 会话级请求选项（D1）：`prompt_cache_key` 与协议扩展开关。
+    /// 放在后端而不是每次 `stream()` 传：回合内压缩也走这条后端，两处必须同口径。
+    pub options: crate::model_client::RequestOptions,
 }
 
 #[async_trait::async_trait]
@@ -71,9 +74,15 @@ impl ModelBackend for ResponsesBackend {
         tools: &[ToolDeclarationShim],
         instructions: &str,
     ) -> Result<ModelStream, crate::model_client::ModelError> {
-        let stream =
-            model_client::stream_model(&self.provider, &self.api_key, history, tools, instructions)
-                .await?;
+        let stream = model_client::stream_model(
+            &self.provider,
+            &self.api_key,
+            history,
+            tools,
+            instructions,
+            &self.options,
+        )
+        .await?;
         Ok(Box::pin(stream))
     }
 }

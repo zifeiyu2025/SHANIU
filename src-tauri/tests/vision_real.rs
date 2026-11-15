@@ -81,9 +81,16 @@ async fn view_image_reaches_the_model() {
         },
     ];
     let request_started = std::time::Instant::now();
-    let mut stream = stream_model(&provider, &api_key, &history, &[], "你是图像描述助手。")
-        .await
-        .expect("请求未建立");
+    let mut stream = stream_model(
+        &provider,
+        &api_key,
+        &history,
+        &[],
+        "你是图像描述助手。",
+        &Default::default(),
+    )
+    .await
+    .expect("请求未建立");
     let mut answer = String::new();
     let mut reasoning = String::new();
     let mut usage = String::new();

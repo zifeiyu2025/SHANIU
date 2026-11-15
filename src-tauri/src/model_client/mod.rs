@@ -19,7 +19,7 @@ use std::time::Duration;
 
 use crate::images::{image_store, ImageRef};
 
-pub use provider::ProviderConfig;
+pub use provider::{ProviderConfig, RequestOptions};
 
 // ============================== 传输时限（审计 H1） ==============================
 
@@ -217,11 +217,15 @@ fn parse_item(item: &serde_json::Value) -> Option<ResponseItem> {
 
 /// 构造 Responses API 请求体（stream:true 固定；工具经 tools 数组下发）。
 /// `instructions` 为系统提示词（Responses 协议的顶层 instructions 字段）。
+///
+/// `options` 承载会话级/开关级差异（`prompt_cache_key`、`responses_extras`、
+/// `parallel_tool_calls`）；端点身份仍只看 `provider`。
 pub fn build_responses_request(
     provider: &ProviderConfig,
     history: &[HistoryItem],
     tools: &[ToolDeclaration],
     instructions: &str,
+    options: &RequestOptions,
 ) -> serde_json::Value {
     let mut body = serde_json::json!({
         "model": provider.model,
@@ -235,6 +239,22 @@ pub fn build_responses_request(
             "parameters": t.parameters,
         })).collect::<Vec<_>>(),
     });
+    // 协议扩展字段（D1）。默认全发；`responses_extras=false` 时一个都不出现，
+    // 请求体回到 2026-11 之前的 5 键形状（给不认这些键的老网关）。
+    if options.responses_extras {
+        // 档案是唯一事实源：显式 store=false，隐私边界不交给网关默认值。
+        body["store"] = serde_json::json!(false);
+        // 端点默认值不一定是 auto（部分网关默认 none / 必选），显式钉住。
+        body["tool_choice"] = serde_json::json!("auto");
+        // 只影响模型一次返回几个调用；宿主执行顺序仍由 agent_loop 决定。
+        body["parallel_tool_calls"] = serde_json::json!(options.parallel_tool_calls);
+        // D1 阶段固定空数组（D2 打开 reasoning.encrypted_content）：不替用户多付密文体积。
+        body["include"] = serde_json::json!([]);
+        // 会话级前缀缓存键：缺省不发（给不认它的端点/夹具留退路）。
+        if let Some(key) = options.cache_key.as_deref().filter(|key| !key.is_empty()) {
+            body["prompt_cache_key"] = serde_json::json!(key);
+        }
+    }
     // 推理档（SH-096）：Responses 协议的推理参数是结构化的 `reasoning.effort`。
     // 缺省不产生该键——给不认它的端点塞陌生字段等于赌端点的宽容度。
     if let Some(effort) = provider.reasoning_effort.as_deref().filter(|e| !e.is_empty()) {
@@ -727,15 +747,21 @@ pub(crate) fn models_probe_request(
 pub type ModelStream = std::pin::Pin<Box<dyn Stream<Item = ModelStreamEvent> + Send>>;
 
 /// 统一入口：按协议族选择 Responses / ChatCompletions 流。
+///
+/// `options` 只被 Responses 消费（Chat 协议没有这些键）；放在统一入口是为了让
+/// 调用方只关心"这次请求的策略"，而不是先判协议族再决定传不传。
 pub async fn stream_model(
     provider: &ProviderConfig,
     api_key: &str,
     history: &[HistoryItem],
     tools: &[ToolDeclaration],
     instructions: &str,
+    options: &RequestOptions,
 ) -> Result<ModelStream, ModelError> {
     if provider.is_responses() {
-        Ok(Box::pin(stream_responses(provider, api_key, history, tools, instructions).await?))
+        Ok(Box::pin(
+            stream_responses(provider, api_key, history, tools, instructions, options).await?,
+        ))
     } else {
         Ok(Box::pin(stream_chat(provider, api_key, history, tools, instructions).await?))
     }
@@ -768,8 +794,14 @@ pub async fn stream_responses(
     history: &[HistoryItem],
     tools: &[ToolDeclaration],
     instructions: &str,
+    options: &RequestOptions,
 ) -> Result<impl Stream<Item = ModelStreamEvent>, ModelError> {
-    stream_body(provider, api_key, build_responses_request(provider, history, tools, instructions)).await
+    stream_body(
+        provider,
+        api_key,
+        build_responses_request(provider, history, tools, instructions, options),
+    )
+    .await
 }
 
 /// 按**已备好的请求体**打开模型 SSE 流；URL 与响应解析按协议族选择。
@@ -930,7 +962,7 @@ mod tests {
             text: "图里是什么".into(),
             images: vec![image_ref("resp-hash")],
         }];
-        let body = build_responses_request(&provider("openai-responses"), &history, &[], "SYS");
+        let body = build_responses_request(&provider("openai-responses"), &history, &[], "SYS", &RequestOptions::default());
         assert_eq!(body["input"][0]["role"], "user");
         assert_eq!(body["input"][0]["content"][0]["type"], "input_text");
         assert_eq!(body["input"][0]["content"][1]["type"], "input_image");
@@ -974,7 +1006,7 @@ mod tests {
             .as_str()
             .expect("应退化为文本说明");
         assert!(text.contains("图片不可用"), "{text}");
-        let responses = build_responses_request(&provider("openai-responses"), &history, &[], "SYS");
+        let responses = build_responses_request(&provider("openai-responses"), &history, &[], "SYS", &RequestOptions::default());
         let text = responses["input"][0]["content"][0]["text"]
             .as_str()
             .expect("应退化为文本说明");
@@ -1144,7 +1176,7 @@ mod tests {
             description: "执行命令".into(),
             parameters: serde_json::json!({"type":"object"}),
         }];
-        let body = build_responses_request(&p, &history, &tools, "SYS");
+        let body = build_responses_request(&p, &history, &tools, "SYS", &RequestOptions::default());
         assert_eq!(body["model"], "m1");
         assert_eq!(body["stream"], true);
         assert_eq!(body["input"][0]["type"], "message");
@@ -1175,7 +1207,7 @@ mod tests {
                 reasoning: Some("推理".into()),
             },
         ];
-        let body = build_responses_request(&p, &history, &[], "SYS");
+        let body = build_responses_request(&p, &history, &[], "SYS", &RequestOptions::default());
         let input = body["input"].as_array().unwrap();
         assert_eq!(input.len(), 3);
         for (idx, role) in ["system", "user", "assistant"].iter().enumerate() {
@@ -1207,7 +1239,7 @@ mod tests {
             HistoryItem::Message { role: Role::User, text: "任务".into(), reasoning: None },
             HistoryItem::FunctionCallOutput { call_id: "c-orphan".into(), output: "结果".into() },
         ];
-        let body = build_responses_request(&p, &history, &[], "SYS");
+        let body = build_responses_request(&p, &history, &[], "SYS", &RequestOptions::default());
         let input = body["input"].as_array().unwrap();
         assert!(input.iter().all(|item| item["type"] != "function_call_output"), "{input:?}");
         assert_eq!(input[1]["type"], "message");
@@ -1217,7 +1249,7 @@ mod tests {
             HistoryItem::FunctionCall { name: "t".into(), arguments: "{}".into(), call_id: "c".into() },
             HistoryItem::FunctionCallOutput { call_id: "c".into(), output: "ok".into() },
         ];
-        let body = build_responses_request(&p, &paired, &[], "SYS");
+        let body = build_responses_request(&p, &paired, &[], "SYS", &RequestOptions::default());
         assert_eq!(body["input"][0]["type"], "function_call");
         assert_eq!(body["input"][1]["type"], "function_call_output");
     }
@@ -1254,10 +1286,30 @@ mod chat_tests {
             reasoning_effort: None,
             headers: Default::default(),
         };
-        assert!(build_responses_request(&p, &[], &[], "SYS").get("reasoning").is_none());
+        assert!(build_responses_request(&p, &[], &[], "SYS", &RequestOptions::default())
+            .get("reasoning")
+            .is_none());
         p.reasoning_effort = Some("low".into());
-        let body = build_responses_request(&p, &[], &[], "SYS");
+        let body = build_responses_request(&p, &[], &[], "SYS", &RequestOptions::default());
         assert_eq!(body["reasoning"]["effort"], "low");
+    }
+
+    #[test]
+    fn responses_extras_are_on_by_default() {
+        let p = ProviderConfig {
+            provider: "openai-responses".into(),
+            base_url: "https://x/v1".into(),
+            model: "m1".into(),
+            reasoning_effort: None,
+            headers: Default::default(),
+        };
+        let body = build_responses_request(&p, &[], &[], "SYS", &RequestOptions::default());
+        assert_eq!(body["store"], false);
+        assert_eq!(body["tool_choice"], "auto");
+        assert_eq!(body["parallel_tool_calls"], true);
+        assert!(body["include"].as_array().is_some(), "include 必须是数组：{body}");
+        // 缺省不带缓存键：单测/评测夹具没有会话 id，不能凭空造一个。
+        assert!(body.get("prompt_cache_key").is_none(), "{body}");
     }
 
     #[test]

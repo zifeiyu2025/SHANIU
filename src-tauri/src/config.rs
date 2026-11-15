@@ -468,6 +468,10 @@ pub struct ResolvedModel {
     /// 上下文窗口（SH-132）：0 = 未知。已知时压缩触发点取
     /// `min(token_budget, context_window * 4/5)`，不再一个固定预算吃到底。
     pub context_window: u32,
+    /// 是否发送 Responses 扩展字段（D1，`[model].responses_extras`）。
+    pub responses_extras: bool,
+    /// 响应端 `parallel_tool_calls`（D1，`[model].parallel_tool_calls`）。
+    pub parallel_tool_calls: bool,
 }
 
 impl AppConfig {
@@ -659,6 +663,8 @@ impl AppConfig {
                     context_window: row
                         .map(|m| m.context_window_effective(&p.base_url))
                         .unwrap_or(0),
+                    responses_extras: self.model.responses_extras,
+                    parallel_tool_calls: self.model.parallel_tool_calls,
                 }
             }
             None => ResolvedModel {
@@ -675,6 +681,8 @@ impl AppConfig {
                 // 也不要在没声明的地方假装能用。
                 vision: false,
                 context_window: 0,
+                responses_extras: self.model.responses_extras,
+                parallel_tool_calls: self.model.parallel_tool_calls,
             },
         }
     }
@@ -812,6 +820,23 @@ pub struct ModelConfig {
     /// 单个采样步最多重试几次模型请求（0 = 关闭重试）。默认 5，装配时封顶 8。
     /// 只对瞬态失败（限流 / 超时 / 网络 / 5xx / 空响应）生效，且只在首个可见增量前。
     pub max_retries: u32,
+    /// 是否发送 Responses 扩展字段（D1：`store` / `tool_choice` / `parallel_tool_calls` /
+    /// `include` / `prompt_cache_key`）。默认 true；不认这些键的老网关关掉后，
+    /// 请求体回到 2026-11 之前的 5 键形状。
+    #[serde(default = "default_true")]
+    pub responses_extras: bool,
+    /// 响应端 `parallel_tool_calls`（D1）。只影响模型一次返回几个工具调用，
+    /// **不改变**宿主执行顺序：批次的串并行仍由 agent_loop 决定。
+    #[serde(default = "default_true")]
+    pub parallel_tool_calls: bool,
+}
+
+/// 布尔项的缺省值 `true`。
+///
+/// `#[serde(default)]` 容器级缺省给的是 `bool::default()`（false），
+/// 对新加的开关语义正好相反，所以这几项必须显式指定。
+fn default_true() -> bool {
+    true
 }
 
 impl Default for ModelConfig {
@@ -822,6 +847,8 @@ impl Default for ModelConfig {
             model: String::new(),
             max_turns: 0,
             max_retries: 5,
+            responses_extras: true,
+            parallel_tool_calls: true,
         }
     }
 }

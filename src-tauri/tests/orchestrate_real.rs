@@ -62,7 +62,7 @@ async fn root_spawns_two_real_children_and_collects_their_answers() {
     let mut router = ToolRouter::new();
     shaniu_lib::tools::register_builtin(&mut router, Arc::new(PlanState::new()), true);
     let engine = Arc::new(AgentLoop {
-        backend: Arc::new(ResponsesBackend { provider, api_key }),
+        backend: Arc::new(ResponsesBackend { provider, api_key, options: Default::default() }),
         router: Arc::new(router),
         broker: Arc::new(ApprovalBroker::new()),
         plan_state: Arc::new(PlanState::new()),

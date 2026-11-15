@@ -76,34 +76,45 @@ let mut body = serde_json::json!({
 
 ### 2.2 请求面（`model_client/provider.rs`）
 
-`ProviderConfig` 增加：
+**落地偏差（2026-11-16）**：不在 `ProviderConfig` 上加字段，而是新增独立结构随调用传入：
 
 ```rust
-pub responses_extras: bool,
-pub parallel_tool_calls: bool,
+pub struct RequestOptions {
+    pub cache_key: Option<String>,
+    pub responses_extras: bool,
+    pub parallel_tool_calls: bool,
+}
+impl Default for RequestOptions { /* cache_key: None, 两个开关都是 true */ }
 ```
 
-`from_model_config` / `from_resolved` 同步赋值（`provider.rs:22-42`）。
+理由：
+
+1. `prompt_cache_key` 是**会话级**数据，`ProviderConfig` 是端点级数据；同一端点被多个会话共用，混在一起生命周期不对。
+2. `ProviderConfig` 的结构体字面量在 10+ 个测试/评测夹具里直接构造；加字段会强迫改动评测线正在修改的 `tests/evals_repo.rs`，把别人的 WIP 卷进本笔提交。
+
+`ProviderConfig` 形状不变，`from_model_config` / `from_resolved` 无需改动；两个开关由 `ResolvedModel` 承担（见 §2.1），在装配点（`build_agent_with`）转成 `RequestOptions`。
 
 ### 2.3 请求体（`model_client/mod.rs`）
 
-`build_responses_request` 增加一个参数 `cache_key: Option<&str>`，在 `responses_extras == true` 时补齐：
+`build_responses_request` 增加一个参数 `options: &RequestOptions`，在 `options.responses_extras == true` 时补齐：
 
 ```rust
 body["store"] = serde_json::json!(false);
 body["tool_choice"] = serde_json::json!("auto");
-body["parallel_tool_calls"] = serde_json::json!(provider.parallel_tool_calls);
-body["include"] = serde_json::json!(include);            // D1 阶段为 []；D2 打开后为 ["reasoning.encrypted_content"]
-if let Some(key) = cache_key { body["prompt_cache_key"] = serde_json::json!(key); }
+body["parallel_tool_calls"] = serde_json::json!(options.parallel_tool_calls);
+body["include"] = serde_json::json!([]);                 // D1 阶段为 []；D2 打开后为 ["reasoning.encrypted_content"]
+if let Some(key) = options.cache_key.as_deref().filter(|k| !k.is_empty()) {
+    body["prompt_cache_key"] = serde_json::json!(key);
+}
 ```
 
 - `store` 恒 `false`：本仓库的档案（rollout）是唯一事实源，不使用服务端存储。
-- `cache_key` 传会话 id（`AgentLoop.session_id`），fork 后的新会话用新 id，resume 沿用原 id（缓存命中率最高）。
+- `cache_key` 传会话 id（`build_agent_with` 的 `agent_id`，根会话即 `session_id`），fork 后的新会话用新 id，resume 沿用原 id（缓存命中率最高）；标题生成等辅助请求不传。
 - `include` 在 D1 单独落地时固定空数组；只有 D2 的 `reasoning_replay` 开关打开才写入 `reasoning.encrypted_content`。这样 D1 不会替用户多付密文体积。
 
-### 2.4 压缩路径同口径（`compaction/mod.rs`）
+### 2.4 压缩路径同口径（`session_compact.rs`）
 
-`compaction::build_request` 与主请求共用同一个构造函数（把 `build_responses_request` 提为唯一入口，压缩侧只传不同的 `instructions`/`history`）。**不允许**两处各写一份 `serde_json::json!`。
+偏差更正：真正拼请求体的不是 `compaction::build_request`（它只按区间切 `HistoryItem`），而是 `session_compact::summarize`。落地时把"请求体 + 输出上限"抽成 `summarize_body`，内部调用 `build_responses_request`——摘要请求与主请求共用同一构造函数，**不允许**两处各写一份 `serde_json::json!`。集成用例直接调 `summarize_body` 守住这条线。
 
 ## 3. 会先变红的用例
 

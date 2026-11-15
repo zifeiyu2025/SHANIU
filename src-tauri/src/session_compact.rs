@@ -17,7 +17,7 @@ use futures::StreamExt;
 
 use crate::compaction::{self, Target};
 use crate::events::{CompactionTrigger, EventMsg, EventSink};
-use crate::model_client::{self, HistoryItem, ModelStreamEvent, Role};
+use crate::model_client::{self, HistoryItem, ModelStreamEvent, RequestOptions, Role};
 use crate::model_client::provider::ProviderConfig;
 use crate::rollout::resume::Resumed;
 use crate::rollout::RolloutItem;
@@ -59,6 +59,7 @@ pub async fn compact_now(
     budget: usize,
     sink: &dyn EventSink,
     cancel: &tokio_util::sync::CancellationToken,
+    options: &RequestOptions,
 ) -> Result<Option<CompactOutcome>, String> {
     let Some(target) = compaction::plan_manual(&resumed.history, budget) else {
         return Ok(None);
@@ -76,7 +77,7 @@ pub async fn compact_now(
             turn: None,
         },
     );
-    let summary = match summarize(provider, api_key, &resumed.history, target, cancel).await {
+    let summary = match summarize(provider, api_key, &resumed.history, target, cancel, options).await {
         Ok(summary) => {
             // 与回合内同一口径：用户原文逐字保留在摘要之前，首条消息无条件保留。
             compaction::compose_summary(&resumed.history, &target, budget, &summary)
@@ -173,18 +174,21 @@ fn emit_ended(
     );
 }
 
-/// 发总结请求并取回摘要。不带工具声明（与回合内同理由：端点多算声明开销，且给模型
-/// "还能继续查"的错误暗示）；流式消费到收口，超时掐断，迟到的成功不采纳。
-async fn summarize(
+/// 构造一次压缩总结请求的请求体。
+///
+/// **必须与主请求共用 [`model_client::build_responses_request`]**（D1）：两者各拼一份
+/// `json!` 时，`store` / `tool_choice` / `parallel_tool_calls` 这类协议字段迟早漂移，
+/// 表现为"摘要请求和主请求在同一个端点上行为不一致"，且很难在线上定位。
+/// 这里只额外注入各协议族的输出上限（辅助请求防失控），不改字段集合。
+pub fn summarize_body(
     provider: &ProviderConfig,
-    api_key: &str,
     history: &[HistoryItem],
     target: Target,
-    cancel: &tokio_util::sync::CancellationToken,
-) -> Result<String, String> {
+    options: &RequestOptions,
+) -> serde_json::Value {
     let request = compaction::build_request(history, &target);
     let mut body = if provider.is_responses() {
-        model_client::build_responses_request(provider, &request, &[], COMPACT_SYSTEM)
+        model_client::build_responses_request(provider, &request, &[], COMPACT_SYSTEM, options)
     } else {
         model_client::build_chat_request(provider, &request, &[], COMPACT_SYSTEM)
     };
@@ -194,6 +198,20 @@ async fn summarize(
     } else {
         body["max_tokens"] = serde_json::json!(MAX_OUTPUT_TOKENS);
     }
+    body
+}
+
+/// 发总结请求并取回摘要。不带工具声明（与回合内同理由：端点多算声明开销，且给模型
+/// "还能继续查"的错误暗示）；流式消费到收口，超时掐断，迟到的成功不采纳。
+async fn summarize(
+    provider: &ProviderConfig,
+    api_key: &str,
+    history: &[HistoryItem],
+    target: Target,
+    cancel: &tokio_util::sync::CancellationToken,
+    options: &RequestOptions,
+) -> Result<String, String> {
+    let body = summarize_body(provider, history, target, options);
     let mut stream = model_client::stream_body(provider, api_key, body)
         .await
         .map_err(|error| error.human)?;

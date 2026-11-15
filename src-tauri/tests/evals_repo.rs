@@ -1340,6 +1340,7 @@ async fn run_child_mode(spec_path: &str) {
         inner: Arc::new(ResponsesBackend {
             provider: provider_from_env(),
             api_key,
+            options: Default::default(),
         }),
         label: format!("{}-r{}", spec.task_id, spec.run),
         seq: AtomicUsize::new(0),

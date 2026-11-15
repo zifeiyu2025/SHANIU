@@ -52,6 +52,30 @@ impl ProviderConfig {
     }
 }
 
+/// 单次请求的协议扩展选项（D1）。
+///
+/// 刻意不挂在 [`ProviderConfig`] 上：端点身份（协议 / 地址 / 模型 / 头）与请求策略
+/// 生命周期不同——`prompt_cache_key` 按**会话**派生，而同一端点被多个会话共用。
+/// 分开后端点结构体不用改形状，装配点少一圈无谓的重构。
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct RequestOptions {
+    /// 会话级提示缓存键（Responses 的 `prompt_cache_key`）。
+    /// `None` = 不发该键（辅助请求：标题生成）。跑评测/单测时缺省也不发。
+    pub cache_key: Option<String>,
+    /// 是否发送 Responses 扩展字段（`store` / `tool_choice` / `parallel_tool_calls` /
+    /// `include`）。默认 true；不认这些键的老网关关掉后回到 2026-11 之前的 5 键请求体。
+    pub responses_extras: bool,
+    /// 响应端 `parallel_tool_calls`。只影响模型一次返回几个调用，
+    /// **不改变**宿主的工具执行顺序（那由 agent_loop 决定）。
+    pub parallel_tool_calls: bool,
+}
+
+impl Default for RequestOptions {
+    fn default() -> Self {
+        Self { cache_key: None, responses_extras: true, parallel_tool_calls: true }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -63,6 +87,8 @@ mod tests {
             model: "test-model".into(),
             max_turns: 8,
             max_retries: 0,
+            responses_extras: true,
+            parallel_tool_calls: true,
         }
     }
 
@@ -79,6 +105,8 @@ mod tests {
             headers: Default::default(),
             vision: false,
             context_window: 0,
+            responses_extras: true,
+            parallel_tool_calls: true,
         };
         let p = ProviderConfig::from_resolved(&resolved);
         assert_eq!(p.reasoning_effort.as_deref(), Some("high"));

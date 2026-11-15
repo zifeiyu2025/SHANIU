@@ -982,7 +982,11 @@ async fn evals_baseline_v0() {
         reasoning_effort: None,
             headers: Default::default(),
     };
-    let backend = Arc::new(ResponsesBackend { provider: provider.clone(), api_key });
+    let backend = Arc::new(ResponsesBackend {
+        provider: provider.clone(),
+        api_key,
+        options: Default::default(),
+    });
 
     let tasks_file = std::env::var("SHANIU_EVAL_TASKS")
         .unwrap_or_else(|_| "evals/tasks.json".to_string());
@@ -1654,7 +1658,7 @@ async fn repair_loop_fixes_broken_rust_project_until_cargo_test_green() {
         reasoning_effort: None,
         headers: Default::default(),
     };
-    let backend = Arc::new(ResponsesBackend { provider, api_key });
+    let backend = Arc::new(ResponsesBackend { provider, api_key, options: Default::default() });
 
     let ws = repo_root().join("target").join(format!(
         "repair-eval-{}-{}",
