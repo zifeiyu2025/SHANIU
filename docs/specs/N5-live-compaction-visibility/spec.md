@@ -1,7 +1,8 @@
-# N5（P2）压缩提示实时显示 — 规格 v2（真机返工）
+# N5（P2）压缩提示实时显示 — 规格 v3（R5 残留收敛）
 
 > v1（`4a8d0be`）的口径与实现已被真机否决，本文件取代 v1 的 §2/§3/§4；v1 §1 的链路定责仍然成立（后端已广播、适配层已接收），错的只是"发出什么形状"和"何时发出"。
-> 范围：`src/transport/`（适配层 + 用例）与 `src-tauri/` 三笔 additive；不改 `src/dsh/` vendored 代码。
+> v2 已由 `408dee9` 落地，真机第五轮 A 组翻绿；v3 只收 R5 的五条残留（四条修、一条登记），判据不放宽。
+> 范围：`src/transport/`、`src/header-actions/`、`src-tauri/`，以及 `src/dsh/` 的**一处**最小 vendored 改动（R5-1，见 §8.1）；不改渲染器、不改 `docs/smoke/`。
 
 ## 0. 为什么 v1 单测绿、真机红
 
@@ -100,3 +101,109 @@ v1 还漏了一件事：实时与回放**只有"有 surface"时才同形**，而
 
 - replace 整段 surface 依赖"压缩发生在回合边界、被压缩区间即当前全部前置历史"；真机证据（range 0–N、压缩后 `history_len` 很小）符合该前提。若将来出现"压缩只覆盖历史中段"，需要后端在事件里带可映射的区间，本规格不预先实现。
 - append 型 checkpoint 的卡片位置在"历史顶部"还是"当前位置"取决于回放顺序；R2 会把它钉死在真实档案的顺序上。
+
+## 8. R5 残留（真机第五轮 `408dee9`）
+
+| 编号 | 级别 | 处置 | 一句话 |
+| --- | --- | --- | --- |
+| R5-1 | P2 | 修 | 压缩节点默认折进两级组内，不展开取 UIA 全树命中 0 |
+| R5-4 | P2 | 修 | 导出三条压缩事务 `turn=null`/`time=0`/无 `trigger` |
+| R5-5 | P3 | 修 | 失败区块「本本轮运行失败」重复；压缩失败日志 0 行 |
+| R5-3 | P3 | 修 | `/compact` 完成卡文案是英文 |
+| R5-2 | P3 | 只登记 | 实时挂当轮、重开挂 range 首轮，重开「记录时刻不可用」 |
+
+### 8.1 R5-1 压缩节点必须不展开就可见
+
+**先查上游有没有 default-open 的配置表达**（要求：能配置就不 fork）：
+
+- `conversation-nodes/common.ts:52-74` 的 `chatNode` 只有 `location` / `visibility` / `groupTree` 三个可选参数；
+- `chat-settings.ts` 与 `presentation-policy.ts` 只提供 `collapseTiming`（收起时机）与视图模式（compact/standard/detailed/verbose），**没有任何按节点类型豁免折叠的开关**；
+- 上游对"留在 Turn、不进过程披露"的唯一既有表达就是 `groupTree: 'turn'`：`turn-error.ts:116`、`turn-max-tokens.ts:72`、`turn-tail.ts:138`、`turn-process.ts:339` 四处都是这个写法；
+- `isAtOrOutside(node,'turn')` 决定 `turn-process-presentation` 跳过、`chat-snapshot-builder` 不把它计为过程成员，因此**不会被「已完成，用时 N 秒」→「已完成分析」两级组折叠**。
+
+结论：没有纯配置入口；最小改动是给 vendored 的 `compaction.ts:55` 补 `{ groupTree: 'turn' }`，与 turn-error 同口径。这不是 fork 渲染器，只是把定义该传的选项传对。
+
+**代价与登记**：`packages/client/ui-chat/src/client/conversation-nodes/compaction.ts` 从此成为 vendored drift，必须同一笔提交里在 `align/overrides.json` 加条目（reason 与 guard 写明「上游若把压缩节点移出过程组，删本地 groupTree」），并在 `docs/07-vendor本地改动清单.md` 追加第 34 行；随后 `node scripts/align-report.mjs` 重生成账本（CI 有「账本过期即失败」）。
+
+**判据（下一轮真机）**：不展开任何组，UIA 全树里 `compaction` 节点命中 ≥1。本地用例把这条钉成 `buildViewNode(...).groupTree === 'turn'`（折叠决策的唯一输入），不靠截图。
+
+### 8.2 R5-4 导出压缩事务的 turn / time / trigger
+
+**根因**：`src/header-actions/session-events.ts` 的 `compaction_summary` 分支合成三条 log-only 事件时，`turn` 硬编码 `null`、`time` 走 `entryTime(entry)`（档案 `at_ms` 恒 0）、`trigger` 根本没有来源——`c6a89be` 补的 `trigger` 只加在 `CompactionEnded` 事件上，没进档案，导出合成分支自然拿不到。
+
+**落法（三层各自最小）**：
+
+1. 档案层 `src-tauri/src/rollout/mod.rs:74` 的 `RolloutItem::Compacted` 增加
+   `#[serde(default)] at_ms: u64` 与 `#[serde(default, skip_serializing_if = "Option::is_none")] trigger: Option<String>`。
+   旧档没有这两个键，`serde(default)` 解码为 `0` / `None`，不伪造。`trigger` 存字符串（与同枚举既有的 `reason: String` 同风格），取值由 `CompactionTrigger::as_str()` 提供（无通配臂 match，新增变体不更新即编译失败），保证只有一份机器值。
+2. 写入层：`agent_loop::append_anchor` 加 `at_ms`/`trigger` 两个参数（两处调用分别传 `now_ms()` + 实际 `trigger`）；`session_compact::write_anchor` 写 `now_ms()` + `Manual`。时刻取**落档那一刻**，不用压缩开始时刻。
+3. 投影层 `lib.rs` 的 `summary_entry` 加 `at_ms` / `trigger` 透传；`SessionEntry::CompactionSummary` 增加 `#[serde(default, skip_serializing_if = "Option::is_none")] trigger: Option<String>`（`at_ms` 已有）。两处 `RolloutItem::Compacted` 解构补字段（`project_entries` 与 `project_slots_with`），`rollout::resume` 的解构用 `..` 之外的显式字段也要同步。
+4. 导出层 `session-events.ts`：
+   - `turn`：`const compactionTurn = open ? turn : null`，三条事件共用。**冲突取舍**：`dsh repair.ts`（`openTurnClosers` 只对"日志末尾还开着"的回合补 closer）与 codex `thread_history_projection`（投影只陈述档案里已成立的归属）都指向"不虚构归属"，所以锚点落在回合外时坚持 `null`，不把它归给"即将开始的下一轮"；锚点写在回合内（溢出补救）时如实带当轮号。代价：回合外锚点无法回答"它属于哪一轮"，与上游 `compaction/*` 的 `turn: null` 语义一致。
+   - `time`：`entryTime(entry)` 读 `at_ms`（新档有真实时刻；旧档仍 `0 + timeUnreliable: true`）。
+   - `trigger`：`entry.trigger === undefined ? {} : { trigger: entry.trigger }` 三处都加。**已知代价**：上游 `compaction/*` 事件类型没有 `trigger` 字段，这是审计扩展；`formatSessionMarkdown` 不读它，但若该导出被当原生 v4 严格校验，未知键可能被拒——与 §3 A2 的「缺 `shadowedRange`」同性质，宁可显式记录也不丢事实。
+
+**用例**：`src/header-actions/session-events.spec.ts`（既有导出用例文件）加三条断言——回合内锚点 `turn === 1`、回合外锚点 `turn === null`、`time` 等于档案 `at_ms` 且 `trigger === 'manual'`；Rust 侧在 `tests/rollout_resume.rs` 或 `tests/compaction_resume.rs` 补一条"旧档无新键可解码、新档回读保留 `at_ms`/`trigger`"。
+
+### 8.3 R5-3 `/compact` 完成卡改中文
+
+`src/transport/adapter.ts:4144/4151` 两处英文：
+
+- `No compactable history yet.` → `暂无可压缩的历史。`
+- `Compacted ${n} history items (~${t} tokens).` → `已压缩 ${n} 条历史（约 ${t} tokens）。`
+
+同步更新 `adapter.spec.ts` 里对这两句的期望（含手动成功用例）。判据：`/compact` 成功/空历史的命令卡文本不含 ASCII 句子。
+
+### 8.4 R5-5 失败文案去重 + 压缩失败日志
+
+**去重**：源码里没有「本本轮」字面量。失败区块的标题是词典 `message.turnError` =「本轮运行失败」，正文来自宿主 `COMPACTION_FAILED` 的 `CompactAbort::Failed(format!("压缩请求发起失败，本轮中止：{e}"))`（`agent_loop/mod.rs:536`）；UIA 全树把两段相邻铺平后再读，就成了「本本轮运行失败」。修法：正文前缀抽成常量 `COMPACT_REQUEST_FAILED = "压缩请求发起失败："`（保留"压缩请求发起失败"这个可 grep 的事实，去掉第二个「本轮」），并附单测断言拼出的正文不含「本轮」。
+
+**为什么不在 UI 用例里锁**：`vite.config.ts:75` 把 `src/dsh/**` 整体排除在 SHANIU 测试面之外（上游测试依赖其 host 运行时），写进 `chat-view.client.spec.tsx` 的断言不会进任何门禁，等于死代码且增加 vendored 测试漂移；标题文案本身由上游词典固定，正文由本侧常量决定，锁前缀即可锁住「只出现一次」。
+
+**日志**：压缩失败目前只有前端痕迹与 rollout，日志 0 行。三处失败点统一补 `warn!`，tag 与成功日志同源、可一条 grep 命中：
+
+- `session_compact.rs::emit_ended` 的 `Err` 分支（手动）；
+- `agent_loop/mod.rs:735` 溢出补救 `Failed`（在原 warn 的文案前加 tag，保留原标题）；
+- `agent_loop/mod.rs:1305-1311` 轮前预算 `Failed`（新增一条）。
+
+统一文案 `上下文压缩失败（SH-032）`，级别 `warn`：成功是 `info`（正常路径不该刷警告），失败必须 warn 才会进用户可见日志级别。
+
+**判据**：新增 `src-tauri/tests/compaction_failure_log.rs`（仿 `now_ms_single_source.rs` 的源扫描用例），断言 `src/agent_loop/mod.rs` 与 `src/session_compact.rs` 内 `上下文压缩失败（SH-032）` 出现 ≥3 次——改回"只在前端留痕"或删任一分支即红。
+
+### 8.5 R5-2 已知限制（只登记，不修）
+
+写入本规格 §12 与 `tasks.md`：
+
+- **实时**：节点锚在**当轮**（`journal.turn` 由适配层按用户消息自增）。
+- **重开**：档案里没有"锚点属于哪一轮"，只能按 `[range_start, range_end)` 推导，落在 **range 首轮**。
+- 两者位置可能不同，这是档案信息不足的必然结果，不是渲染 bug。
+- **「记录时刻不可用」**：旧档案 `Compacted` 无 `at_ms`（本规格之前写入的），投影为 `0`，界面按 A0-4 如实显示"记录时刻不可用"；R5-4 之后的新档有真实时刻。不为了好看回填导出时刻。
+- 不改代码；若将来要给旧档补时刻，必须作为独立迁移任务（不可逆地改写档案），不在本线做。
+
+## 9. 反向验证（v3，逐条改回去必须红）
+
+1. R5-1：删掉 `{ groupTree: 'turn' }` → 新用例红（`groupTree` 为 `undefined`）。
+2. R5-4：导出三条事件 `turn` 固定 `null` → 回合内用例红；删 `trigger` 透传 → `trigger` 断言红；`time` 改回导出时刻 → `at_ms` 断言红；Rust 删 `#[serde(default)]` → 旧档解码用例红。
+3. R5-3：文案改回英文 → 命令卡用例红。
+4. R5-5：前缀改回含「本轮中止」→ 正文单测红；删任一失败日志 → 日志扫描用例红（<3 处或某条关头缺失）。
+5. 每条记录命令与关键输出后恢复，恢复后全量重跑绿。
+
+## 10. 验证命令（v3 与 v2 相同）
+
+`pnpm typecheck`；`pnpm exec vitest run --exclude "scratch/**"`；`cargo test -- --test-threads=1`；`cargo clippy --all-targets -- -D warnings`；`.\scripts\check-deps.ps1`；`.\scripts\dev\check-doc-claims.ps1`；`node scripts/align-report.mjs --check`。Rust 只对改动文件跑 `rustfmt`（禁止 `cargo fmt`）。
+
+## 11. 提交与发布（v3）
+
+四笔，按可独立回滚切分：
+
+1. `fix(N5): 压缩节点默认展开到 Turn 层（R5-1）` —— `compaction.ts` 一行 + 用例 + `align/overrides.json` + `docs/07` 第 34 行 + 重生成的账本；
+2. `feat(N5): 导出压缩事务带 turn/time/trigger（R5-4）` —— Rust 三层 + TS 两处 + 用例 + 本规格 §8.2；
+3. `fix(N5): 压缩文案中文化与失败日志（R5-3/R5-5）` —— `adapter.ts` 两句 + `agent_loop` 正文与三处 warn + 两个用例文件；
+4. `docs(N5): 登记 R5-2 已知限制` —— 只改本规格与 `tasks.md`。
+
+只显式 `git add` 上述路径；**不碰 `docs/smoke/`**；推前 `git fetch`，不带 `--force`；盯 gate + product-smoke + 对齐账本到结论再报。
+
+## 12. 已知限制（R5-2 登记）
+
+实时节点挂当轮、重开挂 range 首轮；重开旧档出现「记录时刻不可用」。原因与取舍见 §8.5，不修。
+
