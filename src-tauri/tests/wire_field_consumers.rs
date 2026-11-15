@@ -143,6 +143,19 @@ const RULES: &[Rule] = &[
     },
     Rule {
         owner: "EventMsg",
+        variant: "SandboxEscalated",
+        fields: "",
+        overrides: &[
+            // 审计事件（D7）：前端已经用审批卡承载了「要不要出沙箱」的决定，
+            // 这条只给日志/回放对账用，不需要 UI 再展示一次。
+            ("call_id", Status::BackendOnly("审计关联：与 exec_approval_request 的 call_id 对齐")),
+            ("tool", Status::BackendOnly("审计关联：记录哪个工具获批出沙箱")),
+            ("request_id", Status::BackendOnly("审计关联：等于 appr-<call_id>-escalate，与审批卡同一份")),
+            ("command", Status::BackendOnly("有意不展示：命令原文只进审计日志，避免 UI 回显长命令")),
+        ],
+    },
+    Rule {
+        owner: "EventMsg",
         variant: "PlanDelta",
         fields: "",
         overrides: &[("delta", Status::BackendOnly("协议占位：预期后端不产生，前端 default 分支忽略"))],
