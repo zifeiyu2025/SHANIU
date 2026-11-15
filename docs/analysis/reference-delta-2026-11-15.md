@@ -368,8 +368,8 @@ output: FunctionCallOutputPayload::from_text("aborted".to_string()),
 ### 6.1 「shell 写盘不计文件写」——维持
 
 - codex 的 `core/src/turn_diff_tracker.rs:1-20` 只跟踪 `apply_patch` 的 committed mutation，shell 写盘同样不计入 turn diff；dsh 没有回合末 `git status` 校验。
-- SHANIU 的写后验证闸门本身会跑 `git status`/测试（`align/permission-presets.md:330-370`），shell 写盘由闸门兜底，语义上仍能被发现。
-- **结论**：判断成立，继续不跟。但建议在使用指南里把「shell 写盘不在文件写计数内，但会被回合末 git 校验捕捉」写成一句话，避免被读成「shell 写盘不算改动」。
+- SHANIU 的写后验证闸门同样只吸收文件写工具：`DirtyTracker::mark`（`agent_loop/verify.rs:78-89`）只看 `FileWrite`，`select_commands`（`verify.rs:220-252`）按脏文件就近选 `cargo`/`python`/`go` 命令，**没有内置 `git status` 兜底**。需要覆盖 shell 写盘时，既有结论是接 Stop hook，而不是猜重定向（`align/permission-presets.md:353-359`）。
+- **结论**：判断成立，继续不跟；与上游同口径。但**不能**写成「会被回合末 git 校验捕捉」——本轮核对时发现原稿这句不成立，已按实际行为改写；使用指南只写「不计入文件写、不会自动触发写后验证；要覆盖就配 Stop hook」。
 
 ### 6.2 「否决额度只给一次」——维持，且上游更严格
 
