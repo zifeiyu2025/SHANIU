@@ -1,0 +1,30 @@
+   Compiling shaniu v0.2.9 (D:\MyWorkspace\SHANIU\src-tauri)
+    Finished `test` profile [unoptimized + debuginfo] target(s) in 23.60s
+     Running unittests src\lib.rs (target\debug\build\shaniu/2ffff59e992d02a6\out\shaniu_lib-2ffff59e992d02a6.exe)
+
+running 1 test
+test tools::apply_patch::tests::mismatch_detail_reports_disk_content_not_preview ... FAILED
+
+failures:
+
+---- tools::apply_patch::tests::mismatch_detail_reports_disk_content_not_preview stdout ----
+
+thread 'tools::apply_patch::tests::mismatch_detail_reports_disk_content_not_preview' (21048) panicked at src\tools\apply_patch.rs:1333:9:
+预演结果不得被当成文件实际内容回执：第 2 个 `@@` 块：上下文不匹配：未找到补丁期望的 2 行序列（已尝试：精确、剥离行号前缀、缩进弹性、空白折叠、首尾锚点）。
+期望匹配的 2 行（块内序号）：
+  块内 1| ZZ
+  块内 2| A9
+文件中最接近的位置：第 2 行起（整块相似度 75%，文件共 4 行）：
+  文件第 2| ZZ
+  文件第 3| A3
+首个不一致：块内第 2 行 vs 文件第 3 行；期望 `A9`，实际读到 `A3`
+请按上面「文件中最接近的位置」的真实内容重建补丁，不要原样重试
+note: run with `RUST_BACKTRACE=1` environment variable to display a backtrace
+
+
+failures:
+    tools::apply_patch::tests::mismatch_detail_reports_disk_content_not_preview
+
+test result: FAILED. 0 passed; 1 failed; 0 ignored; 0 measured; 1156 filtered out; finished in 0.00s
+
+error: test failed, to rerun pass `--lib`

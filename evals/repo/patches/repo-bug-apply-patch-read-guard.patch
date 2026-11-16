@@ -1,13 +1,17 @@
 diff --git a/src-tauri/src/tools/apply_patch.rs b/src-tauri/src/tools/apply_patch.rs
-index 66a38e1..fd6e267 100644
 --- a/src-tauri/src/tools/apply_patch.rs
 +++ b/src-tauri/src/tools/apply_patch.rs
-@@ -438,9 +438,7 @@ fn verify_read_state(
+@@ -737,14 +737,7 @@ fn verify_read_state(
      let Some(reads) = &ctx.reads else { return Ok(None) };
      let key = crate::tool_router::canonical_key(full);
      let Some(recorded) = reads.get(ctx.session_id.as_deref(), &key) else {
+-        // 禁止写成「未读取过」：登记表是**本任务**的，模型完全可能在上一个任务
+-        // 里读过这个文件，断言「没读过」就是在陈述一件我们并不知道的事（N9）。
+-        // 能确证的只有「本任务没有可用记录」，以及它带来的后果——内容可能已过期。
 -        return Err(ToolError::Execution(format!(
--            "write_file_not_read: 未读取过 {path} 就尝试修改。请先用 read_file 读取当前内容，再基于真实内容生成补丁"
+-            "write_file_not_read: {path} 在本任务内没有可用的读取记录（可能尚未读取，\
+-             或上次读取发生在本次修改之前、内容可能已过期）。\
+-             请先用 read_file 读取当前内容，再基于真实内容生成补丁"
 -        )));
 +        return Ok(None);
      };

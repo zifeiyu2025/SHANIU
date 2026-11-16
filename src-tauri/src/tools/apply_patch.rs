@@ -523,8 +523,13 @@ fn mismatch_detail(file: &[String], expected: &[String]) -> String {
 /// `from` 是本块的搜索起点（上一块的结束位置）；返回替换后的全文、命中级别，
 /// 以及新文本里的块结束位置（下一个块的搜索起点）。
 /// Keep 行一律取**文件原文**（保留原缩进/空白），只有 Add 行用补丁文本。
+///
+/// `disk_lines` 是**磁盘原文**（本次补丁尚未预演的那份）：失败回执里的「实际读到」
+/// 必须取自它。多块补丁的前几块是在内存里相继预演的，拿预演结果当「实际读到」，
+/// 报给模型的就是一份磁盘上不存在的文本（N8）。
 fn apply_hunk_seq(
     file_lines: &[String],
+    disk_lines: &[String],
     seq: &[HunkLine],
     from: usize,
 ) -> Result<(Vec<String>, MatchLevel, usize), String> {
@@ -541,14 +546,12 @@ fn apply_hunk_seq(
     let width = expected.len();
     let remaining = file_lines.len().saturating_sub(from);
     if remaining < width {
-        let where_ = if from == 0 {
-            format!("文件只有 {} 行", file_lines.len())
-        } else {
-            format!("文件从第 {} 行起只剩 {remaining} 行", from + 1)
-        };
+        // 行数按磁盘原文报：`file_lines` 可能已被前几块预演改短，说「从第 N 行起只剩
+        // M 行」会把预演结果当成文件事实。
+        let where_ = format!("磁盘文件共 {} 行", disk_lines.len());
         return Err(format!(
             "上下文不匹配：补丁期望 {width} 行上下文，{where_}，无法完整匹配。{}",
-            mismatch_detail(file_lines, &expected)
+            mismatch_detail(disk_lines, &expected)
         ));
     }
 
@@ -614,7 +617,7 @@ fn apply_hunk_seq(
             .map(|l| l.label())
             .collect::<Vec<_>>()
             .join("、"),
-            mismatch_detail(file_lines, &expected)
+            mismatch_detail(disk_lines, &expected)
         ));
     };
 
@@ -681,7 +684,7 @@ fn apply_hunks(
             };
             cursor = found + 1;
         }
-        let (replaced, matched, next) = apply_hunk_seq(&lines, &hunk.seq, cursor)
+        let (replaced, matched, next) = apply_hunk_seq(&lines, file_lines, &hunk.seq, cursor)
             .map_err(|e| format!("第 {} 个 `@@` 块：{e}", index + 1))?;
         if matched != MatchLevel::Exact {
             level = matched;
@@ -735,8 +738,13 @@ fn verify_read_state(
     let Some(reads) = &ctx.reads else { return Ok(None) };
     let key = crate::tool_router::canonical_key(full);
     let Some(recorded) = reads.get(ctx.session_id.as_deref(), &key) else {
+        // 禁止写成「未读取过」：登记表是**本任务**的，模型完全可能在上一个任务
+        // 里读过这个文件，断言「没读过」就是在陈述一件我们并不知道的事（N9）。
+        // 能确证的只有「本任务没有可用记录」，以及它带来的后果——内容可能已过期。
         return Err(ToolError::Execution(format!(
-            "write_file_not_read: 未读取过 {path} 就尝试修改。请先用 read_file 读取当前内容，再基于真实内容生成补丁"
+            "write_file_not_read: {path} 在本任务内没有可用的读取记录（可能尚未读取，\
+             或上次读取发生在本次修改之前、内容可能已过期）。\
+             请先用 read_file 读取当前内容，再基于真实内容生成补丁"
         )));
     };
     let meta = std::fs::metadata(full)
@@ -1294,10 +1302,42 @@ mod tests {
             HunkLine::Remove("d".into()),
             HunkLine::Remove("e".into()),
         ];
-        let message = apply_hunk_seq(&file, &seq, 0).unwrap_err();
-        assert!(message.contains("文件只有 3 行"), "{message}");
+        let message = apply_hunk_seq(&file, &file, &seq, 0).unwrap_err();
+        assert!(message.contains("磁盘文件共 3 行"), "{message}");
         assert!(message.contains("边界"), "{message}");
         assert!(message.contains("无法完整比对"), "{message}");
+    }
+
+    /// N8：多块补丁里前几块在内存中预演过，失败回执的「实际读到」必须取自**磁盘原文**。
+    ///
+    /// 反向对照：把 `apply_hunk_seq` 里两处 `mismatch_detail(disk_lines, …)` 改回
+    /// `mismatch_detail(file_lines, …)`，本用例立刻变红——回执会把预演后的 `ZZ`
+    /// 当成文件实际内容报回来（真机 N8 里报的是预演后的 A3，而磁盘仍是 A2）。
+    #[test]
+    fn mismatch_detail_reports_disk_content_not_preview() {
+        let file: Vec<String> = ["A1", "A2", "A3", "A4"].iter().map(|s| s.to_string()).collect();
+        let first = UpdateHunk {
+            anchor: None,
+            seq: vec![
+                HunkLine::Keep("A1".into()),
+                HunkLine::Remove("A2".into()),
+                HunkLine::Add("ZZ".into()),
+            ],
+        };
+        // 第二块以预演后的 `ZZ` 作为上下文：磁盘上并不存在，必须失败。
+        let second = UpdateHunk {
+            anchor: None,
+            seq: vec![HunkLine::Keep("ZZ".into()), HunkLine::Keep("A9".into())],
+        };
+        let error = apply_hunks(&file, &[first, second]).expect_err("第二块必须失败，且不做部分应用");
+        assert!(
+            !error.contains("文件第 2| ZZ"),
+            "预演结果不得被当成文件实际内容回执：{error}"
+        );
+        assert!(
+            error.contains("文件第 2| A2"),
+            "回执必须给出磁盘上的真实内容：{error}"
+        );
     }
 
     // ---------- SH-123 匹配级别：8 类样本 ----------
@@ -1503,6 +1543,18 @@ mod tests {
             .await
             .unwrap_err();
         assert!(err.to_string().contains("write_file_not_read"), "{err}");
+        // N9：登记表是本任务的，缺记录只说明「本任务没有可用读取」，不能断言
+        // 「未读取过」——模型可能在上一个任务里刚读过。反向对照：把文案改回
+        // 「未读取过 {path} 就尝试修改」，下面两条断言立刻变红。
+        let message = err.to_string();
+        assert!(
+            !message.contains("未读取过"),
+            "不得断言「没读过」：本任务没记录不等于从未读过——{message}"
+        );
+        assert!(
+            message.contains("上次读取发生在本次修改之前"),
+            "必须给出与判定一致的过期说法——{message}"
+        );
         assert_eq!(
             std::fs::read_to_string(ws.join("a.txt")).unwrap(),
             "line1\nline2\nline3\n"
