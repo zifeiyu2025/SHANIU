@@ -332,6 +332,8 @@ async fn cancellation_stops_within_half_second() {
                     shaniu_lib::events::TurnEndReason::Completed => "completed",
                     shaniu_lib::events::TurnEndReason::Failed => "failed",
                     shaniu_lib::events::TurnEndReason::BudgetExhausted => "budget_exhausted",
+                    shaniu_lib::events::TurnEndReason::Interrupted => "interrupted",
+                    shaniu_lib::events::TurnEndReason::MaxTokens => "max_tokens",
                 });
             }
             Ok(())

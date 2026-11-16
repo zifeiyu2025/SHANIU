@@ -94,6 +94,14 @@ impl ExitSummary {
             TurnEndReason::Failed | TurnEndReason::BudgetExhausted => {
                 (ExitStatus::Failed, "子代理失败，没有产出文本结果。")
             }
+            // D12：截断是「部分完成」，中断是「进程退出」，两者都不能算 Done，
+            // 否则父代理会把没做完的子任务当成已完成。
+            TurnEndReason::MaxTokens => {
+                (ExitStatus::Failed, "子代理输出达到上限被截断，结果不完整。")
+            }
+            TurnEndReason::Interrupted => {
+                (ExitStatus::Failed, "子代理所在进程在回合中途退出，没有回传结果。")
+            }
         };
         let summary = last_text
             .map(str::trim)

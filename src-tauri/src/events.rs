@@ -25,6 +25,16 @@ pub enum TurnEndReason {
     Cancelled,
     Failed,
     BudgetExhausted,
+    /// 回合被进程中断后由恢复流程补写（D12，`rollout::reconcile`）。
+    ///
+    /// 与 `Failed` 的区别：没有可证明的失败原因，只有「它没写完」；与「未知」的区别：
+    /// 这是有证据的结论（档案里出现过结局行，或退出流程留过 `AbortNote`），不是不知道。
+    Interrupted,
+    /// 输出达到上限被截断（D12）：已有内容已交付给用户，属于「部分完成」。
+    ///
+    /// 不写 `Failed` 是因为它没有失败——重发同样的请求大概率还是截断；不写 `Completed`
+    /// 是因为内容不完整。用户要看到「被截断」，而不是「失败」或「完成」。
+    MaxTokens,
 }
 
 impl TurnEndReason {
@@ -32,9 +42,19 @@ impl TurnEndReason {
     /// 无通配臂 match 保证新增变体而不更新此处时**编译失败**——模式清单与返回数组必须逐条一致。
     pub fn all_variants() -> &'static [Self] {
         match Self::Completed {
-            Self::Completed | Self::Cancelled | Self::Failed | Self::BudgetExhausted => {
-                &[Self::Completed, Self::Cancelled, Self::Failed, Self::BudgetExhausted]
-            }
+            Self::Completed
+            | Self::Cancelled
+            | Self::Failed
+            | Self::BudgetExhausted
+            | Self::Interrupted
+            | Self::MaxTokens => &[
+                Self::Completed,
+                Self::Cancelled,
+                Self::Failed,
+                Self::BudgetExhausted,
+                Self::Interrupted,
+                Self::MaxTokens,
+            ],
         }
     }
 }

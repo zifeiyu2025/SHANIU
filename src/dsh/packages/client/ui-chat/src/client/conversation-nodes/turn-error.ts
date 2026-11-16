@@ -32,7 +32,8 @@ function lastStep(context: ConversationNodeContext<TurnErrorState>): number {
 
 /**
  * Failure shown for a turn ending: a recorded error, a sign-out cancellation,
- * or a turn that restart recovery closed because the DSH process exited mid-turn.
+ * a turn that restart recovery closed because the process exited mid-turn, or
+ * a turn truncated at the output limit (a partial turn, not a failure).
  */
 function endFailure(reason: TurnEndReason): { readonly message: string; readonly code?: string; readonly detail?: string } | undefined {
   switch (reason.kind) {
@@ -44,12 +45,16 @@ function endFailure(reason: TurnEndReason): { readonly message: string; readonly
         ? { message: 'Stopped because you signed out of DeepSeek.', code: 'ACCOUNT_SIGNED_OUT' }
         : undefined
     case 'interrupted':
-      return { message: 'The DSH process exited before this turn finished.', code: 'INTERRUPTED' }
+      // SHANIU：宿主恢复对账补写的结论——进程在回合中途退出（有证据的没写完）。
+      return { message: '进程在这一轮结束前退出了，回答可能不完整。', code: 'INTERRUPTED' }
+    case 'max-tokens':
+      // SHANIU：截断不是失败，但也不能装作完整——明确说「被截断」，不说「失败」。
+      return { message: '输出达到上限，这条回答被截断（内容不完整）。', code: 'MAX_TOKENS' }
     case 'indeterminate':
       // SHANIU：档案没有收口记录，不知道这一轮是结束了还是还在跑。
       return { message: 'This turn has no recorded ending.', code: 'TURN_UNKNOWN' }
     default:
-      // Completed, blocked, max-tokens, forked, and plugin-merged endings have no failure row.
+      // Completed, blocked, forked, and plugin-merged endings have no failure row.
       return undefined
   }
 }

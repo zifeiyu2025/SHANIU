@@ -1,0 +1,36 @@
+   Compiling shaniu v0.2.8 (D:\MyWorkspace\SHANIU\src-tauri)
+error[E0599]: no variant, associated function, or constant named `MaxTokens` found for enum `events::TurnEndReason` in the current scope
+    --> src\agent_loop\mod.rs:5665:51
+     |
+5665 |         assert_eq!(summary.reason, TurnEndReason::MaxTokens, "截断必须有自己的结局");
+     |                                                   ^^^^^^^^^ variant, associated function, or constant not found in `events::TurnEndReason`
+     |
+    ::: src\events.rs:23:1
+     |
+  23 | pub enum TurnEndReason {
+     | ---------------------- variant, associated function, or constant `MaxTokens` not found for this enum
+
+error[E0599]: no variant, associated function, or constant named `MaxTokens` found for enum `events::TurnEndReason` in the current scope
+    --> src\agent_loop\mod.rs:5678:33
+     |
+5678 |             Some(TurnEndReason::MaxTokens),
+     |                                 ^^^^^^^^^ variant, associated function, or constant not found in `events::TurnEndReason`
+     |
+    ::: src\events.rs:23:1
+     |
+  23 | pub enum TurnEndReason {
+     | ---------------------- variant, associated function, or constant `MaxTokens` not found for this enum
+
+warning: variable does not need to be mutable
+   --> src\rollout\reconcile.rs:276:13
+    |
+276 |         let mut writer = RolloutWriter::open_existing(&path).unwrap();
+    |             ----^^^^^^
+    |             |
+    |             help: remove this `mut`
+    |
+    = note: `#[warn(unused_mut)]` (part of `#[warn(unused)]`) on by default
+
+For more information about this error, try `rustc --explain E0599`.
+warning: `shaniu` (lib test) generated 1 warning
+error: could not compile `shaniu` (lib test) due to 2 previous errors; 1 warning emitted

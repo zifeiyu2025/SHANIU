@@ -761,6 +761,12 @@ function archiveTurnReason(reason: string, error?: TurnErrorInfo): Record<string
       }
     case 'budget_exhausted':
       return { kind: 'error', error: { code: 'BUDGET_EXHAUSTED', message: '本轮已达到轮次上限' } }
+    case 'interrupted':
+      // D12：恢复对账补写的「回合被进程中断」——有证据的「没写完」，不是失败，也不是未知。
+      return { kind: 'interrupted' }
+    case 'max_tokens':
+      // D12：输出达到上限被截断——内容已交付、只是不完整。不能落进 error（那不是失败）。
+      return { kind: 'max-tokens' }
     case 'indeterminate':
       // 宿主恢复对账的诚实结论：回合结束了，但档案里没有可信结局。
       return { kind: 'indeterminate' }
@@ -2542,7 +2548,12 @@ export function createAdapter(options: AdapterOptions): { remote: unknown; dispo
         flushAllowlist(sessionId, journal)
         // 审计 A0：失败回合必须带上结构化原因（如 401 → AUTH）。导出的档案里
         // 由此能看出"为什么失败"；只有后端没给结构时，才退回最后兜底文案。
-        const failure = msg.reason === 'completed'
+        // D12：`max_tokens` / `interrupted` 不是失败，不能挂 `error` 形状（UI 会渲染成红色
+        // 失败行）。截断仍有结构化原因（INCOMPLETE），下面按 reason 决定要不要用它。
+        const notFailure = msg.reason === 'completed'
+          || msg.reason === 'max_tokens'
+          || msg.reason === 'interrupted'
+        const failure = notFailure
           ? undefined
           : msg.error === undefined
             ? { message: `回合以 ${msg.reason} 结束`, code: msg.reason }
@@ -2570,13 +2581,17 @@ export function createAdapter(options: AdapterOptions): { remote: unknown; dispo
             },
           }, { surfaceOp: 'append' })
         }
-        // cancelled 的半截正文是真实发生过的输出：落进档案，但打 interrupted，
+        // cancelled 的半截正文是真实发生过的输出：落进档案，但结局打 aborted，
         // 不能当成正常答完。
         closeTask(sessionId, journal, msg.reason === 'completed'
           ? { kind: 'completed' }
           : msg.reason === 'cancelled'
             ? { kind: 'aborted', reason: { kind: 'user' } }
-            : { kind: 'error', error: failure },
+            : msg.reason === 'max_tokens'
+              ? { kind: 'max-tokens' }
+              : msg.reason === 'interrupted'
+                ? { kind: 'interrupted' }
+                : { kind: 'error', error: failure },
         msg.reason === 'cancelled')
         if (laneId !== undefined) foldLaneTiming(laneId, 'turn/end', msg.reason)
         // 运行态必须收回：输入卡的 Stop 按钮由 `api-session/status` 决定（`running`

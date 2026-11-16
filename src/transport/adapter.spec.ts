@@ -2926,6 +2926,76 @@ describe('适配层的命令面映射', () => {
     expect((ends[0]!['data'] as { reason: { kind: string } }).reason.kind).toBe('indeterminate')
   })
 
+  it('D12：档案 reason=interrupted → 回放为 interrupted，不退化成 indeterminate', async () => {
+    // 宿主恢复对账补写的结论：进程在回合中途退出。它是有证据的结论，不是「未知」；
+    // 反过来把映射表漏掉这一档，用户只能看到「没有收口记录」。
+    const archive = [
+      { kind: 'message', role: 'user', text: '问' },
+      { kind: 'message', role: 'assistant', text: '答一半' },
+      { kind: 'turn_end', turn: 1, task_id: 'agent#1', reason: 'interrupted', at_ms: 1_700_000_000_500 },
+    ]
+    const reopened = createAdapter({ bridge: scriptedBridge(undefined, archive) })
+    const iterator = faceOf(reopened.remote).session.follow({ address: { kind: 'session', sessionId: 'agent-interrupted' } })
+    const events = eventsOf((await iterator.next()).value as Record<string, unknown>)
+    await iterator.return?.(undefined)
+    reopened.dispose()
+
+    const ends = events.filter(event => event['type'] === 'turn/end')
+    expect(ends).toHaveLength(1)
+    expect((ends[0]!['data'] as { reason: { kind: string } }).reason.kind).toBe('interrupted')
+  })
+
+  it('D12：reason=max_tokens 的回合在实时与重开都标「被截断」，不标失败', async () => {
+    // 实时：turn_completed{reason:'max_tokens'}；重开：turn_end{reason:'max_tokens'}。
+    // 两条路径同一口径；漏掉任一档都会退回「失败」或「没有收口记录」。
+    const bridge = scriptedBridge()
+    const adapter = createAdapter({ bridge })
+    const session = faceOf(adapter.remote).session
+    await session.prompt({ sessionId: 'agent-truncated', requestId: 'rpc-trunc', content: [{ type: 'text', text: '写长文' }] })
+    bridge.emit('agent-truncated', { type: 'turn_started', turn: 1 })
+    bridge.emit('agent-truncated', { type: 'agent_message_delta', delta: '写到一半' })
+    bridge.emit('agent-truncated', { type: 'turn_completed', turn: 1, reason: 'max_tokens' })
+    const liveIterator = session.follow({ address: { kind: 'session', sessionId: 'agent-truncated' } })
+    const liveEvents = eventsOf((await liveIterator.next()).value as Record<string, unknown>)
+    await liveIterator.return?.(undefined)
+    adapter.dispose()
+
+    const archive = [
+      { kind: 'message', role: 'user', text: '写长文' },
+      { kind: 'message', role: 'assistant', text: '写到一半' },
+      { kind: 'turn_end', turn: 1, task_id: 'agent#1', iterations: 1, reason: 'max_tokens', at_ms: 1_700_000_000_600 },
+    ]
+    const reopened = createAdapter({ bridge: scriptedBridge(undefined, archive) })
+    const replayIterator = faceOf(reopened.remote).session.follow({ address: { kind: 'session', sessionId: 'agent-truncated' } })
+    const replayEvents = eventsOf((await replayIterator.next()).value as Record<string, unknown>)
+    await replayIterator.return?.(undefined)
+    reopened.dispose()
+
+    const endKinds = (events: Record<string, unknown>[]): string[] =>
+      events
+        .filter(event => event['type'] === 'turn/end')
+        .map(event => (event['data'] as { reason: { kind: string } }).reason.kind)
+    expect(endKinds(liveEvents)).toEqual(['max-tokens'])
+    expect(endKinds(replayEvents)).toEqual(['max-tokens'])
+
+    // 导出：同一条结局行必须原样带出档案码 `max_tokens`（导出侧历来是档案原码，
+    // 不翻译成 UI 的 kind），不许压成 completed / failed。
+    const exportEndReasons = (events: Record<string, unknown>[]): unknown[] =>
+      events
+        .filter(event => event['type'] === 'turn/end')
+        .map(event => (event['data'] as { reason: unknown }).reason)
+    const exported = sessionEntriesToEvents(archive as unknown as never[], '写长文')
+    expect(exportEndReasons(exported as unknown as Record<string, unknown>[])).toEqual(['max_tokens'])
+    const interruptedExport = sessionEntriesToEvents(
+      [
+        { kind: 'message', role: 'user', text: '问' },
+        { kind: 'turn_end', turn: 1, task_id: 'agent#1', reason: 'interrupted', at_ms: 1_700_000_000_700 },
+      ] as unknown as never[],
+      '问',
+    )
+    expect(exportEndReasons(interruptedExport as unknown as Record<string, unknown>[])).toEqual(['interrupted'])
+  })
+
   it('已收口回合 + 进程被杀 + 重启重建：仍是 completed、单条结束、轮次不变', async () => {
     // 真机档案 sess-1794648331061-0001 的投影形状：环境快照 system 消息 → 用户消息 →
     // 助手回复 → 结局行。强杀进程后重启，宿主确认该会话没有任务在跑。

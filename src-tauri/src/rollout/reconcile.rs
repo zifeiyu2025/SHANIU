@@ -1,21 +1,48 @@
 //! 宿主恢复对账（状态源收敛 Phase 3）。
 //!
 //! 「回合已经结束」与「回合的结局是什么」是两件事：宿主确认本会话没有任务在跑，
-//! 只证明了前者；档案里没有 `TurnEnd` 时，结论只能是「结束原因未知」。
-//! 这里把那句诚实的结论补进档案一次（`reason = "indeterminate"`），前端据此收口，
-//! 不再自己往档案里写结局。
+//! 只证明了前者。这里把「结束」这个事实补进档案**一次**，前端据此收口，不再自己往
+//! 档案里写结局。
+//!
+//! 结局只写两种（D12）：
+//! - `interrupted`：有中断证据——档案里出现过 `TurnEnd`（写者会为每条终止路径写结局），
+//!   或最后一条提问之后有 `AbortNote`（退出流程记下了强制中止）；
+//! - `indeterminate`：没有证据（旧档根本没有结局行 / 新档首回合被杀，分不清）——
+//!   这是「未知」，不是成功，也不是失败。
 //!
 //! 幂等由 [`RolloutWriter::append_once`] 的档案写锁保证：重开重建与 60s 兜底并发到达时，
 //! 只有一个能看见「没有结局」，另一个在锁内重读后返回已有结论，档案里只留一条。
 
 use std::path::Path;
 
-use super::{conclude_turn, RolloutError, RolloutItem, RolloutWriter, TurnConclusion};
+use super::{
+    conclude_turn, counts_as_user_turn, RolloutError, RolloutItem, RolloutWriter, TurnConclusion,
+};
+
+/// 补写的结局该写「被中断」还是「未知」——只认证据，不猜。
+///
+/// 1. 档案里已经出现过 `TurnEnd`：写者会为每条终止路径（完成/取消/失败/预算）写结局，
+///    最后一条提问却没有结论，只可能是写它的进程在回合中途退出；
+/// 2. 最后一条提问之后有 `AbortNote`：退出流程自己记下了「取消等待超时仍要退出」。
+///
+/// 两条都不成立时保持 `indeterminate`：旧档（本功能上线前）根本没有结局行，新档首回合
+/// 被杀也长这样，两者分不清——分不清就不许替用户下结论（「未知」是一等状态）。
+fn interruption_evidence(items: &[RolloutItem]) -> bool {
+    if items.iter().any(|item| matches!(item, RolloutItem::TurnEnd { .. })) {
+        return true;
+    }
+    match items.iter().rposition(counts_as_user_turn) {
+        Some(last_user) => items[last_user..]
+            .iter()
+            .any(|item| matches!(item, RolloutItem::AbortNote { .. })),
+        None => false,
+    }
+}
 
 /// 对账结果分类（日志与前端只读它决定要不要收口，不参与语义推断）。
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ReconcileStatus {
-    /// 本次补写了一条「结束原因未知」的结论。
+    /// 本次补写了一条结论（`interrupted` 或 `indeterminate`，见模块文档）。
     Appended,
     /// 已经有结论（新档或旧档），没有写任何东西。
     AlreadyConcluded,
@@ -77,7 +104,8 @@ fn outcome(status: ReconcileStatus, entry: Option<ConcludedTurn>) -> ReconcileOu
     ReconcileOutcome { status, entry }
 }
 
-/// 对账一次：宿主空闲且档案里最后一个用户回合没有结论时，补一条 `indeterminate`。
+/// 对账一次：宿主空闲且档案里最后一个用户回合没有结论时，补一条 `interrupted`
+/// （有中断证据）或 `indeterminate`（无证据）。
 ///
 /// `running` 由调用方从宿主的活动任务槽取（唯一运行态口径），这里不自行推断。
 pub fn reconcile_once(
@@ -107,7 +135,9 @@ pub fn reconcile_once(
     let appended = writer.append_once(|items| {
         // 判定与编号与 agent_loop 收口共用同一份口径（`conclude_turn`）：
         // 最后一条提问已经有结局时返回 None，档案里只留一条结论。
-        let mut decided = conclude_turn(items, &agent_id, "indeterminate", None, None, at_ms);
+        // D12：有中断证据就写 `interrupted`，没有证据才退回 `indeterminate`。
+        let reason = if interruption_evidence(items) { "interrupted" } else { "indeterminate" };
+        let mut decided = conclude_turn(items, &agent_id, reason, None, None, at_ms);
         let item = decided.item.take();
         conclusion = Some(decided);
         item
@@ -228,6 +258,63 @@ mod tests {
         let ends = turn_ends(&path);
         assert_eq!(ends.len(), 1, "幂等：档案里只能有一条结论，实际 {ends:?}");
         assert_eq!(ends[0].at_ms, 42, "已有结论不能被第二次调用的时刻覆盖");
+    }
+
+    /// D12：崩溃中断必须有自己的结局，不能一律 `indeterminate`。
+    ///
+    /// 证据：档案里已经出现过 `TurnEnd`——写者会为每条终止路径（完成/取消/失败/预算）
+    /// 写结局；最后一条提问却没有结局，只可能是写它的进程在回合中途退出。
+    /// 步数仍然未知，所以 `iterations` 必须是 `None`，不能拿「助手消息条数」去编。
+    ///
+    /// 反向对照：把补写理由改回固定 `indeterminate`，本用例必红。
+    #[test]
+    fn reconcile_marks_crash_orphan_as_interrupted_when_writer_is_known() {
+        let dir = temp_dir("interrupted");
+        let writer = RolloutWriter::create(&dir.0, &meta("agent")).unwrap();
+        writer.append(&user("第一问")).unwrap();
+        writer.append(&assistant("答完")).unwrap();
+        writer
+            .append(&RolloutItem::TurnEnd {
+                turn: 1,
+                task_id: Some("agent#1".into()),
+                iterations: Some(1),
+                reason: "completed".into(),
+                at_ms: 3,
+                error: None,
+            })
+            .unwrap();
+        writer.append(&user("第二问")).unwrap();
+        writer.append(&assistant("写一半")).unwrap();
+        let path = writer.path().to_path_buf();
+        drop(writer);
+
+        let result = reconcile_once(&path, false, 99).unwrap();
+        assert_eq!(result.status, ReconcileStatus::Appended);
+        let entry = result.entry.expect("补写必须带回结论行");
+        assert_eq!(entry.turn, 2, "回合号是用户回合，不是采样步数");
+        assert_eq!(entry.reason, "interrupted", "有证据时不许退回 indeterminate");
+        assert_eq!(entry.iterations, None, "中断时不知道跑了几步，不许编");
+        assert_eq!(turn_ends(&path).len(), 2, "前一条结论不能被覆盖");
+    }
+
+    /// 强制中止留痕本身就是证据：退出流程已经写下「取消等待超时仍要退出」。
+    /// 这一条覆盖「旧档没有 TurnEnd」也能判 interrupted 的情形。
+    #[test]
+    fn abort_note_is_evidence_of_interruption() {
+        let dir = temp_dir("abort-note");
+        let path = seed(&dir, "agent-abort", false);
+        let writer = RolloutWriter::open_existing(&path).unwrap();
+        writer
+            .append(&RolloutItem::AbortNote {
+                reason: "因退出而强制中止：取消等待超时".into(),
+                at_ms: 9,
+            })
+            .unwrap();
+        drop(writer);
+
+        let result = reconcile_once(&path, false, 99).unwrap();
+        assert_eq!(result.status, ReconcileStatus::Appended);
+        assert_eq!(result.entry.expect("补写必须带回结论行").reason, "interrupted");
     }
 
     #[test]

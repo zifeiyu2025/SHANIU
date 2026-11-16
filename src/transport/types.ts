@@ -1,6 +1,18 @@
 import type { SessionImageRefWire } from './image-ref'
 
-export type TurnEndReason = 'completed' | 'cancelled' | 'failed' | 'budget_exhausted';
+/**
+ * 回合结局码（与 `events.rs` 的 `TurnEndReason` 逐字对齐，`tests/event_schema.rs` 会比对）。
+ *
+ * - `interrupted`：进程在回合中途退出，由恢复对账补写（D12）——有证据的「没写完」，不是失败；
+ * - `max_tokens`：输出达到上限被截断（D12）——已有内容已交付，属于「部分完成」，不是失败。
+ */
+export type TurnEndReason =
+  | 'completed'
+  | 'cancelled'
+  | 'failed'
+  | 'budget_exhausted'
+  | 'interrupted'
+  | 'max_tokens';
 export type IoChannel = 'stdout' | 'stderr';
 export type RiskLevel = 'read' | 'write_in_workspace' | 'execute' | 'destructive' | 'plan_review';
 export type ApprovalDecision = 'allow' | 'deny' | 'allow_always';

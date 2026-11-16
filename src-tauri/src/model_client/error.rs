@@ -40,6 +40,17 @@ pub enum ModelErrorKind {
     Unknown,
 }
 
+/// 端点给的 `incomplete` 原因是不是「输出达到上限」。
+///
+/// 各家的写法不同（OpenAI `length` / Responses `max_output_tokens` / 其它
+/// `max_tokens` 变体），但都是同一件事：没写完是因为写不下，不是失败。
+/// **判据只此一处**：`ModelError::incomplete` 的人话与 `is_max_tokens()` 必须同源，
+/// 否则会出现「界面说截断、结局说失败」这种自相矛盾。
+fn is_truncation_reason(reason: &str) -> bool {
+    let lowered = reason.to_ascii_lowercase();
+    (lowered.contains("max") && lowered.contains("token")) || lowered == "length"
+}
+
 /// 一次模型端点失败的完整描述。
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ModelError {
@@ -224,7 +235,7 @@ impl ModelError {
     /// 端点明确表示回答未完成（`response.incomplete`）→ 带出可判定的原因。
     pub fn incomplete(reason: &str) -> Self {
         let lowered = reason.to_ascii_lowercase();
-        let human = if (lowered.contains("max") && lowered.contains("token")) || lowered == "length" {
+        let human = if is_truncation_reason(reason) {
             format!("达到最大输出长度，回答被截断（{reason}）")
         } else if lowered.contains("content") && lowered.contains("filter") {
             format!("回答被内容安全策略过滤（{reason}）")
@@ -238,6 +249,14 @@ impl ModelError {
             Some(sanitize(reason)),
             human,
         )
+    }
+
+    /// 是不是「输出达到上限被截断」——决定回合结局写 `max_tokens` 还是 `failed`（D12）。
+    ///
+    /// 只认 `Incomplete` 里的截断原因；内容过滤等其它 `Incomplete` 仍是失败。
+    pub fn is_max_tokens(&self) -> bool {
+        self.kind == ModelErrorKind::Incomplete
+            && self.provider_code.as_deref().is_some_and(is_truncation_reason)
     }
 
     /// 构造 HTTP 客户端失败（配置问题，不是网络问题）。

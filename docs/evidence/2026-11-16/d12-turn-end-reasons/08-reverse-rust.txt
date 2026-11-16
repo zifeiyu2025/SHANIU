@@ -1,0 +1,67 @@
+   Compiling shaniu v0.2.8 (D:\MyWorkspace\SHANIU\src-tauri)
+warning: unused import: `counts_as_user_turn`
+  --> src\rollout\reconcile.rs:19:20
+   |
+19 |     conclude_turn, counts_as_user_turn, RolloutError, RolloutItem, RolloutWriter, TurnConclusion,
+   |                    ^^^^^^^^^^^^^^^^^^^
+   |
+   = note: `#[warn(unused_imports)]` (part of `#[warn(unused)]`) on by default
+
+warning: variant `MaxTokens` is never constructed
+    --> src\agent_loop\mod.rs:3067:5
+     |
+3061 | enum TurnEndReasonLocal {
+     |      ------------------ variant in this enum
+...
+3067 |     MaxTokens,
+     |     ^^^^^^^^^
+     |
+     = note: `TurnEndReasonLocal` has derived impls for the traits `Clone` and `Debug`, but these are intentionally ignored during dead code analysis
+     = note: `#[warn(dead_code)]` (part of `#[warn(unused)]`) on by default
+
+warning: `shaniu` (lib test) generated 2 warnings (run `cargo fix --lib -p shaniu --tests` to apply 1 suggestion)
+    Finished `test` profile [unoptimized + debuginfo] target(s) in 24.18s
+     Running unittests src\lib.rs (target\debug\build\shaniu/3347eb12c1517f2a\out\shaniu_lib-3347eb12c1517f2a.exe)
+
+running 7 tests
+test rollout::reconcile::tests::reconcile_skips_running_absent_and_empty ... ok
+test rollout::reconcile::tests::reconcile_marks_crash_orphan_as_interrupted_when_writer_is_known ... FAILED
+test rollout::reconcile::tests::abort_note_is_evidence_of_interruption ... FAILED
+test rollout::reconcile::tests::reconcile_appends_indeterminate_exactly_once ... ok
+test rollout::reconcile::tests::legacy_ending_counts_as_concluded_without_new_line ... ok
+test rollout::reconcile::tests::concurrent_reconcile_appends_exactly_once ... ok
+test agent_loop::tests::max_tokens_truncation_is_a_partial_turn_not_failure ... FAILED
+
+failures:
+
+---- rollout::reconcile::tests::reconcile_marks_crash_orphan_as_interrupted_when_writer_is_known stdout ----
+
+thread 'rollout::reconcile::tests::reconcile_marks_crash_orphan_as_interrupted_when_writer_is_known' (7032) panicked at src\rollout\reconcile.rs:289:9:
+assertion `left == right` failed: 有证据时不许退回 indeterminate
+  left: "indeterminate"
+ right: "interrupted"
+note: run with `RUST_BACKTRACE=1` environment variable to display a backtrace
+
+---- rollout::reconcile::tests::abort_note_is_evidence_of_interruption stdout ----
+
+thread 'rollout::reconcile::tests::abort_note_is_evidence_of_interruption' (11336) panicked at src\rollout\reconcile.rs:311:9:
+assertion `left == right` failed
+  left: "indeterminate"
+ right: "interrupted"
+
+---- agent_loop::tests::max_tokens_truncation_is_a_partial_turn_not_failure stdout ----
+
+thread 'agent_loop::tests::max_tokens_truncation_is_a_partial_turn_not_failure' (5492) panicked at src\agent_loop\mod.rs:5666:9:
+assertion `left == right` failed: 截断必须有自己的结局
+  left: Failed
+ right: MaxTokens
+
+
+failures:
+    agent_loop::tests::max_tokens_truncation_is_a_partial_turn_not_failure
+    rollout::reconcile::tests::abort_note_is_evidence_of_interruption
+    rollout::reconcile::tests::reconcile_marks_crash_orphan_as_interrupted_when_writer_is_known
+
+test result: FAILED. 4 passed; 3 failed; 0 ignored; 0 measured; 1128 filtered out; finished in 0.24s
+
+error: test failed, to rerun pass `--lib`

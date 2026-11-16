@@ -1642,14 +1642,22 @@ impl AgentLoop {
                         break 'outer;
                     }
                     RetryOutcome::GiveUp(final_error) => {
+                        let mut info: crate::events::TurnErrorInfo = (&final_error).into();
+                        info.attempts = Some(retries);
+                        if final_error.is_max_tokens() {
+                            // D12：截断不是失败。内容已经流给用户了，只是不完整——发 Error
+                            // 会让用户以为整段丢了，结局写 Failed 会让导出/统计把它算进失败率。
+                            // 结构化原因（INCOMPLETE）仍留在结局里，事后能区分截断与过滤器。
+                            turn_error = Some(info);
+                            reason = TurnEndReasonLocal::MaxTokens;
+                            break 'outer;
+                        }
                         // 失败必须留下能自修的信息（A0）：一句人话进 Error，结构化字段进 TurnCompleted。
                         let shown = final_error
                             .provider_message
                             .clone()
                             .unwrap_or_else(|| final_error.human.clone());
                         emit(&sink, EventMsg::Error { message: shown });
-                        let mut info: crate::events::TurnErrorInfo = (&final_error).into();
-                        info.attempts = Some(retries);
                         turn_error = Some(info);
                         reason = TurnEndReasonLocal::Failed;
                         break 'outer;
@@ -2796,6 +2804,7 @@ impl AgentLoop {
             TurnEndReasonLocal::Cancelled => "cancelled",
             TurnEndReasonLocal::Failed => "failed",
             TurnEndReasonLocal::BudgetExhausted => "budget_exhausted",
+            TurnEndReasonLocal::MaxTokens => "max_tokens",
         };
         if let Some(writer) = rollout.as_ref() {
             // 收口补记：取消/模型失败路径按设计不跑验证（用户喊停时再起编译是错的），
@@ -2841,12 +2850,8 @@ impl AgentLoop {
 
         emit(&sink, EventMsg::TurnCompleted {
             turn: last_turn,
-            reason: match reason {
-                TurnEndReasonLocal::Completed => crate::events::TurnEndReason::Completed,
-                TurnEndReasonLocal::Cancelled => crate::events::TurnEndReason::Cancelled,
-                TurnEndReasonLocal::Failed => crate::events::TurnEndReason::Failed,
-                TurnEndReasonLocal::BudgetExhausted => crate::events::TurnEndReason::BudgetExhausted,
-            },
+            // 口径映射只保留一处（`From<TurnEndReasonLocal>`），避免新增结局时两处漏改。
+            reason: reason.into(),
             error: turn_error,
             // 有源码写入、但到结束都没拿到「通过」裁决：如实标记，不假装验证过。
             // 收口复查已跑过但仍被判不出来（Skipped/Inconclusive）或 warn 模式时，
@@ -3065,6 +3070,8 @@ enum TurnEndReasonLocal {
     Cancelled,
     Failed,
     BudgetExhausted,
+    /// D12：输出达到上限被截断——「部分完成」，不是失败。
+    MaxTokens,
 }
 
 impl From<TurnEndReasonLocal> for crate::events::TurnEndReason {
@@ -3074,6 +3081,7 @@ impl From<TurnEndReasonLocal> for crate::events::TurnEndReason {
             TurnEndReasonLocal::Cancelled => Self::Cancelled,
             TurnEndReasonLocal::Failed => Self::Failed,
             TurnEndReasonLocal::BudgetExhausted => Self::BudgetExhausted,
+            TurnEndReasonLocal::MaxTokens => Self::MaxTokens,
         }
     }
 }
@@ -5627,6 +5635,75 @@ mod tests {
                 assert_eq!(task_id.as_deref(), Some("agent#1"));
                 assert_eq!(iterations, Some(2), "采样迭代数只能出现在 iterations");
                 assert_eq!(reason, "completed");
+            }
+            other => panic!("档案最后一行必须是回合结局，实际为 {other:?}"),
+        }
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// D12：输出上限截断是「部分完成」，不是失败。
+    ///
+    /// 用户看到的是「一半的回答 + 红色失败」，会以为整段丢了；档案里也只剩 `failed`，
+    /// 事后无法区分「端点 500」与「只是写不下了」。截断必须有自己的结局，且不得冒充错误。
+    ///
+    /// 反向对照：把 `GiveUp` 分支无条件写回 `Failed`，事件与档案两条断言必红。
+    #[tokio::test]
+    async fn max_tokens_truncation_is_a_partial_turn_not_failure() {
+        let dir = std::env::temp_dir().join(format!("shaniu-d12-maxtokens-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let meta = crate::rollout::RolloutItem::SessionMeta {
+            session_id: "session".into(),
+            agent_id: "agent".into(),
+            parent_id: None,
+            created_at: 0,
+            config_snapshot: crate::rollout::ConfigSnapshot::default(),
+        };
+        let writer = Arc::new(crate::rollout::RolloutWriter::create(&dir, &meta).unwrap());
+        let (mut agent, store, cancel, _broker) = make_loop(vec![vec![
+            ModelStreamEvent::OutputTextDelta { delta: "写到一半".into() },
+            ModelStreamEvent::Incomplete { reason: "max_output_tokens".into() },
+        ]]);
+        agent.rollout = Some(writer.clone());
+        let events = store.clone();
+
+        let summary = agent
+            .run_task("写一段长回答", Arc::new(CapturingSink(store)), cancel)
+            .await;
+        assert_eq!(summary.reason, TurnEndReason::MaxTokens, "截断必须有自己的结局");
+
+        let events = events.lock().unwrap();
+        assert!(
+            !events.iter().any(|event| matches!(event, EventMsg::Error { .. })),
+            "截断不是错误：发 Error 会让用户以为整段丢了"
+        );
+        let completed = events.iter().find_map(|event| match event {
+            EventMsg::TurnCompleted { reason, error, .. } => Some((*reason, error.clone())),
+            _ => None,
+        });
+        assert_eq!(
+            completed.as_ref().map(|(reason, _)| *reason),
+            Some(TurnEndReason::MaxTokens),
+            "事件面结局必须是 max_tokens"
+        );
+        let error = completed.and_then(|(_, error)| error);
+        assert_eq!(
+            error.as_ref().map(|info| info.code.as_str()),
+            Some("INCOMPLETE"),
+            "结构化原因仍要留痕：截断 != 无原因"
+        );
+        drop(events);
+
+        let text = std::fs::read_to_string(writer.path()).unwrap();
+        let last = text.lines().rev().find(|line| !line.trim().is_empty()).unwrap();
+        match serde_json::from_str::<crate::rollout::RolloutItem>(last).unwrap() {
+            crate::rollout::RolloutItem::TurnEnd { reason, error, .. } => {
+                assert_eq!(reason, "max_tokens", "档案与事件面同一码");
+                assert_eq!(
+                    error.map(|info| info.code),
+                    Some("INCOMPLETE".to_string()),
+                    "档案里仍能看出为什么截断"
+                );
             }
             other => panic!("档案最后一行必须是回合结局，实际为 {other:?}"),
         }
