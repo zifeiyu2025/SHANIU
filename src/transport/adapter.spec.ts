@@ -2695,6 +2695,57 @@ describe('适配层的命令面映射', () => {
     dispose()
   })
 
+  it('重开旧会话：被拒/越界的工具卡还原成错误态，展开正文不丢', async () => {
+    // 真机冒烟 2026-11-17 N6：档案只有输出文本（没有 isError 位）。只看 `[exit code: N]`
+    // 会把「用户拒绝」「路径越界」读成成功，卡片折叠态仍是正常样式（`data-state="ok"`），
+    // 只剩「编辑」/「工具调用」一行，看不出这次调用已经被拒。
+    const archive = [
+      { kind: 'message', role: 'user', text: '写工作区外的文件' },
+      {
+        kind: 'tool_call',
+        call_id: 'deny-user',
+        tool: 'unified_exec',
+        arguments: '{"cmd":"pwd"}',
+        output: '拒绝说明：type=user_denied；工具=unified_exec；范围 approval=on_request sandbox=workspace_write\n'
+          + '用户拒绝了这次调用，这条不会被自动放行。\n可行做法：换一种做法，或先向用户说明原因再请求同意。',
+      },
+      {
+        kind: 'tool_call',
+        call_id: 'deny-outside',
+        tool: 'apply_patch',
+        arguments: '{}',
+        output: '第 1 段（Add File: D:/tmp/outside/x.txt，补丁第 2–3 行）：'
+          + '路径越界（工作区之外）: D:/tmp/outside/x.txt',
+      },
+      { kind: 'tool_call', call_id: 'ok-read', tool: 'read_file', arguments: '{}', output: '内容' },
+      {
+        kind: 'tool_call',
+        call_id: 'ok-source',
+        tool: 'read_file',
+        arguments: '{}',
+        // 标记出现在普通文本中间（读宿主源码本身），不能被当成一次拒绝。
+        output: 'pub const OUTSIDE_WORKSPACE_MARKER: &str = "路径越界（工作区之外）: ";',
+      },
+    ]
+    const bridge = scriptedBridge(undefined, archive)
+    const { remote, dispose } = createAdapter({ bridge })
+    const iterator = faceOf(remote).session.follow({ address: { kind: 'session', sessionId: 'agent-denied' } })
+    const snapshot = (await iterator.next()).value as Record<string, unknown>
+    const journal = eventsOf(snapshot)
+    journal.forEach(event => expect(() => assertSessionWireEvent(event)).not.toThrow())
+
+    const results = journal.filter(event => event['type'] === 'tool/result')
+      .map(event => event['data'] as { message: { isError: boolean; content: { type: string; text: string }[] } })
+      .map(data => data.message)
+    expect(results.map(message => message.isError)).toEqual([true, true, false, false])
+    // 展开后的正文仍是档案原文（不因为标了错误就吞掉拒绝说明）。
+    expect(results[0]?.content[0]?.text).toContain('type=user_denied')
+    expect(results[1]?.content[0]?.text).toContain('路径越界（工作区之外）')
+
+    await iterator.return?.(undefined)
+    dispose()
+  })
+
   it('没有观察过的会话档案也为空时交空快照，不挂起', async () => {
     const bridge = scriptedBridge(undefined, [])
     const { remote, dispose } = createAdapter({ bridge })

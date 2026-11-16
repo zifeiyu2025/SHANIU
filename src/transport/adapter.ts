@@ -778,6 +778,46 @@ function archiveTurnReason(reason: string, error?: TurnErrorInfo): Record<string
   }
 }
 
+/**
+ * 档案只有工具输出文本（没有 isError 位）。被拒 / 越界的调用由宿主把拒绝说明写进输出，
+ * 前缀稳定：审批门拒绝统一是 `拒绝说明：type=…`（`src-tauri/src/permission/mod.rs`），
+ * 写边界拒绝是 `路径越界（…）: `（`src-tauri/src/tool_router/mod.rs` 的
+ * `OUTSIDE_WORKSPACE_MARKER` / `PARENT_DIR_MARKER`）。
+ *
+ * 只认「行首」出现的说明：这些标记也可能作为普通文本被读进工具输出（例如读
+ * `tool_router/mod.rs` 本身），按「包含」判定会把成功的读取误标成失败。
+ * apply_patch 的写边界错误会再套一层段前缀（`第 1 段（…）：路径越界（…）: …`），
+ * 所以再放行一种「行首是段前缀 + 标记」的形状。
+ *
+ * 不这样还原的话，重开的会话里这两类卡会被当成成功（`data-state="ok"`），
+ * 折叠态只剩「编辑」/「工具调用」，看不出调用已经被拒（真机冒烟 2026-11-17 N6）。
+ */
+const DENIED_LINE_PREFIXES: readonly string[] = [
+  '拒绝说明：type=',
+  '路径越界（工作区之外）: ',
+  '路径越界（包含 ..）: ',
+]
+
+/**
+ * 单行是否是拒绝说明：允许 apply_patch 的段前缀（`第 N 段（…）：`）后再接标记。
+ * @param line - 输出的一行。
+ * @returns true 表示这一行说明调用被拒/越界。
+ */
+function isDeniedLine(line: string): boolean {
+  const section = line.startsWith('第 ') ? line.indexOf('）：') : -1
+  const body = section === -1 ? line : line.slice(section + 2)
+  return DENIED_LINE_PREFIXES.some(marker => body.startsWith(marker))
+}
+
+/**
+ * 档案输出是否是一份拒绝说明（被拒/越界）。
+ * @param output - 档案里该工具调用的输出文本。
+ * @returns true 表示这次调用没有执行，应还原成错误态。
+ */
+function isDeniedOutput(output: string): boolean {
+  return output.split('\n').some(isDeniedLine)
+}
+
 function newJournal(createdAt: number): Journal {
   journalSerial += 1
   return {
@@ -2174,7 +2214,10 @@ export function createAdapter(options: AdapterOptions): { remote: unknown; dispo
           const exited = entry.output !== undefined
             ? /\[exit code: (-?\d+)\]\s*$/.exec(entry.output)?.[1]
             : undefined
-          const failed = entry.output === undefined || (exited !== undefined && exited !== '0')
+          // 拒绝说明没有退出码：只看 `[exit code: N]` 会把被拒/越界的调用读成成功，
+          // 折叠态的卡片于是仍是「编辑」/「工具调用」的正常样式（真机 N6）。
+          const denied = entry.output !== undefined && isDeniedOutput(entry.output)
+          const failed = entry.output === undefined || (exited !== undefined && exited !== '0') || denied
           pushEvent(journal, 'tool/result', {
             turn: journal.turn,
             step: journal.step,
