@@ -1,0 +1,127 @@
+{
+  "runId": "1794735754077-13808",
+  "args": {
+    "arm": "zcode",
+    "tasks": [
+      "repo-doc-max-turns-drift",
+      "repo-bug-compaction-tail",
+      "repo-refactor-rename-title-api"
+    ],
+    "repeats": 1,
+    "model": "deepseek-flash",
+    "out": "evals/results-compare/phase1-zcode",
+    "prepareOnly": false,
+    "protocol": "",
+    "expectTree": {}
+  },
+  "records": [
+    {
+      "arm": "zcode",
+      "task": "repo-bug-compaction-tail",
+      "run": 1,
+      "model": "deepseek-flash",
+      "protocol": "responses",
+      "status": "PASS",
+      "precondition_red": true,
+      "judge_pass": true,
+      "tampered": false,
+      "timed_out": false,
+      "agent_ms": 135469,
+      "judge_ms": 73249,
+      "wall_ms": 208718,
+      "diff": {
+        "files": 1,
+        "added": 1,
+        "deleted": 1,
+        "untracked": 0,
+        "untracked_files": [],
+        "forbid_hit": false,
+        "summary": "src-tauri/src/compaction/mod.rs +1/-1"
+      },
+      "usage": {
+        "input_total": 989113,
+        "cached": 481792,
+        "output": 5466,
+        "turns": 14,
+        "source": "zcode.result"
+      },
+      "tree": "7a9df680d3242901c39869a8abec3a93e9eb86c0cbeffad5a96379b4fea8915a",
+      "precondition_detail": "REPO-CHECK: FAIL cargo 失败: --lib compaction::",
+      "exit_code": 0,
+      "judge_detail": "REPO-CHECK: PASS",
+      "judge_copy_ms": 10076
+    },
+    {
+      "arm": "zcode",
+      "task": "repo-refactor-rename-title-api",
+      "run": 1,
+      "model": "deepseek-flash",
+      "protocol": "responses",
+      "status": "PASS",
+      "precondition_red": true,
+      "judge_pass": true,
+      "tampered": false,
+      "timed_out": false,
+      "agent_ms": 106578,
+      "judge_ms": 74867,
+      "wall_ms": 181445,
+      "diff": {
+        "files": 1,
+        "added": 8,
+        "deleted": 8,
+        "untracked": 0,
+        "untracked_files": [],
+        "forbid_hit": false,
+        "summary": "src-tauri/src/session_title.rs +8/-8"
+      },
+      "usage": {
+        "input_total": 426646,
+        "cached": 203136,
+        "output": 2070,
+        "turns": 7,
+        "source": "zcode.result"
+      },
+      "tree": "8a1bd7529a782dc769bbee1c168eed083f2347af673e821b42d6e95a50f44949",
+      "precondition_detail": "REPO-CHECK: FAIL cargo 失败: --lib session_title",
+      "exit_code": 0,
+      "judge_detail": "REPO-CHECK: PASS",
+      "judge_copy_ms": 10287
+    },
+    {
+      "arm": "zcode",
+      "task": "repo-doc-max-turns-drift",
+      "run": 1,
+      "model": "deepseek-flash",
+      "protocol": "responses",
+      "status": "PASS",
+      "precondition_red": true,
+      "judge_pass": true,
+      "tampered": false,
+      "timed_out": false,
+      "agent_ms": 34973,
+      "judge_ms": 73661,
+      "wall_ms": 108634,
+      "diff": {
+        "files": 1,
+        "added": 1,
+        "deleted": 1,
+        "untracked": 0,
+        "untracked_files": [],
+        "forbid_hit": false,
+        "summary": "\"docs/04-\\345\\215\\217\\350\\256\\256\\350\\247\\204\\350\\214\\203.md\" +1/-1"
+      },
+      "usage": {
+        "input_total": 777458,
+        "cached": 375296,
+        "output": 5036,
+        "turns": 11,
+        "source": "zcode.result"
+      },
+      "tree": "bd329ad26d0b7b029f0fa972067d054191d6f0aa50e804c8b12ee0ee57ae1382",
+      "precondition_detail": "REPO-CHECK: FAIL 文档值 [24] 与代码默认值 [32] 不一致",
+      "exit_code": 0,
+      "judge_detail": "REPO-CHECK: PASS",
+      "judge_copy_ms": 10277
+    }
+  ]
+}

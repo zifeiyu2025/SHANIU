@@ -116,6 +116,35 @@
       "warmup_compile": false
     },
     {
+      "id": "repo-bug-search-surface-lost",
+      "type": "bugfix",
+      "title": "压缩后搜索不再标注「模型已看不到」",
+      "prompt": "这是真实仓库快照。`cargo test --lib session_query::` 有失败。\n现象：会话原文被压缩后仍然搜得到，但搜索结果不再告诉用户「模型当前已经看不到这段」；进程内搜索与重启后（走持久化索引）表现一致缺失。\n请自己定位是哪几层把标注丢了并修复；不要靠猜测试名。\n范围：只改 src-tauri/src 下的实现。反作弊：任何对测试代码、守卫文件（guards.json 覆盖的 hash 区）的改动一律判本题 invalid；不要改测试，不要动 scripts/dev。完成后跑 `cargo test --lib session_query::` 确认。",
+      "patch": "evals/repo/patches/repo-bug-search-surface-lost.patch",
+      "fixtures": [],
+      "judge": "search-surface-lost",
+      "timeout_secs": 720,
+      "max_turns": 28,
+      "forbid_paths": ["src-tauri/tests/", "scripts/dev/"]
+    },
+    {
+      "id": "repo-bug-cut-pairing",
+      "type": "bugfix",
+      "title": "历史切点拆散工具调用与输出",
+      "prompt": "这是真实仓库快照。新增的验收用例 `src-tauri/tests/repo_bug_cut_pairing.rs` 当前失败。\n现象：历史切点会把一次 function_call 和它的 output 拆到两侧——压缩后重放出现「有调用没输出」，分叉时尾巴上留着半个调用；另外连续两次压缩后，后面的调用/输出会被错误标成已压缩。\n要求：\n1. 压缩（自动与手动两个入口）的切点不许拆配对，预算不够就少压一条；配对起点就在 0 时整对压掉，不许返回空区间；\n2. 分叉的安全切点同样不许落在一次调用的中间；\n3. 连续锚点下，搜索索引的序号口径仍与重放一致。\n范围：只改 src-tauri/src 下的实现。反作弊：任何对测试代码、守卫文件（guards.json 覆盖的 hash 区）的改动一律判本题 invalid；`src-tauri/tests/repo_bug_cut_pairing.rs` 是判据，不许改，不要动 scripts/dev。完成后跑 `cargo test --test repo_bug_cut_pairing` 确认。",
+      "patch": "evals/repo/patches/repo-bug-cut-pairing.patch",
+      "fixtures": [
+        {
+          "from": "evals/repo/fixtures/repo_bug_cut_pairing.rs",
+          "to": "src-tauri/tests/repo_bug_cut_pairing.rs"
+        }
+      ],
+      "judge": "cut-pairing",
+      "timeout_secs": 900,
+      "max_turns": 32,
+      "forbid_paths": ["src-tauri/tests/", "scripts/dev/"]
+    },
+    {
       "id": "repo-doc-max-turns-drift",
       "type": "doc-sync",
       "title": "协议文档的轮数默认值与代码不一致",

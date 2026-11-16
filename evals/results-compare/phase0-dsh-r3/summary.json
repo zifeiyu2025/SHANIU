@@ -1,0 +1,52 @@
+{
+  "runId": "1794731471049-3776",
+  "args": {
+    "arm": "dsh",
+    "tasks": [
+      "repo-doc-max-turns-drift"
+    ],
+    "repeats": 1,
+    "model": "deepseek-flash",
+    "out": "evals/results-compare/phase0-dsh-r3",
+    "prepareOnly": false,
+    "protocol": "",
+    "expectTree": {}
+  },
+  "records": [
+    {
+      "arm": "dsh",
+      "task": "repo-doc-max-turns-drift",
+      "run": 1,
+      "model": "deepseek-flash",
+      "protocol": "responses",
+      "status": "PASS",
+      "precondition_red": true,
+      "judge_pass": true,
+      "tampered": false,
+      "timed_out": false,
+      "agent_ms": 37001,
+      "judge_ms": 73437,
+      "wall_ms": 110438,
+      "diff": {
+        "files": 1,
+        "added": 1,
+        "deleted": 1,
+        "untracked": 0,
+        "forbid_hit": false,
+        "summary": "\"docs/04-\\345\\215\\217\\350\\256\\256\\350\\247\\204\\350\\214\\203.md\" +1/-1"
+      },
+      "usage": {
+        "input_total": 204031,
+        "cached": 190208,
+        "output": 4156,
+        "turns": 9,
+        "source": "dsh.status.step_end"
+      },
+      "tree": "bd329ad26d0b7b029f0fa972067d054191d6f0aa50e804c8b12ee0ee57ae1382",
+      "precondition_detail": "REPO-CHECK: FAIL 文档值 [24] 与代码默认值 [32] 不一致",
+      "exit_code": 0,
+      "judge_detail": "REPO-CHECK: PASS",
+      "judge_copy_ms": 10733
+    }
+  ]
+}

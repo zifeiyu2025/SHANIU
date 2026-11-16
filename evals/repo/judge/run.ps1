@@ -116,6 +116,17 @@ switch ($Task) {
             'tolerates_torn_last_line_and_reports_middle_corruption ... ok'
         )
     }
+    'search-surface-lost' {
+        Expect-CargoOk @('--lib', 'session_query::') @(
+            'documents_mark_compacted_originals_as_shadowed ... ok',
+            'searching_a_compacted_original_says_the_model_no_longer_sees_it ... ok'
+        )
+    }
+    'cut-pairing' {
+        Expect-CargoOk @('--test', 'repo_bug_cut_pairing')
+        Expect-CargoOk @('--lib', 'compaction::')
+        Expect-CargoOk @('--lib', 'rollout::resume')
+    }
     'compaction-tail' {
         Expect-CargoOk @('--lib', 'compaction::') @(
             'always_keeps_the_newest_item ... ok',

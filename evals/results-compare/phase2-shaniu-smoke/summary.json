@@ -1,0 +1,51 @@
+{
+  "runId": "1794738615606-18128",
+  "args": {
+    "arm": "shaniu",
+    "tasks": [
+      "repo-doc-max-turns-drift"
+    ],
+    "repeats": 1,
+    "model": "deepseek-flash",
+    "out": "evals/results-compare/phase2-shaniu-smoke",
+    "prepareOnly": false,
+    "protocol": "responses",
+    "expectTree": {}
+  },
+  "records": [
+    {
+      "arm": "shaniu",
+      "task": "repo-doc-max-turns-drift",
+      "task_type": "doc-sync",
+      "run": 1,
+      "model": "deepseek-flash",
+      "protocol": "responses",
+      "status": "PASS",
+      "invalid_reason": null,
+      "precondition_red": true,
+      "judge_pass": true,
+      "tampered": false,
+      "timed_out": false,
+      "agent_ms": 31857,
+      "judge_ms": 77781,
+      "wall_ms": 109638,
+      "diff": {
+        "summary": "共1文件 +1/-1；未跟踪0；\"docs/04-\\345\\215\\217\\350\\256\\256\\350\\247\\204\\350\\214\\203.md\" +1/-1",
+        "files": 1,
+        "added": 1,
+        "deleted": 1,
+        "untracked": 0,
+        "forbid_hit": false
+      },
+      "usage": {
+        "input_total": 539969,
+        "cached": 443648,
+        "output": 3676,
+        "turns": 12,
+        "source": "shaniu.TokenUsage"
+      },
+      "tree": "bd329ad26d0b7b029f0fa972067d054191d6f0aa50e804c8b12ee0ee57ae1382",
+      "detail": "判据通过｜收口=BudgetExhausted｜错误=[已达最大轮数上限（12）]"
+    }
+  ]
+}

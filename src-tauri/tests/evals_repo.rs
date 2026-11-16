@@ -33,6 +33,7 @@ use std::time::{Duration, Instant};
 
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
+use sha2::{Digest, Sha256};
 use shaniu_lib::agent_loop::{AgentLoop, ModelBackend, ResponsesBackend};
 use shaniu_lib::clock::now_ms;
 use shaniu_lib::config::{ApprovalMode, SandboxMode};
@@ -79,9 +80,7 @@ fn run_log() -> &'static Mutex<File> {
             .create(true)
             .append(true)
             .open(&path)
-            .unwrap_or_else(|error| {
-                panic!("打开运行日志 {} 失败：{error}", path.display())
-            });
+            .unwrap_or_else(|error| panic!("打开运行日志 {} 失败：{error}", path.display()));
         Mutex::new(file)
     })
 }
@@ -112,6 +111,80 @@ fn task_hard_extra() -> Duration {
     Duration::from_secs(secs)
 }
 
+/// 对照跑法用：只跑指定题（逗号分隔）。空或未设置 = 全量。
+///
+/// 为什么用环境变量而不是改任务集：对照跑法要按阶段（试点/全量）切题，
+/// 但题面与判据只能有一份，切题不能靠复制一份 `repo-tasks.json`。
+fn task_selected(id: &str) -> bool {
+    match std::env::var("SHANIU_EVAL_TASK_FILTER") {
+        Ok(raw) => {
+            let ids: Vec<&str> = raw
+                .split(',')
+                .map(str::trim)
+                .filter(|part| !part.is_empty())
+                .collect();
+            ids.is_empty() || ids.contains(&id)
+        }
+        Err(_) => true,
+    }
+}
+
+/// 工作区指纹：`git ls-files -s` 的 sha256。只含 blob 哈希与路径，
+/// 不含提交时间，所以「同一题在三方 agent 启动前是否同一棵树」可以跨进程比对。
+fn tree_fingerprint(ws: &Path) -> String {
+    let Ok(out) = git(ws, &["ls-files", "-s"]) else {
+        return "unknown".to_string();
+    };
+    if !out.ok() {
+        return "unknown".to_string();
+    }
+    let mut hasher = Sha256::new();
+    hasher.update(out.stdout.replace("\r\n", "\n").as_bytes());
+    format!("{:x}", hasher.finalize())
+}
+
+/// 改动面摘要（相对本题基线）。未跟踪文件单独计数，否则「只新增文件」会被读成 0 改动。
+fn diff_summary(ws: &Path, base: &str) -> String {
+    let mut total_add = 0u64;
+    let mut total_del = 0u64;
+    let mut files: Vec<String> = Vec::new();
+    if let Ok(out) = git(ws, &["diff", "--numstat", base]) {
+        if out.ok() {
+            for line in out.stdout.lines() {
+                let cols: Vec<&str> = line.split('\t').collect();
+                if cols.len() < 3 {
+                    continue;
+                }
+                let add: u64 = cols[0].parse().unwrap_or(0);
+                let del: u64 = cols[1].parse().unwrap_or(0);
+                total_add += add;
+                total_del += del;
+                if files.len() < 12 {
+                    files.push(format!("{} +{}/-{}", cols[2], add, del));
+                }
+            }
+        }
+    }
+    let untracked = git(ws, &["status", "--porcelain"])
+        .ok()
+        .filter(CmdOut::ok)
+        .map(|out| {
+            out.stdout
+                .lines()
+                .filter(|line| line.starts_with("??"))
+                .count()
+        })
+        .unwrap_or(0);
+    format!(
+        "共{}文件 +{}/-{}；未跟踪{}；{}",
+        files.len(),
+        total_add,
+        total_del,
+        untracked,
+        clip(&files.join("；"), 400)
+    )
+}
+
 /// 模型后端打点装饰器：每次请求记录开始/结束/超时，并给「拿响应头」套超时。
 ///
 /// 为什么加在评测侧而不是被测产品：本轮要回答的是「评测能不能稳定跑完」，
@@ -140,11 +213,8 @@ impl ModelBackend for TimedBackend {
             limit.as_secs()
         ));
         let started = Instant::now();
-        let result = tokio::time::timeout(
-            limit,
-            self.inner.stream(history, tools, instructions),
-        )
-        .await;
+        let result =
+            tokio::time::timeout(limit, self.inner.stream(history, tools, instructions)).await;
         let ms = started.elapsed().as_millis();
         match result {
             Ok(Ok(stream)) => {
@@ -507,6 +577,12 @@ struct Agg {
     /// 每次打断的工具 + 风险档 + 原因（上限 12 条）：只报总数无法回答「该不该降噪」。
     prompts: Vec<String>,
     errors: Vec<String>,
+    /// 模型用量累计：对照跑法要拿它与 codex/dsh 的 usage 同口径比。
+    /// 单轮 `input_tokens` 是整段上下文，按轮累加才是真实计费量。
+    input_tokens: u64,
+    cached_input_tokens: u64,
+    output_tokens: u64,
+    usage_turns: u32,
 }
 
 fn args_summary(args: &Value) -> String {
@@ -534,6 +610,17 @@ impl EventSink for EvalSink {
                 if agg.errors.len() < 3 {
                     agg.errors.push(message.chars().take(200).collect());
                 }
+            }
+            EventMsg::TokenUsage {
+                input_tokens,
+                cached_input_tokens,
+                output_tokens,
+                ..
+            } => {
+                agg.input_tokens += u64::from(*input_tokens);
+                agg.cached_input_tokens += u64::from(cached_input_tokens.unwrap_or(0));
+                agg.output_tokens += u64::from(*output_tokens);
+                agg.usage_turns += 1;
             }
             EventMsg::ExecApprovalRequest {
                 request_id,
@@ -607,6 +694,14 @@ struct TaskOutcome {
     warmup_ms: u128,
     files_changed: usize,
     forbidden_touched: bool,
+    /// 模型用量（`TokenUsage` 事件按轮累计）。`usage_turns=0` 表示没采到，
+    /// 报告里必须显示为「未采集」而不是 0，避免把缺失读成省 token。
+    input_tokens: u64,
+    cached_input_tokens: u64,
+    output_tokens: u64,
+    usage_turns: u32,
+    /// 相对本题基线的改动面：文件数、增删行数、未跟踪文件数与前 12 个文件的明细。
+    diff_summary: String,
     detail: String,
 }
 
@@ -639,6 +734,11 @@ impl TaskOutcome {
             "warmup_ms": self.warmup_ms as u64,
             "files_changed": self.files_changed,
             "forbidden_touched": self.forbidden_touched,
+            "input_tokens": self.input_tokens,
+            "cached_input_tokens": self.cached_input_tokens,
+            "output_tokens": self.output_tokens,
+            "usage_turns": self.usage_turns,
+            "diff_summary": self.diff_summary,
             "detail": self.detail,
         })
     }
@@ -965,6 +1065,14 @@ fn prepare_workspace(
         ));
     }
     let task_base = task_base.stdout.trim().to_string();
+    // 对照跑法：记录「agent 启动前」的树指纹。Node 驱动器会在自己准备的工作区上算同一指纹，
+    // 两边不一致说明准备逻辑漂移，该题不能进对照。
+    log_line(&format!(
+        "[prep] task={} base={} tree={}",
+        task.id,
+        task_base.get(..12).unwrap_or(&task_base),
+        tree_fingerprint(ws)
+    ));
 
     // 5) 预热：编进 agent 自己的默认产物目录（`src-tauri/target`）。
     //    刻意不设 CARGO_TARGET_DIR：agent 的 `cargo test` 用的是默认目录，只有预热落在
@@ -1229,7 +1337,10 @@ async fn run_one(ctx: RunOneCtx<'_>, backend: Arc<dyn ModelBackend>) -> (TaskOut
     ));
 
     // 判据一次定成败。
-    log_line(&format!("[judge] start task={} check={}", task.id, task.judge));
+    log_line(&format!(
+        "[judge] start task={} check={}",
+        task.id, task.judge
+    ));
     let check_start = Instant::now();
     let judge = run_judge(judge_script, &task.judge, ws);
     out.check_ms += check_start.elapsed().as_millis();
@@ -1255,10 +1366,16 @@ async fn run_one(ctx: RunOneCtx<'_>, backend: Arc<dyn ModelBackend>) -> (TaskOut
         .cloned()
         .collect();
     out.forbidden_touched = !hit.is_empty();
+    // 改动面摘要：自主完成率相同但改动量差两个数量级时，不能算平手。
+    out.diff_summary = diff_summary(ws, &task_base);
 
     let agg = sink.agg.lock().unwrap();
     out.interruptions = agg.approvals;
     out.prompt_attribution = agg.prompts.clone();
+    out.input_tokens = agg.input_tokens;
+    out.cached_input_tokens = agg.cached_input_tokens;
+    out.output_tokens = agg.output_tokens;
+    out.usage_turns = agg.usage_turns;
 
     let mut detail = match &judge {
         Ok(judge) if judge.pass => format!("判据通过｜收口={reason}"),
@@ -1328,8 +1445,8 @@ async fn run_child_mode(spec_path: &str) {
     let spec: ChildSpec = serde_json::from_str(&raw).expect("子进程 spec 解析失败");
     let api_key = std::env::var("SHANIU_TEST_API_KEY").expect("子进程缺少 SHANIU_TEST_API_KEY");
     assert_key_sane(&api_key);
-    let tasks_raw = std::fs::read_to_string(repo_root().join(&spec.tasks_file))
-        .expect("子进程读不到任务集");
+    let tasks_raw =
+        std::fs::read_to_string(repo_root().join(&spec.tasks_file)).expect("子进程读不到任务集");
     let tasks: RepoTasksFile = serde_json::from_str(&tasks_raw).expect("子进程任务集解析失败");
     let task = tasks
         .tasks
@@ -1405,8 +1522,11 @@ async fn run_one_isolated(children_dir: &Path, ctx: RunOneCtx<'_>, hard: Duratio
             .unwrap_or_else(|_| DEFAULT_TASKS_FILE.to_string()),
         outcome: outcome_path.display().to_string(),
     };
-    std::fs::write(&spec_path, serde_json::to_string(&spec).expect("spec 序列化失败"))
-        .unwrap_or_else(|error| panic!("写子进程 spec 失败：{error}"));
+    std::fs::write(
+        &spec_path,
+        serde_json::to_string(&spec).expect("spec 序列化失败"),
+    )
+    .unwrap_or_else(|error| panic!("写子进程 spec 失败：{error}"));
 
     log_line(&format!(
         "[task] start id={} run={} hard_timeout={}s",
@@ -1444,9 +1564,7 @@ async fn run_one_isolated(children_dir: &Path, ctx: RunOneCtx<'_>, hard: Duratio
                 .args(["/T", "/F", "/PID", &child_pid.to_string()])
                 .output();
             if let Err(error) = kill {
-                log_line(&format!(
-                    "[task] taskkill 失败 pid={child_pid} err={error}"
-                ));
+                log_line(&format!("[task] taskkill 失败 pid={child_pid} err={error}"));
             }
             let _ = child.wait();
             killed = true;
@@ -1832,7 +1950,7 @@ async fn evals_repo_v0() {
 
     for run in 1..=repeats {
         let mut outcomes: Vec<TaskOutcome> = Vec::new();
-        for task in &spec.tasks {
+        for task in spec.tasks.iter().filter(|task| task_selected(&task.id)) {
             let outcome = run_one_isolated(
                 &children_dir,
                 RunOneCtx {
@@ -1844,7 +1962,8 @@ async fn evals_repo_v0() {
                     ws: &ws,
                     rollout_root: &rollout_root,
                 },
-                hard_override.unwrap_or_else(|| Duration::from_secs(task.timeout_secs) + hard_extra),
+                hard_override
+                    .unwrap_or_else(|| Duration::from_secs(task.timeout_secs) + hard_extra),
             )
             .await;
             warmup_ms_total += outcome.warmup_ms;

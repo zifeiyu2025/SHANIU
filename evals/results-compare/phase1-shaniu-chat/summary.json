@@ -1,0 +1,121 @@
+{
+  "runId": "1794732241436-11852",
+  "args": {
+    "arm": "shaniu",
+    "tasks": [
+      "repo-doc-max-turns-drift",
+      "repo-bug-compaction-tail",
+      "repo-refactor-rename-title-api"
+    ],
+    "repeats": 1,
+    "model": "deepseek-flash",
+    "out": "evals/results-compare/phase1-shaniu-chat",
+    "prepareOnly": false,
+    "protocol": "chat",
+    "expectTree": {}
+  },
+  "records": [
+    {
+      "arm": "shaniu",
+      "task": "repo-bug-compaction-tail",
+      "task_type": "bugfix",
+      "run": 1,
+      "model": "deepseek-flash",
+      "protocol": "chat",
+      "status": "PASS",
+      "invalid_reason": null,
+      "precondition_red": true,
+      "judge_pass": true,
+      "tampered": false,
+      "timed_out": false,
+      "agent_ms": 87228,
+      "judge_ms": 83970,
+      "wall_ms": 171198,
+      "diff": {
+        "summary": "共1文件 +1/-1；未跟踪0；src-tauri/src/compaction/mod.rs +1/-1",
+        "files": 1,
+        "added": 1,
+        "deleted": 1,
+        "untracked": 0,
+        "forbid_hit": false
+      },
+      "usage": {
+        "input_total": 152997,
+        "cached": 133248,
+        "output": 3197,
+        "turns": 10,
+        "source": "shaniu.TokenUsage"
+      },
+      "tree": "7a9df680d3242901c39869a8abec3a93e9eb86c0cbeffad5a96379b4fea8915a",
+      "detail": "判据通过｜收口=Completed"
+    },
+    {
+      "arm": "shaniu",
+      "task": "repo-refactor-rename-title-api",
+      "task_type": "refactor",
+      "run": 1,
+      "model": "deepseek-flash",
+      "protocol": "chat",
+      "status": "PASS",
+      "invalid_reason": null,
+      "precondition_red": true,
+      "judge_pass": true,
+      "tampered": false,
+      "timed_out": false,
+      "agent_ms": 79521,
+      "judge_ms": 32623,
+      "wall_ms": 112144,
+      "diff": {
+        "summary": "共1文件 +8/-8；未跟踪0；src-tauri/src/session_title.rs +8/-8",
+        "files": 1,
+        "added": 8,
+        "deleted": 8,
+        "untracked": 0,
+        "forbid_hit": false
+      },
+      "usage": {
+        "input_total": 273365,
+        "cached": 256000,
+        "output": 4020,
+        "turns": 16,
+        "source": "shaniu.TokenUsage"
+      },
+      "tree": "8a1bd7529a782dc769bbee1c168eed083f2347af673e821b42d6e95a50f44949",
+      "detail": "判据通过｜收口=Completed"
+    },
+    {
+      "arm": "shaniu",
+      "task": "repo-doc-max-turns-drift",
+      "task_type": "doc-sync",
+      "run": 1,
+      "model": "deepseek-flash",
+      "protocol": "chat",
+      "status": "PASS",
+      "invalid_reason": null,
+      "precondition_red": true,
+      "judge_pass": true,
+      "tampered": false,
+      "timed_out": false,
+      "agent_ms": 30563,
+      "judge_ms": 1251,
+      "wall_ms": 31814,
+      "diff": {
+        "summary": "共1文件 +1/-1；未跟踪0；\"docs/04-\\345\\215\\217\\350\\256\\256\\350\\247\\204\\350\\214\\203.md\" +1/-1",
+        "files": 1,
+        "added": 1,
+        "deleted": 1,
+        "untracked": 0,
+        "forbid_hit": false
+      },
+      "usage": {
+        "input_total": 183282,
+        "cached": 169344,
+        "output": 3929,
+        "turns": 12,
+        "source": "shaniu.TokenUsage"
+      },
+      "tree": "bd329ad26d0b7b029f0fa972067d054191d6f0aa50e804c8b12ee0ee57ae1382",
+      "detail": "判据通过｜收口=Completed"
+    }
+  ]
+}

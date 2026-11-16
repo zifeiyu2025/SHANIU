@@ -1,0 +1,124 @@
+{
+  "runId": "1794734216770-13148",
+  "args": {
+    "arm": "dsh",
+    "tasks": [
+      "repo-doc-max-turns-drift",
+      "repo-bug-compaction-tail",
+      "repo-refactor-rename-title-api"
+    ],
+    "repeats": 1,
+    "model": "deepseek-flash",
+    "out": "evals/results-compare/phase1-dsh",
+    "prepareOnly": false,
+    "protocol": "",
+    "expectTree": {}
+  },
+  "records": [
+    {
+      "arm": "dsh",
+      "task": "repo-bug-compaction-tail",
+      "run": 1,
+      "model": "deepseek-flash",
+      "protocol": "responses",
+      "status": "PASS",
+      "precondition_red": true,
+      "judge_pass": true,
+      "tampered": false,
+      "timed_out": false,
+      "agent_ms": 196390,
+      "judge_ms": 72618,
+      "wall_ms": 269008,
+      "diff": {
+        "files": 1,
+        "added": 1,
+        "deleted": 1,
+        "untracked": 1,
+        "forbid_hit": false,
+        "summary": "src-tauri/src/compaction/mod.rs +1/-1"
+      },
+      "usage": {
+        "input_total": 1774858,
+        "cached": 1724800,
+        "output": 28854,
+        "turns": 33,
+        "source": "dsh.status.step_end"
+      },
+      "tree": "7a9df680d3242901c39869a8abec3a93e9eb86c0cbeffad5a96379b4fea8915a",
+      "precondition_detail": "REPO-CHECK: FAIL cargo 失败: --lib compaction::",
+      "exit_code": 0,
+      "judge_detail": "REPO-CHECK: PASS",
+      "judge_copy_ms": 10768
+    },
+    {
+      "arm": "dsh",
+      "task": "repo-refactor-rename-title-api",
+      "run": 1,
+      "model": "deepseek-flash",
+      "protocol": "responses",
+      "status": "PASS",
+      "precondition_red": true,
+      "judge_pass": true,
+      "tampered": false,
+      "timed_out": false,
+      "agent_ms": 165170,
+      "judge_ms": 95135,
+      "wall_ms": 260305,
+      "diff": {
+        "files": 1,
+        "added": 8,
+        "deleted": 8,
+        "untracked": 0,
+        "forbid_hit": false,
+        "summary": "src-tauri/src/session_title.rs +8/-8"
+      },
+      "usage": {
+        "input_total": 1247505,
+        "cached": 1213568,
+        "output": 23857,
+        "turns": 33,
+        "source": "dsh.status.step_end"
+      },
+      "tree": "8a1bd7529a782dc769bbee1c168eed083f2347af673e821b42d6e95a50f44949",
+      "precondition_detail": "REPO-CHECK: FAIL cargo 失败: --lib session_title",
+      "exit_code": 0,
+      "judge_detail": "REPO-CHECK: PASS",
+      "judge_copy_ms": 10484
+    },
+    {
+      "arm": "dsh",
+      "task": "repo-doc-max-turns-drift",
+      "run": 1,
+      "model": "deepseek-flash",
+      "protocol": "responses",
+      "status": "PASS",
+      "precondition_red": true,
+      "judge_pass": true,
+      "tampered": false,
+      "timed_out": false,
+      "agent_ms": 35799,
+      "judge_ms": 73550,
+      "wall_ms": 109349,
+      "diff": {
+        "files": 1,
+        "added": 1,
+        "deleted": 1,
+        "untracked": 0,
+        "forbid_hit": false,
+        "summary": "\"docs/04-\\345\\215\\217\\350\\256\\256\\350\\247\\204\\350\\214\\203.md\" +1/-1"
+      },
+      "usage": {
+        "input_total": 272339,
+        "cached": 255360,
+        "output": 4156,
+        "turns": 11,
+        "source": "dsh.status.step_end"
+      },
+      "tree": "bd329ad26d0b7b029f0fa972067d054191d6f0aa50e804c8b12ee0ee57ae1382",
+      "precondition_detail": "REPO-CHECK: FAIL 文档值 [24] 与代码默认值 [32] 不一致",
+      "exit_code": 0,
+      "judge_detail": "REPO-CHECK: PASS",
+      "judge_copy_ms": 10401
+    }
+  ]
+}

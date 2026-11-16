@@ -1,0 +1,56 @@
+{
+  "runId": "1794731790155-3116",
+  "args": {
+    "arm": "codex",
+    "tasks": [
+      "repo-bug-compaction-tail",
+      "repo-refactor-rename-title-api"
+    ],
+    "repeats": 1,
+    "model": "deepseek-flash",
+    "out": "evals/results-compare/prep-phase1",
+    "prepareOnly": true,
+    "protocol": "",
+    "expectTree": {}
+  },
+  "records": [
+    {
+      "arm": "codex",
+      "task": "repo-bug-compaction-tail",
+      "run": 1,
+      "model": "deepseek-flash",
+      "protocol": "responses",
+      "status": "PREPARED",
+      "precondition_red": true,
+      "judge_pass": null,
+      "tampered": false,
+      "timed_out": false,
+      "agent_ms": null,
+      "judge_ms": null,
+      "wall_ms": null,
+      "diff": null,
+      "usage": null,
+      "tree": "7a9df680d3242901c39869a8abec3a93e9eb86c0cbeffad5a96379b4fea8915a",
+      "precondition_detail": "REPO-CHECK: FAIL cargo 失败: --lib compaction::"
+    },
+    {
+      "arm": "codex",
+      "task": "repo-refactor-rename-title-api",
+      "run": 1,
+      "model": "deepseek-flash",
+      "protocol": "responses",
+      "status": "PREPARED",
+      "precondition_red": true,
+      "judge_pass": null,
+      "tampered": false,
+      "timed_out": false,
+      "agent_ms": null,
+      "judge_ms": null,
+      "wall_ms": null,
+      "diff": null,
+      "usage": null,
+      "tree": "8a1bd7529a782dc769bbee1c168eed083f2347af673e821b42d6e95a50f44949",
+      "precondition_detail": "REPO-CHECK: FAIL cargo 失败: --lib session_title"
+    }
+  ]
+}

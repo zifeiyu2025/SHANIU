@@ -48,6 +48,35 @@
       "path": "src-tauri/src/tools/apply_patch.rs"
     }
   ],
+  "search-surface-lost": [
+    {
+      "mode": "whole_hash",
+      "value": "17f43e62349fae9b7187af3f24772adaa7570117f6fafb8c789ebdbe02cce3d1",
+      "path": "src-tauri/src/session_query/tests.rs"
+    }
+  ],
+  "cut-pairing": [
+    {
+      "mode": "whole_hash",
+      "value": "08961b539e55e5bbc5c863506fff0edfc7925fd34eaecc801f4d060f100ef240",
+      "path": "src-tauri/tests/repo_bug_cut_pairing.rs"
+    },
+    {
+      "mode": "tail_hash",
+      "value": "974c5df7af15ca8ab8bad2f900ef69870fba32b2800d2f815f7c785b9ab81b26",
+      "path": "src-tauri/src/rollout/resume.rs"
+    },
+    {
+      "mode": "tail_hash",
+      "value": "3555764f5dbbef414a5c64e2e9e31a701e30749f2aace7b824878f110b7b0479",
+      "path": "src-tauri/src/compaction/mod.rs"
+    },
+    {
+      "mode": "whole_hash",
+      "value": "17f43e62349fae9b7187af3f24772adaa7570117f6fafb8c789ebdbe02cce3d1",
+      "path": "src-tauri/src/session_query/tests.rs"
+    }
+  ],
   "compaction-tail": [
     {
       "mode": "tail_hash",

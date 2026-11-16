@@ -1,0 +1,35 @@
+{
+  "runId": "1794730522240-17884",
+  "args": {
+    "arm": "codex",
+    "tasks": [
+      "repo-doc-max-turns-drift"
+    ],
+    "repeats": 1,
+    "model": "deepseek-flash",
+    "out": "evals/results-compare/tree-check",
+    "prepareOnly": true,
+    "protocol": ""
+  },
+  "records": [
+    {
+      "arm": "codex",
+      "task": "repo-doc-max-turns-drift",
+      "run": 1,
+      "model": "deepseek-flash",
+      "protocol": "responses",
+      "status": "PREPARED",
+      "precondition_red": true,
+      "judge_pass": null,
+      "tampered": false,
+      "timed_out": false,
+      "agent_ms": null,
+      "judge_ms": null,
+      "wall_ms": null,
+      "diff": null,
+      "usage": null,
+      "tree": "bd329ad26d0b7b029f0fa972067d054191d6f0aa50e804c8b12ee0ee57ae1382",
+      "precondition_detail": "REPO-CHECK: FAIL 文档值 [24] 与代码默认值 [32] 不一致"
+    }
+  ]
+}

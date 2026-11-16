@@ -1,0 +1,2 @@
+REPO-CHECK: FAIL 守卫目标缺失 src-tauri/src/rollout/resume.rs
+

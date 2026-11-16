@@ -73,6 +73,12 @@ evals/control.json
 evals/.eval.lock
 evals/*.log
 
+# 四臂对照（evals/results-compare）的原始事件流：每题 0.2~13MB，单轮 70MB+，且属于
+# 一次性的运行产物（与 evals/results/ 同理，入库会 churn）。summary.json、判据日志、
+# progress.log 与结论文档（*.md）照常入库；事件流留在本地供取证。
+evals/results-compare/**/*.ndjson
+evals/results-compare/**/*.ndjson.*
+
 # 上游对齐账本的 JSON 产物：本地/CI 读，不入库。理由有两条——
 # ① 三万行生成物入库后，真实漂移的 diff 会被机器重排淹没；
 # ② 它会变成与 overrides.json 并列的"第二个真源"，出现改 ledger 不改 overrides。

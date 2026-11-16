@@ -1,0 +1,52 @@
+{
+  "runId": "1794730977921-4596",
+  "args": {
+    "arm": "dsh",
+    "tasks": [
+      "repo-doc-max-turns-drift"
+    ],
+    "repeats": 1,
+    "model": "deepseek-flash",
+    "out": "evals/results-compare/phase0-dsh-r2",
+    "prepareOnly": false,
+    "protocol": "",
+    "expectTree": {}
+  },
+  "records": [
+    {
+      "arm": "dsh",
+      "task": "repo-doc-max-turns-drift",
+      "run": 1,
+      "model": "deepseek-flash",
+      "protocol": "responses",
+      "status": "FAIL",
+      "precondition_red": true,
+      "judge_pass": false,
+      "tampered": false,
+      "timed_out": false,
+      "agent_ms": 35324,
+      "judge_ms": 6128,
+      "wall_ms": 41452,
+      "diff": {
+        "files": 1,
+        "added": 1,
+        "deleted": 1,
+        "untracked": 0,
+        "forbid_hit": false,
+        "summary": "\"docs/04-\\345\\215\\217\\350\\256\\256\\350\\247\\204\\350\\214\\203.md\" +1/-1"
+      },
+      "usage": {
+        "input_total": 263878,
+        "cached": 246272,
+        "output": 3749,
+        "turns": 11,
+        "source": "dsh.status.step_end"
+      },
+      "tree": "bd329ad26d0b7b029f0fa972067d054191d6f0aa50e804c8b12ee0ee57ae1382",
+      "precondition_detail": "REPO-CHECK: FAIL 文档值 [24] 与代码默认值 [32] 不一致",
+      "exit_code": 0,
+      "judge_detail": "REPO-CHECK: FAIL cargo 失败: --lib config::",
+      "judge_tail": "…-doc-max-turns-drift\\target\\debug\\build\\proc-macro2/fb24b3024cfa4dca\\out\\build_script_build` (exit code: 1)\r   --- stdout\r   cargo:rustc-check-cfg=cfg(fuzzing)\r   cargo:rustc-check-cfg=cfg(no_is_available)\r   cargo:rustc-check-cfg=cfg(no_literal_byte_character)\r   cargo:rustc-check-cfg=cfg(no_literal_c_string)\r   cargo:rustc-check-cfg=cfg(no_source_text)\r   cargo:rustc-check-cfg=cfg(proc_macro_span)\r   cargo:rustc-check-cfg=cfg(proc_macro_span_file)\r   cargo:rustc-check-cfg=cfg(proc_macro_span_location)\r   cargo:rustc-check-cfg=cfg(procmacro2_backtrace)\r   cargo:rustc-check-cfg=cfg(procmacro2_build_probe)\r   cargo:rustc-check-cfg=cfg(procmacro2_nightly_testing)\r   cargo:rustc-check-cfg=cfg(procmacro2_semver_exempt)\r   cargo:rustc-check-cfg=cfg(randomize_layout)\r   cargo:rustc-check-cfg=cfg(span_locations)\r   cargo:rustc-check-cfg=cfg(super_unstable)\r   cargo:rustc-check-cfg=cfg(wrap_proc_macro)\r   cargo:rustc-cfg=span_locations\r   cargo:rerun-if-changed=src/probe/proc_macro_span.rs\r \r   --- stderr\r   Failed to create C:\\Users\\jun\\AppData\\Local\\Temp\\shaniu-cmp-1794730977921-4596\\ws\\repo-doc-max-turns-drift\\target\\debug\\build\\proc-macro2/11051166e9c6d18d\\out\\probe: 拒绝访问。 (os error 5)"
+    }
+  ]
+}
