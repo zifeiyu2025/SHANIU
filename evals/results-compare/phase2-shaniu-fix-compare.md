@@ -82,6 +82,7 @@
 - 泄漏源头（代码位置）：[run-arm.mjs](../../compare/run-arm.mjs) 用 `...process.env` 拼 env、[evals_repo.rs](../../../src-tauri/tests/evals_repo.rs) 拉子进程整份继承。agent 在 `now-ms-exit` 事件流第 46 行自己打出 `CARGO_TARGET_DIR=[D:\MyWorkspace\SHANIU\target\shaniu-a09977b] [exit code: 0]`。
 - 修复：`05ccacc`，只在评测侧改两处——`childEnv()` 统一 `delete env.CARGO_TARGET_DIR`（四臂共用），`evals_repo.rs` 子进程 spawn 处 `.env_remove("CARGO_TARGET_DIR")` 兜底。判据侧 `run.ps1` 自设该变量，不受影响。
 - 复跑条件：干净工作树 `%TEMP%\shaniu-ab-wt`（detached 在 `05ccacc`，`git status` 0 行，被测路径无未提交改动）；外层**故意继续设** `CARGO_TARGET_DIR=%TEMP%\shaniu-ab-target` 做反向验证。
+- 范围收窄 + 端到端复验：`05ccacc` 第一版连 harness 自身的 `cargo test` 也摘了变量，导致外层编译丢了独立 target（A/B 的 worktree 因此涨到 4.45 GB）。`55c1ae8` 改回「只摘被测 agent、外层保留」，并在该提交的干净工作树上再验一次：`repo-doc-max-turns-drift` PASS（12 轮 / 1 文件），harness 产物落在独立 target（4.32 GB，exe 在 `debug\build\shaniu\<hash>\out\`），主树 `src-tauri\target` mtime 仍停在 11-13 17:50、未被改动，agent 事件流 `CARGO_TARGET_DIR` 提及 0。
 
 | 题目 | 泄漏轮（本轮 9 题） | 修复后 A/B | 绕行工具调用 | 判据 |
 |---|---|---|---|---|
