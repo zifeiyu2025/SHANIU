@@ -115,6 +115,17 @@ pub enum RiskLevel {
 }
 
 impl RiskLevel {
+    /// 稳定的小写名：事件序列化与拒绝说明共用同一套词表（D9），避免两处各写一份。
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Read => "read",
+            Self::WriteInWorkspace => "write_in_workspace",
+            Self::Execute => "execute",
+            Self::Destructive => "destructive",
+            Self::PlanReview => "plan_review",
+        }
+    }
+
     /// FF-2 单一事实源（SH-078）：同 `TurnEndReason::all_variants` 的穷举约定。
     pub fn all_variants() -> &'static [Self] {
         match Self::Read {

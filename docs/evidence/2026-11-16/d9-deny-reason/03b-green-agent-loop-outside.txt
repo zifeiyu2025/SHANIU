@@ -1,0 +1,8 @@
+    Finished `test` profile [unoptimized + debuginfo] target(s) in 0.34s
+     Running unittests src\lib.rs (target\debug\build\shaniu/3347eb12c1517f2a\out\shaniu_lib-3347eb12c1517f2a.exe)
+
+running 1 test
+test agent_loop::tests::outside_workspace_result_names_reason_and_path ... ok
+
+test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 1131 filtered out; finished in 0.00s
+

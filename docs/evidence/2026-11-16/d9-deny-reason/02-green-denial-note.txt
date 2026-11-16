@@ -1,0 +1,18 @@
+   Compiling shaniu v0.2.8 (D:\MyWorkspace\SHANIU\src-tauri)
+warning: unused import: `ApprovalMode`
+  --> src\permission\mod.rs:20:21
+   |
+20 | use crate::config::{ApprovalMode, SandboxMode};
+   |                     ^^^^^^^^^^^^
+   |
+   = note: `#[warn(unused_imports)]` (part of `#[warn(unused)]`) on by default
+
+warning: `shaniu` (lib test) generated 1 warning (run `cargo fix --lib -p shaniu --tests` to apply 1 suggestion)
+    Finished `test` profile [unoptimized + debuginfo] target(s) in 22.84s
+     Running unittests src\lib.rs (target\debug\build\shaniu/3347eb12c1517f2a\out\shaniu_lib-3347eb12c1517f2a.exe)
+
+running 1 test
+test permission::tests::denial_note_carries_type_scope_and_path ... ok
+
+test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 1131 filtered out; finished in 0.00s
+

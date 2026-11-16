@@ -480,6 +480,14 @@ pub enum ToolError {
     Cancelled,
 }
 
+/// 工作区写边界拒绝的稳定前缀（D9）：回填拒绝说明时据此识别并取出目标路径。
+///
+/// 生成与识别共用同一常量——两处各写一遍文案，改一个字就会静默失配，
+/// 模型就只能看到一条「失败」而看不到 `outside_workspace`。
+pub const OUTSIDE_WORKSPACE_MARKER: &str = "路径越界（工作区之外）: ";
+/// 目标路径含 `..` 的写边界拒绝：同样属于 `outside_workspace`，只是原因更具体。
+pub const PARENT_DIR_MARKER: &str = "路径越界（包含 ..）: "; 
+
 /// 工具输出（回填给模型的文本 + 成功标记）。
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ToolOutput {
@@ -834,7 +842,7 @@ pub fn resolve_in_workspace(workspace_root: &Path, path: &str) -> Result<PathBuf
         .canonicalize()
         .map_err(|e| ToolError::Execution(format!("工作区根目录不可用: {e}")))?;
     if !canonical.starts_with(&root) {
-        return Err(ToolError::Execution(format!("路径越界（工作区之外）: {path}")));
+        return Err(ToolError::Execution(format!("{OUTSIDE_WORKSPACE_MARKER}{path}")));
     }
     Ok(shell_usable(&canonical))
 }
@@ -881,9 +889,7 @@ pub fn resolve_for_write(workspace_root: &Path, path: &str) -> Result<PathBuf, T
         .components()
         .any(|c| matches!(c, std::path::Component::ParentDir))
     {
-        return Err(ToolError::Execution(format!(
-            "路径越界（包含 ..）: {path}"
-        )));
+        return Err(ToolError::Execution(format!("{PARENT_DIR_MARKER}{path}")));
     }
     // 自底向上找最深存在祖先
     let mut tail: Vec<std::ffi::OsString> = Vec::new();
@@ -910,14 +916,14 @@ pub fn resolve_for_write(workspace_root: &Path, path: &str) -> Result<PathBuf, T
         .canonicalize()
         .map_err(|e| ToolError::Execution(format!("工作区根目录不可用: {e}")))?;
     if !canonical_base.starts_with(&root) {
-        return Err(ToolError::Execution(format!("路径越界（工作区之外）: {path}")));
+        return Err(ToolError::Execution(format!("{OUTSIDE_WORKSPACE_MARKER}{path}")));
     }
     let mut result = canonical_base;
     for name in tail.iter().rev() {
         result.push(name);
     }
     if !result.starts_with(&root) {
-        return Err(ToolError::Execution(format!("路径越界（工作区之外）: {path}")));
+        return Err(ToolError::Execution(format!("{OUTSIDE_WORKSPACE_MARKER}{path}")));
     }
     Ok(shell_usable(&result))
 }

@@ -1,0 +1,3 @@
+[check-deps] 依赖方向检查（FF-1，阈值 0，白名单 fail-closed，依据 docs/01 §2.3.1）
+[check-deps] 已登记 37 个模块的允许边；扫描 105 个 Rust 源文件
+[check-deps] 依赖方向检查通过（0 违规）

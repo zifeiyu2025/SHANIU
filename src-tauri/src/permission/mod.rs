@@ -58,6 +58,84 @@ pub enum GateOutcome {
     Cancelled,
 }
 
+/// 拒绝类型（D9）：tool 输出与 `ToolCallEnd.error` 共用同一套 `reason_code`，
+/// 模型和用户看到同一份「为什么被拒」。
+///
+/// 对齐 codex `core/src/safety.rs` 的「给出具体规则来源」思路，但收敛成四个稳定标记，
+/// 便于前端与日志检索；标记里**不带**宿主内部路径、ACL、SID 或令牌细节。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum DenialKind {
+    /// 用户在审批卡上点了拒绝。
+    UserDenied,
+    /// 当前审批档 × 沙箱档直接拒绝（不会弹卡）。
+    PolicyForbidden,
+    /// 工具不在当前代理的有效工具集内（ADR-103，权限只降不升）。
+    ToolNotInToolset,
+    /// 沙箱在执行/落盘前拒绝。
+    SandboxDenied,
+    /// 目标越过工作区写边界。
+    OutsideWorkspace,
+}
+
+impl DenialKind {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::UserDenied => "user_denied",
+            Self::PolicyForbidden | Self::ToolNotInToolset => "policy_forbidden",
+            Self::SandboxDenied => "sandbox_denied",
+            Self::OutsideWorkspace => "outside_workspace",
+        }
+    }
+}
+
+/// 拒绝说明：类型 + 触发范围 + 目标（已知时）+ 一句人话与已核实的出路。
+///
+/// 格式与 `sandbox::execution_note` / `piped_stdio_hint` 一致：直接拼到工具输出末尾，
+/// 事件 `error` 用同一份文本——两处各写一遍文案，迟早会出现「界面说 A、模型看到 B」。
+/// `path` 只接受调用方已经掌握的目标（工具参数或拒绝消息里的路径）；拿不到就整段省略，
+/// 不推测、不拼宿主路径。
+pub fn denial_note(
+    kind: DenialKind,
+    tool: &str,
+    risk: RiskLevel,
+    policy: policy::SessionPolicy,
+    path: Option<&str>,
+) -> String {
+    let scope = format!(
+        "approval={} sandbox={} risk={}",
+        policy.approval.as_str(),
+        policy.sandbox.as_str(),
+        risk.as_str()
+    );
+    let target = path.map(|p| format!("；目标={p}")).unwrap_or_default();
+    let (why, next) = match kind {
+        DenialKind::UserDenied => (
+            "用户拒绝了这次调用，这条不会被自动放行。",
+            "说明这次操作要达成什么，或换一个更小的动作再问；不要原样重试，也不要换个说法绕过审批。",
+        ),
+        DenialKind::PolicyForbidden => (
+            "当前审批档与沙箱档直接拒绝这类操作，不会弹审批卡——等审批也不会被批准。",
+            "改用当前档位允许的动作（只读档只能读取与列目录）；确需执行请让用户切换审批或沙箱档后再试。",
+        ),
+        DenialKind::ToolNotInToolset => (
+            "该工具不在当前代理的有效工具集内，不会通过审批获得。",
+            "改用可用工具，或在结果里说明这个限制；不要向用户请求提权来获得工具。",
+        ),
+        DenialKind::SandboxDenied => (
+            "沙箱在执行或落盘前拒绝了这次操作，不是项目代码本身失败。",
+            "先按上面的原始错误调整（换路径、去掉被禁的写入）；提权被拒时原样重试不会再弹卡。",
+        ),
+        DenialKind::OutsideWorkspace => (
+            "目标不在工作区写入范围内，工具层在落盘前拒绝，文件没有被改动。",
+            "把目标改到工作区内（相对路径从工作区根解析），或让用户本人处理工作区外文件。",
+        ),
+    };
+    format!(
+        "拒绝说明：type={}；工具={tool}；范围 {scope}{target}\n{why}\n可行做法：{next}",
+        kind.as_str()
+    )
+}
+
 /// 一次门禁的代理身份（ADR-103 审批冒泡与记忆作用域）。
 #[derive(Debug, Clone, Copy)]
 pub struct GateSubject<'a> {
@@ -808,6 +886,40 @@ mod tests {
 
     fn args() -> Value {
         serde_json::json!({"command": "echo x"})
+    }
+
+    /// D9：拒绝说明必须可判读——类型、触发范围、目标路径都在，且不泄露宿主内部细节。
+    ///
+    /// 反向约束：不知道路径时**不得编造**（不写 `目标=`），否则模型会去改一个不存在的文件。
+    #[test]
+    fn denial_note_carries_type_scope_and_path() {
+        let policy = SessionPolicy {
+            approval: ApprovalMode::OnRequest,
+            sandbox: SandboxMode::WorkspaceWrite,
+        };
+        let note = denial_note(
+            DenialKind::UserDenied,
+            "apply_patch",
+            RiskLevel::WriteInWorkspace,
+            policy,
+            Some("src/lib.rs"),
+        );
+        assert!(note.contains("type=user_denied"), "{note}");
+        assert!(note.contains("approval=on_request"), "{note}");
+        assert!(note.contains("sandbox=workspace_write"), "{note}");
+        assert!(note.contains("risk=write_in_workspace"), "{note}");
+        assert!(note.contains("目标=src/lib.rs"), "{note}");
+
+        let no_path = denial_note(
+            DenialKind::PolicyForbidden,
+            "unified_exec",
+            RiskLevel::Execute,
+            policy,
+            None,
+        );
+        assert!(no_path.contains("type=policy_forbidden"), "{no_path}");
+        assert!(!no_path.contains("目标="), "没有路径时不得编造：{no_path}");
+        assert!(!no_path.contains("D:\\"), "拒绝说明不得泄露宿主内部路径：{no_path}");
     }
 
     /// 记录发出的所有事件：前缀放行审计与"never 不发审批卡"都靠它取证。

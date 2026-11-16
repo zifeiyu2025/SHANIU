@@ -2029,29 +2029,53 @@ impl AgentLoop {
                                 crate::permission::GateOutcome::Allowed
                                 | crate::permission::GateOutcome::AllowedEscalated => {}
                                 crate::permission::GateOutcome::Denied => {
+                                    let note = gate_denial_note(
+                                        crate::permission::DenialKind::UserDenied,
+                                        b_name,
+                                        &args_val,
+                                        risk_override
+                                            .unwrap_or_else(|| crate::permission::risk_of(b_name)),
+                                        turn_policy,
+                                    );
                                     emit(&sink, EventMsg::ToolCallEnd {
                                         call_id: b_call_id.clone(),
                                         exit_code: None,
-                                        error: Some("用户拒绝".into()),
+                                        error: Some(note.clone()),
                                         result: Some(ToolCallResult::Denied),
                                     });
                                     history.push(HistoryItem::FunctionCallOutput {
                                         call_id: b_call_id.clone(),
-                                        output: "用户拒绝了该工具调用".into(),
+                                        output: note,
                                     });
                                     resolved[offset] = true;
                                     continue;
                                 }
                                 crate::permission::GateOutcome::Forbidden => {
+                                    let kind = if call_subject
+                                        .allowed_tools
+                                        .is_some_and(|allowed| !allowed.contains(b_name))
+                                    {
+                                        crate::permission::DenialKind::ToolNotInToolset
+                                    } else {
+                                        crate::permission::DenialKind::PolicyForbidden
+                                    };
+                                    let note = gate_denial_note(
+                                        kind,
+                                        b_name,
+                                        &args_val,
+                                        risk_override
+                                            .unwrap_or_else(|| crate::permission::risk_of(b_name)),
+                                        turn_policy,
+                                    );
                                     emit(&sink, EventMsg::ToolCallEnd {
                                         call_id: b_call_id.clone(),
                                         exit_code: None,
-                                        error: Some("策略拒绝：当前代理无权使用该工具".into()),
+                                        error: Some(note.clone()),
                                         result: Some(ToolCallResult::Denied),
                                     });
                                     history.push(HistoryItem::FunctionCallOutput {
                                         call_id: b_call_id.clone(),
-                                        output: "该工具不在当前代理的有效工具集内（权限只降不升），不会通过审批获得；请改用可用工具或在结果中说明限制".into(),
+                                        output: note,
                                     });
                                     resolved[offset] = true;
                                     continue;
@@ -2127,7 +2151,7 @@ impl AgentLoop {
                                         b_name,
                                         b_call_id,
                                         &result,
-                                        turn_policy.sandbox,
+                                        turn_policy,
                                     ) {
                                         Ok(_) => {}
                                         Err(reason_local) => {
@@ -2246,29 +2270,51 @@ impl AgentLoop {
                     crate::permission::GateOutcome::Allowed
                     | crate::permission::GateOutcome::AllowedEscalated => {}
                     crate::permission::GateOutcome::Denied => {
+                        let note = gate_denial_note(
+                            crate::permission::DenialKind::UserDenied,
+                            name,
+                            &args_val,
+                            risk_override.unwrap_or_else(|| crate::permission::risk_of(name)),
+                            turn_policy,
+                        );
                         emit(&sink, EventMsg::ToolCallEnd {
                             call_id: call_id.clone(),
                             exit_code: None,
-                            error: Some("用户拒绝".into()),
+                            error: Some(note.clone()),
                             result: Some(ToolCallResult::Denied),
                         });
                         history.push(HistoryItem::FunctionCallOutput {
                             call_id: call_id.clone(),
-                            output: "用户拒绝了该工具调用".into(),
+                            output: note,
                         });
                         continue;
                     }
                     crate::permission::GateOutcome::Forbidden => {
                         // 策略拒绝与用户拒绝分开回填：模型应换策略，而不是重试等审批。
+                        let kind = if call_subject
+                            .allowed_tools
+                            .is_some_and(|allowed| !allowed.contains(name))
+                        {
+                            crate::permission::DenialKind::ToolNotInToolset
+                        } else {
+                            crate::permission::DenialKind::PolicyForbidden
+                        };
+                        let note = gate_denial_note(
+                            kind,
+                            name,
+                            &args_val,
+                            risk_override.unwrap_or_else(|| crate::permission::risk_of(name)),
+                            turn_policy,
+                        );
                         emit(&sink, EventMsg::ToolCallEnd {
                             call_id: call_id.clone(),
                             exit_code: None,
-                            error: Some("策略拒绝：当前代理无权使用该工具".into()),
+                            error: Some(note.clone()),
                             result: Some(ToolCallResult::Denied),
                         });
                         history.push(HistoryItem::FunctionCallOutput {
                             call_id: call_id.clone(),
-                            output: "该工具不在当前代理的有效工具集内（权限只降不升），不会通过审批获得；请改用可用工具或在结果中说明限制".into(),
+                            output: note,
                         });
                         continue;
                     }
@@ -2405,8 +2451,30 @@ impl AgentLoop {
                                 reason = TurnEndReasonLocal::Cancelled;
                                 break 'outer;
                             }
-                            // 拒绝/策略禁止：保留原始沙箱失败回填给模型
-                            _ => {}
+                            // 拒绝/策略禁止：保留原始沙箱失败，但把「提权被拒」说清楚——
+                            // 否则模型会把同一条命令原样再跑一遍，等一张不会再弹的卡。
+                            crate::permission::GateOutcome::Denied => {
+                                let original = match &result {
+                                    Err(crate::tool_router::ToolError::SandboxDenied(text)) => {
+                                        text.clone()
+                                    }
+                                    _ => String::new(),
+                                };
+                                result = Err(crate::tool_router::ToolError::SandboxDenied(format!(
+                                    "{original}；用户拒绝了「以完全访问重试」的申请"
+                                )));
+                            }
+                            crate::permission::GateOutcome::Forbidden => {
+                                let original = match &result {
+                                    Err(crate::tool_router::ToolError::SandboxDenied(text)) => {
+                                        text.clone()
+                                    }
+                                    _ => String::new(),
+                                };
+                                result = Err(crate::tool_router::ToolError::SandboxDenied(format!(
+                                    "{original}；当前策略不允许提权重试"
+                                )));
+                            }
                         }
                     }
                 }
@@ -2416,7 +2484,10 @@ impl AgentLoop {
                     name,
                     call_id,
                     &result,
-                    effective_sandbox,
+                    crate::permission::SessionPolicy {
+                        approval: turn_policy.approval,
+                        sandbox: effective_sandbox,
+                    },
                 ) {
                     Ok(output_text) => output_text,
                     Err(reason_local) => {
@@ -2832,6 +2903,46 @@ fn parallel_read_only(router: &ToolRouter, name: &str) -> bool {
         && !matches!(name, "todo_write" | "enter_plan_mode" | "wait_agent")
 }
 
+/// 门禁拒绝的说明（D9）：事件与回填共用同一份文本。
+///
+/// 目标路径只取工具参数里显式的 `path`（模型自己给的，不是宿主内部路径）；
+/// 补丁正文不解析——把整段补丁回显会把人话原因淹掉。
+fn gate_denial_note(
+    kind: crate::permission::DenialKind,
+    tool: &str,
+    args: &serde_json::Value,
+    risk: crate::events::RiskLevel,
+    policy: crate::permission::SessionPolicy,
+) -> String {
+    let path = args.get("path").and_then(serde_json::Value::as_str);
+    crate::permission::denial_note(kind, tool, risk, policy, path)
+}
+
+/// 从工具层错误里识别「这是沙箱/写边界拒绝」，并取出可展示的目标路径（D9）。
+///
+/// 只认工具层已经判定的两类：`SandboxDenied` 与写边界前缀。普通执行失败不附拒绝说明——
+/// 把每个非零退出都说成「被拒绝」会让模型误以为换路径就能过。
+fn denial_kind_for_error(
+    error: &crate::tool_router::ToolError,
+) -> Option<(crate::permission::DenialKind, Option<&str>)> {
+    use crate::permission::DenialKind;
+    match error {
+        crate::tool_router::ToolError::SandboxDenied(_) => Some((DenialKind::SandboxDenied, None)),
+        crate::tool_router::ToolError::Execution(text) => {
+            for marker in [
+                crate::tool_router::OUTSIDE_WORKSPACE_MARKER,
+                crate::tool_router::PARENT_DIR_MARKER,
+            ] {
+                if let Some(path) = text.strip_prefix(marker) {
+                    return Some((DenialKind::OutsideWorkspace, Some(path.trim())));
+                }
+            }
+            None
+        }
+        _ => None,
+    }
+}
+
 /// 回填一次工具执行结果：`ToolCallEnd` 事件 + 给模型的 tool 输出（附沙箱说明与图片引用）。
 ///
 /// 返回 `Err(reason)` 表示这次调用被取消，调用方必须结束整个回合；`Ok` 是写进历史前的
@@ -2845,7 +2956,7 @@ fn record_tool_result(
     name: &str,
     call_id: &str,
     result: &Result<crate::tool_router::ToolOutput, crate::tool_router::ToolError>,
-    sandbox: crate::config::SandboxMode,
+    policy: crate::permission::SessionPolicy,
 ) -> Result<String, TurnEndReasonLocal> {
     let output_text = match result {
         Ok(out) => {
@@ -2872,13 +2983,25 @@ fn record_tool_result(
             return Err(TurnEndReasonLocal::Cancelled);
         }
         Err(error) => {
+            // D9：拒绝要给可判读的原因（类型/范围/目标路径），且事件与回填同文。
+            let mut text = error.to_string();
+            if let Some((kind, path)) = denial_kind_for_error(error) {
+                text.push('\n');
+                text.push_str(&crate::permission::denial_note(
+                    kind,
+                    name,
+                    crate::permission::risk_of(name),
+                    policy,
+                    path,
+                ));
+            }
             let _ = sink.emit(&EventMsg::ToolCallEnd {
                 call_id: call_id.to_string(),
                 exit_code: None,
-                error: Some(error.to_string()),
+                error: Some(text.clone()),
                 result: Some(ToolCallResult::Error),
             });
-            error.to_string()
+            text
         }
     };
     history.push(HistoryItem::FunctionCallOutput {
@@ -2887,11 +3010,11 @@ fn record_tool_result(
             // 机器可读自报与「人话出路」分开拼：前者字段固定，不随界面文案漂移；
             // 后者只在真的命中管道 stdio 拒绝时出现，避免每条命令都带一段长文。
             let mut text = output_text.clone();
-            if let Some(note) = crate::sandbox::execution_note(name, sandbox, &output_text) {
+            if let Some(note) = crate::sandbox::execution_note(name, policy.sandbox, &output_text) {
                 text.push('\n');
                 text.push_str(&note);
             }
-            if let Some(hint) = crate::sandbox::piped_stdio_hint(name, sandbox, &output_text) {
+            if let Some(hint) = crate::sandbox::piped_stdio_hint(name, policy.sandbox, &output_text) {
                 text.push('\n');
                 text.push_str(hint);
             }
@@ -3081,6 +3204,69 @@ mod tests {
             self.0.lock().unwrap().push(msg.clone());
             Ok(())
         }
+    }
+
+    /// D9：沙箱/权限拒绝的「为什么被拒」必须**同一份**给模型和用户。
+    ///
+    /// 改前事件里只有原始错误文本、没有类型与触发范围，模型分不清「用户拒绝」与
+    /// 「工作区外写」，只能反复试探同一类操作。
+    #[test]
+    fn denied_result_carries_readable_reason_to_event_and_model() {
+        let policy = crate::permission::SessionPolicy {
+            approval: crate::config::ApprovalMode::OnFailure,
+            sandbox: crate::config::SandboxMode::WorkspaceWrite,
+        };
+        let (sink, store) = CapturingSink::new();
+        let sink: Arc<dyn EventSink> = Arc::new(sink);
+        let mut history = Vec::new();
+        let result = Err(crate::tool_router::ToolError::SandboxDenied(
+            "命令被沙箱拒绝".to_string(),
+        ));
+        record_tool_result(&mut history, &sink, "unified_exec", "call-d9", &result, policy)
+            .expect("失败结果不应结束回合");
+
+        let output = match history.as_slice() {
+            [HistoryItem::FunctionCallOutput { output, .. }] => output.clone(),
+            other => panic!("期望一条工具输出，实际 {other:?}"),
+        };
+        assert!(output.contains("type=sandbox_denied"), "{output}");
+        assert!(output.contains("approval=on_failure"), "{output}");
+        assert!(output.contains("sandbox=workspace_write"), "{output}");
+
+        let visible = match store.lock().unwrap().as_slice() {
+            [EventMsg::ToolCallEnd { error, .. }] => error.clone().expect("拒绝必须带原因"),
+            other => panic!("期望一条 ToolCallEnd，实际 {other:?}"),
+        };
+        assert!(visible.contains("type=sandbox_denied"), "{visible}");
+        assert!(
+            output.contains(&visible),
+            "用户看到的拒绝原因必须原样出现在回填给模型的内容里：\n事件={visible}\n历史={output}"
+        );
+    }
+
+    /// D9：工作区外写入被拒时，reason_code 与目标路径都要出现。
+    #[test]
+    fn outside_workspace_result_names_reason_and_path() {
+        let policy = crate::permission::SessionPolicy {
+            approval: crate::config::ApprovalMode::OnRequest,
+            sandbox: crate::config::SandboxMode::WorkspaceWrite,
+        };
+        let (sink, _store) = CapturingSink::new();
+        let sink: Arc<dyn EventSink> = Arc::new(sink);
+        let mut history = Vec::new();
+        let result = Err(crate::tool_router::ToolError::Execution(format!(
+            "{}{}",
+            crate::tool_router::OUTSIDE_WORKSPACE_MARKER,
+            "..\\outside.txt"
+        )));
+        record_tool_result(&mut history, &sink, "apply_patch", "call-d9b", &result, policy)
+            .expect("失败结果不应结束回合");
+        let output = match history.as_slice() {
+            [HistoryItem::FunctionCallOutput { output, .. }] => output.clone(),
+            other => panic!("期望一条工具输出，实际 {other:?}"),
+        };
+        assert!(output.contains("type=outside_workspace"), "{output}");
+        assert!(output.contains("目标=..\\outside.txt"), "{output}");
     }
 
     /// 转发 sink，并在第一条 `ToolCallBegin` 通过时唤醒等待者。
