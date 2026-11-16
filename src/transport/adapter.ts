@@ -1042,8 +1042,12 @@ export function createAdapter(options: AdapterOptions): { remote: unknown; dispo
    *
    * 两条上游硬约束决定了区间的取法：
    * ① `sourceEventSeqs` 必须覆盖区间内每个被遮蔽节点，少一个客户端 `foldSurface` 就拒绝；
-   * ② surface 的 0 号节点若是 system/message，只允许 system→system 改写它
-   *    （`assertSystemHeadRewrite`）——所以系统提示词永远留在区间之外。
+   * ② system/message **不进区间**（`assertSystemHeadRewrite` 保护头节点，v4 档案的
+   *    protected-head 也要求系统提示词始终在表面里）。判据是 surface 里 system 的**实际 seq**，
+   *    不是索引 0：真机实时路径 surface[0] 是乐观推入的 user/message（用户按下发送就落气泡），
+   *    宿主的 `system_prompt` 随后才到、落在中间。只认 0 号会让 replace 把系统提示词一起遮掉，
+   *    客户端 `inspectSystemPrompt` 从此粘在 `uncertain`、surface 再无系统节点——0.2.9 真机
+   *    实时空白就是这条。所以区间取 system 之后的那一段；system 在末尾时改遮它之前的连续段。
    *
    * surface 为空（档案第一条就是锚点）时**不静默跳过**：先补一个空内容 user/message
    * 作为锚点占位（它立刻被替换遮蔽、不会渲染），再按常规替换。这样实时与回放都产出
@@ -1059,10 +1063,15 @@ export function createAdapter(options: AdapterOptions): { remote: unknown; dispo
     hiddenSeqs: readonly number[],
     sourceCommandId?: string,
   ): number => {
-    const head = journal.surfaceSeqs[0]
-    const anchors = head !== undefined && journal.surfaceTypes.get(head) === 'system/message'
-      ? journal.surfaceSeqs.slice(1)
-      : [...journal.surfaceSeqs]
+    const nodes = journal.surfaceSeqs
+    // 系统提示词按**事件里的实际 seq** 定位，不按索引 0（见上方 ②）：replace 只接受一段
+    // 连续区间，所以取「最后一段连续的非 system 节点」——区间里保证没有任何 system/message。
+    const isSystemNode = (seq: number): boolean => journal.surfaceTypes.get(seq) === 'system/message'
+    let last = nodes.length - 1
+    while (last >= 0 && isSystemNode(nodes[last]!)) last -= 1
+    let first = last
+    while (first > 0 && !isSystemNode(nodes[first - 1]!)) first -= 1
+    let anchors: number[] = last < 0 ? [] : nodes.slice(first, last + 1)
     if (anchors.length === 0) {
       console.warn(`[SHANIU] 压缩节点没有可替换的会话表面，改用自建锚点后替换（compactionId=${compactionId}）`)
       anchors.push(pushEvent(journal, 'user/message', {
