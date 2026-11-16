@@ -8,6 +8,9 @@
   - `delay()`：always 无次数上限；`Retry-After` 超过 10s 上限时改用本地指数退避
     （对齐 dsh `llm-retry/index.ts:228-233`），bounded 仍“超上限即放弃”。
 - `src-tauri/src/config.rs`：`[model] retry_mode`（`bounded` 缺省），拼错直接报错。
+  `RetryMode` 枚举归属 `config`（共享基础设施）：`config` 不能反向依赖
+  `model_client`（FF-1），由 `model_client::retry` 按 E20 正向引用；首版放错方向，
+  CI gate 的 `check-deps` 报了 2 条违规，已在后续提交修正。
 - `src-tauri/src/agent_loop/mod.rs`
   - `from_config` 把 `retry_mode` 灌进策略；always 下 `max_retries` 不参与。
   - `await_retry`：always 不发 `exhausted`，事件 `unbounded = true`、`max_retries = 0`；

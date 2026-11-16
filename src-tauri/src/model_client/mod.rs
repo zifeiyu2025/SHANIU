@@ -9,7 +9,8 @@ pub mod provider;
 mod retry;
 
 pub use error::{ModelError, ModelErrorKind};
-pub use retry::{random01, RetryMode, RetryPolicy};
+pub use crate::config::RetryMode;
+pub use retry::{random01, RetryPolicy};
 
 use eventsource_stream::{Event, Eventsource};
 use futures::{Stream, StreamExt};

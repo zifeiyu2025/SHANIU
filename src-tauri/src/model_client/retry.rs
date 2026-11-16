@@ -8,26 +8,9 @@
 
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
-use serde::{Deserialize, Serialize};
+use crate::config::RetryMode;
 
 use super::ModelErrorKind;
-
-/// 重试次数语义（D5，additive）。
-///
-/// 默认 [`RetryMode::Bounded`]，与 D5 之前完全等价；[`RetryMode::Always`] 是上游
-/// dsh `llm-retry` 的 `mode: 'always'` 语义：没有次数上限、也不看失败类别。
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
-#[serde(rename_all = "snake_case")]
-pub enum RetryMode {
-    /// 最多 `max_retries` 次，且只重 [`RetryPolicy::is_retryable`] 的瞬态失败（默认）。
-    #[default]
-    Bounded,
-    /// 不设次数上限、不筛失败类别，直到成功或被取消。
-    ///
-    /// 只适合「失败多来自网关/代理抖动」的场景；鉴权、参数错误这类确定性失败在
-    /// 这个模式下也会被重试，所以必须由用户显式开启，默认不开。
-    Always,
-}
 
 /// 重试策略。字段公开：配置装配与测试都直接按值构造。
 #[derive(Debug, Clone, PartialEq)]

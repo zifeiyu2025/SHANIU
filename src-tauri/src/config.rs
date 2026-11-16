@@ -834,7 +834,7 @@ pub struct ModelConfig {
     /// 瞬态失败；`always` = 上游 dsh 语义，不限次数也不筛失败类别，直到成功或被取消。
     /// 缺省必须是 `bounded`，保证旧配置行为一字不变。
     #[serde(default)]
-    pub retry_mode: crate::model_client::RetryMode,
+    pub retry_mode: RetryMode,
     /// 是否发送 Responses 扩展字段（D1：`store` / `tool_choice` / `parallel_tool_calls` /
     /// `include` / `prompt_cache_key`）。默认 true；不认这些键的老网关关掉后，
     /// 请求体回到 2026-11 之前的 5 键形状。
@@ -867,7 +867,7 @@ impl Default for ModelConfig {
             model: String::new(),
             max_turns: 0,
             max_retries: 5,
-            retry_mode: crate::model_client::RetryMode::Bounded,
+            retry_mode: RetryMode::Bounded,
             responses_extras: true,
             parallel_tool_calls: true,
             reasoning_replay: true,
@@ -1048,6 +1048,26 @@ pub enum OsSandbox {
     /// **显式回退**：只有受限令牌 + Job 的逻辑沙箱，没有路径级边界。
     /// 选中后 UI 与日志必须标注「当前未启用 OS 沙箱」，禁止静默降级。
     Logical,
+}
+
+/// 重试次数语义（D5，additive）。
+///
+/// 默认 [`RetryMode::Bounded`]，与 D5 之前完全等价；[`RetryMode::Always`] 是上游
+/// dsh `llm-retry` 的 `mode: 'always'` 语义：没有次数上限、也不看失败类别。
+///
+/// 归属放在共享基础设施 `config`（docs/01 §2.3.1）：它既是配置项，又不能让
+/// `config` 反向依赖 `model_client`；`model_client::retry` 按 E20 正向引用它。
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum RetryMode {
+    /// 最多 `max_retries` 次，且只重瞬态失败（默认）。
+    #[default]
+    Bounded,
+    /// 不设次数上限、不筛失败类别，直到成功或被取消。
+    ///
+    /// 只适合「失败多来自网关/代理抖动」的场景；鉴权、参数错误这类确定性失败在
+    /// 这个模式下也会被重试，所以必须由用户显式开启，默认不开。
+    Always,
 }
 
 /// 三档文件效果（对齐 DSH `SandboxMode`，docs/04 §4 `[sandbox] mode`）。
@@ -3175,9 +3195,9 @@ mod tests {
     #[test]
     fn retry_mode_defaults_to_bounded_and_accepts_always() {
         let old: AppConfig = toml::from_str("[model]\nbase_url = \"https://a/v1\"\nmodel = \"m1\"\n").unwrap();
-        assert_eq!(old.model.retry_mode, crate::model_client::RetryMode::Bounded);
+        assert_eq!(old.model.retry_mode, RetryMode::Bounded);
         let always: AppConfig = toml::from_str("[model]\nretry_mode = \"always\"\n").unwrap();
-        assert_eq!(always.model.retry_mode, crate::model_client::RetryMode::Always);
+        assert_eq!(always.model.retry_mode, RetryMode::Always);
         assert!(
             toml::from_str::<AppConfig>("[model]\nretry_mode = \"sometimes\"\n").is_err(),
             "未知模式必须拒绝"
