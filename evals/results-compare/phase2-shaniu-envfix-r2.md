@@ -127,9 +127,10 @@ Adding a new variant breaks that match, requiring a manual arm`），73 行列�
 
 **根因一（工具缺陷，可直接复现）**：`apply_patch` 把同一 `*** Update File` 段里的多个 `@@`
 当无意义标记丢弃、并成一条连续序列。本轮 3 次多块补丁（79 六块 / 86 三块 / 91 两块）**3 次全被拒**，
-单块 11 次里 10 次成功——多块必失败，相关度 100%。后果是模型退回「一次只改一处」，
-3 次被拒 + 3 次拆开重发 = 6 个往返，且再没机会把 `error_codes.rs` 与 `key_check.rs` 一起改完。
-参考实现 `src/dsh/packages/fs/fs-patch/src/parse.ts`（按 `@@` 切块，`@@ <原文>` 为锚点）与
+单块 11 次里 10 次成功——多块必失败，相关度 100%。代价精确到轮：补丁 79 那 6 块覆盖了整个
+`error.rs`，实际用了 10 个往返（79 + 82…101）才落齐，其中 86、91 又被同一原因拒了两次；
+多块支持后是 1 个往返，**净浪费 9 轮 / 32 轮**。参考实现
+`src/dsh/packages/fs/fs-patch/src/parse.ts`（按 `@@` 切块，`@@ <原文>` 为锚点）与
 `apply.ts`（`lineIndex` 游标逐块推进）都不是这个语义。
 已修：`src-tauri/src/tools/apply_patch.rs` 新增 `UpdateHunk` / `apply_hunks`，红绿与反向验证见
 `docs/evidence/2026-11-17/`。
