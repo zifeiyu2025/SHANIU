@@ -103,6 +103,50 @@ wall 口径与上轮一致（agent 段 + 判据段，不含每题准备/预热�
 - 该题收口是 `turn_completed.reason = failed`（`turn_error.code = VERIFY_FAILED`），**不是 `budget_exhausted`**：32 轮打满后宿主在统一收口点补跑了 `cargo check --all-targets`（exit 101），据此把收口改成 `failed`。`raw/shaniu-run.log` 该题为 `[agent] end ... reason=Failed`、`收口=Failed`。
 - 闸门**跑过且报了红**，没有漏判：整题只有 1 条 `verification_result`（turn 32），失败原因是模型 45 次工具调用（14 `apply_patch` / 15 `search` / 12 `read_file` / 4 `list_dir`）里 0 次命令调用，直到第 32 轮仍在 `apply_patch`，循环内闸门（只在「本轮不要工具」时触发）一次都没被问到。缺的是「悬崖之前的裁决」，不是「裁决错了」——已按此补「截止检查点」（见 `docs/04-协议规范.md` §截止检查点）。
 
+### 二次归因（2026-11-17，逐轮复核 + 真机红用例）
+
+**先纠正一处口径**：本轮被测二进制 `bb5e17c` 里**没有**截止检查点。`checkpoint_due` 是
+`79d91fc`（2026-11-16 16:36）引入的，而本轮 16:03:50 已跑完。所以这条红**不能**用来证明
+「截止检查点无效」——它测的是检查点之前的代码。`git show bb5e17c:src-tauri/src/agent_loop/mod.rs`
+里搜不到 `checkpoint_due`。
+
+**轮次去向（32 请求 / 45 次工具调用，`raw/rollouts/.../repo-feat-context-overflow-code-r1.jsonl`）**：
+
+| 段 | 行号 | 请求数 | 内容 |
+|---|---|---|---|
+| 探索 | 5–75 | 18 | `list_dir`/`search`/`read_file`，含一次按字面量搜 `BAD_REQUEST\|bad_request`（36）与三次重复搜 `ModelErrorKind`（24 / 74 / 75） |
+| 改文件 | 78–113 | 14 | 14 次 `apply_patch`（79 一次带 6 个 `@@` 块直接改 error.rs 全篇） |
+| 运行 | — | **0** | 全程 0 次 `unified_exec`，没跑过 `cargo check/test` |
+| 收口 | 115–117 | 1 | 宿主 `cargo check --all-targets` exit 101，`E0004`，`reason=failed` |
+
+模型对「要改哪几处」是清楚的，不是没看出来：23 / 37 / 42 / 56 / 73 / 78 行的 `reasoning`
+反复确认 `key_check.rs` 是穷尽 match（37 行原文 `I saw key_check.rs match with all 10 variants.
+Adding a new variant breaks that match, requiring a manual arm`），73 行列出 8 项清单，
+78 行排出 4 步顺序（`error.rs` → `error_codes.rs` → `key_check.rs` → `retry.rs`）。
+它只走完第 1 步。
+
+**根因一（工具缺陷，可直接复现）**：`apply_patch` 把同一 `*** Update File` 段里的多个 `@@`
+当无意义标记丢弃、并成一条连续序列。本轮 3 次多块补丁（79 六块 / 86 三块 / 91 两块）**3 次全被拒**，
+单块 11 次里 10 次成功——多块必失败，相关度 100%。后果是模型退回「一次只改一处」，
+3 次被拒 + 3 次拆开重发 = 6 个往返，且再没机会把 `error_codes.rs` 与 `key_check.rs` 一起改完。
+参考实现 `src/dsh/packages/fs/fs-patch/src/parse.ts`（按 `@@` 切块，`@@ <原文>` 为锚点）与
+`apply.ts`（`lineIndex` 游标逐块推进）都不是这个语义。
+已修：`src-tauri/src/tools/apply_patch.rs` 新增 `UpdateHunk` / `apply_hunks`，红绿与反向验证见
+`docs/evidence/2026-11-17/`。
+
+**根因二（闸门给的信息不够，已在 `79d91fc` 修过但未进本轮二进制）**：闸门只在「本轮不要工具」
+或循环退出后裁决。模型 32 轮里每轮都要工具，于是整题只在最后一轮拿到一次已无轮次可修的裁决。
+`79d91fc` 的截止检查点（`turn*4 >= max_turns*3`、`turn < max_turns`、每任务一次）正是补这个时机；
+本轮模型在第 24 轮时 `error.rs` 已改过（脏），检查点会在那时给出 `E0004`，此后还剩 8 轮。
+
+**三分法判定**：不是「模型能力不足」——它在 26 / 77 行两次读到 `key_check.rs` 的穷尽 match，
+78 行的计划把三处改动都列对了，缺的是轮次与一次能编译的反馈。归因为
+**「工具给的信息/能力不对」+「轮次被工具摩擦吃掉」**，不是「预算被环境吃掉」（本轮
+`CARGO_TARGET_DIR` 绕行 0 处、400 故障 0 次）。
+
+**还没有的验证**：本轮没有重跑评测，所以「修掉多块补丁 + 带上截止检查点之后这题能不能过」
+**没测过**，不能写成已解决。重跑时请用含 `79d91fc` 与本修的提交，口径照旧（32 轮、判据不改）。
+
 
 ## r1 作废说明
 
