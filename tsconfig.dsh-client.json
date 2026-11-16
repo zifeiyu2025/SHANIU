@@ -2958,6 +2958,7 @@
   "./src/dsh/packages/client/ui-chat/src/client/conversation-nodes/request-prompt.ts",
   "./src/dsh/packages/client/ui-chat/src/client/conversation-nodes/retry.ts",
   "./src/dsh/packages/client/ui-chat/src/client/conversation-nodes/tool.ts",
+  "./src/dsh/packages/client/ui-chat/src/client/conversation-nodes/turn-ending.ts",
   "./src/dsh/packages/client/ui-chat/src/client/conversation-nodes/turn-error.ts",
   "./src/dsh/packages/client/ui-chat/src/client/conversation-nodes/turn-max-tokens.ts",
   "./src/dsh/packages/client/ui-chat/src/client/conversation-nodes/turn-navigation.ts",

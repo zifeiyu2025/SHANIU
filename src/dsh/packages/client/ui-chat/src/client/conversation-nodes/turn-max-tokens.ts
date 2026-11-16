@@ -3,6 +3,7 @@ import type {
   ConversationMatch, ConversationNodeContext, ConversationNodeDefinition, TurnMaxTokensNode,
 } from '@deepseek-ai/dsh-client-ui-conversation/client'
 import { CHAT_SYNTHETIC_SEQ_OFFSETS, chatNode } from './common.ts'
+import { turnEnding } from './turn-ending.ts'
 
 declare module '../contract/chat-nodes.ts' {
   interface ChatNodeDataMap {
@@ -39,7 +40,7 @@ function noticeAnchor(context: ConversationNodeContext<TurnMaxTokensState>, seq:
 }
 
 function stateFrom(match: ConversationMatch): TurnMaxTokensState | undefined {
-  if (match.event.type !== 'turn/end' || match.event.data.reason.kind !== 'max-tokens') return undefined
+  if (match.event.type !== 'turn/end' || turnEnding(match.event.data.reason).kind !== 'truncated') return undefined
   return { turn: match.event.data.turn, seq: match.event.seq, time: match.event.time }
 }
 
@@ -48,7 +49,7 @@ export const turnMaxTokensDefinition: ConversationNodeDefinition<TurnMaxTokensSt
   kind: 'turn-max-tokens',
   target: 'chat',
   match: (event) => {
-    if (event.type === 'turn/end' && event.data.reason.kind === 'max-tokens') {
+    if (event.type === 'turn/end' && turnEnding(event.data.reason).kind === 'truncated') {
       return { id: String(event.data.turn), role: 'start' }
     }
     return null

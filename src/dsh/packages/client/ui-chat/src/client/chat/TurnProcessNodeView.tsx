@@ -2,6 +2,8 @@ import { memo } from 'react'
 import { IconChevronDownOutlineRegular } from '@deepseek-ai/dsh-client-ui-primitives'
 import type { ChatNodeViewProps } from '../contract/slots.ts'
 import { turnProcessAlwaysOpen } from '../contract/turn-process.ts'
+import type { TurnEndingKind } from '../conversation-nodes/turn-ending.ts'
+import { turnEnding } from '../conversation-nodes/turn-ending.ts'
 import { formatRunDuration } from './message-chrome.ts'
 import a11yCss from './accessibility.module.css'
 import css from './TurnProcessNodeView.module.css'
@@ -11,26 +13,48 @@ export type TurnProcessOutcome =
   | { readonly kind: 'stopped' }
   | { readonly kind: 'failed' }
   | { readonly kind: 'unknown' }
+  | { readonly kind: 'truncated' }
   | { readonly kind: 'worked' }
   | { readonly kind: 'took'; readonly elapsedMs: number }
 
 /**
- * Map a Turn's end reason to its control label.
+ * Map a Turn's ending to its control label.
  *
- * `indeterminate` is SHANIU's "no recorded ending" reason (see `turn-error.ts`).
- * It must not fall through to the completed branch: that renders
- * 「已完成，用时 N」for a Turn the archive never concluded, which contradicts
- * the「本轮状态未知」row inside the same Turn. Unknown means unknown — no
- * duration either, because a duration would again read as "it finished".
+ * The ending comes from `turnEnding` — the single judgement shared with the row
+ * inside the Turn. Re-judging `reason.kind` here is what produced the 2026-11-17
+ * smoke contradiction:「本轮运行失败」row and「已完成，用时 5 秒」header for the
+ * same truncated Turn. `truncated` and `unknown` carry no duration: a duration
+ * would read as "it finished".
  */
 export function turnProcessOutcome(
-  reasonKind: string | undefined,
+  ending: TurnEndingKind,
   elapsedMs: number | undefined,
 ): TurnProcessOutcome {
-  if (reasonKind === 'aborted' || reasonKind === 'interrupted') return { kind: 'stopped' }
-  if (reasonKind === 'error') return { kind: 'failed' }
-  if (reasonKind === 'indeterminate') return { kind: 'unknown' }
+  if (ending === 'stopped') return { kind: 'stopped' }
+  if (ending === 'failed') return { kind: 'failed' }
+  if (ending === 'unknown') return { kind: 'unknown' }
+  if (ending === 'truncated') return { kind: 'truncated' }
   return elapsedMs === undefined ? { kind: 'worked' } : { kind: 'took', elapsedMs }
+}
+
+/** 结局 → 组标题词典键；截断/失败/未知各有自己的说法，不借用「已完成」。 */
+type TurnProcessLabelKey =
+  | 'message.stopped'
+  | 'message.turnProcess.failed'
+  | 'message.turnUnknown'
+  | 'message.turnProcess.truncated'
+  | 'message.turnProcess.took'
+  | 'message.turnProcess.worked'
+
+function outcomeLabelKey(outcome: TurnProcessOutcome): TurnProcessLabelKey {
+  switch (outcome.kind) {
+    case 'stopped': return 'message.stopped'
+    case 'failed': return 'message.turnProcess.failed'
+    case 'unknown': return 'message.turnUnknown'
+    case 'truncated': return 'message.turnProcess.truncated'
+    case 'took': return 'message.turnProcess.took'
+    case 'worked': return 'message.turnProcess.worked'
+  }
 }
 
 /** Settled Turn duration and process disclosure above its content. */
@@ -44,21 +68,16 @@ export const TurnProcessNodeView = memo(function TurnProcessNodeView({
     : undefined
   if (turn?.status !== 'closed') return null
   const canCollapse = turnProcess.foldable && turnProcess.hasContent && !turnProcessAlwaysOpen(node)
-  const reason = turn.end?.data.reason.kind
+  // 结局只问 `turnEnding`（与回合内的结局行同一判定）；这里只做展示映射。
+  const ending = turn.end === undefined ? 'completed' : turnEnding(turn.end.data.reason).kind
   const elapsedMs = turn.start === undefined || turn.end === undefined ? undefined
     : Math.max(1000, turn.end.time - turn.start.time)
-  const outcome = turnProcessOutcome(reason, elapsedMs)
+  const outcome = turnProcessOutcome(ending, elapsedMs)
   const duration = outcome.kind === 'took' ? formatRunDuration(outcome.elapsedMs, t) : undefined
-  // Stops, failures and unknown endings replace elapsed time; the rest keep it.
-  const label = outcome.kind === 'stopped' ? t('message.stopped')
-    : outcome.kind === 'failed' ? t('message.turnProcess.failed')
-      : outcome.kind === 'unknown' ? t('message.turnUnknown')
-        : outcome.kind === 'took' ? t('message.turnProcess.took')
-          : t('message.turnProcess.worked')
-  const announcement = outcome.kind === 'stopped' ? t('message.stopped')
-    : outcome.kind === 'failed' ? t('message.turnProcess.failed')
-      : outcome.kind === 'unknown' ? t('message.turnUnknown')
-        : t('message.turnProcess.worked')
+  // Stops, failures, unknown and truncated endings replace elapsed time; the rest keep it.
+  const label = t(outcomeLabelKey(outcome))
+  // 屏幕阅读器播报的是「结束了什么」；带用时的完成沿用旧的「已完成」播报。
+  const announcement = t(outcome.kind === 'took' ? 'message.turnProcess.worked' : outcomeLabelKey(outcome))
   return (
     <>
       <span className={a11yCss.visuallyHidden} role="status" aria-live="polite" aria-atomic="true">{announcement}</span>
