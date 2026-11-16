@@ -68,6 +68,13 @@ export type SessionEntryLike =
     readonly images?: readonly SessionImageRefWire[]
     /** 事件落档时刻（Unix 毫秒）；缺省或 0 = 旧档案未记录（A0-4）。 */
     readonly at_ms?: number
+    /**
+     * 采样步号（0 起，与实时 `step/start` 同码；N4）。
+     *
+     * 缺省 = 档案没记、结局缺 `iterations`、或还原步数与结局对不上：导出与重开
+     * 都必须留空，禁止拿消息条数凑。
+     */
+    readonly step?: number
   }
   | {
     /**
@@ -105,6 +112,8 @@ export type SessionEntryLike =
     readonly output?: string
     /** 事件落档时刻；缺省或 0 = 旧档案未记录（A0-4）。 */
     readonly at_ms?: number
+    /** 发出这次调用的采样步号（口径同 `message.step`；N4）。 */
+    readonly step?: number
   }
   | {
     /** 回合结局（A0-3）：`completed` / `cancelled` / `failed` / `budget_exhausted`。 */

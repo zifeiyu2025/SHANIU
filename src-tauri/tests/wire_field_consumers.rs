@@ -55,23 +55,25 @@ const RULES: &[Rule] = &[
     Rule {
         owner: "SessionEntry",
         variant: "Message",
-        fields: "role text reasoning at_ms images",
+        // `step`：导出与重开都读它核对步号（N4）；缺省 = 不编，导出留空。
+        fields: "role text reasoning at_ms images step",
         overrides: &[],
     },
     Rule {
         owner: "SessionEntry",
         variant: "ToolCall",
-        fields: "call_id tool arguments output at_ms",
+        fields: "call_id tool arguments output at_ms step",
         overrides: &[],
     },
     Rule {
         owner: "SessionEntry",
         variant: "TurnEnd",
+        // `iterations`：导出写进 `turn/end`，用来核对步数（N4）。
         fields: "turn task_id iterations reason at_ms error",
-        overrides: &[
-            ("task_id", Status::BackendOnly("Phase 3 的 reconcile 幂等键；前端只透传、不参与判定")),
-            ("iterations", Status::BackendOnly("采样统计与审计；前端只透传、不参与判定")),
-        ],
+        overrides: &[(
+            "task_id",
+            Status::BackendOnly("Phase 3 的 reconcile 幂等键；前端只透传、不参与判定"),
+        )],
     },
     Rule {
         owner: "SessionEntry",

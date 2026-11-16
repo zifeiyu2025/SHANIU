@@ -153,3 +153,49 @@
 **仍未核实**：N3/N6 的界面口径只在单测与回放层证明；真机重跑后才能把
 `docs/smoke/2026-11-17-9af8431/REPORT.md` 的 N3/N6 改判 PASS。
 
+## 追加：0.2.9 真机冒烟 P2 步数口径（N4 导出丢步 / N5 重开多一步）
+
+基准提交 `efa2681`（本批在其上做，`4421ee3` 已包含）。
+
+**N5 结论：已被 `4421ee3` 覆盖，本批不重复改。**
+该笔把回放 `closeStep` 加上 `stepHasContent` 门槛（空 step 不计数），并锁住重复重开。
+证据：反向对照 `n2-steps-red.log`（旧实现重开 `steps: 3, turns: 2`）与修复后
+`n2-steps-green.log`（`steps: 2, turns: 1`），用例
+`N2：审批挂起时强杀——重开留「已失效」记录、不造假卡、步数与实时一致`。
+N5 报的症状正是「挂起强杀 → 重开多一步」，所以重开口径不再动。
+
+**N4 根因**：导出只读 `load_session` 的投影条目，投影只带回合结局的总步数、不记每条
+属于第几步；导出于是丢掉 `turn/end.iterations`、把每条 `step` 写死 1。真机 04 的第 1 步
+只有工具调用、没有助手正文，也不能靠消息条数反推。
+
+**N4 修法（真值在宿主还原，导出侧不猜）**：
+
+- `project_slots_with` 按迭代边界还原：`agent_loop` 每个采样迭代先写模型侧条目
+  （助手消息 / 推理 / 工具调用），再写该批全部输出，所以「输出之后再出现的第一个模型侧
+  条目」就是下一步；`StepCursor` 只在这时 +1（0 起，与实时 `step/start` 同码）。
+- 还原值必须等于结局行 `iterations` 才保留；结局缺 `iterations`、与还原值对不上、
+  或整回合没有结局行，都把本回合已填 `step` 清回 `None`。
+- `SessionEntry.Message/ToolCall` 透传可选 `step`（旧档线形状不变，`step` 键不写）；
+  重开带 `step` 时按它对齐，缺省才退回旧的「按助手消息切步」口径。
+- 导出 `turn/end` 写 `iterations`，条目写真实 `step`；缺 `iterations` 或步号个数与
+  `iterations` 不符时写 `stepsUnavailable: true`，绝不补数。
+
+**用例**：
+
+| 文件 | 内容 |
+|---|---|
+| `rust-n4-red.log` | 反向对照一：Rust 推导退回「步号恒 0」，投影用例 1 failed |
+| `rust-n4-green.log` | 修复后：`cargo test --lib projection_` 3 passed |
+| `n4-red.log` | 反向对照二：导出退回 `step: 1` 且不带 `iterations`，3 条 N4 用例红 |
+| `n4-green.log` | 修复后：N4 用例 3 passed（含四处一致与重复重开） |
+| `n4-cargo-test-full.log` | `cargo test` 全量：lib 1150 passed / 4 ignored，集成全绿 |
+| `n4-clippy.log` | `cargo clippy --all-targets -- -D warnings` 通过 |
+| `n4-typecheck.log` | `pnpm typecheck` 通过 |
+| `n4-vitest-full.log` | `pnpm test`（已排除 `scratch/**`）：45 files / 509 passed |
+| `n4-check-deps.log` | `check-deps.ps1`：0 违规 |
+| `n4-check-doc-claims.log` | `check-doc-claims.ps1`：A 类缺口 0（B 类为既有项） |
+
+**仍未核实**：真机重跑（多步会话导出、挂起强杀重开）尚未执行；本批只证明投影/导出/重开
+三处口径与用例，`docs/smoke/2026-11-17-9af8431/REPORT.md` 的既有结论不改，N4/N5 仍以
+重跑为准。
+

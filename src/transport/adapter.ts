@@ -2007,6 +2007,19 @@ export function createAdapter(options: AdapterOptions): { remote: unknown; dispo
       }
       stepOpen = false
     }
+    /**
+     * 档案带真实步号时按它对齐（N4）：同号复用，异号先收口再开。
+     *
+     * 步号由宿主在投影时按迭代边界还原、并用结局行 `iterations` 核对过；重开直接
+     * 采信它，才能和实时 `step/start`、导出 `turn/end.iterations` 三处同码。
+     * 缺步号（旧档/被杀回合）才退回下面按助手消息切步的旧口径。
+     */
+    const alignStep = (step: number): void => {
+      if (stepOpen && journal.step === step) return
+      if (stepOpen) closeStep()
+      journal.step = step
+      openStep(step)
+    }
     /** 已按结局行统计过的用户回合号（防重复结局行把一轮数成两轮）。 */
     const concludedTurns = new Set<number>()
     // 默认收口只用于「回合没有可信结局」：说「状态未知」，不说「已中止」
@@ -2136,7 +2149,9 @@ export function createAdapter(options: AdapterOptions): { remote: unknown; dispo
           // 档案开头就是助手消息（压缩锚点之类）：也得给它一个回合，否则这条消息
           // 在界面上没有归属，会被静默丢掉。
           if (!journal.taskOpen) startTurn()
-          if (!stepOpen) {
+          if (entry.step !== undefined) {
+            alignStep(entry.step)
+          } else if (!stepOpen) {
             journal.step += 1
             openStep(journal.step)
           } else if (stepHasAssistant) {
@@ -2185,7 +2200,12 @@ export function createAdapter(options: AdapterOptions): { remote: unknown; dispo
           }
         } else if (entry.kind === 'tool_call') {
           if (!journal.taskOpen) startTurn()
-          if (!stepOpen) { journal.step += 1; openStep(journal.step) }
+          if (entry.step !== undefined) {
+            alignStep(entry.step)
+          } else if (!stepOpen) {
+            journal.step += 1
+            openStep(journal.step)
+          }
           stepHasContent = true
           pushEvent(journal, 'tool/call', {
             turn: journal.turn,

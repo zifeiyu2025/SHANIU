@@ -2988,6 +2988,118 @@ describe('适配层的命令面映射', () => {
     expect(archivedEnd?.iterations).toBe(liveSummary.steps)
   })
 
+  it('N4：步号四处一致（实时 = 重开 = 导出 = rollout），重复重开数值不变', async () => {
+    // 真机 04 的形状：第 1 步只有工具调用（没有助手正文），第 2 步仍是调用，
+    // 第 3 步才是正文。旧导出把每条 step 写死 1，「5 步」在导出侧无从核对。
+    const liveBridge = scriptedBridge()
+    const live = createAdapter({ bridge: liveBridge })
+    const liveSession = faceOf(live.remote).session
+    await liveSession.prompt({
+      sessionId: 'agent-n4',
+      requestId: 'rpc-n4',
+      content: [{ type: 'text', text: '改 sum' }],
+    })
+    liveBridge.emit('agent-n4', { type: 'run_started', run: 1 })
+    liveBridge.emit('agent-n4', { type: 'turn_started', turn: 1 })
+    liveBridge.emit('agent-n4', { type: 'tool_call_begin', call_id: 'c1', tool: 'read_file', args: {} })
+    liveBridge.emit('agent-n4', { type: 'tool_call_end', call_id: 'c1', exit_code: 0, error: null, result: 'ok' })
+    liveBridge.emit('agent-n4', { type: 'tool_call_begin', call_id: 'c2', tool: 'list_dir', args: {} })
+    liveBridge.emit('agent-n4', { type: 'tool_call_end', call_id: 'c2', exit_code: 0, error: null, result: 'ok' })
+    liveBridge.emit('agent-n4', { type: 'turn_started', turn: 2 })
+    liveBridge.emit('agent-n4', { type: 'tool_call_begin', call_id: 'c3', tool: 'unified_exec', args: {} })
+    liveBridge.emit('agent-n4', { type: 'tool_call_end', call_id: 'c3', exit_code: 0, error: null, result: 'ok' })
+    liveBridge.emit('agent-n4', { type: 'turn_started', turn: 3 })
+    liveBridge.emit('agent-n4', { type: 'agent_message_delta', delta: '改好了' })
+    liveBridge.emit('agent-n4', { type: 'turn_completed', turn: 3, reason: 'completed' })
+
+    const liveIterator = liveSession.follow({ address: { kind: 'session', sessionId: 'agent-n4' } })
+    const liveEvents = eventsOf((await liveIterator.next()).value as Record<string, unknown>)
+    await liveIterator.return?.(undefined)
+    live.dispose()
+
+    // 宿主投影给前端的档案形状：step 是投影按迭代边界还原、再用 iterations 核对过的值。
+    const archive = [
+      { kind: 'message', role: 'user', text: '改 sum', at_ms: 1 },
+      { kind: 'message', role: 'assistant', text: '', at_ms: 2, step: 0 },
+      { kind: 'tool_call', call_id: 'c1', tool: 'read_file', arguments: '{}', output: 'a', at_ms: 3, step: 0 },
+      { kind: 'tool_call', call_id: 'c2', tool: 'list_dir', arguments: '{}', output: 'b', at_ms: 4, step: 0 },
+      { kind: 'tool_call', call_id: 'c3', tool: 'unified_exec', arguments: '{}', output: 'done', at_ms: 5, step: 1 },
+      { kind: 'message', role: 'assistant', text: '改好了', at_ms: 6, step: 2 },
+      { kind: 'turn_end', turn: 1, task_id: 'agent#1', iterations: 3, reason: 'completed', at_ms: 7 },
+    ] as const
+
+    type Row = Record<string, unknown>
+    const reopen = async (): Promise<Row[]> => {
+      const adapter = createAdapter({ bridge: scriptedBridge(undefined, archive as unknown as never[]) })
+      const iterator = faceOf(adapter.remote).session.follow({
+        address: { kind: 'session', sessionId: 'agent-n4' },
+      })
+      const events = eventsOf((await iterator.next()).value as Record<string, unknown>)
+      await iterator.return?.(undefined)
+      adapter.dispose()
+      return events as unknown as Row[]
+    }
+    const stepNumbers = (events: Row[]): number[] => {
+      const seen = new Set<number>()
+      for (const event of events) {
+        if (event['type'] !== 'assistant/message' && event['type'] !== 'tool/call') continue
+        const step = (event['data'] as { step?: number }).step
+        if (step !== undefined) seen.add(step)
+      }
+      return [...seen].sort((a, b) => a - b)
+    }
+    const stepCount = (events: Row[]): number => events.filter(event => event['type'] === 'step/start').length
+
+    const replayEvents = await reopen()
+    const againEvents = await reopen()
+
+    // ① 实时 ② 重开：步数与步号集合一致；③ 重复重开数值不变。
+    expect(stepCount(replayEvents)).toBe(stepCount(liveEvents))
+    expect(stepCount(liveEvents)).toBe(3)
+    expect(stepNumbers(replayEvents)).toEqual(stepNumbers(liveEvents))
+    expect(stepNumbers(liveEvents)).toEqual([0, 1, 2])
+    expect({
+      steps: stepCount(againEvents),
+      numbers: stepNumbers(againEvents),
+      ends: againEvents.filter(event => event['type'] === 'turn/end').map(event => event['data']),
+    }).toEqual({
+      steps: stepCount(replayEvents),
+      numbers: stepNumbers(replayEvents),
+      ends: replayEvents.filter(event => event['type'] === 'turn/end').map(event => event['data']),
+    })
+
+    // ③ 导出：turn/end 带 iterations，step 用真实步号，且与重开逐值一致。
+    const exported = sessionEntriesToEvents(archive as unknown as never[], '改 sum') as unknown as Row[]
+    const exportEnd = exported.find(event => event['type'] === 'turn/end')?.['data'] as {
+      iterations?: number
+      stepsUnavailable?: boolean
+    }
+    expect(exportEnd.iterations).toBe(3)
+    expect(exportEnd.stepsUnavailable).toBeUndefined()
+    expect(stepNumbers(exported)).toEqual(stepNumbers(replayEvents))
+
+    // ④ rollout：档案行本身的 iterations 就是三处共同的基数。
+    expect(archive.find(row => row.kind === 'turn_end')?.iterations).toBe(stepCount(liveEvents))
+  })
+
+  it('N4：结局缺 iterations 时导出留空 + 标记，不按消息条数凑步数', () => {
+    const archive = [
+      { kind: 'message', role: 'user', text: '跑一下', at_ms: 1 },
+      { kind: 'message', role: 'assistant', text: '好', at_ms: 2 },
+      { kind: 'turn_end', turn: 1, task_id: 'agent#1', reason: 'interrupted', at_ms: 3 },
+    ] as const
+    const exported = sessionEntriesToEvents(archive as unknown as never[], '标题')
+    const assistant = exported.find(event => event.type === 'assistant/message') as {
+      data: Record<string, unknown>
+    }
+    // 反向对照：退回 `step: 1` 后这里会有 step 键，等于把「不知道几步」说成「第 1 步」。
+    expect('step' in assistant.data).toBe(false)
+    const end = exported.find(event => event.type === 'turn/end')?.['data'] as Record<string, unknown>
+    expect(end['iterations']).toBeUndefined()
+    expect(end['stepsUnavailable']).toBe(true)
+  })
+
+
   it('重开档案按结局行收口：失败回合不会在回放里变成 completed', async () => {
     const archive = [
       { kind: 'message', role: 'user', text: '问' },

@@ -20,9 +20,11 @@
  * ① `seq` 是本地合成的单调值，不是真实日志序号（formatter 不读，仅用于满足类型）；
  * ② `assistant/message` 的 `source`（provider/model 溯源）在 SHANIU 档案里没有等价物，
  *    填最小合法形状——formatter 只读 `content`，读不到这部分；
- * ③ `step` 恒为 1：档案只在结局行记本回合**总步数**（`TurnEnd.iterations`），不记每条
- *    条目属于第几步；formatter 的分段也只读 turn，不读 step。不要拿 `iterations` 去
- *    反推条目步号——那是编造。
+ * ③ `step` 用档案投影里的真实步号（`SessionEntry.step`，0 起、与实时 `step/start`
+ *    同码）：宿主按迭代边界还原、再用结局行 `iterations` 核对，三处口径一致（N4）。
+ *    结局缺 `iterations`（旧档/被杀回合）或核对不通过时，条目**不带** `step`，
+ *    并在 `turn/end` 上写 `stepsUnavailable: true`——宁可留空，也不拿消息条数凑。
+ *    本回合的步号"个数"必须等于 `turn/end.iterations`，否则同样标不可核对。
  *
  * **与实时回放（`transport/adapter.ts`）的字段集不同是有意为之**：实时路径要覆盖
  * journal 的全部语义（reasoning 流、工具参数、用量），导出只保留可读正文——
@@ -88,6 +90,10 @@ export function sessionEntriesToEvents(
   // 压缩锚点编号：`seq` 由 `push` 自增，读到的是"下一条事件序号"而不是锚点编号，
   // 所以单独计数，导出 id 才稳定（同一个锚点三条事件共用一个编号）。
   let compactionIndex = 0
+  // 本回合的步号核对状态（N4）：出现过哪些真实步号、有没有条目缺步号。
+  let turnSteps = new Set<number>()
+  let turnStepMissing = false
+  let turnHasSteppedEntry = false
 
   /** 推入一条事件：`time` 取档案时刻，未知则 0 + `timeUnreliable`（只加不改已有字段）。 */
   const push = (event: Record<string, unknown>, at: { time: number; unreliable: boolean }): void => {
@@ -114,18 +120,48 @@ export function sessionEntriesToEvents(
    * `reason` 缺省为 `unknown`：旧档案没有结局行，只能如实说"不知道"。
    * 写成 `completed` 会让失败回合在导出里变成成功，任何基于档案的统计、
    * 审计、评测都会被骗（A0-3）。
+   *
+   * `iterations` 是结局行里的权威总步数（N4）：写进 `turn/end`，并和本回合条目
+   * 里出现的真实步号个数对账。缺 `iterations`、有条目缺步号、或个数对不上时，
+   * 额外写 `stepsUnavailable: true`——说明这一回合的步数**不可用 step 核对**，
+   * 而不是补一个看起来合理的数字。
    */
   const closeTurn = (
     reason = 'unknown',
     at?: { time: number; unreliable: boolean },
     error?: TurnErrorInfo,
+    iterations?: number,
   ): void => {
     if (!open) return
+    const stepsUnavailable = iterations === undefined
+      || !turnHasSteppedEntry
+      || turnStepMissing
+      || turnSteps.size !== iterations
     push({
       type: 'turn/end',
-      data: error === undefined ? { turn, reason } : { turn, reason, error },
+      data: {
+        turn,
+        reason,
+        ...iterations === undefined ? {} : { iterations },
+        ...stepsUnavailable ? { stepsUnavailable: true } : {},
+        ...error === undefined ? {} : { error },
+      },
     }, at ?? { time: 0, unreliable: true })
     open = false
+    turnSteps = new Set<number>()
+    turnStepMissing = false
+    turnHasSteppedEntry = false
+  }
+
+  /** 记一条带（或不带）步号的正文/调用条目，供回合收口时对账。 */
+  const noteStep = (step: number | undefined): Record<string, number> => {
+    if (step === undefined) {
+      turnStepMissing = true
+      return {}
+    }
+    turnSteps.add(step)
+    turnHasSteppedEntry = true
+    return { step }
   }
 
   for (const entry of entries) {
@@ -134,7 +170,7 @@ export function sessionEntriesToEvents(
     // 不用 `entry.turn` 比较——旧档案那是采样迭代号，新档案才是用户回合号，
     // 两种口径都不该和导出侧按用户消息自增的 `turn` 做等值判断。
     if (entry.kind === 'turn_end') {
-      closeTurn(entry.reason, entryTime(entry), entry.error)
+      closeTurn(entry.reason, entryTime(entry), entry.error, entry.iterations)
       continue
     }
     if (entry.kind === 'compaction_summary') {
@@ -205,7 +241,7 @@ export function sessionEntriesToEvents(
         surfaceOp: 'append',
         data: {
           turn,
-          step: 1,
+          ...noteStep(entry.step),
           message: {
             id: `shaniu-assistant-${String(seq)}`,
             role: 'assistant',
@@ -230,7 +266,7 @@ export function sessionEntriesToEvents(
     const at = entryTime(entry)
     push({
       type: 'tool/call',
-      data: { turn, step: 1, callId: entry.call_id, name: entry.tool, arguments: entry.arguments },
+      data: { turn, ...noteStep(entry.step), callId: entry.call_id, name: entry.tool, arguments: entry.arguments },
     }, at)
     if (entry.output !== undefined) {
       push({
@@ -238,7 +274,7 @@ export function sessionEntriesToEvents(
         surfaceOp: 'append',
         data: {
           turn,
-          step: 1,
+          ...noteStep(entry.step),
           message: {
             id: `shaniu-tool-${entry.call_id}`,
             role: 'tool',

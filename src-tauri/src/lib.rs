@@ -1139,6 +1139,13 @@ pub enum SessionEntry {
         /// 展示与重放都读它，而不是把图片压成正文里的 `[图片: …]` 文本。
         #[serde(default, skip_serializing_if = "Vec::is_empty")]
         images: Vec<images::ImageRef>,
+        /// 采样步号（0 起，与实时 `step/start` 同码）。
+        ///
+        /// 档案本身不记条目步号，`project_slots_with` 按迭代边界还原、再拿结局行的
+        /// `iterations` 核对；对不上或结局缺 `iterations` 时一律留 `None`——导出
+        /// 宁可空着也不编（N4）。
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        step: Option<u32>,
     },
     /// 压缩锚点摘要（`Compacted` 的展示投影）：历史区间 `[range_start, range_end)`
     /// 被这一条取代。
@@ -1174,6 +1181,9 @@ pub enum SessionEntry {
         /// 事件落档时刻；`0` = 旧档案未记录（A0-4）。
         #[serde(default)]
         at_ms: u64,
+        /// 发出这次调用的采样步号（口径同 `Message::step`）。
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        step: Option<u32>,
     },
     /// 回合结局（A0-3）。旧档案没有这一条，导出侧必须标 `unknown` 而不是成功。
     ///
@@ -1258,12 +1268,13 @@ fn slots_to_entries(slots: Vec<Slot>) -> Vec<SessionEntry> {
     for slot in slots {
         match slot {
             Slot::Message(entry) | Slot::Summary(entry) | Slot::Audit(entry) => out.push(entry),
-            Slot::Call { call_id, tool, arguments, at_ms } => out.push(SessionEntry::ToolCall {
+            Slot::Call { call_id, tool, arguments, at_ms, step } => out.push(SessionEntry::ToolCall {
                 output: outputs.get(&call_id).cloned(),
                 call_id,
                 tool,
                 arguments,
                 at_ms,
+                step,
             }),
             // 已并进对应的 ToolCall，不单独成条。
             Slot::Output { .. } => {}
@@ -1281,7 +1292,7 @@ enum Slot {
     /// 普通消息（含图片消息）：投影即成品。
     Message(SessionEntry),
     /// 一次工具调用：输出在投影时按 `call_id` 补上。
-    Call { call_id: String, tool: String, arguments: String, at_ms: u64 },
+    Call { call_id: String, tool: String, arguments: String, at_ms: u64, step: Option<u32> },
     /// 工具输出：占历史序号，但不单独成条。
     Output { call_id: String, output: String },
     /// 锚点把区间换成的摘要（取代区间后同样占一个历史序号）。
@@ -1293,6 +1304,69 @@ enum Slot {
 impl Slot {
     fn is_history(&self) -> bool {
         !matches!(self, Slot::Audit(_))
+    }
+
+    /// 结局行核对失败时把本回合已填的步号清空：不编步数（N4）。
+    fn clear_step(&mut self) {
+        match self {
+            Slot::Message(SessionEntry::Message { step, .. }) => *step = None,
+            Slot::Call { step, .. } => *step = None,
+            _ => {}
+        }
+    }
+}
+
+/// 采样步号游标（N4）：只还原、不凑数。
+///
+/// 档案不记「这条属于第几步」，但 `agent_loop` 每个采样迭代的形状是固定的——
+/// 先写模型侧条目（助手消息 / 推理 / 工具调用），再写这一批的全部工具输出
+/// （"先全部 call、再全部 output"，见 `project_entries` 的注释）。所以
+/// 「上次模型侧条目之后出现过输出」就是下一次迭代的起点。
+///
+/// 还原值必须和回合结局的 `iterations` 对上才留下；结局缺 `iterations`（旧档、
+/// 被杀回合）或对不上时，把本回合已填的步号逐条清回 `None`：导出宁可留空，
+/// 也不拿消息条数或 `iterations` 硬摊。
+struct StepCursor {
+    /// 当前步号（0 起，与实时 `step/start` 同码）。
+    step: u32,
+    /// 自上次模型侧条目以来出现过工具输出。
+    output_since_model: bool,
+    /// 本回合已出现的模型侧条目数（0 = 没有模型输出，谈不上步号）。
+    model_items: u32,
+    /// 本回合已填步号的槽位下标，核对失败时要能逐条清掉。
+    marked: Vec<usize>,
+}
+
+impl StepCursor {
+    fn new() -> Self {
+        Self { step: 0, output_since_model: false, model_items: 0, marked: Vec::new() }
+    }
+
+    /// 记一条模型侧条目，返回它所属的步号。
+    fn model_item(&mut self) -> u32 {
+        if self.model_items > 0 && self.output_since_model {
+            self.step += 1;
+            self.output_since_model = false;
+        }
+        self.model_items += 1;
+        self.step
+    }
+
+    fn mark(&mut self, slot: usize) {
+        self.marked.push(slot);
+    }
+
+    /// 回合收口：步数可核对才保留，否则清空并重开游标。
+    fn settle(&mut self, iterations: Option<u32>, slots: &mut [Slot]) {
+        let derived = (self.model_items > 0).then(|| self.step + 1);
+        if derived != iterations {
+            for &index in &self.marked {
+                if let Some(slot) = slots.get_mut(index) {
+                    slot.clear_step();
+                }
+            }
+        }
+        *self = Self::new();
     }
 }
 
@@ -1346,31 +1420,58 @@ fn project_slots_with(items: &[rollout::RolloutItem], include_compaction: bool) 
             _ => None,
         })
         .collect();
+    let mut cursor = StepCursor::new();
     for item in items {
         match item {
             rollout::RolloutItem::ResponseItem {
                 item: model_client::HistoryItem::Message { role, text, reasoning },
                 at_ms,
-            } => out.push(Slot::Message(SessionEntry::Message {
-                role: role_name(role),
-                text: text.clone(),
-                reasoning: reasoning.clone(),
-                at_ms: *at_ms,
-                images: Vec::new(),
-            })),
+            } => {
+                let name = role_name(role);
+                // 用户消息开新回合：上一回合若没有结局行（进程死在回合中途），
+                // 它的步号不可核对，先清空再重开游标。
+                let step = if name == "user" {
+                    cursor.settle(None, &mut out);
+                    None
+                } else if name == "assistant" {
+                    let step = cursor.model_item();
+                    cursor.mark(out.len());
+                    Some(step)
+                } else {
+                    // 系统消息是每次运行的注记，不是模型响应，不开步。
+                    None
+                };
+                out.push(Slot::Message(SessionEntry::Message {
+                    role: name,
+                    text: text.clone(),
+                    reasoning: reasoning.clone(),
+                    at_ms: *at_ms,
+                    images: Vec::new(),
+                    step,
+                }))
+            }
             rollout::RolloutItem::ResponseItem {
                 item: model_client::HistoryItem::FunctionCall { name, arguments, call_id },
                 at_ms,
-            } => out.push(Slot::Call {
-                call_id: call_id.clone(),
-                tool: name.clone(),
-                arguments: arguments.clone(),
-                at_ms: *at_ms,
-            }),
+            } => {
+                let step = Some(cursor.model_item());
+                cursor.mark(out.len());
+                out.push(Slot::Call {
+                    call_id: call_id.clone(),
+                    tool: name.clone(),
+                    arguments: arguments.clone(),
+                    at_ms: *at_ms,
+                    step,
+                })
+            }
             rollout::RolloutItem::ResponseItem {
                 item: model_client::HistoryItem::FunctionCallOutput { call_id, output },
                 ..
-            } => out.push(Slot::Output { call_id: call_id.clone(), output: output.clone() }),
+            } => {
+                // 输出归上一步；它的出现把下一次模型侧条目推成新的一步。
+                cursor.output_since_model = true;
+                out.push(Slot::Output { call_id: call_id.clone(), output: output.clone() })
+            }
             // 压缩视图里锚点本身不产出条目：位置与内容由 `apply_compaction`
             // 在槽位序列上做替换（先收全部槽位、再按记录顺序应用锚点）。
             // 完整视图里只插一条摘要标记，原文照留——导出不能因为压缩少掉用户回合。
@@ -1391,24 +1492,43 @@ fn project_slots_with(items: &[rollout::RolloutItem], include_compaction: bool) 
             // 推理项（D2）：展示/导出都不投影。密文是"可见但不可读"的数据，
             // 投影进 SessionEntry 只会把推理正文与密文混进对话时间线；导出仍按
             // rollout 原样序列化（本函数只决定界面条目）。
+            // 但它仍是模型侧条目：不推进游标就会把「只有推理的迭代」并进上一步。
             rollout::RolloutItem::ResponseItem {
                 item: model_client::HistoryItem::Reasoning { .. },
                 ..
-            } => {}
+            } => {
+                cursor.model_item();
+            }
             // 带图消息保留结构化引用：展示层自己决定怎么渲染图片卡片，
             // 重放也不再依赖正文里的历史 marker。字节永远不进档案。
             rollout::RolloutItem::ResponseItem {
                 item: model_client::HistoryItem::ImageMessage { role, text, images },
                 at_ms,
-            } => out.push(Slot::Message(SessionEntry::Message {
-                role: role_name(role),
-                text: text.clone(),
-                reasoning: None,
-                at_ms: *at_ms,
-                images: images.clone(),
-            })),
-            // 回合结局：如实带给导出/审计，不进对话历史。
+            } => {
+                let name = role_name(role);
+                let step = if name == "user" {
+                    cursor.settle(None, &mut out);
+                    None
+                } else if name == "assistant" {
+                    let step = cursor.model_item();
+                    cursor.mark(out.len());
+                    Some(step)
+                } else {
+                    None
+                };
+                out.push(Slot::Message(SessionEntry::Message {
+                    role: name,
+                    text: text.clone(),
+                    reasoning: None,
+                    at_ms: *at_ms,
+                    images: images.clone(),
+                    step,
+                }))
+            }
+            // 回合结局：如实带给导出/审计，不进对话历史；同时用它的 `iterations`
+            // 核对本回合还原出的步号，对不上就清空（N4）。
             rollout::RolloutItem::TurnEnd { turn, task_id, iterations, reason, at_ms, error } => {
+                cursor.settle(*iterations, &mut out);
                 out.push(Slot::Audit(SessionEntry::TurnEnd {
                     turn: *turn,
                     task_id: task_id.clone(),
@@ -1445,6 +1565,8 @@ fn project_slots_with(items: &[rollout::RolloutItem], include_compaction: bool) 
             | rollout::RolloutItem::Verification { .. } => {}
         }
     }
+    // 末尾没有结局行（进程死在回合中途）：没有权威总步数，已还原的步号也不能留。
+    cursor.settle(None, &mut out);
     out
 }
 
@@ -4369,6 +4491,13 @@ mod session_projection_tests {
         }
     }
 
+    fn step_of(entry: &SessionEntry) -> Option<u32> {
+        match entry {
+            SessionEntry::Message { step, .. } | SessionEntry::ToolCall { step, .. } => *step,
+            _ => None,
+        }
+    }
+
     #[test]
     fn tool_output_merges_into_its_call_instead_of_standing_alone() {
         // 档案形状是"先全部 call、再全部 output"，投影必须按调用顺序把输出带上
@@ -4406,6 +4535,64 @@ mod session_projection_tests {
             SessionEntry::ToolCall { output, .. } => assert_eq!(output, &None),
             other => panic!("期望 ToolCall，得到 {other:?}"),
         }
+    }
+
+    #[test]
+    fn projection_derives_real_step_numbers_from_iteration_boundaries() {
+        // N4：导出要把「几步」核对得出来。档案按迭代写：模型侧条目 → 该批全部输出，
+        // 所以「输出之后的第一个模型侧条目」就是下一步。这里复刻真机 04 的形状：
+        // 助手(空) + 两个并行调用 → 输出 → 只有调用的迭代 → 助手正文。
+        let items = vec![
+            msg(Role::User, "改 sum"),
+            msg(Role::Assistant, ""),
+            call("read_file", "{}", "c1"),
+            call("list_dir", "{}", "c2"),
+            out("c1", "a"),
+            out("c2", "b"),
+            call("unified_exec", "{}", "c3"),
+            out("c3", "done"),
+            msg(Role::Assistant, "改好了"),
+            RolloutItem::TurnEnd {
+                turn: 1,
+                task_id: Some("s#1".into()),
+                iterations: Some(3),
+                reason: "completed".into(),
+                at_ms: 9,
+                error: None,
+            },
+        ];
+        let steps: Vec<Option<u32>> =
+            project_entries(&items).expect("投影成功").iter().map(step_of).collect();
+        // 两个并行调用同属第 0 步；输出之后的 c3 是第 1 步；助手正文是第 2 步。
+        // 末位是 TurnEnd 审计条目本身（不是模型条目，没有步号）。
+        assert_eq!(steps, vec![None, Some(0), Some(0), Some(0), Some(1), Some(2), None]);
+    }
+
+    #[test]
+    fn projection_leaves_step_empty_when_turn_end_disagrees_or_is_missing() {
+        // N4：结局行的 `iterations` 是唯一权威总数。对不上/缺席时不许编步数，
+        // 也不许拿消息条数硬摊——整回合留空，导出侧据此标「不可核对」。
+        let mismatched = vec![
+            msg(Role::User, "跑一下"),
+            msg(Role::Assistant, "好"),
+            RolloutItem::TurnEnd {
+                turn: 1,
+                task_id: Some("s#1".into()),
+                iterations: Some(5),
+                reason: "completed".into(),
+                at_ms: 9,
+                error: None,
+            },
+        ];
+        let steps: Vec<Option<u32>> =
+            project_entries(&mismatched).expect("投影成功").iter().map(step_of).collect();
+        assert_eq!(steps, vec![None, None, None], "还原 1 步、结局说 5 步：步号不能留");
+
+        // 旧档没有结局行：同样没有权威总步数。
+        let legacy = vec![msg(Role::User, "跑一下"), msg(Role::Assistant, "好")];
+        let steps: Vec<Option<u32>> =
+            project_entries(&legacy).expect("投影成功").iter().map(step_of).collect();
+        assert_eq!(steps, vec![None, None], "缺 iterations 的回合不编步数");
     }
 
     #[test]
@@ -4740,9 +4927,11 @@ mod session_projection_tests {
             reasoning: None,
             at_ms: 0,
             images: Vec::new(),
+            step: None,
         };
         let wire = serde_json::to_value(&entry).expect("serialize");
         assert!(wire.get("images").is_none(), "空图片列表不得写出 images 键");
+        assert!(wire.get("step").is_none(), "无步号不得写出 step 键（N4：宁可留空）");
     }
 
     /// 档位清单与枚举同源（SH-040）。

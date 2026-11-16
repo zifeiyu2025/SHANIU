@@ -279,13 +279,52 @@ describe('档案条目 → 逻辑事件', () => {
     expect(ends[0].data['turn']).toBe(1)
     expect(ends[0].data['reason']).toBe('completed')
 
-    // 新档同结论：turn 是用户回合号，task_id/iterations 只作审计，不改变导出结果。
+    // 新档的 `iterations` 不再只是审计信息：它进 `turn/end`，并作为步数核对基准（N4）。
     const fresh = sessionEntriesToEvents([
       { kind: 'message', role: 'user', text: '唯一问题' },
       { kind: 'message', role: 'assistant', text: '回答' },
       { kind: 'turn_end', turn: 1, task_id: 'agent#1', iterations: 5, reason: 'completed', at_ms: 20 },
     ], '标题')
-    expect(ofType(fresh, 'turn/end').map(event => event.data)).toEqual(ends.map(event => event.data))
+    const freshEnd = ofType(fresh, 'turn/end')[0] as { data: Record<string, unknown> }
+    expect(freshEnd.data['turn']).toBe(1)
+    expect(freshEnd.data['reason']).toBe('completed')
+    expect(freshEnd.data['iterations']).toBe(5)
+    // 条目没有档案步号 → 不做步数核对，如实标记而不是拿消息条数摊。
+    expect(freshEnd.data['stepsUnavailable']).toBe(true)
+    // 旧档没有 iterations：字段缺席 + 同样标记不可核对。
+    expect(ends[0].data['iterations']).toBeUndefined()
+    expect(ends[0].data['stepsUnavailable']).toBe(true)
+  })
+
+  it('N4：step 用档案真实步号，turn/end 带 iterations；缺步号只留标记', () => {
+    const events = sessionEntriesToEvents([
+      { kind: 'message', role: 'user', text: '改 sum' },
+      { kind: 'message', role: 'assistant', text: '', step: 0 },
+      { kind: 'tool_call', call_id: 'c1', tool: 'read_file', arguments: '{}', output: 'a', step: 0 },
+      { kind: 'tool_call', call_id: 'c2', tool: 'unified_exec', arguments: '{}', output: 'done', step: 1 },
+      { kind: 'message', role: 'assistant', text: '改好了', step: 1 },
+      { kind: 'turn_end', turn: 1, task_id: 'agent#1', iterations: 2, reason: 'completed', at_ms: 20 },
+    ], '标题')
+
+    const body = events.filter(event =>
+      event.type === 'assistant/message' || event.type === 'tool/call' || event.type === 'tool/result')
+    // 反向对照：退回 `step: 1` 常量后，这里的步号会全变成 1，与 iterations=2 对不上。
+    expect(body.map(event => (event.data as { step?: number }).step)).toEqual([0, 0, 0, 1, 1, 1])
+    const end = ofType(events, 'turn/end')[0] as { data: Record<string, unknown> }
+    expect(end.data['iterations']).toBe(2)
+    expect(end.data['stepsUnavailable']).toBeUndefined()
+
+    // 缺档案步号：事件里连 `step` 键都不写，回合结局标不可核对（不编、不凑）。
+    const unverified = sessionEntriesToEvents([
+      { kind: 'message', role: 'user', text: '跑一下' },
+      { kind: 'message', role: 'assistant', text: '好' },
+      { kind: 'turn_end', turn: 1, task_id: 'agent#1', iterations: 1, reason: 'completed', at_ms: 20 },
+    ], '标题')
+    const assistant = ofType(unverified, 'assistant/message')[0] as { data: Record<string, unknown> }
+    expect('step' in assistant.data).toBe(false)
+    const unverifiedEnd = ofType(unverified, 'turn/end')[0] as { data: Record<string, unknown> }
+    expect(unverifiedEnd.data['iterations']).toBe(1)
+    expect(unverifiedEnd.data['stepsUnavailable']).toBe(true)
   })
 
   it('事件时间取档案 at_ms，不再让整份导出只有一两个时间', () => {
