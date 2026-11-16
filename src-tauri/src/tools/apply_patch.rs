@@ -9,9 +9,15 @@
 //!  上下文行
 //! -要删除的行
 //! +要新增的行
+//! @@ 可选锚点原文
+//!  另一处上下文的行
+//! -另一处要删除的行
+//! +另一处要新增的行
 //! *** Delete File: <path>
 //! *** End Patch
 //! ```
+//! 同一 Update 段内的多个 `@@` 块各自定位（对齐 dsh `fs-patch` / codex：前一块匹配完，
+//! 后一块从它的结束位置向下找），`@@` 后可跟一行原文当锚点。
 //! 流程：解析 → dry-run 校验（路径边界/存在性/上下文匹配）→ 应用；
 //! 任一步失败即回滚全部已写入文件（内存快照恢复），错误回填模型。
 
@@ -34,10 +40,22 @@ enum HunkLine {
     Add(String),
 }
 
+/// `*** Update File` 段里的一个 `@@` 块（对齐 dsh `fs-patch` 的 `PatchHunk`）。
+///
+/// 同一段内的多个块**各自定位**：前一块匹配完，后一块从它的结束位置继续向下找。
+/// 参考实现见 `src/dsh/packages/fs/fs-patch/src/parse.ts:89-109`（按 `@@` 切块）与
+/// `src/dsh/packages/fs/fs-patch/src/apply.ts:65-79`（`lineIndex` 游标逐块推进）。
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct UpdateHunk {
+    /// `@@ <原文>` 的锚点行：块从这一行之后开始找；裸 `@@` 为 None。
+    anchor: Option<String>,
+    seq: Vec<HunkLine>,
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 enum PatchOp {
     Add { path: String, lines: Vec<String> },
-    Update { path: String, seq: Vec<HunkLine> },
+    Update { path: String, hunks: Vec<UpdateHunk> },
     Delete { path: String },
 }
 
@@ -97,7 +115,7 @@ impl ApplyPatch {
         Self {
             spec: ToolSpec::new(
                 "apply_patch",
-                "对工作区文件应用结构化补丁（V4A 格式：Add/Update/Delete File）。上下文先精确匹配，失败时依次尝试剥离行号前缀、缩进弹性、空白折叠、首尾锚点模糊定位；整单失败自动回滚。",
+                "对工作区文件应用结构化补丁（V4A 格式：Add/Update/Delete File）。同一 Update 段可用多个 `@@` 块分别改多处，`@@ <原文>` 指定锚点行；一个块对不上则整单失败回滚。上下文先精确匹配，失败时依次尝试剥离行号前缀、缩进弹性、空白折叠、首尾锚点模糊定位。",
                 serde_json::json!({
                     "type": "object",
                     "properties": {
@@ -174,13 +192,32 @@ fn parse_patch(patch: &str) -> Result<Vec<PatchSection>, ToolError> {
             let path = path.trim().to_string();
             let start_line = i + 1;
             i += 1;
-            let mut seq: Vec<HunkLine> = Vec::new();
+            let mut hunks: Vec<UpdateHunk> = vec![UpdateHunk {
+                anchor: None,
+                seq: Vec::new(),
+            }];
             while i < lines.len() && !lines[i].starts_with("*** ") {
                 let raw = lines[i];
-                if raw == "@@" {
+                if raw == "@@" || raw.starts_with("@@ ") {
+                    // 块分隔符：`@@` 起新块，`@@ <原文>` 额外给锚点行
+                    let anchor = raw
+                        .strip_prefix("@@ ")
+                        .map(str::trim)
+                        .filter(|a| !a.is_empty())
+                        .map(str::to_string);
+                    if hunks.last().is_some_and(|h| !h.seq.is_empty() || h.anchor.is_some()) {
+                        hunks.push(UpdateHunk {
+                            anchor,
+                            seq: Vec::new(),
+                        });
+                    } else {
+                        // 还没有任何内容的块：把锚点挂上去，不新起块
+                        hunks.last_mut().unwrap().anchor = anchor;
+                    }
                     i += 1;
-                    continue; // 分组标记在连续匹配语义下不改变序列
+                    continue;
                 }
+                let seq = &mut hunks.last_mut().unwrap().seq;
                 if let Some(rest) = raw.strip_prefix(' ') {
                     seq.push(HunkLine::Keep(rest.to_string()));
                 } else if let Some(rest) = raw.strip_prefix('-') {
@@ -200,7 +237,22 @@ fn parse_patch(patch: &str) -> Result<Vec<PatchSection>, ToolError> {
                 }
                 i += 1;
             }
-            if seq.iter().all(|h| matches!(h, HunkLine::Keep(_))) {
+            // 尾部没有内容的 `@@` 不构成块，丢掉再看
+            while hunks.len() > 1 && hunks.last().is_some_and(|h| h.seq.is_empty()) {
+                hunks.pop();
+            }
+            if hunks.iter().any(|h| h.seq.is_empty()) {
+                return Err(ToolError::InvalidArgs(format!(
+                    "补丁格式错误：{} 第 {} 个 `@@` 块是空的，块内至少要有一行上下文/`-`/`+` 行。\
+                     期望形状：每个 `@@` 后紧跟该块的行；多余的 `@@` 请删掉",
+                    section_head(index, "Update File", &path, start_line),
+                    hunks.iter().position(|h| h.seq.is_empty()).unwrap() + 1
+                )));
+            }
+            if hunks
+                .iter()
+                .all(|h| h.seq.iter().all(|l| matches!(l, HunkLine::Keep(_))))
+            {
                 return Err(ToolError::InvalidArgs(format!(
                     "补丁格式错误：{} 只有上下文行，没有任何 `-` 删除行或 `+` 新增行。\
                      期望形状：至少一行以 `-` 或 `+` 开头",
@@ -211,7 +263,7 @@ fn parse_patch(patch: &str) -> Result<Vec<PatchSection>, ToolError> {
                 index,
                 start_line,
                 end_line: i.max(start_line),
-                op: PatchOp::Update { path, seq },
+                op: PatchOp::Update { path, hunks },
             });
         } else if let Some(path) = line.strip_prefix("*** Delete File: ") {
             let start_line = i + 1;
@@ -351,12 +403,17 @@ fn line_similarity(left: &str, right: &str) -> f64 {
     1.0 - levenshtein(left, right) as f64 / max_len as f64
 }
 
-/// 返回首个匹配起点（codex 语义：从文件头向下找第一条，不猜多解）。
-fn first_match(file: &[String], width: usize, at: impl Fn(usize) -> bool) -> Option<usize> {
-    if width == 0 || width > file.len() {
+/// 返回首个匹配起点（codex 语义：从 `from` 起向下找第一条，不猜多解）。
+fn first_match(
+    file: &[String],
+    width: usize,
+    from: usize,
+    at: impl Fn(usize) -> bool,
+) -> Option<usize> {
+    if width == 0 || from >= file.len() || width > file.len() - from {
         return None;
     }
-    (0..=file.len() - width).find(|&start| at(start))
+    (from..=file.len() - width).find(|&start| at(start))
 }
 
 fn anchor_similarity(block: &[String], expected: &[String]) -> f64 {
@@ -461,13 +518,16 @@ fn mismatch_detail(file: &[String], expected: &[String]) -> String {
     out
 }
 
-/// Update 段：keep+remove 序列在文件中按递减严格度定位，替换为 keep+add。
+/// Update 段的单个 `@@` 块：keep+remove 序列在文件中按递减严格度定位，替换为 keep+add。
 ///
+/// `from` 是本块的搜索起点（上一块的结束位置）；返回替换后的全文、命中级别，
+/// 以及新文本里的块结束位置（下一个块的搜索起点）。
 /// Keep 行一律取**文件原文**（保留原缩进/空白），只有 Add 行用补丁文本。
 fn apply_hunk_seq(
     file_lines: &[String],
     seq: &[HunkLine],
-) -> Result<(Vec<String>, MatchLevel), String> {
+    from: usize,
+) -> Result<(Vec<String>, MatchLevel, usize), String> {
     let expected: Vec<String> = seq
         .iter()
         .filter_map(|h| match h {
@@ -479,36 +539,43 @@ fn apply_hunk_seq(
         return Err("Update 段需要至少一行上下文或删除行".into());
     }
     let width = expected.len();
-    if file_lines.len() < width {
+    let remaining = file_lines.len().saturating_sub(from);
+    if remaining < width {
+        let where_ = if from == 0 {
+            format!("文件只有 {} 行", file_lines.len())
+        } else {
+            format!("文件从第 {} 行起只剩 {remaining} 行", from + 1)
+        };
         return Err(format!(
-            "上下文不匹配：补丁期望 {width} 行上下文，文件只有 {} 行，无法完整匹配。{}",
-            file_lines.len(),
+            "上下文不匹配：补丁期望 {width} 行上下文，{where_}，无法完整匹配。{}",
             mismatch_detail(file_lines, &expected)
         ));
     }
 
     let found: Option<(usize, MatchLevel)> = None
         .or_else(|| {
-            first_match(file_lines, width, |start| file_lines[start..start + width] == expected[..])
-                .map(|start| (start, MatchLevel::Exact))
+            first_match(file_lines, width, from, |start| {
+                file_lines[start..start + width] == expected[..]
+            })
+            .map(|start| (start, MatchLevel::Exact))
         })
         .or_else(|| {
             let stripped = strip_line_number_prefixes(&expected)?;
-            first_match(file_lines, width, |start| {
+            first_match(file_lines, width, from, |start| {
                 file_lines[start..start + width] == stripped[..]
             })
             .map(|start| (start, MatchLevel::LineNumberStripped))
         })
         .or_else(|| {
             let normalized = remove_common_indent(&expected);
-            first_match(file_lines, width, |start| {
+            first_match(file_lines, width, from, |start| {
                 remove_common_indent(&file_lines[start..start + width]) == normalized
             })
             .map(|start| (start, MatchLevel::IndentationFlexible))
         })
         .or_else(|| {
             let collapsed: Vec<String> = expected.iter().map(|l| collapse_whitespace(l)).collect();
-            first_match(file_lines, width, |start| {
+            first_match(file_lines, width, from, |start| {
                 let actual: Vec<String> = file_lines[start..start + width]
                     .iter()
                     .map(|l| collapse_whitespace(l))
@@ -523,7 +590,7 @@ fn apply_hunk_seq(
             }
             let first = expected[0].trim();
             let last = expected[width - 1].trim();
-            first_match(file_lines, width, |start| {
+            first_match(file_lines, width, from, |start| {
                 let block = &file_lines[start..start + width];
                 block[0].trim() == first
                     && block[width - 1].trim() == last
@@ -584,9 +651,45 @@ fn apply_hunk_seq(
         }
     }
     let mut out = file_lines[..start].to_vec();
+    let next = start + replacement.len();
     out.extend(replacement);
     out.extend(file_lines[start + width..].to_vec());
-    Ok((out, level))
+    Ok((out, level, next))
+}
+
+/// 逐块应用一次 Update：每块独立定位，后一块从前一块的结束位置继续向下找。
+///
+/// 参考实现 `src/dsh/packages/fs/fs-patch/src/apply.ts:65-79`：`applyHunks` 用
+/// `lineIndex` 游标推进，块失败直接返回错误（不做部分应用）。
+fn apply_hunks(
+    file_lines: &[String],
+    hunks: &[UpdateHunk],
+) -> Result<(Vec<String>, MatchLevel), String> {
+    let mut lines = file_lines.to_vec();
+    let mut cursor = 0usize;
+    let mut level = MatchLevel::Exact;
+    for (index, hunk) in hunks.iter().enumerate() {
+        if let Some(anchor) = hunk.anchor.as_deref() {
+            let found = first_match(&lines, 1, cursor, |start| lines[start].trim() == anchor);
+            let Some(found) = found else {
+                return Err(format!(
+                    "@@ 锚点未找到：第 {} 个 `@@` 块要求锚点行 `{anchor}` 出现在第 {} 行之后，\
+                     文件里没有。请核对锚点原文，或改用裸 `@@`",
+                    index + 1,
+                    cursor + 1
+                ));
+            };
+            cursor = found + 1;
+        }
+        let (replaced, matched, next) = apply_hunk_seq(&lines, &hunk.seq, cursor)
+            .map_err(|e| format!("第 {} 个 `@@` 块：{e}", index + 1))?;
+        if matched != MatchLevel::Exact {
+            level = matched;
+        }
+        lines = replaced;
+        cursor = next;
+    }
+    Ok((lines, level))
 }
 
 // ============================== 写前读状态（SH-124） ==============================
@@ -813,7 +916,7 @@ impl ToolExecutor for ApplyPatch {
                     );
                     summary.push(format!("+ {path}"));
                 }
-                PatchOp::Update { path, seq } => {
+                PatchOp::Update { path, hunks } => {
                     let full = resolve_patch_path(ctx, path)
                         .map_err(|error| with_section(error, section))?;
                     let original = match std::fs::read(&full) {
@@ -849,9 +952,9 @@ impl ToolExecutor for ApplyPatch {
                         )
                     })?;
                     let had_trailing_newline = text.ends_with('\n');
-                    let (new_lines, level) = apply_hunk_seq(
+                    let (new_lines, level) = apply_hunks(
                         &text.lines().map(String::from).collect::<Vec<_>>(),
-                        seq,
+                        hunks,
                     )
                     .map_err(|e| {
                         with_rollback(
@@ -1191,7 +1294,7 @@ mod tests {
             HunkLine::Remove("d".into()),
             HunkLine::Remove("e".into()),
         ];
-        let message = apply_hunk_seq(&file, &seq).unwrap_err();
+        let message = apply_hunk_seq(&file, &seq, 0).unwrap_err();
         assert!(message.contains("文件只有 3 行"), "{message}");
         assert!(message.contains("边界"), "{message}");
         assert!(message.contains("无法完整比对"), "{message}");
@@ -1295,6 +1398,75 @@ mod tests {
         assert_eq!(
             std::fs::read_to_string(ws.join("a.txt")).unwrap(),
             "line1\nline2\nline3\n"
+        );
+    }
+
+    /// 同一 `*** Update File` 段里的多个 `@@` 块必须各自定位。
+    ///
+    /// 参考实现把 `@@` 当块分隔符（`src/dsh/packages/fs/fs-patch/src/parse.ts:89-109`
+    /// 的 `readUpdate` + `apply.ts:65-79` 的 `applyHunks`）；把它们并成一条连续序列，
+    /// 模型一次改多处时必然「上下文不匹配」——评测 `repo-feat-context-overflow-code`
+    /// 就是被这条吃掉 3 个往返（见 `docs/evidence/2026-11-17/`）。
+    ///
+    /// 反向对照：把 `@@` 重新当无意义标记丢弃（旧实现），本条必红。
+    #[tokio::test]
+    async fn multi_hunk_update_applies_each_hunk_at_its_own_location() {
+        let ws = workspace();
+        std::fs::write(ws.join("m.txt"), "alpha\nbravo\ncharlie\ndelta\necho\n").unwrap();
+        let patch = "*** Begin Patch\n*** Update File: m.txt\n@@\n-alpha\n+ALPHA\n@@\n-echo\n+ECHO\n*** End Patch";
+        let out = ApplyPatch::new()
+            .execute(serde_json::json!({"patch": patch}), &ctx(&ws))
+            .await
+            .unwrap();
+        assert!(out.success);
+        assert_eq!(
+            std::fs::read_to_string(ws.join("m.txt")).unwrap(),
+            "ALPHA\nbravo\ncharlie\ndelta\nECHO\n"
+        );
+    }
+
+    /// `@@ <原文>` 是锚点：块从锚点行**之后**开始找，不会命中文件里更早的同名上下文。
+    ///
+    /// 反向对照：忽略 `@@` 后的锚点文本（按裸 `@@` 处理），本条会改到 `alpha` 里那段
+    /// 同名上下文，断言必红。
+    #[tokio::test]
+    async fn hunk_anchor_skips_to_the_named_line() {
+        let ws = workspace();
+        std::fs::write(
+            ws.join("n.txt"),
+            "fn alpha() {\n    KEEP\n}\nfn beta() {\n    KEEP\n}\n",
+        )
+        .unwrap();
+        let patch = "*** Begin Patch\n*** Update File: n.txt\n@@ fn beta() {\n     KEEP\n-}\n+}  // beta 结束\n*** End Patch";
+        let out = ApplyPatch::new()
+            .execute(serde_json::json!({"patch": patch}), &ctx(&ws))
+            .await
+            .unwrap();
+        assert!(out.success);
+        assert_eq!(
+            std::fs::read_to_string(ws.join("n.txt")).unwrap(),
+            "fn alpha() {\n    KEEP\n}\nfn beta() {\n    KEEP\n}  // beta 结束\n"
+        );
+    }
+
+    /// 反向对照（不许放宽）：多 `@@` 补丁里只要有一块对不上，整条补丁失败且不落任何字节。
+    ///
+    /// 这条防的是「为了让多块补丁过，把匹配降级成逐块软失败 / 部分应用」。
+    #[tokio::test]
+    async fn multi_hunk_second_hunk_mismatch_writes_nothing() {
+        let ws = workspace();
+        std::fs::write(ws.join("p.txt"), "alpha\nbravo\n").unwrap();
+        let patch = "*** Begin Patch\n*** Update File: p.txt\n@@\n-alpha\n+ALPHA\n@@\n-nope\n+NOPE\n*** End Patch";
+        let err = ApplyPatch::new()
+            .execute(serde_json::json!({"patch": patch}), &ctx(&ws))
+            .await
+            .unwrap_err();
+        let message = err.to_string();
+        assert!(message.contains("第 2 个 `@@` 块"), "{message}");
+        assert_eq!(
+            std::fs::read_to_string(ws.join("p.txt")).unwrap(),
+            "alpha\nbravo\n",
+            "第二块失败时第一块也不许留下"
         );
     }
 
