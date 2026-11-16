@@ -102,3 +102,6 @@ SID 选择、目录与凭据、卸载回退、探针与反向验证、代价与�
 **同批对齐 codex 的授权细节**：写授权（`Access::Write`）去掉 `FILE_DELETE_CHILD`，只留
 `DELETE` 随 ACE 继承到子对象（父目录的 delete-child allow 会绕过子对象 deny，见 codex
 `acl.rs:513-517` 注释）。回归锁 `write_grant_omits_delete_child_but_keeps_delete`。
+**偏差注**：已安装环境的旧持久 ACE 不会自动收敛（`grant` 的 `AlreadyPresent` 分支复用
+既有 ACE），旧掩码里的 `FILE_DELETE_CHILD` 要等卸载/撤销后重新授权才会消失；该位在当前
+`WRITE_RESTRICTED` 下惰性，不影响现档行为，但切 pass-1 身份前必须先重建授权。
