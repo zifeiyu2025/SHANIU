@@ -75,6 +75,17 @@ const RULES: &[Rule] = &[
     },
     Rule {
         owner: "SessionEntry",
+        variant: "ApprovalExpired",
+        fields: "tool risk at_ms",
+        // 2026-11-17：`tool`/`risk` 直接进那行「未作答，已失效」通知的文案。
+        // 它不是卡：没有 request_id，前端也没有可回执的通道。
+        overrides: &[(
+            "at_ms",
+            Status::BackendOnly("审批时刻只用于审计；通知按档案顺序渲染，不用它排序/计时"),
+        )],
+    },
+    Rule {
+        owner: "SessionEntry",
         variant: "CompactionSummary",
         fields: "text range_start range_end at_ms trigger turn_start_at_ms",
         // 摘要正文与区间都进重建事件；`at_ms` 进导出事件时间（旧档 0 → 标不可信）；

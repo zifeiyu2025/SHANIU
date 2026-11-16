@@ -57,6 +57,11 @@ declare module '@deepseek-ai/dsh-llm' {
     'compaction-notice': { kind: 'compaction-notice'; form: 'notice'; summary: string }
     /** 写后验证的裁决与「未验证」披露（宿主执行/判定，不参与模型请求）。 */
     'verification': { kind: 'verification'; form: 'notice'; summary: string }
+    /**
+     * 「关闭前未作答」的审批留痕（2026-11-17）：审批卡挂起时程序被关掉，重开后
+     * 只能留一行失效说明——不是卡，也没有回执通道，绝不暗示还能点。
+     */
+    'approval-expired': { kind: 'approval-expired'; form: 'notice'; summary: string }
   }
 }
 

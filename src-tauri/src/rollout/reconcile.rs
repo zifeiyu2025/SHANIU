@@ -4,11 +4,15 @@
 //! 只证明了前者。这里把「结束」这个事实补进档案**一次**，前端据此收口，不再自己往
 //! 档案里写结局。
 //!
-//! 结局只写两种（D12）：
-//! - `interrupted`：有中断证据——档案里出现过 `TurnEnd`（写者会为每条终止路径写结局），
-//!   或最后一条提问之后有 `AbortNote`（退出流程记下了强制中止）；
-//! - `indeterminate`：没有证据（旧档根本没有结局行 / 新档首回合被杀，分不清）——
-//!   这是「未知」，不是成功，也不是失败。
+//! 结局只写两种（D12 / 2026-11-17 修订）：
+//! - `interrupted`：有**真实中止证据链**——最后一条提问之后既有 `AbortNote`
+//!   （退出流程记下了强制中止），又有真实执行进展（助手消息 / 推理 / 工具调用 / 工具输出）；
+//! - `indeterminate`：其余全部情形，包括「审批挂起时被杀」——宿主不知道用户会不会
+//!   批准、命令有没有跑，这一轮必须仍然呈现为「未知」，不许写 `interrupted`。
+//!
+//! **更早回合的 `TurnEnd` 不算证据**：它对最后一轮什么也没证明。旧写法「档案里出现过
+//! `TurnEnd` 就判 interrupted」把「第一轮正常收口 + 第二轮等审批」误判成第二轮被中断
+//! （真机 2026-11-17 冒烟 N2：界面「已停止」）。
 //!
 //! 幂等由 [`RolloutWriter::append_once`] 的档案写锁保证：重开重建与 60s 兜底并发到达时，
 //! 只有一个能看见「没有结局」，另一个在锁内重读后返回已有结论，档案里只留一条。
@@ -18,25 +22,40 @@ use std::path::Path;
 use super::{
     conclude_turn, counts_as_user_turn, RolloutError, RolloutItem, RolloutWriter, TurnConclusion,
 };
+use crate::model_client::{HistoryItem, Role};
+
+/// 一条响应项是否证明「这一轮已经开始执行」。
+///
+/// 只认模型/工具侧的产出：助手消息、推理项、工具调用、工具输出。它们只在一次采样
+/// 迭代收完时落档（`flush_history`），所以「有它们」= 至少有一个迭代真的跑过。
+/// 用户消息与 system 脚手架都不算——提交了提问不等于开始执行，那正是等审批的状态。
+fn has_execution_progress(item: &RolloutItem) -> bool {
+    matches!(
+        item,
+        RolloutItem::ResponseItem { item: HistoryItem::Message { role: Role::Assistant, .. }, .. }
+            | RolloutItem::ResponseItem { item: HistoryItem::Reasoning { .. }, .. }
+            | RolloutItem::ResponseItem { item: HistoryItem::FunctionCall { .. }, .. }
+            | RolloutItem::ResponseItem { item: HistoryItem::FunctionCallOutput { .. }, .. }
+    )
+}
 
 /// 补写的结局该写「被中断」还是「未知」——只认证据，不猜。
 ///
-/// 1. 档案里已经出现过 `TurnEnd`：写者会为每条终止路径（完成/取消/失败/预算）写结局，
-///    最后一条提问却没有结论，只可能是写它的进程在回合中途退出；
-/// 2. 最后一条提问之后有 `AbortNote`：退出流程自己记下了「取消等待超时仍要退出」。
+/// 判据：**最后一条用户提问之后**同时满足
+/// 1. 有 `AbortNote`：退出流程记下了「取消等待超时仍要退出」；
+/// 2. 有真实执行进展（见 [`has_execution_progress`]）：断掉的是执行，不是等待。
 ///
-/// 两条都不成立时保持 `indeterminate`：旧档（本功能上线前）根本没有结局行，新档首回合
-/// 被杀也长这样，两者分不清——分不清就不许替用户下结论（「未知」是一等状态）。
+/// 两条缺一即 `indeterminate`：
+/// - 缺 `AbortNote`（进程被直接杀）：宿主不知道发生了什么，只能报「未知」；
+/// - 缺执行进展（审批卡挂起时被杀/被迫退出）：这一轮从未开始执行，
+///   `AbortNote` 也不能把它升级成「执行被中止」。
 fn interruption_evidence(items: &[RolloutItem]) -> bool {
-    if items.iter().any(|item| matches!(item, RolloutItem::TurnEnd { .. })) {
-        return true;
-    }
-    match items.iter().rposition(counts_as_user_turn) {
-        Some(last_user) => items[last_user..]
-            .iter()
-            .any(|item| matches!(item, RolloutItem::AbortNote { .. })),
-        None => false,
-    }
+    let Some(last_user) = items.iter().rposition(counts_as_user_turn) else {
+        return false;
+    };
+    let tail = &items[last_user..];
+    let aborted = tail.iter().any(|item| matches!(item, RolloutItem::AbortNote { .. }));
+    aborted && tail.iter().any(has_execution_progress)
 }
 
 /// 对账结果分类（日志与前端只读它决定要不要收口，不参与语义推断）。
@@ -260,16 +279,13 @@ mod tests {
         assert_eq!(ends[0].at_ms, 42, "已有结论不能被第二次调用的时刻覆盖");
     }
 
-    /// D12：崩溃中断必须有自己的结局，不能一律 `indeterminate`。
+    /// 被任务管理器直接杀掉（没有 `AbortNote`）：只能报「未知」。
     ///
-    /// 证据：档案里已经出现过 `TurnEnd`——写者会为每条终止路径（完成/取消/失败/预算）
-    /// 写结局；最后一条提问却没有结局，只可能是写它的进程在回合中途退出。
-    /// 步数仍然未知，所以 `iterations` 必须是 `None`，不能拿「助手消息条数」去编。
-    ///
-    /// 反向对照：把补写理由改回固定 `indeterminate`，本用例必红。
+    /// 更早回合的 `TurnEnd` 对最后一轮什么也没证明；真实中止证据链缺了 `AbortNote`
+    /// 那一环。旧写法（「档案里出现过 `TurnEnd` 就判 interrupted」）在这里必红。
     #[test]
-    fn reconcile_marks_crash_orphan_as_interrupted_when_writer_is_known() {
-        let dir = temp_dir("interrupted");
+    fn crash_orphan_without_abort_note_stays_indeterminate() {
+        let dir = temp_dir("orphan-indeterminate");
         let writer = RolloutWriter::create(&dir.0, &meta("agent")).unwrap();
         writer.append(&user("第一问")).unwrap();
         writer.append(&assistant("答完")).unwrap();
@@ -292,9 +308,91 @@ mod tests {
         assert_eq!(result.status, ReconcileStatus::Appended);
         let entry = result.entry.expect("补写必须带回结论行");
         assert_eq!(entry.turn, 2, "回合号是用户回合，不是采样步数");
-        assert_eq!(entry.reason, "interrupted", "有证据时不许退回 indeterminate");
+        assert_eq!(entry.reason, "indeterminate", "没有 AbortNote 就不是中止证据链");
         assert_eq!(entry.iterations, None, "中断时不知道跑了几步，不许编");
         assert_eq!(turn_ends(&path).len(), 2, "前一条结论不能被覆盖");
+    }
+
+    /// 真机 N2 原样复现：第一轮正常收口，第二轮在等审批时进程被杀。
+    ///
+    /// 档案里最后一条提问之后只有 system 提示词与审批请求，没有任何执行进展。
+    /// 宿主不知道用户会不会批准、命令有没有跑，必须保持 `indeterminate`；
+    /// 旧写法会因为「档案里有第一轮的 TurnEnd」写出 `interrupted`（界面「已停止」）。
+    #[test]
+    fn pending_approval_kill_stays_indeterminate() {
+        let dir = temp_dir("approval-pending");
+        let writer = RolloutWriter::create(&dir.0, &meta("agent")).unwrap();
+        writer.append(&user("第一问")).unwrap();
+        writer.append(&assistant("答完")).unwrap();
+        writer
+            .append(&RolloutItem::TurnEnd {
+                turn: 1,
+                task_id: Some("agent#1".into()),
+                iterations: Some(2),
+                reason: "completed".into(),
+                at_ms: 3,
+                error: None,
+            })
+            .unwrap();
+        writer.append(&user("跑一条需要审批的命令")).unwrap();
+        writer
+            .append(&RolloutItem::ApprovalRequest {
+                request_id: "appr-call-1".into(),
+                call_id: Some("call-1".into()),
+                tool: "unified_exec".into(),
+                risk: "high".into(),
+                at_ms: 4,
+            })
+            .unwrap();
+        let path = writer.path().to_path_buf();
+        drop(writer);
+
+        let result = reconcile_once(&path, false, 99).unwrap();
+        let entry = result.entry.expect("补写必须带回结论行");
+        assert_eq!(entry.turn, 2);
+        assert_eq!(
+            entry.reason, "indeterminate",
+            "审批挂起时被杀不许写成 interrupted：宿主既不知道是否批准，也不知道命令跑没跑"
+        );
+
+        // 重复对账只补一条、数值不变（重开多次不会越写越多）。
+        let again = reconcile_once(&path, false, 100).unwrap();
+        assert_eq!(again.status, ReconcileStatus::AlreadyConcluded);
+        assert_eq!(turn_ends(&path).len(), 2);
+    }
+
+    /// `AbortNote` 单条不够：它说明「退出流程等超时了」，不说明「执行被中止」。
+    ///
+    /// 挂起等审批时被迫退出也是这个形状——那一轮从未开始执行，结局仍是「未知」。
+    #[test]
+    fn abort_note_without_execution_progress_stays_indeterminate() {
+        let dir = temp_dir("abort-no-progress");
+        let writer = RolloutWriter::create(&dir.0, &meta("agent")).unwrap();
+        writer.append(&user("跑一条需要审批的命令")).unwrap();
+        writer
+            .append(&RolloutItem::ApprovalRequest {
+                request_id: "appr-call-1".into(),
+                call_id: Some("call-1".into()),
+                tool: "unified_exec".into(),
+                risk: "high".into(),
+                at_ms: 4,
+            })
+            .unwrap();
+        writer
+            .append(&RolloutItem::AbortNote {
+                reason: "因退出而强制中止：取消等待超时".into(),
+                at_ms: 9,
+            })
+            .unwrap();
+        let path = writer.path().to_path_buf();
+        drop(writer);
+
+        let result = reconcile_once(&path, false, 99).unwrap();
+        assert_eq!(
+            result.entry.expect("补写必须带回结论行").reason,
+            "indeterminate",
+            "没有执行进展时，AbortNote 只证明退出等待超时，不证明执行被中止"
+        );
     }
 
     /// 强制中止留痕本身就是证据：退出流程已经写下「取消等待超时仍要退出」。

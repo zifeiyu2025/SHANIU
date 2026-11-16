@@ -1911,7 +1911,7 @@ export function createAdapter(options: AdapterOptions): { remote: unknown; dispo
    */
   const replayArchive = (
     entries: readonly SessionEntryLike[],
-    close: { closeOpenTurn: boolean; runtimeUnknown: boolean },
+    close: { closeOpenTurn: boolean; runtimeUnknown: boolean; sessionRunning: boolean },
   ): Journal => {
     const journal = newJournal(now())
     let stepOpen = false
@@ -1921,6 +1921,15 @@ export function createAdapter(options: AdapterOptions): { remote: unknown; dispo
      * 同一个档案回合会被拆成两套步序，回合头与「用时 N 秒」的分组就和实时跑出来的不一样。
      */
     let stepHasAssistant = false
+    /**
+     * 当前 step 里是否有**真实产出**（助手消息 / 工具调用或结果）。
+     *
+     * 开来只为「提交了提问、还没跑完一次迭代就被杀」的那一轮（真机 N2：实时 2 步 →
+     * 重开 3 步）。实时路径的步数只在 step 闭合时推进，那种轮次一个 step 都没闭合，
+     * 一步都不算；重建若把「开着的空 step」也闭合计数，就会凭空多一步。通知类消息
+     * （如「审批已失效」）不算产出：用户提交那一轮并没有因此跑过一次采样。
+     */
+    let stepHasContent = false
     /** 本回合已经折叠掉的 step 数：`TurnEnd.iterations` 拿它做口径校正。 */
     let stepsThisTurn = 0
     /**
@@ -1935,13 +1944,18 @@ export function createAdapter(options: AdapterOptions): { remote: unknown; dispo
       pushEvent(journal, 'step/start', { turn: journal.turn, step })
       stepOpen = true
       stepHasAssistant = false
+      stepHasContent = false
     }
     const closeStep = (): void => {
       if (!stepOpen) return
       pushEvent(journal, 'step/end', { turn: journal.turn, step: journal.step })
-      // 重建只有计数、没有可信时刻：步/回合数如实折叠，墙钟一律不计。
-      closeStepMetrics(journal)
-      stepsThisTurn += 1
+      // 空 step 不计数：实时路径里它根本不会闭合（进程就死在这一次采样上），
+      // 重建替它闭合已经越权，再计一步就是凭空多出来的那一步。
+      if (stepHasContent) {
+        // 重建只有计数、没有可信时刻：步/回合数如实折叠，墙钟一律不计。
+        closeStepMetrics(journal)
+        stepsThisTurn += 1
+      }
       stepOpen = false
     }
     /** 已按结局行统计过的用户回合号（防重复结局行把一轮数成两轮）。 */
@@ -2083,6 +2097,7 @@ export function createAdapter(options: AdapterOptions): { remote: unknown; dispo
             openStep(journal.step)
           }
           stepHasAssistant = true
+          stepHasContent = true
           const content: Record<string, unknown>[] = []
           if (entry.reasoning !== undefined && entry.reasoning !== '') content.push({ type: 'reasoning', text: entry.reasoning })
           content.push({ type: 'text', text: entry.text })
@@ -2097,9 +2112,32 @@ export function createAdapter(options: AdapterOptions): { remote: unknown; dispo
             },
             stream: [],
           }, { surfaceOp: 'append' })
-        } else {
+        } else if (entry.kind === 'approval_expired') {
+          // 关掉程序时还挂着的审批（档案里有请求、没有裁决）。重开**不能**重建那张卡：
+          // 回执通道随进程一起没了，点下去只会给出一个没人等的 request_id。但也不能
+          // 一声不响——用户会以为那次审批从没发生过。这里留一行通知，明说「已失效」，
+          // 且它不推进步数（通知不是执行产出）。
+          //
+          // 只在宿主确认本会话没在跑时标失效：在跑时那条请求可能正挂着等回执，
+          // 说「未作答」就是谎话；运行态未知时同理保持沉默，把判断留给下一次打开。
+          if (!close.sessionRunning && !close.runtimeUnknown && journal.taskOpen) {
+            const text = `这条审批在程序关闭前未作答，已失效：${entry.tool}（风险 ${entry.risk}）。`
+              + '那次审批不会重放，也不会再等待回执。'
+            pushEvent(journal, 'developer/message', {
+              turn: journal.turn,
+              step: journal.step,
+              message: {
+                id: `shaniu-replay-approval-expired-${index}`,
+                role: 'developer',
+                source: { kind: 'approval-expired', form: 'notice', summary: text },
+                content: [{ type: 'text', text }],
+              },
+            }, { surfaceOp: 'append' })
+          }
+        } else if (entry.kind === 'tool_call') {
           if (!journal.taskOpen) startTurn()
           if (!stepOpen) { journal.step += 1; openStep(journal.step) }
+          stepHasContent = true
           pushEvent(journal, 'tool/call', {
             turn: journal.turn,
             step: journal.step,
@@ -2951,6 +2989,7 @@ export function createAdapter(options: AdapterOptions): { remote: unknown; dispo
     const replayed = replayArchive(archiveEntries, {
       closeOpenTurn: idle && reconciled?.status !== 'running' && conclusion === undefined,
       runtimeUnknown: !runtimeKnown,
+      sessionRunning: runningHere,
     })
     replayed.lastEventId = cursor
     journals.set(sessionId, replayed)

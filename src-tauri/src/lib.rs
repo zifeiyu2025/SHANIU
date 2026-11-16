@@ -1191,6 +1191,19 @@ pub enum SessionEntry {
         #[serde(skip_serializing_if = "Option::is_none")]
         error: Option<events::TurnErrorInfo>,
     },
+    /// 「关闭前未作答」的审批记录（档案里有 `ApprovalRequest`、没有 `ApprovalDecision`）。
+    ///
+    /// 只在**没有裁决**时投影：已经作答的审批由随后的工具调用/结果如实呈现，
+    /// 不需要第二条真相。它不是可点击的卡——程序关闭后已没有回执通道，点下去只会
+    /// 给一个谁都不在等的 request_id；前端把它渲染成一行「已失效」的记录。
+    ApprovalExpired {
+        tool: String,
+        /// 记录时的风险档（`low` / `medium` / `high`）。
+        risk: String,
+        /// 审批请求的落档时刻；`0` = 旧档案未记录。
+        #[serde(default)]
+        at_ms: u64,
+    },
 }
 
 /// 档案历史 → 展示条目。
@@ -1324,6 +1337,15 @@ fn project_slots(items: &[rollout::RolloutItem]) -> Vec<Slot> {
 ///   完整视图（导出）传 true：锚点只做标记，原文一条不删。
 fn project_slots_with(items: &[rollout::RolloutItem], include_compaction: bool) -> Vec<Slot> {
     let mut out = Vec::with_capacity(items.len());
+    // 已作答的审批 request_id：先扫一遍，投影时才知道哪条请求「关闭前没作答」。
+    // 逐条向前看会退化成 O(n²)，而档案是整段重放，长会话里那点代价会直接变成卡顿。
+    let answered: std::collections::HashSet<&str> = items
+        .iter()
+        .filter_map(|item| match item {
+            rollout::RolloutItem::ApprovalDecision { request_id, .. } => Some(request_id.as_str()),
+            _ => None,
+        })
+        .collect();
     for item in items {
         match item {
             rollout::RolloutItem::ResponseItem {
@@ -1396,6 +1418,18 @@ fn project_slots_with(items: &[rollout::RolloutItem], include_compaction: bool) 
                     error: error.clone(),
                 }))
             }
+            // 审批留痕（2026-11-17）：只有「请求在、裁决不在」才成条——那正是
+            // 「审批卡挂起时程序被关掉」的形状。有裁决的请求由随后的工具调用呈现。
+            rollout::RolloutItem::ApprovalRequest { request_id, tool, risk, at_ms, .. } => {
+                if !answered.contains(request_id.as_str()) {
+                    out.push(Slot::Audit(SessionEntry::ApprovalExpired {
+                        tool: tool.clone(),
+                        risk: risk.clone(),
+                        at_ms: *at_ms,
+                    }))
+                }
+            }
+            rollout::RolloutItem::ApprovalDecision { .. } => {}
             // 首行 meta 不是历史；子代理引用要等 SH-056 的泳道 UI 才有展示形态；
             // 档位事件是控制面记录，退出留痕是审计记录——都不进对话历史。
             // 系统提示词同样不进：它在轨迹视图里由 `system/message` 事件承载，
@@ -2380,15 +2414,63 @@ fn cancel_task(app: tauri::AppHandle) -> Result<(), String> {
 
 /// 审批回执（approval card → broker）。返回是否命中待审批表：
 /// false = 该 ID 已被裁决或已被租约超时收口，前端据此丢弃过期卡片，不当成错误。
+///
+/// 2026-11-17：裁决先写进会话档案再唤醒等待者。反过来的话，进程在「已唤醒、未落档」
+/// 之间被杀，重开就会把一次真实作答误报成「关闭前未作答」。
 #[tauri::command]
 fn approve(app: tauri::AppHandle, request_id: String, decision: String) -> Result<bool, String> {
-    let decision = match decision.as_str() {
+    let parsed = match decision.as_str() {
         "allow" => events::ApprovalDecision::Allow,
         "allow_always" => events::ApprovalDecision::AllowAlways,
         "deny" => events::ApprovalDecision::Deny,
         other => return Err(format!("未知裁决: {other}")),
     };
-    Ok(app.state::<AppState>().broker.resolve(&request_id, decision))
+    let state = app.state::<AppState>();
+    let session_id = state
+        .broker
+        .pending_snapshot()
+        .approvals
+        .into_iter()
+        .find(|view| view.request_id == request_id)
+        .map(|view| view.session_id);
+    if let Some(session_id) = session_id {
+        archive_approval_decision(&state, &session_id, &request_id, decision.as_str());
+    }
+    Ok(state.broker.resolve(&request_id, parsed))
+}
+
+/// 把审批裁决写进会话档案（与 [`rollout::RolloutItem::ApprovalRequest`] 成对）。
+///
+/// 「有请求无裁决」是重开后判定「关闭前未作答」的唯一依据，所以在**每一个**真的
+/// 给出裁决的入口（用户回执、租约超时看门狗）都必须落这一条，否则一次真作答会被
+/// 误报成已失效。落档失败只 warn：审批是安全路径，审计是旁路，不能互相拖住。
+fn archive_approval_decision(
+    state: &AppState,
+    session_id: &str,
+    request_id: &str,
+    decision: &str,
+) {
+    let path = state
+        .data_root()
+        .join(rollout::ROLLOUT_DIR)
+        .join(format!("{session_id}.jsonl"));
+    if !path.is_file() {
+        return;
+    }
+    let writer = match rollout::RolloutWriter::open_existing(&path) {
+        Ok(writer) => writer,
+        Err(error) => {
+            tracing::warn!(session_id, "审批裁决落档打不开档案: {error}");
+            return;
+        }
+    };
+    if let Err(error) = writer.append(&rollout::RolloutItem::ApprovalDecision {
+        request_id: request_id.to_owned(),
+        decision: decision.to_owned(),
+        at_ms: now_ms(),
+    }) {
+        tracing::warn!(session_id, request_id, "审批裁决落档失败（不影响审批本身）: {error}");
+    }
 }
 
 /// 审批观察者租约：页面启动时登记，之后每 5s 心跳续约。
@@ -2447,6 +2529,14 @@ fn install_approval_reachability(app: &tauri::AppHandle) {
                 .sweep_unattended(std::time::Instant::now());
             for view in expired {
                 use events::EventSink as _;
+                // 超时拒绝也是「真的给出了裁决」：档案里必须留裁决，否则重开会把
+                // 这次看门狗收口误报成「关闭前未作答」。
+                archive_approval_decision(
+                    &watchdog.state::<AppState>(),
+                    &view.session_id,
+                    &view.request_id,
+                    "deny",
+                );
                 let sink = events::TauriEventSink::root(watchdog.clone(), view.session_id.clone());
                 if let Err(error) = sink.emit(&events::EventMsg::ExecApprovalResolved {
                     request_id: view.request_id.clone(),

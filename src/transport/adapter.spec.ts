@@ -2925,6 +2925,77 @@ describe('适配层的命令面映射', () => {
     expect((ends[0]!['data'] as { reason: { kind: string } }).reason.kind).toBe('indeterminate')
   })
 
+  it('N2：审批挂起时强杀——重开留「已失效」记录、不造假卡、步数与实时一致', async () => {
+    // 真机形状（docs/smoke/2026-11-17-9af8431 的 02-rollout-after-kill.jsonl）：
+    // 第一轮正常收口（2 步），第二轮只到「用户提交 + 一个审批请求」就被杀。
+    // 档案里没有执行进展，宿主对账写的是 indeterminate——前端不许把它说成「已停止」。
+    const archive = [
+      { kind: 'message', role: 'user', text: '第一问' },
+      { kind: 'message', role: 'assistant', text: '第一答' },
+      { kind: 'turn_end', turn: 1, task_id: 'agent#1', iterations: 2, reason: 'completed', at_ms: 10 },
+      { kind: 'message', role: 'user', text: '跑一条需要审批的命令' },
+      // 有请求、没有裁决 = 关闭前没作答（`project_slots_with` 只在这种情形下投影这一条）。
+      { kind: 'approval_expired', tool: 'unified_exec', risk: 'execute', at_ms: 20 },
+    ]
+    const followOnce = async (): Promise<{ events: Record<string, unknown>[]; stats: unknown }> => {
+      const { remote, dispose } = createAdapter({ bridge: scriptedBridge(undefined, archive) })
+      const iterator = faceOf(remote).session.follow({ address: { kind: 'session', sessionId: 'agent-pending' } })
+      const snapshot = (await iterator.next()).value as { records: Record<string, unknown>[]; projections: { values: Record<string, unknown> } }
+      await iterator.return?.(undefined)
+      dispose()
+      return {
+        events: eventsOf(snapshot as unknown as Record<string, unknown>),
+        stats: snapshot.projections.values['sessionStats'],
+      }
+    }
+    const first = await followOnce()
+    const opened = first.events
+    // 反向对照一：把 closeStep 改回「空 step 也计数」，步数会变成 3（实时是 2）——本断言必红。
+    expect(first.stats).toMatchObject({ turns: 1, steps: 2 })
+
+    const ends = opened.filter(event => event['type'] === 'turn/end')
+    expect(ends).toHaveLength(2)
+    expect((ends[1]!['data'] as { reason: { kind: string } }).reason.kind).toBe('indeterminate')
+    expect(JSON.stringify(ends)).not.toContain('interrupted')
+
+    // 失效记录：恰好一条，说清「未作答、已失效」，且是通知形态（不是可点击的卡）。
+    const expiredNotices = (events: Record<string, unknown>[]): Record<string, unknown>[] =>
+      events.filter(event => event['type'] === 'developer/message'
+        && (event['data'] as { message?: { source?: { kind?: string } } }).message?.source?.kind === 'approval-expired')
+    const notices = expiredNotices(opened)
+    expect(notices).toHaveLength(1)
+    const noticeSource = (notices[0]!['data'] as { message: { source: { form: string; summary: string } } })
+      .message.source
+    expect(noticeSource.form).toBe('notice')
+    expect(noticeSource.summary).toContain('程序关闭前未作答，已失效')
+    expect(noticeSource.summary).toContain('unified_exec')
+    // 不许暗示还能点：文案里不能出现任何「批准/拒绝」动作词。
+    expect(noticeSource.summary).not.toContain('批准')
+    expect(noticeSource.summary).not.toContain('拒绝')
+
+    // 重复重开：步/轮数值一模一样，通知也只有一条（同一份档案不能被重放成两份事实）。
+    const again = await followOnce()
+    expect(again.stats).toMatchObject({ turns: 1, steps: 2 })
+    expect(expiredNotices(again.events)).toHaveLength(1)
+  })
+
+  it('N2：会话正在跑时不标「已失效」——那条审批可能正挂着等回执', async () => {
+    const archive = [
+      { kind: 'message', role: 'user', text: '跑一条需要审批的命令' },
+      { kind: 'approval_expired', tool: 'unified_exec', risk: 'execute', at_ms: 20 },
+    ]
+    const bridge = scriptedBridge(undefined, archive)
+    bridge.host.active = { sessionId: 'agent-live', kind: 'turn' }
+    const reopened = createAdapter({ bridge })
+    const iterator = faceOf(reopened.remote).session.follow({ address: { kind: 'session', sessionId: 'agent-live' } })
+    const events = eventsOf((await iterator.next()).value as Record<string, unknown>)
+    await iterator.return?.(undefined)
+    reopened.dispose()
+
+    expect(events.some(event => event['type'] === 'developer/message'
+      && (event['data'] as { message?: { source?: { kind?: string } } }).message?.source?.kind === 'approval-expired')).toBe(false)
+  })
+
   it('旧档案有多轮且都没有结局行：中间回合也标 indeterminate，不显示成进行中', async () => {
     // 旧档案没有 TurnEnd 行：每个用户消息都会开一个回合。前一个回合不能留成
     // 「进行中」（会一直转圈），也不能补「已中止」——一律如实标「状态未知」。

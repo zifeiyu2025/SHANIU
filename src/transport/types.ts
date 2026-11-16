@@ -124,6 +124,22 @@ export type SessionEntryLike =
     readonly at_ms: number
     readonly error?: TurnErrorInfo
   }
+  | {
+    /**
+     * 「关闭前未作答」的审批记录（2026-11-17）：档案里有 `ApprovalRequest`、
+     * 没有 `ApprovalDecision`——审批卡挂起时程序被关掉了。
+     *
+     * 它不是卡：关闭后没有回执通道，重开时只能如实留下一行「已失效」，
+     * 绝不重建一个点了也没人接的待批按钮。
+     */
+    readonly kind: 'approval_expired'
+    /** 要权限的工具名（`unified_exec` 等）。 */
+    readonly tool: string
+    /** 记录时的风险档：`read` / `write_in_workspace` / `execute` / `destructive` / `plan_review`。 */
+    readonly risk: string
+    /** 审批请求落档时刻；`0` = 旧档案未记录。 */
+    readonly at_ms?: number
+  }
 
 /**
  * 宿主恢复对账的结论码（与 Rust `ReconcileStatus::as_str()` 的五个值一一对应）。

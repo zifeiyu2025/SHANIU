@@ -1,0 +1,56 @@
+   Compiling shaniu v0.2.9 (D:\MyWorkspace\SHANIU\src-tauri)
+warning: function `has_execution_progress` is never used
+  --> src\rollout\reconcile.rs:32:4
+   |
+32 | fn has_execution_progress(item: &RolloutItem) -> bool {
+   |    ^^^^^^^^^^^^^^^^^^^^^^
+   |
+   = note: `#[warn(dead_code)]` (part of `#[warn(unused)]`) on by default
+
+warning: `shaniu` (lib test) generated 1 warning
+    Finished `test` profile [unoptimized + debuginfo] target(s) in 23.83s
+     Running unittests src\lib.rs (target\debug\build\shaniu/2ffff59e992d02a6\out\shaniu_lib-2ffff59e992d02a6.exe)
+
+running 8 tests
+test rollout::reconcile::tests::reconcile_appends_indeterminate_exactly_once ... ok
+test rollout::reconcile::tests::crash_orphan_without_abort_note_stays_indeterminate ... FAILED
+test rollout::reconcile::tests::reconcile_skips_running_absent_and_empty ... ok
+test rollout::reconcile::tests::pending_approval_kill_stays_indeterminate ... FAILED
+test rollout::reconcile::tests::legacy_ending_counts_as_concluded_without_new_line ... ok
+test rollout::reconcile::tests::concurrent_reconcile_appends_exactly_once ... ok
+test rollout::reconcile::tests::abort_note_is_evidence_of_interruption ... ok
+test rollout::reconcile::tests::abort_note_without_execution_progress_stays_indeterminate ... FAILED
+
+failures:
+
+---- rollout::reconcile::tests::crash_orphan_without_abort_note_stays_indeterminate stdout ----
+
+thread 'rollout::reconcile::tests::crash_orphan_without_abort_note_stays_indeterminate' (14180) panicked at src\rollout\reconcile.rs:315:9:
+assertion `left == right` failed: 没有 AbortNote 就不是中止证据链
+  left: "interrupted"
+ right: "indeterminate"
+note: run with `RUST_BACKTRACE=1` environment variable to display a backtrace
+
+---- rollout::reconcile::tests::pending_approval_kill_stays_indeterminate stdout ----
+
+thread 'rollout::reconcile::tests::pending_approval_kill_stays_indeterminate' (7952) panicked at src\rollout\reconcile.rs:357:9:
+assertion `left == right` failed: 审批挂起时被杀不许写成 interrupted：宿主既不知道是否批准，也不知道命令跑没跑
+  left: "interrupted"
+ right: "indeterminate"
+
+---- rollout::reconcile::tests::abort_note_without_execution_progress_stays_indeterminate stdout ----
+
+thread 'rollout::reconcile::tests::abort_note_without_execution_progress_stays_indeterminate' (4140) panicked at src\rollout\reconcile.rs:395:9:
+assertion `left == right` failed: 没有执行进展时，AbortNote 只证明退出等待超时，不证明执行被中止
+  left: "interrupted"
+ right: "indeterminate"
+
+
+failures:
+    rollout::reconcile::tests::abort_note_without_execution_progress_stays_indeterminate
+    rollout::reconcile::tests::crash_orphan_without_abort_note_stays_indeterminate
+    rollout::reconcile::tests::pending_approval_kill_stays_indeterminate
+
+test result: FAILED. 5 passed; 3 failed; 0 ignored; 0 measured; 1144 filtered out; finished in 0.01s
+
+error: test failed, to rerun pass `--lib`

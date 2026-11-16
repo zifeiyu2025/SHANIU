@@ -72,3 +72,43 @@
   反向对照：忽略锚点文本，本条改到 `alpha` 那段，断言必红。
 - `multi_hunk_second_hunk_mismatch_writes_nothing`（1456）：**反向验证**——第二块对不上时整条补丁
   失败且一个字节都不写，防「为了多块能过而改成部分应用」。
+
+## 追加：0.2.9 真机冒烟 P1 之二（N2 审批挂起时强杀）
+
+基准提交 `efa2681`（`src-tauri` 与 `src` 均为该提交 + 本次改动）。
+
+**问题**：审批卡挂起时强杀，重开后卡片消失、结局被写成 `turn_end reason=interrupted`
+（界面「已停止」）、步数 2→3。真机原始档案见
+`docs/smoke/2026-11-17-9af8431/evidence/02-rollout-after-kill.jsonl`（第 12 行
+`turn=2 reason=interrupted`，其后无任何执行进展）。
+
+**根因（两处，同一口径）**：
+
+1. `reconcile.rs` 的 `interruption_evidence` 把「档案里出现过 `TurnEnd`」当作中断证据。
+   那个 `TurnEnd` 属于**第一轮**，对第二轮什么也没证明；第二轮只有用户提问 + system
+   提示词 + 一个审批请求，宿主既不知道用户会不会批准，也不知道命令跑没跑，只能报「未知」。
+2. 回放时 `closeStep` 无条件计数：第二轮开着的那一步在实时路径里从未闭合（进程死在
+   这次采样上），重建却替它闭合并计一步——凭空多出来的那一步。
+
+**修法**：结局只认「最后一条提问之后」同时有 `AbortNote` **与**真实执行进展；裁决由档案
+自身回答（新增 `ApprovalRequest` / `ApprovalDecision` 两条档案项，请求在审批卡发出时落档、
+裁决在真的有人作答时落档），「有请求无裁决」在 `load_session` 投影成 `approval_expired`，
+前端重开时渲染成一行通知「这条审批在程序关闭前未作答，已失效」（不是卡，也没有回执通道）。
+空 step 不计数。
+
+**用例与原始输出**：
+
+| 文件 | 内容 |
+|---|---|
+| `n2-reconcile-red.log` | 反向对照一：把 `interruption_evidence` 退回旧判据（有 `TurnEnd` 即中断），3 条新用例全红（`left: "interrupted" / right: "indeterminate"`） |
+| `n2-reconcile-green.log` | 修复后：`rollout::reconcile` 8 passed |
+| `n2-steps-red.log` | 反向对照二：`closeStep` 去掉 `stepHasContent` 门槛（空 step 也计数），N2 用例红：`steps: 3, turns: 2` |
+| `n2-steps-green.log` | 修复后：N2 两条用例绿（`steps: 2, turns: 1`，重复重开数值不变） |
+| `n2-cargo-test-full.log` | `cargo test` 全量：lib 1148 passed / 4 ignored（含新增 3 条 reconcile 用例）、集成 25 passed |
+| `n2-clippy.log` | `cargo clippy --all-targets -- -D warnings` 通过 |
+| `n2-vitest-full.log` | `pnpm vitest run --exclude "scratch/**"`：501 passed |
+| `n2-typecheck.log` | `pnpm typecheck` 在**提交树**（`scratch/verify-n2` 干净 worktree）上通过 |
+
+**仍未核实**：真机重跑（强杀 → 重开）尚未执行；本批只证明判据、档案留痕、回放与步数口径，
+冒烟结论仍以 `docs/smoke/2026-11-17-9af8431/REPORT.md` 的 FAIL 为准，直到重跑。
+

@@ -1,0 +1,16 @@
+   Compiling shaniu v0.2.9 (D:\MyWorkspace\SHANIU\src-tauri)
+    Finished `test` profile [unoptimized + debuginfo] target(s) in 25.11s
+     Running unittests src\lib.rs (target\debug\build\shaniu/2ffff59e992d02a6\out\shaniu_lib-2ffff59e992d02a6.exe)
+
+running 8 tests
+test rollout::reconcile::tests::crash_orphan_without_abort_note_stays_indeterminate ... ok
+test rollout::reconcile::tests::reconcile_appends_indeterminate_exactly_once ... ok
+test rollout::reconcile::tests::concurrent_reconcile_appends_exactly_once ... ok
+test rollout::reconcile::tests::abort_note_is_evidence_of_interruption ... ok
+test rollout::reconcile::tests::reconcile_skips_running_absent_and_empty ... ok
+test rollout::reconcile::tests::abort_note_without_execution_progress_stays_indeterminate ... ok
+test rollout::reconcile::tests::legacy_ending_counts_as_concluded_without_new_line ... ok
+test rollout::reconcile::tests::pending_approval_kill_stays_indeterminate ... ok
+
+test result: ok. 8 passed; 0 failed; 0 ignored; 0 measured; 1144 filtered out; finished in 0.01s
+

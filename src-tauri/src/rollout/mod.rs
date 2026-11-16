@@ -110,6 +110,28 @@ pub enum RolloutItem {
     /// 这一行把“为什么断”写清楚，resume 与审计才有据可查。
     /// **只在等待超时、被迫退出时写**；正常取消走 `TurnEnd`，不写这里。
     AbortNote { reason: String, at_ms: u64 },
+    /// 审批请求落档（与 [`RolloutItem::ApprovalDecision`] 成对）。
+    ///
+    /// 为什么必须进档案：审批卡挂起时进程被杀，事件日志之外不留任何痕迹，重开后
+    /// 用户完全看不出「曾经有一个审批在等」。请求先落、裁决后落，「有请求无裁决」
+    /// 就是「关闭前没作答」——回放据此把那张卡**显式标成已失效**，而不是让这次
+    /// 审批像从没发生过一样消失（伪造一张能点的卡同样不行：关闭后已没有回执通道）。
+    ///
+    /// 载荷不含参数原文：档案会被导出与审计，完整命令/补丁在事件侧
+    /// `exec_approval_request` 里已有；这里只需回答「哪个工具、多高风险」。
+    ApprovalRequest {
+        request_id: String,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        call_id: Option<String>,
+        tool: String,
+        risk: String,
+        at_ms: u64,
+    },
+    /// 审批裁决落档（`decision` = `allow` / `allow_always` / `deny`）。
+    ///
+    /// 只在**真的有人（或看门狗）给出裁决**时写。取消（退出流程、租约回收）
+    /// 不算裁决——那时请求确实没被作答，档案里就该保持「无裁决」。
+    ApprovalDecision { request_id: String, decision: String, at_ms: u64 },
     /// 回合结局（A0-3）：档案必须如实记录成功/失败/取消/超时，导出与统计都靠它。
     ///
     /// 旧档案没有这一行——那是历史事实，读侧只能标 `unknown`，不许默认成成功。

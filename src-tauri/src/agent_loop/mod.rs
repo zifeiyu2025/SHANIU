@@ -9,6 +9,7 @@
 //! 每个任务 = 若干 turn；turn 内无工具调用即任务完成（completed）。
 
 pub mod anomaly;
+pub mod approval_archive;
 pub mod budget;
 pub mod error_codes;
 pub mod instance;
@@ -1007,6 +1008,14 @@ impl AgentLoop {
         let history = &mut *history;
         let recorded = &mut *recorded;
         let rollout = &*rollout;
+        // 审批请求/裁决顺手落档案（2026-11-17）：审批卡挂起时被杀，事件日志之外原本
+        // 一点痕迹都没有，重开后那张卡凭空消失。包在这里而不是审批器里——档案写者
+        // 在这一层才有，权限层不该反向依赖会话档案，安全语义也一个字不用动。
+        // 子代理的审批走它自己的实例与自己的档案（各自再包一层），这里只包本实例。
+        let sink: Arc<dyn crate::events::EventSink> = match rollout {
+            Some(writer) => approval_archive::wrap(sink, writer.clone()),
+            None => sink,
+        };
         // 每次工具门禁都要的代理身份（ADR-103）：白名单 + 审批来源。
         let gate_subject = crate::permission::GateSubject {
             agent_id: &scope.agent_id,

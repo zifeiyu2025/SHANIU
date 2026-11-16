@@ -163,6 +163,15 @@ pub fn resume(path: &Path) -> Result<Resumed, RolloutError> {
                 // 否则“档案为什么断在这里”又变成无人能解释。
                 tracing::warn!("会话档案含强制中止记录：{reason}");
             }
+            RolloutItem::ApprovalRequest { tool, risk, .. } => {
+                // 审批请求是审计/重开呈现用的事实，不是对话内容：喂给模型会让它
+                // 把自己的权限询问当成上一轮说过的话。重开要呈现的那条「已失效」
+                // 由投影层（`project_slots_with`）读档案给出。
+                tracing::debug!("会话档案含审批请求：{tool}（风险 {risk}）");
+            }
+            RolloutItem::ApprovalDecision { decision, .. } => {
+                tracing::debug!("会话档案含审批裁决：{decision}");
+            }
             RolloutItem::TurnEnd { reason, .. } => {
                 // 结局只服务于导出/统计/审计，不参与模型历史重建。
                 tracing::debug!("会话档案回合结局：{reason}");

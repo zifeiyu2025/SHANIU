@@ -218,6 +218,13 @@ export function sessionEntriesToEvents(
       continue
     }
 
+    if (entry.kind === 'approval_expired') {
+      // 审批留痕（2026-11-17）不进导出：它不是对话内容，也不是工具调用——
+      // 导出面向人读的会话正文，权限审计在档案 `/events` 与轨迹视图里。
+      // 落到下面的 tool_call 分支会读 `entry.call_id`（此类型没有）而崩，所以必须吃掉。
+      continue
+    }
+
     // tool_call：调用与结果配对展开。`callId` 用档案里的 call_id，
     // formatter 靠它把 result 回填到同一条 ToolEntry 上。
     const at = entryTime(entry)

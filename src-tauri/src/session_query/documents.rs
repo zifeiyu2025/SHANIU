@@ -169,11 +169,14 @@ pub fn build_documents(items: &[RolloutItem], created_at: u64) -> Vec<SearchDoc>
             // 系统提示词也不进索引：它是宿主拼装的固定说明，不是用户/模型对话；
             // 混进来会让每次搜索都命中同一段模板，把真正的会话内容压下去。
             // 写后验证裁决同理：它记录的是宿主执行的命令与退出码，不是对话正文。
+            // 审批请求/裁决是权限审计事实（2026-11-17），不是谁说的话，也不进索引。
             RolloutItem::SessionMeta { .. }
             | RolloutItem::SubagentRef { .. }
             | RolloutItem::SandboxMode { .. }
             | RolloutItem::PermissionPreset { .. }
             | RolloutItem::AbortNote { .. }
+            | RolloutItem::ApprovalRequest { .. }
+            | RolloutItem::ApprovalDecision { .. }
             | RolloutItem::TurnEnd { .. }
             | RolloutItem::Verification { .. }
             | RolloutItem::SystemPrompt { .. } => {}
