@@ -1,0 +1,21 @@
+
+采集方式：CDP 连 WebView2 直接读 DOM（innerText / 属性），时间 2026-11-17 03:3x 本地（UTC+8）。
+
+1. 沙箱越界卡 [data-chat-call-id=call_736cf9916e4648bf8929adca]
+   折叠：innerText = "编辑"；data-state="ok"；data-variant="edit"
+   展开：innerText = "编辑\n输出\n第 1 段（Add File: D:/MyWorkspace/SHANIU/scratch/smoke-1117/outside/x.txt，补丁第 2–3 行）：路径越界（工作区之外）: D:/MyWorkspace/SHANIU/scratch/smoke-1117/outside/x.txt"
+   注：正文随滚动虚拟化卸载，滚动离开后 innerText 退回 "编辑"。
+
+2. 用户拒绝卡 [data-chat-call-id=call_2644075dacf245cba3ca756b]
+   data-state="ok"；textContent 含「工具调用unified_exec · python -c …」+ 输入参数 +
+   「输出拒绝说明：type=user_denied；…可行做法：…」；折叠时正文不渲染。
+
+3. 页脚读数
+   root-a「执行dir命令」第 1 回合结束：1 轮 2 步（shots/02-dir-allowlist-no-card.png）
+   root-a 审批挂起强杀后重开：2 轮 3 步（shots/02-reopen-after-kill.png）
+   root-a「从1输出到30000」：3 轮 4 步（两处「已停止」）
+   root-c 压缩会话：2 轮 4 步 → 3 轮 5 步
+
+4. 托盘
+   关闭前 EnumWindows：hwnd=8389660 visible=True class=Tauri Window
+   关闭后：hwnd=8389660 visible=False class=Tauri Window，进程仍存活；托盘项「SHANIU 仍在后台运行 · 右键退出」可唤回。

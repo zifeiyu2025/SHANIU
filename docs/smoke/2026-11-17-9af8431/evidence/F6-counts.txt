@@ -1,0 +1,17 @@
+
+一、压缩会话（root-c）
+  界面（重开）   3 轮 5 步（shots/03-reopen-final-3turns.png）
+  界面（更早一次重开）2 轮 4 步（shots/03-reopen-compaction-node.png，第 2 轮结束后）
+  rollout        turn_end ×3，iterations 2+2+1=5
+  导出           turn/start=3、turn/end=3、
+                 user/message=3；{"session":1,"session/title":1,"turn/start":3,"user/message":3,"tool/call":2,"tool/result":2,"compaction/start":2,"compaction/summary":2,"compaction/end":2,"assistant/message":4,"turn/end":3}
+                 但 turn/end 条目里没有 iterations / step 字段
+  导出步数口径   所有带 step 的条目取值集合 = [1]（退化为常量 1）
+                 → 界面与 rollout 的「5 步」在导出里无法核对
+
+二、审批挂起强杀会话（root-a「执行dir命令并贴出前五行」）
+  实时（第 1 回合结束）1 轮 2 步（shots/02-dir-allowlist-no-card.png 底部）= rollout turn=1 iterations=2
+  rollout        turn=1 iterations=2 reason=completed；turn=2 iterations=（缺） reason=interrupted
+  重开界面        2 轮 3 步（shots/02-reopen-after-kill.png）→ 该回合档案里没有 iterations，多出来的 1 步无来源
+  该会话导出      09-session.v4.jsonl：{"session":1,"session/title":1,"turn/start":2,"user/message":2,"assistant/message":2,"tool/call":1,"tool/result":1,"turn/end":2}，
+                 turn/end 2 条（turn=2 reason=interrupted），同样没有步数字段；带 step 的条目取值集合 = [1]

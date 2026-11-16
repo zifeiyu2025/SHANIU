@@ -1,0 +1,23 @@
+
+被测对象
+  路径      dist-release/SHANIU-Portable-0.2.9/SHANIU.exe
+  大小      28,724,224 B
+  SHA256    DF7FB6336FB764673F0C3F57ACBA6CD219782C2F3BCBDCCF860D1654848D175F
+  版本      FileVersion=0.2.9  ProductVersion=0.2.9
+被测提交  9af8431aabf5456287e79a305360cfa494fe177f（= origin/main）
+
+数据根（均由 SHANIU_DATA_DIR 隔离，互不可见）
+  root-a  approval=on_request  token_budget=500000  沙箱 workspace_write  CDP 9444  工作区 proj
+  root-b  approval=full_access token_budget=500000  沙箱 workspace_write  CDP 9446  工作区 proj-b
+  root-c  approval=on_request  token_budget=5000    沙箱 workspace_write  CDP 9445  工作区 proj-c（压缩用）
+  root-d  approval=full_access base_url=http://127.0.0.1:9447/v1（本地截断代理）CDP 9448  工作区 proj-b
+
+驱动方式
+  - 真机 GUI：直接运行上述 exe（未重新构建），CDP 连 WebView2 做点击/输入/截图/滚动；
+  - 截断注入：本地 Node 反向代理 9447 转发 LongCat，把请求体 max_tokens 改为 200，
+    路径 /v1/* 转发到上游 /openai/v1/*；
+  - 导出：走真实 UI 菜单 + 原生保存对话框（Browser.setDownloadBehavior + 按键确认）。
+
+说明
+  root-d 第 1 回合是一条 failed（ENDPOINT_UNSUPPORTED HTTP 404），成因是代理首版未加 /openai
+  前缀的测试环境误配，不是产品缺陷；第 2 回合才是本项要看的截断回合。

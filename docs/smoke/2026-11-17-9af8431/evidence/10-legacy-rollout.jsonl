@@ -1,0 +1,4 @@
+{"type":"session_meta","session_id":"sess-legacy-1117-0001","agent_id":"sess-legacy-1117-0001","parent_id":null,"created_at":1794857238970,"config_snapshot":{"provider":"openai-chat","base_url":"https://api.longcat.chat/openai/v1","model":"LongCat-2.5","sandbox":"WorkspaceWrite","approval":"FullAccess","workspace_root":"D:/MyWorkspace/SHANIU/scratch/smoke-1117/proj-b"}}
+{"type":"response_item","item":{"type":"message","role":"user","text":"旧档案：请只回复 legacy-ok"},"at_ms":1794857239970}
+{"type":"response_item","item":{"type":"message","role":"assistant","text":"legacy-ok"},"at_ms":1794857240970}
+{"type":"turn_end","turn":1,"task_id":"sess-legacy-1117-0001#1","reason":"indeterminate","at_ms":1794857253028,"error":null}

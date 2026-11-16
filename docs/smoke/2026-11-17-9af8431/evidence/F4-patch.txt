@@ -1,0 +1,25 @@
+
+一、一次补丁改三处（root-a 04-rollout-modify-sum.jsonl 第 2 回合）
+  提示词要求：用一个 apply_patch 改 src/sections.js 里相隔很远的三处（sectionA→A2、sectionB→B2、sectionC→C2）。
+  回执：「补丁应用成功（1 处）：\n~ src/sections.js」（1 处 = 1 个文件，3 个 @@ 块一次落地）
+  事后核实：search 命中 sectionA 第 5 行 A2、sectionB 第 60 行 B2、sectionC 第 115 行 C2；
+           node test/sections.test.js → sections.test.js OK / [exit code: 0]。
+
+二、整条原子性（第 3 回合，故意坏补丁）
+  CALL apply_patch {"patch": "*** Begin Patch\n*** Update File: src/sections.js\n@@\n-export function sectionA() { return 'A2' }\n+export function sectionA() { return 'A3' }\n@@\n-export function sectionZ() { return 'Z9' }\n+export function sectionZ() { return 'Z3' }\n*** End Patch"}
+  OUT  第 1 段（Update File: src/sections.js，补丁第 2–8 行）：write_file_not_read: 未读取过 src/sections.js 就尝试修改。请先用 read_file 读取当前内容，再基于真实内容生成补丁
+  CALL apply_patch {"patch": "*** Begin Patch\n*** Update File: src/sections.js\n@@\n-export function sectionA() { return 'A2' }\n+export function sectionA() { return 'A3' }\n@@\n-export function sectionZ() { return 'Z9' }\n+export function sectionZ() { return 'Z3' }\n*** End Patch"}
+  OUT  第 1 段（Update File: src/sections.js，补丁第 2–8 行）：第 2 个 `@@` 块：上下文不匹配：未找到补丁期望的 1 行序列（已尝试：精确、剥离行号前缀、缩进弹性、空白折叠、首尾锚点）。
+期望匹配的 1 行（块内序号）：
+  块内 1| export function sectionZ() { return 'Z9' }
+文件中最接近的位置：第 5 行起（整块相似度 93%，文件共 120 行）：
+  文件第 5| export function sectionA() { return 'A3' }
+首个不一致：块内第 1 行 vs 文件第 5 行；期望 `export function sectionZ() { return 'Z9' }`，实际读到 `export function sectionA() { return 'A3' }`
+请按上面「文件中最接近的位置」的真实内容重建补丁，不要原样重试
+
+  磁盘核实（失败后 read_file）：第 5 行仍是 sectionA 'A2'，search 'sectionZ' 未命中 → 第 1 块没有被写入，整条不落盘。
+
+三、新问题：错误正文里的「实际读到」是预演内容
+  失败回执写「实际读到 \`export function sectionA() { return 'A3' }\`」，
+  但磁盘第 5 行是 'A2'（上面 read_file 与 search 都证明），A3 只是本次补丁第 1 块预演后的中间态。
+  → 模型拿到的定位信息与真实文件不一致。

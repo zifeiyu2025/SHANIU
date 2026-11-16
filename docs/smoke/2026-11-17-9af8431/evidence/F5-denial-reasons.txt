@@ -1,0 +1,27 @@
+
+一、沙箱越界（工作区外写）
+  模型收到的原始输出（function_call_output，call_736cf9916e4648bf8929adca）：
+    第 1 段（Add File: D:/MyWorkspace/SHANIU/scratch/smoke-1117/outside/x.txt，补丁第 2–3 行）：路径越界（工作区之外）: D:/MyWorkspace/SHANIU/scratch/smoke-1117/outside/x.txt
+  界面同一张卡：
+    折叠态  只有「编辑」，无失败/拒绝标记；DOM 里 data-state="ok"、data-variant="edit"
+            （shots/F5-sandbox-collapsed.png）
+    展开态  「编辑 / 输出 / 第 1 段（Add File: D:/…/outside/x.txt，补丁第 2–3 行）：路径越界（工作区之外）: D:/…/outside/x.txt」
+            ——与模型收到的文本逐字相同（shots/F5-sandbox-expanded.png）
+  模型回复（节选）："写入被拒，文件未创建。工具返回原文如下（未改动）：\n\n```\n第 1 段（Add File: D:/MyWorkspace/SHANIU/scratch/smoke-1117/outside/x.txt，补丁第 2–3 行）：路径越界（工作区之外）: D:/MyWorkspace/SHANIU/scratch/smoke-1117/outside/x.txt\n```\n\n核对：目标文件当前不存在（`read_file` 返回「文件不存在」）。`list_dir` 对外目录也提示"
+    并给出 4 条可行动替代（写到工作区内/调整工作区授权/确认后用命令试/用户手动创建）。
+
+二、用户拒绝（审批卡点「拒绝」）
+  模型收到的原始输出（call_2644075dacf245cba3ca756b）：
+    拒绝说明：type=user_denied；工具=unified_exec；范围 approval=on_request sandbox=workspace_write risk=execute
+    用户拒绝了这次调用，这条不会被自动放行。
+    可行做法：说明这次操作要达成什么，或换一个更小的动作再问；不要原样重试，也不要换个说法绕过审批。
+  界面同一张卡：
+    折叠标题  「工具调用unified_exec · python -c …」，无「已拒绝」；DOM data-state="ok"
+    展开正文  与上面逐字相同（含「可行做法：…」），但默认折叠（shots/F5-user-denied-card.png 为所在会话）
+  模型回复（节选）："命令未执行——审批被拒绝，工具返回原文如下（未改动）：\n\n```\n拒绝说明：type=user_denied；工具=unified_exec；范围 approval=on_request sandbox=workspace_write risk=execute\n用户拒绝了这次调用，这条不会被自动放行。\n可行做法：说明这次操作要达成什么，或换一个更小的动作再问；不要原样重试，也不要换个说法绕过审批。"
+    并列出 3 条更小动作让用户选（1–100 先验证 / 授权完整输出 / 落文件）。
+
+三、结论口径
+  原因文本一致（界面展开态 = 模型侧逐字），可行动替代也一致（都在同一条输出 + 模型回复里）。
+  不一致的是「状态信号」：两类拒绝在 UI 上都渲染成 data-state="ok"，标题不标已拒绝/失败，
+  不展开就看不出这条没有执行。

@@ -1,0 +1,27 @@
+
+一、模型输出被截断（root-d，代理把 max_tokens 改成 200）
+  {"type":"turn_end","turn":1,"task_id":"sess-1794857289135-0001#1","iterations":1,"reason":"failed","at_ms":1794857300431,"error":{"code":"ENDPOINT_UNSUPPORTED","message":"该地址不支持此接口（HTTP 404）","http_status":404,"attempts":0}}
+  {"type":"turn_end","turn":2,"task_id":"sess-1794857289135-0001#2","iterations":1,"reason":"max_tokens","at_ms":1794857340980,"error":{"code":"INCOMPLETE","message":"达到最大输出长度，回答被截断（length）","provider_code":"length","provider_message":"length","attempts":0}}
+
+  界面（shots/F2-truncated-live.png，重开同形见 F2-truncated-reopen.png）：
+    回合组标题          已完成，用时 5 秒
+    红色行首            「本轮运行失败」 + 「输出达到上限，这条回答被截断（内容不完整）。」 + 右侧标签 MAX_TOKENS
+    黄色提示行          「已达到输出 token 上限 回答被截断，已有输出保留在对话中。发送“继续”可让模型接着输出。」
+    独立错误横幅        无（本回合未出现「处理失败」块；那一个属于同会话第 1 回合的 404 误配）
+  即：档案侧 reason=max_tokens / error.code=INCOMPLETE / provider_code=length 正确，
+      界面有「被截断」「MAX_TOKENS」「发送继续」，但同一行的红字仍是「本轮运行失败」。
+
+二、审批挂起时强杀，重开后的结局（root-a）
+  {"type":"turn_end","turn":1,"task_id":"sess-1794854985776-0001#1","iterations":2,"reason":"completed","at_ms":1794855092067,"error":null}
+  {"type":"turn_end","turn":2,"task_id":"sess-1794854985776-0001#2","reason":"interrupted","at_ms":1794855142525,"error":null}
+
+  界面（shots/02-reopen-after-kill.png）：
+    回合组标题  「已停止」
+    红色说明    「任务已停止 DSH 进程在本轮完成前退出（例如被强制结束、崩溃或关闭超时），重新启动后本轮已中止。未完成的工具调用结果未知。」
+    审批卡      未保留（重开后该回合只剩一条提问气泡，没有审批卡，也没有「确认中」状态）
+    页脚        2 轮 3 步（档案里该回合没有 iterations 字段，即多出的 1 步无来源）
+  对照 r2 判据：应写 reason=indeterminate 且「两处均本轮状态未知」，本轮是 interrupted/已停止。
+
+三、旧档案（无 turn_end）对照：root-b 10-legacy-rollout.jsonl
+  界面两处均为「本轮状态未知」，附「没有找到本轮的收口记录…」，1 轮 1 步，未伪造 completed
+  （shots/10-legacy-open.png）。

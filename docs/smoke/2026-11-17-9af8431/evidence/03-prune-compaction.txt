@@ -1,0 +1,27 @@
+
+一、压缩与确定性裁剪日志（root-c/logs，UTC；本地 +8）
+  2026-11-16T19:20:47.601699Z 上下文已压缩（SH-032） compressed_items=2 history_len=3
+  2026-11-16T19:21:21.293531Z D6 确定性裁剪完成 pruned_items=1 chars_before=18955 chars_after=5181 estimate_before=8285 estimate_after=4852 budget=5000
+  2026-11-16T19:21:33.612169Z 上下文已压缩（SH-032） compressed_items=7 history_len=3
+  2026-11-16T19:22:56.584249Z D6 确定性裁剪完成 pruned_items=1 chars_before=18955 chars_after=5181 estimate_before=8429 estimate_after=4996 budget=5000
+  2026-11-16T19:22:56.584259Z D6 裁剪后已回到预算内，跳过本次摘要调用
+
+二、压缩事件（03-events-compaction.jsonl）
+  compaction_started / compaction_summarized / compaction_ended 各 2 条：
+    cmp-1794856842710-0 trigger=pressure range 0–2 estimated_tokens=7191 budget_tokens=5000 shadowed_items=2
+    cmp-1794856881293-1 trigger=pressure range 0–7 estimated_tokens=7840 budget_tokens=5000 shadowed_items=7
+
+三、导出里的裁剪标记扫描（03-session.v4.jsonl / 03-export.md）
+  含「已裁剪」        0（JSONL）/ 0（MD）
+  含「裁剪」          0（JSONL）
+  含「中间省略」      1 → 唯一一处出现在 assistant/message 第 20 行，是模型自己转述
+                        「工具回传时中间有一段被截断（提示「中间省略 13835 字符，保留头 4096 + 尾 1024」）」
+  含「line 1500」     1（JSONL）/ 1（MD）→ 超长工具输出的中间段仍是完整原文
+  含「line 1999」     1（JSONL）
+
+四、界面侧
+  工具卡正文来自未裁剪的 tool_call_output（事件里 tool_call_output_delta 2000 行），
+  展开后也没有「已裁剪 / 已截断」标记；模型是在自己的回复里告诉用户「中间省略」。
+  压缩发生后实时会话区整块空白、输入框消失（shots/03-compaction-live-blank.png），
+  重开后同一压缩以「上下文已压缩 · 点击查看压缩摘要」节点出现（shots/03-reopen-compaction-node.png），
+  点击后摘要正文可见（shots/03-summary-expanded.png）。

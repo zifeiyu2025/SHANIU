@@ -1,0 +1,5 @@
+hwnd=8389660 visible=False class=Tauri Window
+hwnd=7733382 visible=False class=tray_icon_app
+hwnd=918702 visible=True class=Tao Thread Event Target
+hwnd=1508318 visible=False class=MSCTFIME UI
+hwnd=7668716 visible=False class=IME
