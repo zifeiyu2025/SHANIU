@@ -199,3 +199,69 @@ N5 报的症状正是「挂起强杀 → 重开多一步」，所以重开口径
 三处口径与用例，`docs/smoke/2026-11-17-9af8431/REPORT.md` 的既有结论不改，N4/N5 仍以
 重跑为准。
 
+---
+
+## 0.2.9 真机冒烟收尾批（N7 / N8 / N9，2026-11-17）
+
+来源：`docs/smoke/2026-11-17-9af8431/REPORT.md` 的「新增问题 N7/N8/N9」与
+`evidence/03-prune-compaction.txt`、`evidence/F4-patch.txt`。三条都是「界面/回执说了与事实
+不符的话」，判据与冒烟既有结论一律未改。
+
+### N7（P2）裁剪没有留痕 → 界面/导出把完整原文冒充成「模型看到的」
+
+**根因**：D6 裁剪只改运行态 `history`，不改档案，也不发任何事件。档案里永远是工具输出
+原文，于是重开与导出只能看见全文；`tool_call_output_delta` 也早于裁剪发生。旧规范
+（docs/04 §6.4）甚至把「不需要新增事件类型」写成了设计意图——这正是问题的来源。
+
+**修法**（偏离 dsh 的 log-only `compaction/prune`，理由见下）：
+- `compaction::PruneStats` 增加逐条 `details`（`call_id / original_chars / head / tail`），
+  `prune_tool_outputs` 不再只报聚合条数。
+- 新增事件 `tool_output_pruned`（additive）：运行中的界面据此落一条开发者通知。
+- 新增档案项 `ToolOutputPruned`（append-only，不进模型历史）：`load_session_full` 按
+  `call_id` 挂成 `SessionEntry::ToolCall.pruned`，重开与导出据此判读；同一 id 多条取最后。
+- 前端 `src/transport/prune-marker.ts` 一份文案给三处共用（重开卡片、实时通知、导出）。
+- **口径选择**：档案正文保留**裁剪前原文**，前面加判读行
+  `[已裁剪] … 原始 N 字符，保留头 A + 尾 B，中段省略 M 字符。以下为裁剪前原文（完整）。`
+  不选「导出改成省略版」——档案要保住可复查的原始输出；但只回显原文不标注同样不可接受。
+  规则已写进 docs/04 §6.4 D6 与 §3.1/§1 的表里。
+- 偏离 dsh 的理由：dsh 的 `compaction/prune` 是 log-only（不投影到界面），满足不了
+  「界面与导出都能判读」这条验收；这里保留 log-only 的「不改原文」语义，只把留痕
+  变成可投影的独立档案项。
+
+### N8（P3）`apply_patch` 失败回执的「实际读到」取到了预演结果
+
+**根因**：多块补丁在内存里逐块预演，`apply_hunk_seq` 匹配用 `file_lines`（预演后），
+失败详情也拿它渲染，于是把预演出来的 `A3` 当成磁盘内容报回（磁盘仍是 `A2`）。
+
+**修法**：`apply_hunk_seq` 增加 `disk_lines` 参数，`mismatch_detail` 一律取磁盘原文；
+上下文不足时的行数也改口径为「磁盘文件共 N 行」，不再拿被前几块改短的行数当文件事实。
+
+### N9（P3）写后读状态文案断言「未读取过」
+
+**根因**：读取登记表按**本任务**创建，跨任务必然查不到；文案把「本任务没有记录」写成
+「未读取过」。方向（拒绝写）没错，错在陈述了一件并不知道的事。
+
+**修法**：文案改为
+`{path} 在本任务内没有可用的读取记录（可能尚未读取，或上次读取发生在本次修改之前、内容可能已过期）`，
+不再断言「没读过」。判据未动（仍拒绝），只改措辞；同时重导出了
+`evals/repo/patches/repo-bug-apply-patch-read-guard.patch` 使评估补丁仍可应用。
+
+**用例与反向验证**：
+
+| 文件 | 内容 |
+|---|---|
+| `n7n8n9-rev-n7-rust.log` | 反向一：去掉 `details.push` / 投影恒 `None` → 2 failed（N7 后端） |
+| `n7n8n9-rev-n7-fe.log` | 反向二：去掉导出/重开的 `decorateToolOutput` → 2 failed（N7 前端） |
+| `n7n8n9-rev-n8.log` | 反向三：`mismatch_detail` 退回 `file_lines` → 1 failed，回执复现「实际读到 A3」 |
+| `n7n8n9-rev-n9.log` | 反向四：文案退回「未读取过 …」→ 1 failed |
+| `n7n8n9-cargo-test.log` | 修复后 `cargo test -- --test-threads=1` 全量绿 |
+| `n7n8n9-clippy.log` | `cargo clippy --all-targets -- -D warnings` 通过 |
+| `n7n8n9-typecheck.log` | `pnpm typecheck` 通过 |
+| `n7n8n9-vitest.log` | `vitest run --exclude "scratch/**"`：45 files / 512 passed |
+| `n7n8n9-check-deps.log` | `check-deps.ps1`：0 违规 |
+| `n7n8n9-check-doc-claims.log` | `check-doc-claims.ps1`：A 类缺口 0（B 类为既有项） |
+| `n7n8n9-align-report.log` | `align-report --check`：退出 2，**环境不可比**（本地 DSH 检出不在冻结基线 fcc0ad46），与本批改动无关 |
+
+**仍未核实**：真机未重跑。界面/导出是否真的能判读、真机裁剪是否触发，仍以
+`docs/smoke/` 下次重跑为准；本批只证明代码路径与用例。
+
