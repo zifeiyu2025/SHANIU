@@ -77,12 +77,26 @@
 
 这两题**不能归因于 `a09977b` 本身**。两段（以及修复前那轮）都带着同一个环境泄漏：外层用独立 `CARGO_TARGET_DIR` 编译 harness 时，该变量被子进程继承，agent 在自己的命令里 `cargo` 会去写工作区之外的 target；沙箱拒绝后 agent 反复绕行（rollout 的 `prompt_attribution` 里可见 `set CARGO_TARGET_DIR=%CD%\..\target\shaniu-build` 一类命令；`now-ms-exit` 3 处、`cut-pairing` 2 处）。这个泄漏所有臂、所有轮都有，属于既有偏差，不是本轮新增，但它确实吃掉轮次预算——`feat-title-cap`/`doc-max-turns-drift` 在 11-15 的零改动分析里也被点过名。
 
-结论：本轮只能回答「400 修没修好」，答案是**修好了**；「SHANIU 能力是否提升」这个问题的分子被上述两处噪声污染，不能从 9/12 → 9/12 直接读数。
+### A/B 定论（2026-11-16 14:21–14:33，`phase2-ab-envfix/`）
+
+- 泄漏源头（代码位置）：[run-arm.mjs](../../compare/run-arm.mjs) 用 `...process.env` 拼 env、[evals_repo.rs](../../../src-tauri/tests/evals_repo.rs) 拉子进程整份继承。agent 在 `now-ms-exit` 事件流第 46 行自己打出 `CARGO_TARGET_DIR=[D:\MyWorkspace\SHANIU\target\shaniu-a09977b] [exit code: 0]`。
+- 修复：`05ccacc`，只在评测侧改两处——`childEnv()` 统一 `delete env.CARGO_TARGET_DIR`（四臂共用），`evals_repo.rs` 子进程 spawn 处 `.env_remove("CARGO_TARGET_DIR")` 兜底。判据侧 `run.ps1` 自设该变量，不受影响。
+- 复跑条件：干净工作树 `%TEMP%\shaniu-ab-wt`（detached 在 `05ccacc`，`git status` 0 行，被测路径无未提交改动）；外层**故意继续设** `CARGO_TARGET_DIR=%TEMP%\shaniu-ab-target` 做反向验证。
+
+| 题目 | 泄漏轮（本轮 9 题） | 修复后 A/B | 绕行工具调用 | 判据 |
+|---|---|---|---|---|
+| `repo-refactor-now-ms-exit` | FAIL，24 轮打满，**0 改动** | **PASS**，23 轮，1 文件（+2），收口 Completed | 7 → **0** | REPO-CHECK: PASS |
+| `repo-bug-cut-pairing` | FAIL，32 轮打满，1 文件 `E0308` | **PASS**，32 轮，3 文件（+113），收口 BudgetExhausted | 4 → **0** | REPO-CHECK: PASS |
+
+- 两题事件流里 `CARGO_TARGET_DIR` 提及 **0 次**（泄漏轮合计 11 处、9 个绕行工具调用）；工作区内 `src-tauri/target` 生成 5.26 GB，证明预热与 agent 的 `cargo` 都落回工作区默认目录。A/B 全程无 400（`No tool output found` / `4000103` / `HTTP 400` 命中 0）。
+- 判定：**两处回归都是环境泄漏导致的假回归**，不是模型改不对；`a09977b` 与 SHANIU 的改写能力都不该背这个锅。`cut-pairing` 修复后仍是 32 轮打满才通过，属于「轮数打满但通过」，与修复前同档。
+
+结论：本轮只能回答「400 修没修好」，答案是**修好了**；「SHANIU 能力是否提升」这个问题的分子被上述两处噪声污染，不能从 9/12 → 9/12 直接读数。泄漏已在 `05ccacc` 修掉并用这两题验证，其余 10 题尚未在修复后的驱动器上重跑。
 
 ## 遗留与下一轮建议
 
-1. 把 `CARGO_TARGET_DIR` 的作用域收窄到 harness 外层编译：子进程启动前清空（或重定向到工作区内），再跑一次四臂同类题，才是干净的能力对照。这一项要单独立项做 A/B，不能和功能修复混在一批。
-2. `src-tauri/src/sandbox/acl.rs` 的未提交改动在并行线上，本轮被迫带进被测二进制；下一轮最好等它落地或提交后再跑。
+1. ~~把 `CARGO_TARGET_DIR` 的作用域收窄到 harness 外层编译~~ **已处理**：`05ccacc` 两层拦截 + 上述 A/B 验证。剩余 10 题若要有干净的能力对照，需用同一驱动器整轮重跑（本次只验了回归的两题）。
+2. `src-tauri/src/sandbox/acl.rs` 的未提交改动在并行线上；本次 A/B 已绕开它（改用 `%TEMP%` 的 detached worktree），但那意味着 A/B 的二进制不含该 WIP，与 12 题那轮不是同一份二进制——跨轮比较时要注意这一点。
 3. `repo-bug-search-surface-lost` 两轮都红：修复前是 400 早退，修复后是 28 轮真跑仍红，说明是**模型能力/题目本身**的失败，值得单独看它的 rollout。
 
 ## 取证清单
@@ -92,3 +106,4 @@
 - 中断轮原件：`phase2-shaniu-a09977b/`（`progress.log`、`raw/shaniu-run.log`）保持不动
 - 回收：`%TEMP%\shaniu-evals-repo-ws-12428`（9.40 GB）、`target\evals-repo-pristine-12428`（0.06 GB）、`target\evals-repo-pristine-19172`（0.06 GB）、`target\shaniu-a09977b`（4.64 GB），合计 14.16 GB；C 盘 80.81→89.68 GB，D 盘 546.25→550.74 GB。保留 `target\evals-repo-rollouts-12428`（1.24 MB）与 `-19172`（0.45 MB）作事件流证据。
 - 中断轮自己的临时工作区（`shaniu-evals-repo-ws-19172`，13:22 实测 4.74 GB）在本轮收尾前已被外部清理掉，未计入回收量。
+- A/B（`phase2-ab-envfix/`）：`summary.json`、`raw/shaniu-run.log`、`raw/shaniu-stdout.log`、`raw/children/`（两题 outcome/spec/child）、`raw/rollouts/`（两题事件流）。

@@ -1,0 +1,88 @@
+{
+  "runId": "1794810078863-15856",
+  "args": {
+    "arm": "shaniu",
+    "tasks": [
+      "repo-refactor-now-ms-exit",
+      "repo-bug-cut-pairing"
+    ],
+    "repeats": 1,
+    "model": "deepseek-flash",
+    "out": "D:\\MyWorkspace\\SHANIU\\evals\\results-compare\\phase2-ab-envfix",
+    "prepareOnly": false,
+    "protocol": "",
+    "expectTree": {},
+    "resume": false,
+    "resumeWs": ""
+  },
+  "records": [
+    {
+      "arm": "shaniu",
+      "task": "repo-refactor-now-ms-exit",
+      "task_type": "refactor",
+      "run": 1,
+      "model": "deepseek-flash",
+      "protocol": "chat",
+      "status": "PASS",
+      "invalid_reason": null,
+      "precondition_red": true,
+      "judge_pass": true,
+      "tampered": false,
+      "timed_out": false,
+      "agent_ms": 158694,
+      "judge_ms": 96431,
+      "wall_ms": 255125,
+      "diff": {
+        "summary": "共1文件 +2/-8；未跟踪0；src-tauri/src/session_query/schema.rs +2/-8",
+        "files": 1,
+        "added": 2,
+        "deleted": 8,
+        "untracked": 0,
+        "forbid_hit": false
+      },
+      "usage": {
+        "input_total": 588182,
+        "cached": 551296,
+        "output": 5153,
+        "turns": 23,
+        "source": "shaniu.TokenUsage"
+      },
+      "tree": "eb7cab344a2d53f7e57ef6ff6053e7e7e47fa02556d287099cd5c4488eac2b91",
+      "detail": "判据通过｜收口=Completed"
+    },
+    {
+      "arm": "shaniu",
+      "task": "repo-bug-cut-pairing",
+      "task_type": "bugfix",
+      "run": 1,
+      "model": "deepseek-flash",
+      "protocol": "chat",
+      "status": "PASS",
+      "invalid_reason": null,
+      "precondition_red": true,
+      "judge_pass": true,
+      "tampered": false,
+      "timed_out": false,
+      "agent_ms": 195934,
+      "judge_ms": 58698,
+      "wall_ms": 254632,
+      "diff": {
+        "summary": "共3文件 +113/-25；未跟踪0；src-tauri/src/compaction/mod.rs +61/-6；src-tauri/src/rollout/resume.rs +46/-18；src-tauri/src/session_query/documents.rs +6/-1",
+        "files": 3,
+        "added": 113,
+        "deleted": 25,
+        "untracked": 0,
+        "forbid_hit": false
+      },
+      "usage": {
+        "input_total": 1360545,
+        "cached": 1289216,
+        "output": 21164,
+        "turns": 32,
+        "source": "shaniu.TokenUsage"
+      },
+      "tree": "57aaa675367897342dec38ab855e53ae127994921243da0fa9cb0ff72cce7775",
+      "detail": "判据通过｜收口=BudgetExhausted｜错误=[已达最大轮数上限（32）]"
+    }
+  ]
+}
