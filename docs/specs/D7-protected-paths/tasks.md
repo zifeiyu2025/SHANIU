@@ -81,5 +81,24 @@
 A 的完整规格见 `docs/specs/D7b-lowpriv-sandbox-account/`（含账户生命周期、启动身份、
 SID 选择、目录与凭据、卸载回退、探针与反向验证、代价与风险）。
 
-**状态：§3.4#4 未达成；待用户裁决（2026-11-16）。** 在裁决前，D7 的删除防护保持
-「不可用」，任何文档/UI 不得表述为已覆盖。
+**状态：已关闭（对齐参考口径，2026-11-16）。** 用户拍板「对齐参考，不独家造第二套身份
+模型」，因此 A **不采纳**（规格改为「已评估、未采纳」）、B 不作为默认档、C 已被否决。
+关闭依据（上游代码复核，`docs/16` §12.5 有同一份记录）：
+
+- codex `b016cd18`：与 D7 **同一套** `CreateRestrictedToken(DISABLE_MAX_PRIVILEGE |
+  LUA_TOKEN | WRITE_RESTRICTED)`（`windows-sandbox-rs/src/token.rs:500`）+ capability
+  SID 的 deny ACE（掩码含 `DELETE | FILE_DELETE_CHILD`，`acl.rs:838-866`），删除位同样
+  不在 pass 2 评估 → 同样挡不住删除，且没有删除类反向用例。
+- dsh `39163dd3`：`Everyone: deny FILE_DELETE_CHILD`（`acl.ts:353-361`）只断「父目录
+  捷径」，不碰对象自身 `DELETE`，`del .git\config` 仍成功；不敢 deny `DELETE` 是因为
+  Everyone 会连宿主 git 一起挡。
+- zcode `fec97590`：无文件系统沙箱，只有 Job Object + 命令级守卫
+  （`guarded/windows-delete.ts:5-28`），不构成 OS 边界。
+
+**已知限制（与 codex 同源，不再作为缺口追）**：沙箱子进程删除 `.git` 内文件/整个
+`.git` 仍可成功；写 / 改 / 新建 / 改名仍被拒，「往 hooks 放新文件」这条提权路径被堵。
+文档与 UI 不得表述为「删除已挡住」。
+
+**同批对齐 codex 的授权细节**：写授权（`Access::Write`）去掉 `FILE_DELETE_CHILD`，只留
+`DELETE` 随 ACE 继承到子对象（父目录的 delete-child allow 会绕过子对象 deny，见 codex
+`acl.rs:513-517` 注释）。回归锁 `write_grant_omits_delete_child_but_keeps_delete`。

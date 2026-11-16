@@ -101,13 +101,17 @@ impl Access {
         match self {
             // 读：文件读 + 执行/遍历（目录列举走 FILE_READ_DATA）。
             Access::Read => FILE_GENERIC_READ.0 | FILE_GENERIC_EXECUTE.0,
-            // 写：在读的基础上加写、删、删子项。
+            // 写：在读的基础上加写、删。**不含 `FILE_DELETE_CHILD`**。
+            //
+            // 与 codex `windows-sandbox-rs/src/acl.rs` 的 `WRITE_ALLOW_MASK` 对齐：
+            // 父目录上一条 `FILE_DELETE_CHILD` allow 会让子进程不经子对象自身 DACL
+            // 就能删掉子项，从而绕过 `.git` 上的 deny ACE（D7）。删除能力改为靠
+            // `DELETE` 随同一个 ACE 继承到子对象——deny ACE 因此才有评估机会。
             Access::Write => {
                 FILE_GENERIC_READ.0
                     | FILE_GENERIC_WRITE.0
                     | FILE_GENERIC_EXECUTE.0
                     | DELETE.0
-                    | FILE_DELETE_CHILD.0
             }
             // 祖先：只买「读属性 + 同步」。
             Access::Ancestor => ANCESTOR_ACCESS_MASK,
@@ -2460,6 +2464,40 @@ mod tests {
         assert!(
             has_explicit_grant(&ws, sid.as_psid(), Access::Write.mask()).unwrap(),
             "同一路径从 Ancestor 升级到 Write 时不得被缓存吞掉"
+        );
+        let _ = manager.restore_all();
+    }
+
+    /// 与 codex `windows-sandbox-rs/src/acl.rs` 的 `WRITE_ALLOW_MASK` 对齐：
+    /// 写授权**不得**含父目录的 `FILE_DELETE_CHILD`。
+    ///
+    /// 父目录一条 `FILE_DELETE_CHILD` allow 会让子进程不经过子对象自身的 DACL 就能删子项，
+    /// 直接绕过 `.git` 上的 deny ACE（D7）。删除能力改由 `DELETE` 随同一个 ACE 继承到
+    /// 子对象，deny ACE 才有评估机会。
+    #[test]
+    fn write_grant_omits_delete_child_but_keeps_delete() {
+        assert_eq!(
+            Access::Write.mask() & FILE_DELETE_CHILD.0,
+            0,
+            "写授权不得含 FILE_DELETE_CHILD（父目录 allow 会绕过子对象 deny）"
+        );
+        assert_ne!(
+            Access::Write.mask() & DELETE.0,
+            0,
+            "写授权必须保留 DELETE，靠继承把删除能力放到子对象上"
+        );
+
+        let ws = temp_dir("write-mask-no-delete-child");
+        let sid = super::super::appcontainer::internet_client_capability().unwrap();
+        let mut manager = AclManager::new(ws.join("backups"));
+        manager.grant(&ws, sid.as_psid(), Access::Write).unwrap();
+        assert!(
+            has_explicit_grant(&ws, sid.as_psid(), DELETE.0).unwrap(),
+            "落盘的写 ACE 必须含 DELETE"
+        );
+        assert!(
+            !has_explicit_grant(&ws, sid.as_psid(), FILE_DELETE_CHILD.0).unwrap(),
+            "落盘的写 ACE 不得含 FILE_DELETE_CHILD"
         );
         let _ = manager.restore_all();
     }

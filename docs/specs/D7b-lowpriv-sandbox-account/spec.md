@@ -1,8 +1,22 @@
-# D7b（待批，可选）沙箱改用独立低权 Windows 账户 — 规格 v1
+# D7b（已评估、未采纳）沙箱改用独立低权 Windows 账户 — 规格 v1
 
-> 状态：**规格稿，代码不动**（2026-11-16）。来源：D7 待批项 P1——规格 §3.4#4
-> 「删 `.git/index` 必失败」在现有 `WRITE_RESTRICTED` 机制内做不到（依据见
-> `docs/16 §12.5`）。本规格只给「真正能挡住删除」的那条路，**是否实施由用户裁决**。
+> 状态：**已评估、未采纳**（2026-11-16 用户拍板「对齐参考，不独家造第二套身份模型」）。
+> 本文件保留调研与设计结论备查，**不实施、代码不动**。
+>
+> 未采纳理由（上游代码复核，详见 `docs/16 §12.5` 与 D7 `tasks.md` P1）：
+> - codex（`b016cd18`）与我们**同一套**令牌 + deny 结构：`CreateRestrictedToken` 带
+>   `WRITE_RESTRICTED`，`.git` 的 deny ACE 命名只存在于 restricting 列表的 capability SID，
+>   掩码虽含 `DELETE`，删除位同样不在 pass 2 评估 → **同样挡不住删除**；
+> - dsh（`39163dd3`）只用 `Everyone: deny FILE_DELETE_CHILD` 断「父目录捷径」，
+>   不禁对象自身 `DELETE`，`del .git\config` 仍成功；
+> - zcode（`fec97590`）Windows 侧无文件系统沙箱，只有 Job Object + 命令级守卫。
+>
+> 即：**没有参考实现能用 OS 边界挡住删除**；D7b 会成为独家第二套身份模型，其代价
+> （需管理员或服务助手、独立 `CARGO_HOME`、EDR 敏感、多一份凭据）与「对齐参考」冲突。
+> 已知限制按「与 codex 同源」处理，不再作为缺口追。
+>
+> 原来源：D7 待批项 P1——规格 §3.4#4 「删 `.git/index` 必失败」在现有
+> `WRITE_RESTRICTED` 机制内做不到（依据见 `docs/16 §12.5`）。
 >
 > 前置事实（2026-11-16 本机探针，写约束档 + `.git` 已带 deny ACE）：
 > `echo x> .git\config` 被拒；`ren .git\index index2` 被拒；
