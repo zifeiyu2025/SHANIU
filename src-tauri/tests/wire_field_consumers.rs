@@ -62,7 +62,8 @@ const RULES: &[Rule] = &[
     Rule {
         owner: "SessionEntry",
         variant: "ToolCall",
-        fields: "call_id tool arguments output at_ms step",
+        fields: "call_id tool arguments output at_ms step pruned",
+        // `pruned`（N7）：重开时前端据此给正文加「已裁剪」判读行，导出同样读它。
         overrides: &[],
     },
     Rule {
@@ -129,6 +130,14 @@ const RULES: &[Rule] = &[
         owner: "EventMsg",
         variant: "ToolCallOutputDelta",
         fields: "call_id channel delta",
+        overrides: &[],
+    },
+    Rule {
+        owner: "EventMsg",
+        variant: "ToolOutputPruned",
+        fields: "call_id tool original_chars head_chars tail_chars",
+        // N7：前端读全部字段——`call_id`/`tool` 定位卡片的通知文案，
+        // 三个计数进「保留头 A + 尾 B，中段省略 M」。
         overrides: &[],
     },
     Rule {
@@ -430,7 +439,7 @@ fn every_backend_wire_field_is_classified() {
     // 解析器若损坏会返回空集，那样这张表就变成了永真的装饰品。
     assert!(
         detected.len() >= 100,
-        "只解析出 {} 个后端字段，明显少于预期（EventMsg≈81 + AgentEvent 6 + SessionEntry 14），\
+        "只解析出 {} 个后端字段，明显少于预期（EventMsg≈86 + AgentEvent 6 + SessionEntry 15），\
          解析器可能已经失效",
         detected.len()
     );

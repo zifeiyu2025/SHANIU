@@ -36,8 +36,9 @@ import {
   relaySourceOf, settledNoticeOf, timingProjectionOf,
   type SubagentCatalogEntry, type SubagentCatalogEventData, type SubagentTimingState,
 } from './subagent-wire'
-import type { ActiveTaskView, AgentEvent, EventMsg, ReconcileReply, ReconcileStatus, SessionEntryLike, SessionListRow, TurnErrorInfo, VerifyState } from './types'
+import type { ActiveTaskView, AgentEvent, EventMsg, PruneInfoWire, ReconcileReply, ReconcileStatus, SessionEntryLike, SessionListRow, TurnErrorInfo, VerifyState } from './types'
 import { archiveImageToPrompt, imageContentBlocks, type PromptImageRef } from './image-ref'
+import { decorateToolOutput, pruneNoticeText } from './prune-marker'
 import type { HostBridge } from './tauri'
 import { startApprovalLease } from './approval-lease'
 import { approvalRequestOf, usablePendingSnapshot, type PendingApprovalsSnapshotWire } from './pending-approval'
@@ -2248,7 +2249,7 @@ export function createAdapter(options: AdapterOptions): { remote: unknown; dispo
               toolCallId: entry.call_id,
               content: entry.output === undefined || entry.output === ''
                 ? []
-                : [{ type: 'text', text: entry.output }],
+                : [{ type: 'text', text: decorateToolOutput(entry.output, entry.pruned) }],
               isError: failed,
             },
             ...(entry.output === undefined
@@ -2637,6 +2638,29 @@ export function createAdapter(options: AdapterOptions): { remote: unknown; dispo
         // 获批执行才退出（denied/interrupted 都保持计划态，与宿主 PlanState 一致）。
         if (toolName === 'enter_plan_mode' && !failed) setPlanActive(true)
         if (toolName === 'exit_plan_mode' && !failed) setPlanActive(false)
+        return
+      }
+      case 'tool_output_pruned': {
+        // 裁剪发生在调用之后的回合里，那张卡片早已按完整输出渲染，不能事后回改。
+        // 这条通知回答「刚才那条输出模型只看到裁剪版」——缺了它，界面就在暗示
+        // 模型读过完整原文（N7）。重开时同一事实由档案里的 pruned 标记承接。
+        const info: PruneInfoWire = {
+          original_chars: msg.original_chars,
+          head_chars: msg.head_chars,
+          tail_chars: msg.tail_chars,
+          omitted_chars: Math.max(0, msg.original_chars - msg.head_chars - msg.tail_chars),
+        }
+        const text = pruneNoticeText(msg.call_id, msg.tool, info)
+        pushEvent(journal, 'developer/message', {
+          turn: journal.turn,
+          step: journal.step,
+          message: {
+            id: `shaniu-pruned-${journal.seq + 1}`,
+            role: 'developer',
+            source: { kind: 'prune-notice' as const, form: 'notice' as const, summary: text },
+            content: [{ type: 'text', text }],
+          },
+        }, { surfaceOp: 'append' })
         return
       }
       case 'allowlist_hit': {

@@ -1,0 +1,326 @@
+
+[1m[30m[46m RUN [49m[39m[22m [36mv5.1.0 [39m[90mD:/MyWorkspace/SHANIU[39m
+
+ [31m❯[39m src/header-actions/session-events.spec.ts [2m([22m[2m18 tests[22m[2m | [22m[31m1 failed[39m[2m)[22m[32m 11[2mms[22m[39m
+   [31m❯[39m 档案条目 → 逻辑事件 [2m(18)[22m
+     [32m✓[39m 每个用户消息开一个新回合，编号递增，末尾收口[32m 1[2mms[22m[39m
+     [32m✓[39m 用户消息的图片按附件块导出，不压成正文文本[32m 1[2mms[22m[39m
+     [32m✓[39m 工具调用与结果成对展开，callId 保持一致[32m 0[2mms[22m[39m
+[31m     [31m×[31m 被裁剪的工具输出带「已裁剪」判读行，原文仍完整（N7）[39m[32m 4[2mms[22m[39m
+     [32m✓[39m 没有输出的工具调用只发 call，不伪造空 result[32m 0[2mms[22m[39m
+     [32m✓[39m reasoning 不进事件（上游 formatter 明确省略思考内容）[32m 0[2mms[22m[39m
+     [32m✓[39m system 消息被跳过，用户与助手之外的 role 不产生消息事件[32m 0[2mms[22m[39m
+     [32m✓[39m seq 单调递增，标题事件在首位[32m 0[2mms[22m[39m
+     [32m✓[39m 空档案只产标题事件，不产空回合[32m 0[2mms[22m[39m
+     [32m✓[39m 压缩锚点补三条 log-only 事务事件，摘要不伪装成用户发言[32m 1[2mms[22m[39m
+     [32m✓[39m 回合内压缩（溢出补救/预算）如实带当轮号：归属来自档案已成立的事实[32m 0[2mms[22m[39m
+     [32m✓[39m 旧档案（无 at_ms / trigger）如实标不可信，不编造触发原因[32m 0[2mms[22m[39m
+     [32m✓[39m 档案结局行如实进 turn/end：失败不写成成功，原始错误一并带出[32m 0[2mms[22m[39m
+     [32m✓[39m 旧档案没有结局行 → unknown，不冒充 completed[32m 0[2mms[22m[39m
+     [32m✓[39m 结局行的 turn 是旧口径也不影响导出轮次：按档案位置收口[32m 0[2mms[22m[39m
+     [32m✓[39m N4：step 用档案真实步号，turn/end 带 iterations；缺步号只留标记[32m 0[2mms[22m[39m
+     [32m✓[39m 事件时间取档案 at_ms，不再让整份导出只有一两个时间[32m 0[2mms[22m[39m
+     [32m✓[39m 旧档案没有 at_ms → time 为 0 且标 timeUnreliable，不假装时间可信[32m 0[2mms[22m[39m
+stderr | src/transport/adapter.spec.ts > 适配层把 EventMsg 流映射成 DSH 会话 journal > N5 真机复现（r4 事件原样回放）：实时自动压缩后必须落可见节点，替换要过客户端 foldSurface
+[SHANIU] 没有审批界面在听 approval/request，本次请求按拒绝回执收口
+
+stderr | src/transport/adapter.spec.ts > 适配层把 EventMsg 流映射成 DSH 会话 journal > N5 真机复现（r4 真实档案）：锚点是档案第一条时，重开必须落同形压缩节点而不是通知
+[SHANIU] 压缩节点没有可替换的会话表面，改用自建锚点后替换（compactionId=shaniu-replay-compaction-0）
+
+stderr | src/transport/adapter.spec.ts > 适配层把 EventMsg 流映射成 DSH 会话 journal > R6 真机复现（0.2.9 事件原样回放）：surface[0] 是用户消息、system 在中间时，压缩不得遮蔽系统头
+[SHANIU] 没有审批界面在听 approval/request，本次请求按拒绝回执收口
+[SHANIU] 没有审批界面在听 approval/request，本次请求按拒绝回执收口
+
+stderr | src/transport/adapter.spec.ts > 适配层把 EventMsg 流映射成 DSH 会话 journal > R6 真机复现（0.2.9 事件原样回放）：surface[0] 是用户消息、system 在中间时，压缩不得遮蔽系统头
+[SHANIU] 压缩节点没有可替换的会话表面，改用自建锚点后替换（compactionId=shaniu-replay-compaction-0）
+
+stderr | src/transport/adapter.spec.ts > 适配层把 EventMsg 流映射成 DSH 会话 journal > N5 真机复现（r4 手动 /compact）：命令卡与压缩节点合成一个 manual-compaction 节点，会话区不再铺摘要正文
+[SHANIU] 压缩节点没有可替换的会话表面，改用自建锚点后替换（compactionId=cmp-1794678689186-0）
+
+stderr | src/transport/adapter.spec.ts > 适配层的命令面映射 > list_sessions 形状不可判与「确实没有会话」分开表达：不再把未知折成空表
+[SHANIU] 会话清单查询失败，按未知处理 { code: 'IPC_FAILED', message: '会话清单查询失败' }
+
+stderr | src/transport/adapter.spec.ts > 适配层的命令面映射 > 没有审批 UI 在听时按拒绝收口，绝不静默放行
+[SHANIU] 没有审批界面在听 approval/request，本次请求按拒绝回执收口
+
+stderr | src/transport/adapter.spec.ts > 适配层的命令面映射 > 压缩过的会话重开：摘要不占回合，轮次与实时路径一致、不补中止横幅
+[SHANIU] 压缩节点没有可替换的会话表面，改用自建锚点后替换（compactionId=shaniu-replay-compaction-0）
+
+stderr | src/transport/adapter.spec.ts > 适配层的命令面映射 > 宿主运行态查询失败 → 不写 turn_end，按未知处理
+[SHANIU] 宿主运行态查询失败，档案重建按未知处理 { code: 'IPC_FAILED', message: '运行态查询失败' }
+
+stderr | src/transport/adapter.spec.ts > 权限挡位与底部指标的数据面 > N3：压缩档案重开 = 完整档案重开 = 实时——同一轮次/步数
+[SHANIU] 压缩节点没有可替换的会话表面，改用自建锚点后替换（compactionId=shaniu-replay-compaction-3）
+
+stderr | src/transport/adapter.spec.ts > 权限挡位与底部指标的数据面 > N3：压缩档案重开 = 完整档案重开 = 实时——同一轮次/步数
+[SHANIU] 压缩节点没有可替换的会话表面，改用自建锚点后替换（compactionId=shaniu-replay-compaction-3）
+
+stderr | src/transport/adapter.spec.ts > 权限挡位与底部指标的数据面 > N10：压缩重开后回合用时按墙钟算，不按首条幸存条目重算
+[SHANIU] 压缩节点没有可替换的会话表面，改用自建锚点后替换（compactionId=shaniu-replay-compaction-0）
+
+stderr | src/transport/adapter.spec.ts > 权限挡位与底部指标的数据面 > N10：压缩重开后回合用时按墙钟算，不按首条幸存条目重算
+[SHANIU] 压缩节点没有可替换的会话表面，改用自建锚点后替换（compactionId=shaniu-replay-compaction-0）
+
+stderr | src/transport/adapter.spec.ts > 权限挡位与底部指标的数据面 > N10：压缩后的新用户消息自己就是回合起点，不继承上一回合的墙钟
+[SHANIU] 压缩节点没有可替换的会话表面，改用自建锚点后替换（compactionId=shaniu-replay-compaction-0）
+
+stderr | src/transport/adapter.spec.ts > 权限挡位与底部指标的数据面 > N3：重复结局行只算一轮，重复重开数值不变
+[SHANIU] 压缩节点没有可替换的会话表面，改用自建锚点后替换（compactionId=shaniu-replay-compaction-3）
+
+stderr | src/transport/adapter.spec.ts > 权限挡位与底部指标的数据面 > N3：重复结局行只算一轮，重复重开数值不变
+[SHANIU] 压缩节点没有可替换的会话表面，改用自建锚点后替换（compactionId=shaniu-replay-compaction-3）
+
+[90mstdout[2m | src/transport/adapter.spec.ts[2m > [22m[2m续播幂等与无帧兜底（阶段 2）[2m > [22m[2m60s 无帧且宿主确认空闲、对账没有结论时保持打开（前端不补 interrupted）
+[22m[39m[SHANIU] 会话 agent-dead 超过 60s 无帧且宿主已空闲：对账没有结论，保持回合打开，等待宿主结论或用户手动停止
+
+stderr | src/transport/adapter.spec.ts > 续播幂等与无帧兜底（阶段 2） > 60s 无帧但运行态查询失败：保持现状，不把"问不到"当空闲
+[SHANIU] 会话 agent-unknown 无帧兜底：宿主运行态查询失败，保持现状 { code: 'IPC_FAILED', message: '运行态查询失败' }
+
+[90mstdout[2m | src/transport/adapter.spec.ts[2m > [22m[2m续播幂等与无帧兜底（阶段 2）[2m > [22m[2m60s 无帧但运行态是空壳 {}：保持现状；宿主改口空闲也保持打开
+[22m[39m[SHANIU] 会话 agent-opaque 超过 60s 无帧且宿主已空闲：对账没有结论，保持回合打开，等待宿主结论或用户手动停止
+
+ [31m❯[39m src/transport/adapter.spec.ts [2m([22m[2m187 tests[22m[2m | [22m[31m1 failed[39m[2m)[22m[33m 601[2mms[22m[39m
+   [32m✓[39m SH-116 批 1：附件 prompt 拼装 [2m(7)[22m
+     [32m✓[39m 文本文件经 read_attachment 内联为 attachment 块，正文与用户文本一起进任务[32m 6[2mms[22m[39m
+     [32m✓[39m 二进制附件只给占位，不把字节塞进提示词[32m 1[2mms[22m[39m
+     [32m✓[39m 图片附件：引用走结构化 images 参数、任务文本不含 marker，session.attachment 可读回[32m 2[2mms[22m[39m
+     [32m✓[39m 视觉门禁：send_task 返回 MODEL_NO_VISION 时 prompt 失败并把模型名原样带回[32m 0[2mms[22m[39m
+     [32m✓[39m 旧档案回放：用户文本里的图片标记重建为 image 内容块，标题不带标记[32m 1[2mms[22m[39m
+     [32m✓[39m 档案回放：优先用 entry.images 重建 image 块，正文里没有 marker 也不影响[32m 0[2mms[22m[39m
+     [32m✓[39m 缺回执/读回失败显式失败，绝不静默丢附件[32m 0[2mms[22m[39m
+   [32m✓[39m 适配层把 EventMsg 流映射成 DSH 会话 journal [2m(30)[22m
+     [32m✓[39m 一次纯文本回合：事件逐条 +1、surface 规则与 wire 校验全过[32m 2[2mms[22m[39m
+     [32m✓[39m 裁剪留痕：实时事件落成开发者通知，明说模型只看到裁剪版（N7）[32m 1[2mms[22m[39m
+     [32m✓[39m 模型重试：scheduled 落 llm/retry、started 落 llm/retry-started、exhausted 不落[32m 1[2mms[22m[39m
+     [32m✓[39m D5 always 重试：权威语义是无上限，落 mode=always 且不带 maxRetries[32m 1[2mms[22m[39m
+     [32m✓[39m 失败回合把结构化错误写进 turn/end（401 → AUTH，原始诊断可展开）[32m 0[2mms[22m[39m
+     [32m✓[39m 失败回合的重试次数只从 TurnErrorInfo.attempts 读（实时事件可读，0 次不冒充重试过）[32m 0[2mms[22m[39m
+     [32m✓[39m 助手流帧：revision 从快照基线起逐帧 +1，end 引用真实事件 seq[32m 0[2mms[22m[39m
+     [32m✓[39m 流式中途打开 follow：快照带 activeAttempt 紧凑前缀，后续 revision 续接不丢正文[32m 0[2mms[22m[39m
+     [32m✓[39m 同一 id 的空白复用不得替换已被 follow 捕获的 journal（B-20 回归）[32m 1[2mms[22m[39m
+     [32m✓[39m 两次采样迭代各开一次尝试：同一次内 attemptId 恒定，跨 attempt 不同[32m 0[2mms[22m[39m
+     [32m✓[39m 会话流可被中断：follow 挂起等帧时 abort 立刻结束，$stream.dispose 不再悬挂[32m 0[2mms[22m[39m
+     [32m✓[39m 工作区/投影流同样可中断：workspace.follow 与 session.control 的 dispose 都能落地[32m 0[2mms[22m[39m
+     [32m✓[39m 工具调用：arguments 落原始 JSON 字符串，输出与退出码并进 tool/result[32m 0[2mms[22m[39m
+     [32m✓[39m 审批拒绝与取消都落成可判定的终态，不靠错误文案猜测[32m 0[2mms[22m[39m
+     [32m✓[39m 采样迭代推进 step 而不是新开端回[32m 0[2mms[22m[39m
+     [32m✓[39m 中断收口时半截正文落档并打 interrupted 标记[32m 1[2mms[22m[39m
+     [32m✓[39m 没观察过的会话交空快照，而不是挂着不返回[32m 0[2mms[22m[39m
+     [32m✓[39m 允许列表连续放行按「同回合 + 同工具」合并成一条通知[32m 0[2mms[22m[39m
+     [32m✓[39m 允许列表换工具时先结算上一个，不跨工具合并[32m 0[2mms[22m[39m
+     [32m✓[39m 允许列表同工具但规则不同不合并：放行依据不能说错[32m 0[2mms[22m[39m
+     [32m✓[39m 压缩成功：实时落一条 checkpoint（上游压缩节点），不再发上下文注入通知[32m 1[2mms[22m[39m
+     [32m✓[39m 压缩失败（ok:false 且没有 error）也必须可见：end 带失败原因，自动压缩补一条通知[32m 0[2mms[22m[39m
+     [32m✓[39m 压缩成功不带 error，也不插失败通知[32m 0[2mms[22m[39m
+     [32m✓[39m N5 真机复现（r4 事件原样回放）：实时自动压缩后必须落可见节点，替换要过客户端 foldSurface[32m 2[2mms[22m[39m
+     [32m✓[39m N5 真机复现（r4 真实档案）：锚点是档案第一条时，重开必须落同形压缩节点而不是通知[32m 1[2mms[22m[39m
+     [32m✓[39m R6 真机复现（0.2.9 事件原样回放）：surface[0] 是用户消息、system 在中间时，压缩不得遮蔽系统头[32m 3[2mms[22m[39m
+     [32m✓[39m N5 真机复现（r4 手动 /compact）：命令卡与压缩节点合成一个 manual-compaction 节点，会话区不再铺摘要正文[32m 1[2mms[22m[39m
+     [32m✓[39m 压缩过的会话重开：每个锚点只生成一条 checkpoint，重复重开不叠加[32m 1[2mms[22m[39m
+     [32m✓[39m 实时与回放同形：同一段压缩在两条路径产出同一种 checkpoint[32m 0[2mms[22m[39m
+     [32m✓[39m 手动压缩失败由命令卡片展示，不再插一条通知（不重复）[32m 0[2mms[22m[39m
+   [31m❯[39m 适配层的命令面映射 [2m(63)[22m
+     [32m✓[39m create 走宿主建档、prompt 带上会话身份[32m 0[2mms[22m[39m
+     [32m✓[39m list 的 running 以宿主为准：本地 journal 开着也不算在跑[32m 0[2mms[22m[39m
+     [32m✓[39m list_sessions 形状不可判与「确实没有会话」分开表达：不再把未知折成空表[32m 1[2mms[22m[39m
+     [32m✓[39m 工作区首次订阅：清单不可判时明确失败，空数组才产出空 items[32m 1[2mms[22m[39m
+     [32m✓[39m create 成功后补发 api-session/added：列表行要带 cwd，否则资源管理器与官方 openLocal 都缺前置条件[32m 0[2mms[22m[39m
+     [32m✓[39m 补发事件只补齐 cwd、不新增行：已有占位行时列表条数不变[32m 8[2mms[22m[39m
+     [32m✓[39m cancel 只转发给宿主，不提前造终态[32m 1[2mms[22m[39m
+     [32m✓[39m rename 写回宿主并同步本地标题缓存，清空后投影回落 null 由客户端派生[32m 0[2mms[22m[39m
+     [32m✓[39m rename 失败按 wire 契约回 {ok:false}：超长标题映射 session/title-invalid，其余按网关内部错误[32m 0[2mms[22m[39m
+     [32m✓[39m page 交出已提交事件，throughSeq 按内层信封的 seq 截断[32m 0[2mms[22m[39m
+     [32m✓[39m page 按 maxMessages 截断并把 hasMore 说真话，beforeSeq 排他[32m 0[2mms[22m[39m
+     [32m✓[39m 按游标分支用档案对账表换算条目数，表外才拒绝[32m 1[2mms[22m[39m
+     [32m✓[39m 没有审批 UI 在听时按拒绝收口，绝不静默放行[32m 1[2mms[22m[39m
+     [32m✓[39m 刷新后按待审批快照重建审批卡：UI 注册前只缓存，注册后补派发[32m 75[2mms[22m[39m
+     [32m✓[39m 实时事件与刷新快照带来同一条请求时只呈现一张卡[32m 74[2mms[22m[39m
+     [32m✓[39m 快照里消失即撤销卡片：请求已被收口时不留下点了没用的卡[32m 1[2mms[22m[39m
+     [32m✓[39m 事件通道收到非法载荷时不撤卡，合法空表仍然撤卡[32m 20[2mms[22m[39m
+     [32m✓[39m 桥返回 {} 这类非快照载荷时不崩，也不把已弹出的卡当成「已撤销」[32m 71[2mms[22m[39m
+     [32m✓[39m 倒序到达的旧快照不覆盖新状态[32m 12[2mms[22m[39m
+     [32m✓[39m 补拉到的快照早于实时事件时不撤掉刚弹出的卡[32m 21[2mms[22m[39m
+     [32m✓[39m 审批卡回答 allowed-once 时回 allow[32m 56[2mms[22m[39m
+     [32m✓[39m 审批请求按 DSH 声明的载荷派发，并把会话作用域绑给监听器[32m 1[2mms[22m[39m
+     [32m✓[39m 审批载荷透传 call_id 让详情槽可用，并把批量范围落成卡片描述[32m 0[2mms[22m[39m
+     [32m✓[39m 只有后端原因没有批量范围时，原因单独成为卡片描述[32m 0[2mms[22m[39m
+     [32m✓[39m 未识别的批量范围标识要显式暴露，不能静默当成不批量[32m 0[2mms[22m[39m
+     [32m✓[39m 未知的审批结果一律按拒绝收口，绝不映射成 allow_always[32m 54[2mms[22m[39m
+     [32m✓[39m 审批监听器抛错时按拒绝收口并留下日志，不冒充用户裁决[32m 62[2mms[22m[39m
+     [32m✓[39m 回合的开与收都广播 api-session/status——Stop 按钮只认这个[32m 0[2mms[22m[39m
+     [32m✓[39m 工具结果检视流：冷读报不可用，结果落定后交真值[32m 0[2mms[22m[39m
+     [32m✓[39m 侧栏冷标题走摘要投影提示块；重开会话时标题从宿主回显预热，不从档案重新派生[32m 0[2mms[22m[39m
+     [32m✓[39m 未接线的命名空间显式抛错，文案可读且不带内部编号[32m 0[2mms[22m[39m
+     [32m✓[39m 重开旧会话：从档案重建 journal，回合边界与 wire 校验都成立[32m 1[2mms[22m[39m
+[31m     [31m×[31m 重开旧会话：被裁剪过的工具输出带「已裁剪」判读行，原文不丢（N7）[39m[32m 7[2mms[22m[39m
+     [32m✓[39m 重开旧会话：被拒/越界的工具卡还原成错误态，展开正文不丢[32m 1[2mms[22m[39m
+     [32m✓[39m 没有观察过的会话档案也为空时交空快照，不挂起[32m 0[2mms[22m[39m
+     [32m✓[39m 同一份历史：实时跑出来的事件序列与重开时重建的完全一致[32m 0[2mms[22m[39m
+     [32m✓[39m 同一用户回合：实时与重开重建的轮次和结局一致（TurnEnd.turn 是用户回合号）[32m 0[2mms[22m[39m
+     [32m✓[39m step 游标只认采样迭代号：事件面 turn 不会漏进用户回合号[32m 0[2mms[22m[39m
+     [32m✓[39m run_started 给 attach 路径兜底回合号：run 是用户回合，turn 仍是采样步[32m 0[2mms[22m[39m
+     [32m✓[39m 实时 = 重开 = 导出：同一提问两步的回合/步口径四处一致（D11）[32m 1[2mms[22m[39m
+     [32m✓[39m N4：步号四处一致（实时 = 重开 = 导出 = rollout），重复重开数值不变[32m 1[2mms[22m[39m
+     [32m✓[39m N4：结局缺 iterations 时导出留空 + 标记，不按消息条数凑步数[32m 0[2mms[22m[39m
+     [32m✓[39m 重开档案按结局行收口：失败回合不会在回放里变成 completed[32m 0[2mms[22m[39m
+     [32m✓[39m 重开含失败重试记录的会话：次数从档案 TurnErrorInfo.attempts 还原（0 次不冒充重试过）[32m 0[2mms[22m[39m
+     [32m✓[39m 无结论回合 + 强杀 + 重开：单条 indeterminate 结束，不冒充已中止[32m 0[2mms[22m[39m
+     [32m✓[39m N6：审批挂起时强杀——重开后用户提问仍在，回合标「状态未知」[32m 0[2mms[22m[39m
+     [32m✓[39m N2：审批挂起时强杀——重开留「已失效」记录、不造假卡、步数与实时一致[32m 1[2mms[22m[39m
+     [32m✓[39m N2：会话正在跑时不标「已失效」——那条审批可能正挂着等回执[32m 0[2mms[22m[39m
+     [32m✓[39m 旧档案有多轮且都没有结局行：中间回合也标 indeterminate，不显示成进行中[32m 0[2mms[22m[39m
+     [32m✓[39m 结局行 reason 不是已知结局 → indeterminate，不臆断为已中止[32m 0[2mms[22m[39m
+     [32m✓[39m D12：档案 reason=interrupted → 回放为 interrupted，不退化成 indeterminate[32m 0[2mms[22m[39m
+     [32m✓[39m D12：reason=max_tokens 的回合在实时与重开都标「被截断」，不标失败[32m 0[2mms[22m[39m
+     [32m✓[39m 已收口回合 + 进程被杀 + 重启重建：仍是 completed、单条结束、轮次不变[32m 0[2mms[22m[39m
+     [32m✓[39m 结局行编号是后端采样迭代序号：与前端回合号不同口径也照档案收口[32m 0[2mms[22m[39m
+     [32m✓[39m 压缩过的会话重开：摘要不占回合，轮次与实时路径一致、不补中止横幅[32m 0[2mms[22m[39m
+     [32m✓[39m 宿主说本会话还在跑 → 重建不补 turn_end，实时帧继续落在同一回合[32m 0[2mms[22m[39m
+     [32m✓[39m 宿主运行态查询失败 → 不写 turn_end，按未知处理[32m 0[2mms[22m[39m
+     [32m✓[39m 宿主运行态是空壳 {}：重建不补 turn_end；合法空闲仍照常收口[32m 0[2mms[22m[39m
+     [32m✓[39m 重开档案按条目 at_ms 还原时间：不再把整段历史压成打开会话那一刻[32m 0[2mms[22m[39m
+     [32m✓[39m 旧档案没有 at_ms → 回放事件 time 为 0，界面据此显示记录时刻不可用[32m 0[2mms[22m[39m
+     [32m✓[39m 模型席位只反映宿主真实配置，选模写回服务商文档并推投影[32m 1[2mms[22m[39m
+     [32m✓[39m 席位选一个清单外的模型就是拒绝，不写出一份后端会拒收的文档[32m 0[2mms[22m[39m
+     [32m✓[39m 只有 [model] 回落段的安装：席位显示未配置，不编一个存不回密钥的档位[32m 0[2mms[22m[39m
+   [32m✓[39m 设置 / 凭据 / 目录三张面经 remote 可达 [2m(2)[22m
+     [32m✓[39m 三个命名空间由适配层直供，不再落到"未接线"代理[32m 0[2mms[22m[39m
+     [32m✓[39m 存密钥后向已注册的监听器广播；退订后不再收到[32m 0[2mms[22m[39m
+   [32m✓[39m 权限挡位与底部指标的数据面 [2m(15)[22m
+     [32m✓[39m 挡位目录反推部署默认；会话内切档只写本会话档案，不写配置也不串会话[32m 1[2mms[22m[39m
+     [32m✓[39m §4.2 反向对照：A 会话切高档不许带进之后新建的会话（授权作用域）[32m 0[2mms[22m[39m
+     [32m✓[39m commands.execute：真正未命中的行回 undefined；/permission 的 bare 与未知挡位按上游语义回 CommandResult[32m 0[2mms[22m[39m
+     [32m✓[39m 挡位切换被宿主拒绝时回 CommandResult error（命中命令、草稿保留），目录默认保持旧档[32m 0[2mms[22m[39m
+     [32m✓[39m 会话档位读取失败时投影为 unknown，不回落到任何具体档[32m 0[2mms[22m[39m
+     [32m✓[39m 设置页写 defaultPreset（settings 面的 permission 域）同样推 permissions 投影[32m 0[2mms[22m[39m
+     [32m✓[39m 芯片切档与设置页写默认是两条链：芯片不推进 permission 视图，设置页才推进[32m 0[2mms[22m[39m
+     [32m✓[39m 底部指标：回合/步/墙钟折叠成 sessionStats，首个采样后用量与占用投影出现[32m 0[2mms[22m[39m
+     [32m✓[39m 底部指标：工具墙钟按 callId 配对结算，没等到结果的调用不计时长[32m 0[2mms[22m[39m
+     [32m✓[39m 重开旧会话：回放折叠出回合/步计数，没有可信时刻与用量就不伪造[32m 0[2mms[22m[39m
+     [32m✓[39m N3：压缩档案重开 = 完整档案重开 = 实时——同一轮次/步数[32m 1[2mms[22m[39m
+     [32m✓[39m N10：压缩重开后回合用时按墙钟算，不按首条幸存条目重算[32m 1[2mms[22m[39m
+     [32m✓[39m N10：压缩后的新用户消息自己就是回合起点，不继承上一回合的墙钟[32m 0[2mms[22m[39m
+     [32m✓[39m N3：重复结局行只算一轮，重复重开数值不变[32m 0[2mms[22m[39m
+     [32m✓[39m N3：失败/空迭代回合用 TurnEnd.iterations 校正步数（实时 3 步 = 重开 3 步）[32m 0[2mms[22m[39m
+   [32m✓[39m Plan 芯片与客户端排队 [2m(14)[22m
+     [32m✓[39m Plan 芯片：enter/exit_plan_mode 按执行结果驱动 plan 投影，被拒的退出保持计划态[32m 0[2mms[22m[39m
+     [32m✓[39m 重开旧会话：计划态从档案重建——exit 有输出（获批）才算退出[32m 0[2mms[22m[39m
+     [32m✓[39m /plan 真实进出计划态（SH-115：宿主 set_plan_mode 面），run/done 事件随行[32m 0[2mms[22m[39m
+     [32m✓[39m /plan <message>：空闲态进入计划态并提交消息；运行中如实拒绝注入[32m 0[2mms[22m[39m
+     [32m✓[39m /compact：成功只推 run + done，摘要不再铺成用户气泡；无可压历史与失败各回各的文案[32m 1[2mms[22m[39m
+     [32m✓[39m /export：触发 header-actions 注册的下载链；未装配时如实报错[32m 0[2mms[22m[39m
+     [32m✓[39m 命令目录：五条宿主命令带第一方 definitionId（菜单行与中文别名据此渲染）[32m 0[2mms[22m[39m
+     [32m✓[39m /goal：创建/查看/暂停/恢复/编辑/清除，非法语法与重复创建报上游口径错误[32m 1[2mms[22m[39m
+     [32m✓[39m remote.goals：create/get/pause/resume/edit/clear 与 activation 边沿、CAS 拒绝[32m 1[2mms[22m[39m
+     [32m✓[39m remote.job：list 整表帧、follow opened→output→status、kill 类型化失败[32m 1[2mms[22m[39m
+     [32m✓[39m /permission：bare 回当前挡位与可用清单，未知挡位按上游文案报错[32m 0[2mms[22m[39m
+     [32m✓[39m 客户端排队：运行中提交进 inbox 投影（rpcId 对账），回合收口按序自动补发[32m 52[2mms[22m[39m
+     [32m✓[39m 排队补发：带图项遇到 MODEL_NO_VISION 不重试，队列移除并留一条通知[32m 1[2mms[22m[39m
+     [32m✓[39m updateQueue：编辑/steer 改补发内容与顺序，移除发 spliced 事件退休回声，未知行如实拒绝[32m 1[2mms[22m[39m
+   [32m✓[39m todos 投影（SH-108：todo_write → journal todo/write → TodoDock 数据面） [2m(5)[22m
+     [32m✓[39m todo_write 执行成功：todo/write 落在 tool/call 与 tool/result 之间，投影带 trim 后整表，事件过 wire 闸[32m 0[2mms[22m[39m
+     [32m✓[39m 失败的调用不落清单：result 非 ok 不 emit，参数不可信时即便 ok 也拒绝推导[32m 0[2mms[22m[39m
+     [32m✓[39m 回合边界：turn/end 保留已完成的清单可见，下一次 turn/start 清空（显式 null 帧 + 快照缺席）[32m 0[2mms[22m[39m
+     [32m✓[39m 重开旧会话：清单从档案重建（trim 镜像同源），校验被拒的调用不伪造[32m 0[2mms[22m[39m
+     [32m✓[39m 同一份历史：todo 的实时序列与重开重建序列逐项一致（含 todo/write 载荷）[32m 0[2mms[22m[39m
+   [32m✓[39m workspace 面：归档/置顶/手动排序（SH-100） [2m(5)[22m
+     [32m✓[39m baseline 带归档/置顶集合；归档推 archived 全量替换帧[32m 0[2mms[22m[39m
+     [32m✓[39m 置顶 prepend（最近置顶在前）推 pinned 帧；归档即掉置顶（同一次写）[32m 0[2mms[22m[39m
+     [32m✓[39m 错误按类映射 wire 码：运行中/不存在/置顶已归档；stopActivity 先取消再归档[32m 0[2mms[22m[39m
+     [32m✓[39m insertSessionBefore：insertBefore 式移动推 upsert 帧；锚点缺失按 move-invalid[32m 0[2mms[22m[39m
+     [32m✓[39m 取消归档/取消置顶：集合回到空，帧随之推送[32m 0[2mms[22m[39m
+   [32m✓[39m workspace 注册表对齐上游：默认项可改可删（2026-11-07） [2m(8)[22m
+     [32m✓[39m baseline 默认项标题来自 [workspace].title（上游 registry 可写 title 同构）[32m 0[2mms[22m[39m
+     [32m✓[39m 改默认项名：upsert 帧带新标题；重启基线从 [workspace].title 同源读出[32m 0[2mms[22m[39m
+     [32m✓[39m 删除默认项：remove 帧推给前端，重启基线不再含默认项[32m 0[2mms[22m[39m
+     [32m✓[39m 删除默认项后同路径重新添加：全新 id 穿透 removedIds，回声与基线都可见（SH-110）[32m 1[2mms[22m[39m
+     [32m✓[39m 空注册表重启：initializeDefault 回裸 undefined，vendored model 不抛 TypeError（SH-112）[32m 0[2mms[22m[39m
+     [32m✓[39m 默认项可见时 initializeDefault 按 id 找它，不取顺序首项（SH-111 排序后仍成立）[32m 0[2mms[22m[39m
+     [32m✓[39m 拖拽排序：回值=完整顺序、推 order 帧、重启基线与客户端模型都按新顺序（SH-111）[32m 1[2mms[22m[39m
+     [32m✓[39m 拖拽排序的非法锚点按 workspace/not-found 回显，details 带 workspaceId（SH-111）[32m 0[2mms[22m[39m
+   [32m✓[39m 子代理泳道（SH-109）：AgentEvent 信封的 agent_id 路由 [2m(3)[22m
+     [32m✓[39m 懒建泳道：非 root 事件路由进泳道 journal，父 journal 只落 catalog 引用事件[32m 1[2mms[22m[39m
+     [32m✓[39m 泳道完成态：turn/end 落定、运行状态收回，wire 规则全程过闸[32m 0[2mms[22m[39m
+     [32m✓[39m 泳道的审批请求按泳道会话作用域派发（审批卡落在泳道 composer 上）[32m 0[2mms[22m[39m
+   [32m✓[39m 子代理生命周期事件接泳道（SH-053 批 2） [2m(12)[22m
+     [32m✓[39m spawned：父落 catalog v3、子落 descriptor v3 与任务消息，泳道运行态点亮[32m 1[2mms[22m[39m
+     [32m✓[39m exited(done)：父会话落结算通知，stopReason 映射成上游词汇 completed[32m 0[2mms[22m[39m
+     [32m✓[39m exited(cancelled)：父会话落结算通知，stopReason 映射成上游词汇 aborted[32m 0[2mms[22m[39m
+     [32m✓[39m exited(failed)：父会话落结算通知，stopReason 映射成上游词汇 error[32m 0[2mms[22m[39m
+     [32m✓[39m message：steering 落子泳道 user/message（relay 来源），父 journal 不被污染[32m 0[2mms[22m[39m
+     [32m✓[39m 审批卡 reason 带来源泳道名与任务摘要（上游契约无 subject 字段，不改 vendored）[32m 0[2mms[22m[39m
+     [32m✓[39m 审批来源优先取事件字段：泳道未建立时也能标明是哪个子代理要权限（ADR-103）[32m 0[2mms[22m[39m
+     [32m✓[39m 活动先于 spawned 到达：目录仍只有一行，元数据到达后升级为 continuable[32m 0[2mms[22m[39m
+     [32m✓[39m remote.subagents.prompt 接真：文本投递带 rpcId，宿主类型化错误映射成上游错误码[32m 0[2mms[22m[39m
+     [32m✓[39m UI steering 的回显撤销：带 rpc_id 的注入落 user source，模型注入落 relay source[32m 0[2mms[22m[39m
+     [32m✓[39m 整树回放：重启后 follow 父会话，泳道从事件档案重建且时序取事件时间[32m 0[2mms[22m[39m
+     [32m✓[39m 泳道直达：重启后不先开父会话，直接 follow 子泳道也能从父档案重建（SH-056 批 2）[32m 1[2mms[22m[39m
+   [32m✓[39m session.search 接宿主 FTS5 派生索引（SH-113，wire query-only） [2m(12)[22m
+     [32m✓[39m 成功映射成 wire 形状：只传 {query}，按 sessionId 去重，hasMore 原样透传[32m 1[2mms[22m[39m
+     [32m✓[39m 宿主索引/档案失败按 wire 契约回 {ok:false}，不让 rejection 穿透[32m 0[2mms[22m[39m
+     [32m✓[39m 空/纯空白查询按上游回空表，不调宿主[32m 0[2mms[22m[39m
+     [32m✓[39m hasMore 不是续页：同名 query 再搜也只带 {query}，不触发 Show more 请求[32m 0[2mms[22m[39m
+     [32m✓[39m SH-092 文本读：顶层参数正好是 camelCase，宿主返回原样交出[32m 0[2mms[22m[39m
+     [32m✓[39m SH-092 字节读：base64 还原成 Uint8Array，元数据字段不丢[32m 0[2mms[22m[39m
+     [32m✓[39m SH-092 类型化失败按码翻译，details 带上越界路径与上限[32m 0[2mms[22m[39m
+     [32m✓[39m SH-092 批3 打开方式：应用列表透传、显式应用随 open 请求下发、reveal 不带应用[32m 0[2mms[22m[39m
+     [32m✓[39m SH-090 @file 候选：命令参数 camelCase、结果透传、会话候选如实空表[32m 0[2mms[22m[39m
+     [32m✓[39m SH-090 @file 候选：宿主失败回 {ok:false} 而不是空表冒充没搜到[32m 0[2mms[22m[39m
+     [32m✓[39m SH-092 批3 打开方式：宿主拒单回 {ok:false}，不让 rejection 穿透[32m 0[2mms[22m[39m
+     [32m✓[39m SH-092 变更流：宿主没有监视面就带码中断，不挂一条永不发声的流[32m 0[2mms[22m[39m
+   [32m✓[39m SH-040 只读空态命名空间（插件 / 自动化任务） [2m(1)[22m
+     [32m✓[39m 插件不可管理、任务目录为空、写面显式拒绝[32m 0[2mms[22m[39m
+   [32m✓[39m 用户可见错误文案不带内部编号 [2m(2)[22m
+     [32m✓[39m 未接线的命名空间与成员：文案可读、不含卡号[32m 0[2mms[22m[39m
+     [32m✓[39m 文件变更流不支持时：拒绝文案不含卡号[32m 0[2mms[22m[39m
+   [32m✓[39m 续播幂等与无帧兜底（阶段 2） [2m(5)[22m
+     [32m✓[39m 同一批事件重复到达：面板只多一份，不靠渲染去重[32m 0[2mms[22m[39m
+     [32m✓[39m 60s 无帧但宿主说同会话在跑：续期，不误杀长时间编译[32m 2[2mms[22m[39m
+     [32m✓[39m 60s 无帧且宿主确认空闲、对账没有结论时保持打开（前端不补 interrupted）[32m 1[2mms[22m[39m
+     [32m✓[39m 60s 无帧但运行态查询失败：保持现状，不把"问不到"当空闲[32m 1[2mms[22m[39m
+     [32m✓[39m 60s 无帧但运行态是空壳 {}：保持现状；宿主改口空闲也保持打开[32m 1[2mms[22m[39m
+   [32m✓[39m 宿主恢复对账（阶段 3） [2m(3)[22m
+     [32m✓[39m 重开重建：宿主空闲且档案无结局 → 调用对账并按结论收口[32m 1[2mms[22m[39m
+     [32m✓[39m 重开重建：对账带回旧档结论 → 按档案 reason 收口，不覆盖成未知[32m 0[2mms[22m[39m
+     [32m✓[39m 60s 无帧且宿主空闲、对账有结论 → 按结论收口并收回运行态[32m 1[2mms[22m[39m
+
+⎯⎯⎯⎯⎯⎯⎯ Failed Tests 2 ⎯⎯⎯⎯⎯⎯⎯
+
+ FAIL  src/header-actions/session-events.spec.ts > 档案条目 → 逻辑事件 > 被裁剪的工具输出带「已裁剪」判读行，原文仍完整（N7）
+AssertionError: expected '头头头头头头头头头头头头头头头头头头头头裁剪前原文尾部' to contain '已裁剪'
+
+Expected: "已裁剪"
+Received: "头头头头头头头头头头头头头头头头头头头头裁剪前原文尾部"
+
+ ❯ src/header-actions/session-events.spec.ts:92:18
+     90|     // 反向对照：去掉 session-events 里的 decorateToolOutput，下面三条立刻变红——
+     91|     // 导出只剩完整原文，扫「已裁剪」为 0，读者会以为模型看过全文。
+     92|     expect(text).toContain('已裁剪')
+       |                  ^
+     93|     expect(text).toContain('原始 18955 字符')
+     94|     expect(text).toContain('中段省略 13835 字符')
+
+⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯[1/2]⎯
+
+ FAIL  src/transport/adapter.spec.ts > 适配层的命令面映射 > 重开旧会话：被裁剪过的工具输出带「已裁剪」判读行，原文不丢（N7）
+AssertionError: expected '原原原原原原原原原原原原原原原原原原原原原原原原原原原原原原原原原原原原原…' to contain '已裁剪'
+
+Expected: "已裁剪"
+Received: "原原原原原原原原原原原原原原原原原原原原原原原原原原原原原原原原原原原原原原原原原原原原原原原原原原原原原原原原原原原原"
+
+ ❯ src/transport/adapter.spec.ts:2754:18
+    2752|       message: { content: { text: string }[] }
+    2753|     }).message.content[0]?.text ?? ''
+    2754|     expect(text).toContain('已裁剪')
+       |                  ^
+    2755|     expect(text).toContain('原始 18955 字符')
+    2756|     expect(text).toContain('裁剪前原文')
+
+⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯[2/2]⎯
+
+
+[2m Test Files [22m [1m[31m2 failed[39m[22m[90m (2)[39m
+[2m      Tests [22m [1m[31m2 failed[39m[22m[2m | [22m[1m[32m203 passed[39m[22m[90m (205)[39m
+[2m   Start at [22m 06:42:56
+[2m   Duration [22m 1.45s[2m (environment 43%, tests 33%, transform 11%, setup 8%, import 4%)[22m
+

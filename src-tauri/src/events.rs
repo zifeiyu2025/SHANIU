@@ -341,6 +341,24 @@ pub enum EventMsg {
     ReasoningDelta { delta: String },
     ToolCallBegin { call_id: String, tool: String, args: serde_json::Value },
     ToolCallOutputDelta { call_id: String, channel: IoChannel, delta: String },
+    /// 确定性裁剪留痕（additive，N7）：某条工具输出在发给模型前被保留头尾、省略中段。
+    ///
+    /// 为什么必须有：界面早先已经流式展示过完整输出，裁剪发生在之后的回合里；
+    /// 不发这条事件，界面就只能一直显示「完整原文」，用户无从得知模型看到的是裁剪版
+    /// （`tool_call_output_delta` 与导出原文本身不会变，变的是「模型侧看到过什么」）。
+    /// 载荷只报事实——原文多长、头尾各留多少——不再回传被裁掉的文本。
+    ToolOutputPruned {
+        call_id: String,
+        /// 能查到调用时带上工具名，方便界面把留痕落到具体卡片；查不到就不编造。
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        tool: Option<String>,
+        /// 裁剪前的字符数。
+        original_chars: usize,
+        /// 保留的头部字符数。
+        head_chars: usize,
+        /// 保留的尾部字符数。
+        tail_chars: usize,
+    },
     ToolCallEnd {
         call_id: String,
         exit_code: Option<i32>,

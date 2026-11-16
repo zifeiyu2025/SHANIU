@@ -70,6 +70,35 @@ describe('档案条目 → 逻辑事件', () => {
     expect((result.message as { toolCallId: string }).toolCallId).toBe('call-1')
   })
 
+  it('被裁剪的工具输出带「已裁剪」判读行，原文仍完整（N7）', () => {
+    const output = '头'.repeat(20) + '裁剪前原文尾部'
+    const events = sessionEntriesToEvents([
+      { kind: 'message', role: 'user', text: '跑个命令' },
+      {
+        kind: 'tool_call',
+        call_id: 'call-9',
+        tool: 'unified_exec',
+        arguments: '{}',
+        output,
+        pruned: { original_chars: 18_955, head_chars: 4_096, tail_chars: 1_024, omitted_chars: 13_835 },
+      },
+    ], '标题')
+
+    const text = (ofType(events, 'tool/result')[0]?.data as {
+      message: { content: { text: string }[] }
+    }).message.content[0]?.text ?? ''
+    // 反向对照：去掉 session-events 里的 decorateToolOutput，下面三条立刻变红——
+    // 导出只剩完整原文，扫「已裁剪」为 0，读者会以为模型看过全文。
+    expect(text).toContain('已裁剪')
+    expect(text).toContain('原始 18955 字符')
+    expect(text).toContain('中段省略 13835 字符')
+    // 选定的口径：导出保留档案原文，但必须明说这是**裁剪前原文**，不冒充完整上下文
+    expect(text).toContain('裁剪前原文')
+    expect(text.endsWith(output)).toBe(true)
+    // 端到端：Markdown 导出同样能看到判读行
+    expect(formatSessionMarkdown(events)).toContain('已裁剪')
+  })
+
   it('没有输出的工具调用只发 call，不伪造空 result', () => {
     const events = sessionEntriesToEvents([
       { kind: 'message', role: 'user', text: '取消掉' },

@@ -420,6 +420,59 @@ where
     Ok(())
 }
 
+/// 把一轮确定性裁剪的事实同时送到事件面与档案（N7）。
+///
+/// 事件给界面（当场判读），档案给重开与导出（事后判读）。两者都不能省：
+/// 只发事件，重开后的卡片又会把完整原文当成「模型看到的」；只落档案，运行中的
+/// 界面在本轮结束前没有任何提示。
+///
+/// 落档失败不中止本轮：档案真的不可写时 `flush_history` 会自己报硬错误并中止，
+/// 这里再抛一次只会把「留痕没写上」冒充成「本轮失败」，代价与收益不对称。
+fn record_pruning(
+    sink: &Arc<dyn crate::events::EventSink>,
+    rollout: &Option<Arc<crate::rollout::RolloutWriter>>,
+    history: &[HistoryItem],
+    turn: u32,
+    stats: &crate::compaction::PruneStats,
+) {
+    if stats.is_empty() {
+        return;
+    }
+    for detail in &stats.details {
+        // 工具名只是给界面定位卡片的辅助信息：调用不在历史里就不编造。
+        let tool = history.iter().find_map(|item| match item {
+            HistoryItem::FunctionCall { name, call_id, .. } if call_id == &detail.call_id => {
+                Some(name.clone())
+            }
+            _ => None,
+        });
+        let _ = sink.emit(&EventMsg::ToolOutputPruned {
+            call_id: detail.call_id.clone(),
+            tool,
+            original_chars: detail.original_chars,
+            head_chars: detail.head_chars,
+            tail_chars: detail.tail_chars,
+        });
+        if let Some(writer) = rollout {
+            let record = crate::rollout::RolloutItem::ToolOutputPruned {
+                call_id: detail.call_id.clone(),
+                original_chars: detail.original_chars,
+                head_chars: detail.head_chars,
+                tail_chars: detail.tail_chars,
+                at_ms: now_ms(),
+            };
+            if let Err(error) = writer.append(&record) {
+                tracing::warn!(
+                    turn,
+                    call_id = %detail.call_id,
+                    error = %error,
+                    "裁剪留痕落档失败（界面已提示；重开后这条留痕会缺失）"
+                );
+            }
+        }
+    }
+}
+
 /// 写一条压缩锚点；连续失败即返回 `Err`，由调用方**放弃本次压缩**（不改内存历史）。
 ///
 /// 抽成接收闭包的形式是为了让失败路径可测：`RolloutWriter` 持有已打开的文件句柄，
@@ -703,7 +756,8 @@ impl AgentLoop {
         // D6：端点已经拒绝过一次，先把超长工具输出确定性地裁一轮，再规划区间——
         // 裁完摘要请求本身更小，也让“压完还是超长”的概率下降。裁剪不改变条目结构，
         // 因而不会影响下面的 flush/锚点顺序约束。
-        crate::compaction::prune_tool_outputs(history);
+        let prune_stats = crate::compaction::prune_tool_outputs(history);
+        record_pruning(sink, rollout, history, turn, &prune_stats);
         let Some(target) = crate::compaction::plan_manual(history, self.manual_token_budget) else {
             // 没有可压缩的区间（历史不足两条）：重放多少次都是同一个结局。
             return OverflowOutcome::GiveUp;
@@ -1341,11 +1395,15 @@ impl AgentLoop {
             // 2.5) 采样前检查 token 预算（ADR-001：「每轮采样前检查 token 预算触发 compaction」）。
             // 位置必须在采样之前：压缩的产物要对本轮请求可见才有意义，放轮末等于压了个寂寞
             // ——那一轮的上下文照样发出去，溢出照旧。
-            if let Some(target) = crate::compaction::plan_if_needed_pruning(
+            let (compaction_target, prune_stats) = crate::compaction::plan_if_needed_pruning(
                 observed_input_tokens,
                 history,
                 self.token_budget,
-            ) {
+            );
+            // 裁剪留痕先于压缩落档/上报：即使这轮不需要摘要（`target == None`），
+            // 「模型看到的是裁剪版」也已经是事实，不能因为没压缩就不说（N7）。
+            record_pruning(&sink, rollout, history, turn, &prune_stats);
+            if let Some(target) = compaction_target {
                 // 有损操作必须出声：先落「开始了」，再压；失败/取消都要落到 ended，
                 // 否则用户只看到上下文变短，却没有任何时间线可对（compaction 可见性）。
                 let compaction_id = crate::compaction::new_id();

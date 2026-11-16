@@ -22,6 +22,19 @@ export type SubagentExitStatus = 'done' | 'failed' | 'cancelled';
 export type JsonValue = null | boolean | number | string | JsonValue[] | { [key: string]: JsonValue };
 
 /**
+ * 一条工具输出被确定性裁剪的事实（与 Rust `lib.rs` 的 `PrunedInfo` 同形，N7）。
+ *
+ * 只报数量、不回传被裁掉的文本：档案 `output` 是裁剪前原文，界面/导出据此
+ * 明说「已裁剪」并报出原文长度。
+ */
+export interface PruneInfoWire {
+  readonly original_chars: number
+  readonly head_chars: number
+  readonly tail_chars: number
+  readonly omitted_chars: number
+}
+
+/**
  * 宿主 `list_sessions` 的一行（与 `src-tauri/src/lib.rs` 的 `SessionRow` 同形）。
  *
  * **唯一一份声明**：会话列表、空白复用、标题回填、fork 四处共用。`running` 是宿主
@@ -114,6 +127,13 @@ export type SessionEntryLike =
     readonly at_ms?: number
     /** 发出这次调用的采样步号（口径同 `message.step`；N4）。 */
     readonly step?: number
+    /**
+     * 这条输出在发给模型前被确定性裁剪过（N7）。缺省 = 没被裁过（或旧档案没有留痕）。
+     *
+     * `output` 仍是**裁剪前原文**：界面与导出必须把 `pruned` 显式写出来，否则
+     * 「档案里有完整原文」会被误读成「模型看到的就是完整原文」。
+     */
+    readonly pruned?: PruneInfoWire
   }
   | {
     /** 回合结局（A0-3）：`completed` / `cancelled` / `failed` / `budget_exhausted`。 */
@@ -224,6 +244,8 @@ export type EventMsg =
   | { type: 'reasoning_delta'; delta: string }
   | { type: 'tool_call_begin'; call_id: string; tool: string; args: JsonValue }
   | { type: 'tool_call_output_delta'; call_id: string; channel: IoChannel; delta: string }
+  /** N7：裁剪留痕（additive）。界面据此提示「模型看到的是裁剪版」。 */
+  | { type: 'tool_output_pruned'; call_id: string; tool?: string; original_chars: number; head_chars: number; tail_chars: number }
   | { type: 'tool_call_end'; call_id: string; exit_code: number | null; error: string | null; result?: ToolCallResult | null }
   | { type: 'exec_approval_request'; request_id: string; tool: string; args: JsonValue; risk: RiskLevel; agent_id?: string; task_summary?: string; reason?: string; call_id?: string; batch_scope?: string }
   | { type: 'exec_approval_resolved'; request_id: string; decision: ApprovalDecision }

@@ -170,8 +170,8 @@ const PRUNE_HEAD_CHARS: usize = 4_096;
 /// 裁剪后保留的尾部字符数（结论、报错、最后的计数通常在这里）。
 const PRUNE_TAIL_CHARS: usize = 1_024;
 
-/// 一次确定性裁剪的结果。只用于日志与测试断言，不参与判据。
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+/// 一次确定性裁剪的结果。日志与测试据此断言，`details` 另供界面/导出判读（N7）。
+#[derive(Debug, Clone, PartialEq, Eq, Default)]
 pub struct PruneStats {
     /// 被替换的工具输出条数。
     pub pruned_items: usize,
@@ -179,6 +179,33 @@ pub struct PruneStats {
     pub chars_before: usize,
     /// 裁剪后的字符总数（含省略标记）。
     pub chars_after: usize,
+    /// 逐条的裁剪事实：只有知道「哪条被裁、原文多长」，界面与导出才能
+    /// 明说「已裁剪」而不是把裁剪后的文本静默当成完整原文（N7）。
+    pub details: Vec<PrunedOutput>,
+}
+
+/// 单条工具输出被裁剪的事实（N7）。
+///
+/// 标签用 `call_id` 而不是下标：档案投影按 `call_id` 把输出并回调用，
+/// 下标在压缩/重放后会漂移，拿它当键就是对错行。
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct PrunedOutput {
+    pub call_id: String,
+    /// 裁剪前的字符数（模型侧不再拥有完整原文，但界面/导出要能报出这个数）。
+    pub original_chars: usize,
+    /// 保留的头部字符数。
+    pub head_chars: usize,
+    /// 保留的尾部字符数。
+    pub tail_chars: usize,
+}
+
+impl PrunedOutput {
+    /// 中段被省略的字符数。恒等式只在这里算一次，避免各处各算一遍后漂移。
+    pub fn omitted_chars(&self) -> usize {
+        self.original_chars
+            .saturating_sub(self.head_chars)
+            .saturating_sub(self.tail_chars)
+    }
 }
 
 impl PruneStats {
@@ -198,15 +225,21 @@ impl PruneStats {
 pub fn prune_tool_outputs(items: &mut [HistoryItem]) -> PruneStats {
     let mut stats = PruneStats::default();
     for item in items.iter_mut() {
-        let HistoryItem::FunctionCallOutput { output, .. } = item else {
+        let HistoryItem::FunctionCallOutput { call_id, output } = item else {
             continue;
         };
-        let Some(pruned) = prune_text(output) else {
+        let Some((pruned, original_chars)) = prune_text(output) else {
             continue;
         };
         stats.pruned_items += 1;
-        stats.chars_before += output.chars().count();
+        stats.chars_before += original_chars;
         stats.chars_after += pruned.chars().count();
+        stats.details.push(PrunedOutput {
+            call_id: call_id.clone(),
+            original_chars,
+            head_chars: PRUNE_HEAD_CHARS,
+            tail_chars: PRUNE_TAIL_CHARS,
+        });
         *output = pruned;
     }
     stats
@@ -216,7 +249,10 @@ pub fn prune_tool_outputs(items: &mut [HistoryItem]) -> PruneStats {
 ///
 /// 按 `char` 而不是字节切片：工具输出里中文、emoji 很常见，按字节切会切在
 /// 多字节字符中间，直接 panic 或产生乱码。
-fn prune_text(text: &str) -> Option<String> {
+///
+/// 返回 `(裁剪后文本, 原始字符数)`：原始长度必须和裁剪后文本一起交出去，
+/// 否则调用方只能看到「变短了」而说不出原文多长（N7）。
+fn prune_text(text: &str) -> Option<(String, usize)> {
     let total = text.chars().count();
     if total <= PRUNE_THRESHOLD_CHARS {
         return None;
@@ -224,8 +260,11 @@ fn prune_text(text: &str) -> Option<String> {
     let head: String = text.chars().take(PRUNE_HEAD_CHARS).collect();
     let tail: String = text.chars().skip(total - PRUNE_TAIL_CHARS).collect();
     let removed = total - PRUNE_HEAD_CHARS - PRUNE_TAIL_CHARS;
-    Some(format!(
-        "{head}\n\n[... 工具输出中间省略 {removed} 字符（原文 {total} 字符，保留头 {PRUNE_HEAD_CHARS} + 尾 {PRUNE_TAIL_CHARS}）...]\n\n{tail}"
+    Some((
+        format!(
+            "{head}\n\n[... 工具输出中间省略 {removed} 字符（原文 {total} 字符，保留头 {PRUNE_HEAD_CHARS} + 尾 {PRUNE_TAIL_CHARS}）...]\n\n{tail}"
+        ),
+        total,
     ))
 }
 
@@ -410,17 +449,19 @@ pub fn plan_if_needed(observed_tokens: usize, items: &[HistoryItem], budget: usi
 /// 观测值不跟着裁剪量下调：端点报回的数字里有多少属于刚裁掉的内容无法证明，
 /// 硬减会低估真实占用。所以只有「观测值本身也未超预算」时才允许跳过压缩；
 /// 否则仍按原口径压缩（此时裁剪的收益是让摘要请求本身更小）。
+/// 返回 `(压缩目标, 裁剪事实)`：裁剪后即使不需要摘要（`None`），裁剪事实也必须
+/// 带出去给界面与导出判读，不能因为「这轮没压缩」就把裁剪说成没发生（N7）。
 pub fn plan_if_needed_pruning(
     observed_tokens: usize,
     items: &mut [HistoryItem],
     budget: usize,
-) -> Option<Target> {
+) -> (Option<Target>, PruneStats) {
     if budget == 0 || items.len() < 2 {
-        return None;
+        return (None, PruneStats::default());
     }
     let estimate = history_tokens(items);
     if observed_tokens.max(estimate) < budget {
-        return None;
+        return (None, PruneStats::default());
     }
     let stats = prune_tool_outputs(items);
     if !stats.is_empty() {
@@ -436,14 +477,14 @@ pub fn plan_if_needed_pruning(
         );
         if observed_tokens < budget && after < budget {
             tracing::info!("D6 裁剪后已回到预算内，跳过本次摘要调用");
-            return None;
+            return (None, stats);
         }
     }
     let target = tail_target(items, budget.saturating_mul(KEEP_RATIO_PERCENT) / 100);
     if !has_real_content(items, &target) {
-        return None;
+        return (None, stats);
     }
-    Some(target)
+    (Some(target), stats)
 }
 
 /// 手动压缩（`/compact`，SH-115）的目标规划：与 [`plan_if_needed`] 同一条尾部保留
@@ -795,6 +836,27 @@ mod tests {
         assert!(again.is_empty(), "已裁剪的输出不应再被裁剪");
     }
 
+    /// N7：裁剪必须逐条报出「哪条、原文多长、头尾各留多少」。
+    ///
+    /// 反向对照：去掉 `prune_tool_outputs` 里的 `details.push`，本用例立刻变红——
+    /// 只剩 `pruned_items` 时，界面与导出都拿不到原始长度。
+    #[test]
+    fn prune_reports_per_call_details_for_surface() {
+        let big = format!("{}{}{}", "头".repeat(5_000), "中".repeat(20_000), "尾".repeat(5_000));
+        let mut items = vec![msg(Role::User, "任务"), call("c1", "{}"), out("c1", &big)];
+        let stats = prune_tool_outputs(&mut items);
+        assert_eq!(
+            stats.details,
+            vec![PrunedOutput {
+                call_id: "c1".into(),
+                original_chars: 30_000,
+                head_chars: PRUNE_HEAD_CHARS,
+                tail_chars: PRUNE_TAIL_CHARS,
+            }]
+        );
+        assert_eq!(stats.details[0].omitted_chars(), 24_880);
+    }
+
     /// 未超阈值的工具输出、以及超长但非工具输出的消息，一个字符都不许改。
     #[test]
     fn prune_leaves_short_outputs_and_non_tool_items_alone() {
@@ -824,7 +886,7 @@ mod tests {
         assert!(plan_if_needed(0, &history, 30_000).is_some(), "不裁剪时必然要压缩");
         let mut pruned = history;
         assert_eq!(
-            plan_if_needed_pruning(0, &mut pruned, 30_000),
+            plan_if_needed_pruning(0, &mut pruned, 30_000).0,
             None,
             "裁完已回到预算内，不许再付一次摘要"
         );
@@ -842,7 +904,7 @@ mod tests {
             msg(Role::Assistant, "结论"),
         ];
         assert!(
-            plan_if_needed_pruning(40_000, &mut items, 30_000).is_some(),
+            plan_if_needed_pruning(40_000, &mut items, 30_000).0.is_some(),
             "观测值仍高于预算，必须照常压缩"
         );
     }

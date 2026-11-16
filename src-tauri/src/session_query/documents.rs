@@ -170,6 +170,8 @@ pub fn build_documents(items: &[RolloutItem], created_at: u64) -> Vec<SearchDoc>
             // 混进来会让每次搜索都命中同一段模板，把真正的会话内容压下去。
             // 写后验证裁决同理：它记录的是宿主执行的命令与退出码，不是对话正文。
             // 审批请求/裁决是权限审计事实（2026-11-17），不是谁说的话，也不进索引。
+            // 裁剪留痕（N7）同理：它是「模型看到的输出被裁过」的元数据，正文仍是被索引的
+            // 那条工具输出，把留痕也索引会让同一段内容命中两次。
             RolloutItem::SessionMeta { .. }
             | RolloutItem::SubagentRef { .. }
             | RolloutItem::SandboxMode { .. }
@@ -179,6 +181,7 @@ pub fn build_documents(items: &[RolloutItem], created_at: u64) -> Vec<SearchDoc>
             | RolloutItem::ApprovalDecision { .. }
             | RolloutItem::TurnEnd { .. }
             | RolloutItem::Verification { .. }
+            | RolloutItem::ToolOutputPruned { .. }
             | RolloutItem::SystemPrompt { .. } => {}
         }
     }

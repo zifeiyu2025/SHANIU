@@ -40,6 +40,7 @@ import type { SessionEvent } from '@deepseek-ai/dsh-session/types'
 import type { SessionTitleEventData } from '@deepseek-ai/dsh-session-title/types'
 import type { SessionEntryLike, TurnErrorInfo } from '../transport/types'
 import { archiveImageToPrompt } from '../transport/image-ref'
+import { decorateToolOutput } from '../transport/prune-marker'
 
 // 对外仍从这个模块导出 `SessionEntryLike`（导出/复制路径的既有 import 不改名），
 // 但**声明只有一份**，在 `../transport/types`：实时 journal 回放与这里共用同一份字段定义，
@@ -278,7 +279,9 @@ export function sessionEntriesToEvents(
           message: {
             id: `shaniu-tool-${entry.call_id}`,
             role: 'tool',
-            content: [{ type: 'text', text: entry.output }],
+            // 档案存的是裁剪前原文；被裁剪过的输出必须自带判读行（N7）。
+            // 只导出原文不标记，会让「导出里有全文」被读成「模型看过全文」。
+            content: [{ type: 'text', text: decorateToolOutput(entry.output, entry.pruned) }],
             source: { kind: 'tool', callId: entry.call_id },
             toolCallId: entry.call_id,
           },

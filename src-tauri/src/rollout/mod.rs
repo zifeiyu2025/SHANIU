@@ -91,6 +91,27 @@ pub enum RolloutItem {
     },
     /// 父文件中指向子代理 rollout 的引用（SH-056 用）。
     SubagentRef { child_id: String, rollout_path: String },
+    /// 确定性裁剪留痕（N7）：某条工具输出在**发给模型前**被裁掉了中段。
+    ///
+    /// 为什么必须落档：档案里存的是工具输出**原文**（裁剪只改运行态历史），
+    /// 没有这一行，重开与导出就只能看到完整原文，界面/导出会把「模型实际看到的是
+    /// 裁剪版」这件事静默抹掉。这条记录不改成原文、也不进模型历史，只回答
+    /// 「哪条输出、原文多长、头尾各留多少」——与 dsh 的 `compaction/prune`
+    /// 同为 log-only 元数据，区别是这里按 `call_id` 逐条记，界面才能落到具体卡片。
+    ///
+    /// 同一 `call_id` 在 resume 后可能再被裁一次（原文重新进历史），读侧取**最后一条**。
+    ToolOutputPruned {
+        call_id: String,
+        /// 裁剪前的字符数。
+        original_chars: usize,
+        /// 保留的头部字符数。
+        head_chars: usize,
+        /// 保留的尾部字符数。
+        tail_chars: usize,
+        /// 落档时刻（Unix 毫秒）。
+        #[serde(default)]
+        at_ms: u64,
+    },
     /// 会话内权限档位切换（对齐 DSH 的 `sandbox/mode` 会话事件）。
     ///
     /// **只落档案，不碰 `config.toml`**：会话内切档只影响本会话，重进会话靠这条

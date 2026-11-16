@@ -830,6 +830,40 @@ describe('适配层把 EventMsg 流映射成 DSH 会话 journal', () => {
     dispose()
   })
 
+  it('裁剪留痕：实时事件落成开发者通知，明说模型只看到裁剪版（N7）', async () => {
+    const bridge = scriptedBridge()
+    const { remote, dispose } = createAdapter({ bridge })
+    const session = faceOf(remote).session
+
+    await session.prompt({ sessionId: 'agent-prune', requestId: 'rpc-prune', content: [{ type: 'text', text: '跑长命令' }] })
+    bridge.emit('agent-prune', {
+      type: 'tool_output_pruned',
+      call_id: 'c9',
+      tool: 'unified_exec',
+      original_chars: 18_955,
+      head_chars: 4_096,
+      tail_chars: 1_024,
+    })
+    bridge.emit('agent-prune', { type: 'turn_completed', turn: 1, reason: 'completed' })
+
+    const iterator = session.follow({ address: { kind: 'session', sessionId: 'agent-prune' } })
+    const snapshot = (await iterator.next()).value as Record<string, unknown>
+    const journal = eventsOf(snapshot)
+    journal.forEach(event => expect(() => assertSessionWireEvent(event)).not.toThrow())
+
+    const notice = journal.find(event => event['type'] === 'developer/message')
+    expect(notice, '裁剪留痕必须能在界面上看到，不能静默').toBeDefined()
+    const text = JSON.stringify(notice)
+    expect(text).toContain('unified_exec')
+    expect(text).toContain('c9')
+    expect(text).toContain('原始 18955 字符')
+    // 13835 = 18955 − 4096 − 1024：省略量由三个持久字段推导，不另存一份
+    expect(text).toContain('中段省略 13835 字符')
+
+    await iterator.return?.(undefined)
+    dispose()
+  })
+
   it('模型重试：scheduled 落 llm/retry、started 落 llm/retry-started、exhausted 不落', async () => {
     const bridge = scriptedBridge()
     const { remote, dispose } = createAdapter({ bridge })
@@ -2690,6 +2724,38 @@ describe('适配层的命令面映射', () => {
     expect(results[0]).toBe('port.txt\n[exit code: 0]')
     expect((journal.filter(event => event['type'] === 'tool/result')[1]?.['data'] as { message: { isError: boolean } }).message.isError)
       .toBe(true)
+
+    await iterator.return?.(undefined)
+    dispose()
+  })
+
+  it('重开旧会话：被裁剪过的工具输出带「已裁剪」判读行，原文不丢（N7）', async () => {
+    const output = '原'.repeat(60)
+    const archive = [
+      { kind: 'message', role: 'user', text: '跑个命令' },
+      {
+        kind: 'tool_call',
+        call_id: 'c9',
+        tool: 'unified_exec',
+        arguments: '{}',
+        output,
+        pruned: { original_chars: 18_955, head_chars: 4_096, tail_chars: 1_024, omitted_chars: 13_835 },
+      },
+    ]
+    const bridge = scriptedBridge(undefined, archive)
+    const { remote, dispose } = createAdapter({ bridge })
+    const iterator = faceOf(remote).session.follow({ address: { kind: 'session', sessionId: 'agent-pruned' } })
+    const snapshot = (await iterator.next()).value as Record<string, unknown>
+    const journal = eventsOf(snapshot)
+
+    const text = (journal.find(event => event['type'] === 'tool/result')?.['data'] as {
+      message: { content: { text: string }[] }
+    }).message.content[0]?.text ?? ''
+    expect(text).toContain('已裁剪')
+    expect(text).toContain('原始 18955 字符')
+    expect(text).toContain('裁剪前原文')
+    // 档案原文照常展示：标记是「加一行说明」，不是替换或截断
+    expect(text.endsWith(output)).toBe(true)
 
     await iterator.return?.(undefined)
     dispose()

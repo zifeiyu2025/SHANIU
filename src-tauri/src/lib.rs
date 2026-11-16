@@ -1118,6 +1118,22 @@ fn read_attachment(
     )
 }
 
+/// 一条工具输出被确定性裁剪的事实（N7，随 [`SessionEntry::ToolCall`] 投影）。
+///
+/// 只报数量，不回传被裁掉的文本：原文完整保存在档案 `output` 里，界面/导出拿
+/// `original_chars` 与头尾长度就能写清「已裁剪」，不必再复制一份省略后的副本。
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize)]
+pub struct PrunedInfo {
+    /// 裁剪前的字符数。
+    pub original_chars: usize,
+    /// 保留的头部字符数。
+    pub head_chars: usize,
+    /// 保留的尾部字符数。
+    pub tail_chars: usize,
+    /// 中段被省略的字符数（`original - head - tail`，由档案三个字段推导）。
+    pub omitted_chars: usize,
+}
+
 /// 打开一个会话所需的历史条目。
 ///
 /// **为什么不复用事件流重放**：`EventMsg` 里没有用户消息事件——用户消息历来是前端
@@ -1184,6 +1200,11 @@ pub enum SessionEntry {
         /// 发出这次调用的采样步号（口径同 `Message::step`）。
         #[serde(default, skip_serializing_if = "Option::is_none")]
         step: Option<u32>,
+        /// 这条输出在发给模型前被确定性裁剪过（N7）。`None` = 没被裁过（或旧档案
+        /// 没有裁剪留痕）。界面与导出据此明说「已裁剪」并报出原文长度——档案里的
+        /// `output` 仍是**裁剪前原文**，缺了这个标记，导出就会把原文冒充成「模型看到的」。
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        pruned: Option<PrunedInfo>,
     },
     /// 回合结局（A0-3）。旧档案没有这一条，导出侧必须标 `unknown` 而不是成功。
     ///
@@ -1268,14 +1289,17 @@ fn slots_to_entries(slots: Vec<Slot>) -> Vec<SessionEntry> {
     for slot in slots {
         match slot {
             Slot::Message(entry) | Slot::Summary(entry) | Slot::Audit(entry) => out.push(entry),
-            Slot::Call { call_id, tool, arguments, at_ms, step } => out.push(SessionEntry::ToolCall {
-                output: outputs.get(&call_id).cloned(),
-                call_id,
-                tool,
-                arguments,
-                at_ms,
-                step,
-            }),
+            Slot::Call { call_id, tool, arguments, at_ms, step, pruned } => {
+                out.push(SessionEntry::ToolCall {
+                    output: outputs.get(&call_id).cloned(),
+                    call_id,
+                    tool,
+                    arguments,
+                    at_ms,
+                    step,
+                    pruned,
+                })
+            }
             // 已并进对应的 ToolCall，不单独成条。
             Slot::Output { .. } => {}
         }
@@ -1292,7 +1316,15 @@ enum Slot {
     /// 普通消息（含图片消息）：投影即成品。
     Message(SessionEntry),
     /// 一次工具调用：输出在投影时按 `call_id` 补上。
-    Call { call_id: String, tool: String, arguments: String, at_ms: u64, step: Option<u32> },
+    Call {
+        call_id: String,
+        tool: String,
+        arguments: String,
+        at_ms: u64,
+        step: Option<u32>,
+        /// 裁剪留痕（N7）：档案里同一 `call_id` 有 `ToolOutputPruned` 时才非空。
+        pruned: Option<PrunedInfo>,
+    },
     /// 工具输出：占历史序号，但不单独成条。
     Output { call_id: String, output: String },
     /// 锚点把区间换成的摘要（取代区间后同样占一个历史序号）。
@@ -1420,6 +1452,31 @@ fn project_slots_with(items: &[rollout::RolloutItem], include_compaction: bool) 
             _ => None,
         })
         .collect();
+    // 裁剪留痕（N7）：`call_id → 裁剪事实`。同一 id 被重复裁剪时取**最后一条**，
+    // 因为 resume 后原文重新进历史、可能再被裁一次，最后那条才是当前轮次的真相。
+    let mut pruned: std::collections::HashMap<&str, PrunedInfo> = std::collections::HashMap::new();
+    for item in items {
+        if let rollout::RolloutItem::ToolOutputPruned {
+            call_id,
+            original_chars,
+            head_chars,
+            tail_chars,
+            ..
+        } = item
+        {
+            pruned.insert(
+                call_id.as_str(),
+                PrunedInfo {
+                    original_chars: *original_chars,
+                    head_chars: *head_chars,
+                    tail_chars: *tail_chars,
+                    omitted_chars: original_chars
+                        .saturating_sub(*head_chars)
+                        .saturating_sub(*tail_chars),
+                },
+            );
+        }
+    }
     let mut cursor = StepCursor::new();
     for item in items {
         match item {
@@ -1462,6 +1519,7 @@ fn project_slots_with(items: &[rollout::RolloutItem], include_compaction: bool) 
                     arguments: arguments.clone(),
                     at_ms: *at_ms,
                     step,
+                    pruned: pruned.get(call_id.as_str()).cloned(),
                 })
             }
             rollout::RolloutItem::ResponseItem {
@@ -1562,7 +1620,10 @@ fn project_slots_with(items: &[rollout::RolloutItem], include_compaction: bool) 
             | rollout::RolloutItem::PermissionPreset { .. }
             | rollout::RolloutItem::AbortNote { .. }
             | rollout::RolloutItem::SystemPrompt { .. }
-            | rollout::RolloutItem::Verification { .. } => {}
+            | rollout::RolloutItem::Verification { .. }
+            // 裁剪留痕（N7）不进槽位：它不占历史序号、也不单独成条，只在上面
+            // 预扫时按 `call_id` 挂到对应的 `ToolCall.pruned` 上。
+            | rollout::RolloutItem::ToolOutputPruned { .. } => {}
         }
     }
     // 末尾没有结局行（进程死在回合中途）：没有权威总步数，已还原的步号也不能留。
@@ -4624,6 +4685,73 @@ mod session_projection_tests {
                 assert_eq!(*at_ms, 0, "旧档案不得被补成当前时刻，否则就是假装记录可信")
             }
             other => panic!("期望 Message，得到 {other:?}"),
+        }
+    }
+
+    /// N7：档案里的裁剪留痕必须挂到对应工具调用上，且 `output` 仍是完整原文。
+    ///
+    /// 反向对照：撤掉 `project_slots_with` 里 `pruned: pruned.get(…)` 那一行，
+    /// `pruned` 恒为 `None`，本用例立刻变红——那正是修复前的行为：重开与导出只看到
+    /// 完整原文，谁也看不出模型当时拿到的是裁剪版。
+    #[test]
+    fn projection_attaches_prune_fact_to_matching_tool_call() {
+        let items = vec![
+            RolloutItem::ResponseItem {
+                item: HistoryItem::FunctionCall {
+                    name: "unified_exec".into(),
+                    arguments: "{}".into(),
+                    call_id: "c1".into(),
+                },
+                at_ms: 10,
+            },
+            RolloutItem::ResponseItem {
+                item: HistoryItem::FunctionCallOutput {
+                    call_id: "c1".into(),
+                    output: "裁剪前原文".into(),
+                },
+                at_ms: 11,
+            },
+            // 留痕允许落在输出之后（裁剪发生在后续回合）：投影按 call_id 回挂，不依赖顺序。
+            RolloutItem::ToolOutputPruned {
+                call_id: "c1".into(),
+                original_chars: 18_955,
+                head_chars: 4_096,
+                tail_chars: 1_024,
+                at_ms: 12,
+            },
+            RolloutItem::ResponseItem {
+                item: HistoryItem::FunctionCall {
+                    name: "read_file".into(),
+                    arguments: "{}".into(),
+                    call_id: "c2".into(),
+                },
+                at_ms: 13,
+            },
+        ];
+        let entries = crate::project_entries_full(&items).expect("投影成功");
+        match &entries[0] {
+            SessionEntry::ToolCall { call_id, output, pruned, .. } => {
+                assert_eq!(call_id, "c1");
+                assert_eq!(output.as_deref(), Some("裁剪前原文"), "档案必须保留原文");
+                assert_eq!(
+                    pruned.clone(),
+                    Some(crate::PrunedInfo {
+                        original_chars: 18_955,
+                        head_chars: 4_096,
+                        tail_chars: 1_024,
+                        omitted_chars: 13_835,
+                    }),
+                    "裁剪事实必须随条目出去，否则界面/导出无法判读「已裁剪」"
+                );
+            }
+            other => panic!("期望 ToolCall，得到 {other:?}"),
+        }
+        match &entries[1] {
+            SessionEntry::ToolCall { call_id, pruned, .. } => {
+                assert_eq!(call_id, "c2");
+                assert_eq!(pruned, &None, "没被裁过的调用不许凭空带标记");
+            }
+            other => panic!("期望 ToolCall，得到 {other:?}"),
         }
     }
 

@@ -17,7 +17,7 @@ use shaniu_lib::events::{
 };
 
 /// 与 src/transport/types.ts 的 type 判别值逐一对应。
-const EXPECTED_TAGS: [&str; 27] = [
+const EXPECTED_TAGS: [&str; 28] = [
     // D11：用户回合起点。`run` 是回合号，`turn_started.turn` 仍是采样步号。
     "run_started",
     "turn_started",
@@ -27,6 +27,8 @@ const EXPECTED_TAGS: [&str; 27] = [
     "reasoning_delta",
     "tool_call_begin",
     "tool_call_output_delta",
+    // N7：裁剪留痕（additive），导出/界面据此判读「模型看到的是裁剪版」。
+    "tool_output_pruned",
     "tool_call_end",
     "exec_approval_request",
     "exec_approval_resolved",
@@ -111,6 +113,21 @@ fn all_variants() -> Vec<EventMsg> {
         EventMsg::ReasoningDelta { delta: "先想想".into() },
         EventMsg::ToolCallBegin { call_id: "c1".into(), tool: "unified_exec".into(), args: serde_json::json!({"cmd": "ls"}) },
         EventMsg::ToolCallOutputDelta { call_id: "c1".into(), channel: IoChannel::Stdout, delta: "out".into() },
+        // N7：裁剪留痕的两条序列化路径（有/无工具名）都要覆盖。
+        EventMsg::ToolOutputPruned {
+            call_id: "c1".into(),
+            tool: Some("unified_exec".into()),
+            original_chars: 18_955,
+            head_chars: 4_096,
+            tail_chars: 1_024,
+        },
+        EventMsg::ToolOutputPruned {
+            call_id: "c2".into(),
+            tool: None,
+            original_chars: 9_000,
+            head_chars: 4_096,
+            tail_chars: 1_024,
+        },
         EventMsg::ToolCallEnd { call_id: "c1".into(), exit_code: Some(0), error: None, result: None },
         // 新增（SH-074）：result 有值时的序列化路径也要进快照，别只测 None 分支
         EventMsg::ToolCallEnd {
@@ -274,6 +291,7 @@ fn all_variants() -> Vec<EventMsg> {
             | EventMsg::ReasoningDelta { .. }
             | EventMsg::ToolCallBegin { .. }
             | EventMsg::ToolCallOutputDelta { .. }
+            | EventMsg::ToolOutputPruned { .. }
             | EventMsg::ToolCallEnd { .. }
             | EventMsg::ExecApprovalRequest { .. }
             | EventMsg::ExecApprovalResolved { .. }
