@@ -14,7 +14,7 @@ pub use retry::{random01, RetryPolicy};
 use eventsource_stream::{Event, Eventsource};
 use futures::{Stream, StreamExt};
 use serde::{Deserialize, Serialize};
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, HashSet};
 use std::time::Duration;
 
 use crate::images::{image_store, ImageRef};
@@ -349,11 +349,33 @@ pub fn build_responses_request(
 /// 图片消息必须发成
 /// `{"role","content":[{"type":"input_text"},{"type":"input_image","image_url":"data:…"}]}`：
 /// 真机探针验证过，`image_url` 写成对象会 400（`image_url is required`）。
+///
+/// **工具配对是硬约束**：每个 `function_call` 必须有自己的 `function_call_output`
+/// （call_id 相同、紧随其后），否则端点直接 400
+/// `No tool output found for tool call <call_id>.`——2026-11-16 评测线实测，12 题里 3 题
+/// 因此 FAIL。历史里缺输出的来源有两处：取消/中断在 agent_loop 里 `break 'outer`
+/// （调用已声明、未执行），以及进程在「写入调用」与「写入输出」之间退出后 resume 出来的
+/// 档案。历史已经不可修复，只能就地在 wire 上补齐；补位文本与 Chat 路径同一条
+/// [`CANCELLED_CALL_NOTE`]。codex 在 `context_manager/normalize.rs` 的
+/// `ensure_call_outputs_present` 里做同一件事（补 `"aborted"` 并紧跟调用），本函数与它
+/// 同位置、同语义。
 fn responses_input(history: &[HistoryItem]) -> Vec<serde_json::Value> {
-    degrade_orphan_tool_outputs(history)
+    let history = degrade_orphan_tool_outputs(history);
+    // 哪些 call_id 已经有输出：只统计降级之后的条目——被降级成用户文本的孤儿输出
+    // 不算「已答复」，否则又会漏掉配对。
+    let answered: HashSet<&str> = history
         .iter()
-        .map(|item| match item {
-            HistoryItem::Message { role, text, .. } => responses_message_item(*role, text),
+        .filter_map(|item| match item {
+            HistoryItem::FunctionCallOutput { call_id, .. } => Some(call_id.as_str()),
+            _ => None,
+        })
+        .collect();
+    let mut input = Vec::with_capacity(history.len());
+    for item in &history {
+        match item {
+            HistoryItem::Message { role, text, .. } => {
+                input.push(responses_message_item(*role, text));
+            }
             HistoryItem::ImageMessage { role, text, images } => {
                 let mut content = Vec::new();
                 if !text.trim().is_empty() {
@@ -369,19 +391,31 @@ fn responses_input(history: &[HistoryItem]) -> Vec<serde_json::Value> {
                         })),
                     }
                 }
-                serde_json::json!({ "role": role, "content": content })
+                input.push(serde_json::json!({ "role": role, "content": content }));
             }
-            HistoryItem::FunctionCall { name, arguments, call_id } => serde_json::json!({
-                "type": "function_call",
-                "name": name,
-                "arguments": arguments,
-                "call_id": call_id,
-            }),
-            HistoryItem::FunctionCallOutput { call_id, output } => serde_json::json!({
-                "type": "function_call_output",
-                "call_id": call_id,
-                "output": output,
-            }),
+            HistoryItem::FunctionCall { name, arguments, call_id } => {
+                input.push(serde_json::json!({
+                    "type": "function_call",
+                    "name": name,
+                    "arguments": arguments,
+                    "call_id": call_id,
+                }));
+                // 配对补齐：位置必须紧跟调用之后（端点按相邻块配对，插到别处等于没补）
+                if !answered.contains(call_id.as_str()) {
+                    input.push(serde_json::json!({
+                        "type": "function_call_output",
+                        "call_id": call_id,
+                        "output": CANCELLED_CALL_NOTE,
+                    }));
+                }
+            }
+            HistoryItem::FunctionCallOutput { call_id, output } => {
+                input.push(serde_json::json!({
+                    "type": "function_call_output",
+                    "call_id": call_id,
+                    "output": output,
+                }));
+            }
             HistoryItem::Reasoning { id, summary, encrypted_content } => {
                 let mut item = serde_json::json!({
                     "type": "reasoning",
@@ -396,10 +430,11 @@ fn responses_input(history: &[HistoryItem]) -> Vec<serde_json::Value> {
                 if let Some(encrypted) = encrypted_content.as_deref().filter(|c| !c.is_empty()) {
                     item["encrypted_content"] = serde_json::json!(encrypted);
                 }
-                item
+                input.push(item);
             }
-        })
-        .collect()
+        }
+    }
+    input
 }
 
 /// 一条纯文本历史项 → Responses message 输入项。

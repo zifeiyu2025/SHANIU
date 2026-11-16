@@ -1,27 +1,39 @@
-//! Responses 协议请求体的形状守门（2026-11-15 评测线实测缺陷）。
+//! Responses 协议请求体的形状与配对守门。
 //!
-//! 现象：按统一 Responses 口径跑评测，4 轮 0 文件改动，模型反复表示「这条消息里没有
-//! 具体任务内容」；同一题换 chat 协议立刻通过。根因在 `responses_input()`：它把
-//! `HistoryItem` 的 serde 形态原样发出（`{"role":"user","text":"…"}`），而 Responses 的
-//! message 输入项只认 `content` 数组——`text` 是陌生键，端点不报错、直接忽略，用户消息
-//! 就此静默消失。
+//! 两次实测缺陷都是这条路径打出来的：
 //!
-//! 这里走真实 HTTP 往返而不只断言 `build_responses_request` 的返回值：只测纯函数会漏掉
-//! 「构造对了、发送时又换成另一份 body」这类断链，也看不到请求体在 wire 上的实际形状。
+//! 1. **2026-11-15**：`responses_input()` 把 `HistoryItem` 的 serde 形态原样发出
+//!    （`{"role":"user","text":"…"}`），而 Responses 的 message 输入项只认 `content`
+//!    数组——`text` 是陌生键，端点忽略，用户消息静默消失（评测 4 轮 0 文件改动）。
+//! 2. **2026-11-16（P0）**：历史里出现「有调用、没输出」的半截工具记录时，端点直接
+//!    400 `No tool output found for tool call <call_id>.`——12 题里 3 题因此 FAIL
+//!    （`repo-bug-retry-after` 等，400 只用 129～164ms，是服务端立即拒绝）。
+//!
+//! 这里不用「我们发的形状等于我们以为的形状」这种自证式断言：本地假端点按真实端点的
+//! 规则**校验**请求体，不合规就回 400、错误文案照抄真实端点。整个测试走真实 HTTP 往返
+//! （`stream_responses` → 端点），所以构造、发送、建流三段都在覆盖范围内。
 
 use std::io::{Read as _, Write as _};
 use std::sync::{Arc, Mutex};
 
 use futures::StreamExt as _;
-use shaniu_lib::compaction::Target;
 use shaniu_lib::model_client::{
     stream_responses, HistoryItem, ModelStreamEvent, ProviderConfig, RequestOptions, Role,
 };
-use shaniu_lib::session_compact::summarize_body;
 
 const TASK: &str = "把 README 第三段译成中文，写到 docs/readme.zh.md";
 
-/// 一次性本地端点：留档请求体，再回一段合法的 Responses SSE。
+/// 夹具来源：`evals/repo-tasks.json` 里 `repo-bug-retry-after` 的原始 prompt。
+const RETRY_AFTER_PROMPT: &str = "这是真实仓库快照。`cargo test --lib model_client::retry` 有失败。\n\
+请定位并修复实现，让重试策略在端点给出 Retry-After 时优先采用它、超过上限时放弃重试。\n\
+范围：只改 src-tauri/src 下的实现；不要改测试，不要动 scripts/dev。完成后跑 \
+`cargo test --lib model_client::retry` 确认。";
+
+/// 端点 400 原话里的 call_id（`phase2-shaniu/summary.json`，
+/// `No tool output found for tool call call_01_X7pFedLZ8pmzxHEd0PmX7825.`）。
+const UNFINISHED_CALL_ID: &str = "call_01_X7pFedLZ8pmzxHEd0PmX7825";
+
+/// 一次性本地端点：留档请求体，按真实端点规则校验，再回 SSE（或 400）。
 struct CapturingServer {
     port: u16,
     body: Arc<Mutex<Option<serde_json::Value>>>,
@@ -38,16 +50,37 @@ impl CapturingServer {
                 return;
             };
             let payload = read_request_body(&mut stream);
-            *captured.lock().expect("锁") = serde_json::from_str(&payload).ok();
-            let sse = concat!(
-                "event: response.output_text.delta\ndata: {\"delta\":\"ok\"}\n\n",
-                "event: response.completed\n",
-                "data: {\"response\":{\"usage\":{\"input_tokens\":1,\"output_tokens\":1}}}\n\n",
-            );
-            let response = format!(
-                "HTTP/1.1 200 OK\r\nContent-Type: text/event-stream\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{sse}",
-                sse.len()
-            );
+            let parsed: serde_json::Value = serde_json::from_str(&payload).unwrap_or_default();
+            let verdict = validate_input(&parsed);
+            *captured.lock().expect("锁") = Some(parsed);
+            let response = match verdict {
+                Ok(()) => {
+                    let sse = concat!(
+                        "event: response.output_text.delta\ndata: {\"delta\":\"ok\"}\n\n",
+                        "event: response.completed\n",
+                        "data: {\"response\":{\"usage\":{\"input_tokens\":1,\"output_tokens\":1}}}\n\n",
+                    );
+                    format!(
+                        "HTTP/1.1 200 OK\r\nContent-Type: text/event-stream\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{sse}",
+                        sse.len()
+                    )
+                }
+                Err(message) => {
+                    let error = serde_json::json!({
+                        "error": {
+                            "message": message,
+                            "type": "invalid_request_error",
+                            "param": serde_json::Value::Null,
+                            "code": serde_json::Value::Null,
+                        }
+                    })
+                    .to_string();
+                    format!(
+                        "HTTP/1.1 400 Bad Request\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{error}",
+                        error.len()
+                    )
+                }
+            };
             let _ = stream.write_all(response.as_bytes());
             let _ = stream.flush();
         });
@@ -71,6 +104,99 @@ impl CapturingServer {
             .clone()
             .expect("端点必须收到请求体")
     }
+}
+
+/// 按真实端点规则校验 Responses `input`。
+///
+/// 只校**已被真实端点打脸证实**的规则，文案照抄：
+/// - message 项必须有 `content`，且不带同级 `text`（`Unrecognized request argument`）；
+/// - `function_call` 的 `arguments` 必须是 JSON 字符串；
+/// - 每个 `function_call` 必须在它之后有一条同 `call_id` 的 `function_call_output`，
+///   否则 `No tool output found for tool call <id>.`；
+/// - 每条 `function_call_output` 必须在它之前有一条同 `call_id` 的调用，否则
+///   `No tool call found for function call output with call_id <id>.`。
+fn validate_input(body: &serde_json::Value) -> Result<(), String> {
+    let input = body["input"]
+        .as_array()
+        .ok_or_else(|| "Missing required parameter: 'input'".to_string())?;
+    let mut calls: Vec<(usize, String)> = Vec::new();
+    let mut outputs: Vec<(usize, String)> = Vec::new();
+    for (idx, item) in input.iter().enumerate() {
+        if item.get("text").is_some() {
+            return Err("Unrecognized request argument supplied: text".into());
+        }
+        match item["type"].as_str() {
+            Some("function_call") => {
+                let call_id = item["call_id"]
+                    .as_str()
+                    .ok_or_else(|| format!("Missing required parameter: 'input[{idx}].call_id'"))?;
+                if item["name"].as_str().unwrap_or_default().is_empty() {
+                    return Err(format!("Missing required parameter: 'input[{idx}].name'"));
+                }
+                if !item["arguments"].is_string() {
+                    return Err(format!(
+                        "Invalid type for 'input[{idx}].arguments': expected a string."
+                    ));
+                }
+                calls.push((idx, call_id.to_string()));
+            }
+            Some("function_call_output") => {
+                let call_id = item["call_id"]
+                    .as_str()
+                    .ok_or_else(|| format!("Missing required parameter: 'input[{idx}].call_id'"))?;
+                if !item["output"].is_string() {
+                    return Err(format!(
+                        "Invalid type for 'input[{idx}].output': expected a string."
+                    ));
+                }
+                outputs.push((idx, call_id.to_string()));
+            }
+            Some("reasoning") => {
+                if !item["summary"].is_array() {
+                    return Err(format!("Missing required parameter: 'input[{idx}].summary'"));
+                }
+            }
+            // 图片消息不带 type（只有 role + content），与 message 同一条校验路径
+            Some("message") | None => {
+                if item.get("role").is_none() {
+                    return Err(format!("Missing required parameter: 'input[{idx}].type'"));
+                }
+                match &item["content"] {
+                    serde_json::Value::String(_) => {}
+                    serde_json::Value::Array(parts) if !parts.is_empty() => {
+                        for (part_idx, part) in parts.iter().enumerate() {
+                            match part["type"].as_str() {
+                                Some("input_text" | "output_text") if part["text"].is_string() => {}
+                                Some("input_image") if part["image_url"].is_string() => {}
+                                other => {
+                                    return Err(format!(
+                                        "Invalid content part at 'input[{idx}].content[{part_idx}]': {other:?}"
+                                    ))
+                                }
+                            }
+                        }
+                    }
+                    _ => return Err(format!("Missing required parameter: 'input[{idx}].content'")),
+                }
+            }
+            Some(other) => {
+                return Err(format!("Invalid value for 'input[{idx}].type': '{other}'"));
+            }
+        }
+    }
+    for (call_idx, call_id) in &calls {
+        if !outputs.iter().any(|(idx, id)| id == call_id && idx > call_idx) {
+            return Err(format!("No tool output found for tool call {call_id}."));
+        }
+    }
+    for (out_idx, call_id) in &outputs {
+        if !calls.iter().any(|(idx, id)| id == call_id && idx < out_idx) {
+            return Err(format!(
+                "No tool call found for function call output with call_id {call_id}."
+            ));
+        }
+    }
+    Ok(())
 }
 
 /// 读到请求头，再按 `Content-Length` 补齐正文。
@@ -115,16 +241,7 @@ fn content_length(head: &str) -> usize {
         .unwrap_or(0)
 }
 
-/// 生产主路径的请求选项：带会话缓存键、扩展开关全开。
-fn options(cache_key: &str) -> RequestOptions {
-    RequestOptions {
-        cache_key: Some(cache_key.to_string()),
-        responses_extras: true,
-        parallel_tool_calls: true,
-        reasoning_replay: true,
-    }
-}
-
+/// 完整一对调用/输出 + 三种角色的文本，用于形状核对。
 fn history() -> Vec<HistoryItem> {
     vec![
         // system 注入（环境快照 / 停止钩子提醒）走同一个 message 形状
@@ -144,22 +261,36 @@ fn history() -> Vec<HistoryItem> {
     ]
 }
 
-/// 缺陷本体：用户任务文本必须出现在 `content` 数组里，而不是同级的 `text` 字段。
+/// 评测现场的形状：调用写了、输出没写，之后又推进了一轮。
+///
+/// prompt 与 call_id 逐字取自本机评测产物；「调用之后没有输出」这一段是中断/存档在
+/// `agent_loop` 的 `break 'outer` 与 rollout 两次写入之间留下的真实形态。
+fn unfinished_call_history() -> Vec<HistoryItem> {
+    vec![
+        HistoryItem::Message { role: Role::User, text: RETRY_AFTER_PROMPT.into(), reasoning: None },
+        HistoryItem::Message {
+            role: Role::Assistant,
+            text: "先看重试实现。".into(),
+            reasoning: None,
+        },
+        HistoryItem::FunctionCall {
+            name: "read_file".into(),
+            arguments: r#"{"path":"src-tauri/src/model_client/retry.rs"}"#.into(),
+            call_id: UNFINISHED_CALL_ID.into(),
+        },
+        HistoryItem::Message { role: Role::User, text: "继续。".into(), reasoning: None },
+    ]
+}
+
+/// 缺陷本体 1：用户任务文本必须出现在 `content` 数组里，而不是同级的 `text` 字段。
 #[tokio::test]
 async fn user_text_reaches_the_wire_inside_the_content_array() {
     let server = CapturingServer::start();
-    let mut stream = stream_responses(
-        &server.provider(),
-        "sk-test",
-        &history(),
-        &[],
-        "SYS",
-        &options("sess-1"),
-    )
-    .await
-    .expect("本地端点应成功建流");
+    let mut stream = stream_responses(&server.provider(), "sk-test", &history(), &[], "SYS", &RequestOptions::default())
+        .await
+        .expect("本地端点应成功建流");
     let events: Vec<ModelStreamEvent> = stream.by_ref().collect().await;
-    // 流本身要能走完：请求构造错时端点常常直接 400，这里先把传输面排除掉
+    // 流本身要能走完：请求构造错时端点会 400，这里先把传输面排除掉
     assert!(
         events
             .iter()
@@ -175,164 +306,88 @@ async fn user_text_reaches_the_wire_inside_the_content_array() {
         .iter()
         .find(|item| item["role"] == "user")
         .expect("请求里必须有 user 消息");
-    // 反向对照：改回 `text` 字段时，下面这两条断言就是红的落点
+    // 反向对照：改回 `text` 字段时，下面这两条断言（以及端点的 400）就是红的落点
     assert!(user.get("text").is_none(), "用户文本发到了同级 text 字段：{user}");
     assert_eq!(user["content"][0]["type"], "input_text");
     assert_eq!(user["content"][0]["text"], TASK);
-
-    // 全树扫一遍：任何 input 项都不许出现响应端不认的外部 `text`
-    for item in input {
-        assert!(item.get("text").is_none(), "input 项含陌生 text 字段：{item}");
-    }
 }
 
 /// 其余角色/条目一并核对：assistant 文本、system 注入、工具调用与工具输出。
 #[tokio::test]
 async fn other_roles_and_tool_items_use_responses_shapes() {
     let server = CapturingServer::start();
-    let mut stream = stream_responses(
-        &server.provider(),
-        "sk-test",
-        &history(),
-        &[],
-        "SYS",
-        &options("sess-1"),
-    )
-    .await
-    .expect("本地端点应成功建流");
+    let mut stream = stream_responses(&server.provider(), "sk-test", &history(), &[], "SYS", &RequestOptions::default())
+        .await
+        .expect("本地端点应成功建流");
     let _: Vec<ModelStreamEvent> = stream.by_ref().collect().await;
 
     let body = server.body();
     let input = body["input"].as_array().expect("input 必须是数组");
-    let item = |role: &str| {
-        input
-            .iter()
-            .find(|item| item["role"] == role)
-            .unwrap_or_else(|| panic!("缺少 role={role} 的条目：{input:?}"))
-    };
 
-    // system 注入：同样是 message + content 数组，否则提醒会被静默吞掉
-    assert_eq!(item("system")["type"], "message");
-    assert_eq!(item("system")["content"][0]["type"], "input_text");
-    assert_eq!(item("system")["content"][0]["text"], "环境快照");
+    let assistant = input
+        .iter()
+        .find(|item| item["role"] == "assistant")
+        .expect("缺少 assistant 消息");
+    assert_eq!(assistant["type"], "message");
+    assert_eq!(assistant["content"][0]["type"], "output_text");
+    assert_eq!(assistant["content"][0]["text"], "先读 README。");
+    // reasoning 回放要独立的 reasoning item（带 encrypted_content）；明文塞消息项是陌生键
+    assert!(assistant.get("reasoning").is_none(), "{input:?}");
 
-    // assistant 文本：codex 同口径（ContentItem::OutputText）
-    assert_eq!(item("assistant")["type"], "message");
-    assert_eq!(item("assistant")["content"][0]["type"], "output_text");
-    assert_eq!(item("assistant")["content"][0]["text"], "先读 README。");
-    // reasoning 回放要独立的 reasoning item（带 encrypted_content）；明文塞进消息项是陌生键
-    assert!(item("assistant").get("reasoning").is_none(), "{input:?}");
+    let system = input
+        .iter()
+        .find(|item| item["role"] == "system")
+        .expect("缺少 system 注入");
+    assert_eq!(system["content"][0]["type"], "input_text");
 
-    // 工具调用：arguments 是 JSON **字符串**，不是对象
     let call = input
         .iter()
         .find(|item| item["type"] == "function_call")
         .expect("缺少 function_call");
     assert_eq!(call["name"], "read_file");
     assert_eq!(call["call_id"], "c1");
-    assert_eq!(call["arguments"], r#"{"path":"README.md"}"#);
+    assert_eq!(call["arguments"], r#"{"path":"README.md"}"#, "arguments 必须是 JSON 字符串");
 
-    // 工具输出：output 是字符串
-    let output = input
+    // 已经配好对的调用不能再补一条占位输出（否则同一 call_id 出现两条输出）
+    let outputs: Vec<_> = input
         .iter()
-        .find(|item| item["type"] == "function_call_output")
-        .expect("缺少 function_call_output");
-    assert_eq!(output["call_id"], "c1");
-    assert_eq!(output["output"], "# README");
-
-    // 工具声明与 Responses 的扁平形状一致（`function` 对象是 chat 的形状）
-    assert_eq!(body["stream"], true);
+        .filter(|item| item["type"] == "function_call_output")
+        .collect();
+    assert_eq!(outputs.len(), 1, "配对完整时不得重复补位：{outputs:?}");
+    assert_eq!(outputs[0]["output"], "# README");
 }
 
-/// D1：协议字段必须真的出现在 wire 上，而不是只改了一个纯函数。
+/// P0 回放：半截工具记录（有调用、没输出）必须在上 wire 前补齐。
 ///
-/// 断言走真实 HTTP 往返（见文件头）：只在 `build_responses_request` 返回值上断言，
-/// 会漏掉「构造对了、发送时又换成另一份 body」的断链。
+/// 旧代码原样发出 → 本地端点按真实规则回 400
+/// `No tool output found for tool call call_01_X7pFedLZ8pmzxHEd0PmX7825.`；
+/// 修复后第一次请求就成功，不靠重试、不丢消息。
 #[tokio::test]
-async fn responses_body_carries_protocol_fields() {
+async fn unfinished_tool_call_is_repaired_before_the_request() {
     let server = CapturingServer::start();
-    let mut stream = stream_responses(
-        &server.provider(),
-        "sk-test",
-        &history(),
-        &[],
-        "SYS",
-        &options("sess-1"),
-    )
-    .await
-    .expect("本地端点应成功建流");
-    let _: Vec<ModelStreamEvent> = stream.by_ref().collect().await;
+    let mut stream =
+        stream_responses(&server.provider(), "sk-test", &unfinished_call_history(), &[], "SYS", &RequestOptions::default())
+            .await
+            .expect("修复后第一次请求就该建流成功");
+    let events: Vec<ModelStreamEvent> = stream.by_ref().collect().await;
+    assert!(
+        events
+            .iter()
+            .any(|event| matches!(event, ModelStreamEvent::Completed { .. })),
+        "配对补齐后端点应完成：{events:?}"
+    );
 
     let body = server.body();
-    // 档案是唯一事实源：不许服务端替我们落库（否则隐私边界取决于网关默认值）。
-    assert_eq!(body["store"], false, "store 必须显式 false：{body}");
-    assert_eq!(body["tool_choice"], "auto", "tool_choice 不能被端点默认值决定：{body}");
-    assert_eq!(body["parallel_tool_calls"], true);
-    assert_eq!(body["prompt_cache_key"], "sess-1");
-    // D2：推理回放默认打开，端点才会在响应里带 `encrypted_content`。
-    assert_eq!(
-        body["include"],
-        serde_json::json!(["reasoning.encrypted_content"]),
-        "默认声明 reasoning.encrypted_content：{body}"
-    );
-}
-
-/// 老网关回退：`responses_extras=false` 时五个键一个都不出现，请求体回到旧 5 键形状。
-/// 同时验证 `parallel_tool_calls=false` 确实由配置驱动（不是写死 true）。
-#[tokio::test]
-async fn responses_extras_can_be_disabled() {
-    let off = CapturingServer::start();
-    let mut stream = stream_responses(
-        &off.provider(),
-        "sk-test",
-        &history(),
-        &[],
-        "SYS",
-        &RequestOptions { responses_extras: false, ..options("sess-1") },
-    )
-    .await
-    .expect("本地端点应成功建流");
-    let _: Vec<ModelStreamEvent> = stream.by_ref().collect().await;
-    let body = off.body();
-    for key in ["store", "tool_choice", "parallel_tool_calls", "include", "prompt_cache_key"] {
-        assert!(body.get(key).is_none(), "开关关闭后不应出现 {key}：{body}");
-    }
-
-    // 开关打开、但把并行关掉：wire 上必须跟着 false（配置没接上时这里会红）。
-    let serial = CapturingServer::start();
-    let mut stream = stream_responses(
-        &serial.provider(),
-        "sk-test",
-        &history(),
-        &[],
-        "SYS",
-        &RequestOptions { parallel_tool_calls: false, ..options("sess-1") },
-    )
-    .await
-    .expect("本地端点应成功建流");
-    let _: Vec<ModelStreamEvent> = stream.by_ref().collect().await;
-    assert_eq!(
-        serial.body()["parallel_tool_calls"],
-        false,
-        "parallel_tool_calls 必须来自配置，而不是写死 true"
-    );
-}
-
-/// 压缩摘要请求必须与主请求同口径：同一构造入口，不会各拼一份 `json!` 后漂移。
-#[test]
-fn compaction_request_shares_the_same_fields() {
-    let provider = ProviderConfig {
-        provider: "openai-responses".into(),
-        base_url: "http://127.0.0.1:1".into(),
-        model: "gpt-test".into(),
-        reasoning_effort: None,
-        headers: Default::default(),
-    };
-    let body = summarize_body(&provider, &history(), Target { range_start: 0, range_end: 2 }, &options("sess-1"));
-    assert_eq!(body["store"], false, "摘要请求漏了 store：{body}");
-    assert_eq!(body["tool_choice"], "auto", "摘要请求漏了 tool_choice：{body}");
-    assert_eq!(body["parallel_tool_calls"], true, "摘要请求漏了 parallel_tool_calls：{body}");
-    assert_eq!(body["prompt_cache_key"], "sess-1", "摘要请求漏了 prompt_cache_key：{body}");
-    // 辅助请求仍然保留自己的输出上限（不能被"统一"掉）。
-    assert!(body["max_output_tokens"].is_number(), "{body}");
+    let input = body["input"].as_array().expect("input 必须是数组");
+    let call_idx = input
+        .iter()
+        .position(|item| item["type"] == "function_call")
+        .expect("调用项必须保留（不能为了让端点闭嘴把调用删掉）");
+    assert_eq!(input[call_idx]["call_id"], UNFINISHED_CALL_ID);
+    // 补位输出紧跟调用，call_id 一致
+    assert_eq!(input[call_idx + 1]["type"], "function_call_output");
+    assert_eq!(input[call_idx + 1]["call_id"], UNFINISHED_CALL_ID);
+    assert_eq!(input[call_idx + 1]["output"], "（本轮在该工具调用前被取消，未执行）");
+    // 后续那条用户消息仍在原位（只是中间多了一条输出）
+    assert_eq!(input.last().expect("最后一条")["content"][0]["text"], "继续。");
 }
