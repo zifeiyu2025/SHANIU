@@ -39,6 +39,7 @@
 
 - codex 总数不含其首轮因磁盘满产生的假红：`refactor-now-ms-exit` 首轮判据红是 `os error 112`，续跑时用旧工作区**只重判**（不重跑 agent）得 `REPO-CHECK: PASS`。原日志 `raw/codex-repo-refactor-now-ms-exit-r1.judge.log` 与重判日志 `.resume.judge.log` 都保留。
 - zcode 的 `cut-pairing`：首轮 960s 被杀后判据报「守卫目标缺失」，属不可归因；归档首轮文件后重跑，仍在 960s 处被杀（`turns=21`、`diff=0`），**两次一致，判 TIMEOUT**。
+- **「轮数打满」只对 SHANIU 严格可判**：SHANIU 的 `usage_turns` 与题集 `max_turns` 是同一计数（如 32/32、12/12 精确相等）；dsh 的 `turns` 取 `status/step_end`、zcode 取 `model_request_completed`，是更细的计数（dsh 多数题 33~59、zcode `cut-pairing` 21，均已超过各自的 `max_turns`），**不能按同一口径判打满**，故另两臂不列该列。
 
 ## 3. SHANIU 三分法（单列，不与通过率混算）
 
