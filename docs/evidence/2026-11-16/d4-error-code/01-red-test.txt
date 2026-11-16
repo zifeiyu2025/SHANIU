@@ -1,0 +1,46 @@
+PS D:\MyWorkspace\SHANIU\src-tauri> cargo test --lib model_client::error
+    Finished `test` profile [unoptimized + debuginfo] target(s) in 23.43s
+     Running unittests src\lib.rs (target\debug\build\shaniu/3347eb12c1517f2a\out\shaniu_lib-3347eb12c1517f2a.exe)
+
+running 15 tests
+test model_client::error::tests::non_json_body_keeps_status_only ... ok
+test model_client::error::tests::status_maps_to_kind ... ok
+test model_client::error::tests::http_422_context_overflow_body_maps_to_context_overflow ... ok
+test model_client::error::tests::quota_keyword_wins_over_status ... ok
+test model_client::error::tests::http_400_context_overflow_body_maps_to_context_overflow ... ok
+test model_client::error::tests::provider_fields_extracts_code_and_message ... ok
+test model_client::error::tests::structured_code_classifies_gateway_rejections ... FAILED
+test model_client::error::tests::incomplete_reason_maps_to_actionable_human ... ok
+test model_client::error::tests::content_filter_wins_over_context_overflow ... ok
+test model_client::error::tests::provider_message_is_redacted ... ok
+test model_client::error::tests::stream_error_body_honours_structured_code ... FAILED
+test model_client::error::tests::http_400_plain_bad_request_stays_bad_request ... ok
+test model_client::error::tests::http_413_only_explicit_overflow_body_maps_to_context_overflow ... ok
+test model_client::error::tests::stream_error_body_is_classified_by_actionable_fields ... ok
+test model_client::error::tests::structured_code_is_gated_by_status ... ok
+
+failures:
+
+---- model_client::error::tests::structured_code_classifies_gateway_rejections stdout ----
+
+thread 'model_client::error::tests::structured_code_classifies_gateway_rejections' (19104) panicked at src\model_client\error.rs:700:9:
+assertion `left == right` failed
+  left: Auth
+ right: HookDenied
+note: run with `RUST_BACKTRACE=1` environment variable to display a backtrace
+
+---- model_client::error::tests::stream_error_body_honours_structured_code stdout ----
+
+thread 'model_client::error::tests::stream_error_body_honours_structured_code' (13864) panicked at src\model_client\error.rs:754:13:
+assertion `left == right` failed: 错误体分类错误：{"error":{"code":"inference_hook_denied","message":"denied"}} → ModelError { kind: Unknown, http_status: None, provider_code: Some("inference_hook_denied"), provider_message: Some("denied"), human: "denied", retry_after_ms: None }
+  left: Unknown
+ right: HookDenied
+
+
+failures:
+    model_client::error::tests::stream_error_body_honours_structured_code
+    model_client::error::tests::structured_code_classifies_gateway_rejections
+
+test result: FAILED. 13 passed; 2 failed; 0 ignored; 0 measured; 1123 filtered out; finished in 0.01s
+
+error: test failed, to rerun pass `--lib`

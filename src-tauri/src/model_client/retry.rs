@@ -119,6 +119,8 @@ mod tests {
             ModelErrorKind::Quota,
             ModelErrorKind::BadRequest,
             ModelErrorKind::EndpointUnsupported,
+            ModelErrorKind::HookDenied,
+            ModelErrorKind::AccessProgramUnsupported,
             ModelErrorKind::Unknown,
         ] {
             assert!(!RetryPolicy::is_retryable(kind), "{kind:?} 重试多少次都不会变，必须一次终局");

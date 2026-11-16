@@ -1,0 +1,34 @@
+反向验证：把 from_status / from_body 退回「只用关键词 + 状态码」的旧写法（保留 structured_kind 函数但不调用），
+同一组用例必须变红。
+
+PS D:\MyWorkspace\SHANIU\src-tauri> cargo test --lib model_client::error
+test model_client::error::tests::structured_code_classifies_gateway_rejections ... FAILED
+test model_client::error::tests::stream_error_body_honours_structured_code ... FAILED
+test model_client::error::tests::structured_code_is_gated_by_status ... ok
+test model_client::error::tests::stream_error_body_is_classified_by_actionable_fields ... ok
+
+failures:
+
+---- model_client::error::tests::structured_code_classifies_gateway_rejections stdout ----
+
+thread 'model_client::error::tests::structured_code_classifies_gateway_rejections' (7040) panicked at src\model_client\error.rs:753:9:
+assertion `left == right` failed
+  left: Auth
+ right: HookDenied
+
+---- model_client::error::tests::stream_error_body_honours_structured_code stdout ----
+
+thread 'model_client::error::tests::stream_error_body_honours_structured_code' (17476) panicked at src\model_client\error.rs:807:13:
+assertion `left == right` failed: 错误体分类错误：{"error":{"code":"inference_hook_denied","message":"denied"}} → ModelError { kind: Unknown, http_status: None, provider_code: Some("inference_hook_denied"), provider_message: Some("denied"), human: "denied", retry_after_ms: None }
+  left: Unknown
+ right: HookDenied
+note: run with `RUST_BACKTRACE=1` environment variable to display a backtrace
+
+
+failures:
+    model_client::error::tests::stream_error_body_honours_structured_code
+    model_client::error::tests::structured_code_classifies_gateway_rejections
+
+test result: FAILED. 13 passed; 2 failed; 0 ignored; 0 measured; 1123 filtered out; finished in 0.01s
+
+error: test failed, to rerun pass `--lib`

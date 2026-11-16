@@ -22,6 +22,10 @@ pub mod model {
     pub const CONTEXT_OVERFLOW: &str = "CONTEXT_OVERFLOW";
     /// 请求/回答被内容安全策略拦截（确定性失败）。
     pub const CONTENT_FILTERED: &str = "CONTENT_FILTERED";
+    /// 企业网关的推理钩子拒绝（确定性失败，改 key 无用）。
+    pub const HOOK_DENIED: &str = "HOOK_DENIED";
+    /// 端点不认当前访问程序（确定性失败，属于配置/模型选择问题）。
+    pub const ACCESS_PROGRAM_UNSUPPORTED: &str = "ACCESS_PROGRAM_UNSUPPORTED";
     /// 端点明确表示回答未完成（`response.incomplete`）。
     pub const INCOMPLETE: &str = "INCOMPLETE";
     pub const UNKNOWN: &str = "UNKNOWN";
@@ -64,6 +68,8 @@ pub const ALL: &[&str] = &[
     model::EMPTY_RESPONSE,
     model::CONTEXT_OVERFLOW,
     model::CONTENT_FILTERED,
+    model::HOOK_DENIED,
+    model::ACCESS_PROGRAM_UNSUPPORTED,
     model::INCOMPLETE,
     model::UNKNOWN,
     local::COMPACTION_FAILED,

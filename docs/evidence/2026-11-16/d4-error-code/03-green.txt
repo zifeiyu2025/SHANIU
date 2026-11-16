@@ -1,0 +1,15 @@
+PS D:\MyWorkspace\SHANIU\src-tauri> cargo test --lib model_client::
+...
+test model_client::retry::tests::provider_retry_after_wins_and_oversize_gives_up ... ok
+test model_client::retry::tests::whitelist_is_exactly_the_transient_failures ... ok
+test model_client::error::tests::stream_error_body_honours_structured_code ... ok
+test model_client::error::tests::structured_code_classifies_gateway_rejections ... ok
+test model_client::error::tests::structured_code_is_gated_by_status ... ok
+test model_client::error::tests::stream_error_body_is_classified_by_actionable_fields ... ok
+
+test result: ok. 61 passed; 0 failed; 0 ignored; 0 measured; 1077 filtered out; finished in 0.01s
+
+说明：
+- 既有 13 条 error 用例原样通过（含 400/413/422、额度优先、内容过滤优先、纯 JSON 兜底）。
+- 新增 3 条 D4 用例：结构化 code 优先、状态码门控、流内错误体结构化 code。
+- retry 白名单用例同步把 HOOK_DENIED / ACCESS_PROGRAM_UNSUPPORTED 列为确定性失败。

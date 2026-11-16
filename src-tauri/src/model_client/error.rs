@@ -34,6 +34,17 @@ pub enum ModelErrorKind {
     ContextOverflow,
     /// 请求/回答被内容安全策略拦截（确定性失败，不重试）。
     ContentFiltered,
+    /// 企业网关的推理钩子拒绝（`inference_hook_denied`，D4）。
+    ///
+    /// 与「密钥无效」严格分开：钩子拒绝是**网关策略**的裁决，改 key、换 token
+    /// 都不会好，用户需要找网关管理员或调整策略。按状态码兜底会把它显示成
+    /// 「密钥无效/无权限」，把人引到错误的修复方向。
+    HookDenied,
+    /// 端点不认当前访问程序（`invalid_access_program` / `unsupported_access_program`，D4）。
+    ///
+    /// 这是**配置/模型选择**问题，不是请求格式不合法的普通 400；单列出来才能提示
+    /// 用户换模型或改配置，而不是反复重试同一份请求。
+    AccessProgramUnsupported,
     /// 端点明确表示回答未完成（`response.incomplete`，如达到 max_tokens / 内容过滤）。
     Incomplete,
     /// 其它。
@@ -99,6 +110,8 @@ impl ModelError {
             ModelErrorKind::EmptyResponse => "EMPTY_RESPONSE",
             ModelErrorKind::ContextOverflow => "CONTEXT_OVERFLOW",
             ModelErrorKind::ContentFiltered => "CONTENT_FILTERED",
+            ModelErrorKind::HookDenied => "HOOK_DENIED",
+            ModelErrorKind::AccessProgramUnsupported => "ACCESS_PROGRAM_UNSUPPORTED",
             ModelErrorKind::Incomplete => "INCOMPLETE",
             ModelErrorKind::Unknown => "UNKNOWN",
         }
@@ -106,34 +119,16 @@ impl ModelError {
 
     /// HTTP 状态 + 错误体 → 结构化错误。
     ///
-    /// 分类顺序：先看错误体里的额度关键词（有些端点用 400/403 报余额不足），
-    /// 再看 400/413/422 能否从错误体里判出更具体的原因（上下文超长/内容过滤），
-    /// 最后才按状态码兜底。这样“余额不足”不会被误报成“密钥无效”，
-    /// 真实端点用 HTTP 400 + `context_length_exceeded` 报超长时也能走到反应式压缩。
+    /// 分类顺序（D4）：先按端点给出的结构化 `code`（缺省时回落到 `type`）分类，
+    /// 但必须通过状态码门控；结构化字段判不出、或与状态码冲突时，才退回
+    /// “额度关键词 → 400/413/422 错误体 → 状态码兜底”的旧规则。
+    /// 这样“余额不足”不会被误报成“密钥无效”，真实端点用 HTTP 400 +
+    /// `context_length_exceeded` 报超长时也能走到反应式压缩。
     pub fn from_status(status: u16, body: &str) -> Self {
         let (provider_code, provider_message) = provider_fields(body);
-        let kind = if quota_hit(provider_code.as_deref(), provider_message.as_deref()) {
-            ModelErrorKind::Quota
-        } else if matches!(status, 400 | 413 | 422) {
-            // 只接受错误体**明确**判出的原因；参数错误、纯文本错误体、判不出来的
-            // 一律保持 BAD_REQUEST。宁可漏判，也不能错判成超长——错判会触发一次
-            // 无意义的摘要与重放，白烧额度。413（Payload Too Large）只认超长：
-            // 内容过滤的措辞出现在 413 里，不足以说明是上下文问题。
-            match body_kind(provider_code.as_deref(), provider_message.as_deref()) {
-                ModelErrorKind::ContextOverflow => ModelErrorKind::ContextOverflow,
-                ModelErrorKind::ContentFiltered if status != 413 => ModelErrorKind::ContentFiltered,
-                _ => ModelErrorKind::BadRequest,
-            }
-        } else {
-            match status {
-                401 | 403 => ModelErrorKind::Auth,
-                402 => ModelErrorKind::Quota,
-                404 | 405 => ModelErrorKind::EndpointUnsupported,
-                429 => ModelErrorKind::RateLimited,
-                500..=599 => ModelErrorKind::Server,
-                _ => ModelErrorKind::Unknown,
-            }
-        };
+        let kind = structured_kind(provider_code.as_deref(), Some(status)).unwrap_or_else(|| {
+            legacy_status_kind(status, provider_code.as_deref(), provider_message.as_deref())
+        });
         let human = match kind {
             ModelErrorKind::Auth => "密钥无效".to_string(),
             ModelErrorKind::Quota => "余额不足".to_string(),
@@ -146,6 +141,12 @@ impl ModelError {
             ModelErrorKind::EmptyResponse => "模型返回了空响应".to_string(),
             ModelErrorKind::ContextOverflow => "上下文超出模型窗口限制".to_string(),
             ModelErrorKind::ContentFiltered => "请求被内容安全策略拒绝".to_string(),
+            ModelErrorKind::HookDenied => {
+                "企业网关的推理钩子拒绝了本次请求，请检查网关策略或联系管理员".to_string()
+            }
+            ModelErrorKind::AccessProgramUnsupported => {
+                "该端点不认当前访问程序，请检查服务商配置或换用支持的模型".to_string()
+            }
             ModelErrorKind::Incomplete => "回答未完成".to_string(),
             ModelErrorKind::Unknown => format!("未知错误（HTTP {status}）"),
         };
@@ -158,11 +159,18 @@ impl ModelError {
     /// 数字型 `code`（如 `"503"`）按状态码语义处理。取不到可判定信息就不猜。
     pub fn from_body(value: Option<&serde_json::Value>) -> Self {
         let (provider_code, provider_message) = value.map(provider_fields_value).unwrap_or((None, None));
-        let kind = body_kind(provider_code.as_deref(), provider_message.as_deref());
+        let kind = structured_kind(provider_code.as_deref(), None)
+            .unwrap_or_else(|| body_kind(provider_code.as_deref(), provider_message.as_deref()));
         let human = match kind {
             ModelErrorKind::Quota => "余额不足".to_string(),
             ModelErrorKind::ContextOverflow => "上下文超出模型窗口限制".to_string(),
             ModelErrorKind::ContentFiltered => "请求被内容安全策略拒绝".to_string(),
+            ModelErrorKind::HookDenied => {
+                "企业网关的推理钩子拒绝了本次请求，请检查网关策略或联系管理员".to_string()
+            }
+            ModelErrorKind::AccessProgramUnsupported => {
+                "该端点不认当前访问程序，请检查服务商配置或换用支持的模型".to_string()
+            }
             ModelErrorKind::Auth => "密钥无效".to_string(),
             ModelErrorKind::RateLimited => "请求过于频繁，已被限流".to_string(),
             ModelErrorKind::Timeout => "网络超时".to_string(),
@@ -313,6 +321,79 @@ fn quota_hit(code: Option<&str>, message: Option<&str>) -> bool {
     ]
     .iter()
     .any(|needle| haystack.contains(needle))
+}
+
+/// 端点给的结构化 `code`（缺省时 `provider_fields` 已回落到 `type`）→ 大类。
+///
+/// D4：错误体说的是“具体原因”，状态码说的是“这次失败属于哪一类”，两者冲突时
+/// 以状态码为准，所以每个结构化原因都带合法的状态码集合；不在集合里就返回
+/// `None`，交给 `legacy_status_kind` 按状态码兜底。流内错误体没有状态码，
+/// `status == None` 时不门控。
+///
+/// 只登记**能确定含义**的 code；不认识的 code 仍走关键词兜底，不许直接判 `Unknown`
+/// （端点新增 code 时，错误体里的措辞往往仍然可判）。
+fn structured_kind(code: Option<&str>, status: Option<u16>) -> Option<ModelErrorKind> {
+    let code = code?.trim().to_ascii_lowercase();
+    let allows = |statuses: &[u16]| match status {
+        None => true,
+        Some(status) => statuses.contains(&status),
+    };
+    let is_server = match status {
+        None => true,
+        Some(status) => (500..=599).contains(&status),
+    };
+    Some(match code.as_str() {
+        "context_length_exceeded" if allows(&[400, 413, 422]) => ModelErrorKind::ContextOverflow,
+        // 413 只认超长：内容过滤的 code 出现在 413 里不足以说明是内容问题。
+        "content_policy_violation" | "content_filter" if allows(&[400, 422]) => {
+            ModelErrorKind::ContentFiltered
+        }
+        "inference_hook_denied" if allows(&[400, 403]) => ModelErrorKind::HookDenied,
+        "invalid_access_program" | "unsupported_access_program" if allows(&[400]) => {
+            ModelErrorKind::AccessProgramUnsupported
+        }
+        // 额度与状态码无关：不少端点用 400/402/403 报余额不足，这条必须最先成立。
+        "insufficient_quota" | "insufficient_balance" | "quota_exceeded" | "billing_hard_limit_reached" => {
+            ModelErrorKind::Quota
+        }
+        "rate_limit_exceeded" | "rate_limit_error" if allows(&[429]) => ModelErrorKind::RateLimited,
+        "invalid_api_key" | "authentication_error" | "permission_error" if allows(&[401, 403]) => {
+            ModelErrorKind::Auth
+        }
+        "server_error" | "internal_error" | "overloaded_error" if is_server => {
+            ModelErrorKind::Server
+        }
+        "invalid_request_error" | "invalid_request" | "bad_request" if allows(&[400, 422]) => {
+            ModelErrorKind::BadRequest
+        }
+        _ => return None,
+    })
+}
+
+/// D4 之前的分类规则，原样保留：结构化字段判不出时的兜底，保证默认行为不变。
+fn legacy_status_kind(status: u16, code: Option<&str>, message: Option<&str>) -> ModelErrorKind {
+    if quota_hit(code, message) {
+        return ModelErrorKind::Quota;
+    }
+    if matches!(status, 400 | 413 | 422) {
+        // 只接受错误体**明确**判出的原因；参数错误、纯文本错误体、判不出来的
+        // 一律保持 BAD_REQUEST。宁可漏判，也不能错判成超长——错判会触发一次
+        // 无意义的摘要与重放，白烧额度。413（Payload Too Large）只认超长：
+        // 内容过滤的措辞出现在 413 里，不足以说明是上下文问题。
+        return match body_kind(code, message) {
+            ModelErrorKind::ContextOverflow => ModelErrorKind::ContextOverflow,
+            ModelErrorKind::ContentFiltered if status != 413 => ModelErrorKind::ContentFiltered,
+            _ => ModelErrorKind::BadRequest,
+        };
+    }
+    match status {
+        401 | 403 => ModelErrorKind::Auth,
+        402 => ModelErrorKind::Quota,
+        404 | 405 => ModelErrorKind::EndpointUnsupported,
+        429 => ModelErrorKind::RateLimited,
+        500..=599 => ModelErrorKind::Server,
+        _ => ModelErrorKind::Unknown,
+    }
 }
 
 /// 流内错误体 → 大类（P0-3）。`from_status` 对 400/422 也复用它，避免两套关键词。
@@ -661,5 +742,72 @@ mod tests {
 
         let other = ModelError::incomplete("server_shutdown");
         assert!(other.human.contains("server_shutdown"), "{}", other.human);
+    }
+
+    /// D4：端点给出结构化 `code` 时必须按它分类，而不是靠状态码兜底。
+    ///
+    /// 反向对照：把 `from_status` 退回「只用关键词并集」的实现，前两条会落到
+    /// `Auth` / `BadRequest`，本用例立刻红——用户看到的会是「密钥无效」，
+    /// 改 key 永远修不好网关策略拒绝。
+    #[test]
+    fn structured_code_classifies_gateway_rejections() {
+        let hook = r#"{"error":{"code":"inference_hook_denied","message":"denied by inference hook"}}"#;
+        let error = ModelError::from_status(403, hook);
+        assert_eq!(error.kind, ModelErrorKind::HookDenied);
+        assert_eq!(error.code(), "HOOK_DENIED");
+        assert!(error.human.contains("推理钩子"), "{}", error.human);
+        assert!(!error.human.contains("密钥无效"), "钩子拒绝不得显示成密钥问题：{}", error.human);
+
+        for code in ["invalid_access_program", "unsupported_access_program"] {
+            let body = format!(r#"{{"error":{{"code":"{code}","message":"bad access program"}}}}"#);
+            let error = ModelError::from_status(400, &body);
+            assert_eq!(error.kind, ModelErrorKind::AccessProgramUnsupported, "code={code}");
+            assert_eq!(error.code(), "ACCESS_PROGRAM_UNSUPPORTED");
+            assert!(error.human.contains("访问程序"), "{}", error.human);
+        }
+    }
+
+    /// D4：结构化 code 必须带状态码门控——状态码说明「这是哪一类失败」，
+    /// 冲突时以状态码为准，不能让错误体里的某个 code 把 429/401 改写成确定性拒绝。
+    ///
+    /// 反向对照：去掉 `structured_kind` 里的 `allowed(...)` 门控，后三条会红。
+    #[test]
+    fn structured_code_is_gated_by_status() {
+        let overflow = r#"{"error":{"code":"context_length_exceeded","message":"too long"}}"#;
+        assert_eq!(kind(403, overflow), ModelErrorKind::Auth, "403 上的超长措辞仍是鉴权失败");
+        assert_eq!(kind(500, overflow), ModelErrorKind::Server, "5xx 上的超长措辞仍是服务端错误");
+
+        let filtered = r#"{"error":{"code":"content_policy_violation","message":"blocked"}}"#;
+        assert_eq!(kind(429, filtered), ModelErrorKind::RateLimited, "429 不是内容过滤形态");
+
+        let hook = r#"{"error":{"code":"inference_hook_denied","message":"denied"}}"#;
+        assert_eq!(kind(500, hook), ModelErrorKind::Server, "5xx 优先于钩子 code");
+
+        let program = r#"{"error":{"code":"invalid_access_program","message":"bad"}}"#;
+        assert_eq!(kind(401, program), ModelErrorKind::Auth, "401 优先于访问程序 code");
+    }
+
+    /// D4：流内错误体没有 HTTP 状态码，结构化 code 同样要优先于关键词。
+    #[test]
+    fn stream_error_body_honours_structured_code() {
+        for (body, expected) in [
+            (
+                r#"{"error":{"code":"inference_hook_denied","message":"denied"}}"#,
+                ModelErrorKind::HookDenied,
+            ),
+            (
+                r#"{"error":{"code":"unsupported_access_program","message":"bad"}}"#,
+                ModelErrorKind::AccessProgramUnsupported,
+            ),
+            // 未知 code 仍走关键词兜底：不能因为「有 code 但没登记」就退回 Unknown。
+            (
+                r#"{"error":{"code":"some_new_code","message":"context window exceeded"}}"#,
+                ModelErrorKind::ContextOverflow,
+            ),
+        ] {
+            let value: serde_json::Value = serde_json::from_str(body).unwrap();
+            let error = ModelError::from_body(Some(&value));
+            assert_eq!(error.kind, expected, "错误体分类错误：{body} → {error:?}");
+        }
     }
 }

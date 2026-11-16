@@ -245,6 +245,16 @@ fn from_model_error(error: ModelError) -> KeyCheck {
             "empty_response",
             "端点返回了空响应，无法据此判断密钥".to_string(),
         ),
+        ModelErrorKind::HookDenied => (
+            KeyCheckState::Unknown,
+            "gateway_hook_denied",
+            "请求到达了端点，但被网关推理钩子拒绝（不是密钥问题）".to_string(),
+        ),
+        ModelErrorKind::AccessProgramUnsupported => (
+            KeyCheckState::Unknown,
+            "access_program_unsupported",
+            "端点不认当前访问程序，无法据此判断密钥".to_string(),
+        ),
         ModelErrorKind::ContextOverflow
         | ModelErrorKind::ContentFiltered
         | ModelErrorKind::Incomplete => (KeyCheckState::Unknown, "other", error.human.clone()),
