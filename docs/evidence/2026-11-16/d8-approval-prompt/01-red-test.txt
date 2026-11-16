@@ -1,0 +1,42 @@
+   Compiling shaniu v0.2.8 (D:\MyWorkspace\SHANIU\src-tauri)
+    Finished `test` profile [unoptimized + debuginfo] target(s) in 22.89s
+     Running unittests src\lib.rs (target\debug\build\shaniu/3347eb12c1517f2a\out\shaniu_lib-3347eb12c1517f2a.exe)
+
+running 13 tests
+test mcp_client::guard::tests::approval_bypass_and_role_impersonation_are_detected ... ok
+test mcp_client::trust::tests::refresh_digests_keeps_approval_but_updates_content_baseline ... ok
+test agent_loop::prompt::tests::approval_mode_is_stated_truthfully ... FAILED
+test agent_loop::prompt::tests::approval_change_is_reported_as_tail_message ... FAILED
+test permission::tests::never_mode_never_emits_approval_request ... ok
+test permission::tests::approval_is_denied_immediately_when_nobody_can_answer ... ok
+test permission::tests::approval_request_is_denied_when_card_cannot_be_delivered ... ok
+test permission::tests::approval_request_carries_origin_agent_and_task_summary ... ok
+test permission::tests::lease_ttl_denies_pending_approval_without_heartbeat ... ok
+test permission::tests::fresh_heartbeat_keeps_pending_approval_waiting ... ok
+test permission::tests::escalation_approval_is_marked_and_never_remembered ... ok
+test agent_loop::tests::destructive_tool_requires_approval_and_deny_blocks_execution ... ok
+test permission::tests::approval_waits_when_responder_is_ready_and_allows_after_delay ... ok
+
+failures:
+
+---- agent_loop::prompt::tests::approval_mode_is_stated_truthfully stdout ----
+
+thread 'agent_loop::prompt::tests::approval_mode_is_stated_truthfully' (12672) panicked at src\agent_loop\prompt.rs:890:13:
+Never 下提示词必须写明审批档：审批已关闭
+note: run with `RUST_BACKTRACE=1` environment variable to display a backtrace
+
+---- agent_loop::prompt::tests::approval_change_is_reported_as_tail_message stdout ----
+
+thread 'agent_loop::prompt::tests::approval_change_is_reported_as_tail_message' (19556) panicked at src\agent_loop\prompt.rs:925:9:
+审批档变化必须让模型知道：## 环境变化
+
+
+
+
+failures:
+    agent_loop::prompt::tests::approval_change_is_reported_as_tail_message
+    agent_loop::prompt::tests::approval_mode_is_stated_truthfully
+
+test result: FAILED. 11 passed; 2 failed; 0 ignored; 0 measured; 1116 filtered out; finished in 0.32s
+
+error: test failed, to rerun pass `--lib`

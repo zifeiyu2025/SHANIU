@@ -1,0 +1,37 @@
+   Compiling shaniu v0.2.8 (D:\MyWorkspace\SHANIU\src-tauri)
+    Finished `test` profile [unoptimized + debuginfo] target(s) in 23.08s
+     Running unittests src\lib.rs (target\debug\build\shaniu/3347eb12c1517f2a\out\shaniu_lib-3347eb12c1517f2a.exe)
+
+running 29 tests
+test agent_loop::prompt::tests::isolation_labels_share_the_budget ... ok
+test agent_loop::prompt::tests::git_status_parser_reads_branch_and_counts_changes ... ok
+test agent_loop::prompt::tests::failed_probes_drop_the_whole_line ... ok
+test agent_loop::prompt::tests::includes_workspace_and_sandbox_mode ... ok
+test agent_loop::prompt::tests::approval_change_is_reported_as_tail_message ... ok
+test agent_loop::prompt::tests::isolation_label_follows_effective_mechanism ... ok
+test agent_loop::prompt::tests::permission_and_isolation_are_separate_lines ... ok
+test agent_loop::prompt::tests::never_mentions_secret_material ... ok
+test agent_loop::prompt::tests::approval_mode_is_stated_truthfully ... ok
+test agent_loop::prompt::tests::declares_mcp_output_untrusted_in_every_mode ... ok
+test agent_loop::prompt::tests::no_stale_network_claims_in_prompt ... ok
+test agent_loop::prompt::tests::node_and_npm_lines_only_appear_when_probed ... ok
+test agent_loop::prompt::tests::plan_mode_adds_readonly_clause ... ok
+test agent_loop::prompt::tests::git_line_reports_capabilities_without_leaking_identity ... ok
+test agent_loop::prompt::tests::policy_changes_are_reported_as_tail_messages ... ok
+test agent_loop::prompt::tests::prompt_budget_boundary_is_inclusive ... ok
+test agent_loop::prompt::tests::prompt_stays_within_token_budget ... ok
+test agent_loop::prompt::tests::environment_declares_cmd_not_powershell ... ok
+test agent_loop::prompt::tests::prompt_snapshot_is_locked ... ok
+test agent_loop::prompt::tests::python_line_only_appears_when_probed ... ok
+test agent_loop::prompt::tests::sandbox_block_scopes_itself_to_files ... ok
+test agent_loop::prompt::tests::skill_catalog_is_injected_only_when_present ... ok
+test agent_loop::prompt::tests::system_prompt_is_byte_stable_across_turns ... ok
+test agent_loop::prompt::tests::verification_discipline_has_three_categories ... ok
+test agent_loop::prompt::tests::version_parser_rejects_store_stub_output ... ok
+test agent_loop::prompt::tests::workspace_write_clause_does_not_overclaim_isolation ... ok
+test agent_loop::prompt::tests::prompt_segments_keep_their_share ... ok
+test agent_loop::prompt::tests::real_workspace_prompt_stays_within_budget ... ok
+test agent_loop::prompt::tests::host_probe_results_are_well_formed ... ok
+
+test result: ok. 29 passed; 0 failed; 0 ignored; 0 measured; 1100 filtered out; finished in 0.57s
+

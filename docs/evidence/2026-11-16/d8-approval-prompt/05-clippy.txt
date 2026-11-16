@@ -1,0 +1,2 @@
+   Compiling shaniu v0.2.8 (D:\MyWorkspace\SHANIU\src-tauri)
+    Finished `dev` profile [unoptimized + debuginfo] target(s) in 11.94s

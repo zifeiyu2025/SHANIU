@@ -265,6 +265,7 @@ pub fn write_scope(workspace_root: &Path) -> Vec<PathBuf> {
 **用户可见后果**：在 Never/FullAccess 下模型仍说「我需要你批准才能继续」，但界面不会弹审批，用户以为卡住；反过来在 OnFailure 下模型可能过度保守，不敢先跑命令看失败原因。
 
 **我们具体怎么跟**：等价实现。`PromptContext` 增加 `approval_mode`，安全段按模式改写（never → 「审批已关闭，直接执行，不要再要求用户批准」；on-failure → 「先执行，失败后再申请升级」）。落点 `agent_loop/prompt.rs:582-587` + 调用方。代价：小（约半天，含快照测试）。
+**落地状态（2026-11-16）**：已完成。`PromptContext.approval` + `approval_block` 按四档生成，审批档中途变化走尾部 system 消息；`PROMPT_VERSION = 2026-11-16.1`。红/绿与反向验证输出见 `docs/evidence/2026-11-16/d8-approval-prompt/`。
 **上游版本**：dsh `39163dd3`。**是否需追最新**：否。
 
 ---
@@ -283,6 +284,7 @@ pub fn write_scope(workspace_root: &Path) -> Vec<PathBuf> {
 **用户可见后果**：模型只能反复试探同一类操作，或在「用户拒绝」与「工作区外写」之间猜；用户看到的是模型来回来去问，而不是一次说明白。
 
 **我们具体怎么跟**：等价实现。拒绝结果里带 `reason_code`（user_denied / policy_forbidden / sandbox_denied / outside_workspace）与一句人话，落 tool 输出 + 事件。落点 `agent_loop/mod.rs` 拒绝分支、`permission`、`events.rs`。代价：小（约半天）。
+**落地状态（2026-11-16）**：已完成。门禁拒绝（用户拒绝 / 策略禁止）与工具层沙箱拒绝（`sandbox_denied` / `outside_workspace`）统一附「拒绝说明」，事件 `error` 与回填给模型的历史同文；红/绿与反向验证输出见 `docs/evidence/2026-11-16/d9-deny-reason/`。
 **上游版本**：codex `b016cd18`。**是否需追最新**：否。
 
 ---

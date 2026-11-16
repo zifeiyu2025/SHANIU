@@ -1174,6 +1174,7 @@ impl AgentLoop {
             let prompt_ctx = prompt::PromptContext {
                 workspace_root: &self.workspace_root,
                 sandbox: turn_policy.sandbox,
+                approval: turn_policy.approval,
                 os: crate::sandbox::current_os_mode(),
                 plan_mode: self.plan_state.is_active_for(session_id.as_deref()),
                 skill_catalog: &skill_catalog,

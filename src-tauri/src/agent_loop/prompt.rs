@@ -22,7 +22,7 @@ use std::time::{Duration, Instant};
 use sha2::{Digest, Sha256};
 
 use crate::agent_loop::rules::{self, ProjectRules};
-use crate::config::{OsSandbox, SandboxMode};
+use crate::config::{ApprovalMode, OsSandbox, SandboxMode};
 
 /// 提示词结构版本。**改变块顺序、增删常驻块、改写常驻条款都要 +1**。
 /// 它只回答"这份提示词是哪一版"，与文件指纹一起进日志，便于把评估结论对回具体文本。
@@ -43,7 +43,10 @@ use crate::config::{OsSandbox, SandboxMode};
 /// 2026-11-13.1：工具使用规则补 `read_file` 口径——`offset` 是 1 起算**行号**、`limit` 是行数，
 /// 并明确不要用 shell（`type` / `findstr` / `more`）读文件。评测里模型把 offset 当字节偏移、
 /// 读错区段后逃逸到 shell，浪费大量轮次（`evals/repo/RESULTS-2026-11-13.md`）。
-pub const PROMPT_VERSION: &str = "2026-11-13.1";
+/// 2026-11-16.1（D8）：「审批与安全」段按**当前审批档**改写——此前只写「写入、命令执行都可能
+/// 弹审批」，模型在 `never` / `full_access` 下也会写「等你批准」，而界面永远不会弹卡；
+/// 反过来在 `on-failure` 下又不敢先跑命令。审批档中途变化改走尾部 system 消息。
+pub const PROMPT_VERSION: &str = "2026-11-16.1";
 
 /// 全文 token 上限（估算口径见 [`rules::estimate_tokens`]：CJK 1 字 1 token，ASCII 4 字符 1 token）。
 ///
@@ -76,6 +79,9 @@ pub struct PromptContext<'a> {
     pub workspace_root: &'a Path,
     /// 权限档（只读 / 工作区写入 / 完全访问）。
     pub sandbox: SandboxMode,
+    /// 审批档（D8）：模型必须知道当前会不会弹审批，否则会写出需要交互的动作，
+    /// 或在本可直接执行的档位反复请求批准。
+    pub approval: ApprovalMode,
     /// 隔离机制（AppContainer / 逻辑沙箱）。
     pub os: OsSandbox,
     pub plan_mode: bool,
@@ -373,13 +379,19 @@ pub fn environment_note(ctx: &PromptContext<'_>) -> Option<String> {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 struct LiveFacts {
     sandbox: SandboxMode,
+    approval: ApprovalMode,
     os: OsSandbox,
     plan_mode: bool,
 }
 
 impl LiveFacts {
     fn of(ctx: &PromptContext<'_>) -> Self {
-        Self { sandbox: ctx.sandbox, os: ctx.os, plan_mode: ctx.plan_mode }
+        Self {
+            sandbox: ctx.sandbox,
+            approval: ctx.approval,
+            os: ctx.os,
+            plan_mode: ctx.plan_mode,
+        }
     }
 }
 
@@ -392,7 +404,7 @@ impl LiveFacts {
 ///    由调用方追加到历史尾部；[`Self::instructions`] 永远返回同一份字节；
 /// 3. 采样时用 [`Self::instructions`] 作为 system。
 ///
-/// 冻结的是**前缀**，不是事实：权限档 / 隔离机制 / 计划态变化仍必须让模型知道
+/// 冻结的是**前缀**，不是事实：权限档 / 审批档 / 隔离机制 / 计划态变化仍必须让模型知道
 /// （docs/04 §6.1 不变量③），只是通道从"重写 system"改成"尾部补一条 system 消息"。
 pub struct SessionPrompt {
     text: String,
@@ -419,6 +431,9 @@ impl SessionPrompt {
             return None;
         }
         let mut lines = Vec::new();
+        if next.approval != self.facts.approval {
+            lines.push(format!("- 审批档：{}", approval_mode_clause(next.approval)));
+        }
         if next.sandbox != self.facts.sandbox {
             lines.push(format!("- 权限档：{}", mode_label(next.sandbox)));
         }
@@ -462,6 +477,46 @@ fn isolation_label(os: OsSandbox) -> &'static str {
         OsSandbox::AppContainer => "AppContainer（OS 级；文件系统按路径授权，路径外一律拒绝）",
         OsSandbox::Logical => "逻辑沙箱（无路径级隔离；只有工具层校验）",
     }
+}
+
+/// 审批档文案（D8）：让模型知道**当前会不会弹审批、什么时候问**。
+///
+/// 对齐 dsh `user-approval` 把审批策略作为独立系统提示段的做法（`NEVER_SENTENCE` /
+/// `ASK_SENTENCE`，`packages/interaction/user-approval/src/index.ts:75-77`），
+/// 但按我们自己的四档审批给出各自的口径——只写「可能弹审批」会让 `never` /
+/// `full_access` 下的模型写出「等你批准」而界面永远不会弹卡。
+fn approval_mode_clause(mode: ApprovalMode) -> &'static str {
+    match mode {
+        ApprovalMode::Never => "审批已关闭（never）：需要审批的动作会被直接拒绝，不会弹审批卡；\
+不要要求用户批准，也不要写出「等你批准后再做」这类回答。",
+        ApprovalMode::OnFailure => "审批档为 on-failure：沙箱允许的写入与命令直接执行、不预先询问；\
+只有沙箱拒绝后才申请一次提权并弹审批。先执行，失败后按工具返回的拒绝原因决定是否申请提权。",
+        ApprovalMode::OnRequest => "审批档为 on-request：写入与命令执行可能在执行前弹审批；\
+被拒绝时说明原因并征求指示，不要绕过或换个说法重试。",
+        ApprovalMode::FullAccess => "审批档为 full-access：全部放行且不会弹审批卡；\
+不要请求批准；写范围仍以「沙箱边界」为准。",
+    }
+}
+
+/// 破坏性操作在各审批档下的处置口径（与 `permission::policy::decide` 的 Deny 分支一致）。
+fn destructive_clause(mode: ApprovalMode) -> &'static str {
+    match mode {
+        ApprovalMode::Never | ApprovalMode::OnFailure => "在当前档位直接失败（不询问）",
+        ApprovalMode::OnRequest => "逐次询问",
+        ApprovalMode::FullAccess => "不询问，由你自行判断并说明理由",
+    }
+}
+
+/// 审批与安全段：档位相关的只有前两行，密钥条款对所有档位常驻。
+fn approval_block(ctx: &PromptContext<'_>) -> String {
+    format!(
+        "## 审批与安全\n\
+- {}\n\
+- 破坏性操作（递归删除、强制推送、工作区外写入、上传）{}；密钥/凭据不读取不输出，\
+发现疑似密钥文件即停并告知。\n\n",
+        approval_mode_clause(ctx.approval),
+        destructive_clause(ctx.approval),
+    )
 }
 
 /// 项目规则块：来自 `AGENTS.md` 向上查找，正文已按预算裁剪。
@@ -579,12 +634,7 @@ pub fn system_instruction(ctx: &PromptContext<'_>) -> String {
     );
     text.push_str(&sandbox_block(ctx));
     text.push_str(verification_block());
-    text.push_str(
-        "## 审批与安全\n\
-- 写入、命令执行都可能弹审批；被拒绝时说明原因并征求指示，不要绕过或换个说法重试。\n\
-- 破坏性操作（递归删除、强制推送、工作区外写入、上传）逐次询问；密钥/凭据不读取不输出，\
-发现疑似密钥文件即停并告知。\n\n",
-    );
+    text.push_str(&approval_block(ctx));
     text.push_str(untrusted_output_clause());
 
     if !ctx.skill_catalog.is_empty() {
@@ -826,6 +876,7 @@ mod tests {
         PromptContext {
             workspace_root: root,
             sandbox,
+            approval: ApprovalMode::OnRequest,
             os,
             plan_mode: plan,
             skill_catalog: &[],
@@ -842,6 +893,78 @@ mod tests {
 
     fn demo() -> PathBuf {
         PathBuf::from("D:/ws/demo")
+    }
+
+    fn ctx_with_approval<'a>(
+        root: &'a Path,
+        sandbox: SandboxMode,
+        approval: ApprovalMode,
+        os: OsSandbox,
+        plan: bool,
+    ) -> PromptContext<'a> {
+        let mut context = ctx(root, sandbox, os, plan);
+        context.approval = approval;
+        context
+    }
+
+    /// D8：审批档必须如实进系统提示——模型要能判断「现在会不会弹审批」。
+    ///
+    /// 只断言「写了某句」不够：`Never` / `FullAccess` 下残留「可能弹审批」会教模型
+    /// 写出等待批准的回答，界面却永远不会弹卡。所以每条也断言旧说法不在。
+    #[test]
+    fn approval_mode_is_stated_truthfully() {
+        let root = demo();
+        let cases = [
+            (ApprovalMode::Never, "审批已关闭", "不会弹审批卡"),
+            (ApprovalMode::OnFailure, "on-failure", "先执行"),
+            (ApprovalMode::OnRequest, "on-request", "可能在执行前弹审批"),
+            (ApprovalMode::FullAccess, "full-access", "不会弹审批卡"),
+        ];
+        for (mode, marker, claim) in cases {
+            let text = system_instruction(&ctx_with_approval(
+                &root,
+                SandboxMode::WorkspaceWrite,
+                mode,
+                OsSandbox::AppContainer,
+                false,
+            ));
+            assert!(text.contains(marker), "{mode:?} 下提示词必须写明审批档：{marker}");
+            assert!(text.contains(claim), "{mode:?} 下提示词缺「{claim}」");
+            assert!(
+                !text.contains("写入、命令执行都可能弹审批"),
+                "{mode:?} 下残留旧通用句，模型会以为任何档位都会弹审批"
+            );
+            assert!(
+                text.contains("密钥/凭据不读取不输出"),
+                "{mode:?} 下安全条款不得被模式改写丢掉"
+            );
+        }
+    }
+
+    /// D8：中途切换审批档必须走尾部 system 消息，不改冻结前缀。
+    #[test]
+    fn approval_change_is_reported_as_tail_message() {
+        let root = demo();
+        let first = ctx_with_approval(
+            &root,
+            SandboxMode::WorkspaceWrite,
+            ApprovalMode::OnRequest,
+            OsSandbox::AppContainer,
+            false,
+        );
+        let (mut session, _) = SessionPrompt::assemble(&first);
+        let frozen = session.instructions().to_string();
+
+        let later = ctx_with_approval(
+            &root,
+            SandboxMode::WorkspaceWrite,
+            ApprovalMode::Never,
+            OsSandbox::AppContainer,
+            false,
+        );
+        let note = session.refresh(&later).expect("审批档变了，必须播报");
+        assert!(note.contains("- 审批档："), "审批档变化必须让模型知道：{note}");
+        assert_eq!(session.instructions(), frozen, "播报变化不得回头改系统提示");
     }
 
     #[test]
