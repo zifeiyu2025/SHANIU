@@ -95,7 +95,14 @@ wall 口径与上轮一致（agent 段 + 判据段，不含每题准备/预热�
  error: could not compile `shaniu` (lib) due to 1 previous error
 ```
 
-它新增了 `ModelErrorKind::ContextOverflow` 变体，却在一个 match 里留了 `todo!()` 占位、另一个 match 未补 arm，32 轮内没收敛到可编译状态。这是**真失败**，不是环境问题：该题本轮 `CARGO_TARGET_DIR` 绕行 0 处、400 故障 0 次、前置判据正常红。上轮该题 PASS（同样 32 轮打满），属于模型在预算边缘的稳定性差异，不是驱动器变化导致的系统性回归。
+它新增了 `ModelErrorKind::ContextOverflow` 变体，却在一个 match 里漏了 arm（另一处 match 是否补齐未在判据里体现，判据只报了第一处 `E0004`）。32 轮内没收敛到可编译状态。这是**真失败**，不是环境问题：该题本轮 `CARGO_TARGET_DIR` 绕行 0 处、400 故障 0 次、前置判据正常红。上轮该题 PASS（同样 32 轮打满），属于模型在预算边缘的稳定性差异，不是驱动器变化导致的系统性回归。
+
+**取证订正（2026-11-16，只读复核事件流）**：
+
+- 判据里那行 `ModelErrorKind::ContextOverflow => todo!()` **不是模型写进代码的内容**，是 rustc 对 `E0004` 的补 arm 建议（`251 ~` / `252 ~` 两行相邻的 `~` 是建议格式）。事件流里 `todo!` 只出现在 3 条 `verification` 输出中，14 次 `apply_patch` 的补丁正文里一次都没有。所以「占位符留在生产代码」不是本次事故的成因，`cargo check` 报的始终是缺 arm。
+- 该题收口是 `turn_completed.reason = failed`（`turn_error.code = VERIFY_FAILED`），**不是 `budget_exhausted`**：32 轮打满后宿主在统一收口点补跑了 `cargo check --all-targets`（exit 101），据此把收口改成 `failed`。`raw/shaniu-run.log` 该题为 `[agent] end ... reason=Failed`、`收口=Failed`。
+- 闸门**跑过且报了红**，没有漏判：整题只有 1 条 `verification_result`（turn 32），失败原因是模型 45 次工具调用（14 `apply_patch` / 15 `search` / 12 `read_file` / 4 `list_dir`）里 0 次命令调用，直到第 32 轮仍在 `apply_patch`，循环内闸门（只在「本轮不要工具」时触发）一次都没被问到。缺的是「悬崖之前的裁决」，不是「裁决错了」——已按此补「截止检查点」（见 `docs/04-协议规范.md` §截止检查点）。
+
 
 ## r1 作废说明
 

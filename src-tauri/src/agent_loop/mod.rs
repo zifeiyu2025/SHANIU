@@ -235,6 +235,20 @@ fn stop_verify_view(
     }
 }
 
+/// 截止检查点：预算进入最后 1/4、且**还有下一轮**时，先跑一次同一个闸门。
+///
+/// 循环内的闸门只在「模型这一轮不再要工具」（准备收尾）时才跑，收口口的裁决又没有
+/// 下一轮可用。于是「一直改、一次都不编译、最后一轮仍在请求工具」的路径会把 32 轮
+/// 全花在没有编译反馈的修改上，直到 `turn == max_turns` 才拿到一个无法再修的终局
+/// 裁决（`repo-feat-context-overflow-code` 的现场）。这里的阈值只决定**换一个更早的
+/// 时机**，判定标准仍是 `verify::evaluate`，不改判据、不加轮次。
+///
+/// `turn < max_turns` 同时挡住两类情况：最后一轮（没有下一轮可修）与预算过小
+/// （`max_turns <= 3` 时窗口里没有「还有下一轮」的那一轮），小预算行为不变。
+fn checkpoint_due(turn: u32, max_turns: u32) -> bool {
+    turn < max_turns && turn.saturating_mul(4) >= max_turns.saturating_mul(3)
+}
+
 /// 把一次写后验证裁决写进档案（审计用）。
 ///
 /// 事件流不落盘，`TurnEnd.unverified` 又只有布尔值——不落这一条，「宿主真的跑过
@@ -1053,6 +1067,9 @@ impl AgentLoop {
         // `unverified`，而实际上它已经修好了。
         let mut dirty_epoch: u64 = 0;
         let mut verified_epoch: u64 = 0;
+        // 截止检查点每任务最多跑一次：它的作用是「别让模型走到悬崖才发现编译不过」，
+        // 不是周期性巡检（每次编译几十秒，按轮跑会把预算烧在编译上）。
+        let mut checkpoint_done = false;
         // 首次置脏之前观测到的同命令失败 = 既有失败基线，避免「仓库本来就红」被算到本次改动头上。
         let mut baseline = verify::BaselineCache::default();
         // 评估消融开关在构造时落到配置里（与 REPAIR 同口径）：设 1 = 关闭写后验证闸门
@@ -2501,6 +2518,80 @@ impl AgentLoop {
             // 5) 本轮工具批次已执行完、调用与输出已成对：此刻才收口预算耗尽。
             //    这样「最后一轮仍在请求工具」不会再静默丢调用，也无需额外的
             //    「未执行工具」说明——它们确实执行了，历史是完整的。
+            //
+            //    但在收口之前，预算进入尾段时先跑一次截止检查点：循环内的闸门只在
+            //    「模型这一轮不要工具」时才跑，收口口的裁决又没有下一轮可用。不补这
+            //    一次，「一直改、从不编译、末轮仍在请求工具」的任务会在 32 轮里拿不到
+            //    任何编译结论，最后只剩一个无法再修的终局裁决。
+            if verify_enabled
+                && scope.depth == 0
+                && !checkpoint_done
+                && checkpoint_due(turn, self.max_turns)
+                && dirty.is_dirty()
+                && dirty_epoch != verified_epoch
+                && !cancel.is_cancelled()
+            {
+                checkpoint_done = true;
+                let outcome = verify::evaluate(
+                    &verify::VerifyRequest {
+                        cfg: &self.verify,
+                        dirty: &dirty,
+                        passes: &verify_passes,
+                        baseline: verify::baseline_enabled(&self.verify).then_some(&baseline),
+                        workspace_root: &self.workspace_root,
+                        epoch: dirty_epoch,
+                        timeout: std::time::Duration::from_millis(
+                            self.verify.clamped_timeout_ms(),
+                        ),
+                        sandbox: crate::config::SandboxMode::WorkspaceWrite,
+                    },
+                    cancel,
+                )
+                .await;
+                emit(
+                    &sink,
+                    EventMsg::VerificationResult {
+                        turn,
+                        state: outcome.state,
+                        commands: outcome.commands.clone(),
+                        duration_ms: outcome.duration_ms,
+                        summary: outcome.summary.clone(),
+                        diagnostics: outcome.diagnostics.clone(),
+                    },
+                );
+                last_verify = Some(verify::VerifySnapshot::from_outcome(&outcome, turn));
+                if let Err(message) =
+                    archive_verification(rollout.as_deref(), &outcome, turn, false)
+                {
+                    degrade_rollout(&sink, message);
+                } else {
+                    verification_archived = true;
+                }
+                // 刻意不写 `verified_epoch`：检查点只是把裁决提前，不是「这一代已收口」。
+                // 写成已裁决会让收口复查在模型真没修时跳过，反而把红的任务放成绿。
+                match outcome.state {
+                    crate::events::VerifyState::Passed => {
+                        dirty.clear();
+                        pending_writes.clear();
+                    }
+                    crate::events::VerifyState::Failed => {
+                        // 只提醒、不否决：轮次上限与判据强度都不动。模型拿到的是一条
+                        // 「宿主刚跑过、命令与退出码在这里」的系统消息，下一轮就能改。
+                        if matches!(
+                            self.verify.effective_mode(),
+                            crate::config::VerifyMode::Enforce
+                        ) {
+                            history.push(HistoryItem::Message {
+                                role: Role::System,
+                                text: verify::reminder_text(&outcome, None),
+                                reasoning: None,
+                            });
+                        }
+                    }
+                    crate::events::VerifyState::Inconclusive(_)
+                    | crate::events::VerifyState::Skipped(_) => {}
+                }
+            }
             if turn == self.max_turns {
                 emit(&sink, EventMsg::Error { message: format!("已达最大轮数上限（{turn}）") });
                 reason = TurnEndReasonLocal::BudgetExhausted;
@@ -3438,7 +3529,22 @@ mod tests {
         CancellationToken,
         crate::test_support::TestTempDir,
     ) {
-        let (mut agent, store, cancel, _broker) = make_loop(turns);
+        verify_demo_with_backend(Arc::new(ScriptedBackend::new(turns)), commands, max_turns, mode)
+    }
+
+    /// 与 [`verify_demo`] 同一条装配，只换后端：需要检查「模型收到的历史」的用例用它。
+    fn verify_demo_with_backend(
+        backend: Arc<dyn ModelBackend>,
+        commands: Vec<String>,
+        max_turns: u32,
+        mode: crate::config::VerifyMode,
+    ) -> (
+        AgentLoop,
+        Arc<Mutex<Vec<EventMsg>>>,
+        CancellationToken,
+        crate::test_support::TestTempDir,
+    ) {
+        let (mut agent, store, cancel, _broker) = make_loop_with_backend(backend);
         let ws = crate::test_support::TestTempDir::new("verify-gate");
         let mut router = ToolRouter::new();
         router.register(Arc::new(FakeWriter::default()));
@@ -3458,6 +3564,47 @@ mod tests {
         // 就只有集成用例能验，单测里量不出「关掉闸门」的差别。
         apply_eval_ablation(&mut agent.verify);
         (agent, store, cancel, ws)
+    }
+
+    /// 记录每次采样请求里系统消息的后端：用来断言「宿主裁决真的交给了模型」，
+    /// 而不只是「宿主跑过命令」。队列被问空 = 代码多跑了一轮，直接 panic。
+    struct RecordingBackend {
+        turns: Mutex<std::collections::VecDeque<Vec<ModelStreamEvent>>>,
+        requests: Arc<Mutex<Vec<Vec<String>>>>,
+    }
+
+    impl RecordingBackend {
+        fn new(turns: Vec<Vec<ModelStreamEvent>>) -> Self {
+            Self {
+                turns: Mutex::new(turns.into()),
+                requests: Arc::new(Mutex::new(Vec::new())),
+            }
+        }
+    }
+
+    #[async_trait::async_trait]
+    impl ModelBackend for RecordingBackend {
+        async fn stream(
+            &self,
+            history: &[HistoryItem],
+            _tools: &[ToolDeclaration],
+            _instructions: &str,
+        ) -> Result<ModelStream, crate::model_client::ModelError> {
+            self.requests.lock().unwrap().push(
+                history
+                    .iter()
+                    .filter_map(|item| match item {
+                        HistoryItem::Message { role: Role::System, text, .. } => Some(text.clone()),
+                        _ => None,
+                    })
+                    .collect(),
+            );
+            let mut q = self.turns.lock().unwrap();
+            match q.pop_front() {
+                Some(script) if !script.is_empty() => Ok(Box::pin(futures::stream::iter(script))),
+                _ => panic!("脚本后端被多问了一次：本用例的轮次预算应当刚好够用"),
+            }
+        }
     }
 
     fn verification_states(events: &[EventMsg]) -> Vec<crate::events::VerifyState> {
@@ -3537,6 +3684,73 @@ mod tests {
             ]
         );
         assert!(!completed_unverified(&events), "验证通过后不得标记未验证");
+    }
+
+    /// 截止检查点只在「预算最后 1/4 且还有下一轮」开：最后一轮与过小预算都不开。
+    #[test]
+    fn checkpoint_due_only_in_the_last_quarter_with_a_next_turn() {
+        assert!(!checkpoint_due(23, 32), "前 3/4 不烧编译");
+        assert!(checkpoint_due(24, 32));
+        assert!(checkpoint_due(31, 32));
+        assert!(!checkpoint_due(32, 32), "最后一轮没有下一轮可用，跑了也没人修");
+        assert!(!checkpoint_due(1, 2));
+        assert!(!checkpoint_due(2, 3), "小预算不改变既有收口行为");
+    }
+
+    /// 复现 `repo-feat-context-overflow-code`：32 轮一直在改源码、一次编译都没跑、
+    /// 最后一轮仍在请求工具。旧行为：模型从第 1 轮到收口拿不到任何编译结论，闸门只在
+    /// `turn == max_turns` 的收口口给一个无法再修的 `Failed`。
+    /// 新行为：预算进入尾段先跑同一个闸门，失败作为系统提醒进入下一轮，模型还来得及改。
+    ///
+    /// 反向对照（AGENTS §4.2）：删掉收口前那次 `verify::evaluate`（或让
+    /// `checkpoint_due` 恒为 false），本条红在「第 5 次请求里没有宿主裁决」与
+    /// 「裁决序列只剩收口那一条」。
+    #[tokio::test]
+    async fn verification_checkpoint_hands_diagnostics_before_the_cliff() {
+        // 会起沙箱进程：与建/删 AppContainer profile 的用例串行。
+        let _serial = crate::sandbox::appcontainer::PROFILE_TEST_MUTEX.lock().await;
+        let backend = Arc::new(RecordingBackend::new(vec![
+            script_call_with("apply_patch", r#"{"path":"src/a.rs","body":"pub fn a() {}"}"#, "w1"),
+            script_call_with("apply_patch", r#"{"path":"src/b.rs","body":"pub fn b() {}"}"#, "w2"),
+            script_call_with("apply_patch", r#"{"path":"src/c.rs","body":"pub fn c() {}"}"#, "w3"),
+            script_call_with("apply_patch", r#"{"path":"src/d.rs","body":"pub fn d() {}"}"#, "w4"),
+            // 收到尾段裁决后用同一条命令证明修好了：判据命令只认 src/ok.rs 存在。
+            script_call_with("apply_patch", r#"{"path":"src/ok.rs","body":"pub fn ok() {}"}"#, "w5"),
+        ]));
+        let (agent, store, cancel, _ws) = verify_demo_with_backend(
+            backend.clone(),
+            vec![r"if exist src\ok.rs (exit 0) else (exit 1)".into()],
+            5,
+            crate::config::VerifyMode::Enforce,
+        );
+        let summary = agent.run_task("任务", Arc::new(CapturingSink(store.clone())), cancel).await;
+
+        let events = store.lock().unwrap();
+        assert_eq!(
+            verification_states(&events),
+            vec![
+                crate::events::VerifyState::Failed,
+                crate::events::VerifyState::Passed
+            ],
+            "尾段检查点先红一次，修好后收口再绿一次"
+        );
+        drop(events);
+        assert_eq!(summary.turns, 5, "检查点不额外加轮次");
+        // 用满轮次收口是既有语义（`turn == max_turns` 即 BudgetExhausted）；
+        // 这里要证的是「模型拿到了裁决、收口裁决是绿的」，不是改预算。
+        assert_eq!(summary.reason, TurnEndReason::BudgetExhausted);
+        let requests = backend.requests.lock().unwrap();
+        assert_eq!(requests.len(), 5);
+        assert!(
+            !requests[3].iter().any(|text| text.contains("宿主验证未通过")),
+            "第 4 轮请求在检查点之前，不该有本站裁决；实际 {:?}",
+            requests[3]
+        );
+        assert!(
+            requests[4].iter().any(|text| text.contains("宿主验证未通过")),
+            "第 5 轮请求必须带上检查点的裁决，模型才有机会改；实际 {:?}",
+            requests[4]
+        );
     }
 
     /// 旧行为：末轮不可否决就整块跳过闸门，一次 `VerificationResult` 都不发，
