@@ -1,7 +1,34 @@
-# D7b 任务清单（**待批，未开工**）
+# D7b 任务清单（**已批准，当前环境阻塞**）
 
-> 来源：`docs/specs/D7-protected-paths/tasks.md` 待批项 P1。是否实施由用户裁决；
+> 来源：`docs/specs/D7-protected-paths/tasks.md` 待批项 P1。用户 2026-11-16 已拍板「做」；
 > 本文件不勾任何项，代码一行未动。
+
+## 环境前置（2026-11-16 本机核实，**当前阻塞点**）
+
+- 当前会话**不是**管理员：`IsInRole(Administrator)` = `False`；`whoami /user` =
+  `S-1-5-21-3226398052-62638092-3539548929-1001`（`jun` 在 Administrators 组里，但拿到的是
+  UAC 过滤令牌）。
+- 实测建账户被拒：`net user ShaniuSandboxProbe /add` →
+  `System error 5 has occurred. Access is denied.`（exit 2），**未产生任何账户**。
+- `sudo.exe` 存在但不可用：`已在此计算机上禁用 Sudo`（exit `-2147024891`）。
+- 结论：本机既不能建账户，也不能 `CreateProcessAsUser`（缺 `SeAssignPrimaryTokenPrivilege`
+  / `SeIncreaseQuotaPrivilege`）。T1 / T3 / T9 / T10 的「绿」只有两条路：
+  1. 以管理员身份启动本会话后本机验证；
+  2. 交给 CI（`windows-latest` 以管理员运行，`cargo test` 会收集探针）验证。
+
+## 红证据（D7 旧档，2026-11-16 本机实测，可直接复核）
+
+`WorkspaceWrite` + `OsSandbox::RestrictedToken`，`.git` 已带 D7 的 deny ACE：
+
+| 命令 | 结果 |
+|---|---|
+| `echo x> .git\config` | exit 1，`Access is denied.` |
+| `ren .git\index index2` | exit 1，`Access is denied.` |
+| `del .git\config` | **exit 0，文件被删** |
+| `rmdir /s /q .git` | **exit 0，整个 `.git` 被删** |
+
+这就是 T9 里 `lowpriv_del_git_config_is_denied` / `lowpriv_rmdir_git_is_denied` 的「红」基准：
+换成新档后同样两条命令必须非 0 且目标仍在。
 
 - [ ] T1 账户模块：创建/删除/凭据（DPAPI）/SID 校验，幂等；单测覆盖同名账户与 SID 不一致。
 - [ ] T2 登录权限：`SeDenyInteractiveLogonRight` + `SeDenyRemoteInteractiveLogonRight`，
