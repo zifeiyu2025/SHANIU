@@ -25,7 +25,7 @@
 2. **§3.4#4「删 `.git/index` 必失败」未达成**：`WRITE_RESTRICTED` 的 restricting SID
    只在**写访问**评估时参与（`CreateRestrictedToken` 文档），实测 `del` / `rmdir /s /q`
    均成功；AppContainer 档连普通文件都删不掉，探针不具区分力。
-   **不当作已接受偏差**，见下方「待批项 P1」；`docs/16` §12.5 记录了探针与评估路径。
+   **不当作已接受偏差**，见下方「P1（已关闭）」；`docs/16` §12.5 记录了探针与评估路径。
 3. **T4 的早拒从 `tool_router::resolve_for_write` 下移到 `tools/apply_patch.rs`**：
    `scripts/check-deps.ps1` 按 `docs/01 §2.3.1` 只允许 `tools → sandbox`，`tool_router`
    不含 sandbox 边；硬加边要改门禁权威表，等于为一个函数放宽架构约束。`resolve_for_write`
@@ -34,10 +34,10 @@
 
 ---
 
-## 待批项 P1（**未接受**，需用户裁决）：删除防护
+## P1（已关闭，对齐参考）：删除防护
 
 §3.4#4「删 `.git/index` 必失败」**当前不成立**。这不是「先放着」，也不是已接受的偏差；
-本条需要改身份模型或放宽其他边界，超出 D7 授权范围，**必须由用户拍板**。
+用户已于 2026-11-16 拍板「对齐参考」，本条按下文「状态」关闭，保留事实与评估路径备查。
 
 ### 事实（2026-11-16 本机探针，`WorkspaceWrite` + `OsSandbox::RestrictedToken`）
 
