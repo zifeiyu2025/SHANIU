@@ -163,6 +163,72 @@ pub fn history_tokens(items: &[HistoryItem]) -> usize {
     items.iter().map(item_tokens).sum()
 }
 
+/// 单个工具输出超过这个字符数才做确定性裁剪（D6，对齐 dsh `thresholdChars = 8192`）。
+const PRUNE_THRESHOLD_CHARS: usize = 8_192;
+/// 裁剪后保留的头部字符数（命令回显、前几条结果通常在这里）。
+const PRUNE_HEAD_CHARS: usize = 4_096;
+/// 裁剪后保留的尾部字符数（结论、报错、最后的计数通常在这里）。
+const PRUNE_TAIL_CHARS: usize = 1_024;
+
+/// 一次确定性裁剪的结果。只用于日志与测试断言，不参与判据。
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub struct PruneStats {
+    /// 被替换的工具输出条数。
+    pub pruned_items: usize,
+    /// 裁剪前这些条目的字符总数。
+    pub chars_before: usize,
+    /// 裁剪后的字符总数（含省略标记）。
+    pub chars_after: usize,
+}
+
+impl PruneStats {
+    pub fn is_empty(&self) -> bool {
+        self.pruned_items == 0
+    }
+}
+
+/// 确定性裁剪：超长工具输出保留头尾，中段换成带原始字符数的省略标记（D6）。
+///
+/// 结论取自 dsh `compaction-tool-result-pruner`：头尾各留一段足以保住命令回显与
+/// 结论/报错，中段是重复或冗余的主体；标记里写清裁掉了多少，模型不会把省略误判成
+/// “输出就这么多”。只动 `FunctionCallOutput`，消息、推理、工具调用一律不碰——
+/// 改消息会改语义，改调用会拆配对。
+///
+/// 幂等：裁剪后的文本低于阈值，重复调用不会再加标记。
+pub fn prune_tool_outputs(items: &mut [HistoryItem]) -> PruneStats {
+    let mut stats = PruneStats::default();
+    for item in items.iter_mut() {
+        let HistoryItem::FunctionCallOutput { output, .. } = item else {
+            continue;
+        };
+        let Some(pruned) = prune_text(output) else {
+            continue;
+        };
+        stats.pruned_items += 1;
+        stats.chars_before += output.chars().count();
+        stats.chars_after += pruned.chars().count();
+        *output = pruned;
+    }
+    stats
+}
+
+/// 单条文本的裁剪；不达阈值返回 `None`。
+///
+/// 按 `char` 而不是字节切片：工具输出里中文、emoji 很常见，按字节切会切在
+/// 多字节字符中间，直接 panic 或产生乱码。
+fn prune_text(text: &str) -> Option<String> {
+    let total = text.chars().count();
+    if total <= PRUNE_THRESHOLD_CHARS {
+        return None;
+    }
+    let head: String = text.chars().take(PRUNE_HEAD_CHARS).collect();
+    let tail: String = text.chars().skip(total - PRUNE_TAIL_CHARS).collect();
+    let removed = total - PRUNE_HEAD_CHARS - PRUNE_TAIL_CHARS;
+    Some(format!(
+        "{head}\n\n[... 工具输出中间省略 {removed} 字符（原文 {total} 字符，保留头 {PRUNE_HEAD_CHARS} + 尾 {PRUNE_TAIL_CHARS}）...]\n\n{tail}"
+    ))
+}
+
 /// 从尾部往前装，算出「保留哪些」的切点：`[0, range_end)` 是要压掉的区间。
 ///
 /// 四条不变量是这层抽象**唯一**的存在理由，改任何一条都会让某条路径的行为变坏：
@@ -330,6 +396,51 @@ pub fn plan_if_needed(observed_tokens: usize, items: &[HistoryItem], budget: usi
     if !has_real_content(items, &target) {
         // 区间里只有系统注入或上一条摘要：压了要么得到「压缩对象为空集」，
         // 要么只是把摘要换一层包装；等尾部攒够真实内容再压。
+        return None;
+    }
+    Some(target)
+}
+
+/// D6：压缩前先做一轮确定性裁剪，再决定是否值得付一次模型摘要。
+///
+/// 顺序对齐 dsh `compaction-basic/index.ts:290-372`：**先**看压力是否到阈值，到了
+/// 才裁剪；裁剪后重新测量，若已回到预算内就返回 `None`——这次摘要调用被省掉。
+/// 没到阈值时一律不裁，避免无缘无故改写模型看到的历史。
+///
+/// 观测值不跟着裁剪量下调：端点报回的数字里有多少属于刚裁掉的内容无法证明，
+/// 硬减会低估真实占用。所以只有「观测值本身也未超预算」时才允许跳过压缩；
+/// 否则仍按原口径压缩（此时裁剪的收益是让摘要请求本身更小）。
+pub fn plan_if_needed_pruning(
+    observed_tokens: usize,
+    items: &mut [HistoryItem],
+    budget: usize,
+) -> Option<Target> {
+    if budget == 0 || items.len() < 2 {
+        return None;
+    }
+    let estimate = history_tokens(items);
+    if observed_tokens.max(estimate) < budget {
+        return None;
+    }
+    let stats = prune_tool_outputs(items);
+    if !stats.is_empty() {
+        let after = history_tokens(items);
+        tracing::info!(
+            pruned_items = stats.pruned_items,
+            chars_before = stats.chars_before,
+            chars_after = stats.chars_after,
+            estimate_before = estimate,
+            estimate_after = after,
+            budget,
+            "D6 确定性裁剪完成"
+        );
+        if observed_tokens < budget && after < budget {
+            tracing::info!("D6 裁剪后已回到预算内，跳过本次摘要调用");
+            return None;
+        }
+    }
+    let target = tail_target(items, budget.saturating_mul(KEEP_RATIO_PERCENT) / 100);
+    if !has_real_content(items, &target) {
         return None;
     }
     Some(target)
@@ -657,6 +768,83 @@ mod tests {
         let target = plan_if_needed(0, &items, 50_000).expect("400k 字节的输出必须触发压缩");
         assert_eq!(target.range_start, 0);
         assert!(target.range_end < items.len(), "至少留最后一条不压");
+    }
+
+    /// D6：超长工具输出保留头尾 + 省略标记，标记里写清原始字符数；结构不动且幂等。
+    #[test]
+    fn prune_keeps_head_and_tail_and_states_original_size() {
+        let big = format!("{}{}{}", "头".repeat(5_000), "中".repeat(20_000), "尾".repeat(5_000));
+        let mut items = vec![msg(Role::User, "任务"), call("c1", "{}"), out("c1", &big)];
+        let stats = prune_tool_outputs(&mut items);
+        assert_eq!(stats.pruned_items, 1);
+        assert_eq!(stats.chars_before, 30_000);
+        let pruned = match &items[2] {
+            HistoryItem::FunctionCallOutput { output, .. } => output.clone(),
+            other => panic!("第三条应是工具输出：{other:?}"),
+        };
+        assert!(pruned.starts_with(&"头".repeat(10)), "头部必须保留");
+        assert!(pruned.ends_with(&"尾".repeat(10)), "尾部必须保留");
+        assert!(pruned.contains("中间省略 24880 字符"), "{pruned}");
+        assert!(pruned.contains("原文 30000 字符"), "{pruned}");
+        assert!(pruned.chars().count() < 6_000, "裁剪后仍有 {} 字符", pruned.chars().count());
+        // 只改输出内容：条目数量与调用配对不变
+        assert_eq!(items.len(), 3);
+        assert!(matches!(&items[1], HistoryItem::FunctionCall { .. }));
+        // 幂等：再跑一次不能叠标记
+        let again = prune_tool_outputs(&mut items);
+        assert!(again.is_empty(), "已裁剪的输出不应再被裁剪");
+    }
+
+    /// 未超阈值的工具输出、以及超长但非工具输出的消息，一个字符都不许改。
+    #[test]
+    fn prune_leaves_short_outputs_and_non_tool_items_alone() {
+        let short = "x".repeat(PRUNE_THRESHOLD_CHARS);
+        let mut items = vec![
+            msg(Role::User, &"x".repeat(20_000)),
+            out("c1", &short),
+            call("c1", "{}"),
+        ];
+        let before = items.clone();
+        let stats = prune_tool_outputs(&mut items);
+        assert!(stats.is_empty());
+        assert_eq!(items, before, "非目标条目必须原样保留");
+    }
+
+    /// D6 的核心收益：裁剪已把估算拉回预算内时，不再需要压缩。
+    ///
+    /// 反向对照：把入口换回 `plan_if_needed`，第二条断言会拿到 `Some`。
+    #[test]
+    fn plan_skips_compaction_when_pruning_brings_estimate_back_under_budget() {
+        let history = vec![
+            msg(Role::User, "任务"),
+            call("c1", "{}"),
+            out("c1", &"x".repeat(200_000)), // ≈ 50_000 token
+            msg(Role::Assistant, "结论"),
+        ];
+        assert!(plan_if_needed(0, &history, 30_000).is_some(), "不裁剪时必然要压缩");
+        let mut pruned = history;
+        assert_eq!(
+            plan_if_needed_pruning(0, &mut pruned, 30_000),
+            None,
+            "裁完已回到预算内，不许再付一次摘要"
+        );
+        assert!(history_tokens(&pruned) < 30_000);
+    }
+
+    /// 观测值仍超预算时，不许凭「裁剪后估算变小」跳过压缩：端点报回的数字里
+    /// 有多少属于刚裁掉的内容无法证明，硬减会低估真实占用。
+    #[test]
+    fn pruning_does_not_skip_when_observed_usage_is_still_over_budget() {
+        let mut items = vec![
+            msg(Role::User, "任务"),
+            call("c1", "{}"),
+            out("c1", &"x".repeat(200_000)),
+            msg(Role::Assistant, "结论"),
+        ];
+        assert!(
+            plan_if_needed_pruning(40_000, &mut items, 30_000).is_some(),
+            "观测值仍高于预算，必须照常压缩"
+        );
     }
 
     #[test]

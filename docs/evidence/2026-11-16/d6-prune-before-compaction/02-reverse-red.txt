@@ -1,0 +1,27 @@
+反向验证：把自动压缩入口从 `plan_if_needed_pruning` 换回 `plan_if_needed`（不裁剪），
+同一用例必须变红——省掉的那次摘要调用又回来了。
+
+PS D:\MyWorkspace\SHANIU\src-tauri> cargo test --lib pruning_skips
+
+running 1 test
+test agent_loop::tests::pruning_skips_the_summary_call_when_it_brings_history_back_under_budget ... FAILED
+
+failures:
+
+---- agent_loop::tests::pruning_skips_the_summary_call_when_it_brings_history_back_under_budget stdout ----
+
+thread 'agent_loop::tests::pruning_skips_the_summary_call_when_it_brings_history_back_under_budget' (20096) panicked at src\agent_loop\mod.rs:5300:9:
+assertion `left == right` failed: 裁剪已把历史拉回预算内，摘要请求必须被省掉
+  left: 2
+ right: 1
+note: run with `RUST_BACKTRACE=1` environment variable to display a backtrace
+
+
+failures:
+    agent_loop::tests::pruning_skips_the_summary_call_when_it_brings_history_back_under_budget
+
+test result: FAILED. 0 passed; 1 failed; 0 ignored; 0 measured; 1146 filtered out; finished in 0.22s
+
+说明：left = 实际请求次数 2（摘要 + 压缩后的采样），right = 期望 1（只采样）。
+纯函数层同一条反向对照会拿到 `Some`（`plan_skips_compaction_when_pruning_brings_estimate_back_under_budget`
+第二条断言），同样由本组用例覆盖。

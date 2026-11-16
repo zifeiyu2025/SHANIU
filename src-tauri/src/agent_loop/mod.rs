@@ -699,6 +699,10 @@ impl AgentLoop {
             tracing::warn!(turn, error = %message, "溢出补救放弃：档案不可写，锚点已失去顺序前提");
             return OverflowOutcome::GiveUp;
         }
+        // D6：端点已经拒绝过一次，先把超长工具输出确定性地裁一轮，再规划区间——
+        // 裁完摘要请求本身更小，也让“压完还是超长”的概率下降。裁剪不改变条目结构，
+        // 因而不会影响下面的 flush/锚点顺序约束。
+        crate::compaction::prune_tool_outputs(history);
         let Some(target) = crate::compaction::plan_manual(history, self.manual_token_budget) else {
             // 没有可压缩的区间（历史不足两条）：重放多少次都是同一个结局。
             return OverflowOutcome::GiveUp;
@@ -1328,7 +1332,7 @@ impl AgentLoop {
             // 2.5) 采样前检查 token 预算（ADR-001：「每轮采样前检查 token 预算触发 compaction」）。
             // 位置必须在采样之前：压缩的产物要对本轮请求可见才有意义，放轮末等于压了个寂寞
             // ——那一轮的上下文照样发出去，溢出照旧。
-            if let Some(target) = crate::compaction::plan_if_needed(
+            if let Some(target) = crate::compaction::plan_if_needed_pruning(
                 observed_input_tokens,
                 history,
                 self.token_budget,
@@ -3429,6 +3433,40 @@ mod tests {
         }
     }
 
+    /// D6 专用：脚本化建流结果 + 请求计数。用来证明「省掉的那次模型调用」，
+    /// 而不是只断言裁剪后的历史形状——形状对、请求照样多一次，等于没省。
+    struct CountingResultBackend {
+        scripts: Mutex<std::collections::VecDeque<Result<Vec<ModelStreamEvent>, crate::model_client::ModelError>>>,
+        calls: Arc<std::sync::atomic::AtomicUsize>,
+    }
+
+    impl CountingResultBackend {
+        fn new(
+            scripts: Vec<Result<Vec<ModelStreamEvent>, crate::model_client::ModelError>>,
+        ) -> (Self, Arc<std::sync::atomic::AtomicUsize>) {
+            let calls = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+            (Self { scripts: Mutex::new(scripts.into()), calls: calls.clone() }, calls)
+        }
+    }
+
+    #[async_trait::async_trait]
+    impl ModelBackend for CountingResultBackend {
+        async fn stream(
+            &self,
+            _history: &[HistoryItem],
+            _tools: &[ToolDeclaration],
+            _instructions: &str,
+        ) -> Result<ModelStream, crate::model_client::ModelError> {
+            self.calls.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            let mut q = self.scripts.lock().unwrap();
+            match q.pop_front() {
+                Some(Ok(script)) => Ok(Box::pin(futures::stream::iter(script))),
+                Some(Err(error)) => Err(error),
+                None => panic!("脚本后端被多问了一次：请求次数超出本用例预期"),
+            }
+        }
+    }
+
     /// 与 [`ScriptedBackend`] 的"空脚本"不同：这里连**流都不会建立**——
     /// 用于验证取消能在 `stream().await` 阶段生效（审计 H1）。
     struct HangingBackend;
@@ -5227,6 +5265,59 @@ mod tests {
             )),
             "always 不允许出现 exhausted：{events:?}"
         );
+    }
+
+    /// D6：压缩前先做一轮确定性裁剪。历史只因为一条超长工具输出而超预算时，
+    /// 裁剪一轮就回到预算内，**不该再付一次摘要请求**——用假后端的请求计数钉死，
+    /// 而不是只断言裁剪结果形状。
+    ///
+    /// 反向对照：把入口换回 `plan_if_needed`（不裁剪），请求数从 1 变成 3
+    /// （摘要 + 压缩后的采样 + 可能的第二次），第一条请求数断言立刻红。
+    #[tokio::test]
+    async fn pruning_skips_the_summary_call_when_it_brings_history_back_under_budget() {
+        let sample = || {
+            Ok(vec![ModelStreamEvent::OutputTextDelta { delta: "完成".into() }, usage_ev()])
+        };
+        // 多备两条：反向验证（不裁剪）会额外消耗摘要 + 压缩后的采样。
+        let (backend, calls) = CountingResultBackend::new(vec![sample(), sample(), sample()]);
+        let (mut agent, store, cancel, _) = make_loop_with_backend(Arc::new(backend));
+        agent.token_budget = 30_000;
+
+        let history = vec![
+            HistoryItem::Message { role: Role::User, text: "读一下日志".into(), reasoning: None },
+            HistoryItem::FunctionCall {
+                name: "unified_exec".into(),
+                arguments: "{}".into(),
+                call_id: "c1".into(),
+            },
+            HistoryItem::FunctionCallOutput { call_id: "c1".into(), output: "x".repeat(200_000) },
+        ];
+        let mut instance = AgentInstance::root(history, 0, cancel);
+        let summary =
+            agent.run_instance(&mut instance, Arc::new(CapturingSink(store.clone()))).await;
+
+        assert_eq!(summary.reason, TurnEndReason::Completed, "回合必须正常完成");
+        assert_eq!(
+            calls.load(std::sync::atomic::Ordering::SeqCst),
+            1,
+            "裁剪已把历史拉回预算内，摘要请求必须被省掉"
+        );
+        let events = store.lock().unwrap();
+        assert!(
+            !events.iter().any(|event| matches!(event, EventMsg::CompactionStarted { .. })),
+            "不应发起压缩：{events:?}"
+        );
+        // 省下来的必须是真 token：主请求看到的就是裁剪后的输出，不是只把测量值改小。
+        let output = instance
+            .history
+            .iter()
+            .find_map(|item| match item {
+                HistoryItem::FunctionCallOutput { output, .. } => Some(output.clone()),
+                _ => None,
+            })
+            .expect("历史里应保留工具输出");
+        assert!(output.contains("中间省略"), "主请求必须看到裁剪标记：{output}");
+        assert!(output.len() < 10_000, "裁剪后必须显著变短，实际 {} 字节", output.len());
     }
 
     /// 压缩本身失败：不重放，报原始 `ContextOverflow`；历史仍保留原内容，
