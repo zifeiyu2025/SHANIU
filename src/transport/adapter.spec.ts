@@ -13,6 +13,8 @@ import { commandDefinition } from '../dsh/packages/client/ui-chat/src/client/con
 import { SurfaceManager } from '../dsh/packages/core/session/src/surface.ts'
 import { sessionEntriesToEvents } from '../header-actions/session-events'
 import { R4_EVENT_LINES, R4_MANUAL_EVENT_LINES, R4_THIRD_SUMMARY_LINE } from './fixtures/r4-compaction'
+import { R6_COMPACTED_LINES, R6_LIVE_EVENT_LINES, R6_USER_TEXT } from './fixtures/r6-live-compaction'
+import { inspectSystemPrompt } from '../dsh/packages/client/ui-conversation/src/client/contract/system-prompt.ts'
 import { createAdapter } from './adapter'
 import { PRESET_BUNDLES } from './permission-presets'
 import { registerExportTrigger } from './command-triggers'
@@ -514,6 +516,40 @@ function replayR4(bridge: ScriptedBridge, lines: readonly string[]): string {
  */
 function foldedSurface(journal: Record<string, unknown>[]): number[] {
   return new SurfaceManager(journal as never).nodes as unknown as number[]
+}
+
+/** checkpoint 的摘要正文（适配层把宿主摘要原文原样放进内容块，不做 trim）。 */
+function compactTextOf(event: Record<string, unknown>): string {
+  return (event['data'] as { content?: { text?: string }[] }).content?.[0]?.text ?? ''
+}
+
+/** `system/message` 的提示词正文。 */
+function systemTextOf(event: Record<string, unknown>): string {
+  return (event['data'] as { message?: { content?: { text?: string }[] } }).message?.content?.[0]?.text ?? ''
+}
+
+/** 用上游 `compactionDefinition` 造一个压缩节点视图（与渲染器同一入口）。 */
+function compactionViewOf(
+  journal: Record<string, unknown>[],
+  checkpoint: Record<string, unknown>,
+): { kind: string; visibility: string; groupTree?: string; data: { summary: string | null } } | null {
+  const compactionId = (checkpoint['data'] as { source?: { compactionId?: string } }).source?.compactionId
+  const summaries = journal.filter(event => event['type'] === 'compaction/summary')
+  const summaryEvent = summaries.find(event => (event['data'] as { compactionId?: string }).compactionId === compactionId)
+    ?? summaries.filter(event => (event['seq'] as number) < (checkpoint['seq'] as number)).at(-1)
+    ?? summaries[0]
+  return compactionDefinition.buildViewNode!({
+    key: String(compactionId), id: String(compactionId),
+    start: { event: checkpoint, location: { kind: 'unresolved' } },
+    matches: [
+      { event: summaryEvent, location: { kind: 'unresolved' } },
+      { event: checkpoint, location: { kind: 'unresolved' } },
+    ],
+    state: {
+      summary: { event: summaryEvent, location: { kind: 'unresolved' } },
+      checkpoint: { event: checkpoint, location: { kind: 'unresolved' } },
+    },
+  } as never) as unknown as { kind: string; visibility: string; groupTree?: string; data: { summary: string | null } } | null
 }
 
 /** 让 manager 的微任务通知落地：`sessions.list` 的订阅回填要等一拍才可见。 */
@@ -1552,6 +1588,102 @@ describe('适配层把 EventMsg 流映射成 DSH 会话 journal', () => {
     let nodes: number[] = []
     expect(() => { nodes = foldedSurface(journal) }).not.toThrow()
     expect(nodes).toContain(checkpoints[0]!['seq'] as number)
+    dispose()
+  })
+
+  // ── R6（N5 v4）：0.2.9 真机 9af8431 —— 压缩不得遮蔽系统头 ────────────────────
+  it('R6 真机复现（0.2.9 事件原样回放）：surface[0] 是用户消息、system 在中间时，压缩不得遮蔽系统头', async () => {
+    const bridge = scriptedBridge()
+    const { remote, dispose } = createAdapter({ bridge })
+    const session = faceOf(remote).session
+    const envelopes = R6_LIVE_EVENT_LINES.map(line => JSON.parse(line) as {
+      event_id: string; session_id: string; agent_id: string; ts_ms: number; msg: EventMsg
+    })
+    const sessionId = envelopes[0]!.session_id
+    // 真机顺序：UI 先乐观推 user/message（用户按下发送就要看到气泡），宿主的
+    // `system_prompt` 随后才到。r4 夹具是 system 先到，测不到 surface[0] 不是系统头这条分支。
+    await session.prompt({ sessionId, requestId: 'rpc-r6', content: [{ type: 'text', text: R6_USER_TEXT }] })
+    for (const envelope of envelopes) {
+      bridge.emit(envelope.session_id, envelope.msg, envelope.agent_id, envelope.ts_ms, envelope.event_id)
+    }
+
+    const iterator = session.follow({ address: { kind: 'session', sessionId } })
+    const journal = eventsOf((await iterator.next()).value as Record<string, unknown>)
+    await iterator.return?.(undefined)
+
+    journal.forEach(event => expect(() => assertSessionWireEvent(event)).not.toThrow())
+
+    // 形态锁定（真机 0.2.9）：surface[0] 是乐观推入的 user/message，三条 system/message 都在它之后。
+    const systemEvents = journal.filter(event => event['type'] === 'system/message')
+    expect(systemEvents).toHaveLength(3)
+    const firstSurfaceUser = journal.find(event => event['type'] === 'user/message' && !isCompactCheckpoint(event))!
+    expect(firstSurfaceUser['seq'] as number).toBeLessThan(systemEvents[0]!['seq'] as number)
+
+    // 两次压缩各一条替换型 checkpoint，文案就是宿主摘要原文。
+    const summaries = envelopes
+      .map(envelope => envelope.msg)
+      .filter((msg): msg is Extract<EventMsg, { type: 'compaction_summarized' }> => msg.type === 'compaction_summarized')
+    expect(summaries).toHaveLength(2)
+    const checkpoints = journal.filter(isCompactCheckpoint)
+    expect(checkpoints).toHaveLength(summaries.length)
+    expect(checkpoints.map(compactTextOf)).toEqual(summaries.map(msg => msg.summary))
+    checkpoints.forEach(event => expect(event['surfaceOp']).toMatchObject({ op: 'replace' }))
+
+    // 判据一：每次压缩之后 system 头节点都还在 surface 里，且不是整段表面被替换掉
+    //（真机白屏就是这一条被违反：replace 区间把系统提示词一起遮了）。
+    for (const checkpoint of checkpoints) {
+      const upTo = journal.filter(event => (event['seq'] as number) <= (checkpoint['seq'] as number))
+      const nodes = foldedSurface(upTo)
+      const systemsSeen = upTo.filter(event => event['type'] === 'system/message').map(event => event['seq'] as number)
+      expect(systemsSeen.length).toBeGreaterThan(0)
+      systemsSeen.forEach(seq => expect(nodes).toContain(seq))
+      expect(nodes.length).toBeGreaterThan(1)
+    }
+    expect(foldedSurface(journal)).toContain(systemEvents.at(-1)!['seq'] as number)
+
+    // 判据二：客户端系统提示词解释器不得粘在 uncertain，生效文本是最后一条系统提示词。
+    // 这是客户端运行时真正消费的那份契约（system-prompt.ts），不是自写的等价规则。
+    let promptState: ReturnType<typeof inspectSystemPrompt> | undefined
+    for (const event of journal) {
+      const op = event['surfaceOp']
+      if (event['type'] === 'system/message' || (op !== undefined && op !== 'append')) {
+        promptState = inspectSystemPrompt(promptState, event as never)
+      }
+    }
+    expect(promptState?.uncertain).toBe(false)
+    expect(promptState?.effective?.text).toBe(systemTextOf(systemEvents.at(-1)!))
+
+    // 判据三：卡片与 r4 同形——可见、Turn 层、摘要非空。
+    const lastCheckpoint = checkpoints.at(-1)!
+    const liveNode = compactionViewOf(journal, lastCheckpoint)
+    expect(liveNode?.kind).toBe('compaction')
+    expect(liveNode?.groupTree).toBe('turn')
+    expect((liveNode?.data.summary ?? '').length).toBeGreaterThan(0)
+
+    // 判据四：同一条压缩「重开」（load_session → replayArchive）必须与实时同形：
+    // 同数量、同文案、同可见性。两份输入都来自真机档案，不另造理想序列。
+    const archive = R6_COMPACTED_LINES
+      .map(line => JSON.parse(line) as { summary: string; range_start: number; range_end: number })
+      .map(entry => ({
+        kind: 'compaction_summary' as const,
+        text: entry.summary,
+        range_start: entry.range_start,
+        range_end: entry.range_end,
+      }))
+    const reopenBridge = scriptedBridge(undefined, archive)
+    const reopened = createAdapter({ bridge: reopenBridge })
+    const reopenIterator = faceOf(reopened.remote).session.follow({ address: { kind: 'session', sessionId: 'agent-r6-reopen' } })
+    const reopenJournal = eventsOf((await reopenIterator.next()).value as Record<string, unknown>)
+    await reopenIterator.return?.(undefined)
+    const reopenCheckpoints = reopenJournal.filter(isCompactCheckpoint)
+    expect(reopenCheckpoints).toHaveLength(checkpoints.length)
+    expect(reopenCheckpoints.map(compactTextOf)).toEqual(checkpoints.map(compactTextOf))
+    reopenCheckpoints.forEach(event => expect(event['surfaceOp']).toMatchObject({ op: 'replace' }))
+    const reopenNode = compactionViewOf(reopenJournal, reopenCheckpoints.at(-1)!)
+    expect(reopenNode?.kind).toBe(liveNode?.kind)
+    expect(reopenNode?.visibility).toBe(liveNode?.visibility)
+    reopened.dispose()
+
     dispose()
   })
 
