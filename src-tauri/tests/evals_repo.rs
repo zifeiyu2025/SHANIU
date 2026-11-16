@@ -1542,6 +1542,10 @@ async fn run_one_isolated(children_dir: &Path, ctx: RunOneCtx<'_>, hard: Duratio
         .args(["evals_repo_v0", "--exact", "--ignored", "--nocapture"])
         .env("SHANIU_EVAL_CHILD_SPEC", &spec_path)
         .env("SHANIU_EVAL_RUN_LOG", run_log_path())
+        // 外层为了不污染 src-tauri/target 才设 CARGO_TARGET_DIR；这一层是评测边界，
+        // 必须把它摘掉：否则预热和 agent 的 `cargo` 都去写工作区之外的目录，
+        // 沙箱拒绝后 agent 只能反复重定向 target（now-ms-exit 就是这么烧完全部轮次的）。
+        .env_remove("CARGO_TARGET_DIR")
         .stdin(Stdio::null())
         .stdout(Stdio::from(stdout))
         .stderr(Stdio::from(stderr));

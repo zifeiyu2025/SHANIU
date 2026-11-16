@@ -347,6 +347,21 @@ function judgeOnCopy(ws, ctx, task, run, phase) {
   return out;
 }
 
+/**
+ * 拉评测子进程用的干净环境。
+ *
+ * `CARGO_TARGET_DIR` 只服务于 harness 自身的编译（避免污染 src-tauri/target），
+ * 绝不能传给被测 agent：agent 在沙箱内跑 `cargo` 时会把产物写到工作区之外，
+ * 写入被拒后只能反复尝试重定向 target，白烧轮次（见 2026-11-16 的
+ * phase2-shaniu-fix-compare.md：now-ms-exit 全场在绕行，最终零改动）。
+ * 预热本身也依赖 agent 的默认目录 `src-tauri/target`，两处必须一致。
+ */
+function childEnv(extra = {}) {
+  const env = { ...process.env, ...extra };
+  delete env.CARGO_TARGET_DIR;
+  return env;
+}
+
 /** 起一个 agent 进程；到点用 taskkill 杀整棵树，避免子进程拖住驱动器。 */
 function runAgent(command, args, { cwd, env, timeoutMs }) {
   return new Promise((resolve) => {
@@ -758,11 +773,10 @@ async function runCliArm(task, run, ctx) {
 
   const { command, entry } = ctx.arm;
   const spec = armCommand(ctx.armName, ctx.model, prepared.ws, task.prompt);
-  const env = {
-    ...process.env,
+  const env = childEnv({
     DEEPSEEK_API_KEY: ctx.key,
     DSH_HOME: path.join(ROOT, 'target', 'dsh-home'),
-  };
+  });
   if (ctx.armName === 'zcode') {
     Object.assign(env, zcodeEnv(ctx.key));
   }
@@ -857,8 +871,7 @@ function runShaniuArm(tasks, ctx) {
     {
       cwd: ROOT,
       timeoutMs: 6 * 60 * 60 * 1000,
-      env: {
-        ...process.env,
+      env: childEnv({
         SHANIU_TEST_API_KEY: ctx.key,
         SHANIU_TEST_PROVIDER: `openai-${ctx.protocol}`,
         SHANIU_TEST_BASE_URL: 'https://api.deepseek.com/v1',
@@ -866,7 +879,7 @@ function runShaniuArm(tasks, ctx) {
         SHANIU_EVAL_REPEATS: String(ctx.repeats),
         SHANIU_EVAL_TASK_FILTER: tasks.map((t) => t.id).join(','),
         SHANIU_EVAL_RUN_LOG: logFile,
-      },
+      }),
     },
   );
   fs.writeFileSync(path.join(ctx.outDir, 'raw', 'shaniu-stdout.log'), res.out + res.err);
