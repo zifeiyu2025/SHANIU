@@ -178,7 +178,7 @@ const RULES: &[Rule] = &[
     Rule {
         owner: "EventMsg",
         variant: "ModelRetry",
-        fields: "retry max_retries phase delay_ms code message retry_id",
+        fields: "retry max_retries unbounded phase delay_ms code message retry_id",
         overrides: &[("turn", Status::BackendOnly("后端 turn 是采样轮次；前端用 journal.turn"))],
     },
     Rule {
