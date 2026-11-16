@@ -830,6 +830,11 @@ pub struct ModelConfig {
     /// 单个采样步最多重试几次模型请求（0 = 关闭重试）。默认 5，装配时封顶 8。
     /// 只对瞬态失败（限流 / 超时 / 网络 / 5xx / 空响应）生效，且只在首个可见增量前。
     pub max_retries: u32,
+    /// 重试次数语义（D5，additive）：`bounded`（默认）= 最多 `max_retries` 次且只重
+    /// 瞬态失败；`always` = 上游 dsh 语义，不限次数也不筛失败类别，直到成功或被取消。
+    /// 缺省必须是 `bounded`，保证旧配置行为一字不变。
+    #[serde(default)]
+    pub retry_mode: crate::model_client::RetryMode,
     /// 是否发送 Responses 扩展字段（D1：`store` / `tool_choice` / `parallel_tool_calls` /
     /// `include` / `prompt_cache_key`）。默认 true；不认这些键的老网关关掉后，
     /// 请求体回到 2026-11 之前的 5 键形状。
@@ -862,6 +867,7 @@ impl Default for ModelConfig {
             model: String::new(),
             max_turns: 0,
             max_retries: 5,
+            retry_mode: crate::model_client::RetryMode::Bounded,
             responses_extras: true,
             parallel_tool_calls: true,
             reasoning_replay: true,
@@ -3161,6 +3167,20 @@ mod tests {
             cfg.approval.mode,
             ApprovalMode::OnRequest,
             "审批维保持 on_request（对齐 codex，比 dsh 的只读默认更可用）"
+        );
+    }
+
+    /// D5：`retry_mode` 缺省必须是 bounded（旧配置行为一字不变），显式 always 能解析，
+    /// 拼错的模式必须报错——静默当 bounded 会让用户以为开了 always。
+    #[test]
+    fn retry_mode_defaults_to_bounded_and_accepts_always() {
+        let old: AppConfig = toml::from_str("[model]\nbase_url = \"https://a/v1\"\nmodel = \"m1\"\n").unwrap();
+        assert_eq!(old.model.retry_mode, crate::model_client::RetryMode::Bounded);
+        let always: AppConfig = toml::from_str("[model]\nretry_mode = \"always\"\n").unwrap();
+        assert_eq!(always.model.retry_mode, crate::model_client::RetryMode::Always);
+        assert!(
+            toml::from_str::<AppConfig>("[model]\nretry_mode = \"sometimes\"\n").is_err(),
+            "未知模式必须拒绝"
         );
     }
 

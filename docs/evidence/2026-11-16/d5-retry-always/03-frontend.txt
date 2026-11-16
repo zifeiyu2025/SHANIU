@@ -1,0 +1,8 @@
+PS D:\MyWorkspace\SHANIU> npx vitest run src/transport/adapter.spec.ts
+ ✓ src/transport/adapter.spec.ts (179 tests) 590ms
+ Test Files  1 passed (1)
+      Tests  179 passed (179)
+
+PS D:\MyWorkspace\SHANIU> pnpm typecheck
+$ tsc -b --force
+（无错误）

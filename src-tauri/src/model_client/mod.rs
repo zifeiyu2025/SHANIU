@@ -9,7 +9,7 @@ pub mod provider;
 mod retry;
 
 pub use error::{ModelError, ModelErrorKind};
-pub use retry::{random01, RetryPolicy};
+pub use retry::{random01, RetryMode, RetryPolicy};
 
 use eventsource_stream::{Event, Eventsource};
 use futures::{Stream, StreamExt};

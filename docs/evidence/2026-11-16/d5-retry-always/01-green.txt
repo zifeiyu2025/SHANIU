@@ -1,0 +1,28 @@
+PS D:\MyWorkspace\SHANIU\src-tauri> cargo test --lib always_mode
+running 3 tests
+test model_client::retry::tests::always_mode_degrades_oversize_retry_after_to_local_backoff ... ok
+test model_client::retry::tests::always_mode_never_exhausts_and_ignores_failure_class ... ok
+test agent_loop::tests::always_mode_retries_past_the_bounded_budget ... ok
+
+test result: ok. 3 passed; 0 failed; 0 ignored; 0 measured; 1139 filtered out; finished in 0.29s
+
+PS D:\MyWorkspace\SHANIU\src-tauri> cargo test --lib retry_mode_defaults
+running 1 test
+test config::tests::retry_mode_defaults_to_bounded_and_accepts_always ... ok
+
+test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 1141 filtered out; finished in 0.00s
+
+PS D:\MyWorkspace\SHANIU\src-tauri> cargo test --lib
+test result: ok. 1138 passed; 0 failed; 4 ignored; 0 measured; 0 filtered out; finished in 4.66s
+
+PS D:\MyWorkspace\SHANIU\src-tauri> cargo test --test event_schema
+test every_enum_variant_is_mirrored_in_frontend_types ... ok
+test event_type_tags_exactly_match_frontend_mirror ... ok
+test every_variant_round_trips_losslessly ... ok
+test envelope_keeps_existing_payload_and_matches_frontend_fields ... ok
+test event_payload_fields_match_frontend_mirror ... ok
+test result: ok. 11 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
+
+PS D:\MyWorkspace\SHANIU\src-tauri> cargo clippy --all-targets -- -D warnings
+    Finished `dev` profile [unoptimized + debuginfo] target(s) in 0.54s
+（无 warning）

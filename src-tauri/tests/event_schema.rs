@@ -161,6 +161,7 @@ fn all_variants() -> Vec<EventMsg> {
             code: "RATE_LIMIT".into(),
             message: "请求过于频繁，已被限流".into(),
             retry_id: "01JRETRY".into(),
+            unbounded: false,
         },
         EventMsg::ModelRetry {
             turn: 1,
@@ -171,6 +172,7 @@ fn all_variants() -> Vec<EventMsg> {
             code: "RATE_LIMIT".into(),
             message: "请求过于频繁，已被限流".into(),
             retry_id: "01JRETRY".into(),
+            unbounded: false,
         },
         EventMsg::ModelRetry {
             turn: 3,
@@ -181,6 +183,19 @@ fn all_variants() -> Vec<EventMsg> {
             code: "RATE_LIMIT".into(),
             message: "服务端要求等待 30 秒，超过上限 10 秒，已放弃重试".into(),
             retry_id: "01JRETRY2".into(),
+            unbounded: false,
+        },
+        // D5 additive：always 模式没有次数上限，`unbounded = true` 必须能序列化。
+        EventMsg::ModelRetry {
+            turn: 4,
+            retry: 7,
+            max_retries: 0,
+            phase: RetryPhase::Scheduled,
+            delay_ms: 8_000,
+            code: "NETWORK".into(),
+            message: "连接被重置".into(),
+            retry_id: "01JALWAYS".into(),
+            unbounded: true,
         },
         EventMsg::TokenUsage { turn: 1, input_tokens: 10, cached_input_tokens: Some(4), output_tokens: 20 },
         // SH-053：三个 additive 子代理事件。exited 的三个终态都要进清单，

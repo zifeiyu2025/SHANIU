@@ -398,7 +398,12 @@ pub enum EventMsg {
         /// 第几次重试，1 起。
         retry: u32,
         /// 本次采样允许的最大重试次数（不含首次请求）。
+        /// `unbounded = true`（D5 always 模式）时该值无意义，恒为 0。
         max_retries: u32,
+        /// additive（D5，FF-2）：重试无次数上限（`retry_mode = "always"`）。
+        /// 缺省 `false` = 旧的 bounded 语义，旧消费端无感知。
+        #[serde(default)]
+        unbounded: bool,
         phase: RetryPhase,
         /// `scheduled` = 将要等待的毫秒；`started` / `exhausted` 恒为 0。
         delay_ms: u64,

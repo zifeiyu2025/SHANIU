@@ -889,7 +889,11 @@ impl AgentLoop {
                 verify
             },
             // 手写配置把次数调大只会让一次失败拖成几分钟（500ms→8s 累加），封顶 8。
-            retry: crate::model_client::RetryPolicy::new(cfg.model.max_retries.min(8)),
+            // D5：`retry_mode = "always"` 时次数上限无意义（上游语义：不限次、不筛类别）。
+            retry: crate::model_client::RetryPolicy {
+                mode: cfg.model.retry_mode,
+                ..crate::model_client::RetryPolicy::new(cfg.model.max_retries.min(8))
+            },
         }
     }
 
@@ -3139,7 +3143,9 @@ fn local_turn_error(code: &str, message: impl Into<String>) -> crate::events::Tu
 /// 三条硬约束的落点：
 /// - 等待与取消令牌 `select!` 竞争，不是裸 `sleep`；
 /// - 次数用尽 / `Retry-After` 超上限都发 `exhausted`，且后者文案带出要求秒数与上限；
-/// - `max_retries == 0`（测试默认）时一次也不试，且不产生任何 `model_retry` 事件。
+/// - `max_retries == 0`（测试默认）时一次也不试，且不产生任何 `model_retry` 事件；
+/// - D5 `retry_mode = "always"`：不发 `exhausted`、不看失败类别，直到成功或被取消
+///   （事件用 `unbounded = true` 标明“上限不适用”）。
 async fn await_retry(
     policy: &crate::model_client::RetryPolicy,
     sink: &Arc<dyn crate::events::EventSink>,
@@ -3151,19 +3157,22 @@ async fn await_retry(
 ) -> RetryOutcome {
     use crate::events::RetryPhase;
 
-    if policy.max_retries == 0 || !crate::model_client::RetryPolicy::is_retryable(error.kind) {
+    if !policy.enabled() || !policy.accepts(error.kind) {
         return give_up_without_retry_after(error);
     }
 
     // 第几次重试，1 起；同一条重试链共用一个 id（不同采样步各自生成）。
     let retry = retries_used + 1;
-    let max_retries = policy.max_retries;
+    // bounded：真实上限；always：上限无意义（`unbounded` 字段说明语义）。
+    let unbounded = policy.mode == crate::model_client::RetryMode::Always;
+    let max_retries = if unbounded { 0 } else { policy.max_retries };
     let retry_id = retry_chain.get_or_insert_with(|| ulid::Ulid::generate().to_string()).clone();
     let send = |phase: RetryPhase, delay_ms: u64, message: String| {
         let _ = sink.emit(&EventMsg::ModelRetry {
             turn,
             retry,
             max_retries,
+            unbounded,
             phase,
             delay_ms,
             code: error.code().to_string(),
@@ -3172,7 +3181,7 @@ async fn await_retry(
         });
     };
 
-    if retries_used >= max_retries {
+    if policy.mode == crate::model_client::RetryMode::Bounded && retries_used >= policy.max_retries {
         send(RetryPhase::Exhausted, 0, format!("已重试 {retries_used} 次，仍失败：{}", error.human));
         return give_up_without_retry_after(error);
     }
@@ -5148,6 +5157,75 @@ mod tests {
                 EventMsg::Error { message } if message == "上下文超出模型窗口限制"
             )),
             "终局错误必须是原始的 ContextOverflow：{events:?}"
+        );
+    }
+
+    fn network_error() -> crate::model_client::ModelError {
+        crate::model_client::ModelError::new(
+            crate::model_client::ModelErrorKind::Network,
+            None,
+            None,
+            None,
+            "无法连接到模型服务".to_string(),
+        )
+    }
+
+    /// D5：always 模式不设次数上限——脚本给 6 次瞬态失败、`max_retries` 只配 1，
+    /// 第 7 次仍必须重试并成功；事件必须标 `unbounded = true` 且不发 `exhausted`。
+    ///
+    /// 反向对照：把 `mode` 换回 `Bounded`，第 2 次失败后即终局，本用例红在
+    /// `TurnEndReason::Completed` 断言上。
+    #[tokio::test]
+    async fn always_mode_retries_past_the_bounded_budget() {
+        let mut scripts: Vec<Result<Vec<ModelStreamEvent>, crate::model_client::ModelError>> =
+            (0..6).map(|_| Err(network_error())).collect();
+        scripts.push(Ok(vec![
+            ModelStreamEvent::OutputTextDelta { delta: "完成".into() },
+            usage_ev(),
+        ]));
+        let (mut agent, _, cancel, _) = make_loop_with_backend(result_backend(scripts));
+        agent.retry = crate::model_client::RetryPolicy {
+            mode: crate::model_client::RetryMode::Always,
+            max_retries: 1,
+            initial_delay: std::time::Duration::from_millis(1),
+            max_delay: std::time::Duration::from_millis(2),
+            jitter_ratio: 0.0,
+        };
+        let store = Arc::new(Mutex::new(Vec::new()));
+        let mut instance = AgentInstance::root(
+            vec![HistoryItem::Message { role: Role::User, text: "继续".into(), reasoning: None }],
+            0,
+            cancel,
+        );
+        let summary =
+            agent.run_instance(&mut instance, Arc::new(CapturingSink(store.clone()))).await;
+
+        assert_eq!(summary.reason, TurnEndReason::Completed, "always 模式必须重试到成功");
+        let events = store.lock().unwrap();
+        let scheduled: Vec<(u32, u32, bool)> = events
+            .iter()
+            .filter_map(|event| match event {
+                EventMsg::ModelRetry {
+                    phase: crate::events::RetryPhase::Scheduled,
+                    retry,
+                    max_retries,
+                    unbounded,
+                    ..
+                } => Some((*retry, *max_retries, *unbounded)),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(scheduled.len(), 6, "6 次失败应有 6 次调度：{events:?}");
+        assert!(
+            scheduled.iter().all(|(_, max, unbounded)| *unbounded && *max == 0),
+            "always 事件必须标明无上限，max_retries 不参与：{scheduled:?}"
+        );
+        assert!(
+            !events.iter().any(|event| matches!(
+                event,
+                EventMsg::ModelRetry { phase: crate::events::RetryPhase::Exhausted, .. }
+            )),
+            "always 不允许出现 exhausted：{events:?}"
         );
     }
 

@@ -96,6 +96,7 @@ mod tests {
             model: "test-model".into(),
             max_turns: 8,
             max_retries: 0,
+            retry_mode: crate::model_client::RetryMode::Bounded,
             responses_extras: true,
             parallel_tool_calls: true,
             reasoning_replay: true,

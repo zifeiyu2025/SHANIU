@@ -2762,19 +2762,35 @@ export function createAdapter(options: AdapterOptions): { remote: unknown; dispo
         // `exhausted` 刻意不落 journal：上游没有对应事件，且随后的
         // `turn_completed(failed)` 已给出终局原因，多落一条会在时间线上留个悬空节点。
         if (msg.phase === 'scheduled') {
-          pushEvent(journal, 'llm/retry', {
-            retryId: msg.retry_id,
-            turn: journal.turn,
-            // 后端的一次 turn 对应 DSH 的一个 step（见 turn_started 的折叠注记）。
-            step: journal.step,
-            provider: 'shaniu',
-            mode: 'normal',
-            policyKey: 'default',
-            retry: msg.retry,
-            maxRetries: msg.max_retries,
-            delayMs: msg.delay_ms,
-            failure: { message: msg.message, code: msg.code },
-          })
+          // D5：always 模式没有次数上限，上游事件用 `mode: 'always'` 且不带
+          // `maxRetries`；bounded 保持原样（`mode: 'normal'` + 上限）。
+          if (msg.unbounded === true) {
+            pushEvent(journal, 'llm/retry', {
+              retryId: msg.retry_id,
+              turn: journal.turn,
+              step: journal.step,
+              provider: 'shaniu',
+              mode: 'always',
+              policyKey: 'always',
+              retry: msg.retry,
+              delayMs: msg.delay_ms,
+              failure: { message: msg.message, code: msg.code },
+            })
+          } else {
+            pushEvent(journal, 'llm/retry', {
+              retryId: msg.retry_id,
+              turn: journal.turn,
+              // 后端的一次 turn 对应 DSH 的一个 step（见 turn_started 的折叠注记）。
+              step: journal.step,
+              provider: 'shaniu',
+              mode: 'normal',
+              policyKey: 'default',
+              retry: msg.retry,
+              maxRetries: msg.max_retries,
+              delayMs: msg.delay_ms,
+              failure: { message: msg.message, code: msg.code },
+            })
+          }
         } else if (msg.phase === 'started') {
           pushEvent(journal, 'llm/retry-started', {
             retryId: msg.retry_id,

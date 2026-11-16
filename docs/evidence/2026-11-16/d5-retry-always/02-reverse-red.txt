@@ -1,0 +1,32 @@
+反向验证：把 await_retry 的门槛退回「max_retries == 0 || !is_retryable」、次数判断退回
+「retries_used >= max_retries」、delay 退回「retry > max_retries 即放弃」，同一组用例必须变红。
+
+PS D:\MyWorkspace\SHANIU\src-tauri> cargo test --lib always_mode
+
+running 3 tests
+test model_client::retry::tests::always_mode_degrades_oversize_retry_after_to_local_backoff ... FAILED
+test model_client::retry::tests::always_mode_never_exhausts_and_ignores_failure_class ... FAILED
+test agent_loop::tests::always_mode_retries_past_the_bounded_budget ... FAILED
+
+failures:
+
+---- model_client::retry::tests::always_mode_degrades_oversize_retry_after_to_local_backoff stdout ----
+
+thread 'model_client::retry::tests::always_mode_degrades_oversize_retry_after_to_local_backoff' (15932) panicked at src\model_client\retry.rs:269:9:
+assertion `left == right` failed: always 不能等 120 秒，也不能直接放弃
+  left: None
+ right: Some(500ms)
+
+---- model_client::retry::tests::always_mode_never_exhausts_and_ignores_failure_class stdout ----
+
+thread 'model_client::retry::tests::always_mode_never_exhausts_and_ignores_failure_class' (12484) panicked at src\model_client\retry.rs:244:13:
+always 第 1 次仍应重试
+
+---- agent_loop::tests::always_mode_retries_past_the_bounded_budget stdout ----
+
+thread 'agent_loop::tests::always_mode_retries_past_the_bounded_budget' (16632) panicked at src\agent_loop\mod.rs:5203:9:
+assertion `left == right` failed: always 模式必须重试到成功
+  left: Failed
+ right: Completed
+
+test result: FAILED. 0 passed; 3 failed; 0 ignored; 0 measured; 1139 filtered out; finished in 0.23s

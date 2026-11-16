@@ -207,7 +207,7 @@ export type EventMsg =
   | { type: 'plan_delta'; delta: string }
   | { type: 'turn_diff'; files: string[] }
   | { type: 'error'; message: string }
-  | { type: 'model_retry'; turn: number; retry: number; max_retries: number; phase: RetryPhase; delay_ms: number; code: string; message: string; retry_id: string }
+  | { type: 'model_retry'; turn: number; retry: number; max_retries: number; unbounded?: boolean; phase: RetryPhase; delay_ms: number; code: string; message: string; retry_id: string }
   | { type: 'token_usage'; turn: number; input_tokens: number; cached_input_tokens?: number | null; output_tokens: number }
   | { type: 'subagent_spawned'; child_id: string; task: string; name: string; label: string; created_at_ms: number }
   | { type: 'subagent_exited'; child_id: string; status: SubagentExitStatus; summary: string }

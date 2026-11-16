@@ -8,13 +8,34 @@
 
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
+use serde::{Deserialize, Serialize};
+
 use super::ModelErrorKind;
+
+/// 重试次数语义（D5，additive）。
+///
+/// 默认 [`RetryMode::Bounded`]，与 D5 之前完全等价；[`RetryMode::Always`] 是上游
+/// dsh `llm-retry` 的 `mode: 'always'` 语义：没有次数上限、也不看失败类别。
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum RetryMode {
+    /// 最多 `max_retries` 次，且只重 [`RetryPolicy::is_retryable`] 的瞬态失败（默认）。
+    #[default]
+    Bounded,
+    /// 不设次数上限、不筛失败类别，直到成功或被取消。
+    ///
+    /// 只适合「失败多来自网关/代理抖动」的场景；鉴权、参数错误这类确定性失败在
+    /// 这个模式下也会被重试，所以必须由用户显式开启，默认不开。
+    Always,
+}
 
 /// 重试策略。字段公开：配置装配与测试都直接按值构造。
 #[derive(Debug, Clone, PartialEq)]
 pub struct RetryPolicy {
-    /// 单个采样步最多重试几次（不含首次请求）。
+    /// 单个采样步最多重试几次（不含首次请求）。`mode = Always` 时无意义。
     pub max_retries: u32,
+    /// 次数语义（D5）。默认 `Bounded`。
+    pub mode: RetryMode,
     /// 第一次重试的基准等待。
     pub initial_delay: Duration,
     /// 单次等待的硬上限，也是 `Retry-After` 的可接受上限。
@@ -28,6 +49,7 @@ impl Default for RetryPolicy {
         // 数值逐项对齐 dsh retry-policy.ts:14-17。
         Self {
             max_retries: 5,
+            mode: RetryMode::Bounded,
             initial_delay: Duration::from_millis(500),
             max_delay: Duration::from_secs(10),
             jitter_ratio: 0.1,
@@ -46,6 +68,22 @@ impl RetryPolicy {
         Self::new(0)
     }
 
+    /// 是否允许重试（`Bounded(0)` 关闭；`Always` 永远允许）。
+    pub fn enabled(&self) -> bool {
+        match self.mode {
+            RetryMode::Bounded => self.max_retries > 0,
+            RetryMode::Always => true,
+        }
+    }
+
+    /// 这一类失败是否值得再试：`Bounded` 走白名单，`Always` 一律接受（上游语义）。
+    pub fn accepts(&self, kind: ModelErrorKind) -> bool {
+        match self.mode {
+            RetryMode::Bounded => Self::is_retryable(kind),
+            RetryMode::Always => true,
+        }
+    }
+
     /// 白名单判定。白名单之外一次失败即终局——不猜、不重试。
     pub fn is_retryable(kind: ModelErrorKind) -> bool {
         matches!(
@@ -60,23 +98,38 @@ impl RetryPolicy {
 
     /// 第 `retry` 次重试（从 1 起）该等多久；`None` = 放弃重试。
     ///
-    /// - 端点给了 `Retry-After` 就优先采用；超过 `max_delay` 直接放弃，不自行缩短；
-    /// - 否则指数退避 `initial * 2^(retry-1)`，封顶 `max_delay`，再乘对称抖动并二次封顶。
+    /// - `Bounded`：超过次数即放弃；端点给了 `Retry-After` 就优先采用，超过 `max_delay`
+    ///   直接放弃，不自行缩短；
+    /// - `Always`：永不因次数放弃；`Retry-After` 超过 `max_delay` 时改用本地指数退避
+    ///   （上游 `llm-retry/index.ts:228-233` 同一处理），而不是等一小时或直接放弃；
+    /// - 本地退避：`initial * 2^(retry-1)`，封顶 `max_delay`，再乘对称抖动并二次封顶。
     ///
     /// `random01` 由调用方注入（`[0, 1]`），生产用 [`random01`]，测试用固定值。
     pub fn delay(&self, retry: u32, provider_retry_after_ms: Option<u64>, random01: f64) -> Option<Duration> {
-        if retry == 0 || retry > self.max_retries {
+        if retry == 0 {
             return None;
         }
-        if let Some(required) = provider_retry_after_ms {
-            let required = Duration::from_millis(required);
-            return (required <= self.max_delay).then_some(required);
+        if let RetryMode::Bounded = self.mode {
+            if retry > self.max_retries {
+                return None;
+            }
         }
         // `2^(retry-1)` 用移位算，先夹住指数防止手写超大次数时溢出。
         let exponent = retry.saturating_sub(1).min(20);
         let exponential = self.initial_delay.saturating_mul(1u32 << exponent).min(self.max_delay);
         let jitter = 1.0 - self.jitter_ratio + 2.0 * self.jitter_ratio * random01.clamp(0.0, 1.0);
-        Some(exponential.mul_f64(jitter).min(self.max_delay))
+        let local = exponential.mul_f64(jitter).min(self.max_delay);
+        if let Some(required) = provider_retry_after_ms {
+            let required = Duration::from_millis(required);
+            if required <= self.max_delay {
+                return Some(required);
+            }
+            return match self.mode {
+                RetryMode::Bounded => None,
+                RetryMode::Always => Some(local),
+            };
+        }
+        Some(local)
     }
 }
 
@@ -182,5 +235,51 @@ mod tests {
             let value = super::random01();
             assert!((0.0..1.0).contains(&value), "随机源越界: {value}");
         }
+    }
+
+    /// D5：always 不设次数上限、不筛失败类别；默认仍必须是 bounded。
+    ///
+    /// 反向对照：把 `always_mode` 改成 `bounded`（或让 `enabled/accepts` 不看 mode），
+    /// 本用例立刻红。
+    #[test]
+    fn always_mode_never_exhausts_and_ignores_failure_class() {
+        let always = RetryPolicy { mode: super::RetryMode::Always, ..RetryPolicy::new(0) };
+        assert!(always.enabled(), "always 不得被 max_retries = 0 关掉");
+        for retry in [1u32, 2, 5, 100, 10_000] {
+            assert!(always.delay(retry, None, 0.5).is_some(), "always 第 {retry} 次仍应重试");
+        }
+        for kind in [
+            ModelErrorKind::Auth,
+            ModelErrorKind::Quota,
+            ModelErrorKind::BadRequest,
+            ModelErrorKind::ContextOverflow,
+            ModelErrorKind::HookDenied,
+        ] {
+            assert!(always.accepts(kind), "always 不筛失败类别：{kind:?}");
+        }
+
+        let default = RetryPolicy::new(3);
+        assert_eq!(default.mode, super::RetryMode::Bounded, "默认模式必须还是 bounded");
+        assert!(default.enabled());
+        assert!(!default.accepts(ModelErrorKind::Auth), "bounded 的确定性失败不得重试");
+        assert_eq!(default.delay(4, None, 0.5), None, "bounded 超预算必须放弃");
+        assert!(!RetryPolicy::disabled().enabled(), "bounded(0) 仍然是关闭");
+    }
+
+    /// D5：always 遇到超上限的 `Retry-After` 用本地退避接着重试，
+    /// bounded 保持「超上限即放弃」——两条语义不许互相污染。
+    #[test]
+    fn always_mode_degrades_oversize_retry_after_to_local_backoff() {
+        let always = RetryPolicy { mode: super::RetryMode::Always, ..no_jitter(0) };
+        assert_eq!(
+            always.delay(1, Some(120_000), 0.5),
+            Some(Duration::from_millis(500)),
+            "always 不能等 120 秒，也不能直接放弃"
+        );
+        assert_eq!(
+            no_jitter(5).delay(1, Some(120_000), 0.5),
+            None,
+            "bounded 的既有判据不得放宽"
+        );
     }
 }

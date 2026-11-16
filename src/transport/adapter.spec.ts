@@ -855,6 +855,47 @@ describe('适配层把 EventMsg 流映射成 DSH 会话 journal', () => {
     dispose()
   })
 
+  it('D5 always 重试：权威语义是无上限，落 mode=always 且不带 maxRetries', async () => {
+    const bridge = scriptedBridge()
+    const { remote, dispose } = createAdapter({ bridge })
+    const session = faceOf(remote).session
+
+    await session.prompt({ sessionId: 'agent-retry-always', requestId: 'rpc-retry-always', content: [{ type: 'text', text: '你好' }] })
+    bridge.emit('agent-retry-always', {
+      type: 'model_retry',
+      turn: 1,
+      retry: 3,
+      max_retries: 0,
+      unbounded: true,
+      phase: 'scheduled',
+      delay_ms: 1_000,
+      code: 'NETWORK',
+      message: '连接被重置',
+      retry_id: '01JALWAYS',
+    })
+    bridge.emit('agent-retry-always', { type: 'agent_message_delta', delta: '答案' })
+    bridge.emit('agent-retry-always', { type: 'turn_completed', turn: 1, reason: 'completed' })
+
+    const iterator = session.follow({ address: { kind: 'session', sessionId: 'agent-retry-always' } })
+    const snapshot = (await iterator.next()).value as Record<string, unknown>
+    const journal = eventsOf(snapshot)
+    const retry = journal.filter(event => event['type'] === 'llm/retry')
+    expect(retry).toHaveLength(1)
+    expect(retry[0]?.['data']).toMatchObject({
+      retryId: '01JALWAYS',
+      mode: 'always',
+      policyKey: 'always',
+      retry: 3,
+      delayMs: 1_000,
+      failure: { code: 'NETWORK', message: '连接被重置' },
+    })
+    // 所谓"无上限"就不该出现任何 maxRetries 字段（0 会被 UI 读成"不允许重试"）。
+    expect(retry[0]?.['data']).not.toHaveProperty('maxRetries')
+
+    await iterator.return?.(undefined)
+    dispose()
+  })
+
   it('失败回合把结构化错误写进 turn/end（401 → AUTH，原始诊断可展开）', async () => {
     const bridge = scriptedBridge()
     const { remote, dispose } = createAdapter({ bridge })
