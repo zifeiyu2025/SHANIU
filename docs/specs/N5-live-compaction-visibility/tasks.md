@@ -1,3 +1,23 @@
+# N5 任务清单 v4（R6 实时压缩空白）
+
+> v4：真机 `2026-11-17-9af8431` 的 N1。规格见 `spec.md` §13。所有条目未完成前不得结束回合；反向验证必须贴红输出。
+
+## v4 第一笔：复现（先红）
+
+33. [ ] 回滚上一轮临时调查改动：`src/transport/mock.ts` 的 `/compact-replay` 分支、`index.html` 的错误 overlay、`adapter.spec.ts` 的 `TEMP 0.2.9 实时回放调查` 用例（`git diff` 逐文件确认后恢复，不动另一条线在 `adapter.ts`/`types.ts`/`session-events.ts`/`src-tauri` 的改动）。
+34. [ ] 建 `src/transport/fixtures/r6-live-compaction.ts`：从 `docs/smoke/2026-11-17-9af8431/evidence/03-events-compaction.jsonl` 逐字摘录 3 条 `system_prompt`、2 组 `compaction_*`、首尾 `tool_call_output_delta` 各 1 条（其余 1998 条省略写注释），附来源行号/批次注释。
+35. [ ] `adapter.spec.ts` 加 `R6 实时压缩不改写 system 头`：② foldedSurface 含 system 节点、③ `inspectSystemPrompt` 全链 `uncertain===false` 且 `effective.text` 为最后一条系统提示词、④ checkpoint 节点/摘要/wire 形状护栏。先在未改代码上跑红并记录输出。
+36. [ ] 浏览器现场：dev 下 `remote` 临时接 `createAdapter({ bridge: mockBridge })`，按真实节奏喂同一批事件，压缩窗口截全树 + 收 console 异常；记录「空白 / 未复现」结论与栈，还原临时接线（不提交）。
+
+## v4 第二笔：修复
+
+37. [ ] `adapter.ts pushCompactionCheckpoint`：`sysIdx = surfaceSeqs.findIndex(type === 'system/message')`，`sysIdx<0` 全量、`===0` 跳过头部、`>0` 取 `slice(sysIdx+1)`、空段回退 `slice(0, sysIdx)`；空 surface 占位锚点分支与 `sourceEventSeqs` 拼装不变。
+38. [ ] 反向验证：判据退回 `surface[0]` → 用例 ②③ 红；`anchors` 恒全量 → 同上红；记录输出后恢复并重跑绿。
+39. [ ] 全量：`pnpm typecheck`、`pnpm exec vitest run --exclude "scratch/**"`、`cargo test -- --test-threads=1`、`cargo clippy --all-targets -- -D warnings`、`.\scripts\check-deps.ps1`、`.\scripts\dev\check-doc-claims.ps1`。
+40. [ ] `git fetch` → 两笔提交（只 add 本任务路径，不碰 `docs/smoke/`）→ 非 force 推送 → 盯 CI `gate` + `product-smoke` 到实际结论后汇报；冲突按语义合并，不丢另一线的审批改动。
+
+## v3 历史（已完成）
+
 # N5 任务清单 v3（R5 残留收敛）
 
 > v2 已由 `408dee9` 落地、真机第五轮 A 组翻绿；v3 只追加 R5 五条（四条修、一条登记），v2 的第 14 项（真机结案）保留给用户另排。

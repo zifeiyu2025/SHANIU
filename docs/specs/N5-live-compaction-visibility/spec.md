@@ -1,5 +1,6 @@
-# N5（P2）压缩提示实时显示 — 规格 v3（R5 残留收敛）
+# N5（P2）压缩提示实时显示 — 规格 v4（R6 实时压缩空白）
 
+> v4（R6）：真机 `2026-11-17-9af8431` 的 N1 —— 压缩发生时实时会话区整块空白、输入框消失，压缩节点要重开才出现。根因与修法见 §13；v3 及以前的内容不变（v1 已被真机否决的部分仍以 §2 为准）。
 > v1（`4a8d0be`）的口径与实现已被真机否决，本文件取代 v1 的 §2/§3/§4；v1 §1 的链路定责仍然成立（后端已广播、适配层已接收），错的只是"发出什么形状"和"何时发出"。
 > v2 已由 `408dee9` 落地，真机第五轮 A 组翻绿；v3 只收 R5 的五条残留（四条修、一条登记），判据不放宽。
 > 范围：`src/transport/`、`src/header-actions/`、`src-tauri/`，以及 `src/dsh/` 的**一处**最小 vendored 改动（R5-1，见 §8.1）；不改渲染器、不改 `docs/smoke/`。
@@ -206,4 +207,94 @@ v1 还漏了一件事：实时与回放**只有"有 surface"时才同形**，而
 ## 12. 已知限制（R5-2 登记）
 
 实时节点挂当轮、重开挂 range 首轮；重开旧档出现「记录时刻不可用」。原因与取舍见 §8.5，不修。
+
+## 13. v4（R6）：实时压缩整块空白（真机 `9af8431` N1）
+
+### 13.1 证据与实测序列（先证据，后推测）
+
+- 报告：`docs/smoke/2026-11-17-9af8431/REPORT.md` 的「十项 3 / F3」与「新增问题 N1」。
+- 截图：`shots/03-compaction-live-blank.png` —— 会话头（标题）在，正文与 composer 全空；`shots/03-reopen-compaction-node.png` / `03-summary-expanded.png` —— 重开后压缩节点与摘要都在。
+- 日志：`evidence/03-prune-compaction.txt:3-6` 两次 `上下文已压缩（SH-032）`（19:20:47、19:21:33）与两次 D6 裁剪（19:21:21、19:22:56）。
+- 事件：`evidence/03-events-compaction.jsonl`（622 KB；`tool_call_output_delta` 2000 条、`compaction_*` 各 2 条、`system_prompt` 3 条、`exec_approval_request` 2 条）。
+
+把该档案按序喂给 `createAdapter`（临时调查用例，已删）重建出的**实时 journal**，实测为：
+
+```
+surface 首次成形 = [2 user/message, 3 system/message, 4 assistant/message, 6 tool/result]
+checkpoint#1 = seq12 user/message  replace[2..6]   sourceEventSeqs=[2,3,4,6,9,10]
+checkpoint#2 = seq27 user/message  replace[12..21] sourceEventSeqs=[12,13,18,19,21,24,25]（嵌套遮蔽 #1）
+最终 surface = [27 checkpoint, 33 system/message, 34 assistant/message]
+```
+
+同一批事件在客户端侧实测：`foldSurface` 通过（`nodes=[27,28,33,34]`）、`assertSessionWireEvent` 零失败、真实 `ConversationNodeAssembler` + 真实定义注册表装配不抛错、压缩节点在 `order` 里、`grouped('chat')` 16 条。
+
+### 13.2 根因（可证部分）
+
+`src/transport/adapter.ts:1055 pushCompactionCheckpoint` 只把 **surface[0]** 当系统头保护：
+
+```ts
+const head = journal.surfaceSeqs[0]
+const anchors = head !== undefined && journal.surfaceTypes.get(head) === 'system/message'
+  ? journal.surfaceSeqs.slice(1)
+  : [...journal.surfaceSeqs]
+```
+
+实时路径的首个 surface 事件**不是**系统提示词：`submitPromptNow` 先乐观推 `user/message`（用户按下发送就要立刻看到气泡），宿主的 `system_prompt` 事件随后才到（seq3）。于是 `surface[0]` 是 user/message，`anchors` 取整段 surface，checkpoint#1 的 `replace[2..6]` 把 seq3 的 `system/message` 一起遮蔽。
+
+后果链：
+
+1. 客户端 surface 从此没有 system 节点；`system-prompt.ts:43-45` 的 `unknownEndpoint(2)` 为真（`firstSeq=3`、`replacements` 里没有 2）→ `uncertain=true` 且**粘滞不可恢复**（`||` 累积），`nodes=[]`、`effective=undefined`。
+2. 之后每轮 `system/message` 都 append 到非头位置（18、33），第二次压缩（seq27）再一并遮蔽；与 v4 档案的两条硬契约（`system/message requires a protected first surface head`、`compaction cannot shadow the protected system head`，`session-format-v3-to-v4/src/relationships.ts:126/142/263`）相反。
+3. 重开路径根本不产 `system/message`（`03-session.v4.jsonl` 里 0 条），所以重开看不到这场破坏 —— 「实时空白 / 重开正常」的不对称由此成立。
+
+**诚实边界**：以上能证明「system 头被改写 + 系统提示词契约被破坏」，但把「整块空白」精确钉到某一行 React 抛错，静态代码还证不出来（`inspectSystemPrompt` 的 uncertain 只解释提示词卡消失）。§13.3 的浏览器现场复现是**实现前的强制步骤**，不许拿推测代替现场。
+
+### 13.3 复现（实现前必须完成）
+
+1. **R6 夹具**：新增 `src/transport/fixtures/r6-live-compaction.ts`，从 `03-events-compaction.jsonl` 逐字摘录：3 条 `system_prompt`、2 组 `compaction_started/summarized/ended`、首尾各 1 条 `tool_call_output_delta`（2000 条重复段折叠时不得改动其余事件、不得改写任何字段值），附来源行号与批次注释；`as EventMsg` 断言，不做字段补全。
+2. **契约用例**（`adapter.spec.ts`，复用 `scriptedBridge`/`foldedSurface`）`R6 实时压缩不改写 system 头`：
+   - ① 把夹具事件按原顺序 `bridge.emit`，`follow` 取 journal；
+   - ② 【今天必红】`foldedSurface(journal)` 的 nodes **包含** system 事件（seq3/18/33 至少最后一个）；
+   - ③ 【今天必红】对全部事件逐个 `inspectSystemPrompt` 折叠后 `uncertain === false`，且 `effective.text` 等于最后一条 `system_prompt` 文本；
+   - ④ 【护栏，今天绿】checkpoint 节点存在、摘要非空、`foldSurface` 不抛、`assertSessionWireEvent` 全过、`compactionDefinition.buildViewNode` 产出 `kind:'compaction'`。
+3. **浏览器现场**（不提交的临时接线）：dev 模式下把 `remote` 临时改为 `createAdapter({ bridge: <mock bridge> })`，用 mock 按真实节奏喂同一批宿主事件（含 3 轮、2 次压缩），在压缩窗口截全树并收集 console 异常。
+   - 若出现空白：把异常栈与最小复现补成用例，修法按现场结论收敛；
+   - 若仍不空白：如实登记「浏览器未复现」，以 ②③ 的契约红为验收依据，并把**真机复验（同 `token_budget=5000` 长任务）**列为结案条件。
+
+### 13.4 修复（`adapter.ts` 单点，判据不放宽）
+
+把「系统头 = surface[0]」换成「surface 内任一 `system/message` 都不进区间」：
+
+```ts
+const nodes = journal.surfaceSeqs
+const sysIdx = nodes.findIndex(seq => journal.surfaceTypes.get(seq) === 'system/message')
+let anchors: number[]
+if (sysIdx < 0) anchors = [...nodes]                        // 没有 system：沿用全量
+else if (sysIdx === 0) anchors = nodes.slice(1)             // system 是头：沿用
+else anchors = nodes.slice(sysIdx + 1)                      // 实时路径：只遮蔽 system 之后那一段
+if (anchors.length === 0) anchors = nodes.slice(0, sysIdx)  // system 在末尾：改遮它之前的连续段
+```
+
+- `replace` 只接受**一段连续**区间，所以不追求「遮蔽 system 之前的全部节点」；实时路径里 `[2]` 那条用户消息留在 surface —— 它是当轮正在处理的输入，重开同样显示，不属于被压缩的历史。
+- 空 surface 分支（自建占位锚点后替换）与 `sourceEventSeqs = [...anchors, ...hiddenSeqs 去重]` 不变。
+- `system/message` 永远在区间外，`assertSystemHeadRewrite` 与 v4 protected-head 两条契约同时成立；`inspectSystemPrompt` 不再进入 uncertain。
+- 不改客户端、不改渲染器、不改 `docs/smoke/`、不改冒烟判据。
+
+### 13.5 反向验证（逐条改回去必须红，记录输出后恢复）
+
+1. 把 `sysIdx` 判据退回 `surface[0]` → 用例 ②③ 红（surface nodes 无 system；`uncertain=true`）。
+2. 把 `anchors` 改成恒 `[...nodes]` → 同上红。
+3. 恢复后全量重跑绿。
+
+### 13.6 交付与验收（v4）
+
+- 提交两笔：`test(N5)`（夹具 + R6 用例，先红）+ `fix(N5): 压缩锚点不遮蔽系统头（R6）`（实现 + 规格）；只显式 `git add` 本任务路径。
+- 另一条线正在改 `src/transport/adapter.ts`（审批重开口径）；提交前 `git fetch`，冲突按语义合并，**不 `--force`、不丢对方改动**。
+- 本地：`pnpm typecheck`、`pnpm exec vitest run --exclude "scratch/**"`、`cargo test -- --test-threads=1`、`cargo clippy --all-targets -- -D warnings`、`.\scripts\check-deps.ps1`、`.\scripts\dev\check-doc-claims.ps1`。
+- 推送后盯 `gate` + `product-smoke` 到**实际结论**再报。
+
+### 13.7 已知限制（v4 登记）
+
+- 实时 surface 保留 system 节点与当轮用户消息；重开档案没有 `system/message`，所以「系统提示词卡」只在实时出现（既有不对称，本轮不修）。
+- 若将来后端能给出「压缩覆盖了历史中段」的可映射区间，再扩展区间取法；本实现只保证「不遮蔽 system 头」。
 
