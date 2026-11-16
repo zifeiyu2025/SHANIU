@@ -1,0 +1,73 @@
+   Compiling shaniu v0.2.8 (D:\MyWorkspace\SHANIU\src-tauri)
+    Finished `test` profile [unoptimized + debuginfo] target(s) in 27.43s
+     Running unittests src\lib.rs (target\debug\build\shaniu/3347eb12c1517f2a\out\shaniu_lib-3347eb12c1517f2a.exe)
+
+running 32 tests
+test tools::apply_patch::tests::clean_rollback_keeps_failure_message_concise ... ok
+test tools::apply_patch::tests::malformed_add_line_reports_patch_line_and_shape ... ok
+test tools::apply_patch::tests::malformed_update_line_reports_patch_line_and_shape ... ok
+test tools::apply_patch::tests::mismatch_wider_than_file_states_boundary ... ok
+test tools::apply_patch::tests::malformed_patch_is_invalid_args ... ok
+test tools::apply_patch::tests::out_of_workspace_path_rejected ... ok
+test tools::apply_patch::tests::rollback_reports_files_it_could_not_restore ... ok
+test tools::apply_patch::tests::hunk_anchor_skips_to_the_named_line ... FAILED
+test tools::apply_patch::tests::missing_end_patch_is_rejected_without_writing ... ok
+test tools::apply_patch::tests::delete_removes_file ... ok
+test tools::apply_patch::tests::delete_without_read_is_rejected ... ok
+test tools::apply_patch::tests::add_creates_new_file ... ok
+test tools::apply_patch::tests::block_anchor_matches_similar_middle_line ... ok
+test tools::apply_patch::tests::multi_hunk_second_hunk_mismatch_writes_nothing ... FAILED
+test tools::apply_patch::tests::later_update_failure_restores_earlier_update ... ok
+test tools::apply_patch::tests::add_existing_file_fails ... ok
+test tools::apply_patch::tests::no_match_reports_tried_levels_and_writes_nothing ... ok
+test tools::apply_patch::tests::apply_patch_rejects_git_hook_patch ... ok
+test tools::apply_patch::tests::context_mismatch_reports_nearest_location_and_diff ... ok
+test tools::apply_patch::tests::indentation_flexible_preserves_file_indent ... ok
+test tools::apply_patch::tests::multi_hunk_update_applies_each_hunk_at_its_own_location ... FAILED
+test tools::apply_patch::tests::strips_tab_line_number_prefixes ... ok
+test tools::apply_patch::tests::stale_after_external_change_is_rejected_and_current_content_returned ... ok
+test tools::apply_patch::tests::strips_colon_line_number_prefixes ... ok
+test tools::apply_patch::tests::update_replaces_context_block ... ok
+test tools::apply_patch::tests::apply_patch_still_writes_gitignore ... ok
+test tools::apply_patch::tests::context_mismatch_rolls_back_earlier_ops ... ok
+test tools::apply_patch::tests::update_without_read_is_rejected ... ok
+test tools::apply_patch::tests::update_records_assertion_weakening_in_write_journal ... ok
+test tools::apply_patch::tests::whitespace_collapsed_matches_internal_spacing ... ok
+test tools::apply_patch::tests::update_after_read_succeeds_and_read_state_follows_write ... ok
+test tools::apply_patch::tests::stale_excerpt_is_capped_by_bytes_for_large_files ... ok
+
+failures:
+
+---- tools::apply_patch::tests::hunk_anchor_skips_to_the_named_line stdout ----
+
+thread 'tools::apply_patch::tests::hunk_anchor_skips_to_the_named_line' (11076) panicked at src\tools\apply_patch.rs:1341:14:
+called `Result::unwrap()` on an `Err` value: InvalidArgs("补丁格式错误：第 1 段（Update File: n.txt，从补丁第 2 行开始） 的补丁第 3 行无法识别，原文是 \"@@ fn beta() {\"。期望形状：上下文行以空格开头（` 原内容`）、删除行以 `-` 开头、新增行以 `+` 开头；整行留空视为空上下文行")
+note: run with `RUST_BACKTRACE=1` environment variable to display a backtrace
+
+---- tools::apply_patch::tests::multi_hunk_second_hunk_mismatch_writes_nothing stdout ----
+
+thread 'tools::apply_patch::tests::multi_hunk_second_hunk_mismatch_writes_nothing' (13812) panicked at src\tools\apply_patch.rs:1362:9:
+第 1 段（Update File: p.txt，补丁第 2–8 行）：上下文不匹配：未找到补丁期望的 2 行序列（已尝试：精确、剥离行号前缀、缩进弹性、空白折叠、首尾锚点）。
+期望匹配的 2 行（块内序号）：
+  块内 1| alpha
+  块内 2| nope
+文件中最接近的位置：第 1 行起（整块相似度 50%，文件共 2 行）：
+  文件第 1| alpha
+  文件第 2| bravo
+首个不一致：块内第 2 行 vs 文件第 2 行；期望 `nope`，实际读到 `bravo`
+请按上面「文件中最接近的位置」的真实内容重建补丁，不要原样重试
+
+---- tools::apply_patch::tests::multi_hunk_update_applies_each_hunk_at_its_own_location stdout ----
+
+thread 'tools::apply_patch::tests::multi_hunk_update_applies_each_hunk_at_its_own_location' (18608) panicked at src\tools\apply_patch.rs:1317:14:
+called `Result::unwrap()` on an `Err` value: Execution("第 1 段（Update File: m.txt，补丁第 2–8 行）：上下文不匹配：未找到补丁期望的 2 行序列（已尝试：精确、剥离行号前缀、缩进弹性、空白折叠、首尾锚点）。\n期望匹配的 2 行（块内序号）：\n  块内 1| alpha\n  块内 2| echo\n文件中最接近的位置：第 1 行起（整块相似度 60%，文件共 5 行）：\n  文件第 1| alpha\n  文件第 2| bravo\n首个不一致：块内第 2 行 vs 文件第 2 行；期望 `echo`，实际读到 `bravo`\n请按上面「文件中最接近的位置」的真实内容重建补丁，不要原样重试")
+
+
+failures:
+    tools::apply_patch::tests::hunk_anchor_skips_to_the_named_line
+    tools::apply_patch::tests::multi_hunk_second_hunk_mismatch_writes_nothing
+    tools::apply_patch::tests::multi_hunk_update_applies_each_hunk_at_its_own_location
+
+test result: FAILED. 29 passed; 3 failed; 0 ignored; 0 measured; 1118 filtered out; finished in 0.02s
+
+error: test failed, to rerun pass `--lib`

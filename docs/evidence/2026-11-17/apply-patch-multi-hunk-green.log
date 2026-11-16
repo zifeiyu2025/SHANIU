@@ -1,0 +1,40 @@
+   Compiling shaniu v0.2.8 (D:\MyWorkspace\SHANIU\src-tauri)
+    Finished `test` profile [unoptimized + debuginfo] target(s) in 22.99s
+     Running unittests src\lib.rs (target\debug\build\shaniu/3347eb12c1517f2a\out\shaniu_lib-3347eb12c1517f2a.exe)
+
+running 32 tests
+test tools::apply_patch::tests::clean_rollback_keeps_failure_message_concise ... ok
+test tools::apply_patch::tests::malformed_update_line_reports_patch_line_and_shape ... ok
+test tools::apply_patch::tests::malformed_add_line_reports_patch_line_and_shape ... ok
+test tools::apply_patch::tests::mismatch_wider_than_file_states_boundary ... ok
+test tools::apply_patch::tests::missing_end_patch_is_rejected_without_writing ... ok
+test tools::apply_patch::tests::add_creates_new_file ... ok
+test tools::apply_patch::tests::out_of_workspace_path_rejected ... ok
+test tools::apply_patch::tests::delete_removes_file ... ok
+test tools::apply_patch::tests::add_existing_file_fails ... ok
+test tools::apply_patch::tests::malformed_patch_is_invalid_args ... ok
+test tools::apply_patch::tests::rollback_reports_files_it_could_not_restore ... ok
+test tools::apply_patch::tests::multi_hunk_second_hunk_mismatch_writes_nothing ... ok
+test tools::apply_patch::tests::multi_hunk_update_applies_each_hunk_at_its_own_location ... ok
+test tools::apply_patch::tests::delete_without_read_is_rejected ... ok
+test tools::apply_patch::tests::no_match_reports_tried_levels_and_writes_nothing ... ok
+test tools::apply_patch::tests::indentation_flexible_preserves_file_indent ... ok
+test tools::apply_patch::tests::apply_patch_rejects_git_hook_patch ... ok
+test tools::apply_patch::tests::later_update_failure_restores_earlier_update ... ok
+test tools::apply_patch::tests::hunk_anchor_skips_to_the_named_line ... ok
+test tools::apply_patch::tests::update_replaces_context_block ... ok
+test tools::apply_patch::tests::context_mismatch_rolls_back_earlier_ops ... ok
+test tools::apply_patch::tests::context_mismatch_reports_nearest_location_and_diff ... ok
+test tools::apply_patch::tests::stale_after_external_change_is_rejected_and_current_content_returned ... ok
+test tools::apply_patch::tests::block_anchor_matches_similar_middle_line ... ok
+test tools::apply_patch::tests::apply_patch_still_writes_gitignore ... ok
+test tools::apply_patch::tests::strips_colon_line_number_prefixes ... ok
+test tools::apply_patch::tests::whitespace_collapsed_matches_internal_spacing ... ok
+test tools::apply_patch::tests::strips_tab_line_number_prefixes ... ok
+test tools::apply_patch::tests::update_records_assertion_weakening_in_write_journal ... ok
+test tools::apply_patch::tests::update_without_read_is_rejected ... ok
+test tools::apply_patch::tests::stale_excerpt_is_capped_by_bytes_for_large_files ... ok
+test tools::apply_patch::tests::update_after_read_succeeds_and_read_state_follows_write ... ok
+
+test result: ok. 32 passed; 0 failed; 0 ignored; 0 measured; 1118 filtered out; finished in 0.02s
+
