@@ -348,7 +348,8 @@ function judgeOnCopy(ws, ctx, task, run, phase) {
 }
 
 /**
- * 拉评测子进程用的干净环境。
+ * 拉被测 agent 进程用的干净环境（codex/dsh/zcode 三臂）。
+ * shaniu 臂的 agent 跑在 harness 进程内，由 evals_repo.rs 在子进程边界摘掉。
  *
  * `CARGO_TARGET_DIR` 只服务于 harness 自身的编译（避免污染 src-tauri/target），
  * 绝不能传给被测 agent：agent 在沙箱内跑 `cargo` 时会把产物写到工作区之外，
@@ -871,7 +872,11 @@ function runShaniuArm(tasks, ctx) {
     {
       cwd: ROOT,
       timeoutMs: 6 * 60 * 60 * 1000,
-      env: childEnv({
+      env: {
+        // 这里故意**保留** CARGO_TARGET_DIR：它是 harness 自身的编译，走独立 target
+        // 才不会和其他开发线的 src-tauri/target 抢锁。被测 agent 那侧由
+        // evals_repo.rs 在子进程边界 env_remove 摘掉，两件事互不干扰。
+        ...process.env,
         SHANIU_TEST_API_KEY: ctx.key,
         SHANIU_TEST_PROVIDER: `openai-${ctx.protocol}`,
         SHANIU_TEST_BASE_URL: 'https://api.deepseek.com/v1',
@@ -879,7 +884,7 @@ function runShaniuArm(tasks, ctx) {
         SHANIU_EVAL_REPEATS: String(ctx.repeats),
         SHANIU_EVAL_TASK_FILTER: tasks.map((t) => t.id).join(','),
         SHANIU_EVAL_RUN_LOG: logFile,
-      }),
+      },
     },
   );
   fs.writeFileSync(path.join(ctx.outDir, 'raw', 'shaniu-stdout.log'), res.out + res.err);
