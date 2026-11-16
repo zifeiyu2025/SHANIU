@@ -172,3 +172,62 @@ C 盘 75.24 → 90.57 GB（+15.33），D 盘 595.23 → 599.42 GB（+4.19），�
 - `raw/shaniu-run.log`（逐题时刻、轮次、setup/check、收口原因）、`raw/shaniu-stdout.log`
 - `raw/rollouts/`（12 题事件流，1.67 MB）、`raw/children/`（每题 outcome/spec/child 日志）
 - `phase2-shaniu-envfix-r1/`（作废轮原件）
+
+## 三次重跑：两处修复后的单题验证（2026-11-17）
+
+**结论：PASS（判据绿）。** 口径不变（32 轮上限、`evals/repo/judge/run.ps1` 与 `evals/repo-tasks.json` 一字未改、`timeout_secs=900` 照旧）下这题跑通，且两处修复在真实运行中都被覆盖。
+
+### 口径与身份
+
+| 项 | 本轮 |
+|---|---|
+| 被测提交 | `bc4cdab`（`bc4cdabadd4634102e160b1391dc1ed91a936a6d`；跑前 `HEAD == origin/main`，工作树 0 改动；含 `dfd11b0` 多块补丁与 `79d91fc` 截止检查点） |
+| 被测二进制 | `scratch/run-co-target/debug/build/shaniu/0d55e89eb29d0b0d/out/evals_repo-0d55e89eb29d0b0d.exe`，20,443,136 B，SHA256 `6bbea551199d8df7189649531afef1e5171ce5f2b91666a13bdf53994d7a6aa1` |
+| 构建隔离 | detached worktree `scratch/run-co-wt`（`bc4cdab`，`git status` 0 行）+ 独立 `CARGO_TARGET_DIR=scratch/run-co-target`，与主树 WIP 及其他开发线不共用 |
+| 判据 | `run.ps1 -Task context-overflow-code`：`cargo test --test repo_feat_context_overflow`、`--lib agent_loop::error_codes`、`--lib model_client`、`Assert-Present ContextOverflow`；跑后核对 `git rev-parse HEAD:evals/repo/judge/run.ps1` 仍为 `8ef8a5d8…`、任务集 blob `0a15d32d…`，工作区对这两路径 0 改动 |
+| 模型/协议 | `deepseek-flash` / `openai-chat`（SHANIU 臂既有口径），`--repeats 1` |
+| 时刻 | 2026-11-17 01:21:31 → 01:28:57；agent 241,611 ms + 判据 104,912 ms = wall 346,523 ms（setup 98,917 ms 另计） |
+
+### 结果
+
+- `PASS`，`precondition_red=true`、`tampered=false`、`timed_out=false`、`forbid_hit=false`、`invalid=0`。
+- **26 轮**（上限 32，未打满），收口 `Completed`，`interruptions=11`。
+- 改动 **4 文件 +90/−1、未跟踪 0**：`model_client/error.rs` +81/−1、`key_check.rs` +5、`agent_loop/error_codes.rs` +2、`model_client/retry.rs` +2；`src-tauri/tests/` 未触碰。
+- 起始树指纹 `be9548a8e13e722a424d1b00e029ca66de102e11827dc64add3ee0ae59daf033`，与 r2 完全相同。两轮的 `base=` 哈希不同（r2 `f8b471c1…` / 本轮 `bed939fe…`）是每题 `git init` 新提交的随机性，判断「同一棵树」只能看指纹。
+- token：in 925,997（cached 857,344）/ out 10,941。
+
+### 轮次去向（26 请求 / 33 次工具调用）
+
+| 段 | 轮 | 调用 | 内容 |
+|---|---|---|---|
+| 探索 | t1–t9 | 16（`read_file` 7 / `search` 6 / `list_dir` 3） | 先读判据测试，再读 `error.rs`、`error_codes.rs`、`key_check.rs`、`retry.rs`，并读了 `src/dsh/packages/llm/llm/src/error.ts` 作参照 |
+| 改文件 | t10–t14 | 6 次 `apply_patch` | 6/6 成功，其中 **3 次是多块补丁**（7 块 / 2 块 / 2 块） |
+| 跑命令 | t15–t25 | 11 次 `unified_exec` | t16/t17 判据两条测试绿；t18 `model_client::` + `key_check` + `model_error_mapping` 绿；t22–t24 `clippy --lib --tests -- -D warnings` 绿；t25 复跑判据并 `git status` |
+| 收口 | t26 | 0 | 不再要工具 → 宿主收口复验（dirty 已清）→ `Completed` |
+
+r2 里 45 次调用中「运行 0 次、收口靠宿主」，本轮改成「先读判据、再改、边改边跑」，探索轮数从 18 降到 9。
+
+### 两处修复的实际覆盖
+
+- **多块补丁（`dfd11b0`）**：本轮 3 次多块补丁 **3/3 成功**（同一 `*** Update File` 段内 7 / 2 / 2 个 `@@` 块），单块 3/3 成功。对照 r2 同一题「多块 3 次全被拒、单块 11 次 10 次成功」，且 r2 为落齐 6 块花了 10 个往返（净浪费 9 轮 / 32 轮）。本轮 t10 一次 7 块补丁单回合落地，整个改文件段只用了 5 轮。
+- **截止检查点（`79d91fc`）**：事件流有且只有一条 `verification`：`turn=24, state=passed, cargo check --all-targets, exit 0, 10,094 ms`。`turn=24` 正是 `checkpoint_due(24,32)=true` 的窗口，且模型那一轮仍在调工具（t24 `clippy`），所以这条是检查点跑的、不是收口口跑的；判绿所以不注入提醒（只有 `Failed` 才写系统消息）。t26 收口时 `dirty` 已被检查点清空，未重复验证。
+
+### 归因：修没修好 vs 能力上限
+
+- 本轮**宿主闸门全程没有报红**，因此「报红之后模型有没有看见」这一项在本题上无从观察。能观察的是模型自己的命令红：t15 `tail` 不存在（exit 255）、t19 `cargo fmt --check` 与 t20 `rustfmt --check` 输出差异；宿主依次注入「自动修复提醒（第 1/2 次）」（t15 后、t19 后，中间 t16–t18 成功所以计数重置）、「第 2/2 次」（t20 后）与「失败自愈已停止」（t21 后）；模型随后 t22–t24 用 `clippy --lib --tests -- -D warnings` 连续收绿。
+- 判读：**是修好了，不是「模型突然变强」**。同一模型、同一题、同一判据下，r2 的两个根因都被本轮直接覆盖——多块补丁 1 回合落地、检查点在第 24 轮真跑并给出结论。r2 的 32 轮红不能继续归为「模型能力上限」，也不能归为「预算被环境吃掉」（本轮 `CARGO_TARGET_DIR` 绕行 0 处、400 故障 0 次）。
+- 局限（不美化）：本题只跑 1 次。deepseek-flash 有抽样波动（同一 `bb5e17c` 在 r2 之前的一轮该题曾 PASS、在 r2 红），因此本轮绿**只证明该口径下可解**，不能据此宣称成功率或稳定性提升；「多块补丁 3/3」是本轮的直接证据，不是统计证据。
+
+### 环境核验
+
+- `CARGO_TARGET_DIR` 在事件流与 stdout 命中 **0 处**（无绕行工具调用）。
+- 端点 400 类故障（`No tool output found` / `HTTP 400` / `4000103`）命中 **0 处**；环境故障痕迹（`os error 112` / `os error 3` / `磁盘空间不足` / `robocopy`）在运行日志命中 **0 处**。
+- 判据复跑（成品工作区、暖 target）：`REPO-CHECK: PASS`，exit 0，2s（`raw/judge-rerun.log`；首次判据 104,912 ms 是判据副本冷编译）。
+
+### 证据与回收
+
+- 结果目录：`evals/results-compare/phase2-shaniu-envfix-r3/`
+  - `summary.json`、`raw/shaniu-run.log`（逐轮 `[req] seq/end`）、`raw/shaniu-stdout.log`
+  - `raw/1794850137083-18844-repo.json`（Rust 侧原始报告）、`raw/judge-rerun.log`、`raw/final.diff`（成品改动全文）
+  - `raw/rollouts/repo-feat-context-overflow-code/repo-feat-context-overflow-code-r1.jsonl`（事件流，300,334 B）、`raw/children/`（spec/outcome/child 日志）
+- 回收（实测）：`scratch/run-co-target` 4.32 GB、`%TEMP%\shaniu-evals-repo-ws-18844` 9.99 GB、`scratch/run-co-wt` 0.13 GB（含 `evals-repo-pristine-18844` 0.06 GB），统计合计 **14.50 GB**；`Get-PSDrive` 跑前 C 78.10 / D 591.23 GB，回收后 C 87.57 / D 595.42 GB，实测释放 **13.66 GB**（C +9.47 / D +4.19；与统计值的差额来自删除期间其他进程/缓存，不取高值）。`git worktree list` 只剩主树，`%TEMP%` 无 `shaniu-evals-repo-ws-*` 残留，临时 worktree 与 target 均已删除。

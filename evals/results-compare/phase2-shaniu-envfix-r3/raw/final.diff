@@ -1,0 +1,191 @@
+diff --git a/src-tauri/src/agent_loop/error_codes.rs b/src-tauri/src/agent_loop/error_codes.rs
+index 44681d3..e4d9e36 100644
+--- a/src-tauri/src/agent_loop/error_codes.rs
++++ b/src-tauri/src/agent_loop/error_codes.rs
+@@ -16,6 +16,7 @@ pub mod model {
+     pub const NETWORK: &str = "NETWORK";
+     pub const SERVER: &str = "SERVER";
+     pub const ENDPOINT_UNSUPPORTED: &str = "ENDPOINT_UNSUPPORTED";
++    pub const CONTEXT_OVERFLOW: &str = "CONTEXT_OVERFLOW";
+     pub const BAD_REQUEST: &str = "BAD_REQUEST";
+     pub const EMPTY_RESPONSE: &str = "EMPTY_RESPONSE";
+     pub const UNKNOWN: &str = "UNKNOWN";
+@@ -42,6 +43,7 @@ pub const ALL: &[&str] = &[
+     model::NETWORK,
+     model::SERVER,
+     model::ENDPOINT_UNSUPPORTED,
++    model::CONTEXT_OVERFLOW,
+     model::BAD_REQUEST,
+     model::EMPTY_RESPONSE,
+     model::UNKNOWN,
+diff --git a/src-tauri/src/key_check.rs b/src-tauri/src/key_check.rs
+index 7f395aa..2f5e5bb 100644
+--- a/src-tauri/src/key_check.rs
++++ b/src-tauri/src/key_check.rs
+@@ -243,6 +243,11 @@ fn from_model_error(error: ModelError) -> KeyCheck {
+             "bad_request",
+             "端点拒绝了这次查询，无法据此判断密钥".to_string(),
+         ),
++        ModelErrorKind::ContextOverflow => (
++            KeyCheckState::Unknown,
++            "context_overflow",
++            "端点报了上下文超限，与密钥无关，无法据此判断密钥".to_string(),
++        ),
+         ModelErrorKind::EmptyResponse => (
+             KeyCheckState::Unknown,
+             "empty_response",
+diff --git a/src-tauri/src/model_client/error.rs b/src-tauri/src/model_client/error.rs
+index b20dda5..65fcb21 100644
+--- a/src-tauri/src/model_client/error.rs
++++ b/src-tauri/src/model_client/error.rs
+@@ -26,6 +26,11 @@ pub enum ModelErrorKind {
+     Server,
+     /// 404/405：该地址没有这个接口（常见于把 base_url 指到只支持 chat 的端点）。
+     EndpointUnsupported,
++    /// 400/413，且错误体点名上下文/令牌数超限：请求超过模型上下文窗口。
++    ///
++    /// 与 [`ModelErrorKind::BadRequest`] 分开，因为处置完全不同：这不是
++    /// “参数写错了”，而是“这轮的历史太长”，需要压缩/裁剪后重来。
++    ContextOverflow,
+     /// 400/422：请求本身被拒。
+     BadRequest,
+     /// 流正常结束，但没有任何增量、没有工具调用、也没有 usage。
+@@ -78,6 +83,7 @@ impl ModelError {
+             ModelErrorKind::Network => "NETWORK",
+             ModelErrorKind::Server => "SERVER",
+             ModelErrorKind::EndpointUnsupported => "ENDPOINT_UNSUPPORTED",
++            ModelErrorKind::ContextOverflow => "CONTEXT_OVERFLOW",
+             ModelErrorKind::BadRequest => "BAD_REQUEST",
+             ModelErrorKind::EmptyResponse => "EMPTY_RESPONSE",
+             ModelErrorKind::Unknown => "UNKNOWN",
+@@ -87,11 +93,16 @@ impl ModelError {
+     /// HTTP 状态 + 错误体 → 结构化错误。
+     ///
+     /// 分类顺序：先看错误体里的额度关键词（有些端点用 400/403 报余额不足），
+-    /// 再看状态码。这样“余额不足”不会被误报成“密钥无效”。
++    /// 再看 400/413 上的上下文超限关键词，最后才看状态码。这样“余额不足”
++    /// 不会被误报成“密钥无效”，“上下文超限”也不会淹没在通用的“请求被拒绝”里。
+     pub fn from_status(status: u16, body: &str) -> Self {
+         let (provider_code, provider_message) = provider_fields(body);
+         let kind = if quota_hit(provider_code.as_deref(), provider_message.as_deref()) {
+             ModelErrorKind::Quota
++        } else if matches!(status, 400 | 413)
++            && context_overflow_hit(provider_code.as_deref(), provider_message.as_deref())
++        {
++            ModelErrorKind::ContextOverflow
+         } else {
+             match status {
+                 401 | 403 => ModelErrorKind::Auth,
+@@ -111,6 +122,9 @@ impl ModelError {
+             ModelErrorKind::Network => "无法连接到模型服务".to_string(),
+             ModelErrorKind::Server => format!("模型服务端错误（HTTP {status}）"),
+             ModelErrorKind::EndpointUnsupported => format!("该地址不支持此接口（HTTP {status}）"),
++            ModelErrorKind::ContextOverflow => {
++                format!("请求超出模型上下文上限（HTTP {status}）：请压缩历史或缩短输入后重试")
++            }
+             ModelErrorKind::BadRequest => format!("请求被拒绝（HTTP {status}）"),
+             ModelErrorKind::EmptyResponse => "模型返回了空响应".to_string(),
+             ModelErrorKind::Unknown => format!("未知错误（HTTP {status}）"),
+@@ -126,11 +140,16 @@ impl ModelError {
+         let (provider_code, provider_message) = value.map(provider_fields_value).unwrap_or((None, None));
+         let kind = if quota_hit(provider_code.as_deref(), provider_message.as_deref()) {
+             ModelErrorKind::Quota
++        } else if context_overflow_hit(provider_code.as_deref(), provider_message.as_deref()) {
++            ModelErrorKind::ContextOverflow
+         } else {
+             ModelErrorKind::Unknown
+         };
+         let human = match kind {
+             ModelErrorKind::Quota => "余额不足".to_string(),
++            ModelErrorKind::ContextOverflow => {
++                "请求超出模型上下文上限：请压缩历史或缩短输入后重试".to_string()
++            }
+             _ => provider_message.clone().unwrap_or_else(|| "模型服务返回错误".to_string()),
+         };
+         Self::new(kind, None, provider_code, provider_message, human)
+@@ -231,6 +250,36 @@ fn quota_hit(code: Option<&str>, message: Option<&str>) -> bool {
+     .any(|needle| haystack.contains(needle))
+ }
+ 
++/// 错误体里明确点名「上下文/窗口被撑爆」的措辞。
++///
++/// 分两档：结构化措辞（自带 `context length` 之类定语）直接命中；只说
++/// “令牌太多”这种含糊措辞则要先排除限流语境——TPM 限额的报错同样是
++/// “too many tokens”，那是限流，不是上下文超限。
++fn context_overflow_hit(code: Option<&str>, message: Option<&str>) -> bool {
++    let haystack = format!("{} {}", code.unwrap_or_default(), message.unwrap_or_default()).to_ascii_lowercase();
++    const STRICT: &[&str] = &[
++        "context_length_exceeded",
++        "context length",
++        "context window",
++        "context_window",
++        "context_overflow",
++        "context overflow",
++        "maximum context",
++        "上下文长度",
++        "上下文窗口",
++        "上下文超限",
++    ];
++    if STRICT.iter().any(|needle| haystack.contains(needle)) {
++        return true;
++    }
++    const RATE_WORDING: &[&str] = &["rate limit", "rate_limit", "per minute", "per min", "tpm", "rpm"];
++    if RATE_WORDING.iter().any(|needle| haystack.contains(needle)) {
++        return false;
++    }
++    const LOOSE: &[&str] = &["too many tokens", "token count exceeds", "prompt is too long", "input is too long"];
++    LOOSE.iter().any(|needle| haystack.contains(needle))
++}
++
+ impl From<&ModelError> for crate::events::TurnErrorInfo {
+     fn from(error: &ModelError) -> Self {
+         Self {
+@@ -346,4 +395,35 @@ mod tests {
+         assert!(!message.contains(secret), "错误体回显了凭据: {message}");
+         assert!(message.contains(crate::config::REDACTED));
+     }
++
++    /// 400 上的上下文超限措辞必须独立成 `ContextOverflow`，不能落进通用的
++    /// `BadRequest`——否则界面只会说“请求被拒绝”，用户不知道要压缩历史。
++    #[test]
++    fn context_overflow_wording_wins_over_bad_request() {
++        let body = r#"{"error":{"type":"invalid_request_error","message":"This model's maximum context length is 8192 tokens. However, your messages resulted in 9000 tokens."}}"#;
++        let error = ModelError::from_status(400, body);
++        assert_eq!(error.kind, ModelErrorKind::ContextOverflow);
++        assert_eq!(error.code(), "CONTEXT_OVERFLOW");
++        assert!(crate::agent_loop::error_codes::is_known(error.code()));
++        assert_eq!(error.http_status, Some(400));
++        assert!(!error.human.is_empty());
++
++        let too_many = ModelError::from_status(413, r#"{"error":{"message":"too many tokens in request"}}"#);
++        assert_eq!(too_many.kind, ModelErrorKind::ContextOverflow);
++    }
++
++    /// 反向对照：普通 400 仍必须是 `BadRequest`；限流语境的 “too many tokens”
++    /// （TPM 限额）与 `max_tokens` 参数过大都不得被误判成上下文超限。
++    #[test]
++    fn plain_bad_request_and_token_rate_limits_stay_bad_request() {
++        assert_eq!(kind(400, r#"{"error":{"message":"model not found"}}"#), ModelErrorKind::BadRequest);
++        assert_eq!(
++            kind(400, r#"{"error":{"message":"too many tokens per minute, rate limit reached"}}"#),
++            ModelErrorKind::BadRequest
++        );
++        assert_eq!(
++            kind(400, r#"{"error":{"message":"max_tokens is too large for this model"}}"#),
++            ModelErrorKind::BadRequest
++        );
++    }
+ }
+diff --git a/src-tauri/src/model_client/retry.rs b/src-tauri/src/model_client/retry.rs
+index 5a81569..b16ae76 100644
+--- a/src-tauri/src/model_client/retry.rs
++++ b/src-tauri/src/model_client/retry.rs
+@@ -118,6 +118,8 @@ mod tests {
+             ModelErrorKind::Auth,
+             ModelErrorKind::Quota,
+             ModelErrorKind::BadRequest,
++            // 原样重发同一个超长请求只会再被拒一次，必须先压缩/裁剪。
++            ModelErrorKind::ContextOverflow,
+             ModelErrorKind::EndpointUnsupported,
+             ModelErrorKind::Unknown,
+         ] {

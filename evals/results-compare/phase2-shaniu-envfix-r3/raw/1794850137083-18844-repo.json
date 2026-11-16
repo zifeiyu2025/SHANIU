@@ -1,0 +1,201 @@
+{
+  "arm": "repo-baseline",
+  "base_commit": "0bee58ea8c44e408f3a2592dea4c0c4be286d292",
+  "base_url": "https://api.deepseek.com/v1",
+  "by_category": {
+    "feature": {
+      "infra": 0,
+      "n": 1,
+      "passed": 1,
+      "timeouts": 0
+    }
+  },
+  "by_type": {
+    "feature": {
+      "n": 1,
+      "passed": 1,
+      "success_rate": 1.0
+    }
+  },
+  "epoch_ms": 1794849689098,
+  "kind": "repo",
+  "mode": "seq",
+  "model": "deepseek-flash",
+  "process": {
+    "pid": 18844
+  },
+  "provider": "openai-chat",
+  "repeats": 1,
+  "repo": {
+    "pristine": "target/evals-repo-pristine-18844",
+    "snapshot_files": 7613,
+    "warmup_ms_total": 61216,
+    "workspace": "C:/Users/jun/AppData/Local/Temp/shaniu-evals-repo-ws-18844"
+  },
+  "runs": [
+    {
+      "run": 1,
+      "summary": {
+        "avg_turns": 26.0,
+        "duration": {
+          "agent_ms_p50": 241611.0,
+          "agent_ms_p90": 241611.0,
+          "agent_ms_total": 241611,
+          "check_ms_total": 104912,
+          "setup_ms_total": 98917
+        },
+        "interruptions": {
+          "mean": 11.0,
+          "median": 11.0,
+          "p90": 11.0,
+          "tasks_with_any": 1,
+          "total": 11
+        },
+        "invalid": 0,
+        "max_turns": 32,
+        "median_turns": 26.0,
+        "n": 1,
+        "p90_turns": 26.0,
+        "passed": 1,
+        "success_rate": 1.0,
+        "success_rate_ci95": [
+          0.20654931437723745,
+          1.0
+        ],
+        "success_rate_no_timeout": 1.0,
+        "success_rate_valid_only": 1.0,
+        "timeout_rate": 0.0,
+        "turns_unknown": 0
+      },
+      "tasks": [
+        {
+          "agent_ms": 241611,
+          "base_commit": "0bee58e",
+          "cached_input_tokens": 857344,
+          "check_ms": 104912,
+          "detail": "判据通过｜收口=Completed",
+          "diff_summary": "共4文件 +90/-1；未跟踪0；src-tauri/src/agent_loop/error_codes.rs +2/-0；src-tauri/src/key_check.rs +5/-0；src-tauri/src/model_client/error.rs +81/-1；src-tauri/src/model_client/retry.rs +2/-0",
+          "files_changed": 4,
+          "forbidden_touched": false,
+          "id": "repo-feat-context-overflow-code",
+          "input_tokens": 925997,
+          "interruptions": 11,
+          "invalid": false,
+          "invalid_reason": null,
+          "output_tokens": 10941,
+          "patch_applied": true,
+          "patch_check": "none",
+          "precondition_red": true,
+          "prompt_attribution": [
+            "unified_exec risk=Execute 原因=执行命令需要人工确认（当前审批策略 on_request）。允许只放行执行，不会放宽沙箱：写入工作区、TEMP、工具链目录之外的路径会被拒绝（读取不受影响）；需要写到外部时请改到工作区内，或切换访问模式 参数={\"command\":\"cd src-tauri && cargo test --test repo_feat_context_overflow 2>&1 | tail -40\",…",
+            "unified_exec risk=Execute 原因=执行命令需要人工确认（当前审批策略 on_request）。允许只放行执行，不会放宽沙箱：写入工作区、TEMP、工具链目录之外的路径会被拒绝（读取不受影响）；需要写到外部时请改到工作区内，或切换访问模式 参数={\"command\":\"cd src-tauri && cargo test --test repo_feat_context_overflow\",\"timeout_ms\":600…",
+            "unified_exec risk=Execute 原因=执行命令需要人工确认（当前审批策略 on_request）。允许只放行执行，不会放宽沙箱：写入工作区、TEMP、工具链目录之外的路径会被拒绝（读取不受影响）；需要写到外部时请改到工作区内，或切换访问模式 参数={\"command\":\"cd src-tauri && cargo test --lib agent_loop::error_codes\",\"timeout_ms\":600000}",
+            "unified_exec risk=Execute 原因=执行命令需要人工确认（当前审批策略 on_request）。允许只放行执行，不会放宽沙箱：写入工作区、TEMP、工具链目录之外的路径会被拒绝（读取不受影响）；需要写到外部时请改到工作区内，或切换访问模式 参数={\"command\":\"cd src-tauri && cargo test --lib model_client:: && cargo test --lib key_check …",
+            "unified_exec risk=Execute 原因=执行命令需要人工确认（当前审批策略 on_request）。允许只放行执行，不会放宽沙箱：写入工作区、TEMP、工具链目录之外的路径会被拒绝（读取不受影响）；需要写到外部时请改到工作区内，或切换访问模式 参数={\"command\":\"cd src-tauri && cargo fmt --check && echo FMT_OK && cargo clippy --lib --tests…",
+            "unified_exec risk=Execute 原因=执行命令需要人工确认（当前审批策略 on_request）。允许只放行执行，不会放宽沙箱：写入工作区、TEMP、工具链目录之外的路径会被拒绝（读取不受影响）；需要写到外部时请改到工作区内，或切换访问模式 参数={\"command\":\"cd src-tauri && rustfmt --check --edition 2021 src/model_client/error.rs src/m…",
+            "unified_exec risk=Execute 原因=执行命令需要人工确认（当前审批策略 on_request）。允许只放行执行，不会放宽沙箱：写入工作区、TEMP、工具链目录之外的路径会被拒绝（读取不受影响）；需要写到外部时请改到工作区内，或切换访问模式 参数={\"command\":\"cd src-tauri && dir rustfmt.toml .rustfmt.toml 2>&1\",\"timeout_ms\":60000}",
+            "unified_exec risk=Execute 原因=执行命令需要人工确认（当前审批策略 on_request）。允许只放行执行，不会放宽沙箱：写入工作区、TEMP、工具链目录之外的路径会被拒绝（读取不受影响）；需要写到外部时请改到工作区内，或切换访问模式 参数={\"command\":\"cd src-tauri && cargo clippy --lib --tests 2>&1 | findstr /C:\\\"warning:\\\" /C:\\…",
+            "unified_exec risk=Execute 原因=执行命令需要人工确认（当前审批策略 on_request）。允许只放行执行，不会放宽沙箱：写入工作区、TEMP、工具链目录之外的路径会被拒绝（读取不受影响）；需要写到外部时请改到工作区内，或切换访问模式 参数={\"command\":\"cd src-tauri && copy /b src\\\\model_client\\\\error.rs +,, src\\\\model_client\\\\err…",
+            "unified_exec risk=Execute 原因=执行命令需要人工确认（当前审批策略 on_request）。允许只放行执行，不会放宽沙箱：写入工作区、TEMP、工具链目录之外的路径会被拒绝（读取不受影响）；需要写到外部时请改到工作区内，或切换访问模式 参数={\"command\":\"cd src-tauri && copy /b src\\\\model_client\\\\error.rs +,, src\\\\model_client\\\\err…",
+            "unified_exec risk=Execute 原因=执行命令需要人工确认（当前审批策略 on_request）。允许只放行执行，不会放宽沙箱：写入工作区、TEMP、工具链目录之外的路径会被拒绝（读取不受影响）；需要写到外部时请改到工作区内，或切换访问模式 参数={\"command\":\"cd src-tauri && cargo test --test repo_feat_context_overflow && cargo test --l…"
+          ],
+          "setup_ms": 98917,
+          "success": true,
+          "timeout": false,
+          "timeout_layer": null,
+          "turns": 26,
+          "type": "feature",
+          "usage_turns": 26,
+          "warmup_ms": 61216,
+          "warmup_ok": true
+        }
+      ]
+    }
+  ],
+  "samples": 1,
+  "summary": {
+    "avg_turns": 26.0,
+    "duration": {
+      "agent_ms_p50": 241611.0,
+      "agent_ms_p90": 241611.0,
+      "agent_ms_total": 241611,
+      "check_ms_total": 104912,
+      "setup_ms_total": 98917
+    },
+    "interruptions": {
+      "mean": 11.0,
+      "median": 11.0,
+      "p90": 11.0,
+      "tasks_with_any": 1,
+      "total": 11
+    },
+    "invalid": 0,
+    "max_turns": 32,
+    "median_turns": 26.0,
+    "n": 1,
+    "p90_turns": 26.0,
+    "passed": 1,
+    "success_rate": 1.0,
+    "success_rate_ci95": [
+      0.20654931437723745,
+      1.0
+    ],
+    "success_rate_no_timeout": 1.0,
+    "success_rate_valid_only": 1.0,
+    "timeout_rate": 0.0,
+    "turns_unknown": 0
+  },
+  "tasks": [
+    {
+      "agent_ms": 241611,
+      "base_commit": "0bee58e",
+      "cached_input_tokens": 857344,
+      "check_ms": 104912,
+      "detail": "判据通过｜收口=Completed",
+      "diff_summary": "共4文件 +90/-1；未跟踪0；src-tauri/src/agent_loop/error_codes.rs +2/-0；src-tauri/src/key_check.rs +5/-0；src-tauri/src/model_client/error.rs +81/-1；src-tauri/src/model_client/retry.rs +2/-0",
+      "files_changed": 4,
+      "forbidden_touched": false,
+      "id": "repo-feat-context-overflow-code",
+      "input_tokens": 925997,
+      "interruptions": 11,
+      "invalid": false,
+      "invalid_reason": null,
+      "output_tokens": 10941,
+      "patch_applied": true,
+      "patch_check": "none",
+      "precondition_red": true,
+      "prompt_attribution": [
+        "unified_exec risk=Execute 原因=执行命令需要人工确认（当前审批策略 on_request）。允许只放行执行，不会放宽沙箱：写入工作区、TEMP、工具链目录之外的路径会被拒绝（读取不受影响）；需要写到外部时请改到工作区内，或切换访问模式 参数={\"command\":\"cd src-tauri && cargo test --test repo_feat_context_overflow 2>&1 | tail -40\",…",
+        "unified_exec risk=Execute 原因=执行命令需要人工确认（当前审批策略 on_request）。允许只放行执行，不会放宽沙箱：写入工作区、TEMP、工具链目录之外的路径会被拒绝（读取不受影响）；需要写到外部时请改到工作区内，或切换访问模式 参数={\"command\":\"cd src-tauri && cargo test --test repo_feat_context_overflow\",\"timeout_ms\":600…",
+        "unified_exec risk=Execute 原因=执行命令需要人工确认（当前审批策略 on_request）。允许只放行执行，不会放宽沙箱：写入工作区、TEMP、工具链目录之外的路径会被拒绝（读取不受影响）；需要写到外部时请改到工作区内，或切换访问模式 参数={\"command\":\"cd src-tauri && cargo test --lib agent_loop::error_codes\",\"timeout_ms\":600000}",
+        "unified_exec risk=Execute 原因=执行命令需要人工确认（当前审批策略 on_request）。允许只放行执行，不会放宽沙箱：写入工作区、TEMP、工具链目录之外的路径会被拒绝（读取不受影响）；需要写到外部时请改到工作区内，或切换访问模式 参数={\"command\":\"cd src-tauri && cargo test --lib model_client:: && cargo test --lib key_check …",
+        "unified_exec risk=Execute 原因=执行命令需要人工确认（当前审批策略 on_request）。允许只放行执行，不会放宽沙箱：写入工作区、TEMP、工具链目录之外的路径会被拒绝（读取不受影响）；需要写到外部时请改到工作区内，或切换访问模式 参数={\"command\":\"cd src-tauri && cargo fmt --check && echo FMT_OK && cargo clippy --lib --tests…",
+        "unified_exec risk=Execute 原因=执行命令需要人工确认（当前审批策略 on_request）。允许只放行执行，不会放宽沙箱：写入工作区、TEMP、工具链目录之外的路径会被拒绝（读取不受影响）；需要写到外部时请改到工作区内，或切换访问模式 参数={\"command\":\"cd src-tauri && rustfmt --check --edition 2021 src/model_client/error.rs src/m…",
+        "unified_exec risk=Execute 原因=执行命令需要人工确认（当前审批策略 on_request）。允许只放行执行，不会放宽沙箱：写入工作区、TEMP、工具链目录之外的路径会被拒绝（读取不受影响）；需要写到外部时请改到工作区内，或切换访问模式 参数={\"command\":\"cd src-tauri && dir rustfmt.toml .rustfmt.toml 2>&1\",\"timeout_ms\":60000}",
+        "unified_exec risk=Execute 原因=执行命令需要人工确认（当前审批策略 on_request）。允许只放行执行，不会放宽沙箱：写入工作区、TEMP、工具链目录之外的路径会被拒绝（读取不受影响）；需要写到外部时请改到工作区内，或切换访问模式 参数={\"command\":\"cd src-tauri && cargo clippy --lib --tests 2>&1 | findstr /C:\\\"warning:\\\" /C:\\…",
+        "unified_exec risk=Execute 原因=执行命令需要人工确认（当前审批策略 on_request）。允许只放行执行，不会放宽沙箱：写入工作区、TEMP、工具链目录之外的路径会被拒绝（读取不受影响）；需要写到外部时请改到工作区内，或切换访问模式 参数={\"command\":\"cd src-tauri && copy /b src\\\\model_client\\\\error.rs +,, src\\\\model_client\\\\err…",
+        "unified_exec risk=Execute 原因=执行命令需要人工确认（当前审批策略 on_request）。允许只放行执行，不会放宽沙箱：写入工作区、TEMP、工具链目录之外的路径会被拒绝（读取不受影响）；需要写到外部时请改到工作区内，或切换访问模式 参数={\"command\":\"cd src-tauri && copy /b src\\\\model_client\\\\error.rs +,, src\\\\model_client\\\\err…",
+        "unified_exec risk=Execute 原因=执行命令需要人工确认（当前审批策略 on_request）。允许只放行执行，不会放宽沙箱：写入工作区、TEMP、工具链目录之外的路径会被拒绝（读取不受影响）；需要写到外部时请改到工作区内，或切换访问模式 参数={\"command\":\"cd src-tauri && cargo test --test repo_feat_context_overflow && cargo test --l…"
+      ],
+      "setup_ms": 98917,
+      "success": true,
+      "timeout": false,
+      "timeout_layer": null,
+      "turns": 26,
+      "type": "feature",
+      "usage_turns": 26,
+      "warmup_ms": 61216,
+      "warmup_ok": true
+    }
+  ],
+  "tasks_file": "evals/repo-tasks.json",
+  "timeouts": 0,
+  "valid": true,
+  "validity": {
+    "base_commit_pinned": true,
+    "patch_applied_all": true,
+    "precondition_red_all": true,
+    "snapshot_count_match": true
+  },
+  "version": 1
+}

@@ -1,0 +1,53 @@
+{
+  "runId": "1794849688608-7432",
+  "args": {
+    "arm": "shaniu",
+    "tasks": [
+      "repo-feat-context-overflow-code"
+    ],
+    "repeats": 1,
+    "model": "deepseek-flash",
+    "out": "d:\\MyWorkspace\\SHANIU\\evals\\results-compare\\phase2-shaniu-envfix-r3",
+    "prepareOnly": false,
+    "protocol": "",
+    "expectTree": {},
+    "resume": false,
+    "resumeWs": ""
+  },
+  "records": [
+    {
+      "arm": "shaniu",
+      "task": "repo-feat-context-overflow-code",
+      "task_type": "feature",
+      "run": 1,
+      "model": "deepseek-flash",
+      "protocol": "chat",
+      "status": "PASS",
+      "invalid_reason": null,
+      "precondition_red": true,
+      "judge_pass": true,
+      "tampered": false,
+      "timed_out": false,
+      "agent_ms": 241611,
+      "judge_ms": 104912,
+      "wall_ms": 346523,
+      "diff": {
+        "summary": "共4文件 +90/-1；未跟踪0；src-tauri/src/agent_loop/error_codes.rs +2/-0；src-tauri/src/key_check.rs +5/-0；src-tauri/src/model_client/error.rs +81/-1；src-tauri/src/model_client/retry.rs +2/-0",
+        "files": 4,
+        "added": 90,
+        "deleted": 1,
+        "untracked": 0,
+        "forbid_hit": false
+      },
+      "usage": {
+        "input_total": 925997,
+        "cached": 857344,
+        "output": 10941,
+        "turns": 26,
+        "source": "shaniu.TokenUsage"
+      },
+      "tree": "be9548a8e13e722a424d1b00e029ca66de102e11827dc64add3ee0ae59daf033",
+      "detail": "判据通过｜收口=Completed"
+    }
+  ]
+}
