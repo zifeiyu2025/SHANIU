@@ -17,7 +17,9 @@ use shaniu_lib::events::{
 };
 
 /// 与 src/transport/types.ts 的 type 判别值逐一对应。
-const EXPECTED_TAGS: [&str; 26] = [
+const EXPECTED_TAGS: [&str; 27] = [
+    // D11：用户回合起点。`run` 是回合号，`turn_started.turn` 仍是采样步号。
+    "run_started",
     "turn_started",
     "turn_completed",
     "verification_result",
@@ -48,6 +50,7 @@ const EXPECTED_TAGS: [&str; 26] = [
 
 fn all_variants() -> Vec<EventMsg> {
     let variants = vec![
+        EventMsg::RunStarted { run: 1 },
         EventMsg::TurnStarted { turn: 1 },
         EventMsg::TurnCompleted {
             turn: 1,
@@ -248,7 +251,8 @@ fn all_variants() -> Vec<EventMsg> {
     // vec 更新后 tag 集合随之扩大，EXPECTED_TAGS 不同步则标签集测试必红——双向闭环。
     for msg in &variants {
         match msg {
-            EventMsg::TurnStarted { .. }
+            EventMsg::RunStarted { .. }
+            | EventMsg::TurnStarted { .. }
             | EventMsg::TurnCompleted { .. }
             | EventMsg::VerificationResult { .. }
             | EventMsg::AgentMessageDelta { .. }

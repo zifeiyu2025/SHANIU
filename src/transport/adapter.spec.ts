@@ -11,6 +11,7 @@ import { ClientWorkspaceModel } from '../dsh/packages/api/workspace-controller/s
 import { compactionDefinition } from '../dsh/packages/client/ui-chat/src/client/conversation-nodes/compaction.ts'
 import { commandDefinition } from '../dsh/packages/client/ui-chat/src/client/conversation-nodes/command.ts'
 import { SurfaceManager } from '../dsh/packages/core/session/src/surface.ts'
+import { sessionEntriesToEvents } from '../header-actions/session-events'
 import { R4_EVENT_LINES, R4_MANUAL_EVENT_LINES, R4_THIRD_SUMMARY_LINE } from './fixtures/r4-compaction'
 import { createAdapter } from './adapter'
 import { PRESET_BUNDLES } from './permission-presets'
@@ -2657,6 +2658,110 @@ describe('适配层的命令面映射', () => {
         .map(event => (event['data'] as { turn: number }).turn),
     )
     expect([...turnNumbers]).toEqual([1])
+  })
+
+  it('run_started 给 attach 路径兜底回合号：run 是用户回合，turn 仍是采样步', async () => {
+    // 反向对照：把 `run_started` 当成普通事件忽略（不记 pendingRun），附件路径会按本层
+    // 自增编号得出 turn=1，而不是宿主说的第 3 个用户回合——这里必红。
+    const bridge = scriptedBridge()
+    const adapter = createAdapter({ bridge })
+    const session = faceOf(adapter.remote).session
+    // 没有 prompt：模拟 attach 到别的窗口已经在跑的会话（本层没有用户提问可数）。
+    bridge.emit('agent-attach', { type: 'run_started', run: 3 })
+    bridge.emit('agent-attach', { type: 'turn_started', turn: 2 })
+    bridge.emit('agent-attach', { type: 'agent_message_delta', delta: '继续' })
+
+    const iterator = session.follow({ address: { kind: 'session', sessionId: 'agent-attach' } })
+    const events = eventsOf((await iterator.next()).value as Record<string, unknown>)
+    await iterator.return?.(undefined)
+    adapter.dispose()
+
+    const turns = events
+      .filter(event => event['type'] === 'turn/start')
+      .map(event => (event['data'] as { turn: number }).turn)
+    expect(turns).toEqual([3])
+    const steps = events
+      .filter(event => event['type'] === 'step/start')
+      .map(event => (event['data'] as { step: number }).step)
+    expect(steps).toEqual([0])
+  })
+
+  it('实时 = 重开 = 导出：同一提问两步的回合/步口径四处一致（D11）', async () => {
+    // D11 的端到端判据：一条用例同时钉住四个来源——
+    // ① 实时事件（adapter）；② 重开档案重建（adapter）；③ 导出（`sessionEntriesToEvents`，
+    // ZIP 与 Markdown 共用同一份翻译）；④ 档案行本身（rollout 形状由 Rust 侧
+    // `turn_end_turn_is_user_turn_not_sampling_iteration` 同场景锁定：turn=1、iterations=2）。
+    // 四处对不上，就是「实时 4 轮、导出 3 轮」那类事故的原貌。
+    const liveBridge = scriptedBridge()
+    const live = createAdapter({ bridge: liveBridge })
+    const liveSession = faceOf(live.remote).session
+    await liveSession.prompt({
+      sessionId: 'agent-e2e',
+      requestId: 'rpc-e2e',
+      content: [{ type: 'text', text: '两步任务' }],
+    })
+    liveBridge.emit('agent-e2e', { type: 'run_started', run: 1 })
+    liveBridge.emit('agent-e2e', { type: 'turn_started', turn: 1 })
+    liveBridge.emit('agent-e2e', { type: 'agent_message_delta', delta: '先看' })
+    liveBridge.emit('agent-e2e', { type: 'tool_call_begin', call_id: 'c1', tool: 'read_file', args: {} })
+    liveBridge.emit('agent-e2e', { type: 'tool_call_end', call_id: 'c1', exit_code: 0, error: null, result: 'ok' })
+    liveBridge.emit('agent-e2e', { type: 'turn_started', turn: 2 })
+    liveBridge.emit('agent-e2e', { type: 'agent_message_delta', delta: '改好了' })
+    liveBridge.emit('agent-e2e', { type: 'turn_completed', turn: 2, reason: 'completed' })
+
+    const liveIterator = liveSession.follow({ address: { kind: 'session', sessionId: 'agent-e2e' } })
+    const liveEvents = eventsOf((await liveIterator.next()).value as Record<string, unknown>)
+    await liveIterator.return?.(undefined)
+    live.dispose()
+
+    // 同一任务落进档案的形状（Rust 侧写的就是这些行）。
+    const archive = [
+      { kind: 'message', role: 'user', text: '两步任务', at_ms: 1 },
+      { kind: 'message', role: 'assistant', text: '先看', at_ms: 2 },
+      { kind: 'tool_call', call_id: 'c1', tool: 'read_file', arguments: '{}', output: 'ok', at_ms: 3 },
+      { kind: 'message', role: 'assistant', text: '改好了', at_ms: 4 },
+      { kind: 'turn_end', turn: 1, task_id: 'agent#1', iterations: 2, reason: 'completed', at_ms: 5 },
+    ] as const
+    const reopened = createAdapter({ bridge: scriptedBridge(undefined, archive as unknown as never[]) })
+    const replayIterator = faceOf(reopened.remote).session.follow({
+      address: { kind: 'session', sessionId: 'agent-e2e' },
+    })
+    const replayEvents = eventsOf((await replayIterator.next()).value as Record<string, unknown>)
+    await replayIterator.return?.(undefined)
+    reopened.dispose()
+
+    type Row = Record<string, unknown>
+    const summarize = (events: Row[]) => ({
+      turns: events
+        .filter(event => event['type'] === 'turn/start')
+        .map(event => (event['data'] as { turn: number }).turn),
+      steps: events.filter(event => event['type'] === 'step/start').length,
+      ends: events
+        .filter(event => event['type'] === 'turn/end')
+        .map(event => {
+          const data = event['data'] as { turn: number; reason: { kind: string } | string }
+          return {
+            turn: data.turn,
+            reason: typeof data.reason === 'string' ? data.reason : data.reason.kind,
+          }
+        }),
+    })
+    const liveSummary = summarize(liveEvents as unknown as Row[])
+    const replaySummary = summarize(replayEvents as unknown as Row[])
+
+    // ③ 导出：ZIP/Markdown 共用的翻译（没有 step/start，回合与结局必须逐条相同）。
+    const exported = sessionEntriesToEvents(archive as unknown as never[], '两步任务')
+    const exportSummary = summarize(exported as unknown as Row[])
+
+    // ④ 档案行：回合号 = 1，步总数 = 2，与实时事件的步数一致。
+    const archivedEnd = archive.find(row => row.kind === 'turn_end')
+    expect(liveSummary).toEqual({ turns: [1], steps: 2, ends: [{ turn: 1, reason: 'completed' }] })
+    expect(replaySummary).toEqual(liveSummary)
+    expect({ turns: exportSummary.turns, ends: exportSummary.ends }).toEqual({
+      turns: liveSummary.turns,
+      ends: liveSummary.ends,
+    })
+    expect(archivedEnd?.iterations).toBe(liveSummary.steps)
   })
 
   it('重开档案按结局行收口：失败回合不会在回放里变成 completed', async () => {

@@ -1,0 +1,24 @@
+   Compiling shaniu v0.2.8 (D:\MyWorkspace\SHANIU\src-tauri)
+    Finished `test` profile [unoptimized + debuginfo] target(s) in 24.71s
+     Running unittests src\lib.rs (target\debug\build\shaniu/3347eb12c1517f2a\out\shaniu_lib-3347eb12c1517f2a.exe)
+
+running 1 test
+test agent_loop::tests::turn_end_turn_is_user_turn_not_sampling_iteration ... FAILED
+
+failures:
+
+---- agent_loop::tests::turn_end_turn_is_user_turn_not_sampling_iteration stdout ----
+
+thread 'agent_loop::tests::turn_end_turn_is_user_turn_not_sampling_iteration' (11828) panicked at src\agent_loop\mod.rs:5606:9:
+assertion `left == right` failed: 一次用户提问只发一条 run_started，run = 用户回合号
+  left: []
+ right: [1]
+note: run with `RUST_BACKTRACE=1` environment variable to display a backtrace
+
+
+failures:
+    agent_loop::tests::turn_end_turn_is_user_turn_not_sampling_iteration
+
+test result: FAILED. 0 passed; 1 failed; 0 ignored; 0 measured; 1131 filtered out; finished in 0.63s
+
+error: test failed, to rerun pass `--lib`

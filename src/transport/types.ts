@@ -175,9 +175,11 @@ export type VerifyState = 'passed' | 'failed' | { inconclusive: InconclusiveReas
  *
  * 口径提醒：`turn_started` / `turn_completed` 的 `turn` 是**本回合内的采样迭代号**
  * （= DSH 的 step），与档案 `TurnEnd.turn`（1 起用户回合号）同名不同义。
- * 消费方不得把两者互相比较或赋值——step 只由迭代号推导，回合号只由本层计数。
+ * 消费方不得把两者互相比较或赋值——step 只由迭代号推导，回合号由 `run_started.run`
+ * 给出（D11，与档案 `TurnEnd.turn` 同口径）；没有 `run_started` 时才由本层按用户提问计数。
  */
 export type EventMsg =
+  | { type: 'run_started'; run: number }
   | { type: 'turn_started'; turn: number }
   | { type: 'turn_completed'; turn: number; reason: TurnEndReason; error?: TurnErrorInfo; unverified?: boolean }
   | { type: 'verification_result'; turn: number; state: VerifyState; commands: string[]; duration_ms: number; summary: string; diagnostics: string[] }

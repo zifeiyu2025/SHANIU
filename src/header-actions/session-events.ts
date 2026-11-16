@@ -20,7 +20,9 @@
  * ① `seq` 是本地合成的单调值，不是真实日志序号（formatter 不读，仅用于满足类型）；
  * ② `assistant/message` 的 `source`（provider/model 溯源）在 SHANIU 档案里没有等价物，
  *    填最小合法形状——formatter 只读 `content`，读不到这部分；
- * ③ `step` 恒为 1：档案不记步号，而 formatter 的分段只用 turn，不用 step。
+ * ③ `step` 恒为 1：档案只在结局行记本回合**总步数**（`TurnEnd.iterations`），不记每条
+ *    条目属于第几步；formatter 的分段也只读 turn，不读 step。不要拿 `iterations` 去
+ *    反推条目步号——那是编造。
  *
  * **与实时回放（`transport/adapter.ts`）的字段集不同是有意为之**：实时路径要覆盖
  * journal 的全部语义（reasoning 流、工具参数、用量），导出只保留可读正文——

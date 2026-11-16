@@ -83,6 +83,14 @@ const RULES: &[Rule] = &[
         overrides: &[],
     },
     // ── EventMsg ────────────────────────────────────────────────────────────
+    Rule {
+        owner: "EventMsg",
+        variant: "RunStarted",
+        fields: "run",
+        // D11：`run` 是用户回合号（与档案 TurnEnd.turn 同口径）。前端在 attach/续跑路径
+        // 没有用户提问可数时用它兜底 openTask 的回合号。
+        overrides: &[],
+    },
     Rule { owner: "EventMsg", variant: "TurnStarted", fields: "turn", overrides: &[] },
     Rule {
         owner: "EventMsg",

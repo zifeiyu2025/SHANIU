@@ -1121,6 +1121,28 @@ impl AgentLoop {
         let skill_catalog = crate::skills::catalog_lines(&skill_summaries, 500);
         let has_model_skills = skill_summaries.iter().any(|skill| skill.model_invocable);
 
+        // D11：用户回合号在事件面单独给一条起点。`turn_started.turn` 是采样步号，不能
+        // 拿来当回合号；`run` 与档案 `TurnEnd.turn` 同口径（已落档提问数 + 本次待落档
+        // 提问数），多步提问也不会漂。没有新提问（纯续跑）不发——那不是新回合开始。
+        let pending_user_turns = history[*recorded..]
+            .iter()
+            .filter(|item| {
+                matches!(
+                    item,
+                    HistoryItem::Message { role: Role::User, .. }
+                        | HistoryItem::ImageMessage { role: Role::User, .. }
+                )
+            })
+            .count() as u32;
+        if pending_user_turns > 0 {
+            let run = rollout
+                .as_ref()
+                .map(|writer| writer.user_turns())
+                .unwrap_or(0)
+                + pending_user_turns;
+            emit(&sink, EventMsg::RunStarted { run });
+        }
+
         'outer: for turn in 1..=self.max_turns {
             last_turn = turn;
             turn_error = None;
@@ -3514,6 +3536,8 @@ mod tests {
         assert_eq!(summary.reason, TurnEndReason::Completed);
         let events = store.lock().unwrap();
         let tags: Vec<&str> = events.iter().map(|e| match e {
+            // D11：用户回合起点必须先于第一条采样步（`turn_started` 是步号，不是回合号）。
+            EventMsg::RunStarted { .. } => "run_started",
             EventMsg::TurnStarted { .. } => "turn_started",
             // 提示词入轨迹：首个 turn 在实际下发前记一条（每个 run 恰好一次）。
             EventMsg::SystemPrompt { .. } => "system_prompt",
@@ -3522,7 +3546,7 @@ mod tests {
             EventMsg::TurnCompleted { .. } => "turn_completed",
             other => panic!("意外事件: {other:?}"),
         }).collect();
-        assert_eq!(tags, ["turn_started", "system_prompt", "delta", "usage", "turn_completed"]);
+        assert_eq!(tags, ["run_started", "turn_started", "system_prompt", "delta", "usage", "turn_completed"]);
     }
 
     /// 停止钩子连续阻止收工有硬顶：ZCode 硬顶 3 次，我们同样写死 3 次
@@ -5525,10 +5549,13 @@ mod tests {
         let _ = std::fs::remove_dir_all(&dir);
     }
 
-    /// Phase 2：`TurnEnd.turn` 数的是**用户回合**，不是采样迭代。
+    /// Phase 2 / D11：事件面与档案对「回合 / 步」给出同一份口径。
+    ///
+    /// - 用户回合号：`RunStarted.run` = 档案 `TurnEnd.turn`；
+    /// - 采样步号：`TurnStarted.turn` / `TurnCompleted.turn`，本次 run 的步总数只进 `iterations`。
     ///
     /// 反向对照：把收口写入改回 `turn: last_turn`，本用例得 2（采样迭代数）而不是 1，必红；
-    /// 把 `task_id` 改成 `None`，前半条断言同样红。
+    /// 把 `task_id` 改成 `None`，前半条断言同样红；撤掉 `RunStarted` 的发送，事件侧断言必红。
     #[tokio::test]
     async fn turn_end_turn_is_user_turn_not_sampling_iteration() {
         let dir = std::env::temp_dir().join(format!(
@@ -5561,8 +5588,36 @@ mod tests {
             ],
         ]);
         agent.rollout = Some(writer.clone());
+        let events = store.clone();
 
         agent.run_task("唯一问题", Arc::new(CapturingSink(store)), cancel).await;
+
+        // D11：事件面与档案必须给出**同一份口径**——`run_started.run` / `TurnEnd.turn`
+        // 是用户回合号（1）；`turn_started.turn` / `turn_completed.turn` 是采样步号
+        // （两步 → 1、2）。任何一边退回另一边的编号，这里都会红。
+        let events = events.lock().unwrap();
+        let runs: Vec<u32> = events
+            .iter()
+            .filter_map(|event| match event {
+                EventMsg::RunStarted { run } => Some(*run),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(runs, [1], "一次用户提问只发一条 run_started，run = 用户回合号");
+        let steps: Vec<u32> = events
+            .iter()
+            .filter_map(|event| match event {
+                EventMsg::TurnStarted { turn } => Some(*turn),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(steps, [1, 2], "turn_started.turn 是采样步号，两步就要两条");
+        let completed = events.iter().find_map(|event| match event {
+            EventMsg::TurnCompleted { turn, .. } => Some(*turn),
+            _ => None,
+        });
+        assert_eq!(completed, Some(2), "turn_completed.turn 是最后一步的步号，不冒充回合号");
+        drop(events);
 
         let text = std::fs::read_to_string(writer.path()).unwrap();
         let last = text.lines().rev().find(|line| !line.trim().is_empty()).unwrap();

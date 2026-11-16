@@ -355,6 +355,14 @@ interface Journal {
    * 用户回合号只由本层计数。任何一边都不去读另一边的值，避免两个口径互相借值。
    */
   iterations: number
+  /**
+   * 宿主给出的权威用户回合号（`run_started.run`，D11，与档案 `TurnEnd.turn` 同口径）。
+   *
+   * 只在本层**尚未开回合**时生效：`resume_session` 续跑/中途 attach 时本层没有用户提问
+   * 可数，宿主是唯一权威。已经由 prompt 开过回合时不改写已发出的 `turn/start`（那会让
+   * 推给客户端的事件序列自相矛盾），两个口径不一致时留痕而不是静默。
+   */
+  pendingRun?: number
   taskOpen: boolean
   /**
    * 重建档案时宿主运行态查询失败（IPC 异常）。它只用于避免把用户消息压进
@@ -1796,7 +1804,10 @@ export function createAdapter(options: AdapterOptions): { remote: unknown; dispo
   }
 
   const openTask = (journal: Journal): void => {
-    journal.turn += 1
+    // 宿主给过回合号（`run_started`）就以它为准：attach/续跑路径本层没有用户提问可数，
+    // 自增出来的号可能比档案少（D11）。用完即清，绝不跨回合借用。
+    journal.turn = journal.pendingRun ?? journal.turn + 1
+    journal.pendingRun = undefined
     journal.step = 0
     journal.iterations = 0
     journal.taskOpen = true
@@ -2350,14 +2361,28 @@ export function createAdapter(options: AdapterOptions): { remote: unknown; dispo
     if (event.event_id !== '') journal.lastEventId = event.event_id
     journal.lastFrameAt = now()
     switch (msg.type) {
+      case 'run_started': {
+        // D11：宿主给出的用户回合号。`turn_started.turn` 是采样步号（同一次提问可能多步），
+        // 不能当回合号用。只在尚未开回合时记录（openTask 采纳）；已开回合时对账但不改写。
+        if (journal.taskOpen) {
+          if (msg.run !== journal.turn) {
+            console.warn(
+              `[SHANIU] 会话 ${sessionId} 的回合号与宿主不一致：本地 ${journal.turn}，宿主 ${msg.run}`,
+            )
+          }
+          return
+        }
+        journal.pendingRun = msg.run
+        return
+      }
       case 'turn_started': {
         // 首条用户消息在本层落地时就开了回合（照 mock 的既定顺序：turn/start →
         // step/start → user/message，输入行必须落在回合内，否则回合头不显示用时）。
         // 因此后端的第一次 turn_started 通常是空操作；从第二次起才推进 step——
         // 后端每个采样迭代都发 turn_started，它对应 DSH 的 step 而不是 DSH 的回合。
         //
-        // step 号由 `iterations`（事件面 turn 的语义：采样迭代号）推导，用户回合号
-        // `journal.turn` 只由本层计数，两者不互相借值。
+        // step 号由 `iterations`（事件面 turn 的语义：采样迭代号）推导；用户回合号
+        // `journal.turn` 只由本层计数（宿主给了 `run_started` 时由它兜底），两者不互相借值。
         if (!journal.taskOpen) {
           openTask(journal)
           // 这一帧就是本回合的第一次采样（后端从 1 起编号）。

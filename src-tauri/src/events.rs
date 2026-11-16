@@ -274,6 +274,14 @@ fn is_false(value: &bool) -> bool {
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(tag = "type", rename_all = "snake_case")]
 pub enum EventMsg {
+    /// 用户回合开始（D11）：一次提问 = 一个回合，`run` 是 1 起的用户回合号，
+    /// 与档案 `TurnEnd.turn` 同口径；紧随其后的是本回合第一条 `TurnStarted`。
+    ///
+    /// 为什么不能拿 `TurnStarted.turn` 当回合号：那是**采样步号**（同一提问内的第几次
+    /// 模型请求），一个提问可能有多个步。事件面此前没有回合边界，导出/CLI/评测/崩溃
+    /// 复盘只能靠数用户消息去猜归属。新事件是 additive：载荷没改任何旧字段（FF-104），
+    /// 旧消费端不认识就忽略；纯续跑（没有新提问）不发——那不是"新回合开始"。
+    RunStarted { run: u32 },
     TurnStarted { turn: u32 },
     TurnCompleted {
         turn: u32,
