@@ -559,10 +559,14 @@ impl AclManager {
             return Ok(ScopeGrant::AlreadyPresent);
         }
         let mask = Access::Write.mask();
-        if has_explicit_grant(&normalized, sid, mask)? {
+        // 幂等口径是「恰好一条、掩码与期望**完全一致**」，不是「覆盖即可」。
+        // 只判覆盖会让旧版本写下的掩码（含已废弃的 `FILE_DELETE_CHILD`）永远命中、
+        // 永远不收敛——升级后的机器等于还在用旧权限位。
+        let state = explicit_grant_state(&normalized, sid, SUB_CONTAINERS_AND_OBJECTS_INHERIT)?;
+        if state.is_exact(mask) {
             tracing::info!(
                 dir = %normalized.display(),
-                "目录已有容器 SID 的显式 ACE，跳过改写（持久授权命中）"
+                "目录已有与期望一致的显式 ACE，跳过改写（持久授权命中）"
             );
             self.remember_persistent(&normalized, &sid_text);
             self.granted.insert((normalized, sid_text, Access::Write));
@@ -571,8 +575,23 @@ impl AclManager {
 
         // 写之前记一次「这个 SID 有没有任何显式 ACE」：卸载只许删 `existed_before=false` 的。
         let existed_before = has_any_explicit_grant(&normalized, sid)?;
-        match apply_grant(&normalized, sid, mask, SUB_CONTAINERS_AND_OBJECTS_INHERIT) {
+        // 有旧掩码 → 确定性替换（`SetEntriesInAcl` 只会按位或合并，减不掉权限）；
+        // 没有 → 普通追加。两者只在「怎么把期望掩码落盘」上不同。
+        let applied = if state.count > 0 {
+            replace_explicit_grant(&normalized, sid, mask, SUB_CONTAINERS_AND_OBJECTS_INHERIT)
+        } else {
+            apply_grant(&normalized, sid, mask, SUB_CONTAINERS_AND_OBJECTS_INHERIT)
+        };
+        match applied {
             Ok(()) => {
+                if state.count > 0 {
+                    tracing::info!(
+                        dir = %normalized.display(),
+                        old_mask = state.union,
+                        new_mask = mask,
+                        "旧写授权掩码已收敛到当前口径"
+                    );
+                }
                 self.audit(
                     "grant",
                     &normalized,
@@ -795,13 +814,16 @@ impl AclManager {
         }
         let mask = access.mask();
 
-        // 幂等：磁盘上已有该容器 SID 的显式 ACE 且掩码够用时，不改写 DACL、不写备份。
+        // 幂等：磁盘上已有该容器 SID 的显式 ACE 且掩码**与期望完全一致**时，不改写
+        // DACL、不写备份。只判「覆盖」会让旧掩码（含已废弃的 `FILE_DELETE_CHILD`）
+        // 永远停在磁盘上——升级后的目录等于没收敛。
         // 这种 ACE 来自上次运行残留或外部手工设置，视为外部授权——退出时也不撤销，
         // 避免误删同时运行的另一个实例正在使用的授权。
-        if has_explicit_grant(&normalized, sid, mask)? {
+        let state = explicit_grant_state(&normalized, sid, inheritance)?;
+        if state.is_exact(mask) {
             tracing::info!(
                 dir = %normalized.display(),
-                "目录已有容器 SID 的显式 ACE，跳过改写（幂等，避免触发文件监听器重扫）"
+                "目录已有与期望一致的显式 ACE，跳过改写（幂等，避免触发文件监听器重扫）"
             );
             self.granted.insert((normalized, sid_text, access));
             return Ok(false);
@@ -831,7 +853,13 @@ impl AclManager {
             true
         };
 
-        if let Err(error) = apply_grant(&normalized, sid, mask, inheritance) {
+        let applied = if state.count > 0 {
+            // 旧掩码收敛：先删同继承形态的旧 ACE，再写新的（见 `replace_explicit_grant`）。
+            replace_explicit_grant(&normalized, sid, mask, inheritance)
+        } else {
+            apply_grant(&normalized, sid, mask, inheritance)
+        };
+        if let Err(error) = applied {
             if should_degrade(tolerate_denied, &error) {
                 // 祖先链专用：权限不足只会「少给」，不会放宽，因此降级而不是 fail-closed。
                 //
@@ -1230,6 +1258,131 @@ pub(crate) fn has_any_explicit_grant(path: &Path, sid: PSID) -> Result<bool, Str
     has_explicit_grant(path, sid, 0)
 }
 
+/// 一条 `(路径, SID)` 在当前**继承形态**下的显式允许 ACE 摘要。
+///
+/// 为什么按继承形态分桶：同一个对象上可能同时有祖先 `(RA,S)`（不继承）与
+/// 写授权（可继承）两条同 SID 的 ACE，用途不同；收敛写授权时不能把祖先那条一起删。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) struct ExplicitGrantState {
+    /// 命中的 ACE 条数。
+    pub(crate) count: usize,
+    /// 命中 ACE 的掩码并集。
+    pub(crate) union: u32,
+}
+
+impl ExplicitGrantState {
+    /// 是否「恰好一条、掩码与期望完全一致」——只有这种状态才允许跳过改写。
+    fn is_exact(self, mask: u32) -> bool {
+        self.count == 1 && self.union == mask
+    }
+}
+
+/// 读出该 SID 在对象上、与 `inheritance` **同继承形态**的显式允许 ACE 摘要。
+///
+/// 与 [`has_explicit_grant`] 的差别：那个只判「掩码覆盖」，用来回答「够不够用」；
+/// 这个回答「磁盘上到底是不是我们期望的那一条」，供幂等判定与旧掩码收敛使用。
+pub(crate) fn explicit_grant_state(
+    path: &Path,
+    sid: PSID,
+    inheritance: ACE_FLAGS,
+) -> Result<ExplicitGrantState, String> {
+    let snapshot = read_dacl_snapshot(path)?;
+    let (dacl, info) = snapshot_dacl(path, &snapshot)?;
+    let bytes = unsafe { std::slice::from_raw_parts(dacl as *const u8, info.AclBytesInUse as usize) };
+
+    let mut state = ExplicitGrantState { count: 0, union: 0 };
+    for ace in ace_slices(path, bytes, info.AceCount)? {
+        if is_explicit_allow_ace(ace, sid, Some(inheritance)) {
+            state.count += 1;
+            state.union |= ace_mask(ace);
+        }
+    }
+    Ok(state)
+}
+
+/// 从自相对安全描述符里取出 DACL 指针与 ACL 信息；NULL DACL 直接报错。
+///
+/// 返回的指针指向 `snapshot` 内部，生命周期由调用方持有的快照决定。
+fn snapshot_dacl(path: &Path, snapshot: &[u8]) -> Result<(*mut ACL, ACL_SIZE_INFORMATION), String> {
+    let descriptor = PSECURITY_DESCRIPTOR(snapshot.as_ptr() as *mut c_void);
+    let mut present = BOOL(0);
+    let mut defaulted = BOOL(0);
+    let mut dacl: *mut ACL = std::ptr::null_mut();
+    unsafe { GetSecurityDescriptorDacl(descriptor, &mut present, &mut dacl, &mut defaulted) }
+        .map_err(|error| format!("解析「{}」的 DACL 失败: {error}", path.display()))?;
+    if !present.as_bool() || dacl.is_null() {
+        // NULL DACL = 所有人完全控制。这种状态本身异常，不往上叠 ACE 掩盖它。
+        return Err(format!(
+            "「{}」的 DACL 为 NULL（所有人完全控制），拒绝在其上叠加沙箱 ACE",
+            path.display()
+        ));
+    }
+    let mut info = ACL_SIZE_INFORMATION::default();
+    unsafe {
+        GetAclInformation(
+            dacl,
+            &mut info as *mut ACL_SIZE_INFORMATION as *mut c_void,
+            std::mem::size_of::<ACL_SIZE_INFORMATION>() as u32,
+            AclSizeInformation,
+        )
+    }
+    .map_err(|error| format!("读取「{}」的 ACL 信息失败: {error}", path.display()))?;
+    Ok((dacl, info))
+}
+
+/// ACL 头 8 字节：AclRevision(1) Sbz1(1) AclSize(2) AceCount(2) Sbz2(2)。
+const ACL_HEADER_LEN: usize = 8;
+
+/// 把一段 DACL 字节拆成逐条 ACE 的切片；越界或长度异常都算结构损坏（fail-closed）。
+fn ace_slices<'a>(path: &Path, dacl: &'a [u8], count: u32) -> Result<Vec<&'a [u8]>, String> {
+    let mut slices = Vec::with_capacity(count as usize);
+    let mut offset = ACL_HEADER_LEN;
+    for index in 0..count {
+        let rest = dacl
+            .get(offset..)
+            .ok_or_else(|| format!("「{}」第 {} 条 ACE 越界", path.display(), index + 1))?;
+        let ace_size = rest
+            .get(2..4)
+            .map(|bytes| u16::from_le_bytes([bytes[0], bytes[1]]) as usize)
+            .ok_or_else(|| format!("「{}」ACE 头被截断", path.display()))?;
+        if ace_size < 4 || offset + ace_size > dacl.len() {
+            return Err(format!(
+                "「{}」第 {} 条 ACE 长度异常（{ace_size}）",
+                path.display(),
+                index + 1
+            ));
+        }
+        slices.push(&dacl[offset..offset + ace_size]);
+        offset += ace_size;
+    }
+    Ok(slices)
+}
+
+/// 该 ACE 是否是「指定 SID 的显式允许 ACE」；给 `inheritance` 时还要求继承位完全一致。
+///
+/// 继承来的 ACE（`INHERITED_ACE`，父目录下发）一律排除：撤销与收敛都只碰我们写在本对象
+/// 上的那一条，删掉别人的继承 ACE 会连父目录的授权一起改掉。
+fn is_explicit_allow_ace(ace: &[u8], sid: PSID, inheritance: Option<ACE_FLAGS>) -> bool {
+    // 0 = ACCESS_ALLOWED_ACE_TYPE；SID 从第 8 字节开始（Header 4 + Mask 4）。
+    if ace.len() < 8 || ace[0] != 0 {
+        return false;
+    }
+    if ace[1] & INHERITED_ACE.0 as u8 != 0 {
+        return false;
+    }
+    if let Some(expected) = inheritance {
+        if ace[1] & !(INHERITED_ACE.0 as u8) != expected.0 as u8 {
+            return false;
+        }
+    }
+    unsafe { EqualSid(PSID(ace.as_ptr().add(8) as *mut c_void), sid).is_ok() }
+}
+
+/// ACE 的访问掩码（`Header` 4 字节之后的 4 字节）。
+fn ace_mask(ace: &[u8]) -> u32 {
+    u32::from_le_bytes([ace[4], ace[5], ace[6], ace[7]])
+}
+
 /// 受保护子路径上是否已有容器 SID 的显式**拒绝** ACE（掩码覆盖 `mask`）。
 ///
 /// 只给 D7 的幂等判定用：每次启动按真实 DACL 探测，命中就跳过写，避免同一目录上
@@ -1316,6 +1469,7 @@ unsafe fn scan_acl_for_ace_type(
 
 /// `apply_grant` 的失败：`access_denied` 让调用方区分「没有写 DACL 的权限」
 /// （设备对象只有管理员能改，可降级上报）与真正的错误（fail-closed）。
+#[derive(Debug)]
 pub(crate) struct GrantFailure {
     pub(crate) access_denied: bool,
     pub(crate) message: String,
@@ -1372,6 +1526,17 @@ pub(crate) fn apply_deny(path: &Path, sid: PSID) -> Result<(), GrantFailure> {
     apply_entry(path, sid, DENY_WRITE_MASK, inheritance, DENY_ACCESS)
 }
 
+/// 统一构造授权失败：只有 `ERROR_ACCESS_DENIED` 才算「权限不足」，其余都 fail-closed。
+fn grant_failure(
+    message: String,
+    status: windows::Win32::Foundation::WIN32_ERROR,
+) -> GrantFailure {
+    GrantFailure {
+        access_denied: status == windows::Win32::Foundation::ERROR_ACCESS_DENIED,
+        message,
+    }
+}
+
 /// `apply_grant` / `apply_deny` 的唯一实现：差别只在 `grfAccessMode`。
 fn apply_entry(
     path: &Path,
@@ -1380,10 +1545,7 @@ fn apply_entry(
     inheritance: ACE_FLAGS,
     mode: ACCESS_MODE,
 ) -> Result<(), GrantFailure> {
-    let denied = |message: String, status: windows::Win32::Foundation::WIN32_ERROR| GrantFailure {
-        access_denied: status == windows::Win32::Foundation::ERROR_ACCESS_DENIED,
-        message,
-    };
+    let denied = grant_failure;
     let name = wide(path.as_os_str());
     let mut descriptor = PSECURITY_DESCRIPTOR(std::ptr::null_mut());
     let mut old_dacl: *mut ACL = std::ptr::null_mut();
@@ -1466,92 +1628,105 @@ fn apply_entry(
     Ok(())
 }
 
-/// 精确撤销：删掉这一条 `(路径, SID)` 的**显式** ACE（allow 与 deny 都删），
-/// 其它 ACE 原样保留、顺序不变。返回是否真的删掉了东西。
+/// 把该 SID 在**这一继承形态**下的显式允许 ACE 收敛成恰好 `mask` 一条。
 ///
-/// **为什么不用 `REVOKE_ACCESS`**：Win32 文档写明它只移除
-/// `ACCESS_ALLOWED_ACE` / `SYSTEM_AUDIT_ACE`，**不动 `ACCESS_DENIED_ACE`**
-/// （见 ACCESS_MODE 枚举）。D7 的只读保护恰好是 deny ACE，用 `REVOKE_ACCESS`
-/// 卸载会「调用成功、ACE 还在」，`.git` 永久停在只读状态（T10 用例实测
-/// `considered=1 revoked=0 unchanged=1`）。这里改成确定性重建：逐条复制 ACE，
-/// 跳过匹配项，再把新 DACL 写回。
+/// 为什么不直接用 `apply_grant`：`SetEntriesInAclW` 会把新条目与同一 trustee 的旧 ACE
+/// **按位或**合并——只能加权限、不能减权限。旧版本给写授权多带了一位
+/// `FILE_DELETE_CHILD`（父目录允许删子项，会绕过 `.git` 上的 deny ACE），靠合并永远
+/// 收不回来。所以先按 [`rebuild_acl_without`] 把旧条目删掉，再用 `SetEntriesInAclW`
+/// 把新条目合进**保留其它 ACE（含继承 ACE、别的 trustee、祖先 `(RA,S)`）** 的 ACL，
+/// 只调一次 `SetNamedSecurityInfoW` 写回。
 ///
-/// 继承来的 ACE 一律保留：它们由父目录下发，本就删不掉；写回时原样带回，
-/// 才不会让「重建」顺手抹掉父目录的授权。
-///
-/// `pub(crate)`：设备对象（`\Device\Null`，SH-064 B）也要按 SID 精确撤销，
-/// 但它没有 `exists()`、也不进目录备份台账，所以走不了 `AclManager::revoke`。
-pub(crate) fn revoke_ace(path: &Path, sid: PSID) -> Result<bool, String> {
-    let name = wide(path.as_os_str());
-    let snapshot = read_dacl_snapshot(path)?;
+/// 幂等：磁盘上已无同形态旧 ACE 时直接返回 `Ok(())`，不写 DACL。
+pub(crate) fn replace_explicit_grant(
+    path: &Path,
+    sid: PSID,
+    mask: u32,
+    inheritance: ACE_FLAGS,
+) -> Result<(), GrantFailure> {
+    let snapshot = read_dacl_snapshot(path)
+        .map_err(|message| GrantFailure { access_denied: false, message })?;
+    let pruned = rebuild_acl_without(path, &snapshot, |ace| {
+        is_explicit_allow_ace(ace, sid, Some(inheritance))
+    })
+    .map_err(|message| GrantFailure { access_denied: false, message })?;
+    let Some(pruned) = pruned else {
+        // 没有可替换的旧 ACE（例如另一个进程刚收敛完）：不误报，也不白写一次 DACL。
+        return Ok(());
+    };
 
-    // ---- 1. 从快照里取出 DACL 本体（自相对格式内的 ACL 结构） ----
-    let descriptor = PSECURITY_DESCRIPTOR(snapshot.as_ptr() as *mut c_void);
-    let mut present = BOOL(0);
-    let mut defaulted = BOOL(0);
-    let mut dacl: *mut ACL = std::ptr::null_mut();
-    unsafe { GetSecurityDescriptorDacl(descriptor, &mut present, &mut dacl, &mut defaulted) }
-        .map_err(|error| format!("解析「{}」的 DACL 失败: {error}", path.display()))?;
-    if !present.as_bool() || dacl.is_null() {
-        return Err(format!(
-            "「{}」的 DACL 为 NULL（所有人完全控制），拒绝撤销",
-            path.display()
+    let entry = EXPLICIT_ACCESS_W {
+        grfAccessPermissions: mask,
+        grfAccessMode: GRANT_ACCESS,
+        grfInheritance: inheritance,
+        Trustee: TRUSTEE_W {
+            pMultipleTrustee: std::ptr::null_mut(),
+            MultipleTrusteeOperation: NO_MULTIPLE_TRUSTEE,
+            TrusteeForm: TRUSTEE_IS_SID,
+            TrusteeType: TRUSTEE_IS_UNKNOWN,
+            ptstrName: PWSTR(sid.0.cast::<u16>()),
+        },
+    };
+    let mut new_acl: *mut ACL = std::ptr::null_mut();
+    let status = unsafe {
+        SetEntriesInAclW(
+            Some(std::slice::from_ref(&entry)),
+            Some(pruned.as_ptr().cast::<ACL>()),
+            &mut new_acl,
+        )
+    };
+    if status != ERROR_SUCCESS {
+        return Err(grant_failure(
+            format!("构造收敛后的 DACL 失败（Win32 错误 {}）", status.0),
+            status,
         ));
     }
-    let mut info = ACL_SIZE_INFORMATION::default();
-    unsafe {
-        GetAclInformation(
-            dacl,
-            &mut info as *mut ACL_SIZE_INFORMATION as *mut c_void,
-            std::mem::size_of::<ACL_SIZE_INFORMATION>() as u32,
-            AclSizeInformation,
+
+    let name = wide(path.as_os_str());
+    let status = unsafe {
+        SetNamedSecurityInfoW(
+            PCWSTR(name.as_ptr()),
+            SE_FILE_OBJECT,
+            DACL_SECURITY_INFORMATION,
+            None,
+            None,
+            Some(new_acl as *const ACL),
+            None,
         )
+    };
+    unsafe {
+        let _ = LocalFree(Some(HLOCAL(new_acl.cast::<c_void>())));
     }
-    .map_err(|error| format!("读取「{}」的 ACL 信息失败: {error}", path.display()))?;
-    let old = unsafe { std::slice::from_raw_parts(dacl as *const u8, info.AclBytesInUse as usize) };
-
-    // ---- 2. 逐条判定：只删「非继承 + 基础类型 + SID 匹配」的 ACE ----
-    // ACL 头 8 字节：AclRevision(1) Sbz1(1) AclSize(2) AceCount(2) Sbz2(2)。
-    const ACL_HEADER_LEN: usize = 8;
-    let mut kept: Vec<&[u8]> = Vec::with_capacity(info.AceCount as usize);
-    let mut removed = 0usize;
-    let mut offset = ACL_HEADER_LEN;
-    for index in 0..info.AceCount {
-        let rest = old
-            .get(offset..)
-            .ok_or_else(|| format!("「{}」第 {} 条 ACE 越界", path.display(), index + 1))?;
-        let ace_size = rest
-            .get(2..4)
-            .map(|bytes| u16::from_le_bytes([bytes[0], bytes[1]]) as usize)
-            .ok_or_else(|| format!("「{}」ACE 头被截断", path.display()))?;
-        if ace_size < 4 || offset + ace_size > old.len() {
-            return Err(format!(
-                "「{}」第 {} 条 ACE 长度异常（{ace_size}）",
+    if status != ERROR_SUCCESS {
+        return Err(grant_failure(
+            format!(
+                "写入「{}」收敛后的 DACL 失败（Win32 错误 {}）",
                 path.display(),
-                index + 1
-            ));
-        }
-        let ace = &old[offset..offset + ace_size];
-        // 0 = ACCESS_ALLOWED_ACE_TYPE，1 = ACCESS_DENIED_ACE_TYPE；
-        // 两者的 SID 都从第 8 字节开始（Header 4 + Mask 4）。
-        let basic = (ace[0] == 0 || ace[0] == 1) && ace_size >= 8;
-        let inherited = ace[1] & INHERITED_ACE.0 as u8 != 0;
-        let matches = basic
-            && !inherited
-            && unsafe { EqualSid(PSID(ace.as_ptr().add(8) as *mut c_void), sid).is_ok() };
-        if matches {
-            removed += 1;
-        } else {
-            kept.push(ace);
-        }
-        offset += ace_size;
+                status.0
+            ),
+            status,
+        ));
     }
-    if removed == 0 {
-        // 幂等：本来就没有这条 ACE，不写 DACL（写一次会触发文件监听器重扫）。
-        return Ok(false);
+    Ok(())
+}
+
+/// 按 `drop` 判定重建 DACL：逐条复制 ACE，`drop` 为真的跳过，其余原样保留、顺序不变。
+///
+/// 返回 `None` = 一条都没删（调用方据此零写入：写一次 DACL 会让文件监听器重扫整棵子树）。
+fn rebuild_acl_without(
+    path: &Path,
+    snapshot: &[u8],
+    mut drop: impl FnMut(&[u8]) -> bool,
+) -> Result<Option<Vec<u32>>, String> {
+    let (dacl, info) = snapshot_dacl(path, snapshot)?;
+    let old = unsafe { std::slice::from_raw_parts(dacl as *const u8, info.AclBytesInUse as usize) };
+    let slices = ace_slices(path, old, info.AceCount)?;
+    let kept: Vec<&[u8]> = slices.into_iter().filter(|ace| !drop(ace)).collect();
+    if kept.len() == info.AceCount as usize {
+        return Ok(None);
     }
 
-    // ---- 3. 重建 ACL：头部原样（保留修订号），只更新大小与计数 ----
+    // 重建 ACL：头部原样（保留修订号），只更新大小与计数。
     let new_len = ACL_HEADER_LEN + kept.iter().map(|ace| ace.len()).sum::<usize>();
     // `ACL` 要求 4 字节对齐；用 `Vec<u32>` 承载，再把字节写进去。
     let mut buffer: Vec<u32> = vec![0; new_len.div_ceil(4)];
@@ -1566,7 +1741,12 @@ pub(crate) fn revoke_ace(path: &Path, sid: PSID) -> Result<bool, String> {
             cursor += ace.len();
         }
     }
+    Ok(Some(buffer))
+}
 
+/// 把自相对 ACL 字节写回命名对象。失败文案只差调用方语境，故由调用方补前缀。
+fn write_acl_buffer(path: &Path, buffer: &[u32]) -> Result<(), String> {
+    let name = wide(path.as_os_str());
     let status = unsafe {
         SetNamedSecurityInfoW(
             PCWSTR(name.as_ptr()),
@@ -1580,11 +1760,49 @@ pub(crate) fn revoke_ace(path: &Path, sid: PSID) -> Result<bool, String> {
     };
     if status != ERROR_SUCCESS {
         return Err(format!(
-            "撤销「{}」的 ACE 失败（Win32 错误 {}）",
+            "「{}」的 DACL 写入失败（Win32 错误 {}）",
             path.display(),
             status.0
         ));
     }
+    Ok(())
+}
+
+/// 精确撤销：删掉这一条 `(路径, SID)` 的**显式** ACE（allow 与 deny 都删），
+/// 其它 ACE 原样保留、顺序不变。返回是否真的删掉了东西。
+///
+/// **匹配口径只看 `(路径, SID)`，不看掩码、不看继承形态**：撤销必须能删掉任何版本
+/// 写下的那条 ACE。老环境里的掩码含已废弃的 `FILE_DELETE_CHILD`，若按当前掩码匹配，
+/// 那些机器会「撤也撤不掉」——升级后既不会收敛、也卸载不干净。
+///
+/// **为什么不用 `REVOKE_ACCESS`**：Win32 文档写明它只移除
+/// `ACCESS_ALLOWED_ACE` / `SYSTEM_AUDIT_ACE`，**不动 `ACCESS_DENIED_ACE`**
+/// （见 ACCESS_MODE 枚举）。D7 的只读保护恰好是 deny ACE，用 `REVOKE_ACCESS`
+/// 卸载会「调用成功、ACE 还在」，`.git` 永久停在只读状态（T10 用例实测
+/// `considered=1 revoked=0 unchanged=1`）。这里改成确定性重建：逐条复制 ACE，
+/// 跳过匹配项，再把新 DACL 写回。
+///
+/// 继承来的 ACE 一律保留：它们由父目录下发，本就删不掉；写回时原样带回，
+/// 才不会让「重建」顺手抹掉父目录的授权。
+///
+/// `pub(crate)`：设备对象（`\Device\Null`，SH-064 B）也要按 SID 精确撤销，
+/// 但它没有 `exists()`、也不进目录备份台账，所以走不了 `AclManager::revoke`。
+pub(crate) fn revoke_ace(path: &Path, sid: PSID) -> Result<bool, String> {
+    let snapshot = read_dacl_snapshot(path)?;
+    // 0 = ACCESS_ALLOWED_ACE_TYPE，1 = ACCESS_DENIED_ACE_TYPE；
+    // 两者的 SID 都从第 8 字节开始（Header 4 + Mask 4）。
+    let pruned = rebuild_acl_without(path, &snapshot, |ace| {
+        let basic = (ace[0] == 0 || ace[0] == 1) && ace.len() >= 8;
+        let inherited = ace[1] & INHERITED_ACE.0 as u8 != 0;
+        basic
+            && !inherited
+            && unsafe { EqualSid(PSID(ace.as_ptr().add(8) as *mut c_void), sid).is_ok() }
+    })?;
+    let Some(buffer) = pruned else {
+        // 幂等：本来就没有这条 ACE，不写 DACL（写一次会触发文件监听器重扫）。
+        return Ok(false);
+    };
+    write_acl_buffer(path, &buffer)?;
     Ok(true)
 }
 
@@ -3090,6 +3308,118 @@ mod tests {
         // 收尾：撤销这个 SID 的全部显式 ACE，回到原状。
         assert!(revoke_ace(&dir, sid.as_psid()).unwrap());
         compare_restored(&before, &read_dacl_snapshot(&dir).unwrap()).unwrap();
+    }
+
+    /// 升级收敛：老版本写下的写 ACE 多带 `FILE_DELETE_CHILD`，`grant` 必须把它换成当前
+    /// 掩码，而不是按「覆盖即命中」直接跳过（那等于老机器永远停在旧权限位）。
+    /// 收敛之后再跑一次必须零写入——幂等是「第二次真的跳过」，不是「每次都重写」。
+    #[test]
+    fn scope_grant_converges_stale_mask_and_then_skips() {
+        let ws = temp_dir("scope-converge");
+        let dir = ws.join("workspace");
+        std::fs::create_dir_all(&dir).unwrap();
+        let sid = super::super::appcontainer::internet_client_capability().unwrap();
+        let ledger = ws.join("ace.jsonl");
+        let backup_dir = ws.join("acl");
+        let inheritance = SUB_CONTAINERS_AND_OBJECTS_INHERIT;
+
+        // 造一份「旧版本」DACL：写掩码含已废弃的 `FILE_DELETE_CHILD`。
+        let stale_mask = Access::Write.mask() | FILE_DELETE_CHILD.0;
+        apply_grant(&dir, sid.as_psid(), stale_mask, inheritance).unwrap();
+        assert_eq!(
+            explicit_grant_state(&dir, sid.as_psid(), inheritance).unwrap(),
+            ExplicitGrantState {
+                count: 1,
+                union: stale_mask
+            },
+            "前置：磁盘上必须是旧掩码"
+        );
+
+        let mut manager = AclManager::new(backup_dir.clone());
+        assert_eq!(
+            manager
+                .grant_scope_persistent(&dir, sid.as_psid(), false, &ledger)
+                .unwrap(),
+            ScopeGrant::Written {
+                existed_before: true
+            },
+            "旧掩码不算「已在位」：必须走一次改写"
+        );
+        let state = explicit_grant_state(&dir, sid.as_psid(), inheritance).unwrap();
+        assert_eq!(state.count, 1, "同一 SID 只该留一条显式写 ACE：{state:?}");
+        assert_eq!(state.union, Access::Write.mask(), "掩码必须收敛到当前口径");
+        assert_eq!(
+            state.union & FILE_DELETE_CHILD.0,
+            0,
+            "旧掩码里的 FILE_DELETE_CHILD 必须收回来"
+        );
+        assert_ne!(
+            state.union & DELETE.0,
+            0,
+            "DELETE 必须保留（删除能力落在子对象上）"
+        );
+
+        // 幂等：换一个 manager（无进程内缓存），第二次必须按真实 DACL 命中、零写入。
+        let after_converge = read_dacl_snapshot(&dir).unwrap();
+        let mut fresh = AclManager::new(backup_dir);
+        assert_eq!(
+            fresh
+                .grant_scope_persistent(&dir, sid.as_psid(), false, &ledger)
+                .unwrap(),
+            ScopeGrant::AlreadyPresent
+        );
+        assert_eq!(
+            read_dacl_snapshot(&dir).unwrap(),
+            after_converge,
+            "收敛完成后的第二次调用不得改写 DACL"
+        );
+    }
+
+    /// 撤销口径只看 `(路径, SID)`、不看掩码：老环境里带 `FILE_DELETE_CHILD` 的 ACE
+    /// 必须能被卸载账本删掉，否则升级后既不会收敛、也「撤都撤不掉」。
+    #[test]
+    fn revoke_removes_stale_mask_ace() {
+        let ws = temp_dir("revoke-stale");
+        let dir = ws.join("workspace");
+        std::fs::create_dir_all(&dir).unwrap();
+        let sid = super::super::appcontainer::internet_client_capability().unwrap();
+        let inheritance = SUB_CONTAINERS_AND_OBJECTS_INHERIT;
+        let before = read_dacl_snapshot(&dir).unwrap();
+
+        let stale_mask = Access::Write.mask() | FILE_DELETE_CHILD.0;
+        apply_grant(&dir, sid.as_psid(), stale_mask, inheritance).unwrap();
+
+        // 卸载走账本回放：`existed_before=false` 的老记录必须真的删掉这条旧掩码 ACE。
+        let ledger = ws.join("ace.jsonl");
+        std::fs::write(
+            &ledger,
+            serde_json::json!({
+                "kind": LEDGER_KIND_SCOPE,
+                "path": normalize(&dir).display().to_string(),
+                "sid": sid_to_string(sid.as_psid()).unwrap(),
+                "mask": stale_mask,
+                "inherit": true,
+                "existed_before": false,
+                "added_at_ms": 1,
+            })
+            .to_string()
+                + "\n",
+        )
+        .unwrap();
+        let report = revoke_from_ledger(&ledger);
+        assert_eq!(report.revoked, 1, "旧掩码必须可撤：{report:?}");
+        assert!(report.is_clean(), "撤销不应失败：{report:?}");
+        assert_eq!(
+            explicit_grant_state(&dir, sid.as_psid(), inheritance)
+                .unwrap()
+                .count,
+            0,
+            "撤销后不得留下任何显式允许 ACE"
+        );
+        compare_restored(&before, &read_dacl_snapshot(&dir).unwrap()).unwrap();
+
+        // 再撤一次：幂等（返回 false，不写 DACL）。
+        assert!(!revoke_ace(&dir, sid.as_psid()).unwrap());
     }
 
     /// 工作区根 / temp / 工具链的持久写权限：首写记 `existed_before`、命中零写入、
