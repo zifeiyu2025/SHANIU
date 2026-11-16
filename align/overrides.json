@@ -20,8 +20,8 @@
       "guard": "上游若提供等价入口则改调上游"
     },
     "ui-chat/src/client/chat/TurnProcessNodeView.tsx": {
-      "reason": "N1 顶部回合摘要识别 indeterminate：显示「本轮状态未知」，不再按 completed 计时（docs/07 #33）",
-      "guard": "上游若原生支持「无结论」reason 并同步改顶部控件，删本地分支改跟上游；若只同步 turn-error 不改顶部，必须补回本分支，否则「未知」会重新渲染成「已完成 + 时长」"
+      "reason": "N1 顶部回合摘要识别 indeterminate：显示「本轮状态未知」，不再按 completed 计时（docs/07 #33）；N3 改读 turnEnding() 的结局并新增 truncated →「已截断」，不再自己判 reason.kind（docs/07 #35）",
+      "guard": "上游若原生支持「无结论」reason 并同步改顶部控件，删本地分支改跟上游；若只同步 turn-error 不改顶部，必须补回本分支，否则「未知」会重新渲染成「已完成 + 时长」。N3 的 truncated 分支同理：上游若让顶部读统一结局，删本地 turnProcessOutcome 改跟上游；不要把截断并回「已完成 + 用时」"
     },
     "ui-chat/src/client/chat/ApprovalCommand.module.css": {
       "reason": "A0-T7 本地新增样式（上游无此文件，docs/07 #25）",
@@ -56,8 +56,16 @@
       "guard": "上游若把压缩节点移出过程组、或给节点定义提供 default-open 配置，删本地 groupTree 改跟上游；同步后必须确认不展开任何组时节点仍可见"
     },
     "ui-chat/src/client/conversation-nodes/turn-error.ts": {
-      "reason": "A0-2 TurnErrorNode 增加可选 detail（docs/07 #23）",
-      "guard": "上游若等价则删本地字段；字段必须保持可选"
+      "reason": "A0-2 TurnErrorNode 增加可选 detail（docs/07 #23）；N3 结局判定改由 turnEnding() 统一给出，删掉本地自加的 max-tokens 失败分支（docs/07 #35）",
+      "guard": "上游若等价则删本地字段；字段必须保持可选。同步上游后不要把 max-tokens 加回失败行，否则同一回合同屏出现「失败 + 截断」两条结论"
+    },
+    "ui-chat/src/client/conversation-nodes/turn-ending.ts": {
+      "reason": "N3 本地新增：回合结局的唯一判定（completed/truncated/stopped/failed/unknown），行首结局行/截断提示行/组标题都只读它（docs/07 #35）",
+      "guard": "上游若提供等价的结局判定模块，删本地文件并把三处消费方改指上游；只同步其中一处不够——三处必须继续读同一个判定"
+    },
+    "ui-chat/src/client/conversation-nodes/turn-max-tokens.ts": {
+      "reason": "N3 截断提示行改读 turnEnding().kind === 'truncated'，不再自己比对 reason.kind（docs/07 #35）",
+      "guard": "上游若让提示行读统一结局，删本地判断改跟上游；判据必须与行首结局行一致，不能一处认 max-tokens、一处认结局"
     },
     "ui-chat/tests/approval-command.client.spec.tsx": {
       "reason": "A0-T7 详情槽用例（docs/07 #25）",
@@ -314,8 +322,8 @@
       "guard": "同上"
     },
     "ui-chat/src/client/locale.ts": {
-      "reason": "8 套词典各加 image.openExternal（共 8 条）（docs/07 #22）",
-      "guard": "上游若已加等价键，删本地 8 条改指上游键"
+      "reason": "8 套词典各加 image.openExternal（共 8 条）（docs/07 #22）；N3 再各加 message.turnProcess.truncated（8 条，docs/07 #35）",
+      "guard": "上游若已加等价键，删本地 8 条改指上游键；同步后确认截断组标题不再落到「已完成」"
     },
     "ui-chat/src/client/chat/ChatView.tsx": {
       "reason": "类型级修复（第 9 行批次）+ fileImages.labels 传 image.openExternal（第 22 行）",

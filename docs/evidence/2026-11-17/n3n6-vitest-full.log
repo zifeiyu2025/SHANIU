@@ -1,0 +1,214 @@
+$ vitest run
+
+[1m[30m[46m RUN [49m[39m[22m [36mv5.1.0 [39m[90mD:/MyWorkspace/SHANIU[39m
+
+stderr | src/transport/ws-bridge.spec.ts > ws-bridge（SH-094 批 3） > gateway 连续不可用后只退回一次 Tauri 广播，之后不再重连
+[SHANIU] gateway_info 失败，将重试连接 Error: gateway 尚未绑定端口
+    at D:/MyWorkspace/SHANIU/src/transport/ws-bridge.spec.ts:328:13
+    at Mock (file:///D:/MyWorkspace/SHANIU/node_modules/.pnpm/vitest@5.1.0_@opentelemetry_5f0d3e38192ccd4a765a2b89915a9b04/node_modules/vitest/dist/chunks/spy.DDMXghXv.js:353:40)
+    at Object.invoke (D:/MyWorkspace/SHANIU/src/transport/ws-bridge.spec.ts:73:91)
+    at connect (D:/MyWorkspace/SHANIU/src/transport/ws-bridge.ts:421:25)
+    at Object.listenEvents (D:/MyWorkspace/SHANIU/src/transport/ws-bridge.ts:499:12)
+    at harness (D:/MyWorkspace/SHANIU/src/transport/ws-bridge.spec.ts:105:26)
+    at D:/MyWorkspace/SHANIU/src/transport/ws-bridge.spec.ts:330:15
+    at file:///D:/MyWorkspace/SHANIU/node_modules/.pnpm/vitest@5.1.0_@opentelemetry_5f0d3e38192ccd4a765a2b89915a9b04/node_modules/vitest/dist/chunks/run.CjdgFZiW.js:1632:35
+    at file:///D:/MyWorkspace/SHANIU/node_modules/.pnpm/vitest@5.1.0_@opentelemetry_5f0d3e38192ccd4a765a2b89915a9b04/node_modules/vitest/dist/chunks/run.CjdgFZiW.js:2801:26
+    at file:///D:/MyWorkspace/SHANIU/node_modules/.pnpm/vitest@5.1.0_@opentelemetry_5f0d3e38192ccd4a765a2b89915a9b04/node_modules/vitest/dist/chunks/run.CjdgFZiW.js:3338:20
+
+stderr | src/transport/ws-bridge.spec.ts > ws-bridge（SH-094 批 3） > gateway 连续不可用后只退回一次 Tauri 广播，之后不再重连
+[SHANIU] gateway_info 失败，将重试连接 Error: gateway 尚未绑定端口
+    at D:/MyWorkspace/SHANIU/src/transport/ws-bridge.spec.ts:328:13
+    at Mock (file:///D:/MyWorkspace/SHANIU/node_modules/.pnpm/vitest@5.1.0_@opentelemetry_5f0d3e38192ccd4a765a2b89915a9b04/node_modules/vitest/dist/chunks/spy.DDMXghXv.js:353:40)
+    at Object.invoke (D:/MyWorkspace/SHANIU/src/transport/ws-bridge.spec.ts:73:91)
+    at connect (D:/MyWorkspace/SHANIU/src/transport/ws-bridge.ts:421:25)
+    at Timeout._onTimeout (D:/MyWorkspace/SHANIU/src/transport/ws-bridge.ts:412:12)
+    at listOnTimeout (node:internal/timers:685:17)
+    at process.processTimers (node:internal/timers:618:7)
+[SHANIU] WebSocket gateway 不可用，事件通道退回 Tauri 广播：连续 2 次连接失败
+
+ [32m✓[39m src/__tests__/workspace-tree-keyboard.spec.tsx [2m([22m[2m6 tests[22m[2m)[22m[32m 157[2mms[22m[39m
+ [32m✓[39m src/host/input-context-menu.spec.ts [2m([22m[2m9 tests[22m[2m)[22m[32m 146[2mms[22m[39m
+ [32m✓[39m src/approval-banner/approval-banner.spec.tsx [2m([22m[2m10 tests[22m[2m)[22m[32m 208[2mms[22m[39m
+ [32m✓[39m src/quit-guard/QuitDialog.spec.tsx [2m([22m[2m6 tests[22m[2m)[22m[32m 186[2mms[22m[39m
+ [32m✓[39m src/header-actions/export-zip.spec.ts [2m([22m[2m12 tests[22m[2m)[22m[32m 147[2mms[22m[39m
+[90mstdout[2m | src/transport/ws-bridge.spec.ts[2m > [22m[2mws-bridge 订阅回收（SH-129 M3）[2m > [22m[2m引用计数：多观察者共享一条订阅，最后一个退出才退订（页面切换即回落）
+[22m[39m[M3] 页面打开：订阅表 1 条 / 休眠 0 条 / 两个观察者
+[M3] 页面切走：订阅表 0 条 / 休眠 1 条 / unsubscribe 帧 1 次
+
+stderr | src/transport/adapter.spec.ts > 适配层把 EventMsg 流映射成 DSH 会话 journal > N5 真机复现（r4 事件原样回放）：实时自动压缩后必须落可见节点，替换要过客户端 foldSurface
+[SHANIU] 没有审批界面在听 approval/request，本次请求按拒绝回执收口
+
+stderr | src/transport/adapter.spec.ts > 适配层把 EventMsg 流映射成 DSH 会话 journal > N5 真机复现（r4 真实档案）：锚点是档案第一条时，重开必须落同形压缩节点而不是通知
+[SHANIU] 压缩节点没有可替换的会话表面，改用自建锚点后替换（compactionId=shaniu-replay-compaction-0）
+
+stderr | src/transport/adapter.spec.ts > 适配层把 EventMsg 流映射成 DSH 会话 journal > R6 真机复现（0.2.9 事件原样回放）：surface[0] 是用户消息、system 在中间时，压缩不得遮蔽系统头
+[SHANIU] 没有审批界面在听 approval/request，本次请求按拒绝回执收口
+[SHANIU] 没有审批界面在听 approval/request，本次请求按拒绝回执收口
+
+stderr | src/transport/adapter.spec.ts > 适配层把 EventMsg 流映射成 DSH 会话 journal > R6 真机复现（0.2.9 事件原样回放）：surface[0] 是用户消息、system 在中间时，压缩不得遮蔽系统头
+[SHANIU] 压缩节点没有可替换的会话表面，改用自建锚点后替换（compactionId=shaniu-replay-compaction-0）
+
+stderr | src/transport/adapter.spec.ts > 适配层把 EventMsg 流映射成 DSH 会话 journal > N5 真机复现（r4 手动 /compact）：命令卡与压缩节点合成一个 manual-compaction 节点，会话区不再铺摘要正文
+[SHANIU] 压缩节点没有可替换的会话表面，改用自建锚点后替换（compactionId=cmp-1794678689186-0）
+
+stderr | src/transport/adapter.spec.ts > 适配层的命令面映射 > list_sessions 形状不可判与「确实没有会话」分开表达：不再把未知折成空表
+[SHANIU] 会话清单查询失败，按未知处理 { code: 'IPC_FAILED', message: '会话清单查询失败' }
+
+stderr | src/transport/adapter.spec.ts > 适配层的命令面映射 > 没有审批 UI 在听时按拒绝收口，绝不静默放行
+[SHANIU] 没有审批界面在听 approval/request，本次请求按拒绝回执收口
+
+ [32m✓[39m src/transport/ws-bridge.spec.ts [2m([22m[2m15 tests[22m[2m)[22m[33m 396[2mms[22m[39m
+ [32m✓[39m src/theme-tokens.spec.ts [2m([22m[2m3 tests[22m[2m)[22m[33m 328[2mms[22m[39m
+   [32m✓[39m 主题令牌守卫 [2m(3)[22m
+     [33m[2m✓[22m[39m 上游 `--dsw-*` 引用与令牌清单的差值只有登记过的既有缺口[33m 303[2mms[22m[39m
+stderr | src/transport/adapter.spec.ts > 适配层的命令面映射 > 压缩过的会话重开：摘要不占回合，轮次与实时路径一致、不补中止横幅
+[SHANIU] 压缩节点没有可替换的会话表面，改用自建锚点后替换（compactionId=shaniu-replay-compaction-0）
+
+stderr | src/transport/adapter.spec.ts > 适配层的命令面映射 > 宿主运行态查询失败 → 不写 turn_end，按未知处理
+[SHANIU] 宿主运行态查询失败，档案重建按未知处理 { code: 'IPC_FAILED', message: '运行态查询失败' }
+
+stderr | src/transport/adapter.spec.ts > 权限挡位与底部指标的数据面 > N3：压缩档案重开 = 完整档案重开 = 实时——同一轮次/步数
+[SHANIU] 压缩节点没有可替换的会话表面，改用自建锚点后替换（compactionId=shaniu-replay-compaction-3）
+
+stderr | src/transport/adapter.spec.ts > 权限挡位与底部指标的数据面 > N3：压缩档案重开 = 完整档案重开 = 实时——同一轮次/步数
+[SHANIU] 压缩节点没有可替换的会话表面，改用自建锚点后替换（compactionId=shaniu-replay-compaction-3）
+
+stderr | src/transport/adapter.spec.ts > 权限挡位与底部指标的数据面 > N10：压缩重开后回合用时按墙钟算，不按首条幸存条目重算
+[SHANIU] 压缩节点没有可替换的会话表面，改用自建锚点后替换（compactionId=shaniu-replay-compaction-0）
+
+stderr | src/transport/adapter.spec.ts > 权限挡位与底部指标的数据面 > N10：压缩重开后回合用时按墙钟算，不按首条幸存条目重算
+[SHANIU] 压缩节点没有可替换的会话表面，改用自建锚点后替换（compactionId=shaniu-replay-compaction-0）
+
+stderr | src/transport/adapter.spec.ts > 权限挡位与底部指标的数据面 > N10：压缩后的新用户消息自己就是回合起点，不继承上一回合的墙钟
+[SHANIU] 压缩节点没有可替换的会话表面，改用自建锚点后替换（compactionId=shaniu-replay-compaction-0）
+
+stderr | src/transport/adapter.spec.ts > 权限挡位与底部指标的数据面 > N3：重复结局行只算一轮，重复重开数值不变
+[SHANIU] 压缩节点没有可替换的会话表面，改用自建锚点后替换（compactionId=shaniu-replay-compaction-3）
+
+stderr | src/transport/adapter.spec.ts > 权限挡位与底部指标的数据面 > N3：重复结局行只算一轮，重复重开数值不变
+[SHANIU] 压缩节点没有可替换的会话表面，改用自建锚点后替换（compactionId=shaniu-replay-compaction-3）
+
+[90mstdout[2m | src/transport/adapter.spec.ts[2m > [22m[2m续播幂等与无帧兜底（阶段 2）[2m > [22m[2m60s 无帧且宿主确认空闲、对账没有结论时保持打开（前端不补 interrupted）
+[22m[39m[SHANIU] 会话 agent-dead 超过 60s 无帧且宿主已空闲：对账没有结论，保持回合打开，等待宿主结论或用户手动停止
+
+stderr | src/transport/adapter.spec.ts > 续播幂等与无帧兜底（阶段 2） > 60s 无帧但运行态查询失败：保持现状，不把"问不到"当空闲
+[SHANIU] 会话 agent-unknown 无帧兜底：宿主运行态查询失败，保持现状 { code: 'IPC_FAILED', message: '运行态查询失败' }
+
+[90mstdout[2m | src/transport/adapter.spec.ts[2m > [22m[2m续播幂等与无帧兜底（阶段 2）[2m > [22m[2m60s 无帧但运行态是空壳 {}：保持现状；宿主改口空闲也保持打开
+[22m[39m[SHANIU] 会话 agent-opaque 超过 60s 无帧且宿主已空闲：对账没有结论，保持回合打开，等待宿主结论或用户手动停止
+
+ [32m✓[39m src/transport/adapter.spec.ts [2m([22m[2m183 tests[22m[2m)[22m[33m 772[2mms[22m[39m
+ [32m✓[39m src/__tests__/markdown-image-failure.spec.tsx [2m([22m[2m2 tests[22m[2m)[22m[32m 145[2mms[22m[39m
+ [32m✓[39m src/tray-hint/TrayHintToast.spec.tsx [2m([22m[2m4 tests[22m[2m)[22m[32m 162[2mms[22m[39m
+ [32m✓[39m src/model-config/ModelConfigSeat.spec.tsx [2m([22m[2m4 tests[22m[2m)[22m[32m 166[2mms[22m[39m
+ [32m✓[39m src/__tests__/workspace-search-states.spec.tsx [2m([22m[2m2 tests[22m[2m)[22m[32m 154[2mms[22m[39m
+ [32m✓[39m src/attachment-usage/attachment-usage.spec.tsx [2m([22m[2m5 tests[22m[2m)[22m[32m 71[2mms[22m[39m
+ [32m✓[39m src/sandbox-status/sandbox-status.spec.tsx [2m([22m[2m8 tests[22m[2m)[22m[32m 216[2mms[22m[39m
+ [32m✓[39m src/default-dir/default-dir.spec.tsx [2m([22m[2m5 tests[22m[2m)[22m[32m 70[2mms[22m[39m
+ [32m✓[39m src/host/chrome.spec.ts [2m([22m[2m12 tests[22m[2m)[22m[32m 105[2mms[22m[39m
+ [32m✓[39m src/mcp-trust/McpConnector.spec.tsx [2m([22m[2m9 tests[22m[2m)[22m[33m 330[2mms[22m[39m
+ [32m✓[39m src/brand/brand.spec.tsx [2m([22m[2m6 tests[22m[2m)[22m[32m 38[2mms[22m[39m
+ [32m✓[39m src/__tests__/boot-progress.test.ts [2m([22m[2m7 tests[22m[2m)[22m[32m 51[2mms[22m[39m
+ [32m✓[39m src/model-capabilities/capabilities.spec.tsx [2m([22m[2m15 tests[22m[2m)[22m[33m 456[2mms[22m[39m
+stderr | src/transport/settings-face.spec.ts > settings 面：读视图 > 读不到宿主文档时报不可写，且拒绝整份写入
+[SHANIU] 读取宿主设置失败 Error: 宿主忙
+    at Object.invoke (D:/MyWorkspace/SHANIU/src/transport/settings-face.spec.ts:124:37)
+    at read (D:/MyWorkspace/SHANIU/src/transport/settings-face.ts:363:31)
+    at ensure (D:/MyWorkspace/SHANIU/src/transport/settings-face.ts:643:87)
+    at Object.describe (D:/MyWorkspace/SHANIU/src/transport/settings-face.ts:890:15)
+    at D:/MyWorkspace/SHANIU/src/transport/settings-face.spec.ts:404:43
+    at file:///D:/MyWorkspace/SHANIU/node_modules/.pnpm/vitest@5.1.0_@opentelemetry_5f0d3e38192ccd4a765a2b89915a9b04/node_modules/vitest/dist/chunks/run.CjdgFZiW.js:1632:35
+    at file:///D:/MyWorkspace/SHANIU/node_modules/.pnpm/vitest@5.1.0_@opentelemetry_5f0d3e38192ccd4a765a2b89915a9b04/node_modules/vitest/dist/chunks/run.CjdgFZiW.js:2801:26
+    at file:///D:/MyWorkspace/SHANIU/node_modules/.pnpm/vitest@5.1.0_@opentelemetry_5f0d3e38192ccd4a765a2b89915a9b04/node_modules/vitest/dist/chunks/run.CjdgFZiW.js:3338:20
+    at new Promise (<anonymous>)
+    at runWithCancel (file:///D:/MyWorkspace/SHANIU/node_modules/.pnpm/vitest@5.1.0_@opentelemetry_5f0d3e38192ccd4a765a2b89915a9b04/node_modules/vitest/dist/chunks/run.CjdgFZiW.js:3333:10)
+
+stderr | src/transport/settings-face.spec.ts > settings 面：读视图 > 读不到宿主文档时报不可写，且拒绝整份写入
+[SHANIU] 读取宿主设置失败 Error: 宿主忙
+    at Object.invoke (D:/MyWorkspace/SHANIU/src/transport/settings-face.spec.ts:124:37)
+    at read (D:/MyWorkspace/SHANIU/src/transport/settings-face.ts:363:31)
+    at ensure (D:/MyWorkspace/SHANIU/src/transport/settings-face.ts:643:87)
+    at Object.mutate (D:/MyWorkspace/SHANIU/src/transport/settings-face.ts:936:15)
+    at D:/MyWorkspace/SHANIU/src/transport/settings-face.spec.ts:406:41
+    at process.processTicksAndRejections (node:internal/process/task_queues:104:5)
+    at async file:///D:/MyWorkspace/SHANIU/node_modules/.pnpm/vitest@5.1.0_@opentelemetry_5f0d3e38192ccd4a765a2b89915a9b04/node_modules/vitest/dist/chunks/run.CjdgFZiW.js:2801:20
+
+ [32m✓[39m src/dsh-mapping.spec.ts [2m([22m[2m5 tests[22m[2m)[22m[32m 37[2mms[22m[39m
+stderr | src/transport/settings-face.spec.ts > 席位的生效档 > 读不到宿主文档时拒绝切换，不发半份文档
+[SHANIU] 读取宿主设置失败 Error: 宿主忙
+    at Object.invoke (D:/MyWorkspace/SHANIU/src/transport/settings-face.spec.ts:124:37)
+    at read (D:/MyWorkspace/SHANIU/src/transport/settings-face.ts:363:31)
+    at ensure (D:/MyWorkspace/SHANIU/src/transport/settings-face.ts:643:87)
+    at Object.selectModel (D:/MyWorkspace/SHANIU/src/transport/settings-face.ts:1083:15)
+    at D:/MyWorkspace/SHANIU/src/transport/settings-face.spec.ts:1031:39
+    at file:///D:/MyWorkspace/SHANIU/node_modules/.pnpm/vitest@5.1.0_@opentelemetry_5f0d3e38192ccd4a765a2b89915a9b04/node_modules/vitest/dist/chunks/run.CjdgFZiW.js:1632:35
+    at file:///D:/MyWorkspace/SHANIU/node_modules/.pnpm/vitest@5.1.0_@opentelemetry_5f0d3e38192ccd4a765a2b89915a9b04/node_modules/vitest/dist/chunks/run.CjdgFZiW.js:2801:26
+    at file:///D:/MyWorkspace/SHANIU/node_modules/.pnpm/vitest@5.1.0_@opentelemetry_5f0d3e38192ccd4a765a2b89915a9b04/node_modules/vitest/dist/chunks/run.CjdgFZiW.js:3338:20
+    at new Promise (<anonymous>)
+    at runWithCancel (file:///D:/MyWorkspace/SHANIU/node_modules/.pnpm/vitest@5.1.0_@opentelemetry_5f0d3e38192ccd4a765a2b89915a9b04/node_modules/vitest/dist/chunks/run.CjdgFZiW.js:3333:10)
+
+ [32m✓[39m src/transport/settings-face.spec.ts [2m([22m[2m39 tests[22m[2m)[22m[32m 41[2mms[22m[39m
+ [32m✓[39m src/__tests__/streaming.test.tsx [2m([22m[2m3 tests[22m[2m)[22m[32m 61[2mms[22m[39m
+ [32m✓[39m src/header-actions/header-actions.spec.ts [2m([22m[2m9 tests[22m[2m)[22m[32m 87[2mms[22m[39m
+ [32m✓[39m src/header-actions/session-events.spec.ts [2m([22m[2m16 tests[22m[2m)[22m[32m 14[2mms[22m[39m
+ [32m✓[39m src/open-in-app/route-fetch.spec.ts [2m([22m[2m3 tests[22m[2m)[22m[32m 10[2mms[22m[39m
+ [32m✓[39m src/transport/attachment-upload.spec.ts [2m([22m[2m4 tests[22m[2m)[22m[32m 14[2mms[22m[39m
+ [32m✓[39m src/host/desktop-env.spec.ts [2m([22m[2m4 tests[22m[2m)[22m[32m 17[2mms[22m[39m
+ [32m✓[39m src/transport/mock-models.spec.ts [2m([22m[2m28 tests[22m[2m)[22m[32m 29[2mms[22m[39m
+ [32m✓[39m src/terminal-source/index.spec.ts [2m([22m[2m5 tests[22m[2m)[22m[32m 10[2mms[22m[39m
+ [32m✓[39m src/transport/approval-lease.spec.ts [2m([22m[2m4 tests[22m[2m)[22m[32m 10[2mms[22m[39m
+ [32m✓[39m src/transport/permission-presets.spec.ts [2m([22m[2m8 tests[22m[2m)[22m[32m 8[2mms[22m[39m
+ [32m✓[39m src/transport/stubs.spec.ts [2m([22m[2m4 tests[22m[2m)[22m[32m 10[2mms[22m[39m
+ [32m✓[39m src/external-link/route.spec.ts [2m([22m[2m4 tests[22m[2m)[22m[32m 4[2mms[22m[39m
+ [32m✓[39m src/file-actions/desktop-bridge.spec.ts [2m([22m[2m3 tests[22m[2m)[22m[32m 5[2mms[22m[39m
+ [32m✓[39m src/mcp-trust/model.spec.ts [2m([22m[2m12 tests[22m[2m)[22m[32m 6[2mms[22m[39m
+ [32m✓[39m src/chat-clock.spec.ts [2m([22m[2m2 tests[22m[2m)[22m[32m 3[2mms[22m[39m
+ [32m✓[39m src/model-config/model-config.spec.ts [2m([22m[2m4 tests[22m[2m)[22m[32m 6[2mms[22m[39m
+ [32m✓[39m src/turn-ending.spec.ts [2m([22m[2m4 tests[22m[2m)[22m[32m 4[2mms[22m[39m
+stderr | src/__tests__/boot-globals.test.ts > boot 全局补丁的还原 > boot 期间装上钩子；dispose 后 fetch 回到原引用，其余全局钩子一并撤回
+[SHANIU] gateway_info 失败，将重试连接 Error: 本测试没有 loopback gateway
+    at Object.invoke (D:/MyWorkspace/SHANIU/src/__tests__/boot-globals.test.ts:25:45)
+    at invoke (file:///D:/MyWorkspace/SHANIU/node_modules/.pnpm/@tauri-apps+api@2.12.4/node_modules/@tauri-apps/api/core.js:341:39)
+    at Object.invoke (D:/MyWorkspace/SHANIU/src/transport/tauri.ts:42:20)
+    at process.processTicksAndRejections (node:internal/process/task_queues:104:5)
+    at connect (D:/MyWorkspace/SHANIU/src/transport/ws-bridge.ts:421:14)
+[SHANIU] 待审批通道订阅失败，刷新后可能看不到待审批 TypeError: window.__TAURI_INTERNALS__.transformCallback is not a function
+    at transformCallback (file:///D:/MyWorkspace/SHANIU/node_modules/.pnpm/@tauri-apps+api@2.12.4/node_modules/@tauri-apps/api/core.js:72:39)
+    at listen (file:///D:/MyWorkspace/SHANIU/node_modules/.pnpm/@tauri-apps+api@2.12.4/node_modules/@tauri-apps/api/event.js:142:18)
+    at D:/MyWorkspace/SHANIU/src/transport/tauri.ts:68:91
+    at process.processTicksAndRejections (node:internal/process/task_queues:104:5)
+
+ [32m✓[39m src/turn-process-outcome.spec.ts [2m([22m[2m4 tests[22m[2m)[22m[32m 4[2mms[22m[39m
+ [32m✓[39m src/subagent-mount/subagent-mount.spec.ts [2m([22m[2m1 test[22m[2m)[22m[32m 3[2mms[22m[39m
+stderr | src/__tests__/boot-health.test.ts > boot 装载健康 > 没有 FAILED fiber，且会话头资源管理器入口已注册
+Error: conversation.input: sessions service unavailable
+    at InputHub.sessions (D:/MyWorkspace/SHANIU/src/dsh/packages/client/ui-conversation/src/client/input/hub.ts:322:39)
+    at InputHub.controller (D:/MyWorkspace/SHANIU/src/dsh/packages/client/ui-conversation/src/client/input/hub.ts:309:14)
+    at Object.inputTriggers (D:/MyWorkspace/SHANIU/src/dsh/packages/client/ui-conversation/src/client/input/hub.ts:125:33)
+    at Object.resolveLexicon (D:/MyWorkspace/SHANIU/src/dsh/packages/client/ui-conversation/src/client/input/facade.ts:187:39)
+    at DraftEditorRuntime.refreshLexiconSubscription (D:/MyWorkspace/SHANIU/src/dsh/packages/client/ui-conversation/src/client/input/editor/runtime.ts:166:31)
+    at SessionInputShell.refreshLexiconSubscription (D:/MyWorkspace/SHANIU/src/dsh/packages/client/ui-conversation/src/client/input/facade.ts:247:22)
+    at D:/MyWorkspace/SHANIU/src/dsh/packages/client/ui-conversation/src/client/input/hub.ts:180:30
+    at runDisposable (D:/MyWorkspace/SHANIU/src/dsh/vendor/cordis/src/fiber.ts:115:18)
+    at dispose (D:/MyWorkspace/SHANIU/src/dsh/vendor/cordis/src/fiber.ts:441:26)
+    at D:/MyWorkspace/SHANIU/src/dsh/vendor/cordis/src/fiber.ts:518:44
+
+ [32m✓[39m src/__tests__/boot-globals.test.ts [2m([22m[2m1 test[22m[2m)[22m[32m 249[2mms[22m[39m
+ [32m✓[39m src/__tests__/boot-health.test.ts [2m([22m[2m1 test[22m[2m)[22m[32m 254[2mms[22m[39m
+ [32m✓[39m src/__tests__/plugin-report.test.ts [2m([22m[2m4 tests[22m[2m)[22m[32m 300[2mms[22m[39m
+ [32m✓[39m src/transport/mock.spec.ts [2m([22m[2m11 tests[22m[2m)[22m[33m 5542[2mms[22m[39m
+   [32m✓[39m mock 回合剧本与模型配置状态一致 [2m(2)[22m
+     [33m[2m✓[22m[39m 配好服务商后同一会话走成功回合，失败回合照样占一个回合号[33m 456[2mms[22m[39m
+   [32m✓[39m mock 子代理泳道演示（SH-109） [2m(2)[22m
+     [33m[2m✓[22m[39m /subagent-demo：父落 catalog v3 与汇总，泳道完整回合 + timing 收口[33m 2556[2mms[22m[39m
+     [33m[2m✓[22m[39m remote.subagents：interrupt 让泳道按 aborted 收口，steering 开续聊回合[33m 2509[2mms[22m[39m
+
+[2m Test Files [22m [1m[32m45 passed[39m[22m[90m (45)[39m
+[2m      Tests [22m [1m[32m506 passed[39m[22m[90m (506)[39m
+[2m   Start at [22m 05:18:36
+[2m   Duration [22m 7.08s[2m (environment 48%, import 16%, transform 16%, tests 12%, setup 7%)[22m
+
+[2mEnvironment [22m [33mjsdom was created 45 times[39m[2m · 42.96s total, 48% of tracked time[22m
+[2m            [22m [2mcreate it once per worker with [22m[33mpool: 'vmThreads'[39m[2m (keeps per-file isolation) or [22m[33misolate: false[39m[2m (shares it across files)[22m
+[2m            [22m [2mlearn more: https://vitest.dev/guide/improving-performance#test-environments[22m
+

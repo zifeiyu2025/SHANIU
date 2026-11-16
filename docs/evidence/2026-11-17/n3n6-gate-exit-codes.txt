@@ -1,0 +1,3 @@
+typecheck exit=0
+check-deps exit=0
+check-doc-claims exit=0

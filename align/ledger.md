@@ -6,11 +6,11 @@
 
 ## 统计
 
-- 条目总数：3314
-- same：2677
-- drift：78
+- 条目总数：3315
+- same：2676
+- drift：79
 - missing：0
-- not-applicable：559
+- not-applicable：560
 - 待复核（needs-review）：0
 
 ## 不一致条目
@@ -153,7 +153,7 @@
 | `packages/client/ui-chat/src/client/chat/ChatView.tsx` | drift | 已登记 | 类型级修复（第 9 行批次）+ fileImages.labels 传 image.openExternal（第 22 行） | 两项分别按对应行规则同步：上游统一文案则删本地传参，类型批随 React 19 升级重跑 tsc -b |
 | `packages/client/ui-chat/src/client/chat/MessageItem.module.css` | drift | 已登记 | A0-2 失败行可展开/复制所需的样式（docs/07 #23） | 上游若提供等价诊断 UI，删本地改动 |
 | `packages/client/ui-chat/src/client/chat/MessageItem.tsx` | drift | 已登记 | A0-2 TurnErrorItem 增加可展开的原始诊断与复制（docs/07 #23） | 上游若已提供等价原始诊断，删本地改动改跟上游 |
-| `packages/client/ui-chat/src/client/chat/TurnProcessNodeView.tsx` | drift | 已登记 | N1 顶部回合摘要识别 indeterminate：显示「本轮状态未知」，不再按 completed 计时（docs/07 #33） | 上游若原生支持「无结论」reason 并同步改顶部控件，删本地分支改跟上游；若只同步 turn-error 不改顶部，必须补回本分支，否则「未知」会重新渲染成「已完成 + 时长」 |
+| `packages/client/ui-chat/src/client/chat/TurnProcessNodeView.tsx` | drift | 已登记 | N1 顶部回合摘要识别 indeterminate：显示「本轮状态未知」，不再按 completed 计时（docs/07 #33）；N3 改读 turnEnding() 的结局并新增 truncated →「已截断」，不再自己判 reason.kind（docs/07 #35） | 上游若原生支持「无结论」reason 并同步改顶部控件，删本地分支改跟上游；若只同步 turn-error 不改顶部，必须补回本分支，否则「未知」会重新渲染成「已完成 + 时长」。N3 的 truncated 分支同理：上游若让顶部读统一结局，删本地 turnProcessOutcome 改跟上游；不要把截断并回「已完成 + 用时」 |
 | `packages/client/ui-chat/src/client/chat/TurnTriggerNodeView.tsx` | drift | 已登记 | A0-4 未知时刻改用 span、不挂 dateTime（docs/07 #24） | 同步后确认 time=0 不再渲染成 1970 |
 | `packages/client/ui-chat/src/client/chat/flow-motion.ts` | drift | 已登记 | 类型级修复（docs/07 #9） | 同第 9 行类型批 |
 | `packages/client/ui-chat/src/client/chat/message-chrome.ts` | drift | 已登记 | A0-4 time<=0 返回「记录时刻不可用」（docs/07 #24） | 同步后确认旧档案不再显示假时钟 |
@@ -165,8 +165,10 @@
 | `packages/client/ui-chat/src/client/contract/slots.ts` | drift | 已登记 | 类型级修复（docs/07 #9） | 同第 9 行类型批 |
 | `packages/client/ui-chat/src/client/conversation-nodes/compaction.ts` | drift | 已登记 | N5 R5-1：压缩节点补 groupTree:'turn'，留在 Turn 层不被「已完成，用时 N 秒」→「已完成分析」两级过程组折叠（docs/07 #34） | 上游若把压缩节点移出过程组、或给节点定义提供 default-open 配置，删本地 groupTree 改跟上游；同步后必须确认不展开任何组时节点仍可见 |
 | `packages/client/ui-chat/src/client/conversation-nodes/event-projection.ts` | drift | 已登记 | A0-2 失败节点 detail 透传（docs/07 #23） | 上游若自带 detail，删本地透传 |
-| `packages/client/ui-chat/src/client/conversation-nodes/turn-error.ts` | drift | 已登记 | A0-2 TurnErrorNode 增加可选 detail（docs/07 #23） | 上游若等价则删本地字段；字段必须保持可选 |
-| `packages/client/ui-chat/src/client/locale.ts` | drift | 已登记 | 8 套词典各加 image.openExternal（共 8 条）（docs/07 #22） | 上游若已加等价键，删本地 8 条改指上游键 |
+| `src/dsh/packages/client/ui-chat/src/client/conversation-nodes/turn-ending.ts` | not-applicable | 已登记 | N3 本地新增：回合结局的唯一判定（completed/truncated/stopped/failed/unknown），行首结局行/截断提示行/组标题都只读它（docs/07 #35） | 上游若提供等价的结局判定模块，删本地文件并把三处消费方改指上游；只同步其中一处不够——三处必须继续读同一个判定 |
+| `packages/client/ui-chat/src/client/conversation-nodes/turn-error.ts` | drift | 已登记 | A0-2 TurnErrorNode 增加可选 detail（docs/07 #23）；N3 结局判定改由 turnEnding() 统一给出，删掉本地自加的 max-tokens 失败分支（docs/07 #35） | 上游若等价则删本地字段；字段必须保持可选。同步上游后不要把 max-tokens 加回失败行，否则同一回合同屏出现「失败 + 截断」两条结论 |
+| `packages/client/ui-chat/src/client/conversation-nodes/turn-max-tokens.ts` | drift | 已登记 | N3 截断提示行改读 turnEnding().kind === 'truncated'，不再自己比对 reason.kind（docs/07 #35） | 上游若让提示行读统一结局，删本地判断改跟上游；判据必须与行首结局行一致，不能一处认 max-tokens、一处认结局 |
+| `packages/client/ui-chat/src/client/locale.ts` | drift | 已登记 | 8 套词典各加 image.openExternal（共 8 条）（docs/07 #22）；N3 再各加 message.turnProcess.truncated（8 条，docs/07 #35） | 上游若已加等价键，删本地 8 条改指上游键；同步后确认截断组标题不再落到「已完成」 |
 | `packages/client/ui-chat/tests/approval-command.client.spec.tsx` | drift | 已登记 | A0-T7 详情槽用例（docs/07 #25） | 同步上游后用例随实现一起调整，不要单独删 |
 | `packages/client/ui-conversation/src/client/contract/records.ts` | drift | 已登记 | A0-2 记录里的失败节点增加可选 detail（docs/07 #23） | 上游若自带 detail，删本地字段 |
 | `packages/client/ui-conversation/src/client/contract/slots.ts` | drift | 已登记 | 类型级修复（docs/07 #9） | 同第 9 行类型批 |

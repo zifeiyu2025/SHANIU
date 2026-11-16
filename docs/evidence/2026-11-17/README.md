@@ -112,3 +112,44 @@
 **仍未核实**：真机重跑（强杀 → 重开）尚未执行；本批只证明判据、档案留痕、回放与步数口径，
 冒烟结论仍以 `docs/smoke/2026-11-17-9af8431/REPORT.md` 的 FAIL 为准，直到重跑。
 
+## 追加：0.2.9 真机冒烟 P2 展示口径（N3 截断三口径 / N6 拒绝卡折叠态）
+
+**N3 根因**：一个回合的结局被三处各判一次——`turn-error.ts` 本地自加的 `max-tokens` 分支
+画成红色「本轮运行失败」、`TurnProcessNodeView` 的默认分支画成「已完成，用时 N 秒」、
+`turn-max-tokens.ts` 再画一条黄色截断提示。三处各自读 `reason.kind`，于是同屏出现「失败 + 已完成」。
+
+**N3 修法**：新增 `conversation-nodes/turn-ending.ts` 作为唯一判定
+（`completed` / `truncated` / `stopped` / `failed` / `unknown`）；行首结局行（`turn-error.ts`）、截断提示行（`turn-max-tokens.ts`）、
+组标题（`TurnProcessNodeView.tsx`）都只读它，组件侧只剩展示映射。截断只有一条黄色提示行，
+组标题为「已截断」（8 套词典各加 `message.turnProcess.truncated`），不再出现「失败」或「已完成」。
+
+**N6 根因**：rollout 档案只存 `tool_call` 的 `output` 文本、没有 `isError`；回放只按
+`[exit code: N]` 判失败，而「拒绝说明：type=…」「路径越界（工作区之外）: …」
+「路径越界（包含 ..）: …」都不带退出码 → 被读成成功，卡片折叠仍是 `data-state="ok"`。
+
+**N6 修法**：`src/transport/adapter.ts` 的回放路径按上述宿主稳定行首标记还原错误态
+（兼容 apply_patch 的「第 N 处（…）：」段前缀），并加一条「源码正文里含相同标记的 read」
+负例防误判；未改上游渲染器，展开后正文仍是档案原文。
+
+**用例与原始输出**：
+
+| 文件 | 内容 |
+|---|---|
+| `n3n6-01-red-n3.log` | 先红：`src/turn-ending.spec.ts` / `src/turn-process-outcome.spec.ts` 4 failed / 4 passed（`expected { id: '1', role: 'update' } to be null`、`expected { kind: 'took', elapsedMs: 5000 } to deeply equal { kind: 'truncated' }`） |
+| `n3n6-01-red-n6.log` | 先红：回放用例 1 failed（拒绝说明被当成成功，`isError` 仍为 `false`） |
+| `n3n6-02-green-n3.log` | 修复后：`turn-ending.spec.ts` + `turn-process-outcome.spec.ts` 8 passed |
+| `n3n6-02-green-n6.log` | 修复后：`src/transport/adapter.spec.ts` 回放用例 passed |
+| `n3n6-03-reverse-n3.log` | 反向验证：把结局判定退回「三处各判」（`turn-error` 重新吞 `max-tokens`、顶部默认分支），3 failed / 5 passed |
+| `n3n6-03-reverse-n6.log` | 反向验证：回放退回只认 `[exit code: N]`，1 failed |
+| `n3n6-04-green-restored.log` | 恢复修复后：8 passed |
+| `n3n6-typecheck.log` | `pnpm typecheck` 通过（无输出即通过） |
+| `n3n6-vitest-full.log` | `pnpm test`（已排除 `scratch/**`）：506 passed |
+| `n3n6-cargo-test.log` | `cargo test`：lib 1148 passed / 4 ignored、集成 25 passed |
+| `n3n6-clippy.log` | `cargo clippy --all-targets -- -D warnings` 通过 |
+| `n3n6-check-deps.log` | `check-deps.ps1`：0 违规 |
+| `n3n6-check-doc-claims.log` | `check-doc-claims.ps1`：A 类缺口 0 / B 类 5（既有） |
+| `n3n6-gate-exit-codes.txt` | 三个 TS 门禁退出码：typecheck / check-deps / check-doc-claims 均 0 |
+
+**仍未核实**：N3/N6 的界面口径只在单测与回放层证明；真机重跑后才能把
+`docs/smoke/2026-11-17-9af8431/REPORT.md` 的 N3/N6 改判 PASS。
+

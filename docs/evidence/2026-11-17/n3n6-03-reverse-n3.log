@@ -1,0 +1,85 @@
+
+[1m[30m[46m RUN [49m[39m[22m [36mv5.1.0 [39m[90mD:/MyWorkspace/SHANIU[39m
+
+ [32m✓[39m src/turn-process-outcome.spec.ts [2m([22m[2m4 tests[22m[2m)[22m[32m 4[2mms[22m[39m
+ [31m❯[39m src/turn-ending.spec.ts [2m([22m[2m4 tests[22m[2m | [22m[31m3 failed[39m[2m)[22m[32m 10[2mms[22m[39m
+   [31m❯[39m 回合结局：截断只算「被截断」，不算失败也不算已完成 [2m(4)[22m
+[31m     [31m×[31m 单一判定把 max-tokens 判成 truncated[39m[32m 5[2mms[22m[39m
+[31m     [31m×[31m 行首：截断不再生成「本轮运行失败」结局行，只留截断提示行[39m[32m 1[2mms[22m[39m
+[31m     [31m×[31m 组标题：截断显示「已截断」，不带「已完成」也不带用时[39m[32m 1[2mms[22m[39m
+     [32m✓[39m 其余结局的口径不变[32m 1[2mms[22m[39m
+
+⎯⎯⎯⎯⎯⎯⎯ Failed Tests 3 ⎯⎯⎯⎯⎯⎯⎯
+
+ FAIL  src/turn-ending.spec.ts > 回合结局：截断只算「被截断」，不算失败也不算已完成 > 单一判定把 max-tokens 判成 truncated
+AssertionError: expected { kind: 'truncated', …(2) } to deeply equal { kind: 'truncated', …(1) }
+
+- Expected
++ Received
+
+  {
+    "code": "MAX_TOKENS",
+    "kind": "truncated",
++   "message": "输出达到上限，这条回答被截断（内容不完整）。",
+  }
+
+ ❯ src/turn-ending.spec.ts:36:48
+     34| describe('回合结局：截断只算「被截断」，不算失败也不算已完成', () => {
+     35|   it('单一判定把 max-tokens 判成 truncated', () => {
+     36|     expect(turnEnding({ kind: 'max-tokens' })).toEqual({ kind: 'trunca…
+       |                                                ^
+     37|   })
+     38|
+
+⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯[1/3]⎯
+
+ FAIL  src/turn-ending.spec.ts > 回合结局：截断只算「被截断」，不算失败也不算已完成 > 行首：截断不再生成「本轮运行失败」结局行，只留截断提示行
+AssertionError: expected { id: '1', role: 'update' } to be null
+
+- Expected:
+null
+
++ Received:
+{
+  "id": "1",
+  "role": "update",
+}
+
+ ❯ src/turn-ending.spec.ts:42:46
+     40|     const event = turnEnd(1, { kind: 'max-tokens' })
+     41|     // 反向对照：把 `turn-error` 的 max-tokens 分支加回去，这里会变成 { id: '1', role: '…
+     42|     expect(turnErrorDefinition.match(event)).toBeNull()
+       |                                              ^
+     43|     expect(turnEndingRow(turnEnding({ kind: 'max-tokens' }))).toBeUnde…
+     44|     // 「被截断」仍有一行承载，且与上面是同一个判定。
+
+⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯[2/3]⎯
+
+ FAIL  src/turn-ending.spec.ts > 回合结局：截断只算「被截断」，不算失败也不算已完成 > 组标题：截断显示「已截断」，不带「已完成」也不带用时
+AssertionError: expected { kind: 'took', elapsedMs: 5000 } to deeply equal { kind: 'truncated' }
+
+- Expected
++ Received
+
+  {
+-   "kind": "truncated",
++   "elapsedMs": 5000,
++   "kind": "took",
+  }
+
+ ❯ src/turn-ending.spec.ts:51:62
+     49|     const ending = turnEnding({ kind: 'max-tokens' })
+     50|     // 反向对照：删掉 truncated 分支，这里会变成 { kind: 'took', elapsedMs: 5000 }。
+     51|     expect(turnProcessOutcome(ending.kind, FIVE_SECONDS_MS)).toEqual({…
+       |                                                              ^
+     52|     expect(zh['message.turnProcess.truncated']).toBe('已截断')
+     53|     expect(zh['message.turnProcess.truncated']).not.toBe(zh['message.t…
+
+⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯[3/3]⎯
+
+
+[2m Test Files [22m [1m[31m1 failed[39m[22m[2m | [22m[1m[32m1 passed[39m[22m[90m (2)[39m
+[2m      Tests [22m [1m[31m3 failed[39m[22m[2m | [22m[1m[32m5 passed[39m[22m[90m (8)[39m
+[2m   Start at [22m 05:05:00
+[2m   Duration [22m 1.28s[2m (environment 39%, transform 28%, import 26%, setup 7%, tests 1%)[22m
+

@@ -1,0 +1,112 @@
+
+[1m[30m[46m RUN [49m[39m[22m [36mv5.1.0 [39m[90mD:/MyWorkspace/SHANIU[39m
+
+ [31m❯[39m src/turn-process-outcome.spec.ts [2m([22m[2m4 tests[22m[2m | [22m[31m2 failed[39m[2m)[22m[32m 8[2mms[22m[39m
+   [31m❯[39m 回合顶部摘要：没有结论不得写成已完成 [2m(4)[22m
+[31m     [31m×[31m indeterminate → 本轮状态未知，且不给用时[39m[32m 5[2mms[22m[39m
+     [32m✓[39m completed 保留用时，与旧行为一致[32m 0[2mms[22m[39m
+[31m     [31m×[31m 已中止 / 进程退出 / 失败仍然替换用时[39m[32m 1[2mms[22m[39m
+     [32m✓[39m 既无结局也无时长时退回「已完成」，不新造文案[32m 0[2mms[22m[39m
+ [31m❯[39m src/turn-ending.spec.ts [2m([22m[2m4 tests[22m[2m | [22m[31m2 failed[39m[2m)[22m[32m 8[2mms[22m[39m
+   [31m❯[39m 回合结局：截断只算「被截断」，不算失败也不算已完成 [2m(4)[22m
+     [32m✓[39m 单一判定把 max-tokens 判成 truncated[32m 1[2mms[22m[39m
+[31m     [31m×[31m 行首：截断不再生成「本轮运行失败」结局行，只留截断提示行[39m[32m 4[2mms[22m[39m
+[31m     [31m×[31m 组标题：截断显示「已截断」，不带「已完成」也不带用时[39m[32m 2[2mms[22m[39m
+     [32m✓[39m 其余结局的口径不变[32m 0[2mms[22m[39m
+
+⎯⎯⎯⎯⎯⎯⎯ Failed Tests 4 ⎯⎯⎯⎯⎯⎯⎯
+
+ FAIL  src/turn-ending.spec.ts > 回合结局：截断只算「被截断」，不算失败也不算已完成 > 行首：截断不再生成「本轮运行失败」结局行，只留截断提示行
+AssertionError: expected { id: '1', role: 'update' } to be null
+
+- Expected:
+null
+
++ Received:
+{
+  "id": "1",
+  "role": "update",
+}
+
+ ❯ src/turn-ending.spec.ts:42:46
+     40|     const event = turnEnd(1, { kind: 'max-tokens' })
+     41|     // 反向对照：把 `turn-error` 的 max-tokens 分支加回去，这里会变成 { id: '1', role: '…
+     42|     expect(turnErrorDefinition.match(event)).toBeNull()
+       |                                              ^
+     43|     expect(turnEndingRow(turnEnding({ kind: 'max-tokens' }))).toBeUnde…
+     44|     // 「被截断」仍有一行承载，且与上面是同一个判定。
+
+⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯[1/4]⎯
+
+ FAIL  src/turn-ending.spec.ts > 回合结局：截断只算「被截断」，不算失败也不算已完成 > 组标题：截断显示「已截断」，不带「已完成」也不带用时
+AssertionError: expected { kind: 'took', elapsedMs: 5000 } to deeply equal { kind: 'truncated' }
+
+- Expected
++ Received
+
+  {
+-   "kind": "truncated",
++   "elapsedMs": 5000,
++   "kind": "took",
+  }
+
+ ❯ src/turn-ending.spec.ts:51:62
+     49|     const ending = turnEnding({ kind: 'max-tokens' })
+     50|     // 反向对照：删掉 truncated 分支，这里会变成 { kind: 'took', elapsedMs: 5000 }。
+     51|     expect(turnProcessOutcome(ending.kind, FIVE_SECONDS_MS)).toEqual({…
+       |                                                              ^
+     52|     expect(zh['message.turnProcess.truncated']).toBe('已截断')
+     53|     expect(zh['message.turnProcess.truncated']).not.toBe(zh['message.t…
+
+⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯[2/4]⎯
+
+ FAIL  src/turn-process-outcome.spec.ts > 回合顶部摘要：没有结论不得写成已完成 > indeterminate → 本轮状态未知，且不给用时
+AssertionError: expected { kind: 'took', elapsedMs: 61200000 } to deeply equal { kind: 'unknown' }
+
+- Expected
++ Received
+
+  {
+-   "kind": "unknown",
++   "elapsedMs": 61200000,
++   "kind": "took",
+  }
+
+ ❯ src/turn-process-outcome.spec.ts:28:8
+     26|     // 界面随即显示「已完成，用时 17小时」，与回合内的「本轮状态未知」互相矛盾。
+     27|     expect(turnProcessOutcome(turnEnding({ kind: 'indeterminate' }).ki…
+     28|       .toEqual({ kind: 'unknown' })
+       |        ^
+     29|     expect(zh['message.turnUnknown']).toBe('本轮状态未知')
+     30|   })
+
+⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯[3/4]⎯
+
+ FAIL  src/turn-process-outcome.spec.ts > 回合顶部摘要：没有结论不得写成已完成 > 已中止 / 进程退出 / 失败仍然替换用时
+AssertionError: expected { kind: 'took', elapsedMs: 61200000 } to deeply equal { kind: 'stopped' }
+
+- Expected
++ Received
+
+  {
+-   "kind": "stopped",
++   "elapsedMs": 61200000,
++   "kind": "took",
+  }
+
+ ❯ src/turn-process-outcome.spec.ts:39:8
+     37|   it('已中止 / 进程退出 / 失败仍然替换用时', () => {
+     38|     expect(turnProcessOutcome(turnEnding({ kind: 'aborted', reason: { …
+     39|       .toEqual({ kind: 'stopped' })
+       |        ^
+     40|     expect(turnProcessOutcome(turnEnding({ kind: 'interrupted' }).kind…
+     41|       .toEqual({ kind: 'stopped' })
+
+⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯[4/4]⎯
+
+
+[2m Test Files [22m [1m[31m2 failed[39m[22m[90m (2)[39m
+[2m      Tests [22m [1m[31m4 failed[39m[22m[2m | [22m[1m[32m4 passed[39m[22m[90m (8)[39m
+[2m   Start at [22m 05:04:34
+[2m   Duration [22m 1.45s[2m (environment 37%, transform 30%, import 26%, setup 7%, tests 1%)[22m
+
