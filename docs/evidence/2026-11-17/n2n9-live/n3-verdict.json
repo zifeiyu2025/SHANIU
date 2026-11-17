@@ -1,0 +1,64 @@
+{
+  "scenario": "n3",
+  "at": "2026-11-17T11:23:27.453Z",
+  "exe": "D:\\MyWorkspace\\SHANIU\\dist-portable\\SHANIU-Portable\\SHANIU.exe",
+  "exeSha256": "0ABD6B0A93EEE86FA418924A6FAC407A1440F604430BA91280A85177DFDEC071",
+  "checks": [
+    {
+      "name": "实时：截断提示恰好一条",
+      "ok": true,
+      "detail": "count=1"
+    },
+    {
+      "name": "实时：组标题为「已截断」",
+      "ok": true,
+      "detail": ""
+    },
+    {
+      "name": "实时：无「本轮运行失败」",
+      "ok": true,
+      "detail": ""
+    },
+    {
+      "name": "实时：无「已完成」",
+      "ok": true,
+      "detail": ""
+    },
+    {
+      "name": "重开回到原会话",
+      "ok": true,
+      "detail": ""
+    },
+    {
+      "name": "重开：截断提示恰好一条",
+      "ok": true,
+      "detail": "count=1"
+    },
+    {
+      "name": "重开：组标题为「已截断」",
+      "ok": true,
+      "detail": ""
+    },
+    {
+      "name": "重开：无「本轮运行失败」",
+      "ok": true,
+      "detail": ""
+    },
+    {
+      "name": "重开：无「已完成」",
+      "ok": true,
+      "detail": ""
+    }
+  ],
+  "artifacts": [
+    "n3-live.png",
+    "n3-reopen.png",
+    "n3-rollout.jsonl"
+  ],
+  "stubState": {
+    "mainIndex": 1,
+    "overflow": false,
+    "mainRequests": 1,
+    "auxRequests": 1
+  }
+}

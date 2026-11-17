@@ -1,0 +1,79 @@
+
+    
+      // 与 head 里解析出的偏好保持一致：base.css 靠 body[data-ds-dark-theme] 切暗色变量，
+      // 在样式表生效前写入，避免"浅色默认值 → 暗色"闪一下。
+      ;(function () {
+        if (window.__shaniuBootDark) document.body.setAttribute('data-ds-dark-theme', '')
+      })()
+    
+    
+    SHANIU新会话Ctrl+N插件自动化任务更多工作区默认工作区N2N9 复验刚刚设置N2N9 复验N8 复验：请用一次 apply_patch 改两处。19:37已完成已完成，用时 1秒已调用工具并修改了文件工具调用read_file · data.txt编辑输出第 1 段（Update File: data.txt，补丁第 2–9 行）：第 2 个 `@@` 块：上下文不匹配：未找到补丁期望的 2 行序列（已尝试：精确、剥离行号前缀、缩进弹性、空白折叠、首尾锚点）。
+期望匹配的 2 行（块内序号）：
+  块内 1| a1-first
+  块内 2| nope
+文件中最接近的位置：第 1 行起（整块相似度 12%，文件共 3 行）：
+  文件第 1| a1
+  文件第 2| a2
+首个不一致：块内第 1 行 vs 文件第 1 行；期望 `a1-first`，实际读到 `a1`
+请按上面「文件中最接近的位置」的真实内容重建补丁，不要原样重试补丁已处理。19:37发消息或创建任务, / 调用指令, @ 文件或对话自定义smoke-11 轮 3 步空面板
+
+    
+      // 窗口以 visible:false 创建（tauri.conf.json），这里在启动页已解析、即将绘制时
+      // 通知宿主显示窗口。rAF 在隐藏窗口里可能被节流，故另设 150ms 兜底；
+      // Rust 侧还有 3s 强制显示，保证不存在"窗口永不出现"。
+      // 浏览器联调没有 __TAURI_INTERNALS__，静默跳过。
+      ;(function () {
+        var internals = window.__TAURI_INTERNALS__
+        if (!internals || typeof internals.invoke !== 'function') return
+        var shown = false
+        function show() {
+          if (shown) return
+          shown = true
+          internals.invoke('frontend_ready').catch(function () {})
+        }
+        requestAnimationFrame(function () {
+          requestAnimationFrame(show)
+        })
+        setTimeout(show, 150)
+      })()
+    
+    
+      // 失败出口（最后一层）：主包压根没跑起来（内嵌资源损坏、模块加载失败）时，
+      // 上面的信号已让窗口出现，但没有任何脚本会报错，启动页就会永久停住——比白屏更糟。
+      // 这里放一个比主包内超时（8s）更长的看门狗，超时把启动页换成可诊断面板；
+      // 主包接管后调用 __shaniuBootSettle() 就不再触发。
+      ;(function () {
+        var settled = false
+        window.__shaniuBootSettle = function () {
+          settled = true
+        }
+        setTimeout(function () {
+          if (settled) return
+          var splash = document.getElementById('boot-splash')
+          if (!splash) return
+          var title = document.createElement('div')
+          title.className = 'boot-failure-title'
+          title.textContent = '启动没有完成'
+          var message = document.createElement('div')
+          message.textContent = '界面代码没有在 12 秒内开始运行，可能是程序文件损坏或加载失败。'
+          var stage = document.createElement('div')
+          stage.className = 'boot-failure-stage'
+          stage.textContent = '停在：加载界面代码'
+          var hint = document.createElement('code')
+          hint.textContent = '日志：%LOCALAPPDATA%\\SHANIU\\logs（便携版为程序目录下 data\\logs）'
+          var retry = document.createElement('button')
+          retry.type = 'button'
+          retry.className = 'boot-retry'
+          retry.textContent = '重试'
+          retry.addEventListener('click', function () {
+            window.location.reload()
+          })
+          var wrap = document.createElement('div')
+          wrap.className = 'boot-failure'
+          wrap.append(title, message, stage, hint, retry)
+          splash.replaceChildren(wrap)
+        }, 12000)
+      })()
+    
+  
+

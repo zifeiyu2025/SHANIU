@@ -1,0 +1,86 @@
+{
+  "scenario": "n4",
+  "at": "2026-11-17T11:29:47.854Z",
+  "exe": "D:\\MyWorkspace\\SHANIU\\dist-portable\\SHANIU-Portable\\SHANIU.exe",
+  "exeSha256": "0ABD6B0A93EEE86FA418924A6FAC407A1440F604430BA91280A85177DFDEC071",
+  "checks": [
+    {
+      "name": "导出 ZIP 成功",
+      "ok": true,
+      "detail": ""
+    },
+    {
+      "name": "导出含 session.v4.jsonl",
+      "ok": true,
+      "detail": ""
+    },
+    {
+      "name": "两条 turn/end 都带数值 iterations",
+      "ok": true,
+      "detail": "[2,2]"
+    },
+    {
+      "name": "导出 iterations 与 rollout 一致",
+      "ok": true,
+      "detail": "export=[2,2] rollout=[2,2]"
+    },
+    {
+      "name": "条目步号非恒 1",
+      "ok": true,
+      "detail": "[0,0,1,0,0,1]"
+    },
+    {
+      "name": "步号不超过权威步数",
+      "ok": true,
+      "detail": "steps=[0,0,1,0,0,1] max=2"
+    },
+    {
+      "name": "主导出不带 stepsUnavailable",
+      "ok": true,
+      "detail": ""
+    },
+    {
+      "name": "找到 rollout 档案",
+      "ok": true,
+      "detail": "D:\\MyWorkspace\\SHANIU\\docs\\evidence\\2026-11-17\\n2n9-live\\n4\\data\\rollouts\\sess-1794914948298-0001.jsonl"
+    },
+    {
+      "name": "旧档重开回到原会话",
+      "ok": true,
+      "detail": ""
+    },
+    {
+      "name": "旧档导出 ZIP 成功",
+      "ok": true,
+      "detail": ""
+    },
+    {
+      "name": "旧档导出含 session.v4.jsonl",
+      "ok": true,
+      "detail": ""
+    },
+    {
+      "name": "旧档 turn/end 标 stepsUnavailable",
+      "ok": true,
+      "detail": "[{\"turn\":1,\"reason\":\"completed\",\"stepsUnavailable\":true},{\"turn\":2,\"reason\":\"completed\",\"stepsUnavailable\":true}]"
+    },
+    {
+      "name": "旧档条目不伪造 step",
+      "ok": true,
+      "detail": "[]"
+    }
+  ],
+  "artifacts": [
+    "n4-live.png",
+    "n4-export.png",
+    "n4-session.v4.jsonl",
+    "n4-rollout.jsonl",
+    "n4-legacy-session.v4.jsonl"
+  ],
+  "stubState": {
+    "mainIndex": 4,
+    "overflow": false,
+    "mainRequests": 4,
+    "auxRequests": 1
+  }
+}

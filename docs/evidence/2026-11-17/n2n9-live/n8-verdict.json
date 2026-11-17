@@ -1,0 +1,48 @@
+{
+  "scenario": "n8",
+  "at": "2026-11-17T11:37:23.944Z",
+  "exe": "D:\\MyWorkspace\\SHANIU\\dist-portable\\SHANIU-Portable\\SHANIU.exe",
+  "exeSha256": "0ABD6B0A93EEE86FA418924A6FAC407A1440F604430BA91280A85177DFDEC071",
+  "checks": [
+    {
+      "name": "补丁卡为错误态",
+      "ok": true,
+      "detail": "error"
+    },
+    {
+      "name": "重开回到原会话",
+      "ok": true,
+      "detail": ""
+    },
+    {
+      "name": "回执「实际读到」为磁盘原文",
+      "ok": true,
+      "detail": "retry.className = 'boot-retry'\n          retry.textContent = '重试'\n          retry.addEventListener('click', function () {\n            window.location.reload()\n          })\n          var wrap = document.createElement('div')\n          wrap.className = 'boot-failure'\n          wrap.append(title, message, stage, hint, retry)\n          splash.replaceChildren(wrap)\n        }, 12000)\n      })()\n    \n  \n\n"
+    },
+    {
+      "name": "回执不含预演后的 a1-first",
+      "ok": true,
+      "detail": ""
+    },
+    {
+      "name": "失败后整单回滚",
+      "ok": true,
+      "detail": "\"a1\\na2\\na3\\n\""
+    }
+  ],
+  "artifacts": [
+    "n8-live.png",
+    "n8-card.json",
+    "n8-reopen.png",
+    "n8-reopen-text.txt",
+    "n8-card-reopen.json",
+    "n8-data-after.txt",
+    "n8-rollout.jsonl"
+  ],
+  "stubState": {
+    "mainIndex": 3,
+    "overflow": false,
+    "mainRequests": 3,
+    "auxRequests": 1
+  }
+}

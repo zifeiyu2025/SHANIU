@@ -1,0 +1,72 @@
+{
+  "scenario": "n7",
+  "at": "2026-11-17T11:22:07.805Z",
+  "exe": "D:\\MyWorkspace\\SHANIU\\dist-portable\\SHANIU-Portable\\SHANIU.exe",
+  "exeSha256": "0ABD6B0A93EEE86FA418924A6FAC407A1440F604430BA91280A85177DFDEC071",
+  "checks": [
+    {
+      "name": "实时界面有裁剪通知",
+      "ok": true,
+      "detail": ""
+    },
+    {
+      "name": "找到 rollout 档案",
+      "ok": true,
+      "detail": ""
+    },
+    {
+      "name": "档案保留裁剪前原文",
+      "ok": true,
+      "detail": "len=43077"
+    },
+    {
+      "name": "重开回到原会话",
+      "ok": true,
+      "detail": ""
+    },
+    {
+      "name": "重开卡片有判读行",
+      "ok": true,
+      "detail": "工具调用\nunified_exec · python big.py\n输入\n{\n  \"command\": \"python big.py\"\n}\n输出\n[已裁剪] 这条工具输出在发给模型前被确定性裁剪：原始 38958 字符，保留头 4096 +"
+    },
+    {
+      "name": "重开卡片仍保留原文尾部",
+      "ok": true,
+      "detail": ""
+    },
+    {
+      "name": "导出 ZIP 成功",
+      "ok": true,
+      "detail": ""
+    },
+    {
+      "name": "导出含 session.v4.jsonl",
+      "ok": true,
+      "detail": ""
+    },
+    {
+      "name": "导出含「已裁剪」留痕",
+      "ok": true,
+      "detail": "count=1"
+    },
+    {
+      "name": "导出保留裁剪前原文",
+      "ok": true,
+      "detail": ""
+    }
+  ],
+  "artifacts": [
+    "n7-live.png",
+    "n7-live-expanded.png",
+    "n7-rollout.jsonl",
+    "n7-reopen.png",
+    "n7-export.png",
+    "n7-session.v4.jsonl"
+  ],
+  "stubState": {
+    "mainIndex": 2,
+    "overflow": false,
+    "mainRequests": 2,
+    "auxRequests": 1
+  }
+}

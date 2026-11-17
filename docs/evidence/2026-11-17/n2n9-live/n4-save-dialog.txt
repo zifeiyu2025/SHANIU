@@ -1,0 +1,6 @@
+start
+compiled
+candidates=#32770|保存会话日志
+dialog=1705472
+edit=1639992 width=1031 button=1705558
+clicked

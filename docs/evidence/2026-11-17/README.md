@@ -350,3 +350,52 @@ v4 的 33–38 未回勾，本批只做**核实与证据补齐**，不动实现�
    分多条命令「先启动、再连 CDP」会看到进程已退出/端口未开。`probe.mjs` 因此把
    「等 CDP + 发消息 + 采样 + 截图」放在一次运行里。
 
+---
+
+## N2–N9 真机复验（八场景，2026-11-17，被测提交 `9e057fd`）
+
+**结论**：N2、N3、N4、N5、N6、N7、N8、N9 **八项全部 PASS**（72 条机器判据 0 失败）。
+被测二进制与 N1 同一份：`dist-portable\SHANIU-Portable\SHANIU.exe`，28,803,584 B，
+SHA256 `0ABD6B0A93EEE86FA418924A6FAC407A1440F604430BA91280A85177DFDEC071`。
+**未改产品代码、未改 `docs/smoke/2026-11-17-9af8431/REPORT.md` 的既有判据**。
+
+### 方法
+
+- `scripts/smoke/scenario-model.mjs`：本地 OpenAI 兼容端点，按场景脚本回应文本/工具调用，
+  会话标题与压缩摘要请求按 system prompt 分流、不占步号；可选不回报 `usage`。
+- `scripts/smoke/n2n9-live.mjs`：每场景新建 `<out>/<n>/data`（`SHANIU_DATA_DIR`）与
+  `<out>/<n>/workspace`，CDP 驱动 release exe（真实键入 + 回车），断言写 `<n>-verdict.json`，
+  同时留截图、请求序列、档案与导出件。
+- 原生「另存为」由 `<n>-save-dialog.ps1` 驱动（`#32770` → 最宽 `Edit` 发 `WM_SETTEXT` →
+  「保存」按钮 `BM_CLICK`）；执行日志 `<n>-save-dialog.txt` 与脚本一并落盘，便于复核。
+- 取证一律先展开历史回合的两级折叠（回合过程头 + 过程组头）；工具卡正文用
+  `textContent` 读（卡片正文带 `content-visibility`，`innerText` 会漏）。
+
+### 逐项结果
+
+| 项 | 复验要点 | 判据数 | 结论 | 关键证据 |
+|---|---|---|---|---|
+| N2 | 强杀后档案 `turn_end reason=indeterminate`；重开无审批卡、无「已停止」、显示「本轮状态未知」并留「这条审批在程序关闭前未作答，已失效」；步数不变 | 8 | PASS | `n2-verdict.json`、`n2-reopen.png`、`n2-rollout.jsonl` |
+| N3 | 实时/重开各恰好 1 条截断提示，组标题「已截断」，无「本轮运行失败」/「已完成」 | 9 | PASS | `n3-verdict.json`、`n3-live.png`、`n3-reopen.png` |
+| N4 | 导出 `turn/end.iterations=[2,2]` 与档案一致；条目 `step` 为 `0/1`（0 起，与实时 `step/start` 同码）；旧档删 `iterations` 后 `stepsUnavailable:true` 且不编 `step` | 13 | PASS | `n4-verdict.json`、`n4-session.v4.jsonl`、`n4-legacy-session.v4.jsonl` |
+| N5 | 挂起强杀前后页脚一致（2 轮 3 步，未 +1）；挂起回合落 `indeterminate` 且不带 `iterations` | 7 | PASS | `n5-verdict.json`、`n5-rollout-before.jsonl`、`n5-rollout-after.jsonl` |
+| N6 | 越界/拒绝卡 `data-state=error` 且标题行「失败」；重开保留「路径越界（工作区之外）」/「拒绝说明：type=user_denied」；同标记负例仍 `ok` | 15 | PASS | `n6-verdict.json`、`n6-cards-live.json`、`n6-cards-reopen.json` |
+| N7 | `token_budget=5000` + 端点不回报用量 → D6 裁剪 38958 字符（头 4096 + 尾 1024）；实时通知两句、重开卡 `[已裁剪]` 判读行 + 原文、档案保留 43077 字符、导出「已裁剪」1 处 | 10 | PASS | `n7-verdict.json`、`n7-live-expanded.png`、`n7-reopen.png`、`n7-session.v4.jsonl` |
+| N8 | 同一 `Update File` 段两块、第 2 块对不上：回执「实际读到 `a1`」（磁盘原文，非预演 `a1-first`），文件未改 | 5 | PASS | `n8-verdict.json`、`n8-reopen-text.txt`、`n8-data-after.txt` |
+| N9 | 第 2 回合直接 patch：失败态 + 「在本任务内没有可用的读取记录（可能尚未读取，或上次读取发生在本次修改之前、内容可能已过期）」，无「未读取过」，文件保持第 1 回合结果 | 5 | PASS | `n9-verdict.json`、`n9-card-reopen.json`、`n9-note-after.txt` |
+
+### 附带观察（不在 N2–N9 判据内）
+
+1. **实时与重开的失败卡文案不一致**：实时只给错误码（`ToolError: tool_error`、`Denied: denied`），
+   完整拒绝说明与 `apply_patch` 回执明细只在档案回放时出现，建议单独立项。
+2. **历史回合默认两级折叠**：工具卡与开发者通知都在 `hidden` 子树里，取证必须先展开；
+   否则会把「折叠」误判成「没留痕」。
+3. **裁剪的触发条件**：`observed_input_tokens ≥ 预算` 会连带压缩，压缩会把回合吞进摘要；
+   N7 用「端点不回报用量」走字符估算，把路径收窄成只裁剪不压缩，这是取证手法而非产品行为。
+
+### 脚本与清理
+
+- 新增脚本：`scripts/smoke/scenario-model.mjs`、`scripts/smoke/n2n9-live.mjs`（均无产品代码依赖）。
+- 证据目录 `docs/evidence/2026-11-17/n2n9-live/` 体积约 1.6 MB；`<n>/data` 与 `<n>/workspace`
+  为一次性复验数据根，可按需删除，`<n>-verdict.json` 与截图是判据本体。
+

@@ -1,0 +1,59 @@
+{
+  "scenario": "n2",
+  "at": "2026-11-17T11:22:52.673Z",
+  "exe": "D:\\MyWorkspace\\SHANIU\\dist-portable\\SHANIU-Portable\\SHANIU.exe",
+  "exeSha256": "0ABD6B0A93EEE86FA418924A6FAC407A1440F604430BA91280A85177DFDEC071",
+  "checks": [
+    {
+      "name": "审批卡出现",
+      "ok": true,
+      "detail": ""
+    },
+    {
+      "name": "显示等待审批计数",
+      "ok": true,
+      "detail": ""
+    },
+    {
+      "name": "重开回到原会话",
+      "ok": true,
+      "detail": ""
+    },
+    {
+      "name": "显示「本轮状态未知」",
+      "ok": true,
+      "detail": ""
+    },
+    {
+      "name": "不出现「已停止」",
+      "ok": true,
+      "detail": ""
+    },
+    {
+      "name": "审批卡不复活",
+      "ok": true,
+      "detail": ""
+    },
+    {
+      "name": "留下审批失效通知",
+      "ok": true,
+      "detail": "首次打开即显示"
+    },
+    {
+      "name": "rollout 结局为 indeterminate",
+      "ok": true,
+      "detail": "{\"type\":\"turn_end\",\"turn\":1,\"task_id\":\"sess-1794914544564-0001#1\",\"reason\":\"indeterminate\",\"at_ms\":1794914569362,\"error\":null}"
+    }
+  ],
+  "artifacts": [
+    "n2-before-kill.png",
+    "n2-reopen.png",
+    "n2-rollout.jsonl"
+  ],
+  "stubState": {
+    "mainIndex": 1,
+    "overflow": false,
+    "mainRequests": 1,
+    "auxRequests": 1
+  }
+}

@@ -1,0 +1,5 @@
+{"at":"2026-11-17T11:27:36.115Z","kind":"title","mainIndex":0,"messageCount":2,"toolResultCount":0,"lastUserText":"N6 复验：先读工作区外的文件，再读 marker，最后跑一条需要审批的命令。","overflow":false}
+{"at":"2026-11-17T11:27:36.413Z","kind":"main","mainIndex":1,"messageCount":3,"toolResultCount":0,"lastUserText":"N6 复验：先读工作区外的文件，再读 marker，最后跑一条需要审批的命令。","overflow":false}
+{"at":"2026-11-17T11:27:36.415Z","kind":"main","mainIndex":2,"messageCount":5,"toolResultCount":1,"lastUserText":"路径越界（工作区之外）: ../outside.txt\n拒绝说明：type=outside_workspace；工具=read_file；范围 approval=on_request sandbox=workspace_write risk=read；目标=../outside.txt\n目标不在工作区写入范围内，工具层","overflow":false}
+{"at":"2026-11-17T11:27:36.418Z","kind":"main","mainIndex":3,"messageCount":7,"toolResultCount":2,"lastUserText":"1: 说明：路径越界（工作区之外）: 这是文档示例，不是拒绝\n2: 备注：拒绝说明：type=user_denied；这是示例\n\n（文件结束：共 2 行）","overflow":false}
+{"at":"2026-11-17T11:27:36.749Z","kind":"main","mainIndex":4,"messageCount":9,"toolResultCount":3,"lastUserText":"拒绝说明：type=user_denied；工具=unified_exec；范围 approval=on_request sandbox=workspace_write risk=execute\n用户拒绝了这次调用，这条不会被自动放行。\n可行做法：说明这次操作要达成什么，或换一个更小的动作再问；不要原样重试，也不要换个","overflow":false}

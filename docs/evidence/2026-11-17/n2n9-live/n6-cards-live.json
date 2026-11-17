@@ -1,0 +1,14 @@
+{
+  "c-n6-out": {
+    "state": "error",
+    "text": "失败\n工具调用\nToolError: tool_error\n输入\n{\n  \"path\": \"../outside.txt\"\n}\n输出\nToolError: tool_error"
+  },
+  "c-n6-marker": {
+    "state": "ok",
+    "text": "工具调用\nread_file · marker.txt\n输入\n{\n  \"path\": \"marker.txt\"\n}\n输出\n[exit code: 0]"
+  },
+  "c-n6-deny": {
+    "state": "error",
+    "text": "失败\n工具调用\nDenied: denied\n输入\n{\n  \"command\": \"echo n6-NMWKLY5ZX\"\n}\n输出\nDenied: denied"
+  }
+}
