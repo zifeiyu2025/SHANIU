@@ -299,3 +299,54 @@ v4 的 33–38 未回勾，本批只做**核实与证据补齐**，不动实现�
 仍空白、压缩节点是否实时出现。以 `docs/smoke/2026-11-17-9af8431/REPORT.md` 的 N1 条目为准，
 真机未重跑前该条不改判。
 
+---
+
+## N1 真机复验：已修复（2026-11-17，被测提交 `9e057fd`）
+
+**结论先行**：N1 **修复成立**。压缩发生时刻会话区有内容、压缩节点实时出现、输入框存在，
+180 秒内连续触发多次压缩与 D6 裁剪，未出现整块空白。
+
+| 项 | 值 |
+|---|---|
+| 被测提交 | `9e057fd`（含 `c6287ee` 的锚点修法） |
+| 被测二进制 | `dist-portable\SHANIU-Portable\SHANIU.exe`，28,803,584 B，SHA256 `0ABD6B0A93EEE86FA418924A6FAC407A1440F604430BA91280A85177DFDEC071` |
+| 数据根 | `scratch/n1-smoke/data2`（全新，`SHANIU_DATA_DIR` 隔离） |
+| 配置 | `token_budget = 5000`、`approval.mode = full_access`、`workspace.root = scratch/n1-smoke/proj2` |
+| 驱动 | CDP + `scratch/n1-smoke/probe.mjs`（真实 `Input.insertText` + 回车），每 200ms 采样 DOM |
+
+**时间线（UTC）**：
+
+- `09:15:10.073` 页面就绪，`compactNode=false`（干净数据根，页面上没有历史压缩节点）；
+- `09:15:10.105` 发送长任务（95 段填充 + `python` 2000 行任务）；
+- `09:15:17.963` 日志第一条 `上下文已压缩（SH-032） compressed_items=3 history_len=2`；
+- `09:15:18.144` 采样首次 `compactNode=true`：`composer=true`、`composerVisible=true`、`bodyLen=8465`；
+- `09:15:18` 截图 `compact-window-1.png`：用户消息、压缩节点「上下文已压缩 · 点击查看压缩摘要」、输入框同屏可见；
+- `09:15:10–09:18:10` 共 880 条采样：`bodyLen` 最小 **4335**、最大 8826，从未接近空白；
+  `composer=false` 仅 **2 帧**（发送瞬间的过渡帧，下一帧恢复）；
+- 180 秒内日志共 **5 次**「上下文已压缩（SH-032）」+ **2 次** D6 裁剪（`18958→5181`、`29802→5181`），
+  每次压缩窗口都在采样覆盖内、均未空白。
+
+**证据文件**（本目录 `n1-live/`）：
+
+| 文件 | 内容 |
+|---|---|
+| `samples.jsonl` | 880 条采样（字段：`t/phase/composer/composerVisible/cards/bodyLen/compactNode`；`head` 正文片段已剔除以控制体积） |
+| `verdict.json` | `{"sawCompaction":true,"blankHits":0,"seconds":180}` |
+| `compact-window-1..5.png` | 压缩节点首次出现后连续 5 帧截图 |
+| `final.png` | 采样结束时的界面 |
+| `compaction-log.txt` | 该数据根日志里全部「压缩/裁剪」行 |
+
+**判据与 N1 现象一一对应**：N1 记录的是「窗口只剩标题与会话列表，正文与 composer 全部空白」。
+本轮 880 条采样里 `bodyLen ≥ 4335`、`composer` 只有发送过渡的 2 帧为 false，且压缩节点与
+用户消息同屏——该现象不再出现。**未改冒烟判据、未改产品代码**。
+
+**两个环境坑（复现时必须知道，不是产品缺陷）**：
+
+1. **工作区不能放在数据根内部**。复验数据根若复制用户配置、又把 `workspace.root` 留在
+   `D:/MyWorkspace/SHANIU`（数据根的上级），启动会弹模态「工作区设置不可用」并把窗口卡在
+   初始化前，表现为「窗口在但没有 WebView2 子进程、CDP 端口不开」。改到数据根之外即恢复。
+   证据：`scratch/n1-smoke/evidence/desktop-launch.png`（模态框原文）。
+2. **启动、采样、清理必须在同一条命令内完成**。命令行会话结束时子进程树会被回收，
+   分多条命令「先启动、再连 CDP」会看到进程已退出/端口未开。`probe.mjs` 因此把
+   「等 CDP + 发消息 + 采样 + 截图」放在一次运行里。
+

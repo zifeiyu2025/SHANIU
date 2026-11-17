@@ -1,0 +1,8 @@
+﻿2026-11-17T09:15:17.963425Z  INFO shaniu_lib::agent_loop: 上下文已压缩（SH-032） compressed_items=3 history_len=2
+2026-11-17T09:15:51.707104Z  INFO shaniu_lib::agent_loop: 上下文已压缩（SH-032） compressed_items=2 history_len=4
+2026-11-17T09:16:20.736658Z  INFO shaniu_lib::agent_loop: 上下文已压缩（SH-032） compressed_items=5 history_len=10
+2026-11-17T09:16:45.191791Z  INFO shaniu_lib::agent_loop: 上下文已压缩（SH-032） compressed_items=6 history_len=16
+2026-11-17T09:17:14.409589Z  INFO shaniu_lib::agent_loop: 上下文已压缩（SH-032） compressed_items=6 history_len=14
+2026-11-17T09:17:17.627026Z  INFO shaniu_lib::compaction: D6 确定性裁剪完成 pruned_items=1 chars_before=18958 chars_after=5181 estimate_before=9119 estimate_after=5685 budget=5000
+2026-11-17T09:17:34.151769Z  INFO shaniu_lib::agent_loop: 上下文已压缩（SH-032） compressed_items=14 history_len=5
+2026-11-17T09:18:00.672584Z  INFO shaniu_lib::compaction: D6 确定性裁剪完成 pruned_items=1 chars_before=29802 chars_after=5181 estimate_before=13543 estimate_after=7399 budget=5000
