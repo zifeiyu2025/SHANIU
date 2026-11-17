@@ -44,6 +44,9 @@ const validity = report.validity ?? {};
 const repo = report.repo ?? {};
 const durations = summary.duration ?? {};
 const interruptions = summary.interruptions ?? {};
+const tools = summary.tools ?? {};
+const toolRows = Array.isArray(tools.by_tool) ? tools.by_tool : [];
+const patchStats = tools.apply_patch ?? {};
 
 console.log(
   `${BOLD}[repo-eval]${RESET} base_commit=${report.base_commit ?? '?'} ` +
@@ -107,7 +110,8 @@ if (runs.length > 1) {
     console.log(
       `  run ${run.run}/${runs.length}: 成功率=${fmt(s.passed)}/${fmt(s.n)} ${pct(s.success_rate)} ` +
         `轮次 均值/中位/P90=${fmt(s.avg_turns)}/${fmt(s.median_turns)}/${fmt(s.p90_turns)} ` +
-        `超时率=${pct(s.timeout_rate)} 打断=${fmt(s.interruptions?.total)}`,
+        `超时率=${pct(s.timeout_rate)} 打断=${fmt(s.interruptions?.total)} ` +
+        `工具失败=${fmt(s.tools?.total_failures)}/${fmt(s.tools?.total_calls)}`,
     );
   }
 }
@@ -125,6 +129,25 @@ console.log(
   `  打断 合计=${fmt(interruptions.total)} 均值=${fmt(interruptions.mean)} ` +
     `中位=${fmt(interruptions.median)} P90=${fmt(interruptions.p90)} ` +
     `有打断的题=${fmt(interruptions.tasks_with_any)}`,
+);
+// 工具失败率按终态统计（denied / cancelled / error 分列），不看错误文本长相；
+// 「未回终态」单列，不默认算成功。
+console.log(
+  `  工具 调用=${fmt(tools.total_calls)} 失败=${fmt(tools.total_failures)} 失败率=${pct(tools.failure_rate)} ` +
+    `未回终态=${fmt(tools.unfinished)}`,
+);
+for (const row of toolRows) {
+  const classes = Object.entries(row.classes ?? {})
+    .map(([name, count]) => `${name}:${count}`)
+    .join(' ');
+  console.log(
+    `    ${row.tool} ${fmt(row.calls)} 次 / 失败 ${fmt(row.failures)}（${pct(row.failure_rate)}）` +
+      `${classes ? ` [${classes}]` : ''}`,
+  );
+}
+console.log(
+  `    apply_patch 上下文不匹配 ${fmt(patchStats.context_mismatch)}/${fmt(patchStats.calls)}` +
+    `（${pct(patchStats.context_mismatch_rate)}）`,
 );
 console.log(
   `  超时率=${pct(summary.timeout_rate)} 耗时 P50/P90=${ms(durations.agent_ms_p50)}/${ms(

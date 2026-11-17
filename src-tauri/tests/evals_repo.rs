@@ -22,7 +22,7 @@
 //!
 //! 报告：`evals/results/<epoch_ms>-<pid>-repo.json`，阅读器 `node evals/score-repo.mjs <报告>`。
 
-use std::collections::{BTreeMap, BTreeSet};
+use std::collections::{BTreeMap, BTreeSet, HashMap};
 use std::fs::{File, OpenOptions};
 use std::io::Write;
 use std::path::{Path, PathBuf};
@@ -37,7 +37,7 @@ use sha2::{Digest, Sha256};
 use shaniu_lib::agent_loop::{AgentLoop, ModelBackend, ResponsesBackend};
 use shaniu_lib::clock::now_ms;
 use shaniu_lib::config::{ApprovalMode, SandboxMode};
-use shaniu_lib::events::{ApprovalDecision, EventMsg, EventSink};
+use shaniu_lib::events::{ApprovalDecision, EventMsg, EventSink, ToolCallResult};
 use shaniu_lib::model_client::provider::ProviderConfig;
 use shaniu_lib::model_client::{HistoryItem, ModelError, ModelStream, ToolDeclaration};
 use shaniu_lib::permission::{policy, ApprovalBroker};
@@ -583,6 +583,19 @@ struct Agg {
     cached_input_tokens: u64,
     output_tokens: u64,
     usage_turns: u32,
+    /// 工具名登记：`ToolCallEnd` 不带工具名，只能靠 `ToolCallBegin` 建档。
+    tool_names: HashMap<String, String>,
+    /// 逐工具调用数（`ToolCallBegin` 计一次）。
+    tool_calls: BTreeMap<String, usize>,
+    /// 逐工具终态数（`ToolCallEnd` 计一次）：与调用数之差 = 没等到终态。
+    tool_ends: usize,
+    /// 逐工具失败数（终态不是 `Ok`）。
+    tool_failures: BTreeMap<String, usize>,
+    /// 逐工具失败分类：`denied` / `cancelled` / `error`。
+    tool_failure_classes: BTreeMap<String, BTreeMap<String, usize>>,
+    /// `apply_patch` 的「上下文不匹配」次数。失败里最高频的一类，
+    /// 单列是为了让「编辑工具成功率」这条 P0 有可直接读的数字。
+    patch_context_mismatch: usize,
 }
 
 fn args_summary(args: &Value) -> String {
@@ -592,6 +605,30 @@ fn args_summary(args: &Value) -> String {
         format!("{clipped}…")
     } else {
         clipped
+    }
+}
+
+/// 工具终态 → 失败分类。`None` = 成功；`Some(class)` = 失败。
+///
+/// `result` 缺失时按旧口径回退（有 `error` 或退出码非 0），与前端
+/// `ToolCallResult` 缺省时的两步反推一致，避免把「没带终态」读成成功。
+fn tool_failure_class(
+    result: Option<ToolCallResult>,
+    error: Option<&str>,
+    exit_code: Option<i32>,
+) -> Option<&'static str> {
+    match result {
+        Some(ToolCallResult::Ok) => None,
+        Some(ToolCallResult::Denied) => Some("denied"),
+        Some(ToolCallResult::Cancelled) => Some("cancelled"),
+        Some(ToolCallResult::Error) => Some("error"),
+        None => {
+            if error.is_some() || matches!(exit_code, Some(code) if code != 0) {
+                Some("error")
+            } else {
+                None
+            }
+        }
     }
 }
 
@@ -643,6 +680,38 @@ impl EventSink for EvalSink {
                     agg.errors.push(format!(
                         "审批代答失败：{request_id}（请求不是 broker 签发的）"
                     ));
+                }
+            }
+            EventMsg::ToolCallBegin { call_id, tool, .. } => {
+                agg.tool_names.insert(call_id.clone(), tool.clone());
+                *agg.tool_calls.entry(tool.clone()).or_insert(0) += 1;
+            }
+            EventMsg::ToolCallEnd {
+                call_id,
+                exit_code,
+                error,
+                result,
+            } => {
+                agg.tool_ends += 1;
+                // 找不到 Begin 的 End 单列成 unknown：丢掉会让失败率分母变小。
+                let tool = agg
+                    .tool_names
+                    .remove(call_id)
+                    .unwrap_or_else(|| "unknown".to_string());
+                if let Some(class) = tool_failure_class(*result, error.as_deref(), *exit_code) {
+                    *agg.tool_failures.entry(tool.clone()).or_insert(0) += 1;
+                    *agg.tool_failure_classes
+                        .entry(tool.clone())
+                        .or_default()
+                        .entry(class.to_string())
+                        .or_insert(0) += 1;
+                    if tool == "apply_patch"
+                        && error
+                            .as_deref()
+                            .is_some_and(|text| text.contains("上下文不匹配"))
+                    {
+                        agg.patch_context_mismatch += 1;
+                    }
                 }
             }
             _ => {}
@@ -700,6 +769,13 @@ struct TaskOutcome {
     cached_input_tokens: u64,
     output_tokens: u64,
     usage_turns: u32,
+    /// 逐工具调用/终态/失败与失败分类（P0-1）。没有这组数字，「编辑工具成功率」
+    /// 只能靠翻日志，改动无法作为回归判据。
+    tool_calls: BTreeMap<String, usize>,
+    tool_ends: usize,
+    tool_failures: BTreeMap<String, usize>,
+    tool_failure_classes: BTreeMap<String, BTreeMap<String, usize>>,
+    patch_context_mismatch: usize,
     /// 相对本题基线的改动面：文件数、增删行数、未跟踪文件数与前 12 个文件的明细。
     diff_summary: String,
     detail: String,
@@ -738,6 +814,11 @@ impl TaskOutcome {
             "cached_input_tokens": self.cached_input_tokens,
             "output_tokens": self.output_tokens,
             "usage_turns": self.usage_turns,
+            "tool_calls": self.tool_calls,
+            "tool_ends": self.tool_ends,
+            "tool_failures": self.tool_failures,
+            "tool_failure_classes": self.tool_failure_classes,
+            "patch_context_mismatch": self.patch_context_mismatch,
             "diff_summary": self.diff_summary,
             "detail": self.detail,
         })
@@ -818,6 +899,62 @@ fn interruptions_stats(valid: &[&TaskOutcome]) -> Value {
     })
 }
 
+/// 逐工具调用/失败统计（P0-1）：跨题汇总，给总失败率、逐工具失败分类与
+/// `apply_patch` 上下文不匹配率。分母是调用数；`unfinished`（有 Begin 没 End）
+/// 单列，不把「没等到终态」默认算成功。
+fn tools_stats(valid: &[&TaskOutcome]) -> Value {
+    let mut calls: BTreeMap<String, usize> = BTreeMap::new();
+    let mut failures: BTreeMap<String, usize> = BTreeMap::new();
+    let mut classes: BTreeMap<String, BTreeMap<String, usize>> = BTreeMap::new();
+    let mut total_ends = 0usize;
+    let mut patch_context_mismatch = 0usize;
+    for task in valid {
+        for (tool, count) in &task.tool_calls {
+            *calls.entry(tool.clone()).or_insert(0) += count;
+        }
+        for (tool, count) in &task.tool_failures {
+            *failures.entry(tool.clone()).or_insert(0) += count;
+        }
+        for (tool, by_class) in &task.tool_failure_classes {
+            let entry = classes.entry(tool.clone()).or_default();
+            for (class, count) in by_class {
+                *entry.entry(class.clone()).or_insert(0) += count;
+            }
+        }
+        total_ends += task.tool_ends;
+        patch_context_mismatch += task.patch_context_mismatch;
+    }
+    let total_calls: usize = calls.values().sum();
+    let total_failures: usize = failures.values().sum();
+    let by_tool: Vec<Value> = calls
+        .iter()
+        .map(|(tool, tool_calls)| {
+            let tool_failures = failures.get(tool).copied().unwrap_or(0);
+            json!({
+                "tool": tool,
+                "calls": tool_calls,
+                "failures": tool_failures,
+                "failure_rate": rate(tool_failures, *tool_calls),
+                "classes": classes.get(tool).cloned().unwrap_or_default(),
+            })
+        })
+        .collect();
+    let apply_patch_calls = calls.get("apply_patch").copied().unwrap_or(0);
+    json!({
+        "total_calls": total_calls,
+        "total_ends": total_ends,
+        "unfinished": total_calls.saturating_sub(total_ends),
+        "total_failures": total_failures,
+        "failure_rate": rate(total_failures, total_calls),
+        "by_tool": by_tool,
+        "apply_patch": {
+            "calls": apply_patch_calls,
+            "context_mismatch": patch_context_mismatch,
+            "context_mismatch_rate": rate(patch_context_mismatch, apply_patch_calls),
+        },
+    })
+}
+
 /// 单轮 summary：分母只算有效题（invalid 单列，不进分母）。
 fn summarize(tasks: &[TaskOutcome], max_turns: u32) -> Value {
     let valid: Vec<&TaskOutcome> = tasks.iter().filter(|task| !task.invalid).collect();
@@ -852,6 +989,7 @@ fn summarize(tasks: &[TaskOutcome], max_turns: u32) -> Value {
         "turns_unknown": n - turns.len(),
         "max_turns": max_turns,
         "interruptions": interruptions_stats(&valid),
+        "tools": tools_stats(&valid),
         "timeout_rate": rate(timeouts, n),
         "duration": {
             "agent_ms_p50": median_option(&agent),
@@ -1376,6 +1514,11 @@ async fn run_one(ctx: RunOneCtx<'_>, backend: Arc<dyn ModelBackend>) -> (TaskOut
     out.cached_input_tokens = agg.cached_input_tokens;
     out.output_tokens = agg.output_tokens;
     out.usage_turns = agg.usage_turns;
+    out.tool_calls = agg.tool_calls.clone();
+    out.tool_ends = agg.tool_ends;
+    out.tool_failures = agg.tool_failures.clone();
+    out.tool_failure_classes = agg.tool_failure_classes.clone();
+    out.patch_context_mismatch = agg.patch_context_mismatch;
 
     let mut detail = match &judge {
         Ok(judge) if judge.pass => format!("判据通过｜收口={reason}"),
@@ -1794,6 +1937,78 @@ fn eval_agents_note_is_injected_once_and_keeps_original_rules() {
     std::fs::remove_dir_all(&dir).ok();
 }
 
+/// P0-1：失败按终态判定，不看错误文本长相；只有 `result` 缺失才回退到
+/// 「有 error 或退出码非 0」，避免把没带终态的调用读成成功。
+#[test]
+fn tool_failure_class_uses_terminal_state_not_error_text() {
+    assert_eq!(
+        tool_failure_class(Some(ToolCallResult::Ok), Some("提示：改用 read_file"), Some(0)),
+        None
+    );
+    assert_eq!(
+        tool_failure_class(Some(ToolCallResult::Denied), Some("用户拒绝"), None),
+        Some("denied")
+    );
+    assert_eq!(
+        tool_failure_class(Some(ToolCallResult::Cancelled), None, None),
+        Some("cancelled")
+    );
+    assert_eq!(
+        tool_failure_class(Some(ToolCallResult::Error), None, Some(0)),
+        Some("error")
+    );
+    assert_eq!(
+        tool_failure_class(None, Some("旧路径错误"), None),
+        Some("error")
+    );
+    assert_eq!(tool_failure_class(None, None, Some(1)), Some("error"));
+    assert_eq!(tool_failure_class(None, None, Some(0)), None);
+    assert_eq!(tool_failure_class(None, None, None), None);
+}
+
+/// P0-1：跨题汇总后逐工具失败率与 `apply_patch` 上下文不匹配率必须能对上
+/// 分子分母；没等到终态的调用单列，不默认算成功。
+#[test]
+fn tools_stats_aggregates_per_tool_failures_and_patch_mismatch() {
+    let mut a = TaskOutcome::default();
+    a.tool_calls.insert("apply_patch".into(), 3);
+    a.tool_calls.insert("read_file".into(), 2);
+    a.tool_failures.insert("apply_patch".into(), 1);
+    a.tool_failure_classes
+        .insert("apply_patch".into(), BTreeMap::from([("error".into(), 1)]));
+    a.patch_context_mismatch = 1;
+    a.tool_ends = 5;
+
+    let mut b = TaskOutcome::default();
+    b.tool_calls.insert("apply_patch".into(), 1);
+    b.tool_failures.insert("apply_patch".into(), 1);
+    b.tool_failure_classes
+        .insert("apply_patch".into(), BTreeMap::from([("denied".into(), 1)]));
+    b.tool_ends = 1;
+
+    let stats = tools_stats(&[&a, &b]);
+    assert_eq!(stats["total_calls"].as_u64(), Some(6));
+    assert_eq!(stats["total_ends"].as_u64(), Some(6));
+    assert_eq!(stats["unfinished"].as_u64(), Some(0));
+    assert_eq!(stats["total_failures"].as_u64(), Some(2));
+    assert!((stats["failure_rate"].as_f64().unwrap() - 2.0 / 6.0).abs() < 1e-9);
+    assert_eq!(stats["apply_patch"]["calls"].as_u64(), Some(4));
+    assert_eq!(stats["apply_patch"]["context_mismatch"].as_u64(), Some(1));
+    assert!(
+        (stats["apply_patch"]["context_mismatch_rate"]
+            .as_f64()
+            .unwrap()
+            - 0.25)
+            .abs()
+            < 1e-9
+    );
+    let by_tool = stats["by_tool"].as_array().unwrap();
+    assert_eq!(by_tool.len(), 2, "每个出现过的工具一行");
+    assert_eq!(stats["by_tool"][0]["tool"], "apply_patch");
+    assert_eq!(stats["by_tool"][0]["classes"]["error"].as_u64(), Some(1));
+    assert_eq!(stats["by_tool"][0]["classes"]["denied"].as_u64(), Some(1));
+}
+
 #[tokio::test]
 #[ignore = "真实仓库端到端评测需要真实端点密钥、本机 Rust 工具链与 pwsh，按里程碑/变更回归手动运行"]
 async fn evals_repo_v0() {
@@ -2055,6 +2270,8 @@ async fn evals_repo_v0() {
         "max_turns": max_turns,
         // 打断统计跨轮汇总（每题的打断次数是独立观测，pooled 比「中位数之中位数」更可解释）。
         "interruptions": interruptions_stats(&pooled_valid),
+        // 与打断同口径：逐题观测跨轮 pooled，比「中位数之中位数」更可解释。
+        "tools": tools_stats(&pooled_valid),
         "timeout_rate": median_option(&run_numbers(&run_values, &["summary", "timeout_rate"]))
             .unwrap_or(0.0),
         "duration": {
