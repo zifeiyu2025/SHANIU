@@ -1,0 +1,87 @@
+﻿
+[1m[30m[46m RUN [49m[39m[22m [36mv5.1.0 [39m[90mD:/MyWorkspace/SHANIU[39m
+
+pnpm.exe : [90mstderr[2m | src/transport/adapter.spec.ts[2m > [22m[2m适配层把 EventMsg 流映射成 DSH 会话 journal[2m > [22m
+[2mN5 真机复现（r4 事件原样回放）：实时自动压缩后必须落可见节点，替换要过客户端 foldSurface
+所在位置 C:\Users\jun\AppData\Roaming\npm\pnpm.ps1:14 字符: 3
++   & "$basedir/node_modules/pnpm/pnpm.exe"   $args
++   ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+    + CategoryInfo          : NotSpecified: ([90mstderr[2m...客户端 foldSurface:String) [], RemoteException
+    + FullyQualifiedErrorId : NativeCommandError
+ 
+[22m[39m[SHANIU] 没有审批界面在听 approval/request，本次请求按拒绝回执收口
+
+[90mstderr[2m | src/transport/adapter.spec.ts[2m > [22m[2m适配层把 EventMsg 流映射成 DSH 会话 journal[2m > [22m[2mN5 真机复现
+（r4 真实档案）：锚点是档案第一条时，重开必须落同形压缩节点而不是通知
+[22m[39m[SHANIU] 压缩节点没有可替换的会话表面，改用自建锚点后替换（compactionId=shaniu-replay-compaction-0）
+
+[90mstderr[2m | src/transport/adapter.spec.ts[2m > [22m[2m适配层把 EventMsg 流映射成 DSH 会话 journal[2m > [22m[2mR6 真机复现
+（0.2.9 事件原样回放）：surface[0] 是用户消息、system 在中间时，压缩不得遮蔽系统头
+[22m[39m[SHANIU] 没有审批界面在听 approval/request，本次请求按拒绝回执收口
+[SHANIU] 没有审批界面在听 approval/request，本次请求按拒绝回执收口
+
+[90mstderr[2m | src/transport/adapter.spec.ts[2m > [22m[2m适配层把 EventMsg 流映射成 DSH 会话 journal[2m > [22m[2mR6 真机复现
+（0.2.9 事件原样回放）：surface[0] 是用户消息、system 在中间时，压缩不得遮蔽系统头
+[22m[39m[SHANIU] 压缩节点没有可替换的会话表面，改用自建锚点后替换（compactionId=shaniu-replay-compaction-0）
+
+[90mstderr[2m | src/transport/adapter.spec.ts[2m > [22m[2m适配层把 EventMsg 流映射成 DSH 会话 journal[2m > [22m[2mN5 真机复现
+（r4 手动 /compact）：命令卡与压缩节点合成一个 manual-compaction 节点，会话区不再铺摘要正文
+[22m[39m[SHANIU] 压缩节点没有可替换的会话表面，改用自建锚点后替换（compactionId=cmp-1794678689186-0）
+
+[90mstderr[2m | src/transport/adapter.spec.ts[2m > [22m[2m适配层的命令面映射[2m > [22m[2mlist_sessions 形状不可判与「确实没有会话」分开表
+达：不再把未知折成空表
+[22m[39m[SHANIU] 会话清单查询失败，按未知处理 { code: [32m'IPC_FAILED'[39m, message: [32m'会话清单查询失败'[39m }
+
+[90mstderr[2m | src/transport/adapter.spec.ts[2m > [22m[2m适配层的命令面映射[2m > [22m[2m没有审批 UI 在听时按拒绝收口，绝不静默放行
+[22m[39m[SHANIU] 没有审批界面在听 approval/request，本次请求按拒绝回执收口
+
+[90mstderr[2m | src/transport/adapter.spec.ts[2m > [22m[2m适配层的命令面映射[2m > [22m[2m压缩过的会话重开：摘要不占回合，轮次与实时路径一致、不补中止横
+幅
+[22m[39m[SHANIU] 压缩节点没有可替换的会话表面，改用自建锚点后替换（compactionId=shaniu-replay-compaction-0）
+
+[90mstderr[2m | src/transport/adapter.spec.ts[2m > [22m[2m适配层的命令面映射[2m > [22m[2m宿主运行态查询失败 → 不写 turn_end，按未知处理
+[22m[39m[SHANIU] 宿主运行态查询失败，档案重建按未知处理 { code: [32m'IPC_FAILED'[39m, message: [32m'运行态查询失败'[39m }
+
+[90mstderr[2m | src/transport/adapter.spec.ts[2m > [22m[2m权限挡位与底部指标的数据面[2m > [22m[2mN3：压缩档案重开 = 完整档案重开 = 实时——同一
+轮次/步数
+[22m[39m[SHANIU] 压缩节点没有可替换的会话表面，改用自建锚点后替换（compactionId=shaniu-replay-compaction-3）
+
+[90mstderr[2m | src/transport/adapter.spec.ts[2m > [22m[2m权限挡位与底部指标的数据面[2m > [22m[2mN3：压缩档案重开 = 完整档案重开 = 实时——同一
+轮次/步数
+[22m[39m[SHANIU] 压缩节点没有可替换的会话表面，改用自建锚点后替换（compactionId=shaniu-replay-compaction-3）
+
+[90mstderr[2m | src/transport/adapter.spec.ts[2m > [22m[2m权限挡位与底部指标的数据面[2m > [22m[2mN10：压缩重开后回合用时按墙钟算，不按首条幸存条目重
+算
+[22m[39m[SHANIU] 压缩节点没有可替换的会话表面，改用自建锚点后替换（compactionId=shaniu-replay-compaction-0）
+
+[90mstderr[2m | src/transport/adapter.spec.ts[2m > [22m[2m权限挡位与底部指标的数据面[2m > [22m[2mN10：压缩重开后回合用时按墙钟算，不按首条幸存条目重
+算
+[22m[39m[SHANIU] 压缩节点没有可替换的会话表面，改用自建锚点后替换（compactionId=shaniu-replay-compaction-0）
+
+[90mstderr[2m | src/transport/adapter.spec.ts[2m > [22m[2m权限挡位与底部指标的数据面[2m > [22m[2mN10：压缩后的新用户消息自己就是回合起点，不继承上一
+回合的墙钟
+[22m[39m[SHANIU] 压缩节点没有可替换的会话表面，改用自建锚点后替换（compactionId=shaniu-replay-compaction-0）
+
+[90mstderr[2m | src/transport/adapter.spec.ts[2m > [22m[2m权限挡位与底部指标的数据面[2m > [22m[2mN3：重复结局行只算一轮，重复重开数值不变
+[22m[39m[SHANIU] 压缩节点没有可替换的会话表面，改用自建锚点后替换（compactionId=shaniu-replay-compaction-3）
+
+[90mstderr[2m | src/transport/adapter.spec.ts[2m > [22m[2m权限挡位与底部指标的数据面[2m > [22m[2mN3：重复结局行只算一轮，重复重开数值不变
+[22m[39m[SHANIU] 压缩节点没有可替换的会话表面，改用自建锚点后替换（compactionId=shaniu-replay-compaction-3）
+
+[90mstdout[2m | src/transport/adapter.spec.ts[2m > [22m[2m续播幂等与无帧兜底（阶段 2）[2m > [22m[2m60s 无帧且宿主确认空闲、对账没有结论时保持打开（前端不补 interrupted）
+[22m[39m[SHANIU] 会话 agent-dead 超过 60s 无帧且宿主已空闲：对账没有结论，保持回合打开，等待宿主结论或用户手动停止
+
+[90mstderr[2m | src/transport/adapter.spec.ts[2m > [22m[2m续播幂等与无帧兜底（阶段 2）[2m > [22m[2m60s 无帧但运行态查询失败：保持现状，不把"问不
+到"当空闲
+[22m[39m[SHANIU] 会话 agent-unknown 无帧兜底：宿主运行态查询失败，保持现状 { code: [32m'IPC_FAILED'[39m, message: [32m'运行态查询失败'[39m }
+
+[90mstdout[2m | src/transport/adapter.spec.ts[2m > [22m[2m续播幂等与无帧兜底（阶段 2）[2m > [22m[2m60s 无帧但运行态是空壳 {}：保持现状；宿主改口空闲也保持打开
+[22m[39m[SHANIU] 会话 agent-opaque 超过 60s 无帧且宿主已空闲：对账没有结论，保持回合打开，等待宿主结论或用户手动停止
+
+ [32m✓[39m src/transport/adapter.spec.ts [2m([22m[2m187 tests[22m[2m)[22m[33m 585[2mms[22m[39m
+
+[2m Test Files [22m [1m[32m1 passed[39m[22m[90m (1)[39m
+[2m      Tests [22m [1m[32m187 passed[39m[22m[90m (187)[39m
+[2m   Start at [22m 16:36:28
+[2m   Duration [22m 1.59s[2m (tests 40%, environment 33%, transform 14%, setup 7%, import 5%)[22m
+

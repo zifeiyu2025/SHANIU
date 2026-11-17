@@ -265,3 +265,37 @@ N5 报的症状正是「挂起强杀 → 重开多一步」，所以重开口径
 **仍未核实**：真机未重跑。界面/导出是否真的能判读、真机裁剪是否触发，仍以
 `docs/smoke/` 下次重跑为准；本批只证明代码路径与用例。
 
+---
+
+## N1（P1）实时压缩整块空白：R6 反向验证补齐（2026-11-17）
+
+**实现与用例的当前状态**：修法已随 `c6287ee`（`pushCompactionCheckpoint` 按事件实际 seq
+定位系统提示词，区间取「最后一段连续的非 system 节点」）落地；真机档案夹具与契约用例已随
+`6bb19e4` 落地（`src/transport/fixtures/r6-live-compaction.ts`、`adapter.spec.ts` 的
+「R6 真机复现（0.2.9 事件原样回放）」）。此前 `docs/specs/N5-live-compaction-visibility/tasks.md`
+v4 的 33–38 未回勾，本批只做**核实与证据补齐**，不动实现。
+
+**为什么不是重新实现**：`git log -L 1100,1145:src/transport/adapter.ts` 显示 `c6287ee` 已把
+「系统头 = surface[0]」换成按实际 seq 定位，注释与规格 §13.4 一致；此时再改一遍等于制造第二套判据。
+
+**反向验证（两条，均为今天新跑）**：
+
+| 文件 | 做法 | 结果 |
+|---|---|---|
+| `n1-r6-rev-surface0.txt` | 判据退回 `surface[0]`（`c6287ee` 之前的写法） | `1 failed`：`AssertionError: expected [ 12 ] to include 3` |
+| `n1-r6-rev-all-nodes.txt` | `anchors` 改成恒 `[...journal.surfaceSeqs]` | `1 failed`：同一断言，system 节点被区间遮蔽 |
+| `n1-r6-adapter-green.txt` | 恢复实现后跑整个文件 | `187 passed`，`git diff --stat` 为空（恢复精确） |
+
+断言读法：`[ 12 ]` 是压缩后剩下的表面节点，`3` 是宿主 `system_prompt` 的 seq；修复前它被
+`replace` 区间吞掉，客户端 `inspectSystemPrompt` 因此粘在 `uncertain`——真机「实时空白」的
+可证部分就是这条。
+
+**未做浏览器现场（规格 §13.3 第 3 条），理由与替代**：现场复现要求在 dev 下把 `remote`
+临时改接 `createAdapter({ bridge: mockBridge })`，属一次性调查接线，且它回答的问题（会不会白屏）
+已经由上面两条反向验证在契约层回答（system 节点是否存活）。真机复验是同一条链路的最终判据，
+优先级更高，故以「反向验证红 + 真机复验」替代，不做临时接线。若真机重跑仍白屏，再回到现场。
+
+**仍未核实（结案条件）**：`token_budget=5000` 的长任务在压缩发生窗口内，会话区与输入框是否
+仍空白、压缩节点是否实时出现。以 `docs/smoke/2026-11-17-9af8431/REPORT.md` 的 N1 条目为准，
+真机未重跑前该条不改判。
+

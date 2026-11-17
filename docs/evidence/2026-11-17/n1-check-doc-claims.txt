@@ -1,0 +1,12 @@
+﻿[doc-claims] 清单：align\doc-claims.md（202 行断言）
+[doc-claims] 源码树：9466 个文件
+[doc-claims] 通过 327（判定点）/ A 类缺口 0 / B 类不可判 5
+
+== B 类：不可机械判定（B ≠ 已验证）==
+B	R2-015	01:L162	tray_icon_app	只以字符串/注释出现（str=4 cmt=0），盲区 4/5
+B	R2-035	01:L434	命令级沙箱 … `SandboxTransformRequest` 模式	清单标注不判
+B	R2-152	08:L255	`artifacts` 字段	清单标注不判
+B	R2-172	10:L324	—	清单标注不判
+B	R2-173	10:L325	—	清单标注不判
+
+[doc-claims] 无 A 类缺口（B 类仍需人工/运行期核验）

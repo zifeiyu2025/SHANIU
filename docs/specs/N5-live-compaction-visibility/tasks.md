@@ -4,16 +4,23 @@
 
 ## v4 第一笔：复现（先红）
 
-33. [ ] 回滚上一轮临时调查改动：`src/transport/mock.ts` 的 `/compact-replay` 分支、`index.html` 的错误 overlay、`adapter.spec.ts` 的 `TEMP 0.2.9 实时回放调查` 用例（`git diff` 逐文件确认后恢复，不动另一条线在 `adapter.ts`/`types.ts`/`session-events.ts`/`src-tauri` 的改动）。
-34. [ ] 建 `src/transport/fixtures/r6-live-compaction.ts`：从 `docs/smoke/2026-11-17-9af8431/evidence/03-events-compaction.jsonl` 逐字摘录 3 条 `system_prompt`、2 组 `compaction_*`、首尾 `tool_call_output_delta` 各 1 条（其余 1998 条省略写注释），附来源行号/批次注释。
-35. [ ] `adapter.spec.ts` 加 `R6 实时压缩不改写 system 头`：② foldedSurface 含 system 节点、③ `inspectSystemPrompt` 全链 `uncertain===false` 且 `effective.text` 为最后一条系统提示词、④ checkpoint 节点/摘要/wire 形状护栏。先在未改代码上跑红并记录输出。
+33. [x] 回滚上一轮临时调查改动：`src/transport/mock.ts` 的 `/compact-replay` 分支、`index.html` 的错误 overlay、`adapter.spec.ts` 的 `TEMP 0.2.9 实时回放调查` 用例（`git diff` 逐文件确认后恢复，不动另一条线在 `adapter.ts`/`types.ts`/`session-events.ts`/`src-tauri` 的改动）。
+    - 2026-11-17 复核：三处均不存在（`mock.ts` 无 `compact-replay`、`index.html` 无 `overlay`、`adapter.spec.ts` 无 `TEMP 0.2.9`），工作树干净，无需回滚。
+34. [x] 建 `src/transport/fixtures/r6-live-compaction.ts`：从 `docs/smoke/2026-11-17-9af8431/evidence/03-events-compaction.jsonl` 逐字摘录 3 条 `system_prompt`、2 组 `compaction_*`、首尾 `tool_call_output_delta` 各 1 条（其余 1998 条省略写注释），附来源行号/批次注释。
+    - 已随 `6bb19e4` 落地。
+35. [x] `adapter.spec.ts` 加 `R6 实时压缩不改写 system 头`：② foldedSurface 含 system 节点、③ `inspectSystemPrompt` 全链 `uncertain===false` 且 `effective.text` 为最后一条系统提示词、④ checkpoint 节点/摘要/wire 形状护栏。先在未改代码上跑红并记录输出。
+    - 已随 `6bb19e4` 落地（用例名「R6 真机复现（0.2.9 事件原样回放）」）。
 36. [ ] 浏览器现场：dev 下 `remote` 临时接 `createAdapter({ bridge: mockBridge })`，按真实节奏喂同一批事件，压缩窗口截全树 + 收 console 异常；记录「空白 / 未复现」结论与栈，还原临时接线（不提交）。
+    - 2026-11-17 处置：**未做**。改为「契约用例反向验证 + 真机复验」双证据，理由见 `docs/evidence/2026-11-17/README.md` 的 N1 段（浏览器现场需临时改 `remote` 接线，属一次性调查动作；真机复验是同一条链路的最终判据，优先级更高）。
 
 ## v4 第二笔：修复
 
-37. [ ] `adapter.ts pushCompactionCheckpoint`：`sysIdx = surfaceSeqs.findIndex(type === 'system/message')`，`sysIdx<0` 全量、`===0` 跳过头部、`>0` 取 `slice(sysIdx+1)`、空段回退 `slice(0, sysIdx)`；空 surface 占位锚点分支与 `sourceEventSeqs` 拼装不变。
-38. [ ] 反向验证：判据退回 `surface[0]` → 用例 ②③ 红；`anchors` 恒全量 → 同上红；记录输出后恢复并重跑绿。
-39. [ ] 全量：`pnpm typecheck`、`pnpm exec vitest run --exclude "scratch/**"`、`cargo test -- --test-threads=1`、`cargo clippy --all-targets -- -D warnings`、`.\scripts\check-deps.ps1`、`.\scripts\dev\check-doc-claims.ps1`。
+37. [x] `adapter.ts pushCompactionCheckpoint`：`sysIdx = surfaceSeqs.findIndex(type === 'system/message')`，`sysIdx<0` 全量、`===0` 跳过头部、`>0` 取 `slice(sysIdx+1)`、空段回退 `slice(0, sysIdx)`；空 surface 占位锚点分支与 `sourceEventSeqs` 拼装不变。
+    - 已随 `c6287ee` 落地；实现取「最后一段连续的非 system 节点」，等价于规格的 `slice(sysIdx+1)`，且 system 位于末尾时同样不遮蔽。
+38. [x] 反向验证：判据退回 `surface[0]` → 用例 ②③ 红；`anchors` 恒全量 → 同上红；记录输出后恢复并重跑绿。
+    - 2026-11-17：`docs/evidence/2026-11-17/n1-r6-rev-surface0.txt`（`expected [ 12 ] to include 3`）、`n1-r6-rev-all-nodes.txt`（同断言）；恢复后 `n1-r6-adapter-green.txt`（187 passed）。
+39. [x] 全量：`pnpm typecheck`、`pnpm exec vitest run --exclude "scratch/**"`、`cargo test -- --test-threads=1`、`cargo clippy --all-targets -- -D warnings`、`.\scripts\check-deps.ps1`、`.\scripts\dev\check-doc-claims.ps1`。
+    - 2026-11-17：typecheck 0；vitest 45 files / 512 passed；cargo test lib 1153 passed / 4 ignored + 集成全绿；clippy 0；check-deps 0 违规；check-doc-claims A 类缺口 0 / B 类 5（既有）。日志 `docs/evidence/2026-11-17/n1-*.txt`。**环境注**：`check-doc-claims.ps1` 无 BOM，PowerShell 5.1 直跑会按 ANSI 解码中文注释而解析失败，必须用 `pwsh` 7 跑（CI 默认即 pwsh）。
 40. [ ] `git fetch` → 两笔提交（只 add 本任务路径，不碰 `docs/smoke/`）→ 非 force 推送 → 盯 CI `gate` + `product-smoke` 到实际结论后汇报；冲突按语义合并，不丢另一线的审批改动。
 
 ## v3 历史（已完成）

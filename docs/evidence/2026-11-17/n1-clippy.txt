@@ -1,0 +1,8 @@
+﻿cargo : [1m[92m    Finished[0m ]8;;https://doc.rust-lang.org/cargo/reference/profiles.html#default-profiles\`dev` 
+profile [unoptimized + debuginfo]]8;;\ target(s) in 0.64s
+所在位置 行:15 字符: 4133
++ ... LASTEXITCODE"; cargo clippy --all-targets -- -D warnings 2>&1 | Tee-O ...
++                    ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+    + CategoryInfo          : NotSpecified: ([1m[92m    Fi...get(s) in 0.64s:String) [], RemoteException
+    + FullyQualifiedErrorId : NativeCommandError
+ 
