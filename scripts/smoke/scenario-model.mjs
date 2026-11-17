@@ -21,14 +21,21 @@ function textOf(content) {
 }
 
 /**
- * @param {{ port: number, scenario: { steps: unknown[] }, requestLog?: string }} opts
+ * @param {{ port: number, scenario: { steps: unknown[], usage?: 'none'|'estimate'|'chars', delayMs?: number }, requestLog?: string }} opts
  * @returns {Promise<{ url: string, state: { mainIndex: number, overflow: boolean }, close: () => Promise<void> }>}
  */
 export function startScenarioStub({ port, scenario, requestLog }) {
   const steps = [...(scenario.steps ?? [])]
   // `usage: 'none'`：模拟不回报用量的兼容端点（OpenAI 流式不传 stream_options 就是这样）。
   // 宿主于是退回字符估算判预算——这是让「只裁剪、不压缩」可复现的唯一入口。
-  const withUsage = scenario.usage !== 'none'
+  // `usage: 'chars'`：按请求体字符数报 prompt_tokens。中文约 1 字符 1 token，
+  // `body.length / 4` 是英文口径，会把中文上下文低估 3–4 倍；组合场景要复现
+  // 「观测值已达预算」这条压缩入口，必须按接近真实的分词口径报数。
+  const usageMode = scenario.usage ?? 'estimate'
+  const withUsage = usageMode !== 'none'
+  // 应答延迟：stub 原本是零延迟，压缩窗口（摘要请求往返）在采样间隔内就结束了，
+  // 看不到「窗口内界面是否空白」。给一个确定的小延迟，窗口才可观测。
+  const delayMs = Math.max(0, scenario.delayMs ?? 0)
   const state = { mainIndex: 0, overflow: false, mainRequests: 0, auxRequests: 0 }
 
   const log = (line) => {
@@ -57,7 +64,8 @@ export function startScenarioStub({ port, scenario, requestLog }) {
     req.on('data', (chunk) => {
       body += chunk
     })
-    req.on('end', () => {
+    req.on('end', async () => {
+      if (delayMs > 0) await new Promise((resolve) => setTimeout(resolve, delayMs))
       let parsed = {}
       try {
         parsed = JSON.parse(body)
@@ -93,12 +101,15 @@ export function startScenarioStub({ port, scenario, requestLog }) {
 
       if (kind === 'main') state.mainRequests += 1
       else state.auxRequests += 1
+      const promptTokens = Math.max(1, usageMode === 'chars' ? body.length : Math.ceil(body.length / 4))
       log({
         at: new Date().toISOString(),
         kind,
         mainIndex: state.mainIndex,
         messageCount: messages.length,
         toolResultCount,
+        bodyChars: body.length,
+        promptTokens,
         lastUserText: lastText.slice(0, 160),
         overflow: kind === 'main' && payload?.text === '（场景脚本已结束）',
       })
@@ -109,7 +120,7 @@ export function startScenarioStub({ port, scenario, requestLog }) {
       // 用量必须像真的：宿主的压缩判据读端点回报的 input_tokens（SH-032），
       // 恒报 1 会让「小预算强制裁剪」永远不触发（N7 踩过）。
       const usage = {
-        prompt_tokens: Math.max(1, Math.ceil(body.length / 4)),
+        prompt_tokens: promptTokens,
         completion_tokens: Math.max(1, Math.ceil(text.length / 4)),
         total_tokens: 0,
       }

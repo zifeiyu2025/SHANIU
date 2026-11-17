@@ -27,3 +27,7 @@ overrides:
   # （SSRF/解析不受信 HTML）。本仓只经 @lexical/headless 引入、且不 import 其 /dom
   # 子路径，dist 无引用；按发布闸门 A5 收敛到修复线，跨主版本由 lexical 用例回归兜底。
   happy-dom: ^21.0.4
+  # Dependabot #116（moderate）：uuid <11.1.1 的 v3/v5/v6 在传入 buf 时存在边界问题。
+  # exceljs 4.4.0 与 @fortune-sheet/core 1.0.4 都只用 v4，且 11.x 仍提供 CJS + ESM
+  # 入口（main/exports.require）；运行兼容由 typecheck、单测、vite build 与真机启动覆盖。
+  uuid: ^11.1.1

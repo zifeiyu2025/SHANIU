@@ -2597,6 +2597,14 @@ export function createAdapter(options: AdapterOptions): { remote: unknown; dispo
           : (msg.exit_code ?? 0) !== 0 || (msg.error !== null && msg.error !== undefined)
         const textParts: string[] = []
         if (lines.length > 0) textParts.push(lines.join('\n'))
+        else if (msg.result !== 'cancelled' && msg.error !== null && msg.error !== undefined && msg.error !== '') {
+          // 失败正文只在事件里：拒绝说明、越界原因、补丁回执都不会以 output_delta 到达
+          // （只有流式工具才发 delta）。不带它，卡片就退化成 resultText 的 `名字: 码`
+          // 兜底——真机 N6/N8 的实时视图只剩 `Denied: denied`/`ToolError: tool_error`，
+          // 完整正文要重开读档案才有。档案输出的也是这段文本，两条路径由此对齐。
+          // 取消是例外：档案不落输出，「已取消」随之成为单边文案，仍然不带。
+          textParts.push(msg.error)
+        }
         // 终端卡片按尾标记解析退出码（terminal-card-model.ts 的既有约定）。
         if (msg.exit_code !== null && msg.exit_code !== undefined) textParts.push(`[exit code: ${msg.exit_code}]`)
         const error = msg.result === 'denied'

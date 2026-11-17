@@ -1,0 +1,14 @@
+{
+  "c-n6-out": {
+    "state": "error",
+    "text": "失败\n工具调用\n路径越界（工作区之外）: ../outside.txt\n输入\n{\n  \"path\": \"../outside.txt\"\n}\n输出\n路径越界（工作区之外）: ../outside.txt\n拒绝说明：type=outside_workspace；工具=read_file；范围 approval=on_request sandbox=workspace_write risk=read；目标=../outside.txt\n目标不在工作区写入范围内，工具层在落盘前拒绝，文件没有被改动。\n可行做法：把目标改到工作区内（相对路径从工作区根解析），或让用户本人处理工作区外文件。"
+  },
+  "c-n6-marker": {
+    "state": "ok",
+    "text": "工具调用\nread_file · marker.txt\n输入\n{\n  \"path\": \"marker.txt\"\n}\n输出\n[exit code: 0]"
+  },
+  "c-n6-deny": {
+    "state": "error",
+    "text": "失败\n工具调用\n拒绝说明：type=user_denied；工具=unified_exec；范围 approval=on_request sandbox=workspace_write risk=execute\n输入\n{\n  \"command\": \"echo n6-NMWKRCLD8\"\n}\n输出\n拒绝说明：type=user_denied；工具=unified_exec；范围 approval=on_request sandbox=workspace_write risk=execute\n用户拒绝了这次调用，这条不会被自动放行。\n可行做法：说明这次操作要达成什么，或换一个更小的动作再问；不要原样重试，也不要换个说法绕过审批。"
+  }
+}

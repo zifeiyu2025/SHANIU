@@ -1,0 +1,130 @@
+{
+  "scenario": "n10",
+  "at": "2026-11-17T13:21:43.798Z",
+  "exe": "D:\\MyWorkspace\\SHANIU\\dist-portable\\SHANIU-Portable\\SHANIU.exe",
+  "exeSha256": "0ABD6B0A93EEE86FA418924A6FAC407A1440F604430BA91280A85177DFDEC071",
+  "checks": [
+    {
+      "name": "第一轮在窗口内完成",
+      "ok": true,
+      "detail": "samples=5"
+    },
+    {
+      "name": "采样窗口内确实发生压缩",
+      "ok": true,
+      "detail": "compactSamples=3"
+    },
+    {
+      "name": "压缩窗口输入框未消失",
+      "ok": true,
+      "detail": "hits=0"
+    },
+    {
+      "name": "压缩窗口未整块空白",
+      "ok": true,
+      "detail": "hits=0"
+    },
+    {
+      "name": "实时界面有裁剪通知",
+      "ok": true,
+      "detail": ""
+    },
+    {
+      "name": "实时界面出现压缩节点",
+      "ok": true,
+      "detail": ""
+    },
+    {
+      "name": "实时页脚为 2 轮",
+      "ok": true,
+      "detail": "[2,3]"
+    },
+    {
+      "name": "导出 ZIP 成功",
+      "ok": true,
+      "detail": ""
+    },
+    {
+      "name": "导出含 session.v4.jsonl",
+      "ok": true,
+      "detail": ""
+    },
+    {
+      "name": "导出含「已裁剪」留痕",
+      "ok": true,
+      "detail": "count=1"
+    },
+    {
+      "name": "导出含压缩事件",
+      "ok": true,
+      "detail": "count=3"
+    },
+    {
+      "name": "导出回合数与界面一致",
+      "ok": true,
+      "detail": "starts=2 ends=2 ui=[2,3]"
+    },
+    {
+      "name": "导出 turn/end 都带数值 iterations",
+      "ok": true,
+      "detail": "[2,1]"
+    },
+    {
+      "name": "导出步数合计与界面一致",
+      "ok": true,
+      "detail": "export=3 ui=[2,3]"
+    },
+    {
+      "name": "导出条目步号非恒 1 且不越界",
+      "ok": true,
+      "detail": "[0,0,1,0]"
+    },
+    {
+      "name": "主导出不带 stepsUnavailable",
+      "ok": true,
+      "detail": ""
+    },
+    {
+      "name": "重开回到原会话",
+      "ok": true,
+      "detail": ""
+    },
+    {
+      "name": "重开后压缩节点在",
+      "ok": true,
+      "detail": ""
+    },
+    {
+      "name": "重开轮次步数与实时一致",
+      "ok": true,
+      "detail": "live=[2,3] reopen=[2,3]"
+    },
+    {
+      "name": "档案轮次与界面一致",
+      "ok": true,
+      "detail": "[{\"turn\":1,\"reason\":\"completed\",\"iterations\":2},{\"turn\":2,\"reason\":\"completed\",\"iterations\":1}]"
+    },
+    {
+      "name": "档案步数合计与界面一致",
+      "ok": true,
+      "detail": "sum=3 ui=[2,3]"
+    }
+  ],
+  "artifacts": [
+    "n10-compaction-live.png",
+    "n10-samples.jsonl",
+    "n10-live-final.png",
+    "n10-live-text.txt",
+    "n10-export.png",
+    "n10-session.v4.jsonl",
+    "n10-reopen-text.txt",
+    "n10-reopen.png",
+    "n10-rollout.jsonl"
+  ],
+  "stubState": {
+    "mainIndex": 3,
+    "overflow": false,
+    "mainRequests": 3,
+    "auxRequests": 2
+  }
+}

@@ -36,7 +36,7 @@ const arg = (name, fallback) => {
 const scenarioId = arg('scenario', 'n3')
 const exe = path.resolve(arg('exe', 'dist-portable/SHANIU-Portable/SHANIU.exe'))
 const outRoot = path.resolve(arg('out', 'docs/evidence/2026-11-17/n2n9-live'))
-const order = ['n2', 'n3', 'n4', 'n5', 'n6', 'n7', 'n8', 'n9']
+const order = ['n2', 'n3', 'n4', 'n5', 'n6', 'n7', 'n8', 'n9', 'n10']
 const index = order.indexOf(scenarioId)
 if (index < 0) {
   console.error(`[n2n9] 未知场景：${scenarioId}`)
@@ -459,7 +459,9 @@ const defs = {
       )
       artifacts.push('n8-card.json')
       check('补丁卡为错误态', state !== null && state !== 'ok', String(state))
-      // 实时路径的上游流只带错误码（同 N6），回执正文要靠档案回放才完整——判据按重开取。
+      // 回执正文随事件到达实时卡（此前只有重开读档案才看得到）。
+      check('实时回执「实际读到」为磁盘原文', text?.includes('实际读到 `a1`') === true, String(text ?? '').slice(0, 300))
+      check('实时回执不含预演后的 a1-first', text?.includes('实际读到 `a1-first`') !== true)
       await d.stop()
       await sleep(1200)
       await d.launch()
@@ -527,7 +529,13 @@ const defs = {
       writeFileSync(path.join(outRoot, 'n9-card.json'), JSON.stringify({ state, text }, null, 2))
       artifacts.push('n9-card.json')
       check('第二次补丁卡为错误态', state !== null && state !== 'ok', String(state))
-      // 实时卡只报错误码，文案判据取档案回放（与 N6/N8 同一处上游口径差）。
+      // 实时卡也拿得到失败文案（此前只报错误码），与重开口径一致。
+      check(
+        '实时文案指向「读取记录过期」',
+        text?.includes('没有可用的读取记录') === true,
+        String(text ?? '').slice(0, 300),
+      )
+      check('实时不出现「未读取过」', text?.includes('未读取过') !== true)
       await d.stop()
       await sleep(1200)
       await d.launch()
@@ -556,6 +564,131 @@ const defs = {
       check('文件保持第 1 回合结果', after === 'alpha-1\nbeta\n', JSON.stringify(after))
     },
   },
+
+  // N10：组合链路——小预算 → 大块工具输出 → 裁剪 + 压缩 → 追问 → 重开 → 导出。
+  // N2–N9 是把每个修复拆开验的，这里只验它们叠在一起时是否互相破坏：
+  // 压缩窗口不空白、压缩节点实时出现、轮次步数在界面/档案/导出三处一致、导出带裁剪留痕。
+  // 用量按字符数回报（中文口径）：观测值才会真的越预算，走到「裁剪 + 摘要」组合路径。
+  // delayMs 让摘要往返可观测，否则零延迟 stub 会在一个采样间隔内跑完整条链路。
+  n10: {
+    approval: 'full_access',
+    tokenBudget: 5000,
+    usage: 'chars',
+    delayMs: 300,
+    fixtures: { 'note.md': noteMd, 'big.py': "for i in range(1, 4001):\n    print('line', i)\n" },
+    steps: [
+      { calls: [{ id: 'c-n10-big', name: 'unified_exec', args: { command: 'python big.py' } }] },
+      { text: '第一轮完成。' },
+      { text: '追问完成。' },
+    ],
+    async run(d) {
+      const samples = []
+      let sawCompaction = false
+      let blankHits = 0
+      let compactBlank = 0
+      await d.sendPrompt('N10 组合复验第一轮：请执行一段会输出很多行的命令，我会在压缩窗口里观察界面。')
+      const deadline = Date.now() + 180_000
+      while (Date.now() < deadline) {
+        const snap = await d.snapshot('第一轮完成。')
+        samples.push({ at: new Date().toISOString(), ...snap })
+        if (snap.compactNode && !sawCompaction) {
+          sawCompaction = true
+          await d.shot('n10-compaction-live')
+        }
+        if (!snap.composer && snap.bodyLen < 200) blankHits += 1
+        if (snap.compactNode && (!snap.composer || !snap.composerVisible)) compactBlank += 1
+        if (snap.marker) break
+        await sleep(200)
+      }
+      writeFileSync(
+        path.join(outRoot, 'n10-samples.jsonl'),
+        `${samples.map((item) => JSON.stringify(item)).join('\n')}\n`,
+      )
+      artifacts.push('n10-samples.jsonl')
+      check('第一轮在窗口内完成', samples.at(-1)?.marker === true, `samples=${samples.length}`)
+      check('采样窗口内确实发生压缩', sawCompaction, `compactSamples=${samples.filter((item) => item.compactNode).length}`)
+      check('压缩窗口输入框未消失', compactBlank === 0, `hits=${compactBlank}`)
+      check('压缩窗口未整块空白', blankHits === 0, `hits=${blankHits}`)
+
+      await d.sendPrompt('N10 组合复验第二轮：用一句话说明当前进度。')
+      await d.waitText('追问完成。', 120_000)
+      await sleep(1200)
+      await d.shot('n10-live-final')
+      // 裁剪通知与压缩节点都在过程组里：先展开，再按可见文本判「实时就有」。
+      await d.expandProcessGroups()
+      const liveBody = await d.bodyText()
+      writeFileSync(path.join(outRoot, 'n10-live-text.txt'), liveBody)
+      artifacts.push('n10-live-text.txt')
+      check(
+        '实时界面有裁剪通知',
+        liveBody.includes('的输出在发给模型前被确定性裁剪') && liveBody.includes('卡片里显示的仍是裁剪前原文'),
+      )
+      check('实时界面出现压缩节点', liveBody.includes('上下文已压缩'))
+      const liveFooter = await d.footer()
+      check('实时页脚为 2 轮', liveFooter !== null && liveFooter[0] === 2, JSON.stringify(liveFooter))
+
+      const zip = path.join(outRoot, 'n10-export.zip')
+      check('导出 ZIP 成功', await d.exportZip(zip))
+      await d.shot('n10-export')
+      const exported = d.extractSession(zip, 'n10-unzip')
+      check('导出含 session.v4.jsonl', exported !== null)
+      if (exported !== null) {
+        writeFileSync(path.join(outRoot, 'n10-session.v4.jsonl'), exported.text)
+        artifacts.push('n10-session.v4.jsonl')
+        const ends = exported.entries.filter((entry) => entry?.type === 'turn/end').map((entry) => entry.data)
+        const iterations = ends.map((entry) => entry.iterations)
+        const turnStarts = exported.entries.filter((entry) => entry?.type === 'turn/start').length
+        const steps = exported.entries.map((entry) => entry?.data?.step).filter((step) => typeof step === 'number')
+        const prunedHits = (exported.text.match(/已裁剪/g) ?? []).length
+        const compactionEvents = exported.entries.filter((entry) => String(entry?.type ?? '').startsWith('compaction/')).length
+        const sumIterations = iterations.filter((n) => typeof n === 'number').reduce((total, n) => total + n, 0)
+        const maxIterations = Math.max(0, ...iterations.filter((n) => typeof n === 'number'))
+        check('导出含「已裁剪」留痕', prunedHits > 0, `count=${prunedHits}`)
+        check('导出含压缩事件', compactionEvents > 0, `count=${compactionEvents}`)
+        check(
+          '导出回合数与界面一致',
+          liveFooter !== null && turnStarts === liveFooter[0] && ends.length === liveFooter[0],
+          `starts=${turnStarts} ends=${ends.length} ui=${JSON.stringify(liveFooter)}`,
+        )
+        check('导出 turn/end 都带数值 iterations', ends.length > 0 && iterations.every((n) => typeof n === 'number'), JSON.stringify(iterations))
+        check('导出步数合计与界面一致', liveFooter !== null && sumIterations === liveFooter[1], `export=${sumIterations} ui=${JSON.stringify(liveFooter)}`)
+        check(
+          '导出条目步号非恒 1 且不越界',
+          new Set(steps).size >= 2 && steps.includes(1) && steps.every((step) => step >= 0 && step < maxIterations),
+          JSON.stringify(steps),
+        )
+        check('主导出不带 stepsUnavailable', ends.every((entry) => entry.stepsUnavailable === undefined))
+      }
+
+      await d.stop()
+      await sleep(1500)
+      await d.launch()
+      await d.afterLaunch()
+      // 第一轮的提问会被压缩摘要吞掉，重开后不再可见；用第二轮提问判「回到了原会话」。
+      check('重开回到原会话', await d.openPriorSession('N10 组合复验第二轮'))
+      await sleep(1500)
+      await d.expandProcessGroups()
+      const reopenBody = await d.bodyText()
+      writeFileSync(path.join(outRoot, 'n10-reopen-text.txt'), reopenBody)
+      artifacts.push('n10-reopen-text.txt')
+      await d.shot('n10-reopen')
+      check('重开后压缩节点在', reopenBody.includes('上下文已压缩'))
+      const reopenFooter = await d.footer()
+      check(
+        '重开轮次步数与实时一致',
+        reopenFooter !== null && liveFooter !== null && reopenFooter[0] === liveFooter[0] && reopenFooter[1] === liveFooter[1],
+        `live=${JSON.stringify(liveFooter)} reopen=${JSON.stringify(reopenFooter)}`,
+      )
+      const ends = d.turnEnds()
+      const sumIterations = ends.reduce((total, entry) => total + (typeof entry.iterations === 'number' ? entry.iterations : 0), 0)
+      check(
+        '档案轮次与界面一致',
+        reopenFooter !== null && ends.length === reopenFooter[0],
+        JSON.stringify(ends.map((entry) => ({ turn: entry.turn, reason: entry.reason, iterations: entry.iterations }))),
+      )
+      check('档案步数合计与界面一致', reopenFooter !== null && sumIterations === reopenFooter[1], `sum=${sumIterations} ui=${JSON.stringify(reopenFooter)}`)
+    },
+  },
 }
 
 function assertTruncated(d, phase) {
@@ -575,11 +708,10 @@ function assertCards(cards, phase) {
   check(`${phase}：越界卡不是 ok`, typeof out?.state === 'string' && out.state !== 'ok', JSON.stringify(out))
   check(`${phase}：拒绝卡不是 ok`, typeof deny?.state === 'string' && deny.state !== 'ok', JSON.stringify(deny))
   check(`${phase}：负例卡仍为 ok`, marker?.state === 'ok', JSON.stringify(marker))
-  if (phase === '重开') {
-    // 档案回放带完整拒绝说明；实时路径的上游流只有错误码，属另一处口径差（见 REPORT 附带观察）。
-    check(`${phase}：越界卡保留拒绝说明`, out?.text?.includes('路径越界') === true)
-    check(`${phase}：拒绝卡保留拒绝说明`, deny?.text?.includes('拒绝说明：type=') === true)
-  } else {
+  // 完整拒绝说明两视图都必须有：实时事件带 error 正文，重开由档案 output 回放。
+  check(`${phase}：越界卡保留拒绝说明`, out?.text?.includes('路径越界') === true, String(out?.text ?? '').slice(0, 120))
+  check(`${phase}：拒绝卡保留拒绝说明`, deny?.text?.includes('拒绝说明：type=') === true, String(deny?.text ?? '').slice(0, 120))
+  if (phase !== '重开') {
     check(`${phase}：越界卡显式标失败`, out?.text?.includes('失败') === true, JSON.stringify(out?.text?.slice(0, 80)))
     check(`${phase}：拒绝卡显式标失败`, deny?.text?.includes('失败') === true, JSON.stringify(deny?.text?.slice(0, 80)))
   }
@@ -633,7 +765,7 @@ if (existsSync(requestLog)) rmSync(requestLog)
 
 const stub = await startScenarioStub({
   port: stubPort,
-  scenario: { steps: def.steps, usage: def.usage },
+  scenario: { steps: def.steps, usage: def.usage, delayMs: def.delayMs },
   requestLog,
 })
 
@@ -843,6 +975,24 @@ class Driver {
 
   bodyText() {
     return this.eval(`document.body.innerText || ''`)
+  }
+
+  // 压缩窗口的窗口期只有一次摘要往返，200ms 采样才能看清「界面是否整块空白」。
+  // 判据取自 N1 探针：composer 不在 且 正文几乎为空 = 空白；压缩节点按可见文本判。
+  snapshot(marker = '') {
+    return this.eval(`(() => {
+      const composer = document.querySelector('[contenteditable="true"]')
+      const text = document.body.innerText || ''
+      return {
+        composer: composer !== null,
+        composerVisible: composer !== null && composer.getBoundingClientRect().height > 0,
+        bodyLen: text.length,
+        compactNode: /上下文已压缩/.test(text),
+        pruneNotice: text.includes('的输出在发给模型前被确定性裁剪'),
+        marker: ${marker === '' ? 'true' : `text.includes(${JSON.stringify(marker)})`},
+        head: text.slice(0, 120).replace(/\\n/g, ' / '),
+      }
+    })()`)
   }
 
   // 工具卡正文用 content-visibility 做了屏外跳过，`innerText` 会漏掉；判文案用 `textContent`

@@ -1,0 +1,106 @@
+{
+  "scenario": "n6",
+  "at": "2026-11-17T13:59:00.636Z",
+  "exe": "D:\\MyWorkspace\\SHANIU\\dist-portable\\SHANIU-Portable\\SHANIU.exe",
+  "exeSha256": "E6325EC6D85B2F77ABD81706C785DF85B552944B1F16832E84535EA6A93B10E2",
+  "checks": [
+    {
+      "name": "越界 read 卡出现",
+      "ok": true,
+      "detail": ""
+    },
+    {
+      "name": "负例 read 卡出现",
+      "ok": true,
+      "detail": ""
+    },
+    {
+      "name": "审批卡出现",
+      "ok": true,
+      "detail": ""
+    },
+    {
+      "name": "点击「拒绝」",
+      "ok": true,
+      "detail": ""
+    },
+    {
+      "name": "实时：越界卡不是 ok",
+      "ok": true,
+      "detail": "{\"state\":\"error\",\"text\":\"失败\\n工具调用\\n路径越界（工作区之外）: ../outside.txt\\n输入\\n{\\n  \\\"path\\\": \\\"../outside.txt\\\"\\n}\\n输出\\n路径越界（工作区之外）: ../outside.txt\\n拒绝说明：type=outside_workspace；工具=read_file；范围 approval=on_request sandbox=workspace_write risk=read；目标=../outside.txt\\n目标不在工作区写入范围内，工具层在落盘前拒绝，文件没有被改动。\\n可行做法：把目标改到工作区内（相对路径从工作区根解析），或让用户本人处理工作区外文件。\"}"
+    },
+    {
+      "name": "实时：拒绝卡不是 ok",
+      "ok": true,
+      "detail": "{\"state\":\"error\",\"text\":\"失败\\n工具调用\\n拒绝说明：type=user_denied；工具=unified_exec；范围 approval=on_request sandbox=workspace_write risk=execute\\n输入\\n{\\n  \\\"command\\\": \\\"echo n6-NMWKRCLD8\\\"\\n}\\n输出\\n拒绝说明：type=user_denied；工具=unified_exec；范围 approval=on_request sandbox=workspace_write risk=execute\\n用户拒绝了这次调用，这条不会被自动放行。\\n可行做法：说明这次操作要达成什么，或换一个更小的动作再问；不要原样重试，也不要换个说法绕过审批。\"}"
+    },
+    {
+      "name": "实时：负例卡仍为 ok",
+      "ok": true,
+      "detail": "{\"state\":\"ok\",\"text\":\"工具调用\\nread_file · marker.txt\\n输入\\n{\\n  \\\"path\\\": \\\"marker.txt\\\"\\n}\\n输出\\n[exit code: 0]\"}"
+    },
+    {
+      "name": "实时：越界卡保留拒绝说明",
+      "ok": true,
+      "detail": "失败\n工具调用\n路径越界（工作区之外）: ../outside.txt\n输入\n{\n  \"path\": \"../outside.txt\"\n}\n输出\n路径越界（工作区之外）: ../outside.txt\n拒绝说明：type=outside_w"
+    },
+    {
+      "name": "实时：拒绝卡保留拒绝说明",
+      "ok": true,
+      "detail": "失败\n工具调用\n拒绝说明：type=user_denied；工具=unified_exec；范围 approval=on_request sandbox=workspace_write risk=execute\n输入\n{\n  \"comman"
+    },
+    {
+      "name": "实时：越界卡显式标失败",
+      "ok": true,
+      "detail": "\"失败\\n工具调用\\n路径越界（工作区之外）: ../outside.txt\\n输入\\n{\\n  \\\"path\\\": \\\"../outside.txt\\\"\\n}\\n输出\\n路径越界（工作\""
+    },
+    {
+      "name": "实时：拒绝卡显式标失败",
+      "ok": true,
+      "detail": "\"失败\\n工具调用\\n拒绝说明：type=user_denied；工具=unified_exec；范围 approval=on_request sandbox=wor\""
+    },
+    {
+      "name": "重开回到原会话",
+      "ok": true,
+      "detail": ""
+    },
+    {
+      "name": "重开：越界卡不是 ok",
+      "ok": true,
+      "detail": "{\"state\":\"error\",\"text\":\"失败\\n工具调用\\n路径越界（工作区之外）: ../outside.txt\\n输入\\n{\\n  \\\"path\\\": \\\"../outside.txt\\\"\\n}\\n输出\\n路径越界（工作区之外）: ../outside.txt\\n拒绝说明：type=outside_workspace；工具=read_file；范围 approval=on_request sandbox=workspace_write risk=read；目标=../outside.txt\\n目标不在工作区写入范围内，工具层在落盘前拒绝，文件没有被改动。\\n可行做法：把目标改到工作区内（相对路径从工作区根解析），或让用户本人处理工作区外文件。\"}"
+    },
+    {
+      "name": "重开：拒绝卡不是 ok",
+      "ok": true,
+      "detail": "{\"state\":\"error\",\"text\":\"失败\\n工具调用\\n拒绝说明：type=user_denied；工具=unified_exec；范围 approval=on_request sandbox=workspace_write risk=execute\\n输入\\n{\\n  \\\"command\\\": \\\"echo n6-NMWKRCLD8\\\"\\n}\\n输出\\n拒绝说明：type=user_denied；工具=unified_exec；范围 approval=on_request sandbox=workspace_write risk=execute\\n用户拒绝了这次调用，这条不会被自动放行。\\n可行做法：说明这次操作要达成什么，或换一个更小的动作再问；不要原样重试，也不要换个说法绕过审批。\"}"
+    },
+    {
+      "name": "重开：负例卡仍为 ok",
+      "ok": true,
+      "detail": "{\"state\":\"ok\",\"text\":\"工具调用\\nread_file · marker.txt\\n输入\\n{\\n  \\\"path\\\": \\\"marker.txt\\\"\\n}\\n输出\\n1: 说明：路径越界（工作区之外）: 这是文档示例，不是拒绝\\n2: 备注：拒绝说明：type=user_denied；这是示例\\n\\n（文件结束：共 2 行）\"}"
+    },
+    {
+      "name": "重开：越界卡保留拒绝说明",
+      "ok": true,
+      "detail": "失败\n工具调用\n路径越界（工作区之外）: ../outside.txt\n输入\n{\n  \"path\": \"../outside.txt\"\n}\n输出\n路径越界（工作区之外）: ../outside.txt\n拒绝说明：type=outside_w"
+    },
+    {
+      "name": "重开：拒绝卡保留拒绝说明",
+      "ok": true,
+      "detail": "失败\n工具调用\n拒绝说明：type=user_denied；工具=unified_exec；范围 approval=on_request sandbox=workspace_write risk=execute\n输入\n{\n  \"comman"
+    }
+  ],
+  "artifacts": [
+    "n6-live.png",
+    "n6-cards-live.json",
+    "n6-reopen.png",
+    "n6-cards-reopen.json",
+    "n6-rollout.jsonl"
+  ],
+  "stubState": {
+    "mainIndex": 4,
+    "overflow": false,
+    "mainRequests": 4,
+    "auxRequests": 1
+  }
+}

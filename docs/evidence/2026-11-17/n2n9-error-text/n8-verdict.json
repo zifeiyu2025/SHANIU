@@ -1,0 +1,58 @@
+{
+  "scenario": "n8",
+  "at": "2026-11-17T13:59:36.928Z",
+  "exe": "D:\\MyWorkspace\\SHANIU\\dist-portable\\SHANIU-Portable\\SHANIU.exe",
+  "exeSha256": "E6325EC6D85B2F77ABD81706C785DF85B552944B1F16832E84535EA6A93B10E2",
+  "checks": [
+    {
+      "name": "补丁卡为错误态",
+      "ok": true,
+      "detail": "error"
+    },
+    {
+      "name": "实时回执「实际读到」为磁盘原文",
+      "ok": true,
+      "detail": "失败\n编辑\n第 1 段（Update File: data.txt，补丁第 2–9 行）：第 2 个 `@@` 块：上下文不匹配：未找到补丁期望的 2 行序列（已尝试：精确、剥离行号前缀、缩进弹性、空白折叠、首尾锚点）。\n输出\n第 1 段（Update File: data.txt，补丁第 2–9 行）：第 2 个 `@@` 块：上下文不匹配：未找到补丁期望的 2 行序列（已尝试：精确、剥离行号前缀、缩进弹性、空白折叠、首尾锚点）。\n期望匹配的 2 行（块内序号）：\n  块内 1| a1-first\n  块内 2| nope\n文件中最接近的位置：第 1 行起（整块相似度 12%，文件共 3 行"
+    },
+    {
+      "name": "实时回执不含预演后的 a1-first",
+      "ok": true,
+      "detail": ""
+    },
+    {
+      "name": "重开回到原会话",
+      "ok": true,
+      "detail": ""
+    },
+    {
+      "name": "回执「实际读到」为磁盘原文",
+      "ok": true,
+      "detail": "N8 复验：请用一次 apply_patch 改两处。21:59已完成已完成，用时 1秒已调用工具并修改了文件工具调用read_file · data.txt编辑输出第 1 段（Update File: data.txt，补丁第 2–9 行）：第 2 个 `@@` 块：上下文不匹配：未找到补丁期望的 2 行序列（已尝试：精确、剥离行号前缀、缩进弹性、空白折叠、首尾锚点）。\n期望匹配的 2 行（块内序号）：\n  块内 1| a1-first\n  块内 2| nope\n文件中最接近的位置：第 1 行起（整块相似度 12%，文件共 3 行）：\n  文件第 1| a1\n  文件第 2| a2\n首个不一致：块内第 1 行 vs 文件第 1 行；期望 `a1-first`，实际读到 `a1`\n请按上面「文件中最接近的位置」的真实内容重建补丁，不要原样重试补丁已处理。21:59"
+    },
+    {
+      "name": "回执不含预演后的 a1-first",
+      "ok": true,
+      "detail": ""
+    },
+    {
+      "name": "失败后整单回滚",
+      "ok": true,
+      "detail": "\"a1\\na2\\na3\\n\""
+    }
+  ],
+  "artifacts": [
+    "n8-live.png",
+    "n8-card.json",
+    "n8-reopen.png",
+    "n8-reopen-text.txt",
+    "n8-card-reopen.json",
+    "n8-data-after.txt",
+    "n8-rollout.jsonl"
+  ],
+  "stubState": {
+    "mainIndex": 3,
+    "overflow": false,
+    "mainRequests": 3,
+    "auxRequests": 1
+  }
+}

@@ -121,12 +121,101 @@ SHA256 `0ABD6B0A93EEE86FA418924A6FAC407A1440F604430BA91280A85177DFDEC071`。
 1. **实时与重开的工具卡文案不一致**。实时路径的失败卡只有错误码（`ToolError: tool_error`、
    `Denied: denied`），完整拒绝说明、`apply_patch` 回执明细只在档案回放（重开）时出现。
    N6/N8/N9 的文案判据因此取重开视图；该口径差本身未修。
+   （后续已修复，见文末「实时失败卡正文对齐」节；原观察保留，不改写。）
 2. **历史回合默认两级折叠**（回合过程头 + 过程组头，正文带 `hidden`）。工具卡与开发者通知
    都不在未展开的可见文本里；本轮取证一律先展开再判。后续冒烟脚本若直接读全文，会把
    「折叠」误判成「没留痕」（本轮 N2/N6/N7 初版就踩过）。
 3. 裁剪必须由「上一步回报的用量或字符估算超预算」触发，且 `observed ≥ 预算` 会连带压缩。
    N7 用「端点不回报用量」把路径收窄成只裁剪不压缩，回合才留在视图里——这不是产品行为，
    是取证手法，已在脚本注释写明。
+
+### 组合场景复验（N10，被测提交 `4d92256`，产品代码 `9e057fd`）
+
+N2–N9 是把每个修复拆开验的：N7 用「端点不回报用量」绕开了压缩，压缩、裁剪、追问、重开、
+导出没有在同一条链路上同时出现。本节点只验组合：小预算 → 4 万字符工具输出 → 确定性裁剪 +
+上下文压缩 → 追问 → 重开 → 导出。被测物与上节同一份 exe（28,803,584 B，
+SHA256 `0ABD6B0A93EEE86FA418924A6FAC407A1440F604430BA91280A85177DFDEC071`），
+场景 `n10` 由 `scripts/smoke/n2n9-live.mjs` 驱动，**21 条机器判据 0 失败**。
+
+方法与口径：
+
+- `token_budget=5000`、`approval=full_access`；夹具 `big.py` 输出 4000 行（38,958 字符）。
+- 端点按**字符数**回报 `prompt_tokens`（中文约 1 字符 1 token；`body.length / 4` 是英文口径，
+  会把中文上下文低估 3–4 倍）。本轮主请求实测 12,185 / 17,948 token，观测值确实越过预算。
+- 端点加 300ms 确定延迟：零延迟 stub 会在一个采样间隔内跑完整条压缩链路，窗口不可观测。
+- 压缩窗口按 200ms 采样 `document.body.innerText` 与 composer 可见性（判据同 N1 探针）。
+
+实测：
+
+| 观测面 | 结果 |
+|---|---|
+| 压缩窗口 | 5 帧采样，其中 3 帧 `compactNode=true`；`composer` 均存在且可见，`blankHits=0`；截图中会话区有用户消息、工具调用头、压缩节点，输入框在 |
+| 裁剪留痕（实时） | 展开过程组后可见两句：「原始 38958 字符，保留头 4096 + 尾 1024，中段省略 33838 字符」「卡片里显示的仍是裁剪前原文」 |
+| 裁剪留痕（导出） | `tool/result` 正文以 `[已裁剪] …` 判读行开头，其后保留裁剪前原文；扫「已裁剪」= 1 处 |
+| 压缩事件 | 导出一组 `compaction/*`（`start`/`summary`/`end`）；摘要按事件标记 `trigger=pressure`，未虚增回合 |
+| 轮次步数（四处） | 界面页脚 2 轮 3 步 = 导出 `turn/start=2`/`turn/end=2` = 导出 `iterations [2,1]` 合计 3 = rollout `turn_end iterations [2,1]` 合计 3；条目 `step` 为 `[0,0,1,0]`（0 起，非恒 1，且都小于所属回合 `iterations`） |
+| 重开 | 回到原会话；压缩节点仍在；页脚 `[2,3]` 与实时逐项一致；档案两条 `turn_end` 均为 `completed` |
+
+**结论**：组合链路未复现 N1（空白窗口）、F2/F3（三口径/裁剪无痕）、F6（步数在导出侧缺失）
+的任一失败面；裁剪与压缩同时发生时，界面、档案、导出三处口径保持一致。
+
+**与本报告 FAIL 行的对照（追加改判，原行与上节 N2–N9 表不改写）**：
+
+| 原 FAIL 行 | 修复后证据 | 追加结论 |
+|---|---|---|
+| 十项 2 审批挂起强杀 | N2（8/8）：`indeterminate`、卡片不复活、留「这条审批在程序关闭前未作答，已失效」、步数不变 | 已修复；原行「卡片保留为确认中」在 r2 后已由「卡片失效 + 明确通知」替换 |
+| 十项 3 压缩后追问 | N10 + N1：压缩窗口不空白、节点实时出现、追问轮次与重开一致 | 已修复 |
+| F2 截断/强杀结局 | N3（9/9）+ N2：截断只报「已截断」，强杀回合 `indeterminate` | 已修复 |
+| F3 裁剪留痕 + 压缩节点 | N7（10/10）+ N10：实时通知、重开卡片 `[已裁剪]`、导出留痕；压缩节点实时在 | 已修复 |
+| F6 轮次步数四处一致 | N4（13/13）+ N10：导出 `turn/end.iterations` 与界面、档案一致 | 已修复 |
+
+证据：`docs/evidence/2026-11-17/n2n9-combo/`（`n10-verdict.json`、`n10-samples.jsonl`、
+`n10-requests.jsonl`、`n10-compaction-live.png`、`n10-live-text.txt`、`n10-session.v4.jsonl`、
+`n10-rollout.jsonl` 等），索引见
+[`docs/evidence/2026-11-17/README.md`](../../evidence/2026-11-17/README.md) 的「N10 组合场景复验」段。
+
+**对「与历轮结论的对照」两行的追加校准**（原表不改写，只补现状）：
+
+| 原表行 | 修复后证据 | 追加结论 |
+|---|---|---|
+| r5 N5「压缩提示实时不显示」：仍存在且更重（实时整块空白） | N1 复验：880 条采样 `bodyLen ≥ 4335`、`composer=false` 仅发送过渡 2 帧；N10：压缩窗口 5 帧中 3 帧 `compactNode=true`、`blankHits=0` | 已修复；原行的「整块空白」不再复现 |
+| r6「步数在导出侧缺失」 | N4（13/13）：导出 `turn/end.iterations` 与条目真实 `step` 齐全；N10：界面 = 导出 = rollout 三处一致 | 已修复；缺权威步数的档案如实标 `stepsUnavailable`，不再编造 |
+
+### 实时失败卡正文对齐（N6/N8/N9 复验，工作区改动未提交）
+
+**问题**：上文附带观察第 1 条。实时失败卡只剩错误码，完整拒绝说明、越界原因与
+`apply_patch` 回执只在重开时出现。
+
+**根因**：工具输出只有流式工具（`unified_exec`）走 `tool_call_output_delta`；其余工具
+（`read_file`/`apply_patch`/…）的失败正文只放在 `tool_call_end.error`。前端把
+`tool/result` 正文拼成「delta 行 + 退出码」，失败时两者都为空，卡片便退化为
+`resultText` 的 `名字: 码` 兜底（`Denied: denied`、`ToolError: tool_error`）。档案回放读的是
+落档的 output 文本，所以只有重开才完整。
+
+**修法**（`src/transport/adapter.ts` 的 `tool_call_end`）：没有 delta 行、结局不是
+`cancelled` 且事件带 `error` 时，把 `error` 原文并入 `tool/result` 正文。档案 output 与
+事件 error 同源，两条路径由此逐字一致。`cancelled` 仍不带：档案不落该输出，带进来反而
+制造反方向的单边文案。
+
+**验证**：
+
+| 面 | 结果 |
+|---|---|
+| 单测 | `adapter.spec.ts` 扩展拒绝用例（正文=拒绝说明）+ 新增「实时失败正文来自事件 error」用例（多行越界说明；`cancelled` 正文仍为空）；全量 45 files / 513 passed |
+| 类型检查 | `pnpm typecheck` 退出码 0 |
+| 构建 | 版本升 `0.2.10` 后重编：`pnpm tauri build` + `pnpm package:portable`；exe 28,803,072 B，`FileVersion=ProductVersion=0.2.10`，SHA256 `E6325EC6D85B2F77ABD81706C785DF85B5529441B1F16832E84535EA6A93B10E2` |
+| 依赖 | Dependabot #116（moderate）：`uuid` 经 `pnpm-workspace.yaml` 的 `overrides` 收敛到 `^11.1.1`；`exceljs`/`@fortune-sheet/core` 只用 `v4`，11.x 的 CJS+ESM 入口已实测可加载，`pnpm audit --audit-level moderate` 归零 |
+| N6 | 17/17：实时与重开两视图中，越界卡与拒绝卡都含「路径越界（工作区之外）」「拒绝说明：type=user_denied…」；`data-state=error`、标题行「失败」；同标记负例仍 `ok` |
+| N8 | 7/7：实时卡含回执明细与「实际读到 a1」（磁盘原文），不含「实际读到 a1-first」；整单回滚，文件仍 `a1\na2\na3` |
+| N9 | 7/7：实时卡含「在本任务内没有可用的读取记录（可能尚未读取，或上次读取发生在本次修改之前、内容可能已过期）」，不出现「未读取过」；文件保持第 1 回合结果 |
+
+证据：`docs/evidence/2026-11-17/n2n9-error-text/`（`n6|n8|n9-verdict.json`、截图、卡片文本与
+档案、`pnpm-test.log`、`typecheck.log`），索引见
+[`docs/evidence/2026-11-17/README.md`](../../evidence/2026-11-17/README.md)。目录内
+`<n>/data`、`<n>/workspace` 为一次性复验数据根，可删。
+
+**判据变化**：仅把 N6/N8/N9 的文案判据从「仅重开」扩到「实时 + 重开」两视图，原断言
+一条未放宽；判据数 N6 15→17、N8 5→7、N9 5→7。
 
 ## 证据索引（`evidence/`）
 

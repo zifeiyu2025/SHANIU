@@ -388,6 +388,7 @@ SHA256 `0ABD6B0A93EEE86FA418924A6FAC407A1440F604430BA91280A85177DFDEC071`。
 
 1. **实时与重开的失败卡文案不一致**：实时只给错误码（`ToolError: tool_error`、`Denied: denied`），
    完整拒绝说明与 `apply_patch` 回执明细只在档案回放时出现，建议单独立项。
+   （已修复，见文末「实时失败卡正文对齐」节；原观察保留。）
 2. **历史回合默认两级折叠**：工具卡与开发者通知都在 `hidden` 子树里，取证必须先展开；
    否则会把「折叠」误判成「没留痕」。
 3. **裁剪的触发条件**：`observed_input_tokens ≥ 预算` 会连带压缩，压缩会把回合吞进摘要；
@@ -398,4 +399,73 @@ SHA256 `0ABD6B0A93EEE86FA418924A6FAC407A1440F604430BA91280A85177DFDEC071`。
 - 新增脚本：`scripts/smoke/scenario-model.mjs`、`scripts/smoke/n2n9-live.mjs`（均无产品代码依赖）。
 - 证据目录 `docs/evidence/2026-11-17/n2n9-live/` 体积约 1.6 MB；`<n>/data` 与 `<n>/workspace`
   为一次性复验数据根，可按需删除，`<n>-verdict.json` 与截图是判据本体。
+
+---
+
+## N10 组合场景复验（2026-11-17，产品代码 `9e057fd`）
+
+**结论**：**21 条机器判据 0 失败**。N2–N9 是拆开单项验的（N7 还用「端点不回报用量」绕开
+压缩），本节把「裁剪 + 压缩 + 追问 + 重开 + 导出」放进同一条链路：
+
+| 观测面 | 实测 |
+|---|---|
+| 压缩窗口 | 5 帧采样（200ms）中 3 帧 `compactNode=true`，`composer` 均可见，`blankHits=0` |
+| 裁剪留痕 | 实时两句通知；导出 `[已裁剪]` 1 处并保留裁剪前原文（38,958 → 5,120 字符，中段省略 33,838） |
+| 压缩事件 | 导出一组 `compaction/*`，未虚增回合 |
+| 轮次步数 | 界面 2 轮 3 步 = 导出 `turn/start=2`/`turn/end=2` = `iterations [2,1]` = rollout `[2,1]`；条目 `step [0,0,1,0]` |
+| 重开 | 压缩节点仍在，页脚 `[2,3]` 与实时一致，档案两条 `turn_end` 均 `completed` |
+
+被测物与 N2–N9 同一份 exe：28,803,584 B，
+SHA256 `0ABD6B0A93EEE86FA418924A6FAC407A1440F604430BA91280A85177DFDEC071`。
+
+### 方法与新增观测点
+
+- 场景 `n10`：`token_budget=5000`、`approval=full_access`、夹具 `big.py` 输出 4000 行。
+- `scripts/smoke/scenario-model.mjs` 新增 `usage: 'chars'`：按请求体字符数报 `prompt_tokens`
+  （中文约 1 字符 1 token）。原来的 `body.length / 4` 是英文口径，会低估 3–4 倍，组合场景
+  需要「观测值真的越过预算」才会走到裁剪 + 压缩同时发生。
+- 新增 `delayMs`：零延迟 stub 会在一个采样间隔内跑完整条压缩链路；300ms 后窗口才可采样。
+- `scripts/smoke/n2n9-live.mjs` 新增 `snapshot()`：200ms 采样 `innerText` 长度、composer
+  可见性与压缩节点/裁剪通知；判据同 N1 探针（`composer` 不在且正文 < 200 字符 = 空白）。
+- 证据目录 `docs/evidence/2026-11-17/n2n9-combo/`：`n10-verdict.json`（判据）、
+  `n10-samples.jsonl`（压缩窗口采样）、`n10-requests.jsonl`（含 `bodyChars`/`promptTokens`，
+  可核对压缩触发）、`n10-compaction-live.png`、`n10-live-text.txt`、`n10-reopen-text.txt`、
+  `n10-session.v4.jsonl`（导出）、`n10-rollout.jsonl`。`n10/data`、`n10/workspace` 为一次性
+  数据根，可按需删除。
+
+---
+
+## 实时失败卡正文对齐（2026-11-17，N6/N8/N9 复验，产品代码为工作区改动未提交）
+
+**结论**：附带观察第 1 条（实时失败卡只有错误码）**已修复**。实时与重开两个视图的
+失败卡正文逐字一致；N6 17/17、N8 7/7、N9 7/7 条机器判据 0 失败。
+
+**根因**：只有流式工具（`unified_exec`）发 `tool_call_output_delta`；`read_file`/`apply_patch`
+等工具的失败正文仅在 `tool_call_end.error`。前端 `tool/result` 正文只由 delta 行与退出码拼成，
+失败时两者皆空，`ToolRow` 退化为 `resultText` 的 `名字: 码` 兜底；档案回放读落档 output，
+故完整正文只在重开出现。
+
+**修法**：`src/transport/adapter.ts` 的 `tool_call_end`——无 delta 行、结局非 `cancelled`
+且带 `error` 时，把 `error` 原文并入正文。`cancelled` 不带（档案不落该输出，避免反方向的
+单边文案）。档案 output 与事件 error 同源，两条路径由此对齐。
+
+**验证**：
+
+| 面 | 结果 |
+|---|---|
+| 单测 | `src/transport/adapter.spec.ts`：拒绝用例断言正文=拒绝说明；新增「实时失败正文来自事件 error」用例（多行越界说明 + `cancelled` 正文仍空）；全量 45 files / 513 passed（`pnpm-test.log`） |
+| 类型检查 | `pnpm typecheck` 退出码 0（`typecheck.log`） |
+| 构建 | 版本升 `0.2.10` 后重编：`pnpm tauri build` + `pnpm package:portable`；被测 exe 28,803,072 B，`FileVersion=ProductVersion=0.2.10`，SHA256 `E6325EC6D85B2F77ABD81706C785DF85B5529441B1F16832E84535EA6A93B10E2` |
+| 依赖 | Dependabot #116（moderate）：`uuid` 在 `pnpm-workspace.yaml` 用 `overrides` 收敛到 `^11.1.1`；`exceljs`/`@fortune-sheet/core` 只用 `v4`，11.x 的 CJS+ESM 入口实测可加载，`pnpm audit --audit-level moderate` 归零 |
+| N6 | 17/17：实时与重开都含「路径越界（工作区之外）」与「拒绝说明：type=user_denied…」；负例 `marker.txt` 仍 `ok` |
+| N8 | 7/7：实时回执含「实际读到 a1」与整段失败明细，不含「实际读到 a1-first」；文件未改 |
+| N9 | 7/7：实时文案为「在本任务内没有可用的读取记录（可能尚未读取，或上次读取发生在本次修改之前、内容可能已过期）」，不出现「未读取过」 |
+
+证据目录：`docs/evidence/2026-11-17/n2n9-error-text/`（`n6|n8|n9-verdict.json`、截图、
+`n6-cards-live.json`/`n6-cards-reopen.json`、`n8-card*.json`、`n8-reopen-text.txt`、
+`n9-card*.json`、`n9-note-after.txt`、`pnpm-test.log`、`typecheck.log`）。
+`<n>/data` 与 `<n>/workspace` 为一次性复验数据根，已删除。
+
+**判据变化**：N6/N8/N9 的文案判据从「仅重开」扩到「实时 + 重开」，原断言未放宽；
+判据数 N6 15→17、N8 5→7、N9 5→7。
 

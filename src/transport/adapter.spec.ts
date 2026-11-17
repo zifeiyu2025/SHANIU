@@ -1290,13 +1290,44 @@ describe('适配层把 EventMsg 流映射成 DSH 会话 journal', () => {
     const iterator = session.follow({ address: { kind: 'session', sessionId: 'agent-new' } })
     const journal = eventsOf((await iterator.next()).value as Record<string, unknown>)
     const resultEvent = journal.find(event => event['type'] === 'tool/result')
-    const result = resultEvent?.['data'] as { message: { isError: boolean }; error: { name: string; code: string } }
+    const result = resultEvent?.['data'] as { message: { isError: boolean; content: { text: string }[] }; error: { name: string; code: string } }
     expect(result.error.name).toBe('Denied')
     expect(result.message.isError).toBe(true)
+    // 实时视图也要拿到拒绝正文：档案回放里有（Rollout 的 output），实时事件里只在
+    // `error` 字段；不带进正文，卡片就只剩 `Denied: denied` 这行兜底（真机 N6）。
+    expect(result.message.content[0]?.text).toBe('用户拒绝')
     // validator 的前提：带 error 时 isError 必须为真，否则 wire 校验直接抛
     expect(() => assertSessionWireEvent(resultEvent!)).not.toThrow()
     expect((journal.find(event => event['type'] === 'turn/end')?.['data'] as { reason: unknown }).reason)
       .toEqual({ kind: 'aborted', reason: { kind: 'user' } })
+
+    await iterator.return?.(undefined)
+    dispose()
+  })
+
+  it('实时失败正文来自事件 error：越界/补丁回执不再只剩名字与码', async () => {
+    const bridge = scriptedBridge()
+    const { remote, dispose } = createAdapter({ bridge })
+    const session = faceOf(remote).session
+    await session.prompt({ sessionId: 'agent-new', requestId: 'rpc-1', content: [{ type: 'text', text: '改一下' }] })
+    const outside = '第 1 段（Add File: D:/tmp/outside/x.txt，补丁第 2–3 行）：路径越界（工作区之外）: D:/tmp/outside/x.txt'
+    bridge.emit('agent-new', { type: 'tool_call_begin', call_id: 'c3', tool: 'apply_patch', args: { patch: '…' } })
+    bridge.emit('agent-new', { type: 'tool_call_end', call_id: 'c3', exit_code: null, error: outside, result: 'error' })
+    // 取消仍然不带正文：档案不落输出，「已取消」会是单边文案。
+    bridge.emit('agent-new', { type: 'tool_call_begin', call_id: 'c4', tool: 'unified_exec', args: {} })
+    bridge.emit('agent-new', { type: 'tool_call_end', call_id: 'c4', exit_code: null, error: '已取消', result: 'cancelled' })
+    bridge.emit('agent-new', { type: 'turn_completed', turn: 1, reason: 'cancelled' })
+
+    const iterator = session.follow({ address: { kind: 'session', sessionId: 'agent-new' } })
+    const journal = eventsOf((await iterator.next()).value as Record<string, unknown>)
+    journal.forEach(event => expect(() => assertSessionWireEvent(event)).not.toThrow())
+    const results = journal.filter(event => event['type'] === 'tool/result')
+      .map(event => event['data'] as { message: { content: { text: string }[]; isError: boolean }; error?: { name: string } })
+    expect(results[0]?.message.content[0]?.text).toBe(outside)
+    expect(results[0]?.message.isError).toBe(true)
+    expect(results[0]?.error?.name).toBe('ToolError')
+    expect(results[1]?.message.content).toEqual([])
+    expect(results[1]?.message.isError).toBe(true)
 
     await iterator.return?.(undefined)
     dispose()
